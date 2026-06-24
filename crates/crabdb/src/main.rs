@@ -65,52 +65,105 @@ enum OutputFormat {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize a new CrabDB workspace and default branch state.
+    /// Use this once per repository to create `.crabdb`, default config,
+    /// `.crabignore`, and baseline root metadata.
     Init(InitArgs),
+    /// Inspect and edit workspace configuration values.
+    /// Use `get` and `set` to read typed keys and adjust behavior safely.
     Config(ConfigCommand),
+    /// Manage `.crabignore` rules that shield files from recording.
+    /// Add/remove patterns or check whether a path is currently ignored.
     Ignore(IgnoreCommand),
+    /// Run policy checks for proposed agent actions.
+    /// Use `check` to preflight approval, denylist, and ignore decisions.
     Guardrails(GuardrailsCommand),
+    /// Show current branch state, root object, dirty status, and recent changes.
     Status(StatusArgs),
+    /// Scan worktree changes and record a new operation on the active branch.
+    /// Supports partial recording via `--paths` and optional session links.
     Record(RecordArgs),
+    /// Poll the worktree on a timer and record cleanly detected changes.
+    /// Useful for background recording in a local loop or automation scripts.
     Watch(WatchArgs),
+    /// List recent operations across workspace, branch, session, or agent scope.
     Timeline(TimelineArgs),
+    /// Print details for an operation, message, ref, or object id.
+    /// Supports human and JSON output.
     Show(ShowArgs),
+    /// Inspect generic CrabDB object metadata and summarize known object kinds.
     Object(ObjectCommand),
+    /// Decode and display a `WorktreeRoot` object in detail.
     Root(RootCommand),
+    /// Decode and display a `TextContent` object including line identities.
     Text(TextCommand),
+    /// Inspect low-level prolly map roots and byte ranges.
+    /// Supports several map decoding modes and key-address forms.
     Map(MapCommand),
+    /// Compare two refs or roots and optionally print a patch.
     Diff(DiffArgs),
+    /// Materialize a branch, ref, operation, or root into the workspace.
+    /// Supports safe dry-run and alternate workdir workflows.
     Checkout(CheckoutArgs),
+    /// Create, rename, list, or delete branch refs in local history.
     Branch(BranchArgs),
+    /// Merge a source branch/ref into a target with conflict-aware checks.
+    /// Returns planned paths on dry run and conflict sets on failure.
     Merge(MergeArgs),
+    /// Resolve authorship and history for a specific path or stable line.
+    /// Useful for provenance questions before changing a location.
     Why(WhyArgs),
+    /// Show file and line edit history from derived indexes.
     History(HistoryArgs),
+    /// Find source operations and changed paths from a message, session, or agent.
     CodeFrom(CodeFromArgs),
+    /// Manage agent branches, metadata, sessions, patches, tests, and traces.
+    /// This command group covers the full CLI-facing agent workflow.
     Agent(AgentCommand),
+    /// Create and manage agent sessions, context packets, and lifecycle.
     Session(SessionCommand),
+    /// Handle sensitive action approvals and reviewer decisions.
     Approvals(ApprovalsCommand),
+    /// Merge an agent branch into a standard branch with readiness checks.
+    /// Applies the same conflict rules as queue/manual merges.
     MergeAgent(MergeAgentArgs),
+    /// Schedule and run controlled serialized merges using a queue.
+    /// Merge items pause on first conflict and keep audit history.
     MergeQueue(MergeQueueCommand),
+    /// Inspect and resolve conflict sets opened by merge operations.
     Conflicts(ConflictsCommand),
+    /// Create and resolve stable anchors that survive nearby line churn.
     Anchor(AnchorCommand),
+    /// Manage advisory read/write leases used for path coordination.
+    /// Helps prevent overlapping agent writes across workdirs.
     Lease(LeaseCommand),
+    /// Move data between CrabDB refs and Git, and inspect mapping metadata.
     Git(GitCommand),
-    #[command(about = "Inspect the local JSON HTTP API contract")]
+    /// Inspect and render local API schemas for integrations.
     Api(ApiCommand),
-    #[command(about = "Run the local JSON HTTP API for editor and agent integrations")]
+    /// Run the JSON HTTP API daemon for editor and agent integrations.
     Daemon(DaemonArgs),
-    #[command(about = "Run the MCP stdio server for agent hosts")]
+    /// Start the MCP stdio server for agent host tool discovery.
     Mcp,
+    /// Run full local diagnostics for workspace and integration readiness.
     Doctor,
+    /// Export, verify, and restore workspace backup bundles.
     Backup(BackupCommand),
+    /// Verify repository integrity and report structural or reference issues.
     Fsck,
+    /// Rebuild searchable indexes used by history and provenance queries.
     Index(IndexCommand),
+    /// Prune unused objects and stale index references.
     Gc(GcArgs),
 }
 
 #[derive(Subcommand)]
 enum ConfigSubcommand {
+    /// List all currently configured workspace keys.
     List,
+    /// Print one typed workspace config value.
     Get(ConfigGetArgs),
+    /// Set one typed workspace config value after validation.
     Set(ConfigSetArgs),
 }
 
@@ -133,9 +186,13 @@ struct ConfigSetArgs {
 
 #[derive(Subcommand)]
 enum IgnoreSubcommand {
+    /// Print the active ignore patterns.
     List,
+    /// Add a path pattern to `.crabignore`.
     Add(IgnorePatternArgs),
+    /// Remove a path pattern from `.crabignore`.
     Remove(IgnorePatternArgs),
+    /// Check whether a path is currently ignored.
     Check(IgnoreCheckArgs),
 }
 
@@ -157,6 +214,7 @@ struct IgnoreCheckArgs {
 
 #[derive(Subcommand)]
 enum GuardrailsSubcommand {
+    /// Preflight an agent action against policy and ignore checks.
     Check(GuardrailCheckArgs),
 }
 
@@ -266,6 +324,7 @@ struct ShowArgs {
 
 #[derive(Subcommand)]
 enum ObjectSubcommand {
+    /// Show a structured object summary for a specific object id.
     Show(ObjectShowArgs),
 }
 
@@ -282,6 +341,7 @@ struct ObjectShowArgs {
 
 #[derive(Subcommand)]
 enum RootSubcommand {
+    /// Show a `WorktreeRoot` object with stable file metadata.
     Show(RootShowArgs),
 }
 
@@ -298,6 +358,7 @@ struct RootShowArgs {
 
 #[derive(Subcommand)]
 enum TextSubcommand {
+    /// Show a `TextContent` object and stable line identifiers.
     Show(TextShowArgs),
 }
 
@@ -316,7 +377,9 @@ struct TextShowArgs {
 
 #[derive(Subcommand)]
 enum MapSubcommand {
+    /// Show a mapped range from a prolly map root.
     Range(MapRangeArgs),
+    /// Diff two prolly map roots with optional range filtering.
     Diff(MapDiffArgs),
 }
 
@@ -451,30 +514,55 @@ struct CodeFromArgs {
 
 #[derive(Subcommand)]
 enum AgentSubcommand {
+    /// Create a new agent branch and optional materialized workdir.
     Spawn(AgentSpawnArgs),
+    /// List all agent branches and metadata.
     List,
+    /// Show one agent record and branch state.
     Show(AgentShowArgs),
+    /// Show current status for an agent branch including readiness signals.
     Status(AgentStatusArgs),
+    /// Build an agent change review bundle with operation history.
     Contribution(AgentContributionArgs),
+    /// List recent agent test/eval gate results by kind.
     Gates(AgentGatesArgs),
+    /// Compute agent merge-readiness including blockers and warnings.
     Readiness(AgentReadinessArgs),
+    /// Produce a handoff-ready transfer packet for an agent.
     Handoff(AgentHandoffArgs),
+    /// Create a best-effort advisory claim for path-level work coordination.
     Claim(AgentClaimArgs),
+    /// Add a message to an agent timeline.
     Message(AgentMessageArgs),
+    /// Work directly with durable agent turns.
     Turn(AgentTurnCommand),
+    /// Manage durable paused/resumed agent runs.
     Run(AgentRunCommand),
+    /// Query structured trace events across agents, sessions, and turns.
     Events(AgentEventsArgs),
+    /// Manage trace spans (start/end/list/summary/show).
     Trace(AgentTraceCommand),
+    /// Record all current agent workdir changes as one operation.
     Record(AgentRecordArgs),
+    /// Watch and record agent workdir changes continuously.
     Watch(AgentWatchArgs),
+    /// Run a command in agent workdir and record test gate metadata.
     Test(AgentTestArgs),
+    /// Run evaluation command in agent workdir and record eval gate metadata.
     Eval(AgentTestArgs),
+    /// Print the resolved agent workdir path.
     Workdir(AgentWorkdirArgs),
+    /// Re-sync agent workdir from the agent branch head.
     SyncWorkdir(AgentSyncWorkdirArgs),
+    /// Apply a structured patch directly to an agent branch.
     ApplyPatch(AgentPatchArgs),
+    /// Show current diff for an agent branch head vs base.
     Diff(AgentDiffArgs),
+    /// List operations on an agent timeline.
     Timeline(AgentTimelineArgs),
+    /// Preview or materialize an agent branch into workspace.
     Checkout(AgentCheckoutArgs),
+    /// Remove an agent branch and associated workdir materialization.
     Rm(AgentRemoveArgs),
 }
 
@@ -576,11 +664,17 @@ struct AgentMessageArgs {
 
 #[derive(Subcommand)]
 enum AgentTurnSubcommand {
+    /// Start a new durable turn and attach context.
     Start(AgentTurnStartArgs),
+    /// Show one turn report with linked messages and events.
     Show(AgentTurnShowArgs),
+    /// Add a message event to a turn.
     Message(AgentTurnMessageArgs),
+    /// Add a trace event to a turn.
     Event(AgentTurnEventArgs),
+    /// Apply a structured patch linked to a turn.
     ApplyPatch(AgentTurnPatchArgs),
+    /// Mark a turn finished with terminal status.
     End(AgentTurnEndArgs),
 }
 
@@ -646,9 +740,13 @@ struct AgentTurnEndArgs {
 
 #[derive(Subcommand)]
 enum AgentRunSubcommand {
+    /// Pause an agent run with optional interruption state.
     Pause(AgentRunPauseArgs),
+    /// List paused or active agent runs.
     List(AgentRunListArgs),
+    /// Show one agent run checkpoint.
     Show(AgentRunShowArgs),
+    /// Resume a paused run after approval or state review.
     Resume(AgentRunResumeArgs),
 }
 
@@ -780,10 +878,15 @@ struct AgentEventsArgs {
 
 #[derive(Subcommand)]
 enum AgentTraceSubcommand {
+    /// Start a new named trace span.
     Start(AgentTraceStartArgs),
+    /// Close a span with final status and optional result payload.
     End(AgentTraceEndArgs),
+    /// List recent spans with filtering and limits.
     List(AgentTraceListArgs),
+    /// Summarize spans and durations for traces of interest.
     Summary(AgentTraceSummaryArgs),
+    /// Show one full span report.
     Show(AgentTraceShowArgs),
 }
 
@@ -870,11 +973,17 @@ struct AgentRemoveArgs {
 
 #[derive(Subcommand)]
 enum SessionSubcommand {
+    /// Start a new session for a given agent.
     Start(SessionStartArgs),
+    /// Show current session attachment for all agents or one agent.
     Current(SessionCurrentArgs),
+    /// List recent sessions, optionally filtered by agent.
     List(SessionListArgs),
+    /// Show one session with context and linked records.
     Show(SessionShowArgs),
+    /// Return bounded session context packet.
     Context(SessionContextArgs),
+    /// End a session with explicit terminal status.
     End(SessionEndArgs),
 }
 
@@ -925,9 +1034,13 @@ struct SessionEndArgs {
 
 #[derive(Subcommand)]
 enum ApprovalsSubcommand {
+    /// Create a new approval request for a sensitive action.
     Request(ApprovalRequestArgs),
+    /// List approval requests, optionally filtered by agent/status.
     List(ApprovalListArgs),
+    /// Show one approval request record and decision state.
     Show(ApprovalShowArgs),
+    /// Record a decision for an existing approval request.
     Decide(ApprovalDecideArgs),
 }
 
@@ -1006,9 +1119,13 @@ struct MergeAgentArgs {
 
 #[derive(Subcommand)]
 enum MergeQueueSubcommand {
+    /// Add a source ref to the merge queue.
     Add(MergeQueueAddArgs),
+    /// List queued merge candidates and states.
     List,
+    /// Run queued merges up to optional item limit.
     Run(MergeQueueRunArgs),
+    /// Remove a queued item before execution.
     Remove(MergeQueueRemoveArgs),
 }
 
@@ -1040,8 +1157,11 @@ struct MergeQueueRemoveArgs {
 
 #[derive(Subcommand)]
 enum ConflictsSubcommand {
+    /// List recent unresolved or historical conflict sets.
     List,
+    /// Show details for one conflict set.
     Show(ConflictShowArgs),
+    /// Resolve a conflict by taking source/target or manual file map.
     Resolve(ConflictResolveArgs),
 }
 
@@ -1087,9 +1207,13 @@ impl ConflictTakeArg {
 
 #[derive(Subcommand)]
 enum AnchorSubcommand {
+    /// Create a stable anchor for a `path:line` selector.
     Create(AnchorCreateArgs),
+    /// Resolve an anchor to current identifier in branch context.
     Resolve(AnchorResolveArgs),
+    /// List existing anchors.
     List,
+    /// Remove an anchor by id.
     Delete(AnchorDeleteArgs),
 }
 
@@ -1118,8 +1242,11 @@ struct AnchorDeleteArgs {
 
 #[derive(Subcommand)]
 enum LeaseSubcommand {
+    /// Acquire a lease for a given path and mode.
     Acquire(LeaseAcquireArgs),
+    /// List active (or all) advisory leases.
     List(LeaseListArgs),
+    /// Release a single lease by id.
     Release(LeaseReleaseArgs),
 }
 
@@ -1168,8 +1295,11 @@ impl LeaseModeArg {
 
 #[derive(Subcommand)]
 enum GitSubcommand {
+    /// Export a range as Git patch or commit.
     Export(GitExportArgs),
+    /// Import current Git snapshot into CrabDB.
     ImportUpdate(GitImportUpdateArgs),
+    /// List recent Git<->CrabDB mapping entries.
     Mappings(GitMappingsArgs),
 }
 
@@ -1202,6 +1332,7 @@ struct GitMappingsArgs {
 
 #[derive(Subcommand)]
 enum ApiSubcommand {
+    /// Print or write the OpenAPI contract JSON.
     Openapi(ApiOpenapiArgs),
 }
 
@@ -1237,6 +1368,7 @@ struct DaemonArgs {
 
 #[derive(Subcommand)]
 enum IndexSubcommand {
+    /// Rebuild all derived indexes from current workspace state.
     Rebuild,
 }
 
@@ -1254,8 +1386,11 @@ struct GcArgs {
 
 #[derive(Subcommand)]
 enum BackupSubcommand {
+    /// Create a portable workspace backup file.
     Create(BackupCreateArgs),
+    /// Verify backup integrity before restore.
     Verify(BackupVerifyArgs),
+    /// Restore workspace data from a backup archive.
     Restore(BackupRestoreArgs),
 }
 
