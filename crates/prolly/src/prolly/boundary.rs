@@ -39,21 +39,12 @@ pub fn is_boundary(node: &Node, idx: usize) -> bool {
         return true;
     }
 
-    // Hash-based boundary using xxHash64
-    let key = &node.keys[idx];
-    let val = &node.vals[idx];
-
-    let mut hasher = Xxh64::new(node.hash_seed);
-    hasher.write(key);
-    hasher.write(val);
-    let hash = hasher.finish();
-
-    // Use lower 32 bits for threshold comparison
-    let hash_val = (hash & 0xFFFF_FFFF) as u32;
-
-    // Threshold: lower = more boundaries = smaller nodes
-    let threshold = u32::MAX / node.chunking_factor;
-    hash_val <= threshold
+    is_hash_boundary(
+        node.hash_seed,
+        node.chunking_factor,
+        &node.keys[idx],
+        &node.vals[idx],
+    )
 }
 
 /// Check if entry creates a chunk boundary using Config.
@@ -81,8 +72,19 @@ pub fn is_boundary_config(config: &Config, count: usize, key: &[u8], val: &[u8])
         return true;
     }
 
-    // Hash-based boundary using xxHash64
-    let mut hasher = Xxh64::new(config.hash_seed);
+    is_hash_boundary_config(config, key, val)
+}
+
+/// Check only the hash predicate for a boundary, without applying min/max size rules.
+///
+/// Bulk builders can precompute this part in parallel, then apply the min/max
+/// checks using the current chunk-local entry count.
+pub(crate) fn is_hash_boundary_config(config: &Config, key: &[u8], val: &[u8]) -> bool {
+    is_hash_boundary(config.hash_seed, config.chunking_factor, key, val)
+}
+
+fn is_hash_boundary(hash_seed: u64, chunking_factor: u32, key: &[u8], val: &[u8]) -> bool {
+    let mut hasher = Xxh64::new(hash_seed);
     hasher.write(key);
     hasher.write(val);
     let hash = hasher.finish();
@@ -91,7 +93,7 @@ pub fn is_boundary_config(config: &Config, count: usize, key: &[u8], val: &[u8])
     let hash_val = (hash & 0xFFFF_FFFF) as u32;
 
     // Threshold: lower = more boundaries = smaller nodes
-    let threshold = u32::MAX / config.chunking_factor;
+    let threshold = u32::MAX / chunking_factor;
     hash_val <= threshold
 }
 

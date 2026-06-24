@@ -92,9 +92,9 @@ pub fn rebalance<S: Store>(
         return handle_empty_node(prolly, ancestors);
     }
 
-    // Check for splits based on entry count
-    // Use >= to ensure we never exceed max_chunk_size
-    if node.len() >= node.max_chunk_size && node.len() > 1 {
+    // Check for splits based on entry count. `max_chunk_size` is an
+    // inclusive capacity; split only after the node exceeds it.
+    if node.len() > node.max_chunk_size && node.len() > 1 {
         return split_node(prolly, node, ancestors);
     }
 
@@ -182,37 +182,32 @@ fn split_node<S: Store>(
 ) -> Result<Cid, Error> {
     let max_size = node.max_chunk_size;
 
-    // We need to split such that both halves are strictly less than max_chunk_size
-    // The maximum size for each half should be max_size - 1 to ensure we stay under the limit
-    let max_half_size = max_size.saturating_sub(1).max(1);
-
     // Find split point using boundary detection
-    // We need to find a split point that ensures both halves are under max_chunk_size
+    // We need to find a split point that ensures both halves fit within max_chunk_size.
     let mut split_idx = None;
     for i in 0..node.len() {
         if is_boundary(&node, i) {
             // Check if this split point would create valid-sized nodes
-            // Both halves must be strictly less than max_chunk_size
+            // Both halves must be at or below max_chunk_size.
             let left_size = i + 1;
             let right_size = node.len() - i - 1;
-            if left_size < max_size && right_size > 0 && right_size < max_size {
+            if left_size <= max_size && right_size > 0 && right_size <= max_size {
                 split_idx = Some(i);
                 break;
             }
         }
     }
 
-    // If no valid boundary found, split to ensure both halves are under max_chunk_size
+    // If no valid boundary found, split to ensure both halves fit within max_chunk_size.
     let split_idx = split_idx.unwrap_or_else(|| {
-        // Split at a point that keeps both sides under max_chunk_size
-        // For a node of size N, we want left_size < max_size and right_size < max_size
-        // left_size = split_idx + 1, right_size = N - split_idx - 1
-        // So: split_idx + 1 < max_size => split_idx < max_size - 1
-        // And: N - split_idx - 1 < max_size => split_idx > N - max_size
+        // Split at a point that keeps both sides within max_chunk_size.
+        // For a node of size N, we want:
+        // left_size = split_idx + 1 <= max_size
+        // right_size = N - split_idx - 1 <= max_size
 
         // Calculate the valid range for split_idx
-        let min_split = node.len().saturating_sub(max_size);
-        let max_split = max_half_size.min(node.len().saturating_sub(1));
+        let min_split = node.len().saturating_sub(max_size + 1);
+        let max_split = max_size.saturating_sub(1).min(node.len().saturating_sub(2));
 
         // Choose a split point in the valid range, preferring the middle
         if min_split <= max_split {
@@ -250,7 +245,7 @@ fn split_node<S: Store>(
 
     // Recursively split if either half is still too large
     // This handles cases where max_chunk_size is very small
-    let left_cid = if left.len() >= max_size && left.len() > 1 {
+    let left_cid = if left.len() > max_size && left.len() > 1 {
         // Left is still too large, need to split it further
         // We'll handle this by creating a temporary parent structure
         split_and_save_oversized(prolly, &left, ancestors)?
@@ -258,7 +253,7 @@ fn split_node<S: Store>(
         prolly.save(&left)?
     };
 
-    let right_cid = if right.len() >= max_size && right.len() > 1 {
+    let right_cid = if right.len() > max_size && right.len() > 1 {
         // Right is still too large, need to split it further
         split_and_save_oversized(prolly, &right, ancestors)?
     } else {
@@ -275,7 +270,7 @@ fn split_node<S: Store>(
         parent.vals.push(right_cid.0.to_vec());
 
         // Check if parent needs splitting too
-        if parent.len() >= parent.max_chunk_size {
+        if parent.len() > parent.max_chunk_size {
             return split_node(prolly, parent, &[]);
         }
         return prolly.save(&parent);
@@ -316,7 +311,7 @@ fn split_and_save_oversized<S: Store>(
     let max_size = node.max_chunk_size;
 
     // If node is small enough, just save it
-    if node.len() < max_size {
+    if node.len() <= max_size {
         return prolly.save(node);
     }
 
@@ -326,9 +321,8 @@ fn split_and_save_oversized<S: Store>(
     let mut start = 0;
 
     while start < node.len() {
-        // Calculate end index for this chunk
-        // Each chunk should be strictly less than max_size
-        let chunk_size = (max_size - 1).min(node.len() - start).max(1);
+        // Calculate end index for this chunk. Chunks may fill max_size exactly.
+        let chunk_size = max_size.min(node.len() - start).max(1);
         let end = start + chunk_size;
 
         let mut chunk = prolly.new_node_like(node);
@@ -353,7 +347,7 @@ fn split_and_save_oversized<S: Store>(
     }
 
     // If parent is also too large, recursively split it
-    if parent.len() >= max_size && parent.len() > 1 {
+    if parent.len() > max_size && parent.len() > 1 {
         return split_and_save_oversized(prolly, &parent, &[]);
     }
 
@@ -403,7 +397,7 @@ fn try_merge_with_sibling<S: Store>(
             let new_idx = idx - 1;
 
             // Check if merged node needs splitting (might be too large after merge)
-            if merged.len() >= merged.max_chunk_size && merged.len() > 1 {
+            if merged.len() > merged.max_chunk_size && merged.len() > 1 {
                 // Need to split the merged node - build new ancestors with updated parent position
                 let mut new_ancestors: Vec<(Node, usize)> =
                     ancestors[..ancestors.len() - 1].to_vec();
@@ -444,7 +438,7 @@ fn try_merge_with_sibling<S: Store>(
             new_parent.vals.remove(idx + 1);
 
             // Check if merged node needs splitting (might be too large after merge)
-            if merged.len() >= merged.max_chunk_size && merged.len() > 1 {
+            if merged.len() > merged.max_chunk_size && merged.len() > 1 {
                 // Need to split the merged node - build new ancestors with updated parent position
                 let mut new_ancestors: Vec<(Node, usize)> =
                     ancestors[..ancestors.len() - 1].to_vec();
@@ -545,8 +539,8 @@ pub fn rebalance_with_collector<S: Store>(
         return handle_empty_node_with_collector(prolly, ancestors, collector);
     }
 
-    // Check for splits based on entry count
-    if node.len() >= node.max_chunk_size && node.len() > 1 {
+    // Check for splits based on entry count.
+    if node.len() > node.max_chunk_size && node.len() > 1 {
         return split_node_with_collector(prolly, node, ancestors, collector);
     }
 
@@ -636,7 +630,7 @@ fn split_node_with_collector<S: Store>(
 ) -> Result<Option<Cid>, Error> {
     let max_size = node.max_chunk_size;
 
-    // Split the node into multiple chunks that are all under max_size
+    // Split the node into multiple chunks that are all at or under max_size.
     let chunks = split_into_chunks(prolly, &node, max_size);
 
     // If only one chunk (shouldn't happen but handle gracefully)
@@ -685,7 +679,7 @@ fn split_node_with_collector<S: Store>(
         }
 
         // Check if parent needs splitting too
-        if parent.len() >= parent.max_chunk_size {
+        if parent.len() > parent.max_chunk_size {
             return split_node_with_collector(prolly, parent, &[], collector);
         }
         let root_cid = collector.add(&parent);
@@ -717,20 +711,20 @@ fn split_node_with_collector<S: Store>(
     rebalance_with_collector(prolly, parent, &ancestors[..ancestors.len() - 1], collector)
 }
 
-/// Split a node into multiple chunks, each under max_size.
+/// Split a node into multiple chunks, each at or under max_size.
 ///
 /// This function is exposed for testing purposes.
 ///
 /// # Arguments
 /// * `prolly` - Reference to the Prolly tree manager
 /// * `node` - The node to split into chunks
-/// * `max_size` - The maximum chunk size (strict upper bound)
+/// * `max_size` - The inclusive maximum chunk size
 ///
 /// # Returns
-/// * `Vec<Node>` - A vector of chunks, each with length strictly less than `max_size`
+/// * `Vec<Node>` - A vector of chunks, each with length at most `max_size`
 ///
 /// # Invariants
-/// - All returned chunks have `chunk.len() < max_size`
+/// - All returned chunks have `chunk.len() <= max_size`
 /// - All returned chunks have `chunk.len() > 0` (non-empty)
 /// - The concatenation of all chunks equals the original node's entries
 pub fn split_into_chunks<S: Store>(prolly: &Prolly<S>, node: &Node, max_size: usize) -> Vec<Node> {
@@ -740,12 +734,14 @@ pub fn split_into_chunks<S: Store>(prolly: &Prolly<S>, node: &Node, max_size: us
         "split_into_chunks: input node keys must be in strictly ascending order"
     );
 
-    if node.len() < max_size {
+    let capacity = max_size.max(1);
+
+    if node.len() <= capacity {
         return vec![node.clone()];
     }
 
     // Calculate the number of chunks needed
-    let num_chunks = (node.len() + max_size - 2) / (max_size - 1); // Ceiling division
+    let num_chunks = (node.len() + capacity - 1) / capacity; // Ceiling division
 
     let mut chunks: Vec<Node> = Vec::new();
     let mut start = 0;
@@ -759,16 +755,16 @@ pub fn split_into_chunks<S: Store>(prolly: &Prolly<S>, node: &Node, max_size: us
         // but still have entries left. This can happen due to rounding in num_chunks calculation.
         // In this case, we need to create additional chunks.
         let target_end = if remaining_chunks == 0 {
-            // Create a chunk with remaining entries, respecting max_size
-            (start + remaining_entries).min(start + max_size - 1)
+            // Create a chunk with remaining entries, respecting capacity.
+            (start + remaining_entries).min(start + capacity)
         } else {
             start + (remaining_entries / remaining_chunks).max(1)
         };
 
-        // Ensure we don't exceed max_size
-        // A chunk from start..end has size (end - start), so we want end - start < max_size
-        // Therefore, end < start + max_size, so max_end = start + max_size - 1
-        let max_end = (start + max_size - 1).min(node.len());
+        // Ensure we don't exceed capacity.
+        // A chunk from start..end has size (end - start), so we want
+        // end - start <= capacity.
+        let max_end = (start + capacity).min(node.len());
         let min_end = start + 1;
 
         // Start with target_end, but clamp to valid range
@@ -785,25 +781,25 @@ pub fn split_into_chunks<S: Store>(prolly: &Prolly<S>, node: &Node, max_size: us
             }
         }
 
-        // Ensure we don't create oversized chunks
-        // Chunk size is end - start, must be < max_size
-        if end - start >= max_size {
-            end = start + max_size - 1;
+        // Ensure we don't create oversized chunks.
+        // Chunk size is end - start, must be <= capacity.
+        if end - start > capacity {
+            end = start + capacity;
         }
 
         // Ensure we don't leave a tiny remainder
         let remaining_after = node.len() - end;
         if remaining_after > 0
-            && remaining_after < max_size / 4
-            && (end - start) + remaining_after < max_size
+            && remaining_after < capacity / 4
+            && (end - start) + remaining_after <= capacity
         {
             // Include the remainder in this chunk
             end = node.len();
         }
 
-        // Final safety check: ensure chunk size is strictly less than max_size
-        if end - start >= max_size {
-            end = start + max_size - 1;
+        // Final safety check: ensure chunk size is at or below capacity.
+        if end - start > capacity {
+            end = start + capacity;
         }
 
         let mut chunk = prolly.new_node_like(node);
@@ -857,7 +853,7 @@ fn try_merge_with_sibling_collector<S: Store>(
             let new_idx = idx - 1;
 
             // Check if merged node needs splitting (might be too large after merge)
-            if merged.len() >= merged.max_chunk_size && merged.len() > 1 {
+            if merged.len() > merged.max_chunk_size && merged.len() > 1 {
                 // Need to split the merged node - build new ancestors with updated parent position
                 let mut new_ancestors: Vec<(Node, usize)> =
                     ancestors[..ancestors.len() - 1].to_vec();
@@ -899,7 +895,7 @@ fn try_merge_with_sibling_collector<S: Store>(
             new_parent.vals.remove(idx + 1);
 
             // Check if merged node needs splitting (might be too large after merge)
-            if merged.len() >= merged.max_chunk_size && merged.len() > 1 {
+            if merged.len() > merged.max_chunk_size && merged.len() > 1 {
                 // Need to split the merged node - build new ancestors with updated parent position
                 let mut new_ancestors: Vec<(Node, usize)> =
                     ancestors[..ancestors.len() - 1].to_vec();

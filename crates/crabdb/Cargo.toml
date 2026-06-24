@@ -7,7 +7,23 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-prolly = { path = "../prolly" }
+clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+ignore.workspace = true
+prolly = { path = "../prolly", features = ["sqlite"] }
+rusqlite.workspace = true
+serde.workspace = true
+serde_cbor.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

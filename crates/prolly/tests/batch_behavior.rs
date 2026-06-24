@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{configured_prolly, entries};
+use common::{assert_tree_invariants, configured_prolly, entries};
 use prolly::{BatchBuilder, Config, MemStore, Mutation, Prolly};
 
 #[test]
@@ -114,4 +114,134 @@ fn batch_mutations_are_last_write_wins_and_match_repeated_ops() {
         entries(&batched, &batched_tree),
         entries(&repeated, &expected)
     );
+}
+
+#[test]
+fn batch_mutations_across_many_leaves_match_repeated_ops() {
+    let config = Config::builder()
+        .min_chunk_size(2)
+        .max_chunk_size(4)
+        .chunking_factor(u32::MAX)
+        .hash_seed(19)
+        .build();
+    let batched = Prolly::new(MemStore::new(), config.clone());
+    let repeated = Prolly::new(MemStore::new(), config);
+
+    let mut batched_base = batched.create();
+    let mut repeated_tree = repeated.create();
+    for i in 0..80 {
+        let key = format!("k{i:03}").into_bytes();
+        let val = format!("v{i:03}").into_bytes();
+        batched_base = batched
+            .put(&batched_base, key.clone(), val.clone())
+            .unwrap();
+        repeated_tree = repeated.put(&repeated_tree, key, val).unwrap();
+    }
+
+    let mutations = vec![
+        Mutation::Upsert {
+            key: b"k003".to_vec(),
+            val: b"updated-left".to_vec(),
+        },
+        Mutation::Delete {
+            key: b"k017".to_vec(),
+        },
+        Mutation::Upsert {
+            key: b"k039".to_vec(),
+            val: b"updated-middle".to_vec(),
+        },
+        Mutation::Delete {
+            key: b"k058".to_vec(),
+        },
+        Mutation::Upsert {
+            key: b"k071".to_vec(),
+            val: b"updated-right".to_vec(),
+        },
+    ];
+
+    let batched_tree = batched.batch(&batched_base, mutations.clone()).unwrap();
+
+    for mutation in mutations {
+        repeated_tree = match mutation {
+            Mutation::Upsert { key, val } => repeated.put(&repeated_tree, key, val).unwrap(),
+            Mutation::Delete { key } => repeated.delete(&repeated_tree, &key).unwrap(),
+        };
+    }
+
+    assert_eq!(
+        entries(&batched, &batched_tree),
+        entries(&repeated, &repeated_tree)
+    );
+}
+
+#[test]
+fn batch_mutations_across_many_leaves_handle_inserts_deletes_and_splits() {
+    let batched_store = Arc::new(MemStore::new());
+    let repeated_store = Arc::new(MemStore::new());
+    let config = Config::builder()
+        .min_chunk_size(2)
+        .max_chunk_size(4)
+        .chunking_factor(u32::MAX)
+        .hash_seed(23)
+        .build();
+    let batched = Prolly::new(batched_store.clone(), config.clone());
+    let repeated = Prolly::new(repeated_store.clone(), config.clone());
+
+    let mut batched_base = batched.create();
+    let mut repeated_tree = repeated.create();
+    for i in 0..96 {
+        let key = format!("k{i:03}").into_bytes();
+        let val = format!("v{i:03}").into_bytes();
+        batched_base = batched
+            .put(&batched_base, key.clone(), val.clone())
+            .unwrap();
+        repeated_tree = repeated.put(&repeated_tree, key, val).unwrap();
+    }
+
+    let mutations = vec![
+        Mutation::Upsert {
+            key: b"k003a".to_vec(),
+            val: b"insert-left-gap".to_vec(),
+        },
+        Mutation::Upsert {
+            key: b"k004a".to_vec(),
+            val: b"insert-left-split".to_vec(),
+        },
+        Mutation::Delete {
+            key: b"k018".to_vec(),
+        },
+        Mutation::Delete {
+            key: b"k019".to_vec(),
+        },
+        Mutation::Upsert {
+            key: b"k039a".to_vec(),
+            val: b"insert-middle-gap".to_vec(),
+        },
+        Mutation::Upsert {
+            key: b"k040a".to_vec(),
+            val: b"insert-middle-split".to_vec(),
+        },
+        Mutation::Delete {
+            key: b"k070".to_vec(),
+        },
+        Mutation::Upsert {
+            key: b"k090a".to_vec(),
+            val: b"insert-right-gap".to_vec(),
+        },
+    ];
+
+    let batched_tree = batched.batch(&batched_base, mutations.clone()).unwrap();
+
+    for mutation in mutations {
+        repeated_tree = match mutation {
+            Mutation::Upsert { key, val } => repeated.put(&repeated_tree, key, val).unwrap(),
+            Mutation::Delete { key } => repeated.delete(&repeated_tree, &key).unwrap(),
+        };
+    }
+
+    assert_eq!(
+        entries(&batched, &batched_tree),
+        entries(&repeated, &repeated_tree)
+    );
+    assert_tree_invariants(&batched_store, &batched_tree, &config);
 }

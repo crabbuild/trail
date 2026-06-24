@@ -86,7 +86,7 @@ impl Node {
 
     /// Serialize to bytes (deterministic CBOR)
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_cbor::to_vec(self).expect("serialization should not fail")
+        serde_cbor::ser::to_vec_packed(self).expect("serialization should not fail")
     }
 
     /// Deserialize from bytes
@@ -283,6 +283,28 @@ mod tests {
         let bytes = node.to_bytes();
         let restored = Node::from_bytes(&bytes).unwrap();
         assert_eq!(node, restored);
+    }
+
+    #[test]
+    fn packed_serialization_reads_legacy_cbor_and_reduces_size() {
+        let node = Node::builder()
+            .keys(vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()])
+            .vals(vec![b"val1".to_vec(), b"val2".to_vec(), b"val3".to_vec()])
+            .leaf(true)
+            .level(0)
+            .min_chunk_size(2)
+            .max_chunk_size(128)
+            .chunking_factor(64)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build();
+
+        let legacy_bytes = serde_cbor::to_vec(&node).unwrap();
+        let packed_bytes = node.to_bytes();
+
+        assert_eq!(Node::from_bytes(&legacy_bytes).unwrap(), node);
+        assert_eq!(Node::from_bytes(&packed_bytes).unwrap(), node);
+        assert!(packed_bytes.len() < legacy_bytes.len());
     }
 
     #[test]

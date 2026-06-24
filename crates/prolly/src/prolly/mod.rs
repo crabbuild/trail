@@ -188,6 +188,27 @@ pub struct Prolly<S: Store> {
     store: S,
     config: Config,
     node_cache: RwLock<HashMap<Cid, Arc<Node>>>,
+    rightmost_path_cache: RwLock<Option<(Cid, Vec<CachedRightmostPathEntry>)>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedRightmostPathEntry {
+    pub cid: Cid,
+    pub node: Node,
+    pub child_index: usize,
+}
+
+fn is_rightmost_append_path(path: &[(Node, usize)], key: &[u8]) -> bool {
+    let Some((leaf, _)) = path.last() else {
+        return true;
+    };
+
+    if !leaf.leaf || leaf.search(key) != Err(leaf.len()) {
+        return false;
+    }
+
+    path.iter()
+        .all(|(node, child_index)| *child_index + 1 == node.len())
 }
 
 impl<S: Store> Prolly<S> {
@@ -201,6 +222,7 @@ impl<S: Store> Prolly<S> {
             store,
             config,
             node_cache: RwLock::new(HashMap::new()),
+            rightmost_path_cache: RwLock::new(None),
         }
     }
 
@@ -280,6 +302,10 @@ impl<S: Store> Prolly<S> {
         // Build path to leaf
         let path = self.find_path(tree, &key)?;
 
+        if is_rightmost_append_path(&path, &key) {
+            return batch::append_upsert_with_path(self, tree, key, val, &path);
+        }
+
         // Insert into leaf
         let mut node = path
             .last()
@@ -299,8 +325,19 @@ impl<S: Store> Prolly<S> {
             }
         }
 
-        // Rebalance and save
-        let new_root = rebalance::rebalance(self, node, &path[..path.len().saturating_sub(1)])?;
+        // Rebalance and persist the O(height) changed path atomically. This
+        // keeps random updates localized while avoiding one disk transaction
+        // per rewritten node on durable stores.
+        let mut collector = batch::BatchWriteCollector::new_cached();
+        let new_root = rebalance::rebalance_with_collector(
+            self,
+            node,
+            &path[..path.len().saturating_sub(1)],
+            &mut collector,
+        )?
+        .ok_or(Error::InvalidNode)?;
+        collector.flush(self.store())?;
+        collector.cache_nodes(self)?;
 
         Ok(Tree {
             root: Some(new_root),
@@ -349,11 +386,20 @@ impl<S: Store> Prolly<S> {
             });
         }
 
-        // Rebalance
-        let new_root = rebalance::rebalance(self, node, &path[..path.len().saturating_sub(1)])?;
+        // Rebalance and persist the O(height) changed path atomically, matching
+        // the localized write behavior used by put.
+        let mut collector = batch::BatchWriteCollector::new_cached();
+        let new_root = rebalance::rebalance_with_collector(
+            self,
+            node,
+            &path[..path.len().saturating_sub(1)],
+            &mut collector,
+        )?;
+        collector.flush(self.store())?;
+        collector.cache_nodes(self)?;
 
         Ok(Tree {
-            root: Some(new_root),
+            root: new_root,
             config: tree.config.clone(),
         })
     }
@@ -441,6 +487,21 @@ impl<S: Store> Prolly<S> {
     /// ```
     pub fn diff(&self, base: &Tree, other: &Tree) -> Result<Vec<Diff>, Error> {
         diff::compute_diff(self, base, other)
+    }
+
+    /// Compute the difference between two trees within a half-open key range.
+    ///
+    /// Returns only changes whose key is in `[start, end)`. Unlike collecting
+    /// two ranges and comparing them, this walks the tree shape directly and
+    /// skips equal or out-of-range subtrees by CID and key span.
+    pub fn range_diff(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<Diff>, Error> {
+        diff::compute_range_diff(self, base, other, start, end)
     }
 
     /// Merge two trees using three-way merge.
@@ -700,11 +761,12 @@ impl<S: Store> Prolly<S> {
         cursor::DiffCursor::new(&self.store, base, other)
     }
 
-    /// Create a streaming diff iterator between two trees using the StreamingDiffer trait.
+    /// Create a streaming diff iterator between two trees.
     ///
     /// Returns an iterator that yields `Result<Diff, Error>` entries representing
     /// the changes needed to transform `base` into `other`. This method uses the
-    /// [`DefaultStreamingDiffer`] implementation which wraps [`DiffCursor`].
+    /// Append-only suffix changes are routed through the tree-structural diff
+    /// shortcut; other changes use [`DiffCursor`].
     ///
     /// # Arguments
     /// * `base` - The base tree to compare from
@@ -747,12 +809,10 @@ impl<S: Store> Prolly<S> {
         base: &Tree,
         other: &Tree,
     ) -> Result<Box<dyn Iterator<Item = Result<Diff, Error>> + 'a>, Error> {
-        // Short-circuit for identical trees (same root CID)
-        if base.root == other.root {
-            return Ok(Box::new(std::iter::empty()));
+        if let Some(diffs) = diff::try_append_only_diff(self, base, other)? {
+            return Ok(Box::new(diffs.into_iter().map(Ok)));
         }
 
-        // Use existing DiffCursor implementation, wrapping items in Ok()
         let diff_cursor = cursor::DiffCursor::new(&self.store, base, other)?;
         Ok(Box::new(diff_cursor.map(Ok)))
     }
@@ -785,6 +845,63 @@ impl<S: Store> Prolly<S> {
         Ok(node)
     }
 
+    /// Load nodes by CID in input order, batching cache misses through the store.
+    pub(crate) fn load_many_ordered(&self, cids: &[Cid]) -> Result<Vec<Arc<Node>>, Error> {
+        let mut nodes = vec![None; cids.len()];
+        let mut missing_indices = Vec::new();
+        let mut missing_cids = Vec::new();
+
+        if let Ok(cache) = self.node_cache.read() {
+            for (idx, cid) in cids.iter().enumerate() {
+                if let Some(node) = cache.get(cid) {
+                    nodes[idx] = Some(node.clone());
+                } else {
+                    missing_indices.push(idx);
+                    missing_cids.push(cid.clone());
+                }
+            }
+        } else {
+            missing_indices.extend(0..cids.len());
+            missing_cids.extend(cids.iter().cloned());
+        }
+
+        if !missing_cids.is_empty() {
+            let keys = missing_cids
+                .iter()
+                .map(|cid| cid.as_bytes())
+                .collect::<Vec<_>>();
+            let loaded = self
+                .store
+                .batch_get_ordered(&keys)
+                .map_err(|e| Error::Store(Box::new(e)))?;
+
+            if loaded.len() != missing_cids.len() {
+                return Err(Error::InvalidNode);
+            }
+
+            let mut cache = self.node_cache.write().ok();
+            for ((idx, cid), bytes) in missing_indices
+                .into_iter()
+                .zip(missing_cids.into_iter())
+                .zip(loaded)
+            {
+                let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
+                let node = Arc::new(Node::from_bytes(&bytes)?);
+                let node = if let Some(cache) = cache.as_mut() {
+                    cache.entry(cid).or_insert_with(|| node.clone()).clone()
+                } else {
+                    node
+                };
+                nodes[idx] = Some(node);
+            }
+        }
+
+        nodes
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::InvalidNode)
+    }
+
     /// Save a node to the store and return its CID.
     pub(crate) fn save(&self, node: &Node) -> Result<Cid, Error> {
         let bytes = node.to_bytes();
@@ -798,6 +915,31 @@ impl<S: Store> Prolly<S> {
         Ok(cid)
     }
 
+    pub(crate) fn cache_node(&self, cid: Cid, node: Node) {
+        if let Ok(mut cache) = self.node_cache.write() {
+            cache.insert(cid, Arc::new(node));
+        }
+    }
+
+    pub(crate) fn cached_rightmost_path(
+        &self,
+        root: &Cid,
+    ) -> Option<Vec<CachedRightmostPathEntry>> {
+        self.rightmost_path_cache
+            .read()
+            .ok()
+            .and_then(|cached| match cached.as_ref() {
+                Some((cached_root, path)) if cached_root == root => Some(path.clone()),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn cache_rightmost_path(&self, root: Cid, path: Vec<CachedRightmostPathEntry>) {
+        if let Ok(mut cache) = self.rightmost_path_cache.write() {
+            *cache = Some((root, path));
+        }
+    }
+
     /// Clear the in-process immutable node cache.
     ///
     /// This is mostly useful after external store maintenance or tests that
@@ -805,6 +947,9 @@ impl<S: Store> Prolly<S> {
     pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.node_cache.write() {
             cache.clear();
+        }
+        if let Ok(mut cache) = self.rightmost_path_cache.write() {
+            *cache = None;
         }
     }
 
@@ -1043,7 +1188,76 @@ impl<S: Store> Prolly<S> {
 mod tests {
     use super::*;
     use error::Diff;
-    use store::MemStore;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use store::{BatchOp, MemStore};
+
+    #[derive(Debug)]
+    struct CountingStoreError;
+
+    impl std::fmt::Display for CountingStoreError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("counting store error")
+        }
+    }
+
+    impl std::error::Error for CountingStoreError {}
+
+    #[derive(Default)]
+    struct CountingStore {
+        data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+        put_calls: AtomicUsize,
+        batch_calls: AtomicUsize,
+        batch_put_calls: AtomicUsize,
+    }
+
+    impl Store for CountingStore {
+        type Error = CountingStoreError;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            let data = self.data.lock().unwrap();
+            Ok(data.get(key).cloned())
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            self.put_calls.fetch_add(1, Ordering::Relaxed);
+            data.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            data.remove(key);
+            Ok(())
+        }
+
+        fn batch(&self, ops: &[BatchOp]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            for op in ops {
+                match op {
+                    BatchOp::Upsert { key, value } => {
+                        data.insert(key.to_vec(), value.to_vec());
+                    }
+                    BatchOp::Delete { key } => {
+                        data.remove(*key);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            self.batch_put_calls.fetch_add(1, Ordering::Relaxed);
+            for (key, value) in entries {
+                data.insert(key.to_vec(), value.to_vec());
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_prolly_new() {
@@ -1249,6 +1463,89 @@ mod tests {
         assert_eq!(prolly.get(&tree, b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(prolly.get(&tree, b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(prolly.get(&tree, b"c").unwrap(), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn test_put_batches_non_append_rebalance_writes() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(1000000)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let mut tree = prolly.create();
+
+        for i in 0..20 {
+            tree = prolly
+                .put(
+                    &tree,
+                    format!("k{i:03}").into_bytes(),
+                    format!("v{i:03}").into_bytes(),
+                )
+                .unwrap();
+        }
+
+        let put_calls_before = store.put_calls.load(Ordering::Relaxed);
+        let batch_put_calls_before = store.batch_put_calls.load(Ordering::Relaxed);
+
+        let tree = prolly
+            .put(&tree, b"k010".to_vec(), b"changed".to_vec())
+            .unwrap();
+
+        assert_eq!(
+            prolly.get(&tree, b"k010").unwrap(),
+            Some(b"changed".to_vec())
+        );
+        assert_eq!(
+            store.put_calls.load(Ordering::Relaxed),
+            put_calls_before,
+            "non-append put should avoid per-node store.put calls"
+        );
+        assert_eq!(
+            store.batch_put_calls.load(Ordering::Relaxed) - batch_put_calls_before,
+            1,
+            "non-append put should flush rewritten path in one batch"
+        );
+    }
+
+    #[test]
+    fn test_delete_batches_rebalance_writes() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(1000000)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let mut tree = prolly.create();
+
+        for i in 0..20 {
+            tree = prolly
+                .put(
+                    &tree,
+                    format!("k{i:03}").into_bytes(),
+                    format!("v{i:03}").into_bytes(),
+                )
+                .unwrap();
+        }
+
+        let put_calls_before = store.put_calls.load(Ordering::Relaxed);
+        let batch_put_calls_before = store.batch_put_calls.load(Ordering::Relaxed);
+
+        let tree = prolly.delete(&tree, b"k010").unwrap();
+
+        assert_eq!(prolly.get(&tree, b"k010").unwrap(), None);
+        assert_eq!(
+            store.put_calls.load(Ordering::Relaxed),
+            put_calls_before,
+            "delete should avoid per-node store.put calls"
+        );
+        assert_eq!(
+            store.batch_put_calls.load(Ordering::Relaxed) - batch_put_calls_before,
+            1,
+            "delete should flush rewritten path in one batch"
+        );
     }
 
     #[test]

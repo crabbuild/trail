@@ -240,16 +240,21 @@
 //!     .with_optimized_merge(false);  // Use binary search for comparison
 //! ```
 
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+
+use super::boundary::is_boundary;
 use super::cid::Cid;
 use super::cursor::Cursor;
 use super::error::Error;
 use super::error::Mutation;
 use super::node::Node;
-use super::store::{BatchOp, Store};
+use super::store::Store;
 use super::tree::Tree;
 
 use super::rebalance;
-use super::Prolly;
+use super::{CachedRightmostPathEntry, Prolly};
 
 /// Leaf span affected by mutations.
 ///
@@ -288,7 +293,7 @@ pub struct LeafSpan {
 ///
 /// This struct accumulates nodes during batch mutation processing and writes
 /// them all atomically to the store at the end of the operation using the
-/// Store's batch API.
+/// Store's bulk upsert API.
 ///
 /// # Example
 /// ```ignore
@@ -299,6 +304,7 @@ pub struct LeafSpan {
 pub struct BatchWriteCollector {
     /// Nodes to write: (cid_bytes, node_bytes)
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
+    cache_nodes: Option<Vec<(Cid, Node)>>,
 }
 
 impl BatchWriteCollector {
@@ -307,7 +313,22 @@ impl BatchWriteCollector {
     /// # Returns
     /// A new BatchWriteCollector with no nodes collected.
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            cache_nodes: None,
+        }
+    }
+
+    /// Create a collector that also retains node clones for cheap cache warming.
+    ///
+    /// This is intended for small hot paths such as single-key `put`, where the
+    /// caller will cache rewritten nodes after the atomic flush. Larger batch
+    /// writers should use `new` to avoid holding duplicate node payloads.
+    pub(crate) fn new_cached() -> Self {
+        Self {
+            nodes: Vec::new(),
+            cache_nodes: Some(Vec::new()),
+        }
     }
 
     /// Add a node to be written, returns its CID.
@@ -323,13 +344,16 @@ impl BatchWriteCollector {
     pub fn add(&mut self, node: &Node) -> Cid {
         let bytes = node.to_bytes();
         let cid = Cid::from_bytes(&bytes);
+        if let Some(cache_nodes) = &mut self.cache_nodes {
+            cache_nodes.push((cid.clone(), node.clone()));
+        }
         self.nodes.push((cid.0.to_vec(), bytes));
         cid
     }
 
     /// Write all collected nodes to the store atomically.
     ///
-    /// Uses the Store's batch operation to write all nodes in a single
+    /// Uses the Store's bulk upsert operation to write all nodes in a single
     /// atomic operation. If the batch operation fails, no partial modifications
     /// are made to the store.
     ///
@@ -344,16 +368,53 @@ impl BatchWriteCollector {
             return Ok(());
         }
 
-        let ops: Vec<BatchOp> = self
+        let entries: Vec<(&[u8], &[u8])> = self
             .nodes
             .iter()
-            .map(|(k, v)| BatchOp::Upsert {
-                key: k.as_slice(),
-                value: v.as_slice(),
-            })
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
 
-        store.batch(&ops).map_err(|e| Error::Store(Box::new(e)))
+        store
+            .batch_put(&entries)
+            .map_err(|e| Error::Store(Box::new(e)))
+    }
+
+    pub(crate) fn flush_with_hint<S: Store>(
+        &self,
+        store: &S,
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), Error> {
+        let entries: Vec<(&[u8], &[u8])> = self
+            .nodes
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        store
+            .batch_put_with_hint(&entries, namespace, key, value)
+            .map_err(|e| Error::Store(Box::new(e)))
+    }
+
+    pub(crate) fn cache_nodes<S: Store>(&self, prolly: &Prolly<S>) -> Result<(), Error> {
+        if let Some(cache_nodes) = &self.cache_nodes {
+            for (cid, node) in cache_nodes {
+                prolly.cache_node(cid.clone(), node.clone());
+            }
+            return Ok(());
+        }
+
+        for (cid_bytes, node_bytes) in &self.nodes {
+            let cid = Cid(cid_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidNode)?);
+            let node = Node::from_bytes(node_bytes)?;
+            prolly.cache_node(cid, node);
+        }
+
+        Ok(())
     }
 
     /// Get the number of nodes collected.
@@ -736,6 +797,42 @@ pub struct LeafMutationGroup {
     pub mutations: Vec<Mutation>,
 }
 
+struct LeafMutationGroupWithPath {
+    leaf: Node,
+    ancestors: Vec<(Node, usize)>,
+    ancestor_cids: Vec<Cid>,
+    mutations: Vec<Mutation>,
+}
+
+impl From<LeafMutationGroupWithPath> for LeafMutationGroup {
+    fn from(group: LeafMutationGroupWithPath) -> Self {
+        Self {
+            leaf: group.leaf,
+            ancestors: group.ancestors,
+            mutations: group.mutations,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ChildRef {
+    cid: Cid,
+    first_key: Vec<u8>,
+    level: u8,
+}
+
+#[derive(Clone)]
+struct ParentLink {
+    parent_cid: Cid,
+    child_index: usize,
+}
+
+#[derive(Clone)]
+struct AncestorContext {
+    node: Node,
+    parent: Option<ParentLink>,
+}
+
 /// Result of applying mutations in deferred mode.
 ///
 /// This struct captures the state after mutations have been applied to leaves
@@ -896,7 +993,7 @@ pub fn apply_mutations_deferred(groups: Vec<LeafMutationGroup>) -> DeferredMutat
 /// * `node` - The node to split (may be oversized after deferred mutations)
 ///
 /// # Returns
-/// A vector of nodes, each with length strictly less than `max_chunk_size`.
+/// A vector of nodes, each with length at most `max_chunk_size`.
 /// If the input node is already within size limits, returns a single-element vector
 /// containing a clone of the input node.
 ///
@@ -908,7 +1005,7 @@ pub fn apply_mutations_deferred(groups: Vec<LeafMutationGroup>) -> DeferredMutat
 ///
 /// # Requirements
 /// - Requirement 3.2: Split oversized leaves into properly-sized chunks
-/// - Requirement 4.1: All nodes have length strictly less than max_chunk_size
+/// - Requirement 4.1: All nodes have length at most max_chunk_size
 ///
 /// # Example
 /// ```rust,ignore
@@ -922,7 +1019,7 @@ pub fn apply_mutations_deferred(groups: Vec<LeafMutationGroup>) -> DeferredMutat
 ///
 /// // All chunks are properly sized
 /// for chunk in &chunks {
-///     assert!(chunk.len() < chunk.max_chunk_size);
+///     assert!(chunk.len() <= chunk.max_chunk_size);
 /// }
 /// ```
 pub fn split_oversized_node<S: Store>(prolly: &Prolly<S>, node: &Node) -> Vec<Node> {
@@ -948,7 +1045,7 @@ pub fn split_oversized_node<S: Store>(prolly: &Prolly<S>, node: &Node) -> Vec<No
 /// These can be used as input to build the next level up.
 ///
 /// # Algorithm
-/// 1. Iterate through children in chunks of `max_chunk_size - 1`
+/// 1. Iterate through children in chunks of `max_chunk_size`
 /// 2. For each chunk, create an internal node with keys and child CID references
 /// 3. Add each node to the collector and record its CID and first key
 /// 4. Return the collected (CID, first_key) pairs for the next level
@@ -1011,10 +1108,8 @@ pub fn build_internal_level<S: Store>(
     let mut start = 0;
 
     while start < child_cids.len() {
-        // Calculate chunk end - don't exceed max_chunk_size - 1 entries per node
-        // We use max_chunk_size - 1 to ensure the node stays strictly under max_chunk_size
-        // after adding entries (since len() must be < max_chunk_size, not <=)
-        let chunk_size = (max_chunk_size - 1).max(1); // Ensure at least 1 entry per node
+        // Calculate chunk end without exceeding the inclusive node capacity.
+        let chunk_size = max_chunk_size.max(1);
         let end = (start + chunk_size).min(child_cids.len());
 
         // Create internal node for this chunk
@@ -1067,7 +1162,7 @@ pub fn build_internal_level<S: Store>(
 /// # Guarantees
 ///
 /// - Each node is written to the collector exactly once
-/// - All nodes satisfy size constraints (length < max_chunk_size)
+/// - All nodes satisfy size constraints (length <= max_chunk_size)
 /// - Tree invariants are preserved:
 ///   - Leaf keys are in strictly ascending order
 ///   - Internal node keys match the first key of their children
@@ -1523,77 +1618,150 @@ pub fn append_batch<S: Store>(
         return Ok(tree.clone());
     }
 
-    // Check if this is truly an append-only workload
-    // by comparing the first mutation key with the tree's maximum key
-    let first_mutation_key = mutations.first().unwrap().key();
+    match try_append_batch_preprocessed(prolly, tree, mutations)? {
+        AppendBatchAttempt::Appended(tree) => Ok(tree),
+        AppendBatchAttempt::NotAppend(mutations) => apply_batch(prolly, tree, mutations),
+    }
+}
 
-    // Get the maximum key in the tree
-    let max_existing_key = if let Some(root_cid) = &tree.root {
-        get_max_key(prolly, root_cid)?
+enum AppendBatchAttempt {
+    Appended(Tree),
+    NotAppend(Vec<Mutation>),
+}
+
+#[derive(Clone)]
+struct RightmostPathEntry {
+    cid: Cid,
+    node: Node,
+    child_index: usize,
+}
+
+struct AppendTreeUpdate {
+    root: Cid,
+    rightmost_path: Vec<RightmostPathEntry>,
+}
+
+const RIGHTMOST_PATH_HINT_NAMESPACE: &[u8] = b"prolly:rightmost-path:v1";
+
+#[derive(Serialize, Deserialize)]
+struct RightmostPathHint {
+    version: u8,
+    entries: Vec<RightmostPathHintEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RightmostPathHintEntry {
+    cid: Cid,
+    child_index: usize,
+}
+
+fn try_append_batch_preprocessed<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    mutations: Vec<Mutation>,
+) -> Result<AppendBatchAttempt, Error> {
+    if !mutations
+        .iter()
+        .any(|mutation| matches!(mutation, Mutation::Upsert { .. }))
+    {
+        return Ok(AppendBatchAttempt::Appended(tree.clone()));
+    }
+
+    let rightmost_path = if tree.root.is_some() {
+        find_rightmost_path(prolly, tree)?
     } else {
-        None
+        Vec::new()
     };
 
-    // If first mutation key <= max existing key, fall back to regular batch
-    if let Some(ref max_key) = max_existing_key {
-        if first_mutation_key <= max_key.as_slice() {
-            return apply_batch(prolly, tree, mutations);
+    // Check if this is truly an append-only workload by comparing the first
+    // mutation key with the maximum key discovered from the same right-edge
+    // path we'll update below.
+    if let Some(max_key) = rightmost_path
+        .last()
+        .and_then(|entry| entry.node.keys.last())
+    {
+        if mutations.first().unwrap().key() <= max_key.as_slice() {
+            return Ok(AppendBatchAttempt::NotAppend(mutations));
         }
     }
 
-    // This is an append-only workload - use optimized path
-    let mut collector = BatchWriteCollector::new();
+    let tree = append_batch_to_rightmost_path(prolly, tree, mutations, rightmost_path, false)?;
+    Ok(AppendBatchAttempt::Appended(tree))
+}
 
-    // Build new leaves directly from mutations
-    let max_chunk_size = prolly.new_leaf_node().max_chunk_size;
-    let mut new_leaves: Vec<Node> = Vec::new();
-    let mut current_leaf = prolly.new_leaf_node();
+pub(crate) fn append_upsert_with_path<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    key: Vec<u8>,
+    val: Vec<u8>,
+    path: &[(Node, usize)],
+) -> Result<Tree, Error> {
+    let rightmost_path = rightmost_path_from_find_path(tree, path)?;
+    append_batch_to_rightmost_path(
+        prolly,
+        tree,
+        vec![Mutation::Upsert { key, val }],
+        rightmost_path,
+        true,
+    )
+}
 
-    for mutation in mutations {
-        if let Mutation::Upsert { key, val } = mutation {
-            current_leaf.keys.push(key);
-            current_leaf.vals.push(val);
-
-            // Check if leaf is full
-            if current_leaf.len() >= max_chunk_size {
-                new_leaves.push(current_leaf);
-                current_leaf = prolly.new_leaf_node();
-            }
-        }
-        // Ignore Delete mutations in append-only mode (they can't delete future keys)
-    }
-
-    // Don't forget the last partial leaf
-    if !current_leaf.is_empty() {
-        new_leaves.push(current_leaf);
-    }
-
-    if new_leaves.is_empty() {
-        return Ok(tree.clone());
-    }
+fn append_batch_to_rightmost_path<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    mutations: Vec<Mutation>,
+    rightmost_path: Vec<RightmostPathEntry>,
+    cache_written_nodes: bool,
+) -> Result<Tree, Error> {
+    let mut collector = if cache_written_nodes {
+        BatchWriteCollector::new_cached()
+    } else {
+        BatchWriteCollector::new()
+    };
 
     // If tree is empty, build from scratch
     if tree.root.is_none() {
+        let new_leaves = build_append_leaf_chunks(prolly, None, mutations);
+
         // Save all leaves and build parent structure
         let leaf_cids: Vec<Cid> = new_leaves.iter().map(|leaf| collector.add(leaf)).collect();
 
-        let new_root = build_tree_from_leaves(prolly, &leaf_cids, &new_leaves, &mut collector)?;
-        collector.flush(prolly.store())?;
+        let update = build_tree_from_leaves_with_rightmost_path(
+            prolly,
+            &leaf_cids,
+            &new_leaves,
+            &mut collector,
+        )?;
+        flush_append_collector(
+            prolly,
+            &collector,
+            cache_written_nodes,
+            Some((&update.root, &update.rightmost_path)),
+        )?;
 
         return Ok(Tree {
-            root: Some(new_root),
+            root: Some(update.root),
             config: tree.config.clone(),
         });
     }
 
-    // Tree exists - find rightmost path and append
-    let rightmost_path = find_rightmost_path(prolly, tree)?;
+    // Tree exists - append by replacing only the rightmost path.
+    let existing_tail = rightmost_path.last().ok_or(Error::InvalidNode)?;
+    let existing_tail_leaf = existing_tail.node.clone();
+    let existing_tail_cid = existing_tail.cid.clone();
+    let new_leaves = build_append_leaf_chunks(prolly, Some(existing_tail_leaf.clone()), mutations);
 
-    // Save new leaves
-    let new_leaf_cids: Vec<Cid> = new_leaves.iter().map(|leaf| collector.add(leaf)).collect();
+    // Save rewritten/new leaves. When the existing tail was already closed,
+    // the first returned leaf is unchanged; keep its CID and avoid a disk write.
+    let new_leaf_cids = collect_append_leaf_cids(
+        &existing_tail_cid,
+        &existing_tail_leaf,
+        &new_leaves,
+        &mut collector,
+    );
 
-    // Merge new leaves into the tree structure
-    let new_root = append_leaves_to_tree(
+    // Merge replacement leaves into the tree structure
+    let update = append_leaves_to_tree(
         prolly,
         &rightmost_path,
         &new_leaf_cids,
@@ -1601,12 +1769,278 @@ pub fn append_batch<S: Store>(
         &mut collector,
     )?;
 
-    collector.flush(prolly.store())?;
+    flush_append_collector(
+        prolly,
+        &collector,
+        cache_written_nodes,
+        Some((&update.root, &update.rightmost_path)),
+    )?;
 
     Ok(Tree {
-        root: Some(new_root),
+        root: Some(update.root),
         config: tree.config.clone(),
     })
+}
+
+fn flush_append_collector<S: Store>(
+    prolly: &Prolly<S>,
+    collector: &BatchWriteCollector,
+    cache_written_nodes: bool,
+    rightmost_hint: Option<(&Cid, &[RightmostPathEntry])>,
+) -> Result<(), Error> {
+    if let Some((root, path)) = rightmost_hint {
+        if prolly.store().supports_hints() {
+            if let Ok(bytes) = encode_rightmost_path_hint(path) {
+                collector.flush_with_hint(
+                    prolly.store(),
+                    RIGHTMOST_PATH_HINT_NAMESPACE,
+                    root.as_bytes(),
+                    &bytes,
+                )?;
+            } else {
+                collector.flush(prolly.store())?;
+            }
+        } else {
+            collector.flush(prolly.store())?;
+        }
+        prolly.cache_rightmost_path(root.clone(), cached_rightmost_entries(path));
+    } else {
+        collector.flush(prolly.store())?;
+    }
+
+    if cache_written_nodes {
+        collector.cache_nodes(prolly)?;
+    }
+
+    Ok(())
+}
+
+fn rightmost_path_from_find_path(
+    tree: &Tree,
+    path: &[(Node, usize)],
+) -> Result<Vec<RightmostPathEntry>, Error> {
+    let Some(root_cid) = &tree.root else {
+        return Ok(Vec::new());
+    };
+
+    let mut cid = root_cid.clone();
+    let mut rightmost_path = Vec::with_capacity(path.len());
+
+    for (node, child_index) in path {
+        if *child_index + 1 != node.len() {
+            return Err(Error::InvalidNode);
+        }
+
+        let current_cid = cid.clone();
+        if !node.leaf {
+            let child = node.vals.get(*child_index).ok_or(Error::InvalidNode)?;
+            cid = Cid(child
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidNode)?);
+        }
+
+        rightmost_path.push(RightmostPathEntry {
+            cid: current_cid,
+            node: node.clone(),
+            child_index: *child_index,
+        });
+    }
+
+    Ok(rightmost_path)
+}
+
+fn cached_rightmost_entries(path: &[RightmostPathEntry]) -> Vec<CachedRightmostPathEntry> {
+    path.iter()
+        .map(|entry| CachedRightmostPathEntry {
+            cid: entry.cid.clone(),
+            node: entry.node.clone(),
+            child_index: entry.child_index,
+        })
+        .collect()
+}
+
+fn publish_rightmost_path<S: Store>(prolly: &Prolly<S>, root: Cid, path: &[RightmostPathEntry]) {
+    let cached = cached_rightmost_entries(path);
+    prolly.cache_rightmost_path(root.clone(), cached);
+
+    if prolly.store().supports_hints() {
+        let Ok(bytes) = encode_rightmost_path_hint(path) else {
+            return;
+        };
+        // Hints are performance-only sidecars. A failed hint write must not
+        // make an otherwise durable content-addressed tree update fail.
+        let _ = prolly
+            .store()
+            .put_hint(RIGHTMOST_PATH_HINT_NAMESPACE, root.as_bytes(), &bytes);
+    }
+}
+
+fn encode_rightmost_path_hint(path: &[RightmostPathEntry]) -> Result<Vec<u8>, Error> {
+    let hint = RightmostPathHint {
+        version: 2,
+        entries: path
+            .iter()
+            .map(|entry| RightmostPathHintEntry {
+                cid: entry.cid.clone(),
+                child_index: entry.child_index,
+            })
+            .collect(),
+    };
+    serde_cbor::ser::to_vec_packed(&hint).map_err(|err| Error::Deserialize(err.to_string()))
+}
+
+fn load_rightmost_path_hint<S: Store>(
+    prolly: &Prolly<S>,
+    root: &Cid,
+) -> Result<Option<Vec<RightmostPathEntry>>, Error> {
+    let Some(bytes) = prolly
+        .store()
+        .get_hint(RIGHTMOST_PATH_HINT_NAMESPACE, root.as_bytes())
+        .map_err(|err| Error::Store(Box::new(err)))?
+    else {
+        return Ok(None);
+    };
+
+    let Ok(hint) = serde_cbor::from_slice::<RightmostPathHint>(&bytes) else {
+        return Ok(None);
+    };
+
+    if hint.version != 2 || hint.entries.is_empty() {
+        return Ok(None);
+    }
+
+    if hint.entries.first().map(|entry| &entry.cid) != Some(root) {
+        return Ok(None);
+    }
+
+    let keys = hint
+        .entries
+        .iter()
+        .map(|entry| entry.cid.as_bytes())
+        .collect::<Vec<_>>();
+    let node_bytes = prolly
+        .store()
+        .batch_get_ordered(&keys)
+        .map_err(|err| Error::Store(Box::new(err)))?;
+
+    if node_bytes.len() != hint.entries.len() || node_bytes.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+
+    let mut path = Vec::with_capacity(hint.entries.len());
+    for (entry, bytes) in hint.entries.into_iter().zip(node_bytes) {
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let Ok(node) = Node::from_bytes(&bytes) else {
+            return Ok(None);
+        };
+        path.push(RightmostPathEntry {
+            cid: entry.cid,
+            node,
+            child_index: entry.child_index,
+        });
+    }
+
+    if !rightmost_path_hint_is_valid(root, &path) {
+        return Ok(None);
+    }
+
+    for entry in &path {
+        prolly.cache_node(entry.cid.clone(), entry.node.clone());
+    }
+
+    Ok(Some(path))
+}
+
+fn rightmost_path_hint_is_valid(root: &Cid, path: &[RightmostPathEntry]) -> bool {
+    if path.first().map(|entry| &entry.cid) != Some(root) {
+        return false;
+    }
+
+    for (idx, entry) in path.iter().enumerate() {
+        if entry.node.is_empty() || entry.child_index + 1 != entry.node.len() {
+            return false;
+        }
+
+        let is_last = idx + 1 == path.len();
+        if is_last != entry.node.leaf {
+            return false;
+        }
+
+        if !is_last {
+            let child_bytes: [u8; 32] =
+                match entry.node.vals[entry.child_index].as_slice().try_into() {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
+            if Cid(child_bytes) != path[idx + 1].cid {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn rightmost_entries_from_cache(path: Vec<CachedRightmostPathEntry>) -> Vec<RightmostPathEntry> {
+    path.into_iter()
+        .map(|entry| RightmostPathEntry {
+            cid: entry.cid,
+            node: entry.node,
+            child_index: entry.child_index,
+        })
+        .collect()
+}
+
+fn should_close_append_leaf(node: &Node, max_chunk_size: usize) -> bool {
+    if node.is_empty() {
+        return false;
+    }
+
+    if node.len() >= max_chunk_size {
+        return true;
+    }
+
+    is_boundary(node, node.len() - 1)
+}
+
+fn build_append_leaf_chunks<S: Store>(
+    prolly: &Prolly<S>,
+    existing_tail_leaf: Option<Node>,
+    mutations: Vec<Mutation>,
+) -> Vec<Node> {
+    let mut leaves = Vec::new();
+    let mut current_leaf = existing_tail_leaf.unwrap_or_else(|| prolly.new_leaf_node());
+    let max_chunk_size = current_leaf.max_chunk_size;
+
+    if should_close_append_leaf(&current_leaf, max_chunk_size) {
+        leaves.push(current_leaf);
+        current_leaf = prolly.new_leaf_node();
+    }
+
+    for mutation in mutations {
+        let Mutation::Upsert { key, val } = mutation else {
+            continue;
+        };
+
+        current_leaf.keys.push(key);
+        current_leaf.vals.push(val);
+
+        // Close appended leaves with the same boundary detector used by regular
+        // tree construction, not just by fixed max-size chunks.
+        if should_close_append_leaf(&current_leaf, max_chunk_size) {
+            leaves.push(current_leaf);
+            current_leaf = prolly.new_leaf_node();
+        }
+    }
+
+    if !current_leaf.is_empty() {
+        leaves.push(current_leaf);
+    }
+
+    leaves
 }
 
 /// Gets the maximum key in the tree by traversing to the rightmost leaf.
@@ -1722,12 +2156,21 @@ pub fn should_use_deferred_rebalancing<S: Store>(
 fn find_rightmost_path<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
-) -> Result<Vec<(Node, usize)>, Error> {
+) -> Result<Vec<RightmostPathEntry>, Error> {
     let mut path = Vec::new();
 
     let Some(root_cid) = &tree.root else {
         return Ok(path);
     };
+
+    if let Some(cached) = prolly.cached_rightmost_path(root_cid) {
+        return Ok(rightmost_entries_from_cache(cached));
+    }
+
+    if let Some(path) = load_rightmost_path_hint(prolly, root_cid)? {
+        prolly.cache_rightmost_path(root_cid.clone(), cached_rightmost_entries(&path));
+        return Ok(path);
+    }
 
     let mut cid = root_cid.clone();
 
@@ -1736,85 +2179,134 @@ fn find_rightmost_path<S: Store>(
         let last_idx = node.len().saturating_sub(1);
 
         let is_leaf = node.leaf;
-        path.push((node.clone(), last_idx));
+        let node_cid = cid.clone();
+        let next_cid = if is_leaf {
+            None
+        } else {
+            let child = node.vals.get(last_idx).ok_or(Error::InvalidNode)?;
+            Some(Cid(child
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidNode)?))
+        };
 
-        if is_leaf {
+        path.push(RightmostPathEntry {
+            cid: node_cid,
+            node,
+            child_index: last_idx,
+        });
+
+        let Some(next_cid) = next_cid else {
             break;
-        }
-
-        cid = Cid(node.vals[last_idx]
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::InvalidNode)?);
+        };
+        cid = next_cid;
     }
+
+    publish_rightmost_path(prolly, root_cid.clone(), &path);
 
     Ok(path)
 }
 
-/// Build a tree structure from a list of leaf CIDs.
-fn build_tree_from_leaves<S: Store>(
+fn collect_append_leaf_cids(
+    existing_tail_cid: &Cid,
+    existing_tail_leaf: &Node,
+    new_leaves: &[Node],
+    collector: &mut BatchWriteCollector,
+) -> Vec<Cid> {
+    let mut cids = Vec::with_capacity(new_leaves.len());
+    let start_idx = if new_leaves.first() == Some(existing_tail_leaf) {
+        cids.push(existing_tail_cid.clone());
+        1
+    } else {
+        0
+    };
+
+    for leaf in &new_leaves[start_idx..] {
+        cids.push(collector.add(leaf));
+    }
+
+    cids
+}
+
+fn build_tree_from_leaves_with_rightmost_path<S: Store>(
     prolly: &Prolly<S>,
     leaf_cids: &[Cid],
     leaves: &[Node],
     collector: &mut BatchWriteCollector,
-) -> Result<Cid, Error> {
-    if leaf_cids.len() == 1 {
-        return Ok(leaf_cids[0].clone());
+) -> Result<AppendTreeUpdate, Error> {
+    if leaf_cids.len() != leaves.len() || leaf_cids.is_empty() {
+        return Err(Error::InvalidNode);
     }
 
-    // Build parent level
-    let max_chunk_size = prolly.new_internal_node(1).max_chunk_size;
-    let mut parents: Vec<Node> = Vec::new();
-    let mut current_parent = prolly.new_internal_node(1);
+    let mut current_level = leaf_cids
+        .iter()
+        .cloned()
+        .zip(leaves.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut rightmost_path = vec![rightmost_entry_from_node_ref(
+        current_level.last().ok_or(Error::InvalidNode)?,
+    )];
 
-    for (i, cid) in leaf_cids.iter().enumerate() {
-        let first_key = leaves[i].keys.first().cloned().unwrap_or_default();
-        current_parent.keys.push(first_key);
-        current_parent.vals.push(cid.0.to_vec());
+    if current_level.len() == 1 {
+        return Ok(AppendTreeUpdate {
+            root: current_level[0].0.clone(),
+            rightmost_path,
+        });
+    }
 
-        if current_parent.len() >= max_chunk_size {
-            parents.push(current_parent);
-            current_parent = prolly.new_internal_node(1);
+    let mut level = 1;
+    loop {
+        let cids = current_level
+            .iter()
+            .map(|(cid, _)| cid.clone())
+            .collect::<Vec<_>>();
+        let first_keys = current_level
+            .iter()
+            .map(|(_, node)| node.keys.first().cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let parents = build_parent_nodes(prolly, &cids, &first_keys, level);
+        current_level = parents
+            .into_iter()
+            .map(|node| {
+                let cid = collector.add(&node);
+                (cid, node)
+            })
+            .collect();
+
+        rightmost_path.insert(
+            0,
+            rightmost_entry_from_node_ref(current_level.last().ok_or(Error::InvalidNode)?),
+        );
+
+        if current_level.len() == 1 {
+            return Ok(AppendTreeUpdate {
+                root: current_level[0].0.clone(),
+                rightmost_path,
+            });
         }
+
+        level += 1;
     }
-
-    if !current_parent.is_empty() {
-        parents.push(current_parent);
-    }
-
-    // Recursively build higher levels
-    let parent_cids: Vec<Cid> = parents.iter().map(|p| collector.add(p)).collect();
-
-    if parent_cids.len() == 1 {
-        return Ok(parent_cids[0].clone());
-    }
-
-    // Need more levels - recurse
-    build_tree_from_internal_nodes(prolly, &parent_cids, &parents, 2, collector)
 }
 
-/// Build tree levels from internal nodes.
-fn build_tree_from_internal_nodes<S: Store>(
+fn build_parent_nodes<S: Store>(
     prolly: &Prolly<S>,
-    node_cids: &[Cid],
-    nodes: &[Node],
+    child_cids: &[Cid],
+    first_keys: &[Vec<u8>],
     level: u8,
-    collector: &mut BatchWriteCollector,
-) -> Result<Cid, Error> {
-    if node_cids.len() == 1 {
-        return Ok(node_cids[0].clone());
-    }
+) -> Vec<Node> {
+    debug_assert_eq!(child_cids.len(), first_keys.len());
 
-    let max_chunk_size = prolly.new_internal_node(level).max_chunk_size;
-    let mut parents: Vec<Node> = Vec::new();
+    let mut parents = Vec::new();
     let mut current_parent = prolly.new_internal_node(level);
 
-    for (i, cid) in node_cids.iter().enumerate() {
-        let first_key = nodes[i].keys.first().cloned().unwrap_or_default();
-        current_parent.keys.push(first_key);
+    for (cid, first_key) in child_cids.iter().zip(first_keys) {
+        current_parent.keys.push(first_key.clone());
         current_parent.vals.push(cid.0.to_vec());
 
-        if current_parent.len() >= max_chunk_size {
+        // Use the same content-defined boundary rule as bulk construction so
+        // append-built subtrees have stable, deterministic internal structure.
+        if is_boundary(&current_parent, current_parent.len() - 1) {
             parents.push(current_parent);
             current_parent = prolly.new_internal_node(level);
         }
@@ -1824,109 +2316,138 @@ fn build_tree_from_internal_nodes<S: Store>(
         parents.push(current_parent);
     }
 
-    let parent_cids: Vec<Cid> = parents.iter().map(|p| collector.add(p)).collect();
+    parents
+}
 
-    if parent_cids.len() == 1 {
-        return Ok(parent_cids[0].clone());
+fn rightmost_entry_from_node_ref((cid, node): &(Cid, Node)) -> RightmostPathEntry {
+    RightmostPathEntry {
+        cid: cid.clone(),
+        node: node.clone(),
+        child_index: node.len().saturating_sub(1),
     }
-
-    build_tree_from_internal_nodes(prolly, &parent_cids, &parents, level + 1, collector)
 }
 
 /// Append new leaves to an existing tree by updating the rightmost path.
 fn append_leaves_to_tree<S: Store>(
     prolly: &Prolly<S>,
-    rightmost_path: &[(Node, usize)],
+    rightmost_path: &[RightmostPathEntry],
     new_leaf_cids: &[Cid],
     new_leaves: &[Node],
     collector: &mut BatchWriteCollector,
-) -> Result<Cid, Error> {
+) -> Result<AppendTreeUpdate, Error> {
     if rightmost_path.is_empty() || new_leaf_cids.is_empty() {
         return Err(Error::InvalidNode);
     }
 
-    // Start from the parent of the rightmost leaf
-    let mut current_level_cids = new_leaf_cids.to_vec();
-    let mut current_level_first_keys: Vec<Vec<u8>> = new_leaves
+    let mut current_level = new_leaf_cids
         .iter()
-        .map(|n| n.keys.first().cloned().unwrap_or_default())
-        .collect();
+        .cloned()
+        .zip(new_leaves.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut new_rightmost_path = vec![rightmost_entry_from_node_ref(
+        current_level.last().ok_or(Error::InvalidNode)?,
+    )];
 
-    // Process from leaf level up to root
-    for (_level_idx, (node, _idx)) in rightmost_path.iter().rev().enumerate() {
+    if rightmost_path.len() == 1 && rightmost_path[0].node.leaf {
+        return build_tree_from_leaves_with_rightmost_path(
+            prolly,
+            new_leaf_cids,
+            new_leaves,
+            collector,
+        );
+    }
+
+    // Process from leaf level up to root. At each level we replace the old
+    // rightmost child with the rewritten/split child or children from below.
+    for entry in rightmost_path.iter().rev() {
+        let node = &entry.node;
+        let idx = entry.child_index;
+
         if node.leaf {
             // Skip the leaf level - we're appending new leaves, not modifying existing
             continue;
         }
 
-        // This is an internal node - add references to new children
         let mut updated_node = node.clone();
 
-        for (i, cid) in current_level_cids.iter().enumerate() {
-            updated_node.keys.push(current_level_first_keys[i].clone());
-            updated_node.vals.push(cid.0.to_vec());
+        updated_node.keys.remove(idx);
+        updated_node.vals.remove(idx);
+
+        for (i, (cid, child)) in current_level.iter().enumerate() {
+            updated_node
+                .keys
+                .insert(idx + i, child.keys.first().cloned().unwrap_or_default());
+            updated_node.vals.insert(idx + i, cid.0.to_vec());
         }
 
         // Check if node needs splitting
         let max_size = updated_node.max_chunk_size;
-        if updated_node.len() >= max_size {
-            // Split the node
-            let (left_cids, left_keys, right_cids, right_keys) =
-                split_internal_node(prolly, &updated_node, collector)?;
-
-            current_level_cids = vec![left_cids, right_cids];
-            current_level_first_keys = vec![left_keys, right_keys];
+        if updated_node.len() > max_size {
+            current_level = split_internal_node(prolly, &updated_node, collector);
         } else {
             // Node fits - save it
             let cid = collector.add(&updated_node);
-            current_level_cids = vec![cid];
-            current_level_first_keys = vec![updated_node.keys.first().cloned().unwrap_or_default()];
+            current_level = vec![(cid, updated_node)];
         }
+
+        new_rightmost_path.insert(
+            0,
+            rightmost_entry_from_node_ref(current_level.last().ok_or(Error::InvalidNode)?),
+        );
     }
 
     // If we have multiple nodes at the top, create a new root
-    if current_level_cids.len() == 1 {
-        return Ok(current_level_cids[0].clone());
+    if current_level.len() == 1 {
+        return Ok(AppendTreeUpdate {
+            root: current_level[0].0.clone(),
+            rightmost_path: new_rightmost_path,
+        });
     }
 
     // Create new root
     let root_level = rightmost_path
         .first()
-        .map(|(n, _)| n.level + 1)
+        .map(|entry| entry.node.level + 1)
         .unwrap_or(1);
     let mut new_root = prolly.new_internal_node(root_level);
 
-    for (i, cid) in current_level_cids.iter().enumerate() {
-        new_root.keys.push(current_level_first_keys[i].clone());
+    for (cid, node) in &current_level {
+        new_root
+            .keys
+            .push(node.keys.first().cloned().unwrap_or_default());
         new_root.vals.push(cid.0.to_vec());
     }
 
-    Ok(collector.add(&new_root))
+    let new_root_cid = collector.add(&new_root);
+    new_rightmost_path.insert(
+        0,
+        RightmostPathEntry {
+            cid: new_root_cid.clone(),
+            node: new_root,
+            child_index: current_level.len() - 1,
+        },
+    );
+
+    Ok(AppendTreeUpdate {
+        root: new_root_cid,
+        rightmost_path: new_rightmost_path,
+    })
 }
 
-/// Split an internal node and return CIDs and first keys for both halves.
+/// Split an internal node and return CIDs with their nodes.
 fn split_internal_node<S: Store>(
     prolly: &Prolly<S>,
     node: &Node,
     collector: &mut BatchWriteCollector,
-) -> Result<(Cid, Vec<u8>, Cid, Vec<u8>), Error> {
-    let split_point = node.len() / 2;
-
-    let mut left = prolly.new_internal_node(node.level);
-    left.keys = node.keys[..split_point].to_vec();
-    left.vals = node.vals[..split_point].to_vec();
-
-    let mut right = prolly.new_internal_node(node.level);
-    right.keys = node.keys[split_point..].to_vec();
-    right.vals = node.vals[split_point..].to_vec();
-
-    let left_first_key = left.keys.first().cloned().unwrap_or_default();
-    let right_first_key = right.keys.first().cloned().unwrap_or_default();
-
-    let left_cid = collector.add(&left);
-    let right_cid = collector.add(&right);
-
-    Ok((left_cid, left_first_key, right_cid, right_first_key))
+) -> Vec<(Cid, Node)> {
+    let chunks = rebalance::split_into_chunks(prolly, node, node.max_chunk_size);
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let cid = collector.add(&chunk);
+            (cid, chunk)
+        })
+        .collect()
 }
 
 /// Apply multiple mutations to a tree in a single optimized operation.
@@ -2211,80 +2732,73 @@ fn group_mutations_by_leaf_optimized<S: Store>(
     tree: &Tree,
     mutations: Vec<Mutation>,
 ) -> Result<Vec<LeafMutationGroup>, Error> {
-    let mut groups: Vec<LeafMutationGroup> = Vec::new();
-    let mut mutation_idx = 0;
-    let total_mutations = mutations.len();
+    Ok(group_mutations_by_leaf_with_paths(prolly, tree, mutations)?
+        .into_iter()
+        .map(LeafMutationGroup::from)
+        .collect())
+}
 
-    while mutation_idx < total_mutations {
+fn group_mutations_by_leaf_with_paths<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    mutations: Vec<Mutation>,
+) -> Result<Vec<LeafMutationGroupWithPath>, Error> {
+    if mutations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if tree.root.is_none() {
+        return Ok(vec![LeafMutationGroupWithPath {
+            leaf: prolly.new_leaf_node(),
+            ancestors: vec![],
+            ancestor_cids: vec![],
+            mutations,
+        }]);
+    }
+
+    let mut groups: Vec<LeafMutationGroupWithPath> = Vec::new();
+    let mut mutations = mutations.into_iter().peekable();
+
+    while let Some(first_mutation) = mutations.next() {
         // Find path to the current mutation's target leaf
-        let mutation_key = mutations[mutation_idx].key();
-        let path = prolly.find_path(tree, mutation_key)?;
+        let path = find_path_with_cids(prolly, tree, first_mutation.key())?;
 
         // Get leaf info from path
-        let (current_leaf, current_ancestors) = if path.is_empty() {
-            (prolly.new_leaf_node(), vec![])
+        let (current_leaf, current_ancestors, current_ancestor_cids) = if path.is_empty() {
+            (prolly.new_leaf_node(), vec![], vec![])
         } else {
-            let leaf = path.last().unwrap().0.clone();
-            let ancestors = path[..path.len() - 1].to_vec();
-            (leaf, ancestors)
+            let leaf = path.last().unwrap().1.clone();
+            let ancestors = path[..path.len() - 1]
+                .iter()
+                .map(|(_, node, idx)| (node.clone(), *idx))
+                .collect();
+            let ancestor_cids = path[..path.len() - 1]
+                .iter()
+                .map(|(cid, _, _)| cid.clone())
+                .collect();
+            (leaf, ancestors, ancestor_cids)
         };
 
-        // Compute the CID of the current leaf to identify it
-        let current_leaf_cid = if !current_leaf.is_empty() {
-            Some(Cid::from_bytes(&current_leaf.to_bytes()))
-        } else {
-            None
-        };
-
-        // Get the end key of this leaf to determine which mutations belong here
-        let leaf_end_key = current_leaf.keys.last().cloned();
+        // Get this leaf's exclusive upper bound once. Keys below the next
+        // leaf's first key belong to the current leaf, even if they are larger
+        // than the current leaf's last key. If there is no next leaf, this is
+        // the rightmost leaf and all remaining sorted mutations belong here.
+        let next_leaf_first_key = next_leaf_first_key(prolly, &current_ancestors)?;
 
         // Collect all consecutive mutations that belong to this leaf
         let mut leaf_mutations: Vec<Mutation> = Vec::new();
 
         // Add the first mutation (we know it belongs to this leaf from find_path)
-        leaf_mutations.push(mutations[mutation_idx].clone());
-        mutation_idx += 1;
+        leaf_mutations.push(first_mutation);
 
         // For subsequent mutations, check if they belong to the same leaf
-        while mutation_idx < total_mutations {
-            let key = mutations[mutation_idx].key();
+        while let Some(mutation) = mutations.peek() {
+            let key = mutation.key();
 
-            // If the leaf is empty or has no end key, this is a new tree - take all mutations
-            if current_leaf.is_empty() || leaf_end_key.is_none() {
-                leaf_mutations.push(mutations[mutation_idx].clone());
-                mutation_idx += 1;
-                continue;
-            }
-
-            let end_key = leaf_end_key.as_ref().unwrap();
-
-            if key <= end_key.as_slice() {
-                // Key is within the leaf's current range - definitely belongs here
-                leaf_mutations.push(mutations[mutation_idx].clone());
-                mutation_idx += 1;
+            if key_belongs_before_next_leaf(key, next_leaf_first_key.as_deref()) {
+                leaf_mutations.push(mutations.next().expect("peeked mutation must exist"));
             } else {
-                // Key is beyond the leaf's current range
-                // We must check find_path for EACH key beyond end_key because
-                // different keys may belong to different leaves. We cannot cache
-                // this result because the tree may have multiple leaves after
-                // the current one.
-                let next_path = prolly.find_path(tree, key)?;
-                let next_leaf_cid = if !next_path.is_empty() {
-                    let next_leaf = &next_path.last().unwrap().0;
-                    Some(Cid::from_bytes(&next_leaf.to_bytes()))
-                } else {
-                    None
-                };
-
-                if next_leaf_cid == current_leaf_cid {
-                    // Same leaf - mutation belongs here (rightmost leaf case)
-                    leaf_mutations.push(mutations[mutation_idx].clone());
-                    mutation_idx += 1;
-                } else {
-                    // Different leaf - break and start a new group
-                    break;
-                }
+                break;
             }
         }
 
@@ -2299,9 +2813,10 @@ fn group_mutations_by_leaf_optimized<S: Store>(
         }
 
         // Add group
-        groups.push(LeafMutationGroup {
+        groups.push(LeafMutationGroupWithPath {
             leaf: current_leaf,
             ancestors: current_ancestors,
+            ancestor_cids: current_ancestor_cids,
             mutations: leaf_mutations,
         });
     }
@@ -2311,6 +2826,90 @@ fn group_mutations_by_leaf_optimized<S: Store>(
     }
 
     Ok(groups)
+}
+
+fn find_path_with_cids<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    key: &[u8],
+) -> Result<Vec<(Cid, Node, usize)>, Error> {
+    let mut path = Vec::new();
+
+    let Some(root_cid) = &tree.root else {
+        return Ok(path);
+    };
+
+    let mut cid = root_cid.clone();
+    loop {
+        let node = prolly.load(&cid)?;
+        let idx = match node.search(key) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+
+        let current_cid = cid.clone();
+        let is_leaf = node.leaf;
+        let next_cid = if is_leaf {
+            None
+        } else {
+            let child = node.vals.get(idx).ok_or(Error::InvalidNode)?;
+            Some(Cid(child
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidNode)?))
+        };
+
+        path.push((current_cid, node, idx));
+
+        if let Some(next_cid) = next_cid {
+            cid = next_cid;
+        } else {
+            break;
+        }
+    }
+
+    Ok(path)
+}
+
+fn key_belongs_before_next_leaf(key: &[u8], next_leaf_first_key: Option<&[u8]>) -> bool {
+    match next_leaf_first_key {
+        Some(next_key) => key < next_key,
+        None => true,
+    }
+}
+
+fn next_leaf_first_key<S: Store>(
+    prolly: &Prolly<S>,
+    ancestors: &[(Node, usize)],
+) -> Result<Option<Vec<u8>>, Error> {
+    for (ancestor, idx) in ancestors.iter().rev() {
+        let next_idx = idx + 1;
+        if next_idx >= ancestor.len() {
+            continue;
+        }
+
+        let mut cid = Cid(ancestor.vals[next_idx]
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidNode)?);
+
+        loop {
+            let node = prolly.load(&cid)?;
+            if node.leaf {
+                return Ok(node.keys.first().cloned());
+            }
+
+            let Some(first_child) = node.vals.first() else {
+                return Err(Error::InvalidNode);
+            };
+            cid = Cid(first_child
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidNode)?);
+        }
+    }
+
+    Ok(None)
 }
 
 /// Group mutations by their target leaf node using cursor-based traversal.
@@ -2348,93 +2947,7 @@ pub fn group_mutations_by_leaf_cursor<S: Store>(
     tree: &Tree,
     mutations: Vec<Mutation>,
 ) -> Result<Vec<LeafMutationGroup>, Error> {
-    // Handle empty mutations
-    if mutations.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Handle empty tree - all mutations go to a new leaf
-    if tree.root.is_none() {
-        return Ok(vec![LeafMutationGroup {
-            leaf: prolly.new_leaf_node(),
-            ancestors: vec![],
-            mutations,
-        }]);
-    }
-
-    let mut groups: Vec<LeafMutationGroup> = Vec::new();
-    let mut mutation_iter = mutations.into_iter().peekable();
-
-    // Get the first mutation to position the cursor
-    let first_mutation = mutation_iter.next().unwrap();
-    let first_key = first_mutation.key();
-
-    // Use find_path for the first mutation to get the full ancestor path
-    let path = prolly.find_path(tree, first_key)?;
-
-    if path.is_empty() {
-        // Shouldn't happen for non-empty tree, but handle gracefully
-        return Ok(vec![LeafMutationGroup {
-            leaf: prolly.new_leaf_node(),
-            ancestors: vec![],
-            mutations: std::iter::once(first_mutation)
-                .chain(mutation_iter)
-                .collect(),
-        }]);
-    }
-
-    // Extract leaf and ancestors from path
-    let mut current_leaf = path.last().unwrap().0.clone();
-    let mut current_ancestors = path[..path.len() - 1].to_vec();
-    let mut current_mutations = vec![first_mutation];
-
-    // Get the key range of the current leaf
-    let mut leaf_end_key = current_leaf.keys.last().cloned().unwrap_or_default();
-
-    // Process remaining mutations
-    while let Some(mutation) = mutation_iter.next() {
-        let mutation_key = mutation.key();
-
-        // Check if this mutation falls within the current leaf's range
-        // A mutation belongs to the current leaf if its key <= leaf's last key
-        // OR if it would be inserted into this leaf (key > last key but no next leaf covers it)
-        if mutation_key <= leaf_end_key.as_slice() {
-            // Mutation belongs to current leaf
-            current_mutations.push(mutation);
-        } else {
-            // Mutation is beyond current leaf - need to find the correct leaf
-            // First, save the current group
-            groups.push(LeafMutationGroup {
-                leaf: current_leaf,
-                ancestors: current_ancestors,
-                mutations: current_mutations,
-            });
-
-            // Find the path to the new mutation's leaf
-            let new_path = prolly.find_path(tree, mutation_key)?;
-
-            if new_path.is_empty() {
-                // Edge case: mutation beyond all existing keys
-                current_leaf = prolly.new_leaf_node();
-                current_ancestors = vec![];
-            } else {
-                current_leaf = new_path.last().unwrap().0.clone();
-                current_ancestors = new_path[..new_path.len() - 1].to_vec();
-            }
-
-            leaf_end_key = current_leaf.keys.last().cloned().unwrap_or_default();
-            current_mutations = vec![mutation];
-        }
-    }
-
-    // Don't forget the last group
-    groups.push(LeafMutationGroup {
-        leaf: current_leaf,
-        ancestors: current_ancestors,
-        mutations: current_mutations,
-    });
-
-    Ok(groups)
+    group_mutations_by_leaf_optimized(prolly, tree, mutations)
 }
 
 /// Result of a bottom-up rebuild operation.
@@ -2661,6 +3174,230 @@ pub fn bottom_up_rebuild_groups<S: Store>(
     }
 
     Ok(final_root)
+}
+
+fn apply_groups_coalesced<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    groups: Vec<LeafMutationGroupWithPath>,
+    use_optimized_merge: bool,
+    collector: &mut BatchWriteCollector,
+) -> Result<Option<Cid>, Error> {
+    let mut contexts: HashMap<Cid, AncestorContext> = HashMap::new();
+    let mut pending: HashMap<Cid, BTreeMap<usize, Vec<ChildRef>>> = HashMap::new();
+    let mut root_replacement: Option<Vec<ChildRef>> = None;
+    let mut changed = false;
+
+    for group in groups {
+        collect_ancestor_contexts(&group.ancestors, &group.ancestor_cids, &mut contexts);
+
+        let modified_leaf = if use_optimized_merge {
+            apply_mutations_to_leaf(group.leaf.clone(), &group.mutations)
+        } else {
+            apply_mutations_to_leaf_binary_search(group.leaf.clone(), &group.mutations)
+        };
+
+        if modified_leaf == group.leaf {
+            continue;
+        }
+        changed = true;
+
+        let child_refs = child_refs_from_modified_node(prolly, modified_leaf, collector);
+        if let Some((_, child_index)) = group.ancestors.last() {
+            let parent_cid = group
+                .ancestor_cids
+                .last()
+                .ok_or(Error::InvalidNode)?
+                .clone();
+            let previous = pending
+                .entry(parent_cid)
+                .or_default()
+                .insert(*child_index, child_refs);
+            if previous.is_some() {
+                return Err(Error::InvalidNode);
+            }
+        } else {
+            root_replacement = Some(child_refs);
+        }
+    }
+
+    if !changed {
+        return Ok(tree.root.clone());
+    }
+
+    if let Some(replacement) = root_replacement {
+        return build_root_from_child_refs(prolly, replacement, collector);
+    }
+
+    let mut root_refs: Option<Vec<ChildRef>> = None;
+    while !pending.is_empty() {
+        let current = std::mem::take(&mut pending);
+
+        for (node_cid, replacements) in current {
+            let context = contexts.get(&node_cid).ok_or(Error::InvalidNode)?;
+            let replacement_refs =
+                apply_child_replacements(prolly, &context.node, replacements, collector)?;
+
+            if let Some(parent) = &context.parent {
+                let previous = pending
+                    .entry(parent.parent_cid.clone())
+                    .or_default()
+                    .insert(parent.child_index, replacement_refs);
+                if previous.is_some() {
+                    return Err(Error::InvalidNode);
+                }
+            } else {
+                root_refs = Some(replacement_refs);
+            }
+        }
+    }
+
+    let root_refs = root_refs.ok_or(Error::InvalidNode)?;
+    build_root_from_child_refs(prolly, root_refs, collector)
+}
+
+fn collect_ancestor_contexts(
+    ancestors: &[(Node, usize)],
+    ancestor_cids: &[Cid],
+    contexts: &mut HashMap<Cid, AncestorContext>,
+) {
+    debug_assert_eq!(ancestors.len(), ancestor_cids.len());
+
+    for (idx, (node, _)) in ancestors.iter().enumerate() {
+        let parent = if idx == 0 {
+            None
+        } else {
+            Some(ParentLink {
+                parent_cid: ancestor_cids[idx - 1].clone(),
+                child_index: ancestors[idx - 1].1,
+            })
+        };
+
+        contexts
+            .entry(ancestor_cids[idx].clone())
+            .or_insert_with(|| AncestorContext {
+                node: node.clone(),
+                parent,
+            });
+    }
+}
+
+fn child_refs_from_modified_node<S: Store>(
+    prolly: &Prolly<S>,
+    node: Node,
+    collector: &mut BatchWriteCollector,
+) -> Vec<ChildRef> {
+    if node.is_empty() {
+        return Vec::new();
+    }
+
+    let nodes = if node.len() > node.max_chunk_size && node.len() > 1 {
+        rebalance::split_into_chunks(prolly, &node, node.max_chunk_size)
+    } else {
+        vec![node]
+    };
+
+    nodes
+        .into_iter()
+        .filter(|node| !node.is_empty())
+        .map(|node| {
+            let first_key = node.keys.first().cloned().unwrap_or_default();
+            let level = node.level;
+            let cid = collector.add(&node);
+            ChildRef {
+                cid,
+                first_key,
+                level,
+            }
+        })
+        .collect()
+}
+
+fn apply_child_replacements<S: Store>(
+    prolly: &Prolly<S>,
+    node: &Node,
+    replacements: BTreeMap<usize, Vec<ChildRef>>,
+    collector: &mut BatchWriteCollector,
+) -> Result<Vec<ChildRef>, Error> {
+    let mut updated = prolly.new_node_like(node);
+
+    for idx in 0..node.len() {
+        if let Some(children) = replacements.get(&idx) {
+            for child in children {
+                updated.keys.push(child.first_key.clone());
+                updated.vals.push(child.cid.0.to_vec());
+            }
+        } else {
+            updated.keys.push(node.keys[idx].clone());
+            updated.vals.push(node.vals[idx].clone());
+        }
+    }
+
+    if replacements.keys().any(|idx| *idx >= node.len()) {
+        return Err(Error::InvalidNode);
+    }
+
+    debug_assert!(
+        updated.keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "coalesced batch rebuild must preserve parent key order"
+    );
+
+    Ok(child_refs_from_modified_node(prolly, updated, collector))
+}
+
+fn build_root_from_child_refs<S: Store>(
+    prolly: &Prolly<S>,
+    child_refs: Vec<ChildRef>,
+    collector: &mut BatchWriteCollector,
+) -> Result<Option<Cid>, Error> {
+    if child_refs.is_empty() {
+        return Ok(None);
+    }
+
+    if child_refs.len() == 1 {
+        return Ok(Some(child_refs[0].cid.clone()));
+    }
+
+    let mut cids = child_refs
+        .iter()
+        .map(|child| child.cid.clone())
+        .collect::<Vec<_>>();
+    let mut first_keys = child_refs
+        .iter()
+        .map(|child| child.first_key.clone())
+        .collect::<Vec<_>>();
+    let mut level = child_refs[0].level + 1;
+
+    loop {
+        let parents = build_parent_nodes(prolly, &cids, &first_keys, level);
+        let parent_refs = parents
+            .into_iter()
+            .map(|node| {
+                let first_key = node.keys.first().cloned().unwrap_or_default();
+                let level = node.level;
+                let cid = collector.add(&node);
+                ChildRef {
+                    cid,
+                    first_key,
+                    level,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if parent_refs.len() == 1 {
+            return Ok(Some(parent_refs[0].cid.clone()));
+        }
+
+        cids = parent_refs
+            .iter()
+            .map(|child| child.cid.clone())
+            .collect::<Vec<_>>();
+        first_keys = parent_refs
+            .iter()
+            .map(|child| child.first_key.clone())
+            .collect::<Vec<_>>();
+        level += 1;
+    }
 }
 
 /// Configuration for batch write operations.
@@ -3091,20 +3828,60 @@ impl BatchWriter {
         }
 
         // Step 1: Preprocess - sort and deduplicate
-        let mutations = preprocess_mutations(mutations);
+        let mut mutations = preprocess_mutations(mutations);
 
         // Handle case where preprocessing results in empty mutations
         if mutations.is_empty() {
             return Ok(tree.clone());
         }
 
-        // Step 2: Group mutations by affected leaf
-        let groups = group_mutations_by_leaf(prolly, tree, mutations)?;
+        // Fast path for the paper's sequential workload: avoid grouping every
+        // appended key through root-to-leaf search when the batch is strictly
+        // append-only and contains only inserts.
+        if self.config.enable_deferred_rebalancing
+            && mutations
+                .iter()
+                .all(|mutation| matches!(mutation, Mutation::Upsert { .. }))
+        {
+            match try_append_batch_preprocessed(prolly, tree, mutations)? {
+                AppendBatchAttempt::Appended(tree) => return Ok(tree),
+                AppendBatchAttempt::NotAppend(returned_mutations) => {
+                    mutations = returned_mutations;
+                }
+            }
+        }
+
+        // Step 2: Group mutations by affected leaf. Keep ancestor CIDs in the
+        // private representation so multi-leaf rebuilds can avoid deriving
+        // them from cloned ancestor nodes.
+        let path_groups = group_mutations_by_leaf_with_paths(prolly, tree, mutations)?;
 
         // Handle case where all mutations result in no changes
-        if groups.is_empty() {
+        if path_groups.is_empty() {
             return Ok(tree.clone());
         }
+
+        if path_groups.len() > 1 {
+            let mut collector = BatchWriteCollector::new();
+            let current_root = apply_groups_coalesced(
+                prolly,
+                tree,
+                path_groups,
+                self.config.use_optimized_merge,
+                &mut collector,
+            )?;
+            collector.flush(prolly.store())?;
+
+            return Ok(Tree {
+                root: current_root,
+                config: tree.config.clone(),
+            });
+        }
+
+        let groups: Vec<LeafMutationGroup> = path_groups
+            .into_iter()
+            .map(LeafMutationGroup::from)
+            .collect();
 
         // Step 2.5: Check if deferred rebalancing should be used
         // This optimization is beneficial for append patterns and single-leaf groups
@@ -3438,9 +4215,111 @@ pub fn compute_affected_spans<S: Store>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::builder::BatchBuilder;
     use super::super::config::Config;
-    use super::super::store::MemStore;
+    use super::super::store::{BatchOp, MemStore};
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct CountingStoreError;
+
+    impl std::fmt::Display for CountingStoreError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("counting store error")
+        }
+    }
+
+    impl std::error::Error for CountingStoreError {}
+
+    #[derive(Default)]
+    struct CountingStore {
+        data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+        hints: Mutex<BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>>,
+        get_calls: AtomicUsize,
+        put_calls: AtomicUsize,
+        batch_calls: AtomicUsize,
+        batch_put_calls: AtomicUsize,
+        batch_put_entries: AtomicUsize,
+        batch_get_ordered_calls: AtomicUsize,
+        hint_get_calls: AtomicUsize,
+        hint_put_calls: AtomicUsize,
+    }
+
+    impl Store for CountingStore {
+        type Error = CountingStoreError;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            let data = self.data.lock().unwrap();
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(data.get(key).cloned())
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            self.put_calls.fetch_add(1, Ordering::Relaxed);
+            data.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            data.remove(key);
+            Ok(())
+        }
+
+        fn batch(&self, ops: &[BatchOp]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            for op in ops {
+                match op {
+                    BatchOp::Upsert { key, value } => {
+                        data.insert(key.to_vec(), value.to_vec());
+                    }
+                    BatchOp::Delete { key } => {
+                        data.remove(*key);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            self.batch_put_calls.fetch_add(1, Ordering::Relaxed);
+            self.batch_put_entries
+                .fetch_add(entries.len(), Ordering::Relaxed);
+            for (key, value) in entries {
+                data.insert(key.to_vec(), value.to_vec());
+            }
+            Ok(())
+        }
+
+        fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+            self.batch_get_ordered_calls.fetch_add(1, Ordering::Relaxed);
+            let data = self.data.lock().unwrap();
+            Ok(keys.iter().map(|key| data.get(*key).cloned()).collect())
+        }
+
+        fn supports_hints(&self) -> bool {
+            true
+        }
+
+        fn get_hint(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.hint_get_calls.fetch_add(1, Ordering::Relaxed);
+            let hints = self.hints.lock().unwrap();
+            Ok(hints.get(&(namespace.to_vec(), key.to_vec())).cloned())
+        }
+
+        fn put_hint(&self, namespace: &[u8], key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+            self.hint_put_calls.fetch_add(1, Ordering::Relaxed);
+            let mut hints = self.hints.lock().unwrap();
+            hints.insert((namespace.to_vec(), key.to_vec()), value.to_vec());
+            Ok(())
+        }
+    }
 
     /// Helper function to create a tree with the given key-value pairs
     fn create_tree_with_entries(prolly: &Prolly<MemStore>, entries: &[(Vec<u8>, Vec<u8>)]) -> Tree {
@@ -3473,6 +4352,631 @@ mod tests {
             ancestors,
             mutations,
         }
+    }
+
+    #[test]
+    fn batch_write_collector_flush_uses_bulk_upsert_path() {
+        let store = CountingStore::default();
+        let mut collector = BatchWriteCollector::new();
+        let node = create_test_leaf(vec![b"a".to_vec()], vec![b"1".to_vec()]);
+
+        collector.add(&node);
+        collector.flush(&store).unwrap();
+
+        assert_eq!(
+            store.batch_calls.load(Ordering::Relaxed),
+            0,
+            "collector flush should avoid generic batch for upsert-only node writes"
+        );
+        assert_eq!(store.batch_put_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(store.batch_put_entries.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn append_batch_uses_configured_boundary_detection_for_new_leaves() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(100)
+            .chunking_factor(1)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let tree = prolly.create();
+        let mutations = (0..8)
+            .map(|i| Mutation::Upsert {
+                key: format!("k{i:03}").into_bytes(),
+                val: format!("v{i:03}").into_bytes(),
+            })
+            .collect();
+
+        let tree = append_batch(&prolly, &tree, mutations).unwrap();
+        let entries = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 8);
+
+        let data = store.data.lock().unwrap();
+        let mut leaf_lengths = data
+            .values()
+            .map(|bytes| Node::from_bytes(bytes).unwrap())
+            .filter(|node| node.leaf)
+            .map(|node| node.len())
+            .collect::<Vec<_>>();
+        leaf_lengths.sort_unstable();
+
+        assert_eq!(leaf_lengths, vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn append_batch_empty_tree_matches_batch_builder_internal_chunking() {
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(16)
+            .chunking_factor(1)
+            .hash_seed(33)
+            .build();
+        let entries = (0..64)
+            .map(|i| {
+                (
+                    format!("k{i:03}").into_bytes(),
+                    format!("v{i:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let append_store = Arc::new(MemStore::new());
+        let append_prolly = Prolly::new(append_store, config.clone());
+        let append_tree = append_batch(
+            &append_prolly,
+            &append_prolly.create(),
+            entries
+                .iter()
+                .map(|(key, val)| Mutation::Upsert {
+                    key: key.clone(),
+                    val: val.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let builder_store = Arc::new(MemStore::new());
+        let mut builder = BatchBuilder::new(builder_store, config);
+        for (key, val) in entries {
+            builder.add(key, val);
+        }
+        let builder_tree = builder.build().unwrap();
+
+        assert_eq!(append_tree.root, builder_tree.root);
+    }
+
+    #[test]
+    fn append_batch_reuses_closed_tail_leaf_cid_without_rewriting_it() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(1)
+            .max_chunk_size(2)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let tree = append_batch(
+            &prolly,
+            &prolly.create(),
+            vec![
+                Mutation::Upsert {
+                    key: b"a".to_vec(),
+                    val: b"1".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"b".to_vec(),
+                    val: b"2".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let writes_before_append = store.batch_put_entries.load(Ordering::Relaxed);
+
+        let tree = append_batch(
+            &prolly,
+            &tree,
+            vec![
+                Mutation::Upsert {
+                    key: b"c".to_vec(),
+                    val: b"3".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"d".to_vec(),
+                    val: b"4".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let appended_writes =
+            store.batch_put_entries.load(Ordering::Relaxed) - writes_before_append;
+        assert_eq!(
+            appended_writes, 2,
+            "closed tail append should write only the new leaf and new root"
+        );
+
+        let entries = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_batch_reuses_cached_rightmost_anchor_for_append_chains() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..64 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+
+        let first = append_batch(
+            &prolly,
+            &base,
+            (64..80)
+                .map(|i| Mutation::Upsert {
+                    key: format!("k{i:03}").into_bytes(),
+                    val: format!("v{i:03}").into_bytes(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let get_calls_after_first = store.get_calls.load(Ordering::Relaxed);
+        assert!(
+            get_calls_after_first > 0,
+            "first append should discover the rightmost path"
+        );
+
+        let second = append_batch(
+            &prolly,
+            &first,
+            (80..96)
+                .map(|i| Mutation::Upsert {
+                    key: format!("k{i:03}").into_bytes(),
+                    val: format!("v{i:03}").into_bytes(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            get_calls_after_first,
+            "second append should reuse the cached rightmost anchor"
+        );
+
+        prolly.clear_cache();
+        let get_calls_before_third = store.get_calls.load(Ordering::Relaxed);
+        let ordered_get_calls_before_third = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+        let hint_get_calls_before_third = store.hint_get_calls.load(Ordering::Relaxed);
+        let third = append_batch(
+            &prolly,
+            &second,
+            (96..112)
+                .map(|i| Mutation::Upsert {
+                    key: format!("k{i:03}").into_bytes(),
+                    val: format!("v{i:03}").into_bytes(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            get_calls_before_third,
+            "clearing process caches should still use persisted rightmost hints"
+        );
+        assert!(
+            store.hint_get_calls.load(Ordering::Relaxed) > hint_get_calls_before_third,
+            "clearing process caches should consult persisted hints"
+        );
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > ordered_get_calls_before_third,
+            "clearing process caches should hydrate hinted nodes in one ordered batch"
+        );
+
+        assert_eq!(prolly.get(&third, b"k111").unwrap(), Some(b"v111".to_vec()));
+    }
+
+    #[test]
+    fn append_batch_uses_persisted_rightmost_anchor_in_new_manager() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..64 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config.clone());
+
+        let first = append_batch(
+            &prolly,
+            &base,
+            (64..80)
+                .map(|i| Mutation::Upsert {
+                    key: format!("k{i:03}").into_bytes(),
+                    val: format!("v{i:03}").into_bytes(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert!(
+            store.hint_put_calls.load(Ordering::Relaxed) > 0,
+            "append should persist a rightmost anchor hint"
+        );
+
+        let node_gets_before_second = store.get_calls.load(Ordering::Relaxed);
+        let ordered_gets_before_second = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+        let hint_gets_before_second = store.hint_get_calls.load(Ordering::Relaxed);
+        let fresh_prolly = Prolly::new(store.clone(), config);
+        let second = append_batch(
+            &fresh_prolly,
+            &first,
+            (80..96)
+                .map(|i| Mutation::Upsert {
+                    key: format!("k{i:03}").into_bytes(),
+                    val: format!("v{i:03}").into_bytes(),
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            node_gets_before_second,
+            "fresh manager should not do dependent right-edge node gets"
+        );
+        assert!(
+            store.hint_get_calls.load(Ordering::Relaxed) > hint_gets_before_second,
+            "fresh manager should consult persisted hints"
+        );
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > ordered_gets_before_second,
+            "fresh manager should hydrate hinted nodes in one ordered batch"
+        );
+        assert_eq!(
+            fresh_prolly.get(&second, b"k095").unwrap(),
+            Some(b"v095".to_vec())
+        );
+    }
+
+    #[test]
+    fn public_batch_append_fast_path_walks_right_edge_once() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(8)
+            .max_chunk_size(100)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let tree = append_batch(
+            &prolly,
+            &prolly.create(),
+            vec![
+                Mutation::Upsert {
+                    key: b"a".to_vec(),
+                    val: b"1".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"b".to_vec(),
+                    val: b"2".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        prolly.clear_cache();
+        let gets_before_append = store.get_calls.load(Ordering::Relaxed);
+
+        let tree = prolly
+            .batch(
+                &tree,
+                vec![
+                    Mutation::Upsert {
+                        key: b"c".to_vec(),
+                        val: b"3".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"d".to_vec(),
+                        val: b"4".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let append_gets = store.get_calls.load(Ordering::Relaxed) - gets_before_append;
+        assert_eq!(
+            append_gets, 0,
+            "append fast path should hydrate the persisted rightmost anchor"
+        );
+
+        let entries = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn public_batch_append_fast_path_preserves_existing_single_leaf_tree() {
+        let config = Config::builder()
+            .min_chunk_size(8)
+            .max_chunk_size(100)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(MemStore::new(), config);
+        let mut tree = prolly.create();
+        tree = prolly.put(&tree, b"a".to_vec(), b"1".to_vec()).unwrap();
+        tree = prolly.put(&tree, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        let tree = prolly
+            .batch(
+                &tree,
+                vec![
+                    Mutation::Upsert {
+                        key: b"c".to_vec(),
+                        val: b"3".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"d".to_vec(),
+                        val: b"4".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let entries = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn public_put_uses_append_fast_path_for_rightmost_insert() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let tree = append_batch(
+            &prolly,
+            &prolly.create(),
+            vec![
+                Mutation::Upsert {
+                    key: b"a".to_vec(),
+                    val: b"1".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"b".to_vec(),
+                    val: b"2".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let batch_put_calls_before = store.batch_put_calls.load(Ordering::Relaxed);
+        let put_calls_before = store.put_calls.load(Ordering::Relaxed);
+
+        let tree = prolly.put(&tree, b"c".to_vec(), b"3".to_vec()).unwrap();
+
+        assert_eq!(
+            store.put_calls.load(Ordering::Relaxed) - put_calls_before,
+            0,
+            "rightmost put should use append batch writes, not generic node puts"
+        );
+        assert_eq!(
+            store.batch_put_calls.load(Ordering::Relaxed) - batch_put_calls_before,
+            1,
+            "rightmost put should flush rewritten append-path nodes atomically"
+        );
+
+        let entries = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn public_batch_append_fast_path_fills_open_tail_leaf_before_new_sibling() {
+        let store = Arc::new(MemStore::new());
+        let config = Config::builder()
+            .min_chunk_size(8)
+            .max_chunk_size(100)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let mut tree = prolly.create();
+        tree = prolly.put(&tree, b"a".to_vec(), b"1".to_vec()).unwrap();
+        tree = prolly.put(&tree, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        let tree = prolly
+            .batch(
+                &tree,
+                vec![
+                    Mutation::Upsert {
+                        key: b"c".to_vec(),
+                        val: b"3".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"d".to_vec(),
+                        val: b"4".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let root = tree.root.as_ref().unwrap();
+        let root_bytes = store.get(root.as_bytes()).unwrap().unwrap();
+        let root_node = Node::from_bytes(&root_bytes).unwrap();
+
+        assert!(root_node.leaf);
+        assert_eq!(root_node.len(), 4);
+    }
+
+    #[test]
+    fn public_batch_append_fast_path_rewrites_ancestors_without_duplicate_subtrees() {
+        let store = Arc::new(MemStore::new());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store.clone(), config);
+        let mut tree = prolly.create();
+
+        for i in 0..32 {
+            tree = prolly
+                .put(
+                    &tree,
+                    format!("k{i:03}").into_bytes(),
+                    format!("v{i:03}").into_bytes(),
+                )
+                .unwrap();
+        }
+
+        let root = tree.root.as_ref().unwrap();
+        let root_bytes = store.get(root.as_bytes()).unwrap().unwrap();
+        let root_node = Node::from_bytes(&root_bytes).unwrap();
+        assert!(!root_node.leaf, "test must exercise an internal path");
+
+        let mutations = (32..40)
+            .map(|i| Mutation::Upsert {
+                key: format!("k{i:03}").into_bytes(),
+                val: format!("v{i:03}").into_bytes(),
+            })
+            .collect();
+        let tree = prolly.batch(&tree, mutations).unwrap();
+
+        let entries = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected = (0..40)
+            .map(|i| {
+                (
+                    format!("k{i:03}").into_bytes(),
+                    format!("v{i:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries, expected);
+    }
+
+    #[test]
+    fn group_mutations_uses_next_leaf_bound_for_gap_and_rightmost_tail_keys() {
+        let store = Arc::new(MemStore::new());
+        let config = Config::builder()
+            .min_chunk_size(4)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in (0..160).step_by(10) {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let tree = builder.build().unwrap();
+        let prolly = Prolly::new(store, config);
+
+        let mutations = preprocess_mutations(vec![
+            Mutation::Upsert {
+                key: b"k035".to_vec(),
+                val: b"gap-before-next-leaf".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k045".to_vec(),
+                val: b"inside-second-leaf-gap".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k999".to_vec(),
+                val: b"rightmost-tail-1".to_vec(),
+            },
+            Mutation::Delete {
+                key: b"z999".to_vec(),
+            },
+        ]);
+
+        let groups = group_mutations_by_leaf(&prolly, &tree, mutations).unwrap();
+        assert_eq!(groups.len(), 3);
+
+        assert_eq!(groups[0].leaf.keys.last().unwrap(), b"k030");
+        assert_eq!(groups[0].mutations[0].key(), b"k035");
+
+        assert_eq!(groups[1].leaf.keys.first().unwrap(), b"k040");
+        assert_eq!(groups[1].leaf.keys.last().unwrap(), b"k070");
+        assert_eq!(groups[1].mutations[0].key(), b"k045");
+
+        assert_eq!(groups[2].leaf.keys.last().unwrap(), b"k150");
+        assert_eq!(
+            groups[2]
+                .mutations
+                .iter()
+                .map(|mutation| mutation.key().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"k999".to_vec(), b"z999".to_vec()]
+        );
     }
 
     // ==================== should_use_deferred_rebalancing tests ====================
@@ -3959,11 +5463,11 @@ mod tests {
             "Oversized node should be split into multiple chunks"
         );
 
-        // Each chunk should be strictly less than max_chunk_size
+        // Each chunk should be at or below max_chunk_size.
         for chunk in &chunks {
             assert!(
-                chunk.len() < 5,
-                "Each chunk should have length < max_chunk_size (5), got {}",
+                chunk.len() <= 5,
+                "Each chunk should have length <= max_chunk_size (5), got {}",
                 chunk.len()
             );
         }

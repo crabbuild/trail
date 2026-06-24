@@ -3,7 +3,7 @@
 //! The `BatchBuilder` enables efficient bulk loading of data into a Prolly tree
 //! with parallel boundary detection and node creation using rayon.
 
-use super::boundary::is_boundary_config;
+use super::boundary::is_hash_boundary_config;
 use super::cid::Cid;
 use super::config::Config;
 use super::encoding::INIT_LEVEL;
@@ -13,6 +13,19 @@ use super::store::Store;
 use super::tree::Tree;
 
 use rayon::prelude::*;
+
+#[derive(Debug)]
+struct BuiltNode {
+    cid: Cid,
+    first_key: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeSummary {
+    cid: Cid,
+    first_key: Vec<u8>,
+}
 
 /// Batch builder for parallel tree construction.
 ///
@@ -111,55 +124,27 @@ where
     /// * `entries` - Sorted key-value pairs
     ///
     /// # Returns
-    /// * `Ok(Vec<Cid>)` - CIDs of the created leaf nodes
+    /// * `Ok(Vec<NodeSummary>)` - summaries of the created leaf nodes
     /// * `Err(Error)` - If storage operations fail
     ///
-    fn parallel_chunk(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<Cid>, Error> {
+    fn parallel_chunk(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<NodeSummary>, Error> {
         if entries.is_empty() {
             return Ok(vec![]);
         }
 
-        // Find boundary points in parallel
-        let boundaries: Vec<usize> = entries
+        // Precompute the hash predicate in parallel. Min/max rules depend on
+        // the current chunk length, so they are applied in a sequential pass.
+        let hash_boundaries: Vec<bool> = entries
             .par_iter()
-            .enumerate()
-            .filter_map(|(i, (k, v))| {
-                // Check if this entry creates a boundary
-                // count is i + 1 because we're considering entries 0..=i
-                if is_boundary_config(&self.config, i + 1, k, v) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
+            .map(|(k, v)| is_hash_boundary_config(&self.config, k, v))
             .collect();
 
-        // Build chunk ranges from boundaries
-        let mut chunk_ranges: Vec<std::ops::RangeInclusive<usize>> = Vec::new();
-        let mut start = 0;
+        let chunk_ranges = chunk_ranges_from_hash_boundaries(&self.config, &hash_boundaries);
 
-        for end in &boundaries {
-            if *end >= start {
-                chunk_ranges.push(start..=*end);
-                start = end + 1;
-            }
-        }
-
-        // Add remaining entries as final chunk
-        if start < entries.len() {
-            chunk_ranges.push(start..=(entries.len() - 1));
-        }
-
-        // Handle edge case: if no boundaries found, create single chunk
-        if chunk_ranges.is_empty() && !entries.is_empty() {
-            chunk_ranges.push(0..=(entries.len() - 1));
-        }
-
-        // Create leaf nodes in parallel
-        let store = &self.store;
+        // Create leaf nodes in parallel, then persist them in one batched write.
         let config = &self.config;
 
-        let cids: Result<Vec<Cid>, Error> = chunk_ranges
+        let nodes: Vec<BuiltNode> = chunk_ranges
             .par_iter()
             .map(|range| {
                 let mut node = Node::builder()
@@ -177,16 +162,25 @@ where
                     node.vals.push(entries[i].1.clone());
                 }
 
+                let first_key = node.keys.first().cloned().unwrap_or_default();
                 let bytes = node.to_bytes();
                 let cid = Cid::from_bytes(&bytes);
-                store
-                    .put(cid.as_bytes(), &bytes)
-                    .map_err(|e| Error::Store(Box::new(e)))?;
-                Ok(cid)
+                BuiltNode {
+                    cid,
+                    first_key,
+                    bytes,
+                }
             })
             .collect();
 
-        cids
+        self.persist_nodes(&nodes)?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| NodeSummary {
+                cid: node.cid,
+                first_key: node.first_key,
+            })
+            .collect())
     }
 
     /// Build internal nodes from leaf CIDs, level by level.
@@ -195,15 +189,15 @@ where
     /// reference the nodes from the previous level.
     ///
     /// # Arguments
-    /// * `level_cids` - CIDs of nodes at the current (leaf) level
+    /// * `level_nodes` - Summaries of nodes at the current (leaf) level
     ///
     /// # Returns
     /// * `Ok(Tree)` - The constructed tree with root
     /// * `Err(Error)` - If storage operations fail
     ///
-    fn build_from_chunks(&self, mut level_cids: Vec<Cid>) -> Result<Tree, Error> {
+    fn build_from_chunks(&self, mut level_nodes: Vec<NodeSummary>) -> Result<Tree, Error> {
         // Handle empty case
-        if level_cids.is_empty() {
+        if level_nodes.is_empty() {
             return Ok(Tree {
                 root: None,
                 config: self.config.clone(),
@@ -211,9 +205,9 @@ where
         }
 
         // Handle single node case - it becomes the root
-        if level_cids.len() == 1 {
+        if level_nodes.len() == 1 {
             return Ok(Tree {
-                root: Some(level_cids.remove(0)),
+                root: Some(level_nodes.remove(0).cid),
                 config: self.config.clone(),
             });
         }
@@ -221,74 +215,55 @@ where
         let mut level = INIT_LEVEL;
 
         // Build internal nodes level by level until we have a single root
-        while level_cids.len() > 1 {
+        while level_nodes.len() > 1 {
             level += 1;
-            level_cids = self.build_level(level_cids, level)?;
+            level_nodes = self.build_level(level_nodes, level)?;
         }
 
         Ok(Tree {
-            root: level_cids.into_iter().next(),
+            root: level_nodes.into_iter().next().map(|node| node.cid),
             config: self.config.clone(),
         })
     }
 
-    /// Build a single level of internal nodes from child CIDs.
+    /// Build a single level of internal nodes from child summaries.
     ///
     /// Creates internal nodes that reference the child nodes, using
     /// boundary detection to determine node boundaries.
     ///
     /// # Arguments
-    /// * `child_cids` - CIDs of child nodes
+    /// * `children` - Summaries of child nodes
     /// * `level` - The level number for the new internal nodes
     ///
     /// # Returns
-    /// * `Ok(Vec<Cid>)` - CIDs of the created internal nodes
+    /// * `Ok(Vec<NodeSummary>)` - summaries of the created internal nodes
     /// * `Err(Error)` - If storage operations fail
-    fn build_level(&self, child_cids: Vec<Cid>, level: u8) -> Result<Vec<Cid>, Error> {
-        if child_cids.is_empty() {
+    fn build_level(
+        &self,
+        children: Vec<NodeSummary>,
+        level: u8,
+    ) -> Result<Vec<NodeSummary>, Error> {
+        if children.is_empty() {
             return Ok(vec![]);
         }
 
-        // Load first key from each child for internal node keys
-        let keys: Vec<Vec<u8>> = child_cids
+        // Precompute hash predicate in parallel, then apply size rules using
+        // chunk-local counts so max_chunk_size does not degenerate into
+        // one-child internal nodes after the first full chunk.
+        let hash_boundaries: Vec<bool> = children
             .par_iter()
-            .map(|cid| {
-                let bytes = self
-                    .store
-                    .get(cid.as_bytes())
-                    .map_err(|e| Error::Store(Box::new(e)))?
-                    .ok_or_else(|| Error::NotFound(cid.clone()))?;
-                let node = Node::from_bytes(&bytes)?;
-                Ok(node.keys.first().cloned().unwrap_or_default())
+            .map(|child| {
+                is_hash_boundary_config(&self.config, &child.first_key, child.cid.as_bytes())
             })
-            .collect::<Result<Vec<_>, Error>>()?;
-
-        // Find boundaries for internal nodes
-        let mut boundaries = Vec::new();
-        for (i, (key, cid)) in keys.iter().zip(&child_cids).enumerate() {
-            if is_boundary_config(&self.config, i + 1, key, cid.as_bytes()) {
-                boundaries.push(i);
-            }
-        }
+            .collect();
+        let chunk_ranges = chunk_ranges_from_hash_boundaries(&self.config, &hash_boundaries);
 
         // Build internal nodes
-        let mut result = Vec::new();
-        let mut start = 0;
+        let mut nodes = Vec::new();
 
-        // Process each chunk defined by boundaries
-        let boundary_iter = boundaries.iter().copied();
-        let final_boundary = child_cids.len() - 1;
-
-        // Collect all end points (boundaries + final index if not already included)
-        let mut end_points: Vec<usize> = boundary_iter.collect();
-        if end_points.is_empty() || *end_points.last().unwrap() != final_boundary {
-            end_points.push(final_boundary);
-        }
-
-        for end in end_points {
-            if start > end {
-                continue;
-            }
+        for range in chunk_ranges {
+            let start = *range.start();
+            let end = *range.end();
 
             let mut node = Node::builder()
                 .leaf(false)
@@ -301,20 +276,237 @@ where
                 .build();
 
             for i in start..=end {
-                node.keys.push(keys[i].clone());
-                node.vals.push(child_cids[i].0.to_vec());
+                node.keys.push(children[i].first_key.clone());
+                node.vals.push(children[i].cid.0.to_vec());
             }
 
+            let first_key = node.keys.first().cloned().unwrap_or_default();
             let bytes = node.to_bytes();
             let cid = Cid::from_bytes(&bytes);
-            self.store
-                .put(cid.as_bytes(), &bytes)
-                .map_err(|e| Error::Store(Box::new(e)))?;
-            result.push(cid);
-
-            start = end + 1;
+            nodes.push(BuiltNode {
+                cid,
+                first_key,
+                bytes,
+            });
         }
 
-        Ok(result)
+        self.persist_nodes(&nodes)?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| NodeSummary {
+                cid: node.cid,
+                first_key: node.first_key,
+            })
+            .collect())
+    }
+
+    fn persist_nodes(&self, nodes: &[BuiltNode]) -> Result<(), Error> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+
+        let entries = nodes
+            .iter()
+            .map(|node| (node.cid.as_bytes(), node.bytes.as_slice()))
+            .collect::<Vec<_>>();
+        self.store
+            .batch_put(&entries)
+            .map_err(|e| Error::Store(Box::new(e)))
+    }
+}
+
+fn chunk_ranges_from_hash_boundaries(
+    config: &Config,
+    hash_boundaries: &[bool],
+) -> Vec<std::ops::RangeInclusive<usize>> {
+    if hash_boundaries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunk_ranges = Vec::new();
+    let mut start = 0;
+
+    for (i, is_hash_boundary) in hash_boundaries.iter().enumerate() {
+        let count = i - start + 1;
+        if count < config.min_chunk_size {
+            continue;
+        }
+
+        if count >= config.max_chunk_size || *is_hash_boundary {
+            chunk_ranges.push(start..=i);
+            start = i + 1;
+        }
+    }
+
+    if start < hash_boundaries.len() {
+        chunk_ranges.push(start..=(hash_boundaries.len() - 1));
+    }
+
+    chunk_ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prolly::store::BatchOp;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CountingStore {
+        inner: Arc<Mutex<CountingStoreInner>>,
+    }
+
+    #[derive(Default)]
+    struct CountingStoreInner {
+        data: BTreeMap<Vec<u8>, Vec<u8>>,
+        get_calls: usize,
+        put_calls: usize,
+        batch_put_calls: usize,
+    }
+
+    #[derive(Debug)]
+    struct CountingStoreError(String);
+
+    impl std::fmt::Display for CountingStoreError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore error: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for CountingStoreError {}
+
+    impl Store for CountingStore {
+        type Error = CountingStoreError;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| CountingStoreError(format!("lock poisoned: {}", e)))?;
+            inner.get_calls += 1;
+            Ok(inner.data.get(key).cloned())
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| CountingStoreError(format!("lock poisoned: {}", e)))?;
+            inner.put_calls += 1;
+            inner.data.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), Self::Error> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| CountingStoreError(format!("lock poisoned: {}", e)))?;
+            inner.data.remove(key);
+            Ok(())
+        }
+
+        fn batch(&self, ops: &[BatchOp]) -> Result<(), Self::Error> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| CountingStoreError(format!("lock poisoned: {}", e)))?;
+            for op in ops {
+                match op {
+                    BatchOp::Upsert { key, value } => {
+                        inner.data.insert(key.to_vec(), value.to_vec());
+                    }
+                    BatchOp::Delete { key } => {
+                        inner.data.remove(*key);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| CountingStoreError(format!("lock poisoned: {}", e)))?;
+            inner.batch_put_calls += 1;
+            for (key, value) in entries {
+                inner.data.insert(key.to_vec(), value.to_vec());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batch_builder_persists_levels_with_batched_writes_without_readback() {
+        let store = CountingStore::default();
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(2)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config);
+
+        for i in 0..64 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+
+        let tree = builder.build().unwrap();
+        assert!(tree.root.is_some());
+
+        let inner = store.inner.lock().unwrap();
+        assert_eq!(inner.get_calls, 0);
+        assert_eq!(inner.put_calls, 0);
+        assert!(inner.batch_put_calls > 1);
+    }
+
+    #[test]
+    fn batch_builder_applies_max_chunk_size_to_current_chunk_not_global_index() {
+        let store = CountingStore::default();
+        let config = Config::builder()
+            .min_chunk_size(4)
+            .max_chunk_size(4)
+            .chunking_factor(2)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config);
+
+        for i in 0..64 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+
+        let tree = builder.build().unwrap();
+        assert!(tree.root.is_some());
+
+        let inner = store.inner.lock().unwrap();
+        let mut leaf_lengths = Vec::new();
+        let mut level_one_lengths = Vec::new();
+        let mut root_length = None;
+
+        for bytes in inner.data.values() {
+            let node = Node::from_bytes(bytes).unwrap();
+            if node.leaf {
+                leaf_lengths.push(node.len());
+            } else if node.level == 1 {
+                level_one_lengths.push(node.len());
+            }
+
+            if Some(Cid::from_bytes(bytes)) == tree.root {
+                root_length = Some(node.len());
+            }
+        }
+
+        leaf_lengths.sort_unstable();
+        level_one_lengths.sort_unstable();
+
+        assert_eq!(leaf_lengths, vec![4; 16]);
+        assert_eq!(level_one_lengths, vec![4; 4]);
+        assert_eq!(root_length, Some(4));
     }
 }

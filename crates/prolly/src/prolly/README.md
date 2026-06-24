@@ -18,6 +18,8 @@ Prolly trees (Probabilistic B-Trees) are persistent, immutable data structures t
 - **CRDT Support**: Conflict-free replicated data type semantics for distributed systems
 - **Parallel Processing**: Optional parallel batch operations for large trees
 
+See [`PERFORMANCE.md`](../../PERFORMANCE.md) for the paper-derived optimization plan, implemented hardening, and benchmark coverage.
+
 ## Quick Start
 
 ```rust

@@ -15,6 +15,14 @@ CREATE TABLE IF NOT EXISTS prolly_nodes (
     node BLOB NOT NULL
 ) WITHOUT ROWID;";
 
+const CREATE_HINTS_TABLE_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS prolly_hints (
+    namespace BLOB NOT NULL,
+    key       BLOB NOT NULL,
+    value     BLOB NOT NULL,
+    PRIMARY KEY (namespace, key)
+) WITHOUT ROWID;";
+
 const SELECT_SQL: &str = "SELECT node FROM prolly_nodes WHERE cid = ?1";
 const UPSERT_SQL: &str = "\
 INSERT INTO prolly_nodes (cid, node)
@@ -147,6 +155,8 @@ impl SqliteStore {
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to set temp_store=MEMORY"))?;
         conn.execute_batch(CREATE_TABLE_SQL)
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to initialize schema"))?;
+        conn.execute_batch(CREATE_HINTS_TABLE_SQL)
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to initialize hint schema"))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -190,17 +200,26 @@ impl Store for SqliteStore {
             .transaction()
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to start transaction"))?;
 
-        for op in ops {
-            match op {
-                BatchOp::Upsert { key, value } => {
-                    tx.execute(UPSERT_SQL, params![key, value]).map_err(|e| {
-                        SqliteStoreError::from_sqlite(e, "Failed to write key in batch")
-                    })?;
-                }
-                BatchOp::Delete { key } => {
-                    tx.execute(DELETE_SQL, params![key]).map_err(|e| {
-                        SqliteStoreError::from_sqlite(e, "Failed to delete key in batch")
-                    })?;
+        {
+            let mut upsert = tx
+                .prepare_cached(UPSERT_SQL)
+                .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to prepare batch write"))?;
+            let mut delete = tx
+                .prepare_cached(DELETE_SQL)
+                .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to prepare batch delete"))?;
+
+            for op in ops {
+                match op {
+                    BatchOp::Upsert { key, value } => {
+                        upsert.execute(params![key, value]).map_err(|e| {
+                            SqliteStoreError::from_sqlite(e, "Failed to write key in batch")
+                        })?;
+                    }
+                    BatchOp::Delete { key } => {
+                        delete.execute(params![key]).map_err(|e| {
+                            SqliteStoreError::from_sqlite(e, "Failed to delete key in batch")
+                        })?;
+                    }
                 }
             }
         }
@@ -255,11 +274,80 @@ impl Store for SqliteStore {
             .transaction()
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to start transaction"))?;
 
-        for (key, value) in entries {
-            tx.execute(UPSERT_SQL, params![key, value]).map_err(|e| {
-                SqliteStoreError::from_sqlite(e, "Failed to write key in batch_put")
+        {
+            let mut stmt = tx.prepare_cached(UPSERT_SQL).map_err(|e| {
+                SqliteStoreError::from_sqlite(e, "Failed to prepare batch_put write")
             })?;
+            for (key, value) in entries {
+                stmt.execute(params![key, value]).map_err(|e| {
+                    SqliteStoreError::from_sqlite(e, "Failed to write key in batch_put")
+                })?;
+            }
         }
+
+        tx.commit()
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to commit transaction"))
+    }
+
+    fn supports_hints(&self) -> bool {
+        true
+    }
+
+    fn get_hint(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT value FROM prolly_hints WHERE namespace = ?1 AND key = ?2",
+            params![namespace, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to read hint"))
+    }
+
+    fn put_hint(&self, namespace: &[u8], key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        let conn = self.connection()?;
+        conn.execute(
+            "\
+            INSERT INTO prolly_hints (namespace, key, value) \
+            VALUES (?1, ?2, ?3) \
+            ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value",
+            params![namespace, key, value],
+        )
+        .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to write hint"))?;
+        Ok(())
+    }
+
+    fn batch_put_with_hint(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), Self::Error> {
+        let mut conn = self.connection()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to start transaction"))?;
+
+        {
+            let mut upsert_node = tx.prepare_cached(UPSERT_SQL).map_err(|e| {
+                SqliteStoreError::from_sqlite(e, "Failed to prepare batch_put write")
+            })?;
+            for (key, value) in entries {
+                upsert_node.execute(params![key, value]).map_err(|e| {
+                    SqliteStoreError::from_sqlite(e, "Failed to write key in batch_put")
+                })?;
+            }
+        }
+
+        tx.execute(
+            "\
+            INSERT INTO prolly_hints (namespace, key, value) \
+            VALUES (?1, ?2, ?3) \
+            ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value",
+            params![namespace, key, value],
+        )
+        .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to write hint in batch_put"))?;
 
         tx.commit()
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to commit transaction"))
@@ -324,5 +412,24 @@ mod tests {
 
         assert_eq!(store.get(b"a").unwrap(), Some(b"new".to_vec()));
         assert_eq!(store.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn sqlite_store_persists_hints_separately_from_nodes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        store.put_hint(b"rightmost", b"root", b"hint-v1").unwrap();
+        assert_eq!(
+            store.get_hint(b"rightmost", b"root").unwrap(),
+            Some(b"hint-v1".to_vec())
+        );
+        assert_eq!(store.get_hint(b"rightmost", b"missing").unwrap(), None);
+        assert_eq!(store.get(b"root").unwrap(), None);
+
+        store.put_hint(b"rightmost", b"root", b"hint-v2").unwrap();
+        assert_eq!(
+            store.get_hint(b"rightmost", b"root").unwrap(),
+            Some(b"hint-v2".to_vec())
+        );
     }
 }

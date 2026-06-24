@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use prolly::{
-    BatchBuilder, BatchWriter, BatchWriterConfig, Config, MemStore, Mutation, ParallelConfig,
-    Prolly, Resolver, Store, Tree,
+    append_batch, BatchBuilder, BatchWriter, BatchWriterConfig, Config, MemStore, Mutation,
+    ParallelConfig, Prolly, Resolver, Store, Tree,
 };
 
 const DEFAULT_SCALE: usize = 10_000;
@@ -22,18 +22,26 @@ fn main() {
     bench_incremental_insert(scale / 5);
     bench_batch_builder(scale);
     bench_point_get(scale);
+    bench_point_updates(scale);
+    bench_point_deletes(scale);
     bench_range_scan(scale);
     bench_range_scan_window(scale);
     bench_batch_mutations(scale);
     bench_batch_mutations_mixed(scale);
     bench_batch_mutations_append(scale);
+    bench_append_batch_direct(scale);
+    bench_append_batch_chain(scale);
+    bench_append_batch_chain_cold(scale);
     bench_batch_mutations_no_prefetch(scale);
     bench_batch_mutations_bottom_up(scale);
     bench_parallel_batch_mutations(scale);
     bench_diff_identical(scale);
     bench_diff_sparse(scale);
+    bench_diff_append_suffix(scale);
+    bench_diff_empty_to_full(scale);
     bench_diff_full_rewrite(scale);
     bench_stream_diff_sparse(scale);
+    bench_stream_diff_append_suffix(scale);
     bench_range_diff_window(scale);
     bench_merge_sparse(scale);
     bench_merge_conflict_resolved(scale);
@@ -42,9 +50,15 @@ fn main() {
     {
         bench_sqlite_roundtrip(scale / 5);
         bench_sqlite_disk_incremental_persist(scale / 10);
+        bench_sqlite_disk_point_updates(scale / 5);
+        bench_sqlite_disk_point_deletes(scale / 5);
         bench_sqlite_disk_batch_builder_persist(scale / 2);
         bench_sqlite_disk_reopen_get(scale / 5);
         bench_sqlite_disk_batch_mutations(scale / 5);
+        bench_sqlite_disk_append_batch_persist(scale / 5);
+        bench_sqlite_disk_append_batch_chain_persist(scale / 5);
+        bench_sqlite_disk_append_batch_chain_new_manager_persist(scale / 5);
+        bench_sqlite_disk_diff_empty_to_full(scale / 5);
     }
 }
 
@@ -90,6 +104,38 @@ fn bench_point_get(items: usize) {
             let key = &data[i % data.len()].0;
             black_box(prolly.get(&tree, black_box(key)).unwrap());
         }
+    });
+}
+
+fn bench_point_updates(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let count = mutation_count(items);
+    let updates = point_updates(items, count, "point-update");
+
+    measure("point_updates_mem", 20, count, || {
+        let mut tree = base.clone();
+        for (key, val) in &updates {
+            tree = prolly
+                .put(&tree, black_box(key.clone()), black_box(val.clone()))
+                .unwrap();
+        }
+        black_box(tree.root);
+    });
+}
+
+fn bench_point_deletes(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let count = mutation_count(items);
+    let deletes = point_delete_keys(items, count);
+
+    measure("point_deletes_mem", 20, count, || {
+        let mut tree = base.clone();
+        for key in &deletes {
+            tree = prolly.delete(&tree, black_box(key)).unwrap();
+        }
+        black_box(tree.root);
     });
 }
 
@@ -171,6 +217,56 @@ fn bench_batch_mutations_append(items: usize) {
     });
 }
 
+fn bench_append_batch_direct(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let mutation_count = mutation_count(items);
+    let mutations = append_mutations(items, mutation_count, "append-direct");
+
+    measure("append_batch_direct_mem", 20, mutation_count, || {
+        let tree = append_batch(&prolly, &base, black_box(mutations.clone())).unwrap();
+        black_box(tree.root);
+    });
+}
+
+fn bench_append_batch_chain(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let batch_size = append_chain_batch_size(items);
+    let rounds = append_chain_rounds();
+    let batches = append_chain_mutation_batches(items, batch_size, rounds, "append-chain");
+
+    measure("append_batch_chain_mem", 20, batch_size * rounds, || {
+        let mut tree = base.clone();
+        for batch in &batches {
+            tree = append_batch(&prolly, &tree, black_box(batch.clone())).unwrap();
+        }
+        black_box(tree.root);
+    });
+}
+
+fn bench_append_batch_chain_cold(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let batch_size = append_chain_batch_size(items);
+    let rounds = append_chain_rounds();
+    let batches = append_chain_mutation_batches(items, batch_size, rounds, "append-chain-cold");
+
+    measure(
+        "append_batch_chain_cold_mem",
+        20,
+        batch_size * rounds,
+        || {
+            let mut tree = base.clone();
+            for batch in &batches {
+                prolly.clear_cache();
+                tree = append_batch(&prolly, &tree, black_box(batch.clone())).unwrap();
+            }
+            black_box(tree.root);
+        },
+    );
+}
+
 fn bench_batch_mutations_no_prefetch(items: usize) {
     let data = data_set(items);
     let (_, prolly, base) = build_tree(&data);
@@ -242,6 +338,34 @@ fn bench_diff_sparse(items: usize) {
     });
 }
 
+fn bench_diff_append_suffix(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let count = mutation_count(items);
+    let other = append_batch(
+        &prolly,
+        &base,
+        append_mutations(items, count, "diff-append"),
+    )
+    .unwrap();
+
+    measure("diff_append_suffix_mem", 20, count, || {
+        let diffs = prolly.diff(&base, &other).unwrap();
+        black_box(diffs);
+    });
+}
+
+fn bench_diff_empty_to_full(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, other) = build_tree(&data);
+    let empty = prolly.create();
+
+    measure("diff_empty_to_full_mem", 10, items, || {
+        let diffs = prolly.diff(&empty, &other).unwrap();
+        black_box(diffs.len());
+    });
+}
+
 fn bench_diff_full_rewrite(items: usize) {
     let data = data_set(items);
     let (store, prolly, base) = build_tree(&data);
@@ -274,6 +398,27 @@ fn bench_stream_diff_sparse(items: usize) {
     });
 }
 
+fn bench_stream_diff_append_suffix(items: usize) {
+    let data = data_set(items);
+    let (_, prolly, base) = build_tree(&data);
+    let count = mutation_count(items);
+    let other = append_batch(
+        &prolly,
+        &base,
+        append_mutations(items, count, "stream-diff-append"),
+    )
+    .unwrap();
+
+    measure("stream_diff_append_suffix_mem", 20, count, || {
+        let diffs = prolly
+            .stream_diff(&base, &other)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        black_box(diffs);
+    });
+}
+
 fn bench_range_diff_window(items: usize) {
     let data = data_set(items);
     let (_, prolly, base) = build_tree(&data);
@@ -284,6 +429,13 @@ fn bench_range_diff_window(items: usize) {
     let window_items = end_idx - start_idx;
 
     measure("range_diff_window_mem", 30, window_items, || {
+        let diffs = prolly
+            .range_diff(&base, &other, start.as_slice(), Some(end.as_slice()))
+            .unwrap();
+        black_box(diffs.len());
+    });
+
+    measure("range_diff_window_scan_mem", 30, window_items, || {
         let diff_count = range_diff_count(
             &prolly,
             &base,
@@ -402,6 +554,74 @@ fn bench_sqlite_disk_incremental_persist(items: usize) {
 }
 
 #[cfg(feature = "sqlite")]
+fn bench_sqlite_disk_point_updates(items: usize) {
+    use prolly::SqliteStore;
+
+    let data = data_set(items);
+    let config = bench_config();
+    let path = temp_db_path("point-updates");
+    remove_sqlite_files(&path);
+
+    {
+        let store =
+            Arc::new(SqliteStore::open_with_config(&path, durable_sqlite_config()).unwrap());
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for (key, val) in &data {
+            builder.add(key.clone(), val.clone());
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store, config);
+        let count = mutation_count(items);
+        let updates = point_updates(items, count, "sqlite-point-update");
+
+        measure("sqlite_disk_point_updates", 5, count, || {
+            let mut tree = base.clone();
+            for (key, val) in &updates {
+                tree = prolly
+                    .put(&tree, black_box(key.clone()), black_box(val.clone()))
+                    .unwrap();
+            }
+            black_box(tree.root);
+        });
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_disk_point_deletes(items: usize) {
+    use prolly::SqliteStore;
+
+    let data = data_set(items);
+    let config = bench_config();
+    let path = temp_db_path("point-deletes");
+    remove_sqlite_files(&path);
+
+    {
+        let store =
+            Arc::new(SqliteStore::open_with_config(&path, durable_sqlite_config()).unwrap());
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for (key, val) in &data {
+            builder.add(key.clone(), val.clone());
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store, config);
+        let count = mutation_count(items);
+        let deletes = point_delete_keys(items, count);
+
+        measure("sqlite_disk_point_deletes", 5, count, || {
+            let mut tree = base.clone();
+            for key in &deletes {
+                tree = prolly.delete(&tree, black_box(key)).unwrap();
+            }
+            black_box(tree.root);
+        });
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[cfg(feature = "sqlite")]
 fn bench_sqlite_disk_batch_builder_persist(items: usize) {
     use prolly::SqliteStore;
 
@@ -481,6 +701,149 @@ fn bench_sqlite_disk_batch_mutations(items: usize) {
         measure("sqlite_disk_batch_mutations", 5, count, || {
             let tree = prolly.batch(&base, black_box(mutations.clone())).unwrap();
             black_box(tree.root);
+        });
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_disk_append_batch_persist(items: usize) {
+    use prolly::SqliteStore;
+
+    let data = data_set(items);
+    let config = bench_config();
+    let path = temp_db_path("append-batch");
+    remove_sqlite_files(&path);
+
+    {
+        let store =
+            Arc::new(SqliteStore::open_with_config(&path, durable_sqlite_config()).unwrap());
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for (key, val) in &data {
+            builder.add(key.clone(), val.clone());
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store, config);
+        let count = mutation_count(items);
+        let mutations = append_mutations(items, count, "sqlite-append");
+
+        measure("sqlite_disk_append_batch_persist", 5, count, || {
+            let tree = append_batch(&prolly, &base, black_box(mutations.clone())).unwrap();
+            black_box(tree.root);
+        });
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_disk_append_batch_chain_persist(items: usize) {
+    use prolly::SqliteStore;
+
+    let data = data_set(items);
+    let config = bench_config();
+    let path = temp_db_path("append-batch-chain");
+    remove_sqlite_files(&path);
+
+    {
+        let store =
+            Arc::new(SqliteStore::open_with_config(&path, durable_sqlite_config()).unwrap());
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for (key, val) in &data {
+            builder.add(key.clone(), val.clone());
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store, config);
+        let batch_size = append_chain_batch_size(items);
+        let rounds = append_chain_rounds();
+        let batches =
+            append_chain_mutation_batches(items, batch_size, rounds, "sqlite-append-chain");
+
+        measure(
+            "sqlite_disk_append_batch_chain_persist",
+            5,
+            batch_size * rounds,
+            || {
+                let mut tree = base.clone();
+                for batch in &batches {
+                    tree = append_batch(&prolly, &tree, black_box(batch.clone())).unwrap();
+                }
+                black_box(tree.root);
+            },
+        );
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_disk_append_batch_chain_new_manager_persist(items: usize) {
+    use prolly::SqliteStore;
+
+    let data = data_set(items);
+    let config = bench_config();
+    let path = temp_db_path("append-batch-chain-new-manager");
+    remove_sqlite_files(&path);
+
+    {
+        let store =
+            Arc::new(SqliteStore::open_with_config(&path, durable_sqlite_config()).unwrap());
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for (key, val) in &data {
+            builder.add(key.clone(), val.clone());
+        }
+        let base = builder.build().unwrap();
+        let batch_size = append_chain_batch_size(items);
+        let rounds = append_chain_rounds();
+        let batches = append_chain_mutation_batches(
+            items,
+            batch_size,
+            rounds,
+            "sqlite-append-chain-new-manager",
+        );
+
+        measure(
+            "sqlite_disk_append_batch_chain_new_manager_persist",
+            5,
+            batch_size * rounds,
+            || {
+                let mut tree = base.clone();
+                for batch in &batches {
+                    let prolly = Prolly::new(store.clone(), config.clone());
+                    tree = append_batch(&prolly, &tree, black_box(batch.clone())).unwrap();
+                }
+                black_box(tree.root);
+            },
+        );
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[cfg(feature = "sqlite")]
+fn bench_sqlite_disk_diff_empty_to_full(items: usize) {
+    use prolly::SqliteStore;
+
+    let data = data_set(items);
+    let config = bench_config();
+    let path = temp_db_path("diff-empty-to-full");
+    remove_sqlite_files(&path);
+
+    {
+        let store =
+            Arc::new(SqliteStore::open_with_config(&path, durable_sqlite_config()).unwrap());
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for (key, val) in &data {
+            builder.add(key.clone(), val.clone());
+        }
+        let other = builder.build().unwrap();
+
+        measure("sqlite_disk_diff_empty_to_full", 5, items, || {
+            let prolly = Prolly::new(store.clone(), config.clone());
+            let empty = prolly.create();
+            let diffs = prolly.diff(&empty, &other).unwrap();
+            black_box(diffs.len());
         });
     }
 
@@ -670,6 +1033,52 @@ fn append_mutations(items: usize, count: usize, label: &str) -> Vec<Mutation> {
         .map(|i| Mutation::Upsert {
             key: key_for_index(items + i),
             val: format!("{label}-{i:08}").into_bytes(),
+        })
+        .collect()
+}
+
+fn append_chain_batch_size(items: usize) -> usize {
+    (items / 100).clamp(25, 200)
+}
+
+fn append_chain_rounds() -> usize {
+    10
+}
+
+fn append_chain_mutation_batches(
+    start: usize,
+    batch_size: usize,
+    rounds: usize,
+    label: &str,
+) -> Vec<Vec<Mutation>> {
+    (0..rounds)
+        .map(|round| {
+            append_mutations(
+                start + round * batch_size,
+                batch_size,
+                &format!("{label}-{round:02}"),
+            )
+        })
+        .collect()
+}
+
+fn point_updates(items: usize, count: usize, label: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            let key_idx = (items / 4 + i * 7) % items;
+            (
+                key_for_index(key_idx),
+                format!("{label}-{i:08}").into_bytes(),
+            )
+        })
+        .collect()
+}
+
+fn point_delete_keys(items: usize, count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|i| {
+            let key_idx = (items / 4 + i * 7) % items;
+            key_for_index(key_idx)
         })
         .collect()
 }

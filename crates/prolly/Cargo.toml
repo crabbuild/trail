@@ -31,3 +31,7 @@ workspace = true
 [[bench]]
 name = "prolly_bench"
 harness = false
+
+[[bench]]
+name = "sqlite_scale_bench"
+harness = false
