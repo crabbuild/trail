@@ -3540,8 +3540,33 @@ impl CrabDb {
                 "summary": redacted_summary
             }),
         )?;
+        let approval = self.agent_approval(&approval_id)?;
+        let run_state = self.insert_agent_run_state(
+            &approval.agent_id,
+            approval.session_id.as_deref(),
+            approval.turn_id.as_deref(),
+            Some(&approval.approval_id),
+            "approval_required",
+            &approval.summary,
+            Some(serde_json::json!({
+                "agent_id": approval.agent_id.clone(),
+                "session_id": approval.session_id.clone(),
+                "turn_id": approval.turn_id.clone(),
+                "approval_id": approval.approval_id.clone(),
+                "action": approval.action.clone(),
+                "summary": approval.summary.clone(),
+                "payload": approval.payload.clone()
+            })),
+            Some(serde_json::json!({
+                "type": "approval_required",
+                "approval_id": approval.approval_id.clone(),
+                "action": approval.action.clone(),
+                "summary": approval.summary.clone()
+            })),
+        )?;
         Ok(AgentApprovalRequestReport {
-            approval: self.agent_approval(&approval_id)?,
+            approval,
+            run_state: Some(run_state),
         })
     }
 
@@ -3957,6 +3982,138 @@ impl CrabDb {
             .map_err(Error::from)
     }
 
+    pub fn pause_agent_run(
+        &mut self,
+        agent: &str,
+        reason: &str,
+        summary: &str,
+        state: Option<serde_json::Value>,
+        interruption: Option<serde_json::Value>,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<AgentRunPauseReport> {
+        let _lock = self.acquire_write_lock()?;
+        validate_ref_segment(agent)?;
+        let branch = self.agent_branch(agent)?;
+        let (session_id, turn_id) =
+            self.validate_agent_run_context(&branch, session_id, turn_id)?;
+        let run_state = self.insert_agent_run_state(
+            &branch.agent_id,
+            session_id.as_deref(),
+            turn_id.as_deref(),
+            None,
+            reason,
+            summary,
+            state,
+            interruption,
+        )?;
+        Ok(AgentRunPauseReport { run_state })
+    }
+
+    pub fn list_agent_run_states(
+        &self,
+        agent: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<AgentRunState>> {
+        let status = status
+            .map(parse_agent_run_status_filter)
+            .transpose()?
+            .flatten();
+        match (agent, status) {
+            (Some(agent), Some(status)) => {
+                let branch = self.agent_branch(agent)?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note \
+                     FROM agent_run_states WHERE agent_id = ?1 AND status = ?2 ORDER BY updated_at DESC, run_id DESC",
+                )?;
+                let rows = stmt.query_map(params![branch.agent_id, status], agent_run_state_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            }
+            (Some(agent), None) => {
+                let branch = self.agent_branch(agent)?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note \
+                     FROM agent_run_states WHERE agent_id = ?1 ORDER BY updated_at DESC, run_id DESC",
+                )?;
+                let rows = stmt.query_map(params![branch.agent_id], agent_run_state_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            }
+            (None, Some(status)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note \
+                     FROM agent_run_states WHERE status = ?1 ORDER BY updated_at DESC, run_id DESC",
+                )?;
+                let rows = stmt.query_map(params![status], agent_run_state_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note \
+                     FROM agent_run_states ORDER BY updated_at DESC, run_id DESC",
+                )?;
+                let rows = stmt.query_map([], agent_run_state_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            }
+        }
+    }
+
+    pub fn show_agent_run_state(&self, run_id: &str) -> Result<AgentRunState> {
+        self.agent_run_state(run_id)
+    }
+
+    pub fn resume_agent_run(
+        &mut self,
+        run_id: &str,
+        reviewer: Option<String>,
+        note: Option<String>,
+    ) -> Result<AgentRunResumeReport> {
+        let _lock = self.acquire_write_lock()?;
+        let run_state = self.agent_run_state(run_id)?;
+        if run_state.status != "paused" {
+            return Err(Error::InvalidInput(format!(
+                "agent run `{}` is {} and cannot be resumed",
+                run_state.run_id, run_state.status
+            )));
+        }
+        if let Some(approval_id) = run_state.approval_id.as_deref() {
+            let approval = self.agent_approval(approval_id)?;
+            if approval.status != "approved" {
+                return Err(Error::InvalidInput(format!(
+                    "agent run `{}` is waiting on approval `{approval_id}` ({})",
+                    run_state.run_id, approval.status
+                )));
+            }
+        }
+        let reviewer = reviewer.map(|reviewer| redact_sensitive_text(&reviewer));
+        let note = note.map(|note| redact_sensitive_text(&note));
+        let now = now_ts();
+        self.conn.execute(
+            "UPDATE agent_run_states SET status = 'resumed', updated_at = ?1, resumed_at = ?1, reviewer = ?2, note = ?3 WHERE run_id = ?4",
+            params![now, reviewer.clone(), note.clone(), run_state.run_id],
+        )?;
+        self.insert_agent_event_with_context(
+            &run_state.agent_id,
+            run_state.session_id.as_deref(),
+            run_state.turn_id.as_deref(),
+            "run_resumed",
+            None,
+            None,
+            &serde_json::json!({
+                "run_id": run_state.run_id,
+                "approval_id": run_state.approval_id,
+                "reviewer": reviewer,
+                "note": note
+            }),
+        )?;
+        Ok(AgentRunResumeReport {
+            run_state: self.agent_run_state(run_id)?,
+        })
+    }
+
     pub fn show_agent_approval(&self, approval_id: &str) -> Result<AgentApproval> {
         self.agent_approval(approval_id)
     }
@@ -3998,9 +4155,21 @@ impl CrabDb {
                 "note": note
             }),
         )?;
+        if matches!(decision, "rejected" | "cancelled") {
+            let run_status = if decision == "rejected" {
+                "blocked"
+            } else {
+                "cancelled"
+            };
+            self.conn.execute(
+                "UPDATE agent_run_states SET status = ?1, updated_at = ?2, reviewer = ?3, note = ?4 WHERE approval_id = ?5 AND status = 'paused'",
+                params![run_status, decided_at, reviewer.clone(), note.clone(), approval_id],
+            )?;
+        }
         Ok(AgentApprovalDecisionReport {
             approval: self.agent_approval(approval_id)?,
             decision: decision.to_string(),
+            run_states: self.agent_run_states_for_approval(approval_id)?,
         })
     }
 
@@ -7145,6 +7314,26 @@ impl CrabDb {
             );
             CREATE INDEX IF NOT EXISTS agent_approvals_status_idx ON agent_approvals(status, requested_at);
             CREATE INDEX IF NOT EXISTS agent_approvals_agent_idx ON agent_approvals(agent_id, requested_at);
+            CREATE TABLE IF NOT EXISTS agent_run_states (
+                run_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_id TEXT,
+                turn_id TEXT,
+                approval_id TEXT,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                interruption_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                resumed_at INTEGER,
+                reviewer TEXT,
+                note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS agent_run_states_agent_idx ON agent_run_states(agent_id, updated_at);
+            CREATE INDEX IF NOT EXISTS agent_run_states_status_idx ON agent_run_states(status, updated_at);
+            CREATE INDEX IF NOT EXISTS agent_run_states_approval_idx ON agent_run_states(approval_id);
             CREATE TABLE IF NOT EXISTS leases (
                 lease_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -8628,6 +8817,148 @@ impl CrabDb {
             )
             .optional()?
             .ok_or_else(|| Error::InvalidInput(format!("event `{event_id}` not found")))
+    }
+
+    fn validate_agent_run_context(
+        &self,
+        branch: &AgentBranch,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let turn = turn_id
+            .map(|turn_id| self.agent_turn(turn_id))
+            .transpose()?;
+        if let Some(turn) = &turn {
+            if turn.agent_id != branch.agent_id {
+                return Err(Error::InvalidInput(format!(
+                    "turn `{}` does not belong to agent `{}`",
+                    turn.turn_id, branch.agent_id
+                )));
+            }
+            if turn.ended_at.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "turn `{}` is already ended",
+                    turn.turn_id
+                )));
+            }
+        }
+        let resolved_session_id = session_id
+            .map(str::to_string)
+            .or_else(|| turn.as_ref().and_then(|turn| turn.session_id.clone()))
+            .or_else(|| branch.session_id.clone());
+        if let Some(session_id) = resolved_session_id.as_deref() {
+            let session = self.agent_session(session_id)?;
+            if session.agent_id != branch.agent_id {
+                return Err(Error::InvalidInput(format!(
+                    "session `{session_id}` does not belong to agent `{}`",
+                    branch.agent_id
+                )));
+            }
+        }
+        Ok((resolved_session_id, turn_id.map(str::to_string)))
+    }
+
+    fn insert_agent_run_state(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        approval_id: Option<&str>,
+        reason: &str,
+        summary: &str,
+        state: Option<serde_json::Value>,
+        interruption: Option<serde_json::Value>,
+    ) -> Result<AgentRunState> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(Error::InvalidInput(
+                "agent run pause reason cannot be empty".to_string(),
+            ));
+        }
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err(Error::InvalidInput(
+                "agent run pause summary cannot be empty".to_string(),
+            ));
+        }
+        let redacted_reason = redact_sensitive_text(reason);
+        let redacted_summary = redact_sensitive_text(summary);
+        let redacted_state = redact_sensitive_json(state.unwrap_or_else(|| serde_json::json!({})));
+        let redacted_interruption = interruption.map(redact_sensitive_json);
+        let seed = format!(
+            "{}:{}:{}:{}:{}:{}",
+            agent_id,
+            session_id.unwrap_or("none"),
+            turn_id.unwrap_or("none"),
+            approval_id.unwrap_or("none"),
+            redacted_reason,
+            now_nanos()
+        );
+        let run_id = format!("run_{}", crate::ids::short_hash(seed.as_bytes(), 16));
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO agent_run_states \
+             (run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'paused', ?6, ?7, ?8, ?9, ?10, ?10, NULL, NULL, NULL)",
+            params![
+                run_id,
+                agent_id,
+                session_id,
+                turn_id,
+                approval_id,
+                redacted_reason,
+                redacted_summary,
+                serde_json::to_string(&redacted_state)?,
+                redacted_interruption
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                now
+            ],
+        )?;
+        self.insert_agent_event_with_context(
+            agent_id,
+            session_id,
+            turn_id,
+            "run_paused",
+            None,
+            None,
+            &serde_json::json!({
+                "run_id": run_id,
+                "approval_id": approval_id,
+                "reason": redacted_reason,
+                "summary": redacted_summary
+            }),
+        )?;
+        self.agent_run_state(&run_id)
+    }
+
+    fn agent_run_state(&self, run_id: &str) -> Result<AgentRunState> {
+        let run_id = run_id.trim();
+        if run_id.is_empty() {
+            return Err(Error::InvalidInput(
+                "agent run id cannot be empty".to_string(),
+            ));
+        }
+        self.conn
+            .query_row(
+                "SELECT run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note \
+                 FROM agent_run_states WHERE run_id = ?1",
+                params![run_id],
+                agent_run_state_row,
+            )
+            .optional()?
+            .ok_or_else(|| Error::InvalidInput(format!("agent run `{run_id}` not found")))
+    }
+
+    fn agent_run_states_for_approval(&self, approval_id: &str) -> Result<Vec<AgentRunState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, agent_id, session_id, turn_id, approval_id, status, reason, summary, state_json, interruption_json, created_at, updated_at, resumed_at, reviewer, note \
+             FROM agent_run_states WHERE approval_id = ?1 ORDER BY updated_at DESC, run_id DESC",
+        )?;
+        let rows = stmt.query_map(params![approval_id], agent_run_state_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     fn agent_approval(&self, approval_id: &str) -> Result<AgentApproval> {
@@ -12284,6 +12615,19 @@ fn parse_approval_status_filter(value: &str) -> Result<Option<&'static str>> {
     }
 }
 
+fn parse_agent_run_status_filter(value: &str) -> Result<Option<&'static str>> {
+    match value {
+        "all" => Ok(None),
+        "paused" => Ok(Some("paused")),
+        "resumed" => Ok(Some("resumed")),
+        "blocked" => Ok(Some("blocked")),
+        "cancelled" | "canceled" => Ok(Some("cancelled")),
+        other => Err(Error::InvalidInput(format!(
+            "agent run status must be paused, resumed, blocked, cancelled, or all, got `{other}`"
+        ))),
+    }
+}
+
 fn parse_approval_decision(value: &str) -> Result<&'static str> {
     match value {
         "approved" | "approve" => Ok("approved"),
@@ -12646,6 +12990,32 @@ fn agent_approval_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentApproval
         decided_at: row.get(9)?,
         reviewer: row.get(10)?,
         note: row.get(11)?,
+    })
+}
+
+fn agent_run_state_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunState> {
+    let state_json: String = row.get(8)?;
+    let state =
+        serde_json::from_str::<serde_json::Value>(&state_json).unwrap_or(serde_json::Value::Null);
+    let interruption_json: Option<String> = row.get(9)?;
+    let interruption =
+        interruption_json.and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+    Ok(AgentRunState {
+        run_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        session_id: row.get(2)?,
+        turn_id: row.get(3)?,
+        approval_id: row.get(4)?,
+        status: row.get(5)?,
+        reason: row.get(6)?,
+        summary: row.get(7)?,
+        state,
+        interruption,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        resumed_at: row.get(12)?,
+        reviewer: row.get(13)?,
+        note: row.get(14)?,
     })
 }
 

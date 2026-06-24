@@ -1268,6 +1268,64 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         .as_str()
         .unwrap()
         .to_string();
+    assert_eq!(requested["run_state"]["status"], "paused");
+    assert_eq!(requested["run_state"]["reason"], "approval_required");
+    assert_eq!(requested["run_state"]["approval_id"], approval_id);
+    assert_eq!(requested["run_state"]["session_id"], session_id);
+    assert_eq!(requested["run_state"]["turn_id"], turn_id);
+    let run_id = requested["run_state"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let pending_resume = crabdb::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            &format!("/v1/agent/runs/{run_id}/resume"),
+            serde_json::json!({ "reviewer": "human-reviewer" }),
+        ),
+    );
+    assert_eq!(pending_resume.status, 400);
+    let pending_resume: serde_json::Value = pending_resume.body_json().unwrap();
+    assert!(pending_resume["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("waiting on approval"));
+
+    let run_list = crabdb::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/agent/runs?agent=approval-bot&status=paused",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(run_list.status, 200);
+    let run_list: serde_json::Value = run_list.body_json().unwrap();
+    assert!(run_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run_state| run_state["run_id"] == run_id));
+
+    let cli_run_list = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "run",
+            "list",
+            "--agent",
+            "approval-bot",
+            "--status",
+            "paused",
+        ],
+    );
+    assert!(cli_run_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run_state| run_state["run_id"] == run_id));
 
     let pending = crabdb::server::handle_http_request(
         &mut db,
@@ -1329,9 +1387,128 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         "crabdb.approval_list",
         "crabdb.approval_show",
         "crabdb.approval_decide",
+        "crabdb.run_pause",
+        "crabdb.run_list",
+        "crabdb.run_show",
+        "crabdb.run_resume",
     ] {
         assert!(tool_list.iter().any(|tool| tool["name"] == name), "{name}");
     }
+
+    let mcp_run_show = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.run_show",
+                "arguments": {
+                    "run_id": run_id.clone()
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_run_show["result"]["isError"], false);
+    assert_eq!(
+        mcp_run_show["result"]["structuredContent"]["approval_id"],
+        approval_id
+    );
+
+    let mcp_run_resource = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "resources/read",
+            "params": {
+                "uri": format!("crabdb://workspace/runs/{run_id}")
+            }
+        }),
+    )
+    .unwrap();
+    let run_resource_text = mcp_run_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(run_resource_text.contains(&run_id));
+
+    let mcp_pause = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.run_pause",
+                "arguments": {
+                    "agent": "approval-bot",
+                    "reason": "handoff",
+                    "summary": "Pause for coordinator review",
+                    "session_id": session_id.clone(),
+                    "turn_id": turn_id.clone(),
+                    "state": { "step": "review" },
+                    "interruption": { "type": "handoff" }
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_pause["result"]["isError"], false);
+    let manual_run_id = mcp_pause["result"]["structuredContent"]["run_state"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        mcp_pause["result"]["structuredContent"]["run_state"]["status"],
+        "paused"
+    );
+
+    let mcp_run_list = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.run_list",
+                "arguments": {
+                    "agent": "approval-bot",
+                    "status": "paused"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_run_list["result"]["isError"], false);
+    assert!(mcp_run_list["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|run_state| run_state["run_id"] == manual_run_id));
+
+    let mcp_run_resume = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.run_resume",
+                "arguments": {
+                    "run_id": manual_run_id,
+                    "reviewer": "coordinator",
+                    "note": "Handoff accepted"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_run_resume["result"]["isError"], false);
+    assert_eq!(
+        mcp_run_resume["result"]["structuredContent"]["run_state"]["status"],
+        "resumed"
+    );
 
     let mcp_show = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -1377,6 +1554,44 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         mcp_decide["result"]["structuredContent"]["approval"]["status"],
         "approved"
     );
+    assert_eq!(
+        mcp_decide["result"]["structuredContent"]["run_states"][0]["run_id"],
+        run_id
+    );
+    assert_eq!(
+        mcp_decide["result"]["structuredContent"]["run_states"][0]["status"],
+        "paused"
+    );
+
+    let resumed = crabdb::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            &format!("/v1/agent/runs/{run_id}/resume"),
+            serde_json::json!({
+                "reviewer": "human-reviewer",
+                "note": "Approval accepted; continue"
+            }),
+        ),
+    );
+    assert_eq!(resumed.status, 200);
+    let resumed: serde_json::Value = resumed.body_json().unwrap();
+    assert_eq!(resumed["run_state"]["run_id"], run_id);
+    assert_eq!(resumed["run_state"]["status"], "resumed");
+    assert_eq!(resumed["run_state"]["reviewer"], "human-reviewer");
+
+    let shown_run = crabdb::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            &format!("/v1/agent/runs/{run_id}"),
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(shown_run.status, 200);
+    let shown_run: serde_json::Value = shown_run.body_json().unwrap();
+    assert_eq!(shown_run["run_id"], run_id);
+    assert_eq!(shown_run["status"], "resumed");
 
     let shown = crabdb::server::handle_http_request(
         &mut db,
@@ -1458,13 +1673,21 @@ fn local_api_and_mcp_manage_human_approval_gates() {
             Some(&turn_id),
         )
         .unwrap();
-    db.decide_agent_approval(
-        &rejected.approval.approval_id,
-        "rejected",
-        Some("human-reviewer".to_string()),
-        Some("Preview deploy is not allowed".to_string()),
-    )
-    .unwrap();
+    let rejected_run_id = rejected.run_state.as_ref().unwrap().run_id.clone();
+    let rejected_decision = db
+        .decide_agent_approval(
+            &rejected.approval.approval_id,
+            "rejected",
+            Some("human-reviewer".to_string()),
+            Some("Preview deploy is not allowed".to_string()),
+        )
+        .unwrap();
+    assert_eq!(rejected_decision.run_states[0].run_id, rejected_run_id);
+    assert_eq!(rejected_decision.run_states[0].status, "blocked");
+    let rejected_resume = db
+        .resume_agent_run(&rejected_run_id, Some("human-reviewer".to_string()), None)
+        .unwrap_err();
+    assert!(rejected_resume.to_string().contains("cannot be resumed"));
     let rejected_guardrail = db
         .guardrail_check(
             Some("approval-bot"),
@@ -1489,6 +1712,14 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         .events
         .iter()
         .any(|event| event.event_type == "approval_decided"));
+    assert!(details
+        .events
+        .iter()
+        .any(|event| event.event_type == "run_paused"));
+    assert!(details
+        .events
+        .iter()
+        .any(|event| event.event_type == "run_resumed"));
 }
 
 #[test]

@@ -154,6 +154,9 @@ This repository now includes a production-oriented local v1 slice:
 - Durable human approval gates for sensitive agent actions through CLI, HTTP,
   and MCP, with decisions linked back into agent/session traces and matching
   approved/rejected decisions reflected in later guardrail checks.
+- Durable paused agent run checkpoints through CLI, HTTP, and MCP, with
+  approval requests returning a linked resumable run state and rejected
+  approvals blocking linked resumes.
 - Local JSON HTTP API for agent turn, message, patch, and close workflows.
 - MCP stdio tool server for model-controlled CrabDB status, agent turn, trace,
   patch, and diff workflows.
@@ -198,7 +201,8 @@ This repository now includes a production-oriented local v1 slice:
 - Read-only MCP resources for workspace status, doctor diagnostics, agents,
   merge queue, conflicts, OpenAPI, and bundled user/agent/CLI guides.
 - MCP resource templates and completions for host navigation across agents,
-  agent handoffs, sessions, turns, conflicts, approvals, and trace spans.
+  agent handoffs, sessions, turns, conflicts, approvals, run states, and trace
+  spans.
 - MCP tool annotations for every advertised tool, including read-only,
   destructive, idempotent, and open-world hints for host permission UX.
 - MCP prompt templates for safe agent task execution, branch review, and

@@ -30,6 +30,7 @@ const RESOURCE_SESSION_TEMPLATE: &str = "crabdb://workspace/sessions/{session_id
 const RESOURCE_TURN_TEMPLATE: &str = "crabdb://workspace/turns/{turn_id}";
 const RESOURCE_CONFLICT_TEMPLATE: &str = "crabdb://workspace/conflicts/{conflict_set_id}";
 const RESOURCE_APPROVAL_TEMPLATE: &str = "crabdb://workspace/approvals/{approval_id}";
+const RESOURCE_RUN_TEMPLATE: &str = "crabdb://workspace/runs/{run_id}";
 const RESOURCE_SPAN_TEMPLATE: &str = "crabdb://workspace/spans/{span_id}";
 const PROMPT_AGENT_TASK: &str = "crabdb.agent_task";
 const PROMPT_REVIEW_AGENT: &str = "crabdb.review_agent";
@@ -195,6 +196,43 @@ struct ApprovalShowArgs {
 struct ApprovalDecideArgs {
     approval_id: String,
     decision: String,
+    #[serde(default)]
+    reviewer: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRunPauseArgs {
+    agent: String,
+    reason: String,
+    summary: String,
+    #[serde(default)]
+    state: Option<Value>,
+    #[serde(default)]
+    interruption: Option<Value>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default, alias = "turn")]
+    turn_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRunListArgs {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRunShowArgs {
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRunResumeArgs {
+    run_id: String,
     #[serde(default)]
     reviewer: Option<String>,
     #[serde(default)]
@@ -838,6 +876,30 @@ fn handle_tool_call(db: &mut CrabDb, params: Value) -> Result<Value> {
                 args.note,
             )?)
         }
+        "crabdb.run_pause" => {
+            let args: AgentRunPauseArgs = from_arguments(call.arguments)?;
+            tool_result(db.pause_agent_run(
+                &args.agent,
+                &args.reason,
+                &args.summary,
+                args.state,
+                args.interruption,
+                args.session_id.as_deref(),
+                args.turn_id.as_deref(),
+            )?)
+        }
+        "crabdb.run_list" => {
+            let args: AgentRunListArgs = from_arguments(call.arguments)?;
+            tool_result(db.list_agent_run_states(args.agent.as_deref(), args.status.as_deref())?)
+        }
+        "crabdb.run_show" => {
+            let args: AgentRunShowArgs = from_arguments(call.arguments)?;
+            tool_result(db.show_agent_run_state(&args.run_id)?)
+        }
+        "crabdb.run_resume" => {
+            let args: AgentRunResumeArgs = from_arguments(call.arguments)?;
+            tool_result(db.resume_agent_run(&args.run_id, args.reviewer, args.note)?)
+        }
         "crabdb.lease_acquire" => {
             let args: LeaseAcquireArgs = from_arguments(call.arguments)?;
             let mode = args.mode.unwrap_or_else(default_lease_mode);
@@ -1277,6 +1339,13 @@ fn resource_templates() -> Value {
             "mimeType": "application/json"
         },
         {
+            "uriTemplate": RESOURCE_RUN_TEMPLATE,
+            "name": "agent-run",
+            "title": "Agent Run State",
+            "description": "Read one durable paused/resumed agent run checkpoint.",
+            "mimeType": "application/json"
+        },
+        {
             "uriTemplate": RESOURCE_SPAN_TEMPLATE,
             "name": "trace-span",
             "title": "Trace Span",
@@ -1554,6 +1623,14 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
             pretty_json(&db.show_agent_approval(&approval_id)?)?,
         ));
     }
+    if let Some(run_id) =
+        template_uri_argument(uri, "crabdb://workspace/runs/", "", RESOURCE_RUN_TEMPLATE)?
+    {
+        return Ok((
+            "application/json",
+            pretty_json(&db.show_agent_run_state(&run_id)?)?,
+        ));
+    }
     if let Some(span_id) =
         template_uri_argument(uri, "crabdb://workspace/spans/", "", RESOURCE_SPAN_TEMPLATE)?
     {
@@ -1650,7 +1727,7 @@ Workflow:\n\
 3. Start a turn with `crabdb.begin_turn`, then attach the user request with `crabdb.add_message`.\n\
 4. Claim busy paths with `crabdb.agent_claim` when multiple agents may edit the same files, then prefer structured patches through `crabdb.apply_patch`; preflight risky shell, network, deploy, destructive, or ignored-path work with `crabdb.guardrail_check`.\n\
 5. Record trace spans/events for tool calls, guardrails, and handoffs.\n\
-6. Request human approval with `crabdb.approval_request` when `crabdb.guardrail_check` returns `approval_required`.\n\
+6. Request human approval with `crabdb.approval_request` when `crabdb.guardrail_check` returns `approval_required`; keep the returned run checkpoint and resume it with `crabdb.run_resume` after approval.\n\
 7. Run `crabdb.run_test` and, when model/policy quality matters, `crabdb.run_eval`.\n\
 8. End the turn with `crabdb.end_turn`, inspect `crabdb.agent_status`, `crabdb.agent_handoff`, and `crabdb.diff_agent`, then queue or merge only after review.\n\
 9. If merge conflicts appear, use `crabdb.conflict_show` and `crabdb.conflict_resolve`; do not overwrite target changes silently."
@@ -1672,7 +1749,7 @@ Checklist:\n\
 5. Call `crabdb.agent_status` for `{agent}` and confirm the branch/workdir state is clean enough to review.\n\
 6. Call `crabdb.diff_agent` with patches and line ids; inspect provenance with `crabdb.why`, `crabdb.history`, and `crabdb.code_from` when a change is unclear.\n\
 7. Confirm latest tests and evals passed or explain why warnings are acceptable.\n\
-8. Use `crabdb.approval_request` for any unresolved human decision.\n\
+8. Use `crabdb.approval_request` for any unresolved human decision and inspect linked paused runs with `crabdb.run_list`.\n\
 9. Prefer `crabdb.merge_queue_add` plus `crabdb.merge_queue_run` for shared target branches; use direct `merge-agent` only for one-off merges.\n\
 10. If conflicts exist, stop review and switch to the `{PROMPT_RESOLVE_CONFLICT}` prompt."
                 ),
@@ -1841,6 +1918,7 @@ fn resource_completion_candidates(
         (RESOURCE_TURN_TEMPLATE, "turn_id") => turn_completion_candidates(db),
         (RESOURCE_CONFLICT_TEMPLATE, "conflict_set_id") => conflict_completion_candidates(db),
         (RESOURCE_APPROVAL_TEMPLATE, "approval_id") => approval_completion_candidates(db),
+        (RESOURCE_RUN_TEMPLATE, "run_id") => run_completion_candidates(db),
         (RESOURCE_SPAN_TEMPLATE, "span_id") => span_completion_candidates(db),
         (
             RESOURCE_AGENT_TEMPLATE
@@ -1854,6 +1932,7 @@ fn resource_completion_candidates(
             | RESOURCE_TURN_TEMPLATE
             | RESOURCE_CONFLICT_TEMPLATE
             | RESOURCE_APPROVAL_TEMPLATE
+            | RESOURCE_RUN_TEMPLATE
             | RESOURCE_SPAN_TEMPLATE,
             _,
         ) => Ok(Vec::new()),
@@ -1916,6 +1995,14 @@ fn approval_completion_candidates(db: &CrabDb) -> Result<Vec<String>> {
         .list_agent_approvals(None, None)?
         .into_iter()
         .map(|approval| approval.approval_id)
+        .collect())
+}
+
+fn run_completion_candidates(db: &CrabDb) -> Result<Vec<String>> {
+    Ok(db
+        .list_agent_run_states(None, None)?
+        .into_iter()
+        .map(|run_state| run_state.run_id)
         .collect())
 }
 
@@ -2234,6 +2321,47 @@ fn tools() -> Value {
                 "reviewer": { "type": "string" },
                 "note": { "type": "string" }
             }), vec!["approval_id", "decision"])
+        },
+        {
+            "name": "crabdb.run_pause",
+            "title": "Pause Agent Run",
+            "description": "Persist a serialized paused agent run checkpoint for later resume.",
+            "inputSchema": object_schema(json!({
+                "agent": { "type": "string" },
+                "reason": { "type": "string" },
+                "summary": { "type": "string" },
+                "state": { "type": "object" },
+                "interruption": { "type": "object" },
+                "session_id": { "type": "string" },
+                "turn_id": { "type": "string" }
+            }), vec!["agent", "reason", "summary"])
+        },
+        {
+            "name": "crabdb.run_list",
+            "title": "List Agent Run States",
+            "description": "List durable paused/resumed agent checkpoints, optionally scoped by agent and status.",
+            "inputSchema": object_schema(json!({
+                "agent": { "type": "string" },
+                "status": { "type": "string", "enum": ["paused", "resumed", "blocked", "cancelled", "all"] }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.run_show",
+            "title": "Show Agent Run State",
+            "description": "Show one durable agent run checkpoint by id.",
+            "inputSchema": object_schema(json!({
+                "run_id": { "type": "string" }
+            }), vec!["run_id"])
+        },
+        {
+            "name": "crabdb.run_resume",
+            "title": "Resume Agent Run",
+            "description": "Mark a paused checkpoint resumed after any linked approval is approved.",
+            "inputSchema": object_schema(json!({
+                "run_id": { "type": "string" },
+                "reviewer": { "type": "string" },
+                "note": { "type": "string" }
+            }), vec!["run_id"])
         },
         {
             "name": "crabdb.lease_acquire",
@@ -2691,6 +2819,8 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.session_context"
         | "crabdb.approval_list"
         | "crabdb.approval_show"
+        | "crabdb.run_list"
+        | "crabdb.run_show"
         | "crabdb.lease_list"
         | "crabdb.anchor_list"
         | "crabdb.anchor_resolve"

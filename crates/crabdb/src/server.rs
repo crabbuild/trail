@@ -229,6 +229,29 @@ struct ApprovalDecisionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AgentRunPauseRequest {
+    agent: String,
+    reason: String,
+    summary: String,
+    #[serde(default)]
+    state: Option<serde_json::Value>,
+    #[serde(default)]
+    interruption: Option<serde_json::Value>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default, alias = "turn")]
+    turn_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRunResumeRequest {
+    #[serde(default)]
+    reviewer: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LeaseAcquireRequest {
     agent: String,
     #[serde(default)]
@@ -633,6 +656,23 @@ pub fn openapi_spec() -> serde_json::Value {
                     openapi_query("slowest", "integer")
                 ], None, true)
             },
+            "/v1/agent/runs": {
+                "get": openapi_operation("agentRunList", "List agent run states", "List durable paused/resumed agent run checkpoints, optionally scoped by agent and status.", vec![
+                    openapi_query("agent", "string"),
+                    openapi_query("status", "string")
+                ], None, true),
+                "post": openapi_operation("agentRunPause", "Pause agent run", "Persist a serialized paused agent run checkpoint for later resume.", vec![], Some("AgentRunPauseRequest"), true)
+            },
+            "/v1/agent/runs/{run_id}": {
+                "get": openapi_operation("agentRunShow", "Show agent run state", "Show one durable agent run checkpoint.", vec![
+                    openapi_path_param("run_id", "string")
+                ], None, true)
+            },
+            "/v1/agent/runs/{run_id}/resume": {
+                "post": openapi_operation("agentRunResume", "Resume agent run", "Mark a paused checkpoint resumed after any linked approval is approved.", vec![
+                    openapi_path_param("run_id", "string")
+                ], Some("AgentRunResumeRequest"), true)
+            },
             "/v1/agent/spans/{span_id}": {
                 "get": openapi_operation("spanShow", "Show trace span", "Show one derived agent trace span.", vec![
                     openapi_path_param("span_id", "string")
@@ -952,6 +992,27 @@ fn openapi_schemas() -> serde_json::Value {
             "required": ["decision"],
             "properties": {
                 "decision": { "type": "string", "enum": ["approved", "rejected", "cancelled"] },
+                "reviewer": { "type": "string" },
+                "note": { "type": "string" }
+            }
+        },
+        "AgentRunPauseRequest": {
+            "type": "object",
+            "required": ["agent", "reason", "summary"],
+            "properties": {
+                "agent": { "type": "string" },
+                "reason": { "type": "string" },
+                "summary": { "type": "string" },
+                "state": { "type": "object", "additionalProperties": true },
+                "interruption": { "type": "object", "additionalProperties": true },
+                "session_id": { "type": "string" },
+                "turn_id": { "type": "string" },
+                "turn": { "type": "string" }
+            }
+        },
+        "AgentRunResumeRequest": {
+            "type": "object",
+            "properties": {
                 "reviewer": { "type": "string" },
                 "note": { "type": "string" }
             }
@@ -1421,6 +1482,26 @@ fn route_request_result(
         return json_response(200, "OK", &report);
     }
 
+    if request.method == "GET" && path == "/v1/agent/runs" {
+        let run_states =
+            db.list_agent_run_states(query_value(query, "agent"), query_value(query, "status"))?;
+        return json_response(200, "OK", &run_states);
+    }
+
+    if request.method == "POST" && path == "/v1/agent/runs" {
+        let body: AgentRunPauseRequest = serde_json::from_slice(&request.body)?;
+        let report = db.pause_agent_run(
+            &body.agent,
+            &body.reason,
+            &body.summary,
+            body.state,
+            body.interruption,
+            body.session_id.as_deref(),
+            body.turn_id.as_deref(),
+        )?;
+        return json_response(201, "Created", &report);
+    }
+
     if request.method == "GET" && path == "/v1/sessions/current" {
         let reports = db.current_agent_sessions(query_value(query, "agent"))?;
         return json_response(200, "OK", &reports);
@@ -1534,6 +1615,35 @@ fn route_request_result(
     if parts.len() == 3 && parts[0] == "v1" && parts[1] == "approvals" && request.method == "GET" {
         let approval = db.show_agent_approval(parts[2])?;
         return json_response(200, "OK", &approval);
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "agent"
+        && parts[2] == "runs"
+        && request.method == "GET"
+    {
+        let run_state = db.show_agent_run_state(parts[3])?;
+        return json_response(200, "OK", &run_state);
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "agent"
+        && parts[2] == "runs"
+        && parts[4] == "resume"
+        && request.method == "POST"
+    {
+        let body: AgentRunResumeRequest = if request.body.is_empty() {
+            AgentRunResumeRequest {
+                reviewer: None,
+                note: None,
+            }
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.resume_agent_run(parts[3], body.reviewer, body.note)?;
+        return json_response(200, "OK", &report);
     }
 
     if parts.len() == 4

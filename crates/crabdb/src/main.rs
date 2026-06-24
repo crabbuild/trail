@@ -11,22 +11,22 @@ use crabdb::model::{
     AgentApproval, AgentApprovalDecisionReport, AgentApprovalRequestReport, AgentClaimReport,
     AgentContributionReport, AgentDetails, AgentEventRecord, AgentGateHistoryReport,
     AgentGateOptions, AgentHandoffReport, AgentMessageReport, AgentPatchReport,
-    AgentReadinessReport, AgentRecordReport, AgentRemoveReport, AgentSession,
-    AgentSessionContextReport, AgentSessionCurrentReport, AgentSessionDetails,
-    AgentSessionEndReport, AgentSessionStartReport, AgentSpawnReport, AgentStatusReport,
-    AgentTestReport, AgentTraceSpan, AgentTraceSpanEndReport, AgentTraceSpanStartReport,
-    AgentTraceSummaryReport, AgentWatchReport, AgentWorkdirReport, AgentWorkdirSyncReport, Anchor,
-    AnchorCreateReport, AnchorDeleteReport, AnchorResolveReport, BackupCreateReport,
-    BackupRestoreReport, BackupVerifyReport, BranchDeleteReport, BranchListEntry,
-    BranchRenameReport, BranchReport, CheckoutReport, CodeFromResult, ConfigEntry, ConfigSetReport,
-    ConflictManualFile, ConflictManualResolution, ConflictResolveReport, ConflictSetSummary,
-    DiffSummary, DoctorReport, FsckReport, GcReport, GitExportReport, GitImportReport, GitMapping,
-    GuardrailCheckReport, HistoryResult, IgnoreAddReport, IgnoreCheckReport, IgnoreListReport,
-    IgnoreRemoveReport, IndexRebuildReport, InitReport, LeaseAcquireReport, LeaseRecord,
-    LeaseReleaseReport, MapDiffReport, MapRangeReport, MergeQueueAddReport, MergeQueueEntry,
-    MergeQueueRemoveReport, MergeQueueRunReport, MergeReport, ObjectInspectReport, OperationKind,
-    RecordOptions, RecordReport, RootInspectReport, ShowResult, StatusReport, TextInspectReport,
-    TimelineEntry, WhyResult,
+    AgentReadinessReport, AgentRecordReport, AgentRemoveReport, AgentRunPauseReport,
+    AgentRunResumeReport, AgentRunState, AgentSession, AgentSessionContextReport,
+    AgentSessionCurrentReport, AgentSessionDetails, AgentSessionEndReport, AgentSessionStartReport,
+    AgentSpawnReport, AgentStatusReport, AgentTestReport, AgentTraceSpan, AgentTraceSpanEndReport,
+    AgentTraceSpanStartReport, AgentTraceSummaryReport, AgentWatchReport, AgentWorkdirReport,
+    AgentWorkdirSyncReport, Anchor, AnchorCreateReport, AnchorDeleteReport, AnchorResolveReport,
+    BackupCreateReport, BackupRestoreReport, BackupVerifyReport, BranchDeleteReport,
+    BranchListEntry, BranchRenameReport, BranchReport, CheckoutReport, CodeFromResult, ConfigEntry,
+    ConfigSetReport, ConflictManualFile, ConflictManualResolution, ConflictResolveReport,
+    ConflictSetSummary, DiffSummary, DoctorReport, FsckReport, GcReport, GitExportReport,
+    GitImportReport, GitMapping, GuardrailCheckReport, HistoryResult, IgnoreAddReport,
+    IgnoreCheckReport, IgnoreListReport, IgnoreRemoveReport, IndexRebuildReport, InitReport,
+    LeaseAcquireReport, LeaseRecord, LeaseReleaseReport, MapDiffReport, MapRangeReport,
+    MergeQueueAddReport, MergeQueueEntry, MergeQueueRemoveReport, MergeQueueRunReport, MergeReport,
+    ObjectInspectReport, OperationKind, RecordOptions, RecordReport, RootInspectReport, ShowResult,
+    StatusReport, TextInspectReport, TimelineEntry, WhyResult,
 };
 use crabdb::{Actor, CrabDb, Error, InitImportMode, PatchDocument, Result, WorktreeState};
 
@@ -462,6 +462,7 @@ enum AgentSubcommand {
     Claim(AgentClaimArgs),
     Message(AgentMessageArgs),
     Turn(AgentTurnCommand),
+    Run(AgentRunCommand),
     Events(AgentEventsArgs),
     Trace(AgentTraceCommand),
     Record(AgentRecordArgs),
@@ -641,6 +642,59 @@ struct AgentTurnEndArgs {
     turn_id: String,
     #[arg(long, default_value = "completed")]
     status: String,
+}
+
+#[derive(Subcommand)]
+enum AgentRunSubcommand {
+    Pause(AgentRunPauseArgs),
+    List(AgentRunListArgs),
+    Show(AgentRunShowArgs),
+    Resume(AgentRunResumeArgs),
+}
+
+#[derive(Args)]
+struct AgentRunCommand {
+    #[command(subcommand)]
+    command: AgentRunSubcommand,
+}
+
+#[derive(Args)]
+struct AgentRunPauseArgs {
+    name: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long)]
+    summary: String,
+    #[arg(long = "state-json")]
+    state_json: Option<String>,
+    #[arg(long = "interruption-json")]
+    interruption_json: Option<String>,
+    #[arg(long)]
+    session: Option<String>,
+    #[arg(long)]
+    turn: Option<String>,
+}
+
+#[derive(Args)]
+struct AgentRunListArgs {
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+}
+
+#[derive(Args)]
+struct AgentRunShowArgs {
+    run_id: String,
+}
+
+#[derive(Args)]
+struct AgentRunResumeArgs {
+    run_id: String,
+    #[arg(long)]
+    reviewer: Option<String>,
+    #[arg(long)]
+    note: Option<String>,
 }
 
 #[derive(Args)]
@@ -1761,6 +1815,39 @@ fn run(cli: Cli) -> Result<()> {
                     let mut db = open_db(&ctx)?;
                     let report = db.end_agent_turn(&args.turn_id, &args.status)?;
                     render_agent_turn_end(&report, ctx.json, ctx.quiet)
+                }
+            },
+            AgentSubcommand::Run(run) => match run.command {
+                AgentRunSubcommand::Pause(args) => {
+                    let mut db = open_db(&ctx)?;
+                    let state = parse_optional_json(args.state_json.as_deref())?;
+                    let interruption = parse_optional_json(args.interruption_json.as_deref())?;
+                    let report = db.pause_agent_run(
+                        &args.name,
+                        &args.reason,
+                        &args.summary,
+                        state,
+                        interruption,
+                        args.session.as_deref(),
+                        args.turn.as_deref(),
+                    )?;
+                    render_agent_run_pause(&report, ctx.json, ctx.quiet)
+                }
+                AgentRunSubcommand::List(args) => {
+                    let db = open_db(&ctx)?;
+                    let run_states =
+                        db.list_agent_run_states(args.agent.as_deref(), args.status.as_deref())?;
+                    render_agent_run_list(&run_states, ctx.json, ctx.quiet)
+                }
+                AgentRunSubcommand::Show(args) => {
+                    let db = open_db(&ctx)?;
+                    let run_state = db.show_agent_run_state(&args.run_id)?;
+                    render_agent_run_state(&run_state, ctx.json, ctx.quiet)
+                }
+                AgentRunSubcommand::Resume(args) => {
+                    let mut db = open_db(&ctx)?;
+                    let report = db.resume_agent_run(&args.run_id, args.reviewer, args.note)?;
+                    render_agent_run_resume(&report, ctx.json, ctx.quiet)
                 }
             },
             AgentSubcommand::Events(args) => {
@@ -3980,6 +4067,89 @@ fn render_agent_turn_end(
     Ok(())
 }
 
+fn render_agent_run_pause(report: &AgentRunPauseReport, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Paused run {} for {}",
+            report.run_state.run_id, report.run_state.agent_id
+        );
+        println!("Reason: {}", report.run_state.reason);
+        println!("Summary: {}", report.run_state.summary);
+        if let Some(approval_id) = &report.run_state.approval_id {
+            println!("Approval: {approval_id}");
+        }
+    }
+    Ok(())
+}
+
+fn render_agent_run_resume(report: &AgentRunResumeReport, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Resumed run {} for {}",
+            report.run_state.run_id, report.run_state.agent_id
+        );
+        if let Some(resumed_at) = report.run_state.resumed_at {
+            println!("Resumed at: {resumed_at}");
+        }
+    }
+    Ok(())
+}
+
+fn render_agent_run_list(run_states: &[AgentRunState], json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(run_states);
+    }
+    if !quiet {
+        if run_states.is_empty() {
+            println!("No agent run states");
+        }
+        for run_state in run_states {
+            let approval = run_state.approval_id.as_deref().unwrap_or("-");
+            println!(
+                "{} {} agent={} reason={} approval={}",
+                run_state.run_id, run_state.status, run_state.agent_id, run_state.reason, approval
+            );
+            println!("  {}", run_state.summary);
+        }
+    }
+    Ok(())
+}
+
+fn render_agent_run_state(run_state: &AgentRunState, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(run_state);
+    }
+    if !quiet {
+        println!("Agent run: {}", run_state.run_id);
+        println!("Agent: {}", run_state.agent_id);
+        println!("Status: {}", run_state.status);
+        println!("Reason: {}", run_state.reason);
+        println!("Summary: {}", run_state.summary);
+        if let Some(session_id) = &run_state.session_id {
+            println!("Session: {session_id}");
+        }
+        if let Some(turn_id) = &run_state.turn_id {
+            println!("Turn: {turn_id}");
+        }
+        if let Some(approval_id) = &run_state.approval_id {
+            println!("Approval: {approval_id}");
+        }
+        if let Some(reviewer) = &run_state.reviewer {
+            println!("Reviewer: {reviewer}");
+        }
+        if let Some(note) = &run_state.note {
+            println!("Note: {note}");
+        }
+    }
+    Ok(())
+}
+
 fn render_session_start(report: &AgentSessionStartReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);
@@ -4158,6 +4328,9 @@ fn render_approval_request(
             report.approval.approval_id, report.approval.action
         );
         println!("{}", report.approval.summary);
+        if let Some(run_state) = &report.run_state {
+            println!("Paused run: {}", run_state.run_id);
+        }
     }
     Ok(())
 }
@@ -4220,6 +4393,9 @@ fn render_approval_decision(
             "Decision {} for {}",
             report.decision, report.approval.approval_id
         );
+        if !report.run_states.is_empty() {
+            println!("Linked run states: {}", report.run_states.len());
+        }
     }
     Ok(())
 }
