@@ -1,0 +1,13 @@
+[package]
+name = "crabdb"
+description = "Local-first operation database for code and text worktrees."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+prolly = { path = "../prolly" }
+
+[lints]
+workspace = true

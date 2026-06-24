@@ -1,0 +1,33 @@
+[package]
+name = "prolly"
+description = "Content-addressed prolly tree storage primitives for CrabDB."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "prolly"
+path = "src/lib.rs"
+
+[features]
+default = []
+rocksdb = ["dep:rocksdb"]
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+serde_cbor.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+xxhash-rust.workspace = true
+rocksdb = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "prolly_bench"
+harness = false
