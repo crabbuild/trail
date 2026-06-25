@@ -1,0 +1,254 @@
+use super::*;
+
+impl CrabDb {
+    pub fn acquire_lease(
+        &mut self,
+        agent: &str,
+        path: Option<&str>,
+        mode: &str,
+        ttl_secs: u64,
+    ) -> Result<LeaseAcquireReport> {
+        let _lock = self.acquire_write_lock()?;
+        validate_ref_segment(agent)?;
+        let mode = parse_lease_mode(mode)?;
+        if ttl_secs == 0 {
+            return Err(Error::InvalidInput(
+                "lease ttl must be greater than zero".to_string(),
+            ));
+        }
+        let branch = self.agent_branch(agent)?;
+        let path = path.map(normalize_relative_path).transpose()?;
+        let file_id = if let Some(path) = &path {
+            let ref_record = self.get_ref(&branch.ref_name)?;
+            let files = self.load_root_files(&ref_record.root_id)?;
+            files.get(path).map(|entry| file_id_key(&entry.file_id))
+        } else {
+            None
+        };
+        let now = now_ts();
+        if let Some(existing) =
+            self.existing_active_lease(&branch.agent_id, path.as_deref(), mode)?
+        {
+            return Ok(LeaseAcquireReport { lease: existing });
+        }
+        let conflicts = self.conflicting_active_leases(&branch.agent_id, path.as_deref(), mode)?;
+        if !conflicts.is_empty() {
+            let holders = conflicts
+                .iter()
+                .map(|lease| format!("{} {}", lease.agent_id, lease.lease_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Conflict(format!(
+                "active lease conflict on {} held by {holders}",
+                path.as_deref().unwrap_or("<workspace>")
+            )));
+        }
+
+        let expires_at = now + ttl_secs as i64;
+        let seed = format!(
+            "{}:{}:{}:{}:{}:{}",
+            branch.agent_id,
+            branch.ref_name,
+            path.as_deref().unwrap_or("workspace"),
+            mode,
+            expires_at,
+            now_nanos()
+        );
+        let lease_id = format!("lease_{}", crate::ids::short_hash(seed.as_bytes(), 16));
+        self.conn.execute(
+            "INSERT INTO leases \
+             (lease_id, agent_id, ref_name, path, file_id, mode, expires_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                lease_id,
+                branch.agent_id,
+                branch.ref_name,
+                path,
+                file_id,
+                mode,
+                expires_at,
+                now
+            ],
+        )?;
+        let lease = self.lease(&lease_id)?;
+        self.insert_agent_event(
+            &branch.agent_id,
+            "lease_acquired",
+            Some(&branch.head_change),
+            None,
+            &serde_json::json!({
+                "lease_id": lease.lease_id,
+                "path": lease.path,
+                "mode": lease.mode,
+                "expires_at": lease.expires_at
+            }),
+        )?;
+        Ok(LeaseAcquireReport { lease })
+    }
+
+    pub fn claim_agent_path(
+        &mut self,
+        agent: &str,
+        path: &str,
+        ttl_secs: u64,
+    ) -> Result<AgentClaimReport> {
+        let _lock = self.acquire_write_lock()?;
+        validate_ref_segment(agent)?;
+        if ttl_secs == 0 {
+            return Err(Error::InvalidInput(
+                "agent claim ttl must be greater than zero".to_string(),
+            ));
+        }
+        let branch = self.agent_branch(agent)?;
+        let path = normalize_relative_path(path)?;
+        let mode = "write";
+        if let Some(existing) = self.existing_active_lease(&branch.agent_id, Some(&path), mode)? {
+            return Ok(AgentClaimReport {
+                agent_id: branch.agent_id,
+                ref_name: branch.ref_name,
+                path,
+                mode: mode.to_string(),
+                ttl_secs,
+                claimed: true,
+                lease: Some(existing),
+                conflicts: Vec::new(),
+                warning: None,
+            });
+        }
+
+        let conflicts = self.conflicting_active_leases(&branch.agent_id, Some(&path), mode)?;
+        if !conflicts.is_empty() {
+            let holders = conflicts
+                .iter()
+                .map(|lease| format!("{} {}", lease.agent_id, lease.lease_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let warning = format!("`{path}` is already claimed by {holders}");
+            self.insert_agent_event(
+                &branch.agent_id,
+                "claim_conflicted",
+                Some(&branch.head_change),
+                None,
+                &serde_json::json!({
+                    "path": &path,
+                    "mode": mode,
+                    "conflicts": &conflicts,
+                    "warning": &warning
+                }),
+            )?;
+            return Ok(AgentClaimReport {
+                agent_id: branch.agent_id,
+                ref_name: branch.ref_name,
+                path,
+                mode: mode.to_string(),
+                ttl_secs,
+                claimed: false,
+                lease: None,
+                conflicts,
+                warning: Some(warning),
+            });
+        }
+
+        let file_id = {
+            let ref_record = self.get_ref(&branch.ref_name)?;
+            let files = self.load_root_files(&ref_record.root_id)?;
+            files.get(&path).map(|entry| file_id_key(&entry.file_id))
+        };
+        let now = now_ts();
+        let expires_at = now + ttl_secs as i64;
+        let seed = format!(
+            "{}:{}:{}:{}:{}:{}",
+            branch.agent_id,
+            branch.ref_name,
+            path,
+            mode,
+            expires_at,
+            now_nanos()
+        );
+        let lease_id = format!("lease_{}", crate::ids::short_hash(seed.as_bytes(), 16));
+        self.conn.execute(
+            "INSERT INTO leases \
+             (lease_id, agent_id, ref_name, path, file_id, mode, expires_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                lease_id,
+                branch.agent_id,
+                branch.ref_name,
+                path,
+                file_id,
+                mode,
+                expires_at,
+                now
+            ],
+        )?;
+        let lease = self.lease(&lease_id)?;
+        self.insert_agent_event(
+            &lease.agent_id,
+            "agent_claimed_path",
+            Some(&branch.head_change),
+            None,
+            &serde_json::json!({
+                "lease_id": &lease.lease_id,
+                "path": &lease.path,
+                "mode": &lease.mode,
+                "expires_at": lease.expires_at
+            }),
+        )?;
+        Ok(AgentClaimReport {
+            agent_id: lease.agent_id.clone(),
+            ref_name: lease.ref_name.clone(),
+            path: lease.path.clone().unwrap_or_else(|| path.to_string()),
+            mode: lease.mode.clone(),
+            ttl_secs,
+            claimed: true,
+            lease: Some(lease),
+            conflicts: Vec::new(),
+            warning: None,
+        })
+    }
+
+    pub fn list_leases(&self, include_expired: bool) -> Result<Vec<LeaseRecord>> {
+        if include_expired {
+            let mut stmt = self.conn.prepare(
+                "SELECT lease_id, agent_id, ref_name, path, file_id, mode, expires_at, created_at \
+                 FROM leases ORDER BY expires_at ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([], lease_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT lease_id, agent_id, ref_name, path, file_id, mode, expires_at, created_at \
+                 FROM leases WHERE expires_at > ?1 ORDER BY expires_at ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![now_ts()], lease_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        }
+    }
+
+    pub fn release_lease(&mut self, lease_id: &str) -> Result<LeaseReleaseReport> {
+        let _lock = self.acquire_write_lock()?;
+        let lease = self.lease(lease_id)?;
+        let deleted = self
+            .conn
+            .execute("DELETE FROM leases WHERE lease_id = ?1", params![lease_id])?;
+        if deleted > 0 {
+            self.insert_agent_event(
+                &lease.agent_id,
+                "lease_released",
+                None,
+                None,
+                &serde_json::json!({
+                    "lease_id": lease.lease_id,
+                    "path": lease.path,
+                    "mode": lease.mode
+                }),
+            )?;
+        }
+        Ok(LeaseReleaseReport {
+            lease_id: lease_id.to_string(),
+            released: deleted > 0,
+        })
+    }
+}

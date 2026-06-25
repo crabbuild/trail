@@ -1,0 +1,41 @@
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatchDocument {
+    pub base_change: Option<String>,
+    pub message: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub allow_ignored: bool,
+    pub edits: Vec<PatchEdit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PatchEdit {
+    Write {
+        path: String,
+        content: String,
+        #[serde(default)]
+        executable: bool,
+    },
+    WriteBytes {
+        path: String,
+        bytes_hex: String,
+        #[serde(default)]
+        executable: bool,
+    },
+    ReplaceLine {
+        path: String,
+        line_id: String,
+        #[serde(default)]
+        expected_text: Option<String>,
+        new_text: String,
+    },
+    Delete {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+}
