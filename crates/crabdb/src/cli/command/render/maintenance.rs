@@ -132,6 +132,23 @@ pub(crate) fn render_index_rebuild(
     Ok(())
 }
 
+pub(crate) fn render_worktree_index(
+    report: &WorktreeIndexReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Worktree index refreshed: {} files, {} cached entries in {}ms",
+            report.files, report.indexed_entries, report.duration_ms
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn render_gc(report: &GcReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);

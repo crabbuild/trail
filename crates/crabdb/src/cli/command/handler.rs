@@ -11,6 +11,7 @@ use crabdb::{
 
 mod agent;
 mod collaboration;
+mod daemon_rpc;
 mod errors;
 mod inspect;
 mod maintenance;
@@ -54,6 +55,16 @@ fn run(cli: Cli) -> Result<()> {
         .branch
         .clone()
         .or_else(|| std::env::var("CRABDB_BRANCH").ok());
+    let daemon_url = cli
+        .daemon_url
+        .clone()
+        .or_else(|| std::env::var("CRABDB_DAEMON_URL").ok())
+        .filter(|value| !value.trim().is_empty());
+    let daemon_token = cli
+        .daemon_token
+        .clone()
+        .or_else(|| std::env::var("CRABDB_DAEMON_TOKEN").ok())
+        .filter(|value| !value.trim().is_empty());
     let ctx = RuntimeContext {
         workspace,
         db_dir,
@@ -62,7 +73,20 @@ fn run(cli: Cli) -> Result<()> {
         quiet: cli.quiet,
         format,
     };
-    match cli.command {
+    let command = cli.command;
+    if let Some(daemon_url) = daemon_url {
+        if daemon_rpc::try_handle_daemon_command(
+            &ctx,
+            Some(daemon_url),
+            daemon_token.clone(),
+            &command,
+        )? {
+            return Ok(());
+        }
+    } else if daemon_rpc::try_handle_auto_daemon_command(&ctx, daemon_token.clone(), &command)? {
+        return Ok(());
+    }
+    match command {
         Command::Init(args) => {
             let workspace = ctx
                 .workspace

@@ -1,6 +1,10 @@
 use super::*;
 
 impl CrabDb {
+    pub fn default_agent_materialize(&self) -> bool {
+        self.config.agent.default_materialize
+    }
+
     pub fn spawn_agent(
         &mut self,
         name: &str,
@@ -21,6 +25,42 @@ impl CrabDb {
         model: Option<String>,
         workdir: Option<PathBuf>,
     ) -> Result<AgentSpawnReport> {
+        self.spawn_agent_with_workdir_paths(name, from, materialize, provider, model, workdir, &[])
+    }
+
+    pub fn spawn_agent_with_workdir_paths(
+        &mut self,
+        name: &str,
+        from: Option<&str>,
+        materialize: bool,
+        provider: Option<String>,
+        model: Option<String>,
+        workdir: Option<PathBuf>,
+        sparse_paths: &[String],
+    ) -> Result<AgentSpawnReport> {
+        self.spawn_agent_with_workdir_paths_and_neighbors(
+            name,
+            from,
+            materialize,
+            provider,
+            model,
+            workdir,
+            sparse_paths,
+            false,
+        )
+    }
+
+    pub fn spawn_agent_with_workdir_paths_and_neighbors(
+        &mut self,
+        name: &str,
+        from: Option<&str>,
+        materialize: bool,
+        provider: Option<String>,
+        model: Option<String>,
+        workdir: Option<PathBuf>,
+        sparse_paths: &[String],
+        include_neighbors: bool,
+    ) -> Result<AgentSpawnReport> {
         let _lock = self.acquire_write_lock()?;
         validate_ref_segment(name)?;
         if workdir.is_some() && !materialize {
@@ -28,6 +68,12 @@ impl CrabDb {
                 "custom agent workdir requires materialization to be enabled".to_string(),
             ));
         }
+        if !sparse_paths.is_empty() && !materialize {
+            return Err(Error::InvalidInput(
+                "sparse agent workdir paths require materialization to be enabled".to_string(),
+            ));
+        }
+        let sparse_paths = normalize_record_paths(sparse_paths)?;
         let source = match from {
             Some(refish) => self.resolve_refish(refish)?,
             None => self.resolve_branch_ref(&self.current_branch()?)?,
@@ -45,7 +91,13 @@ impl CrabDb {
             None
         };
         let materialized_workdir = if let Some(dir) = &workdir_path {
-            self.materialize_agent_workdir_at(&source.root_id, dir, workdir.is_some())?;
+            self.materialize_agent_workdir_at_paths_with_neighbors(
+                &source.root_id,
+                dir,
+                workdir.is_some(),
+                &sparse_paths,
+                include_neighbors,
+            )?;
             Some(dir.to_string_lossy().to_string())
         } else {
             None
@@ -122,12 +174,118 @@ impl CrabDb {
         dir: &Path,
         custom_workdir: bool,
     ) -> Result<()> {
+        self.materialize_agent_workdir_at_paths(root_id, dir, custom_workdir, &[])
+    }
+
+    pub(crate) fn materialize_agent_workdir_at_paths(
+        &self,
+        root_id: &ObjectId,
+        dir: &Path,
+        custom_workdir: bool,
+        sparse_paths: &[String],
+    ) -> Result<()> {
+        self.materialize_agent_workdir_at_paths_with_neighbors(
+            root_id,
+            dir,
+            custom_workdir,
+            sparse_paths,
+            false,
+        )
+    }
+
+    pub(crate) fn materialize_agent_workdir_at_paths_with_neighbors(
+        &self,
+        root_id: &ObjectId,
+        dir: &Path,
+        custom_workdir: bool,
+        sparse_paths: &[String],
+        include_neighbors: bool,
+    ) -> Result<()> {
         prepare_agent_workdir(dir, custom_workdir)?;
         let empty = BTreeMap::new();
-        let files = self.load_root_files(root_id)?;
-        materialize_into(&self.workspace_root, dir, &empty, &files, |entry| {
-            self.materialize_entry_bytes(entry)
-        })
+        let files = if sparse_paths.is_empty() {
+            self.load_root_files(root_id)?
+        } else if include_neighbors {
+            self.load_root_files_for_selections_with_neighbors(root_id, sparse_paths)?
+        } else {
+            self.load_root_files_for_selections(root_id, sparse_paths)?
+        };
+        let cloned_from_workspace = sparse_paths.is_empty()
+            && self.workspace_matches_file_entries(&files)?
+            && materialize_from_workspace_cow(&self.workspace_root, dir, &files)?;
+        if !cloned_from_workspace {
+            self.materialize_files_best_effort_at(dir, &empty, &files)?;
+        }
+        if sparse_paths.is_empty() {
+            remove_sparse_workdir_manifest(dir)?;
+        } else {
+            self.write_sparse_workdir_manifest(dir, files.keys())?;
+        }
+        self.write_clean_workdir_manifest(dir, root_id, &files, files.keys())?;
+        Ok(())
+    }
+
+    fn workspace_matches_file_entries(&self, files: &BTreeMap<String, FileEntry>) -> Result<bool> {
+        let manifest = self.scan_worktree_manifest_indexed()?;
+        Ok(self.diff_file_maps_to_manifest(files, &manifest).is_empty())
+    }
+
+    pub(crate) fn sparse_workdir_paths(&self, dir: &Path) -> Result<Option<Vec<String>>> {
+        let manifest = sparse_workdir_manifest_path(dir);
+        if !manifest.exists() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        let Some(paths) = value
+            .get("materialized_paths")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Err(Error::Corrupt(format!(
+                "invalid sparse workdir manifest `{}`",
+                manifest.display()
+            )));
+        };
+        let mut normalized = BTreeSet::new();
+        for path in paths {
+            let Some(path) = path.as_str() else {
+                return Err(Error::Corrupt(format!(
+                    "invalid sparse workdir manifest path in `{}`",
+                    manifest.display()
+                )));
+            };
+            normalized.insert(normalize_relative_path(path)?);
+        }
+        Ok(Some(normalized.into_iter().collect()))
+    }
+
+    pub(crate) fn write_sparse_workdir_manifest<'a, I>(&self, dir: &Path, paths: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let manifest = sparse_workdir_manifest_path(dir);
+        let parent = manifest.parent().ok_or_else(|| Error::InvalidPath {
+            path: manifest.to_string_lossy().to_string(),
+            reason: "sparse manifest has no parent".to_string(),
+        })?;
+        fs::create_dir_all(parent)?;
+        let mut normalized = BTreeSet::new();
+        for path in paths {
+            normalized.insert(normalize_relative_path(path)?);
+        }
+        let body = serde_json::json!({
+            "version": 1,
+            "materialized_paths": normalized.into_iter().collect::<Vec<_>>()
+        });
+        fs::write(manifest, serde_json::to_vec_pretty(&body)?)?;
+        Ok(())
+    }
+
+    pub(crate) fn selected_file_entries(
+        &self,
+        files: &BTreeMap<String, FileEntry>,
+        selected_paths: &[String],
+    ) -> BTreeMap<String, FileEntry> {
+        selected_file_entries(files, selected_paths)
     }
 
     pub(crate) fn resolve_agent_workdir_path(
@@ -218,4 +376,31 @@ impl CrabDb {
         }
         Ok(normalized)
     }
+}
+
+pub(crate) fn selected_file_entries(
+    files: &BTreeMap<String, FileEntry>,
+    selected_paths: &[String],
+) -> BTreeMap<String, FileEntry> {
+    files
+        .iter()
+        .filter(|(path, _)| {
+            selected_paths
+                .iter()
+                .any(|selected| path_matches_selection(path, selected))
+        })
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect()
+}
+
+fn sparse_workdir_manifest_path(dir: &Path) -> PathBuf {
+    dir.join(".crabdb").join("sparse-workdir.json")
+}
+
+fn remove_sparse_workdir_manifest(dir: &Path) -> Result<()> {
+    let manifest = sparse_workdir_manifest_path(dir);
+    if manifest.exists() {
+        fs::remove_file(manifest)?;
+    }
+    Ok(())
 }

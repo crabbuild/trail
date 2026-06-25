@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use crate::model::AgentGateOptions;
 use crate::server::request_types::{
-    AgentClaimRequest, AgentTestRequest, SpawnAgentRequest, SyncWorkdirRequest,
+    AgentClaimRequest, AgentReadFileRequest, AgentTestRequest, SpawnAgentRequest,
+    SyncWorkdirRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
@@ -24,13 +25,18 @@ pub(super) fn handle_agent_resources(
 
     if request.method == "POST" && path == "/v1/agents" {
         let body: SpawnAgentRequest = serde_json::from_slice(&request.body)?;
-        let report = db.spawn_agent_with_workdir(
+        let materialize = body.materialize.unwrap_or(
+            body.workdir.is_some() || !body.paths.is_empty() || db.default_agent_materialize(),
+        );
+        let report = db.spawn_agent_with_workdir_paths_and_neighbors(
             &body.name,
             body.from.as_deref(),
-            body.materialize.unwrap_or(true),
+            materialize,
             body.provider,
             body.model,
             body.workdir.map(PathBuf::from),
+            &body.paths,
+            body.include_neighbors,
         )?;
         return Ok(Some(json_response(201, "Created", &report)?));
     }
@@ -106,16 +112,43 @@ pub(super) fn handle_agent_resources(
     if parts.len() == 4
         && parts[0] == "v1"
         && parts[1] == "agents"
+        && parts[3] == "read-file"
+        && request.method == "POST"
+    {
+        let agent = db.resolve_agent_handle(parts[2])?;
+        let body: AgentReadFileRequest = serde_json::from_slice(&request.body)?;
+        let report = db.read_agent_file_with_hydration(
+            &agent,
+            &body.path,
+            body.hydrate,
+            body.force,
+            body.include_neighbors,
+        )?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "agents"
         && parts[3] == "sync-workdir"
         && request.method == "POST"
     {
         let agent = db.resolve_agent_handle(parts[2])?;
         let body: SyncWorkdirRequest = if request.body.is_empty() {
-            SyncWorkdirRequest { force: false }
+            SyncWorkdirRequest {
+                force: false,
+                paths: Vec::new(),
+                include_neighbors: false,
+            }
         } else {
             serde_json::from_slice(&request.body)?
         };
-        let report = db.sync_agent_workdir(&agent, body.force)?;
+        let report = db.sync_agent_workdir_with_paths_and_neighbors(
+            &agent,
+            body.force,
+            &body.paths,
+            body.include_neighbors,
+        )?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

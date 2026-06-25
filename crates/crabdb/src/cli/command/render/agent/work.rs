@@ -2,6 +2,7 @@ use super::render_json;
 
 use crabdb::model::*;
 use crabdb::Result;
+use std::io::Write;
 
 pub(crate) fn render_agent_record(
     report: &AgentRecordReport,
@@ -111,6 +112,20 @@ pub(crate) fn render_agent_workdir(
         } else {
             println!("Agent {} has no materialized workdir", report.agent_id);
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_file_read(
+    report: &AgentFileReadReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        std::io::stdout().write_all(report.content.as_bytes())?;
     }
     Ok(())
 }

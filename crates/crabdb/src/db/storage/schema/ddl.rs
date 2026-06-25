@@ -244,10 +244,41 @@ impl CrabDb {
             );
             CREATE INDEX IF NOT EXISTS git_mappings_change_idx ON git_mappings(crab_change);
             CREATE INDEX IF NOT EXISTS git_mappings_head_idx ON git_mappings(git_head);
+            CREATE TABLE IF NOT EXISTS worktree_file_index (
+                path TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                changed_ns INTEGER NOT NULL,
+                device_id INTEGER NOT NULL DEFAULT 0,
+                inode INTEGER NOT NULL DEFAULT 0,
+                executable INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                last_seen_scan INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
             ",
         )?;
         ensure_column(&self.conn, "conflict_sets", "details_json", "TEXT")?;
         ensure_column(&self.conn, "agent_events", "session_id", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "worktree_file_index",
+            "last_seen_scan",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "worktree_file_index",
+            "device_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "worktree_file_index",
+            "inode",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         self.record_schema_version()?;
         Ok(())
     }

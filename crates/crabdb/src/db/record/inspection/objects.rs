@@ -56,6 +56,7 @@ impl CrabDb {
                     "content_hash": text.content_hash,
                     "line_count": text.line_count,
                     "byte_count": text.byte_count,
+                    "full_bytes_blob_id": text.full_bytes_blob_id,
                     "representation": text.representation,
                     "order_map_root": text.order_map_root,
                     "line_index_map_root": text.line_index_map_root,

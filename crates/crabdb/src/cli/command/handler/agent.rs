@@ -9,14 +9,24 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
     match agent.command {
         AgentSubcommand::Spawn(args) => {
             let mut db = open_db(ctx)?;
-            let materialize = args.materialize && !args.no_materialize;
-            let report = db.spawn_agent_with_workdir(
+            let materialize = if args.no_materialize {
+                false
+            } else {
+                args.materialize.unwrap_or(
+                    args.workdir.is_some()
+                        || !args.paths.is_empty()
+                        || db.default_agent_materialize(),
+                )
+            };
+            let report = db.spawn_agent_with_workdir_paths_and_neighbors(
                 &args.name,
                 args.from.as_deref(),
                 materialize,
                 args.provider,
                 args.model,
                 args.workdir,
+                &args.paths,
+                args.include_neighbors,
             )?;
             render_agent_spawn(&report, ctx.json, ctx.quiet)
         }
@@ -91,6 +101,24 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
         AgentSubcommand::Eval(args) => {
             work::handle_gate_command(ctx, args, work::AgentGateKind::Eval)
         }
+        AgentSubcommand::Read(args) => {
+            let mut db = open_db(ctx)?;
+            let hydrate = if args.hydrate {
+                Some(true)
+            } else if args.no_hydrate {
+                Some(false)
+            } else {
+                None
+            };
+            let report = db.read_agent_file_with_hydration(
+                &args.name,
+                &args.path,
+                hydrate,
+                args.force,
+                args.include_neighbors,
+            )?;
+            render_agent_file_read(&report, ctx.json, ctx.quiet)
+        }
         AgentSubcommand::Workdir(args) => {
             let db = open_db(ctx)?;
             let report = db.agent_workdir(&args.name)?;
@@ -98,7 +126,12 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
         }
         AgentSubcommand::SyncWorkdir(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.sync_agent_workdir(&args.name, args.force)?;
+            let report = db.sync_agent_workdir_with_paths_and_neighbors(
+                &args.name,
+                args.force,
+                &args.paths,
+                args.include_neighbors,
+            )?;
             render_agent_workdir_sync(&report, ctx.json, ctx.quiet)
         }
         AgentSubcommand::ApplyPatch(args) => {

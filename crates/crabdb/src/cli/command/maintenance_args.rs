@@ -79,12 +79,24 @@ pub(super) struct DaemonArgs {
 pub(super) enum IndexSubcommand {
     /// Rebuild all derived indexes from current workspace state.
     Rebuild,
+    /// Continuously refresh the persisted worktree file index.
+    Watch(IndexWatchArgs),
 }
 
 #[derive(Args)]
 pub(super) struct IndexCommand {
     #[command(subcommand)]
     pub(super) command: IndexSubcommand,
+}
+
+#[derive(Args)]
+pub(super) struct IndexWatchArgs {
+    #[arg(long)]
+    pub(super) once: bool,
+    #[arg(long)]
+    pub(super) iterations: Option<usize>,
+    #[arg(long = "interval-ms", default_value_t = 1000)]
+    pub(super) interval_ms: u64,
 }
 
 #[derive(Args)]

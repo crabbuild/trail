@@ -8,6 +8,7 @@ impl CrabDb {
         previous: Option<&[LineEntry]>,
         line_seq: &mut u64,
         similarity_threshold: f32,
+        small_text: bool,
     ) -> Result<TextBuildResult> {
         let new_lines = split_lines(bytes);
         let previous = previous.unwrap_or(&[]);
@@ -173,23 +174,45 @@ impl CrabDb {
             )
         });
 
-        let mut order_builder = BatchBuilder::new(self.store.clone(), prolly_config());
-        let mut index_builder = BatchBuilder::new(self.store.clone(), prolly_config());
-        for (idx, entry) in entries.iter().enumerate() {
-            let key = order_key(idx as u64 + 1);
-            order_builder.add(key.clone(), cbor(entry)?);
-            index_builder.add(entry.line_id.encode_key(), key);
-        }
-        let order_tree = order_builder.build()?;
-        let index_tree = index_builder.build()?;
+        let (order_map_root, line_index_map_root, representation) = if small_text {
+            (
+                None,
+                None,
+                TextRepresentation::SmallTextTable {
+                    table: encode_small_text_table(&entries),
+                },
+            )
+        } else {
+            let mut order_builder = BatchBuilder::new(self.store.clone(), prolly_config());
+            let mut index_builder = BatchBuilder::new(self.store.clone(), prolly_config());
+            for (idx, entry) in entries.iter().enumerate() {
+                let key = order_key(idx as u64 + 1);
+                order_builder.add(key.clone(), cbor(entry)?);
+                index_builder.add(entry.line_id.encode_key(), key);
+            }
+            let order_tree = order_builder.build()?;
+            let index_tree = index_builder.build()?;
+            (
+                tree_root_hex(&order_tree),
+                tree_root_hex(&index_tree),
+                TextRepresentation::TreeText,
+            )
+        };
+        let content_hash = sha256_hex(bytes);
+        let full_bytes_blob_id = if small_text {
+            None
+        } else {
+            Some(self.put_blob(bytes.to_vec())?)
+        };
         let content = TextContent {
             version: TEXT_OBJECT_VERSION,
-            content_hash: sha256_hex(bytes),
+            content_hash,
             line_count: entries.len() as u64,
             byte_count: bytes.len() as u64,
-            order_map_root: tree_root_hex(&order_tree),
-            line_index_map_root: tree_root_hex(&index_tree),
-            representation: TextRepresentation::TreeText,
+            full_bytes_blob_id,
+            order_map_root,
+            line_index_map_root,
+            representation,
         };
         let object_id = self.put_object(TEXT_CONTENT_KIND, TEXT_OBJECT_VERSION, &content)?;
         Ok(TextBuildResult {

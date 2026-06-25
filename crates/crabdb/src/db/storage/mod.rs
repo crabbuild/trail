@@ -22,4 +22,5 @@ mod refs;
 mod root_diff;
 mod schema;
 mod validation;
+mod worktree_index;
 mod worktree_scan;

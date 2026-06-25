@@ -171,7 +171,7 @@ impl CrabConfig {
                 preserve_similarity: 0.45,
             },
             agent: AgentConfig {
-                default_materialize: true,
+                default_materialize: false,
                 require_test_gate: false,
                 require_eval_gate: false,
                 required_test_suites: Vec::new(),

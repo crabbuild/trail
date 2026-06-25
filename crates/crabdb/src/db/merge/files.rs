@@ -1,6 +1,50 @@
 use super::*;
 
 impl CrabDb {
+    pub(crate) fn merge_root_maps_for_changed_paths(
+        &self,
+        base_root_id: &ObjectId,
+        target_root_id: &ObjectId,
+        source_root_id: &ObjectId,
+        change_id: &ChangeId,
+    ) -> Result<PathLocalMergeResult> {
+        let changed_paths =
+            self.merge_changed_paths_between_roots(base_root_id, target_root_id, source_root_id)?;
+        let paths = changed_paths.into_iter().collect::<Vec<_>>();
+        let base_files = self.load_root_files_for_paths(base_root_id, &paths)?;
+        let target_files = self.load_root_files_for_paths(target_root_id, &paths)?;
+        let source_files = self.load_root_files_for_paths(source_root_id, &paths)?;
+        let (merged_files, conflicts) =
+            self.merge_file_maps(&base_files, &target_files, &source_files, change_id)?;
+        Ok(PathLocalMergeResult {
+            target_files,
+            merged_files,
+            conflicts,
+        })
+    }
+
+    fn merge_changed_paths_between_roots(
+        &self,
+        base_root_id: &ObjectId,
+        target_root_id: &ObjectId,
+        source_root_id: &ObjectId,
+    ) -> Result<BTreeSet<String>> {
+        let mut paths = BTreeSet::new();
+        for summary in self.diff_root_file_summaries(base_root_id, target_root_id)? {
+            if let Some(old_path) = summary.old_path {
+                paths.insert(old_path);
+            }
+            paths.insert(summary.path);
+        }
+        for summary in self.diff_root_file_summaries(base_root_id, source_root_id)? {
+            if let Some(old_path) = summary.old_path {
+                paths.insert(old_path);
+            }
+            paths.insert(summary.path);
+        }
+        Ok(paths)
+    }
+
     pub(crate) fn merge_file_maps(
         &self,
         base: &BTreeMap<String, FileEntry>,

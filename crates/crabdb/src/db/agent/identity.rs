@@ -68,9 +68,7 @@ impl CrabDb {
         let details = self.agent_details(agent)?;
         let source = self.get_ref(&details.branch.ref_name)?;
         let base = self.ref_from_change(&details.branch.base_change)?;
-        let base_files = self.load_root_files(&base.root_id)?;
-        let source_files = self.load_root_files(&source.root_id)?;
-        let diff = self.diff_file_maps(&base_files, &source_files)?;
+        let changed_paths = self.diff_root_file_summaries(&base.root_id, &source.root_id)?;
         let workdir_changed_paths = self
             .agent_workdir_changed_paths(&details.branch, &source)?
             .unwrap_or_default();
@@ -88,7 +86,7 @@ impl CrabDb {
             latest_test: self.latest_agent_test(&details.branch.agent_id)?,
             latest_eval: self.latest_agent_gate(&details.branch.agent_id, "eval")?,
             agent: details,
-            changed_paths: diff.summaries,
+            changed_paths,
             queued_merges: queued_merges as u64,
             workdir_state,
             workdir_changed_paths,

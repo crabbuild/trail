@@ -107,6 +107,7 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.merge_queue_remove"
         | "crabdb.conflict_resolve"
         | "crabdb.apply_patch"
+        | "crabdb.read_file"
         | "crabdb.sync_workdir" => ToolRiskClass::DestructiveWrite,
         "crabdb.run_test" | "crabdb.run_eval" => ToolRiskClass::OpenWorldWrite,
         _ => ToolRiskClass::Write,

@@ -31,6 +31,13 @@ pub struct IndexRebuildReport {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WorktreeIndexReport {
+    pub files: u64,
+    pub indexed_entries: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GcReport {
     pub dry_run: bool,
     pub total_known_objects: u64,

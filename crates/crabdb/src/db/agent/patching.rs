@@ -43,10 +43,11 @@ impl CrabDb {
             self.ensure_patch_edit_allowed(edit, patch.allow_ignored)?;
         }
 
-        let previous_files = self.load_root_files(&head.root_id)?;
+        let touched_paths = self.patch_touched_paths(&patch.edits)?;
+        let previous_touched = self.load_root_files_for_paths(&head.root_id, &touched_paths)?;
         let actor = Actor::agent(agent);
         let change_id = self.allocate_change_id(&actor.id, "agent_patch")?;
-        let mut files = previous_files.clone();
+        let mut target_touched = previous_touched.clone();
         let mut manual_line_changes = Vec::new();
         let mut file_seq = 1;
         let mut line_seq = 1;
@@ -54,7 +55,7 @@ impl CrabDb {
         for edit in patch.edits {
             self.apply_patch_edit_to_files(
                 edit,
-                &mut files,
+                &mut target_touched,
                 &change_id,
                 &mut file_seq,
                 &mut line_seq,
@@ -62,8 +63,13 @@ impl CrabDb {
             )?;
         }
 
-        let built = self.build_root_from_file_entries(files, &change_id)?;
-        let mut diff = self.diff_file_maps(&previous_files, &built.files)?;
+        let built = self.build_root_from_touched_file_entries_incremental(
+            &head.root_id,
+            &previous_touched,
+            &target_touched,
+            &change_id,
+        )?;
+        let mut diff = self.diff_file_maps(&previous_touched, &target_touched)?;
         for (path, file_id, line) in manual_line_changes {
             if let Some(change) = diff
                 .changes
@@ -84,6 +90,7 @@ impl CrabDb {
                 "patch produced no changes".to_string(),
             ));
         }
+        let changed_summaries = diff.summaries.clone();
 
         let patch_message = patch.message.as_deref().map(redact_sensitive_text);
         let patch_session_id = if let Some(turn) = api_turn {
@@ -154,7 +161,7 @@ impl CrabDb {
                     "root_id": built.root_id.0.clone(),
                     "session_id": patch_session_id.clone(),
                     "allow_ignored": patch.allow_ignored,
-                    "changed_paths": diff.summaries.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
+                    "changed_paths": changed_summaries.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
                 }),
             )?;
         self.conn.execute(
@@ -169,14 +176,51 @@ impl CrabDb {
             ],
         )?;
         if let Some(workdir) = agent_row.workdir {
-            let previous = self.load_root_files(&head.root_id)?;
-            materialize_into(
-                &self.workspace_root,
-                Path::new(&workdir),
-                &previous,
-                &built.files,
-                |entry| self.materialize_entry_bytes(entry),
-            )?;
+            let workdir_path = Path::new(&workdir);
+            let sparse_paths = self.sparse_workdir_paths(workdir_path)?;
+            let (previous_files, target_files) = if let Some(sparse_paths) = sparse_paths {
+                let mut selected_paths = sparse_paths;
+                for summary in &changed_summaries {
+                    selected_paths.push(summary.path.clone());
+                    if let Some(old_path) = &summary.old_path {
+                        selected_paths.push(old_path.clone());
+                    }
+                }
+                selected_paths.sort();
+                selected_paths.dedup();
+                let previous_files =
+                    self.load_root_files_for_paths(&head.root_id, &selected_paths)?;
+                let target_files =
+                    self.load_root_files_for_paths(&built.root_id, &selected_paths)?;
+                self.write_sparse_workdir_manifest(workdir_path, target_files.keys())?;
+                (previous_files, target_files)
+            } else if self.refresh_clean_materialized_workdir_for_agent_patch(
+                workdir_path,
+                &head.root_id,
+                &built.root_id,
+                &previous_touched,
+                &target_touched,
+            )? {
+                (BTreeMap::new(), BTreeMap::new())
+            } else {
+                (
+                    self.load_root_files(&head.root_id)?,
+                    self.load_root_files(&built.root_id)?,
+                )
+            };
+            if !previous_files.is_empty() || !target_files.is_empty() {
+                self.materialize_files_best_effort_at(
+                    workdir_path,
+                    &previous_files,
+                    &target_files,
+                )?;
+                self.write_clean_workdir_manifest(
+                    workdir_path,
+                    &built.root_id,
+                    &target_files,
+                    target_files.keys(),
+                )?;
+            }
         }
         if api_turn.is_some() {
             self.update_agent_turn_progress(&turn_id, "patch_applied", Some(&change_id))?;
@@ -187,7 +231,40 @@ impl CrabDb {
             agent_id: agent_row.agent_id,
             operation: change_id,
             root_id: built.root_id,
-            changed_paths: diff.summaries,
+            changed_paths: changed_summaries,
         })
+    }
+
+    fn refresh_clean_materialized_workdir_for_agent_patch(
+        &self,
+        workdir_path: &Path,
+        previous_root_id: &ObjectId,
+        next_root_id: &ObjectId,
+        previous_touched: &BTreeMap<String, FileEntry>,
+        target_touched: &BTreeMap<String, FileEntry>,
+    ) -> Result<bool> {
+        if !matches!(
+            self.cached_workdir_manifest_status(workdir_path, previous_root_id)?,
+            CachedWorkdirManifestStatus::Clean
+        ) {
+            return Ok(false);
+        }
+        if !self.clean_workdir_manifest_allows_file_subset_update(
+            workdir_path,
+            previous_root_id,
+            previous_touched,
+            target_touched,
+        )? {
+            return Ok(false);
+        }
+
+        self.materialize_files_best_effort_at(workdir_path, previous_touched, target_touched)?;
+        self.update_clean_workdir_manifest_from_file_subset(
+            workdir_path,
+            previous_root_id,
+            next_root_id,
+            previous_touched,
+            target_touched,
+        )
     }
 }

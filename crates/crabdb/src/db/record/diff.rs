@@ -56,10 +56,15 @@ impl CrabDb {
         let _lock = self.acquire_write_lock()?;
         let branch = self.current_branch()?;
         let head = self.resolve_branch_ref(&branch)?;
-        let previous_files = self.load_root_files(&head.root_id)?;
+        if let Some(diff) =
+            self.diff_dirty_from_daemon_cache(&branch, &head.root_id, patches, line_changes)?
+        {
+            return Ok(diff);
+        }
         let fast_dirty_paths = self.scan_git_dirty_tracked_paths()?;
         let disk_files;
         let build_selected_paths;
+        let previous_files;
         if let Some(paths) = fast_dirty_paths {
             if paths.is_empty() {
                 return Ok(DiffSummary {
@@ -68,6 +73,7 @@ impl CrabDb {
                     files: Vec::new(),
                 });
             }
+            previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
             let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
             if snapshot.paths.is_empty() {
                 return Ok(DiffSummary {
@@ -79,8 +85,34 @@ impl CrabDb {
             disk_files = snapshot.files;
             build_selected_paths = Some(snapshot.paths);
         } else {
-            disk_files = self.scan_worktree_files()?;
-            build_selected_paths = None;
+            let refresh = self.refresh_worktree_index_streaming_report()?;
+            if !refresh.changed
+                && self
+                    .worktree_index_baseline_root()?
+                    .is_some_and(|baseline| baseline == head.root_id.clone())
+            {
+                return Ok(DiffSummary {
+                    from: branch,
+                    to: "dirty".to_string(),
+                    files: Vec::new(),
+                });
+            }
+            let summaries = self.diff_root_to_worktree_index(&head.root_id)?;
+            if summaries.is_empty() {
+                self.set_worktree_index_baseline(&head.root_id)?;
+                return Ok(DiffSummary {
+                    from: branch,
+                    to: "dirty".to_string(),
+                    files: Vec::new(),
+                });
+            }
+            let paths = summaries
+                .iter()
+                .map(|summary| summary.path.clone())
+                .collect::<Vec<_>>();
+            disk_files = self.scan_visible_files_for_paths(&paths)?;
+            previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
+            build_selected_paths = Some(paths);
         }
         let change_id = self.allocate_change_id("crabdb", "dirty-diff")?;
         let built = if let Some(paths) = build_selected_paths.as_deref() {
@@ -103,5 +135,67 @@ impl CrabDb {
             patches,
             line_changes,
         )
+    }
+
+    fn diff_dirty_from_daemon_cache(
+        &self,
+        branch: &str,
+        root_id: &ObjectId,
+        patches: bool,
+        line_changes: bool,
+    ) -> Result<Option<DiffSummary>> {
+        let Some(snapshot) = self.daemon_worktree_snapshot() else {
+            return Ok(None);
+        };
+        let (generation, paths) = match snapshot {
+            DaemonWorktreeSnapshot::Clean {
+                generation: _,
+                root_id: Some(clean_root),
+            } if clean_root == *root_id => {
+                return Ok(Some(DiffSummary {
+                    from: branch.to_string(),
+                    to: "dirty".to_string(),
+                    files: Vec::new(),
+                }));
+            }
+            DaemonWorktreeSnapshot::Dirty { generation, paths }
+                if paths.len() <= self.daemon_dirty_path_limit() =>
+            {
+                (generation, paths)
+            }
+            DaemonWorktreeSnapshot::Clean { .. }
+            | DaemonWorktreeSnapshot::Dirty { .. }
+            | DaemonWorktreeSnapshot::Overflow { .. } => return Ok(None),
+        };
+
+        let previous_files = self.load_root_files_for_selections(root_id, &paths)?;
+        let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+        self.reconcile_daemon_status_paths(root_id, &paths, &snapshot.summaries, generation);
+        if snapshot.paths.is_empty() {
+            return Ok(Some(DiffSummary {
+                from: branch.to_string(),
+                to: "dirty".to_string(),
+                files: Vec::new(),
+            }));
+        }
+
+        let change_id = self.allocate_change_id("crabdb", "dirty-diff")?;
+        let built = self.build_root_for_selected_record_incremental(
+            root_id,
+            &previous_files,
+            &snapshot.files,
+            &snapshot.paths,
+            false,
+            &change_id,
+        )?;
+        self.diff_files(
+            branch.to_string(),
+            "dirty".to_string(),
+            &previous_files,
+            &built.files,
+            patches,
+            line_changes,
+        )
+        .map(Some)
     }
 }

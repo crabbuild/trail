@@ -44,6 +44,10 @@ struct Cli {
     no_color: bool,
     #[arg(long, global = true)]
     format: Option<OutputFormat>,
+    #[arg(long, global = true, value_name = "URL")]
+    daemon_url: Option<String>,
+    #[arg(long, global = true, value_name = "TOKEN")]
+    daemon_token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }

@@ -56,6 +56,10 @@ pub enum Error {
     TomlSer(#[from] toml::ser::Error),
     #[error("TOML error: {0}")]
     TomlDe(#[from] toml::de::Error),
+    #[error("daemon unavailable: {0}")]
+    DaemonUnavailable(String),
+    #[error("{message}")]
+    DaemonError { message: String, exit_code: i32 },
 }
 
 impl Error {
@@ -85,6 +89,8 @@ impl Error {
             Error::ProllySqlite(_) => "PROLLY_SQLITE_ERROR",
             Error::Json(_) => "JSON_ERROR",
             Error::TomlSer(_) | Error::TomlDe(_) => "TOML_ERROR",
+            Error::DaemonUnavailable(_) => "DAEMON_UNAVAILABLE",
+            Error::DaemonError { .. } => "DAEMON_ERROR",
         }
     }
 
@@ -103,6 +109,8 @@ impl Error {
             Error::RefNotFound(_) => 13,
             Error::IgnoredPath(_) => 14,
             Error::InvalidInput(_) | Error::WorkspaceExists(_) => 2,
+            Error::DaemonUnavailable(_) => 11,
+            Error::DaemonError { exit_code, .. } => *exit_code,
             _ => 1,
         }
     }

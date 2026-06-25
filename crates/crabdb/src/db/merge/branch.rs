@@ -27,14 +27,15 @@ impl CrabDb {
         let target_ref = self.get_ref(&target_ref_name)?;
         let base_change = self.common_parent_hint(&source_ref.change_id, &target_ref.change_id)?;
         let base_ref = self.ref_from_change(&base_change)?;
-        let base_files = self.load_root_files(&base_ref.root_id)?;
-        let source_files = self.load_root_files(&source_ref.root_id)?;
-        let target_files = self.load_root_files(&target_ref.root_id)?;
         let actor = Actor::human();
         let change_id = self.allocate_change_id(&actor.id, "merge")?;
-        let (merged_files, conflicts) =
-            self.merge_file_maps(&base_files, &target_files, &source_files, &change_id)?;
-        if !conflicts.is_empty() {
+        let merged = self.merge_root_maps_for_changed_paths(
+            &base_ref.root_id,
+            &target_ref.root_id,
+            &source_ref.root_id,
+            &change_id,
+        )?;
+        if !merged.conflicts.is_empty() {
             if dry_run {
                 return Ok(MergeReport {
                     operation: change_id,
@@ -43,13 +44,29 @@ impl CrabDb {
                     root_id: target_ref.root_id,
                     dry_run,
                     changed_paths: Vec::new(),
-                    conflicts,
+                    conflicts: merged.conflicts,
                 });
             }
-            return Err(Error::Conflict(conflicts.join("; ")));
+            return Err(Error::Conflict(merged.conflicts.join("; ")));
         }
-        let built = self.build_root_from_file_entries(merged_files, &change_id)?;
-        let diff = self.diff_file_maps(&target_files, &built.files)?;
+        if merged.merged_files == merged.target_files {
+            return Ok(MergeReport {
+                operation: target_ref.change_id,
+                source_ref: source_ref_name,
+                target_ref: target_ref_name,
+                root_id: target_ref.root_id,
+                dry_run,
+                changed_paths: Vec::new(),
+                conflicts: Vec::new(),
+            });
+        }
+        let built = self.build_root_from_touched_file_entries_incremental(
+            &target_ref.root_id,
+            &merged.target_files,
+            &merged.merged_files,
+            &change_id,
+        )?;
+        let diff = self.diff_file_maps(&merged.target_files, &merged.merged_files)?;
         if dry_run {
             return Ok(MergeReport {
                 operation: change_id,

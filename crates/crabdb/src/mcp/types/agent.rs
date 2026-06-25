@@ -5,10 +5,14 @@ pub(crate) struct AgentSpawnArgs {
     pub(crate) name: String,
     #[serde(default, alias = "from", alias = "branch")]
     pub(crate) from_ref: Option<String>,
-    #[serde(default = "default_true")]
-    pub(crate) materialize: bool,
+    #[serde(default)]
+    pub(crate) materialize: Option<bool>,
     #[serde(default, alias = "workdir_path")]
     pub(crate) workdir: Option<String>,
+    #[serde(default)]
+    pub(crate) paths: Vec<String>,
+    #[serde(default, alias = "include_neighborhood")]
+    pub(crate) include_neighbors: bool,
     #[serde(default)]
     pub(crate) provider: Option<String>,
     #[serde(default)]
@@ -102,16 +106,28 @@ pub(crate) struct RunTestArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ReadFileArgs {
+    pub(crate) agent: String,
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) hydrate: Option<bool>,
+    #[serde(default)]
+    pub(crate) force: bool,
+    #[serde(default, alias = "include_neighborhood")]
+    pub(crate) include_neighbors: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct SyncWorkdirArgs {
     pub(crate) agent: String,
     #[serde(default)]
     pub(crate) force: bool,
+    #[serde(default)]
+    pub(crate) paths: Vec<String>,
+    #[serde(default, alias = "include_neighborhood")]
+    pub(crate) include_neighbors: bool,
 }
 
 pub(crate) fn default_lease_mode() -> String {
     "write".to_string()
-}
-
-pub(crate) fn default_true() -> bool {
-    true
 }

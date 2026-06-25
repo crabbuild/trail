@@ -20,7 +20,8 @@ impl CrabDb {
         let path = path.map(normalize_relative_path).transpose()?;
         let file_id = if let Some(path) = &path {
             let ref_record = self.get_ref(&branch.ref_name)?;
-            let files = self.load_root_files(&ref_record.root_id)?;
+            let files =
+                self.load_root_files_for_paths(&ref_record.root_id, std::slice::from_ref(path))?;
             files.get(path).map(|entry| file_id_key(&entry.file_id))
         } else {
             None
@@ -103,6 +104,8 @@ impl CrabDb {
         let path = normalize_relative_path(path)?;
         let mode = "write";
         if let Some(existing) = self.existing_active_lease(&branch.agent_id, Some(&path), mode)? {
+            let (hydrated_paths, hydration_warning) =
+                self.claim_sparse_hydration(agent, &branch, &path);
             return Ok(AgentClaimReport {
                 agent_id: branch.agent_id,
                 ref_name: branch.ref_name,
@@ -112,7 +115,9 @@ impl CrabDb {
                 claimed: true,
                 lease: Some(existing),
                 conflicts: Vec::new(),
+                hydrated_paths,
                 warning: None,
+                hydration_warning,
             });
         }
 
@@ -145,13 +150,16 @@ impl CrabDb {
                 claimed: false,
                 lease: None,
                 conflicts,
+                hydrated_paths: Vec::new(),
                 warning: Some(warning),
+                hydration_warning: None,
             });
         }
 
         let file_id = {
             let ref_record = self.get_ref(&branch.ref_name)?;
-            let files = self.load_root_files(&ref_record.root_id)?;
+            let files =
+                self.load_root_files_for_paths(&ref_record.root_id, std::slice::from_ref(&path))?;
             files.get(&path).map(|entry| file_id_key(&entry.file_id))
         };
         let now = now_ts();
@@ -182,6 +190,8 @@ impl CrabDb {
             ],
         )?;
         let lease = self.lease(&lease_id)?;
+        let (hydrated_paths, hydration_warning) =
+            self.claim_sparse_hydration(agent, &branch, &path);
         self.insert_agent_event(
             &lease.agent_id,
             "agent_claimed_path",
@@ -203,8 +213,31 @@ impl CrabDb {
             claimed: true,
             lease: Some(lease),
             conflicts: Vec::new(),
+            hydrated_paths,
             warning: None,
+            hydration_warning,
         })
+    }
+
+    fn claim_sparse_hydration(
+        &self,
+        agent: &str,
+        branch: &AgentBranch,
+        path: &str,
+    ) -> (Vec<String>, Option<String>) {
+        match self.hydrate_sparse_agent_workdir_paths_unlocked(
+            agent,
+            branch,
+            &[path.to_string()],
+            false,
+            false,
+        ) {
+            Ok(paths) => (paths, None),
+            Err(err) => (
+                Vec::new(),
+                Some(format!("claimed path was not hydrated: {err}")),
+            ),
+        }
     }
 
     pub fn list_leases(&self, include_expired: bool) -> Result<Vec<LeaseRecord>> {

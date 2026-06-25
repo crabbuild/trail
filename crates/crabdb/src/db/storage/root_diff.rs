@@ -1,6 +1,126 @@
 use super::*;
 
 impl CrabDb {
+    pub(crate) fn diff_root_file_summaries(
+        &self,
+        left_root_id: &ObjectId,
+        right_root_id: &ObjectId,
+    ) -> Result<Vec<FileDiffSummary>> {
+        let left_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, left_root_id)?;
+        let right_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, right_root_id)?;
+        let left_tree = worktree_root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
+        let right_tree = worktree_root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
+        let diffs = self
+            .root_prolly
+            .range_diff(&left_tree, &right_tree, &[], None)?;
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut changed = Vec::new();
+        for diff in diffs {
+            match diff {
+                Diff::Added { key, val } => {
+                    added.push((path_from_key(key)?, from_cbor::<FileEntry>(&val)?));
+                }
+                Diff::Removed { key, val } => {
+                    removed.push((path_from_key(key)?, from_cbor::<FileEntry>(&val)?));
+                }
+                Diff::Changed { key, old, new } => {
+                    changed.push((
+                        path_from_key(key)?,
+                        from_cbor::<FileEntry>(&old)?,
+                        from_cbor::<FileEntry>(&new)?,
+                    ));
+                }
+            }
+        }
+
+        added.sort_by(|left, right| left.0.cmp(&right.0));
+        removed.sort_by(|left, right| left.0.cmp(&right.0));
+        changed.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut summaries = Vec::new();
+        let mut removed_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
+        for (path, entry) in &removed {
+            removed_by_hash
+                .entry(entry.content_hash.clone())
+                .or_default()
+                .push((path.clone(), entry.clone()));
+        }
+
+        let mut consumed_removed = HashSet::new();
+        for (path, new_entry) in added {
+            let rename = removed_by_hash
+                .get(&new_entry.content_hash)
+                .and_then(|candidates| {
+                    candidates.iter().find(|(old_path, old_entry)| {
+                        !consumed_removed.contains(old_path)
+                            && old_entry.file_id == new_entry.file_id
+                    })
+                });
+            if let Some((old_path, old_entry)) = rename {
+                consumed_removed.insert(old_path.clone());
+                summaries.push(file_diff_summary(
+                    path,
+                    Some(old_path.clone()),
+                    FileChangeKind::Renamed,
+                    Some(old_entry.content_hash.clone()),
+                    Some(new_entry.content_hash),
+                ));
+                continue;
+            }
+
+            summaries.push(file_diff_summary(
+                path,
+                None,
+                FileChangeKind::Added,
+                None,
+                Some(new_entry.content_hash),
+            ));
+        }
+
+        for (path, old_entry) in removed {
+            if consumed_removed.contains(&path) {
+                continue;
+            }
+            summaries.push(file_diff_summary(
+                path,
+                None,
+                FileChangeKind::Deleted,
+                Some(old_entry.content_hash),
+                None,
+            ));
+        }
+
+        for (path, old_entry, new_entry) in changed {
+            if old_entry.content_hash == new_entry.content_hash
+                && old_entry.executable == new_entry.executable
+                && old_entry.kind == new_entry.kind
+            {
+                continue;
+            }
+            let kind = if old_entry.kind != new_entry.kind {
+                FileChangeKind::TypeChanged
+            } else {
+                FileChangeKind::Modified
+            };
+            summaries.push(file_diff_summary(
+                path,
+                None,
+                kind,
+                Some(old_entry.content_hash),
+                Some(new_entry.content_hash),
+            ));
+        }
+
+        summaries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.old_path.cmp(&right.old_path))
+        });
+        Ok(summaries)
+    }
+
     pub(crate) fn diff_root_file_maps(
         &self,
         left_root_id: &ObjectId,
@@ -10,9 +130,11 @@ impl CrabDb {
     ) -> Result<RootDiff> {
         let left_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, left_root_id)?;
         let right_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, right_root_id)?;
-        let left_tree = tree_from_root_hex(left_root.path_map_root.as_deref())?;
-        let right_tree = tree_from_root_hex(right_root.path_map_root.as_deref())?;
-        let diffs = self.prolly.range_diff(&left_tree, &right_tree, &[], None)?;
+        let left_tree = worktree_root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
+        let right_tree = worktree_root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
+        let diffs = self
+            .root_prolly
+            .range_diff(&left_tree, &right_tree, &[], None)?;
 
         let mut added = Vec::new();
         let mut removed = Vec::new();
@@ -141,4 +263,24 @@ impl CrabDb {
 }
 fn path_from_key(key: Vec<u8>) -> Result<String> {
     String::from_utf8(key).map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))
+}
+
+fn file_diff_summary(
+    path: String,
+    old_path: Option<String>,
+    kind: FileChangeKind,
+    before_hash: Option<String>,
+    after_hash: Option<String>,
+) -> FileDiffSummary {
+    FileDiffSummary {
+        path,
+        old_path,
+        kind,
+        before_hash,
+        after_hash,
+        additions: 0,
+        deletions: 0,
+        line_changes: Vec::new(),
+        patch: None,
+    }
 }

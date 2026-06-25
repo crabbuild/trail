@@ -10,6 +10,13 @@ impl CrabDb {
         patches: bool,
         include_line_changes: bool,
     ) -> Result<DiffSummary> {
+        if !patches && !include_line_changes {
+            return Ok(DiffSummary {
+                from,
+                to,
+                files: self.diff_root_file_summaries(left_root_id, right_root_id)?,
+            });
+        }
         let mut patch_left = BTreeMap::new();
         let mut patch_right = BTreeMap::new();
         let mut diff = self.diff_root_file_maps(
@@ -40,6 +47,13 @@ impl CrabDb {
         patches: bool,
         include_line_changes: bool,
     ) -> Result<DiffSummary> {
+        if !patches && !include_line_changes {
+            return Ok(DiffSummary {
+                from,
+                to,
+                files: diff_file_map_summaries(left, right),
+            });
+        }
         let mut diff = self.diff_file_maps(left, right)?;
         if include_line_changes {
             attach_line_changes(&diff.changes, &mut diff.summaries);
@@ -59,145 +73,229 @@ impl CrabDb {
         left: &BTreeMap<String, FileEntry>,
         right: &BTreeMap<String, FileEntry>,
     ) -> Result<RootDiff> {
-        let mut paths = BTreeSet::new();
-        paths.extend(left.keys().cloned());
-        paths.extend(right.keys().cloned());
-        let mut changes = Vec::new();
-        let mut summaries = Vec::new();
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut changed = Vec::new();
         let mut removed_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
         for (path, entry) in left {
-            if !right.contains_key(path) {
+            match right.get(path) {
+                Some(new_entry)
+                    if entry.content_hash != new_entry.content_hash
+                        || entry.executable != new_entry.executable
+                        || entry.kind != new_entry.kind =>
+                {
+                    changed.push((path.clone(), entry.clone(), new_entry.clone()));
+                }
+                Some(_) => {}
+                None => {
+                    removed.push((path.clone(), entry.clone()));
+                    removed_by_hash
+                        .entry(entry.content_hash.clone())
+                        .or_default()
+                        .push((path.clone(), entry.clone()));
+                }
+            }
+        }
+        for (path, entry) in right {
+            if !left.contains_key(path) {
+                added.push((path.clone(), entry.clone()));
+            }
+        }
+
+        let mut changes = Vec::new();
+        let mut consumed_removed = HashSet::new();
+        for (path, new_entry) in added {
+            let rename = removed_by_hash
+                .get(&new_entry.content_hash)
+                .and_then(|candidates| {
+                    candidates.iter().find(|(old_path, old_entry)| {
+                        !consumed_removed.contains(old_path)
+                            && old_entry.file_id == new_entry.file_id
+                    })
+                });
+            if let Some((old_path, old_entry)) = rename {
+                consumed_removed.insert(old_path.clone());
+                changes.push(FileChange {
+                    path,
+                    old_path: Some(old_path.clone()),
+                    file_id: Some(new_entry.file_id),
+                    kind: FileChangeKind::Renamed,
+                    before_hash: Some(old_entry.content_hash.clone()),
+                    after_hash: Some(new_entry.content_hash),
+                    line_changes: Vec::new(),
+                });
+            } else {
+                let line_changes = self.added_line_changes(&path, &new_entry)?;
+                changes.push(FileChange {
+                    path,
+                    old_path: None,
+                    file_id: Some(new_entry.file_id),
+                    kind: FileChangeKind::Added,
+                    before_hash: None,
+                    after_hash: Some(new_entry.content_hash),
+                    line_changes,
+                });
+            }
+        }
+
+        for (path, old_entry) in removed {
+            if consumed_removed.contains(&path) {
+                continue;
+            }
+            let line_changes = self.deleted_line_changes(&path, &old_entry)?;
+            changes.push(FileChange {
+                path,
+                old_path: None,
+                file_id: Some(old_entry.file_id),
+                kind: FileChangeKind::Deleted,
+                before_hash: Some(old_entry.content_hash),
+                after_hash: None,
+                line_changes,
+            });
+        }
+
+        for (path, old_entry, new_entry) in changed {
+            let line_changes = self.modified_line_changes(&old_entry, &new_entry)?;
+            let kind = if old_entry.kind != new_entry.kind {
+                FileChangeKind::TypeChanged
+            } else {
+                FileChangeKind::Modified
+            };
+            changes.push(FileChange {
+                path,
+                old_path: None,
+                file_id: Some(new_entry.file_id),
+                kind,
+                before_hash: Some(old_entry.content_hash),
+                after_hash: Some(new_entry.content_hash),
+                line_changes,
+            });
+        }
+
+        changes.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.old_path.cmp(&right.old_path))
+        });
+        let summaries = summarize_file_changes(&changes);
+        Ok(RootDiff { changes, summaries })
+    }
+}
+
+fn diff_file_map_summaries(
+    left: &BTreeMap<String, FileEntry>,
+    right: &BTreeMap<String, FileEntry>,
+) -> Vec<FileDiffSummary> {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    let mut removed_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
+    for (path, entry) in left {
+        match right.get(path) {
+            Some(new_entry)
+                if entry.content_hash != new_entry.content_hash
+                    || entry.executable != new_entry.executable
+                    || entry.kind != new_entry.kind =>
+            {
+                changed.push((path.clone(), entry.clone(), new_entry.clone()));
+            }
+            Some(_) => {}
+            None => {
                 removed_by_hash
                     .entry(entry.content_hash.clone())
                     .or_default()
                     .push((path.clone(), entry.clone()));
+                removed.push((path.clone(), entry.clone()));
             }
         }
+    }
+    for (path, entry) in right {
+        if !left.contains_key(path) {
+            added.push((path.clone(), entry.clone()));
+        }
+    }
 
-        let mut handled_renames = HashSet::new();
-        for path in paths {
-            let old = left.get(&path);
-            let new = right.get(&path);
-            match (old, new) {
-                (None, Some(new_entry)) => {
-                    let rename = removed_by_hash
-                        .get(&new_entry.content_hash)
-                        .and_then(|candidates| candidates.first());
-                    if let Some((old_path, old_entry)) = rename {
-                        if old_entry.file_id == new_entry.file_id {
-                            handled_renames.insert(old_path.clone());
-                            let change = FileChange {
-                                path: path.clone(),
-                                old_path: Some(old_path.clone()),
-                                file_id: Some(new_entry.file_id.clone()),
-                                kind: FileChangeKind::Renamed,
-                                before_hash: Some(old_entry.content_hash.clone()),
-                                after_hash: Some(new_entry.content_hash.clone()),
-                                line_changes: Vec::new(),
-                            };
-                            summaries.push(FileDiffSummary {
-                                path: path.clone(),
-                                old_path: Some(old_path.clone()),
-                                kind: FileChangeKind::Renamed,
-                                before_hash: Some(old_entry.content_hash.clone()),
-                                after_hash: Some(new_entry.content_hash.clone()),
-                                additions: 0,
-                                deletions: 0,
-                                line_changes: Vec::new(),
-                                patch: None,
-                            });
-                            changes.push(change);
-                            continue;
-                        }
-                    }
-                    let line_changes = self.added_line_changes(&path, new_entry)?;
-                    let (adds, dels) = count_line_delta(&line_changes);
-                    changes.push(FileChange {
-                        path: path.clone(),
-                        old_path: None,
-                        file_id: Some(new_entry.file_id.clone()),
-                        kind: FileChangeKind::Added,
-                        before_hash: None,
-                        after_hash: Some(new_entry.content_hash.clone()),
-                        line_changes,
-                    });
-                    summaries.push(FileDiffSummary {
-                        path,
-                        old_path: None,
-                        kind: FileChangeKind::Added,
-                        before_hash: None,
-                        after_hash: Some(new_entry.content_hash.clone()),
-                        additions: adds,
-                        deletions: dels,
-                        line_changes: Vec::new(),
-                        patch: None,
-                    });
-                }
-                (Some(old_entry), None) => {
-                    if handled_renames.contains(&path) {
-                        continue;
-                    }
-                    let line_changes = self.deleted_line_changes(&path, old_entry)?;
-                    let (adds, dels) = count_line_delta(&line_changes);
-                    changes.push(FileChange {
-                        path: path.clone(),
-                        old_path: None,
-                        file_id: Some(old_entry.file_id.clone()),
-                        kind: FileChangeKind::Deleted,
-                        before_hash: Some(old_entry.content_hash.clone()),
-                        after_hash: None,
-                        line_changes,
-                    });
-                    summaries.push(FileDiffSummary {
-                        path,
-                        old_path: None,
-                        kind: FileChangeKind::Deleted,
-                        before_hash: Some(old_entry.content_hash.clone()),
-                        after_hash: None,
-                        additions: adds,
-                        deletions: dels,
-                        line_changes: Vec::new(),
-                        patch: None,
-                    });
-                }
-                (Some(old_entry), Some(new_entry)) => {
-                    if old_entry.content_hash == new_entry.content_hash
-                        && old_entry.executable == new_entry.executable
-                        && old_entry.kind == new_entry.kind
-                    {
-                        continue;
-                    }
-                    let line_changes = self.modified_line_changes(old_entry, new_entry)?;
-                    let (adds, dels) = count_line_delta(&line_changes);
-                    let kind = if old_entry.kind != new_entry.kind {
-                        FileChangeKind::TypeChanged
-                    } else {
-                        FileChangeKind::Modified
-                    };
-                    changes.push(FileChange {
-                        path: path.clone(),
-                        old_path: None,
-                        file_id: Some(new_entry.file_id.clone()),
-                        kind: kind.clone(),
-                        before_hash: Some(old_entry.content_hash.clone()),
-                        after_hash: Some(new_entry.content_hash.clone()),
-                        line_changes,
-                    });
-                    summaries.push(FileDiffSummary {
-                        path,
-                        old_path: None,
-                        kind,
-                        before_hash: Some(old_entry.content_hash.clone()),
-                        after_hash: Some(new_entry.content_hash.clone()),
-                        additions: adds,
-                        deletions: dels,
-                        line_changes: Vec::new(),
-                        patch: None,
-                    });
-                }
-                (None, None) => {}
-            }
+    let mut consumed_removed = HashSet::new();
+    let mut summaries = Vec::new();
+    for (path, new_entry) in added {
+        let rename = removed_by_hash
+            .get(&new_entry.content_hash)
+            .and_then(|candidates| {
+                candidates.iter().find(|(old_path, old_entry)| {
+                    !consumed_removed.contains(old_path) && old_entry.file_id == new_entry.file_id
+                })
+            });
+        if let Some((old_path, old_entry)) = rename {
+            consumed_removed.insert(old_path.clone());
+            summaries.push(summary_without_line_counts(
+                path,
+                Some(old_path.clone()),
+                FileChangeKind::Renamed,
+                Some(old_entry.content_hash.clone()),
+                Some(new_entry.content_hash),
+            ));
+        } else {
+            summaries.push(summary_without_line_counts(
+                path,
+                None,
+                FileChangeKind::Added,
+                None,
+                Some(new_entry.content_hash),
+            ));
         }
-        Ok(RootDiff { changes, summaries })
+    }
+
+    for (path, old_entry) in removed {
+        if consumed_removed.contains(&path) {
+            continue;
+        }
+        summaries.push(summary_without_line_counts(
+            path,
+            None,
+            FileChangeKind::Deleted,
+            Some(old_entry.content_hash),
+            None,
+        ));
+    }
+
+    for (path, old_entry, new_entry) in changed {
+        let kind = if old_entry.kind != new_entry.kind {
+            FileChangeKind::TypeChanged
+        } else {
+            FileChangeKind::Modified
+        };
+        summaries.push(summary_without_line_counts(
+            path,
+            None,
+            kind,
+            Some(old_entry.content_hash),
+            Some(new_entry.content_hash),
+        ));
+    }
+    summaries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.old_path.cmp(&right.old_path))
+    });
+    summaries
+}
+
+fn summary_without_line_counts(
+    path: String,
+    old_path: Option<String>,
+    kind: FileChangeKind,
+    before_hash: Option<String>,
+    after_hash: Option<String>,
+) -> FileDiffSummary {
+    FileDiffSummary {
+        path,
+        old_path,
+        kind,
+        before_hash,
+        after_hash,
+        additions: 0,
+        deletions: 0,
+        line_changes: Vec::new(),
+        patch: None,
     }
 }

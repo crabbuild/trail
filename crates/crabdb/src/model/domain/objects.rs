@@ -50,6 +50,8 @@ pub struct TextContent {
     pub content_hash: String,
     pub line_count: u64,
     pub byte_count: u64,
+    #[serde(default)]
+    pub full_bytes_blob_id: Option<ObjectId>,
     pub order_map_root: Option<String>,
     pub line_index_map_root: Option<String>,
     pub representation: TextRepresentation,
@@ -62,6 +64,8 @@ pub enum TextRepresentation {
         blob_id: ObjectId,
         reason: OpaqueReason,
     },
+    SmallTextTable { table: Vec<u8> },
+    SmallText { lines: Vec<LineEntry> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

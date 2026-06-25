@@ -13,6 +13,9 @@ pub(super) fn agent_schemas() -> Value {
                 "materialize": { "type": "boolean" },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" },
                 "provider": { "type": "string" },
                 "model": { "type": "string" }
             }
@@ -111,9 +114,25 @@ pub(super) fn agent_schemas() -> Value {
                 "threshold": { "type": "number" }
             }
         },
+        "AgentReadFileRequest": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "hydrate": { "type": "boolean" },
+                "force": { "type": "boolean" },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" }
+            }
+        },
         "SyncWorkdirRequest": {
             "type": "object",
-            "properties": { "force": { "type": "boolean" } }
+            "properties": {
+                "force": { "type": "boolean" },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" }
+            }
         }
     })
 }

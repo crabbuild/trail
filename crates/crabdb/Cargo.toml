@@ -11,8 +11,11 @@ clap.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 ignore.workspace = true
+notify.workspace = true
 prolly = { path = "../prolly", features = ["sqlite"] }
+rayon.workspace = true
 rusqlite.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_cbor.workspace = true
 serde_json.workspace = true

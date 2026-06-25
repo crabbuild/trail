@@ -24,6 +24,7 @@ cargo run -p crabdb -- why src/lib.rs:42
 
 # Start the local API for editor and agent integrations.
 # By default this creates .crabdb/daemon.token and requires bearer auth.
+# While running, supported CLI hot paths auto-discover .crabdb/daemon.json.
 cargo run -p crabdb -- daemon
 
 # Export the machine-readable local API contract.
@@ -69,9 +70,13 @@ crabdb merge-queue add doc-bot --into main
 crabdb merge-queue run
 ```
 
-Each agent gets an isolated `refs/agents/<name>` branch and, by default, a
-materialized workdir under `.crabdb/worktrees/<name>/`. Merging back to `main`
-is explicit, serialized through an optional merge queue, and conservative.
+Each agent gets an isolated `refs/agents/<name>` branch. Large-repo workflows
+default to headless branches for structured patch, HTTP, and MCP operation;
+materialized and sparse workdirs are opt-in when a tool needs filesystem
+access. Sparse workdirs can hydrate selected paths and lightweight dependency
+neighbors incrementally, including lazy hydration on first `agent read`.
+Merging back to `main` is explicit, serialized through
+an optional merge queue, and conservative.
 
 ## Documentation
 

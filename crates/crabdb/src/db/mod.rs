@@ -1,17 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{symlink as symlink_file, PermissionsExt};
+use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
 use prolly::{BatchBuilder, Cid, Config, Diff, Encoding, Prolly, SqliteStore, Tree};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
@@ -36,6 +36,8 @@ const OP_OBJECT_VERSION: u16 = 1;
 const BLOB_OBJECT_VERSION: u16 = 1;
 const MESSAGE_OBJECT_VERSION: u16 = 1;
 const ANCHOR_OBJECT_VERSION: u16 = 1;
+const OBJECT_CACHE_MAX_ENTRIES: usize = 4096;
+const OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ORDER_KEY_STEP: u64 = 1024;
 const AGENT_TEST_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
 const DEFAULT_CRABIGNORE_PATTERNS: &[&str] = &[
@@ -62,7 +64,63 @@ pub struct CrabDb {
     conn: Connection,
     store: Arc<SqliteStore>,
     prolly: Prolly<Arc<SqliteStore>>,
+    root_prolly: Prolly<Arc<SqliteStore>>,
     config: CrabConfig,
+    object_cache: Mutex<ObjectCache>,
+    daemon_worktree_cache: Option<DaemonWorktreeCache>,
+}
+
+#[derive(Debug, Default)]
+struct ObjectCache {
+    entries: HashMap<String, ObjectCacheEntry>,
+    order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+#[derive(Debug)]
+struct ObjectCacheEntry {
+    kind: String,
+    bytes: Vec<u8>,
+}
+
+impl ObjectCache {
+    fn get(&self, kind: &str, object_id: &ObjectId) -> Option<Vec<u8>> {
+        self.entries.get(&object_id.0).and_then(|entry| {
+            if entry.kind == kind {
+                Some(entry.bytes.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&mut self, object_id: &ObjectId, kind: &str, bytes: &[u8]) {
+        if bytes.len() > OBJECT_CACHE_MAX_BYTES {
+            return;
+        }
+        if self.entries.contains_key(&object_id.0) {
+            return;
+        }
+        self.entries.insert(
+            object_id.0.clone(),
+            ObjectCacheEntry {
+                kind: kind.to_string(),
+                bytes: bytes.to_vec(),
+            },
+        );
+        self.order.push_back(object_id.0.clone());
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        while self.entries.len() > OBJECT_CACHE_MAX_ENTRIES
+            || self.total_bytes > OBJECT_CACHE_MAX_BYTES
+        {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&evicted) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +142,11 @@ pub(crate) struct RootBuildResult {
     root_id: ObjectId,
     files: BTreeMap<String, FileEntry>,
     stats: ImportStats,
+}
+
+#[derive(Debug)]
+pub(crate) struct IncrementalRootBuildResult {
+    root_id: ObjectId,
 }
 
 #[derive(Debug)]
@@ -109,6 +172,13 @@ pub(crate) struct TextBuildResult {
 pub(crate) struct RootDiff {
     changes: Vec<FileChange>,
     summaries: Vec<FileDiffSummary>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PathLocalMergeResult {
+    target_files: BTreeMap<String, FileEntry>,
+    merged_files: BTreeMap<String, FileEntry>,
+    conflicts: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -180,6 +250,52 @@ pub(crate) struct DiskManifest {
     kind: FileKind,
     executable: bool,
     content_hash: String,
+}
+
+pub(crate) struct DaemonWorktreeCache {
+    state: Arc<Mutex<DaemonWorktreeCacheState>>,
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[derive(Debug)]
+pub struct DaemonWorktreeCacheWarmup {
+    workspace_root: PathBuf,
+    db_dir: PathBuf,
+    state: Arc<Mutex<DaemonWorktreeCacheState>>,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DaemonWorktreeCacheState {
+    dirty_paths: BTreeSet<String>,
+    overflow: bool,
+    initialized: bool,
+    baseline_root_id: Option<ObjectId>,
+    generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum DaemonWorktreeSnapshot {
+    Clean {
+        generation: u64,
+        root_id: Option<ObjectId>,
+    },
+    Dirty {
+        generation: u64,
+        paths: Vec<String>,
+    },
+    Overflow {
+        generation: u64,
+    },
+}
+
+pub(crate) enum CachedWorkdirManifestStatus {
+    Clean,
+    Dirty {
+        disk_manifest: BTreeMap<String, DiskManifest>,
+        candidate_paths: Option<Vec<String>>,
+    },
+    Missing,
 }
 
 #[derive(Debug, Clone)]

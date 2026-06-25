@@ -12,6 +12,10 @@ pub(crate) struct SpawnAgentRequest {
     #[serde(default, alias = "workdir_path")]
     pub(crate) workdir: Option<String>,
     #[serde(default)]
+    pub(crate) paths: Vec<String>,
+    #[serde(default, alias = "include_neighborhood")]
+    pub(crate) include_neighbors: bool,
+    #[serde(default)]
     pub(crate) provider: Option<String>,
     #[serde(default)]
     pub(crate) model: Option<String>,
@@ -92,9 +96,24 @@ pub(crate) struct AgentTestRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct AgentReadFileRequest {
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) hydrate: Option<bool>,
+    #[serde(default)]
+    pub(crate) force: bool,
+    #[serde(default, alias = "include_neighborhood")]
+    pub(crate) include_neighbors: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct SyncWorkdirRequest {
     #[serde(default)]
     pub(crate) force: bool,
+    #[serde(default)]
+    pub(crate) paths: Vec<String>,
+    #[serde(default, alias = "include_neighborhood")]
+    pub(crate) include_neighbors: bool,
 }
 
 #[derive(Debug, Deserialize)]

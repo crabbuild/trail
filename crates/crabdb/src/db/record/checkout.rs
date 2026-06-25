@@ -52,13 +52,7 @@ impl CrabDb {
         if !dry_run {
             if let Some(output_root) = &output_root {
                 prepare_checkout_workdir(output_root)?;
-                materialize_into(
-                    &self.workspace_root,
-                    output_root,
-                    &BTreeMap::new(),
-                    &target_files,
-                    |entry| self.materialize_entry_bytes(entry),
-                )?;
+                self.materialize_files_at(output_root, &BTreeMap::new(), &target_files)?;
             } else {
                 self.materialize_files(&current_files, &target_files)?;
             }

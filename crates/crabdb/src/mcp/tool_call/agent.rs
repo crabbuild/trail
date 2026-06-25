@@ -10,13 +10,18 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
     let value = match name {
         "crabdb.agent_spawn" => {
             let args: AgentSpawnArgs = parse_args(arguments)?;
-            tool_result(db.spawn_agent_with_workdir(
+            let materialize = args.materialize.unwrap_or(
+                args.workdir.is_some() || !args.paths.is_empty() || db.default_agent_materialize(),
+            );
+            tool_result(db.spawn_agent_with_workdir_paths_and_neighbors(
                 &args.name,
                 args.from_ref.as_deref(),
-                args.materialize,
+                materialize,
                 args.provider,
                 args.model,
                 args.workdir.map(PathBuf::from),
+                &args.paths,
+                args.include_neighbors,
             )?)
         }
         "crabdb.agent_claim" => {
@@ -115,9 +120,25 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
                 options,
             )?)
         }
+        "crabdb.read_file" => {
+            let args: ReadFileArgs = parse_args(arguments)?;
+            let agent = db.resolve_agent_handle(&args.agent)?;
+            tool_result(db.read_agent_file_with_hydration(
+                &agent,
+                &args.path,
+                args.hydrate,
+                args.force,
+                args.include_neighbors,
+            )?)
+        }
         "crabdb.sync_workdir" => {
             let args: SyncWorkdirArgs = parse_args(arguments)?;
-            tool_result(db.sync_agent_workdir(&args.agent, args.force)?)
+            tool_result(db.sync_agent_workdir_with_paths_and_neighbors(
+                &args.agent,
+                args.force,
+                &args.paths,
+                args.include_neighbors,
+            )?)
         }
         _ => return Ok(None),
     };

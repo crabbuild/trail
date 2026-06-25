@@ -14,6 +14,9 @@ pub(super) fn tools() -> Value {
                 "materialize": { "type": "boolean" },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" },
                 "provider": { "type": "string" },
                 "model": { "type": "string" }
             }), vec!["name"])

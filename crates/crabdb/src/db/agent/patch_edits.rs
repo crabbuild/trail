@@ -3,6 +3,25 @@ use super::*;
 pub(crate) type ManualLineChange = (String, FileId, LineChange);
 
 impl CrabDb {
+    pub(crate) fn patch_touched_paths(&self, edits: &[PatchEdit]) -> Result<Vec<String>> {
+        let mut paths = BTreeSet::new();
+        for edit in edits {
+            match edit {
+                PatchEdit::Write { path, .. }
+                | PatchEdit::WriteBytes { path, .. }
+                | PatchEdit::ReplaceLine { path, .. }
+                | PatchEdit::Delete { path } => {
+                    paths.insert(normalize_relative_path(path)?);
+                }
+                PatchEdit::Rename { from, to } => {
+                    paths.insert(normalize_relative_path(from)?);
+                    paths.insert(normalize_relative_path(to)?);
+                }
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     pub(crate) fn apply_patch_edit_to_files(
         &self,
         edit: PatchEdit,

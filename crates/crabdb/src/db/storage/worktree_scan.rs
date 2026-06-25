@@ -25,15 +25,16 @@ impl CrabDb {
                 return Ok(None);
             }
             let status = &record[..2];
-            if status == b"??" {
-                return Ok(None);
-            }
             let path = normalize_relative_path(&String::from_utf8_lossy(&record[3..]))?;
             if path == ".crabignore" || path == ".gitignore" {
                 return Ok(None);
             }
             if !self.ignore_check(&path)?.ignored {
                 paths.insert(path);
+            }
+            if status == b"??" {
+                idx += 1;
+                continue;
             }
             if status.contains(&b'R') || status.contains(&b'C') {
                 idx += 1;
@@ -54,6 +55,7 @@ impl CrabDb {
     }
 
     pub(crate) fn scan_visible_files_for_paths(&self, paths: &[String]) -> Result<Vec<DiskFile>> {
+        let root = self.workspace_root.canonicalize()?;
         let mut files = BTreeMap::new();
         for path in paths {
             if self.ignore_check(path)?.ignored {
@@ -77,6 +79,13 @@ impl CrabDb {
                         executable: executable_from_metadata(&metadata),
                     },
                 );
+            } else if metadata.is_dir() {
+                scan_files_under_selection(
+                    &root,
+                    &abs,
+                    self.config.recording.ignore_gitignored,
+                    &mut files,
+                )?;
             }
         }
         Ok(files.into_values().collect())
@@ -144,6 +153,48 @@ impl CrabDb {
         self.scan_files_under(&self.workspace_root)
     }
 
+    pub(crate) fn scan_files_under_for_paths(
+        &self,
+        root: &Path,
+        paths: &[String],
+    ) -> Result<Vec<DiskFile>> {
+        let root = root.canonicalize()?;
+        let mut files = BTreeMap::new();
+        for path in paths {
+            let path = normalize_relative_path(path)?;
+            if is_default_ignored(&path) {
+                continue;
+            }
+            let abs = safe_join(&root, &path)?;
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_file() {
+                files.insert(
+                    path.clone(),
+                    DiskFile {
+                        path,
+                        bytes: fs::read(&abs)?,
+                        executable: executable_from_metadata(&metadata),
+                    },
+                );
+            } else if metadata.is_dir() {
+                scan_files_under_selection(
+                    &root,
+                    &abs,
+                    self.config.recording.ignore_gitignored,
+                    &mut files,
+                )?;
+            }
+        }
+        Ok(files.into_values().collect())
+    }
+
     pub(crate) fn scan_files_under(&self, root: &Path) -> Result<Vec<DiskFile>> {
         let root = root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
@@ -183,4 +234,49 @@ impl CrabDb {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
     }
+}
+
+fn scan_files_under_selection(
+    root: &Path,
+    selected_root: &Path,
+    use_git_ignores: bool,
+    files: &mut BTreeMap<String, DiskFile>,
+) -> Result<()> {
+    let mut builder = WalkBuilder::new(selected_root);
+    builder
+        .hidden(false)
+        .git_ignore(use_git_ignores)
+        .git_exclude(use_git_ignores)
+        .git_global(use_git_ignores)
+        .add_custom_ignore_filename(".crabignore");
+    let walker = builder.build();
+    for item in walker {
+        let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let path = entry.path();
+        if path == selected_root {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let rel = normalize_relative_path(&rel.to_string_lossy())?;
+        if entry.file_type().is_some_and(|kind| kind.is_dir()) && is_default_ignored(&rel) {
+            continue;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if is_default_ignored(&rel) {
+            continue;
+        }
+        files.insert(
+            rel.clone(),
+            DiskFile {
+                path: rel,
+                bytes: fs::read(path)?,
+                executable: executable(path)?,
+            },
+        );
+    }
+    Ok(())
 }

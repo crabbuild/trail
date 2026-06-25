@@ -50,6 +50,7 @@ impl CrabDb {
             InitImportMode::WorkingTree => db.scan_worktree_files()?,
         };
         let built = db.build_root_from_disk_files(&disk_files, &change_id, None)?;
+        db.update_worktree_index_from_disk_files(&disk_files)?;
         let kind = if mode == InitImportMode::Empty {
             OperationKind::Init
         } else {
@@ -88,6 +89,7 @@ impl CrabDb {
             &built.root_id,
             &operation_id,
         )?;
+        db.set_worktree_index_baseline(&built.root_id)?;
         if mode == InitImportMode::GitTracked {
             db.insert_git_mapping("import", &branch, &change_id, &built.root_id)?;
         }
@@ -149,13 +151,17 @@ impl CrabDb {
         let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());
+        let root_prolly = Prolly::new(store.clone(), worktree_root_map_prolly_config());
         let db = Self {
             workspace_root,
             db_dir,
             conn,
             store,
             prolly,
+            root_prolly,
             config,
+            object_cache: Mutex::new(ObjectCache::default()),
+            daemon_worktree_cache: None,
         };
         db.init_schema()?;
         Ok(db)
@@ -221,20 +227,54 @@ impl CrabDb {
 
     pub(crate) fn acquire_write_lock(&self) -> Result<WorkspaceLock> {
         let path = self.db_dir.join("lock");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    let holder =
-                        fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
-                    Error::WorkspaceLocked(holder.trim().to_string())
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder =
+                    fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
+                if is_stale_lock_holder(&holder)
+                    && fs::read_to_string(&path).unwrap_or_default() == holder
+                {
+                    fs::remove_file(&path)?;
+                    OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?
                 } else {
-                    Error::Io(err)
+                    return Err(Error::WorkspaceLocked(holder.trim().to_string()));
                 }
-            })?;
+            }
+            Err(err) => return Err(Error::Io(err)),
+        };
         writeln!(file, "pid={} created_at={}", std::process::id(), now_ts())?;
         Ok(WorkspaceLock { path })
     }
+}
+
+fn is_stale_lock_holder(holder: &str) -> bool {
+    let Some(pid) = lock_holder_pid(holder) else {
+        return false;
+    };
+    !process_is_alive(pid)
+}
+
+fn lock_holder_pid(holder: &str) -> Option<u32> {
+    holder.split_whitespace().find_map(|part| {
+        part.strip_prefix("pid=")
+            .and_then(|value| value.parse::<u32>().ok())
+    })
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }

@@ -54,6 +54,11 @@ pub(super) fn agent_paths() -> Value {
                 openapi_query("show-line-ids", "boolean")
             ], None, true)
         },
+        "/v1/agents/{agent_or_id}/read-file": {
+            "post": openapi_operation("agentReadFile", "Read agent file", "Read one file from an agent branch. Sparse workdirs hydrate lazily when hydrate is omitted; pass hydrate=false for a side-effect-free read.", vec![
+                openapi_path_param("agent_or_id", "string")
+            ], Some("AgentReadFileRequest"), true)
+        },
         "/v1/agents/{agent_or_id}/sync-workdir": {
             "post": openapi_operation("agentSyncWorkdir", "Sync agent workdir", "Refresh a materialized agent workdir.", vec![
                 openapi_path_param("agent_or_id", "string")

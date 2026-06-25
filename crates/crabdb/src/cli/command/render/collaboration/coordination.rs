@@ -107,6 +107,15 @@ pub(crate) fn render_agent_claim(report: &AgentClaimReport, json: bool, quiet: b
             } else {
                 println!("Claimed {} for {}", report.path, report.agent_id);
             }
+            if !report.hydrated_paths.is_empty() {
+                println!(
+                    "Hydrated {} sparse workdir paths",
+                    report.hydrated_paths.len()
+                );
+            }
+            if let Some(warning) = &report.hydration_warning {
+                println!("Warning: {warning}");
+            }
         } else if let Some(warning) = &report.warning {
             println!("Warning: {warning}");
         } else {

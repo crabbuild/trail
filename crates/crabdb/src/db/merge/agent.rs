@@ -33,14 +33,15 @@ impl CrabDb {
         let target_ref = self.get_ref(&target_ref_name)?;
         let base_ref = self.ref_from_change(&agent_branch.base_change)?;
 
-        let base_files = self.load_root_files(&base_ref.root_id)?;
-        let source_files = self.load_root_files(&source_ref.root_id)?;
-        let target_files = self.load_root_files(&target_ref.root_id)?;
         let actor = Actor::system();
         let change_id = self.allocate_change_id(&actor.id, "agent_merge")?;
-        let (merged_files, conflicts) =
-            self.merge_file_maps(&base_files, &target_files, &source_files, &change_id)?;
-        if !conflicts.is_empty() {
+        let merged = self.merge_root_maps_for_changed_paths(
+            &base_ref.root_id,
+            &target_ref.root_id,
+            &source_ref.root_id,
+            &change_id,
+        )?;
+        if !merged.conflicts.is_empty() {
             if dry_run {
                 return Ok(MergeReport {
                     operation: change_id,
@@ -49,10 +50,10 @@ impl CrabDb {
                     root_id: target_ref.root_id,
                     dry_run,
                     changed_paths: Vec::new(),
-                    conflicts,
+                    conflicts: merged.conflicts,
                 });
             }
-            let detail = conflicts.join("; ");
+            let detail = merged.conflicts.join("; ");
             let conflict_message = if persist_conflict {
                 let context = MergeContext {
                     base_change: agent_branch.base_change.clone(),
@@ -92,9 +93,7 @@ impl CrabDb {
             return Err(Error::Conflict(conflict_message));
         }
 
-        let built = self.build_root_from_file_entries(merged_files, &change_id)?;
-        let diff = self.diff_file_maps(&target_files, &built.files)?;
-        if diff.changes.is_empty() {
+        if merged.merged_files == merged.target_files {
             if !dry_run {
                 self.conn.execute(
                     "UPDATE agent_branches SET status = 'merged', updated_at = ?1 WHERE agent_id = ?2",
@@ -111,6 +110,13 @@ impl CrabDb {
                 conflicts: Vec::new(),
             });
         }
+        let built = self.build_root_from_touched_file_entries_incremental(
+            &target_ref.root_id,
+            &merged.target_files,
+            &merged.merged_files,
+            &change_id,
+        )?;
+        let diff = self.diff_file_maps(&merged.target_files, &merged.merged_files)?;
         if dry_run {
             return Ok(MergeReport {
                 operation: change_id,
@@ -219,11 +225,36 @@ impl CrabDb {
         if !workdir_path.is_dir() {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
-        let head_files = self.load_root_files(&head.root_id)?;
-        let disk_files = self.scan_files_under(&workdir_path)?;
-        let disk_manifest = self.disk_manifest(&disk_files);
-        Ok(Some(
-            self.diff_file_maps_to_manifest(&head_files, &disk_manifest),
-        ))
+        let cached_manifest =
+            match self.cached_workdir_manifest_status(&workdir_path, &head.root_id)? {
+                CachedWorkdirManifestStatus::Clean => return Ok(Some(Vec::new())),
+                CachedWorkdirManifestStatus::Dirty {
+                    disk_manifest,
+                    candidate_paths,
+                } => Some((disk_manifest, candidate_paths)),
+                CachedWorkdirManifestStatus::Missing => None,
+            };
+        let disk_files;
+        let (disk_manifest, candidate_paths) = if let Some(cached_manifest) = cached_manifest {
+            cached_manifest
+        } else {
+            disk_files = self.scan_files_under(&workdir_path)?;
+            (self.disk_manifest(&disk_files), None)
+        };
+        let changed_paths = if let Some(sparse_paths) = self.sparse_workdir_paths(&workdir_path)? {
+            let mut selected_paths = sparse_paths;
+            selected_paths.extend(disk_manifest.keys().cloned());
+            selected_paths.sort();
+            selected_paths.dedup();
+            let head_files = self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
+            self.diff_file_maps_to_manifest_for_paths(&head_files, &disk_manifest, &selected_paths)
+        } else if let Some(candidate_paths) = candidate_paths {
+            let head_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
+            self.diff_file_maps_to_manifest_for_paths(&head_files, &disk_manifest, &candidate_paths)
+        } else {
+            let head_files = self.load_root_files(&head.root_id)?;
+            self.diff_file_maps_to_manifest(&head_files, &disk_manifest)
+        };
+        Ok(Some(changed_paths))
     }
 }

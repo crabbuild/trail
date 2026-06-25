@@ -11,7 +11,7 @@ impl CrabDb {
                 .iter()
                 .any(|path| self.workspace_root.join(path_from_rel(path)).is_dir())
         {
-            let disk_files = self.scan_worktree_files()?;
+            let disk_files = self.scan_visible_files_for_paths(selected_paths)?;
             return self.selected_record_disk_files(&disk_files, selected_paths, false);
         }
 

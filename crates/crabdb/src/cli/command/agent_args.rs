@@ -48,6 +48,8 @@ pub(super) enum AgentSubcommand {
     Test(AgentTestArgs),
     /// Run evaluation command in agent workdir and record eval gate metadata.
     Eval(AgentTestArgs),
+    /// Read one file from an agent branch, lazily hydrating sparse workdirs by default.
+    Read(AgentReadArgs),
     /// Print the resolved agent workdir path.
     Workdir(AgentWorkdirArgs),
     /// Re-sync agent workdir from the agent branch head.
@@ -77,17 +79,20 @@ pub(super) struct AgentSpawnArgs {
     pub(super) from: Option<String>,
     #[arg(
         long,
-        default_value_t = true,
         default_missing_value = "true",
         num_args = 0..=1,
         require_equals = true,
         conflicts_with = "no_materialize"
     )]
-    pub(super) materialize: bool,
+    pub(super) materialize: Option<bool>,
     #[arg(long = "no-materialize")]
     pub(super) no_materialize: bool,
     #[arg(long)]
     pub(super) workdir: Option<PathBuf>,
+    #[arg(long, num_args = 1.., conflicts_with = "no_materialize")]
+    pub(super) paths: Vec<String>,
+    #[arg(long)]
+    pub(super) include_neighbors: bool,
     #[arg(long)]
     pub(super) provider: Option<String>,
     #[arg(long)]
@@ -200,6 +205,20 @@ pub(super) struct AgentTestArgs {
 }
 
 #[derive(Args)]
+pub(super) struct AgentReadArgs {
+    pub(super) name: String,
+    pub(super) path: String,
+    #[arg(long, conflicts_with = "no_hydrate")]
+    pub(super) hydrate: bool,
+    #[arg(long = "no-hydrate")]
+    pub(super) no_hydrate: bool,
+    #[arg(long)]
+    pub(super) force: bool,
+    #[arg(long)]
+    pub(super) include_neighbors: bool,
+}
+
+#[derive(Args)]
 pub(super) struct AgentWorkdirArgs {
     pub(super) name: String,
 }
@@ -209,6 +228,10 @@ pub(super) struct AgentSyncWorkdirArgs {
     pub(super) name: String,
     #[arg(long)]
     pub(super) force: bool,
+    #[arg(long, num_args = 1..)]
+    pub(super) paths: Vec<String>,
+    #[arg(long)]
+    pub(super) include_neighbors: bool,
 }
 
 #[derive(Args)]

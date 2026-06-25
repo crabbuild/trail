@@ -180,11 +180,27 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.sync_workdir",
             "title": "Sync Agent Workdir",
-            "description": "Refresh an agent materialized workdir from its branch head, refusing dirty edits unless force is true.",
+            "description": "Refresh an agent materialized workdir from its branch head, or hydrate selected paths in a sparse workdir, refusing dirty edits unless force is true.",
             "inputSchema": object_schema(json!({
                 "agent": { "type": "string" },
-                "force": { "type": "boolean" }
+                "force": { "type": "boolean" },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" }
             }), vec!["agent"])
+        },
+        {
+            "name": "crabdb.read_file",
+            "title": "Read Agent File",
+            "description": "Read one file from an agent branch without materializing the whole workdir. Sparse workdirs hydrate lazily when hydrate is omitted; pass hydrate=false for a side-effect-free read.",
+            "inputSchema": object_schema(json!({
+                "agent": { "type": "string" },
+                "path": { "type": "string" },
+                "hydrate": { "type": "boolean" },
+                "force": { "type": "boolean" },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" }
+            }), vec!["agent", "path"])
         }
     ])
 }

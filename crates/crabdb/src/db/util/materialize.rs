@@ -33,15 +33,61 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<u6
     Ok(bytes)
 }
 
-pub(crate) fn materialize_into<F>(
+pub(crate) fn materialize_into_batched<F>(
     workspace_root: &Path,
     output_root: &Path,
     previous: &BTreeMap<String, FileEntry>,
     target: &BTreeMap<String, FileEntry>,
-    bytes_for: F,
+    batch_size: usize,
+    bytes_for_batch: F,
 ) -> Result<()>
 where
-    F: Fn(&FileEntry) -> Result<Vec<u8>>,
+    F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
+{
+    materialize_into_batched_with_durability(
+        workspace_root,
+        output_root,
+        previous,
+        target,
+        batch_size,
+        true,
+        bytes_for_batch,
+    )
+}
+
+pub(crate) fn materialize_into_batched_best_effort<F>(
+    workspace_root: &Path,
+    output_root: &Path,
+    previous: &BTreeMap<String, FileEntry>,
+    target: &BTreeMap<String, FileEntry>,
+    batch_size: usize,
+    bytes_for_batch: F,
+) -> Result<()>
+where
+    F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
+{
+    materialize_into_batched_with_durability(
+        workspace_root,
+        output_root,
+        previous,
+        target,
+        batch_size,
+        false,
+        bytes_for_batch,
+    )
+}
+
+fn materialize_into_batched_with_durability<F>(
+    workspace_root: &Path,
+    output_root: &Path,
+    previous: &BTreeMap<String, FileEntry>,
+    target: &BTreeMap<String, FileEntry>,
+    batch_size: usize,
+    durable: bool,
+    bytes_for_batch: F,
+) -> Result<()>
+where
+    F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
 {
     reject_case_insensitive_collisions(output_root, target)?;
     for path in previous.keys() {
@@ -52,15 +98,46 @@ where
             }
         }
     }
+
+    let batch_size = batch_size.max(1);
+    let mut batch = BTreeMap::new();
     for (path, entry) in target {
+        batch.insert(path.clone(), entry.clone());
+        if batch.len() >= batch_size {
+            materialize_batch(output_root, &batch, durable, &bytes_for_batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        materialize_batch(output_root, &batch, durable, &bytes_for_batch)?;
+    }
+
+    let _ = workspace_root;
+    Ok(())
+}
+
+fn materialize_batch<F>(
+    output_root: &Path,
+    batch: &BTreeMap<String, FileEntry>,
+    durable: bool,
+    bytes_for_batch: &F,
+) -> Result<()>
+where
+    F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
+{
+    let bytes = bytes_for_batch(batch)?;
+    for (path, entry) in batch {
         let abs = safe_join(output_root, path)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent)?;
         }
-        let bytes = bytes_for(entry)?;
-        write_materialized_file(&abs, path, &bytes, entry.executable)?;
+        let Some(file_bytes) = bytes.get(path) else {
+            return Err(Error::Corrupt(format!(
+                "missing materialized bytes for `{path}`"
+            )));
+        };
+        write_materialized_file_with_durability(&abs, path, file_bytes, entry.executable, durable)?;
     }
-    let _ = workspace_root;
     Ok(())
 }
 
@@ -176,11 +253,12 @@ pub(crate) fn ensure_no_symlink_ancestors(root: &Path, normalized: &str, rel: &s
     Ok(())
 }
 
-pub(crate) fn write_materialized_file(
+fn write_materialized_file_with_durability(
     path: &Path,
     rel: &str,
     bytes: &[u8],
     executable: bool,
+    durable: bool,
 ) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
@@ -205,11 +283,15 @@ pub(crate) fn write_materialized_file(
     let (tmp, mut file) = create_materialize_temp_file(parent, path)?;
     let result = (|| -> Result<()> {
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
         drop(file);
         set_executable(&tmp, executable)?;
         fs::rename(&tmp, path)?;
-        sync_directory(parent);
+        if durable {
+            sync_directory(parent);
+        }
         Ok(())
     })();
     if result.is_err() {
