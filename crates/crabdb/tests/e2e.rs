@@ -3187,6 +3187,7 @@ fn local_agent_http_api_can_require_bearer_token() {
 fn cli_daemon_url_routes_hot_agent_commands() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    fs::write(temp.path().join("NOTES.md"), "notes\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let port = free_loopback_port();
@@ -3251,6 +3252,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         .unwrap()
         .iter()
         .any(|path| path["path"] == "README.md"));
+    fs::remove_file(temp.path().join("rpc-patch.json")).unwrap();
 
     let read = run_crabdb_json_daemon(
         temp.path(),
@@ -3269,6 +3271,64 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let readiness =
         run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "readiness", "rpc-bot"]);
     assert_eq!(readiness["ready"], true);
+
+    fs::write(
+        temp.path().join("NOTES.md"),
+        "notes\nworkspace record through daemon\n",
+    )
+    .unwrap();
+    let workspace_record = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "record",
+            "-m",
+            "daemon workspace record",
+            "--paths",
+            "NOTES.md",
+        ],
+    );
+    assert!(workspace_record["operation"].as_str().is_some());
+    assert!(workspace_record["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "NOTES.md"));
+    let clean_status = run_crabdb_json_daemon(temp.path(), &daemon_url, &["status"]);
+    assert_eq!(clean_status["worktree_state"], "Clean");
+
+    let materialized = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "spawn",
+            "mat-rpc",
+            "--from",
+            "main",
+            "--materialize",
+        ],
+    );
+    let materialized_workdir = materialized["workdir"].as_str().unwrap();
+    fs::write(
+        Path::new(materialized_workdir).join("README.md"),
+        "hello\nrecorded through daemon\n",
+    )
+    .unwrap();
+    let recorded = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "record", "mat-rpc", "-m", "daemon CLI record"],
+    );
+    assert!(recorded["operation"].as_str().is_some());
+    assert!(recorded["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "README.md"));
+    let materialized_status =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "status", "mat-rpc"]);
+    assert_eq!(materialized_status["workdir_state"], "Clean");
 
     let merge = run_crabdb_json_daemon(
         temp.path(),
@@ -4718,9 +4778,38 @@ fn git_import_update_records_current_git_tracked_snapshot() {
     assert!(no_change.mapping.is_none());
     assert!(no_change.changed_paths.is_empty());
 
+    fs::remove_file(temp.path().join("src/lib.rs")).unwrap();
+    let deleted = db
+        .git_import_update(Some("main"), Some("remove tracked lib".to_string()))
+        .unwrap();
+    assert!(deleted.operation.is_some());
+    assert!(deleted
+        .changed_paths
+        .iter()
+        .any(|path| { path.path == "src/lib.rs" && path.kind == crabdb::FileChangeKind::Deleted }));
+    let deleted_root = db.inspect_root(&deleted.root_id.0).unwrap();
+    assert!(!deleted_root
+        .files
+        .iter()
+        .any(|file| file.path == "src/lib.rs"));
+    let clean_after_delete = db.status(Some("main")).unwrap();
+    assert_eq!(
+        clean_after_delete.worktree_state,
+        WorktreeState::DirtyUntracked
+    );
+    assert!(clean_after_delete
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "scratch.txt" && path.kind == crabdb::FileChangeKind::Added));
+    assert!(!clean_after_delete
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "src/lib.rs"));
+
     let mappings = db.git_mappings(10).unwrap();
-    assert_eq!(mappings.len(), 2);
-    assert_eq!(mappings[0].crab_change, imported_change);
+    assert_eq!(mappings.len(), 3);
+    assert_eq!(mappings[0].crab_change, deleted.operation.unwrap());
+    assert_eq!(mappings[1].crab_change, imported_change);
 }
 
 #[cfg(unix)]
@@ -7346,6 +7435,54 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
 }
 
 #[test]
+fn large_roots_default_agents_to_no_materialize() {
+    let temp = tempfile::tempdir().unwrap();
+    let files_dir = temp.path().join("files");
+    fs::create_dir_all(&files_dir).unwrap();
+    for idx in 0..=10_000 {
+        fs::write(files_dir.join(format!("file-{idx:05}.txt")), "tiny\n").unwrap();
+    }
+    let init = CrabDb::init_with_text_policy(
+        temp.path(),
+        "main",
+        InitImportMode::WorkingTree,
+        false,
+        Some("minimal"),
+    )
+    .unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    match db.show(&init.operation.0).unwrap() {
+        ShowResult::Operation { value } => {
+            assert!(value.operation.changes.is_empty());
+        }
+        other => panic!("expected operation show result, got {other:?}"),
+    }
+    let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
+    let file_history_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM file_history", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(file_history_rows, 0);
+    let file_history = db
+        .history_for_path("files/file-00000.txt")
+        .unwrap()
+        .file_history;
+    assert_eq!(file_history.len(), 1);
+    assert_eq!(file_history[0].kind, crabdb::FileChangeKind::Added);
+    assert_eq!(file_history[0].change_id, init.operation);
+
+    db.config_set("agent.default_materialize", "true").unwrap();
+    assert!(db.default_agent_materialize());
+    assert!(!db.default_agent_materialize_for_ref(Some("main")).unwrap());
+
+    let materialize = db.default_agent_materialize_for_ref(Some("main")).unwrap();
+    let report = db
+        .spawn_agent("large-default-bot", Some("main"), materialize, None, None)
+        .unwrap();
+    assert!(report.workdir.is_none());
+}
+
+#[test]
 fn agent_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -7572,6 +7709,73 @@ fn materialized_agent_status_detects_manifest_candidate_paths() {
         recorded_paths.get("src/lib.rs"),
         Some(&crabdb::FileChangeKind::Deleted)
     );
+    assert_eq!(
+        db.agent_status("doc-bot").unwrap().workdir_state,
+        Some(WorktreeState::Clean)
+    );
+}
+
+#[test]
+fn materialized_agent_status_and_record_without_clean_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    fs::write(temp.path().join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .unwrap();
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    let manifest = workdir.join(".crabdb/workdir-manifest.json");
+    fs::remove_file(&manifest).unwrap();
+    fs::write(workdir.join("README.md"), "hello\nchanged\n").unwrap();
+    fs::remove_file(workdir.join("src/lib.rs")).unwrap();
+    fs::write(workdir.join("src/new.rs"), "pub fn new() {}\n").unwrap();
+
+    let status = db.agent_status("doc-bot").unwrap();
+    assert_eq!(status.workdir_state, Some(WorktreeState::DirtyUntracked));
+    let changed = status
+        .workdir_changed_paths
+        .iter()
+        .map(|path| (path.path.as_str(), path.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        changed.get("README.md"),
+        Some(&crabdb::FileChangeKind::Modified)
+    );
+    assert_eq!(
+        changed.get("src/lib.rs"),
+        Some(&crabdb::FileChangeKind::Deleted)
+    );
+    assert_eq!(
+        changed.get("src/new.rs"),
+        Some(&crabdb::FileChangeKind::Added)
+    );
+
+    let recorded = db
+        .record_agent_workdir("doc-bot", Some("record missing manifest".to_string()))
+        .unwrap();
+    assert!(recorded.operation.is_some());
+    let recorded_paths = recorded
+        .changed_paths
+        .iter()
+        .map(|path| (path.path.as_str(), path.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        recorded_paths.get("README.md"),
+        Some(&crabdb::FileChangeKind::Modified)
+    );
+    assert_eq!(
+        recorded_paths.get("src/lib.rs"),
+        Some(&crabdb::FileChangeKind::Deleted)
+    );
+    assert_eq!(
+        recorded_paths.get("src/new.rs"),
+        Some(&crabdb::FileChangeKind::Added)
+    );
+    assert!(manifest.exists());
     assert_eq!(
         db.agent_status("doc-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
@@ -8805,6 +9009,68 @@ fn small_text_policy_avoids_prolly_text_maps_for_tiny_files() {
     ));
     assert!(text.content.full_bytes_blob_id.is_some());
     assert!(text.content.order_map_root.is_some());
+}
+
+#[test]
+fn minimal_text_policy_uses_lazy_line_trackable_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let body = (0..512)
+        .map(|idx| format!("line {idx}\n"))
+        .collect::<String>();
+    assert!(body.len() > 4 * 1024);
+    fs::write(temp.path().join("README.md"), body).unwrap();
+
+    CrabDb::init_with_text_policy(
+        temp.path(),
+        "main",
+        InitImportMode::WorkingTree,
+        false,
+        Some("minimal"),
+    )
+    .unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    let status = db.status(Some("main")).unwrap();
+    let root = db.inspect_root(&status.head.root_id.0).unwrap();
+    let readme = root
+        .files
+        .iter()
+        .find(|file| file.path == "README.md")
+        .unwrap();
+    let text = db.inspect_text(&readme.content_object.0, 0).unwrap();
+    assert!(matches!(
+        text.content.representation,
+        TextRepresentation::LazyText { .. }
+    ));
+    assert!(text.content.full_bytes_blob_id.is_some());
+    assert!(text.content.order_map_root.is_none());
+    assert!(text.content.line_index_map_root.is_none());
+    assert_eq!(text.lines.len(), 512);
+
+    let why = db.why("README.md:128", Some("main")).unwrap();
+    assert_eq!(why.current_text, "line 127");
+    let line_id = why.line_id.clone();
+
+    let report = db.rebuild_indexes_with_rich_text().unwrap();
+    assert_eq!(report.rich_text_hydrated, 1);
+
+    let status = db.status(Some("main")).unwrap();
+    let root = db.inspect_root(&status.head.root_id.0).unwrap();
+    let readme = root
+        .files
+        .iter()
+        .find(|file| file.path == "README.md")
+        .unwrap();
+    let text = db.inspect_text(&readme.content_object.0, 0).unwrap();
+    assert!(matches!(
+        text.content.representation,
+        TextRepresentation::TreeText
+    ));
+    assert!(text.content.order_map_root.is_some());
+
+    let hydrated_why = db.why("README.md:128", Some("main")).unwrap();
+    assert_eq!(hydrated_why.current_text, "line 127");
+    assert_eq!(hydrated_why.line_id, line_id);
 }
 
 #[test]

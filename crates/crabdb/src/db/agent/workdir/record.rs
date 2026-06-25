@@ -62,10 +62,15 @@ impl CrabDb {
                         );
                         (summaries, previous_files, true)
                     } else {
-                        let previous_files = self.load_root_files(&head.root_id)?;
                         let summaries =
-                            self.diff_file_maps_to_manifest(&previous_files, &disk_manifest);
-                        (summaries, previous_files, false)
+                            self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?;
+                        let selected_paths = summaries
+                            .iter()
+                            .map(|summary| summary.path.clone())
+                            .collect::<Vec<_>>();
+                        let previous_files =
+                            self.load_root_files_for_paths(&head.root_id, &selected_paths)?;
+                        (summaries, previous_files, true)
                     };
                 let materialized_paths = disk_manifest.keys().cloned().collect::<Vec<_>>();
                 if summaries.is_empty() {
@@ -119,8 +124,7 @@ impl CrabDb {
             }
             CachedWorkdirManifestStatus::Missing => {
                 let disk_files = self.scan_files_under(&workdir_path)?;
-                let (built, previous_files) = if let Some(mut selected_paths) = sparse_paths.clone()
-                {
+                if let Some(mut selected_paths) = sparse_paths.clone() {
                     selected_paths.extend(disk_files.iter().map(|file| file.path.clone()));
                     selected_paths.sort();
                     selected_paths.dedup();
@@ -133,25 +137,50 @@ impl CrabDb {
                         &selected_paths,
                         &change_id,
                     )?;
-                    (built, previous_files)
-                } else {
-                    let previous_files = self.load_root_files(&head.root_id)?;
-                    let built = self.build_root_from_disk_files(
-                        &disk_files,
-                        &change_id,
-                        Some(&previous_files),
-                    )?;
-                    (built, previous_files)
-                };
-                let materialized_paths = if is_sparse {
-                    disk_files
+                    let materialized_paths = disk_files
                         .iter()
                         .map(|file| file.path.clone())
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (built, materialized_paths, previous_files, None)
                 } else {
-                    built.files.keys().cloned().collect::<Vec<_>>()
-                };
-                (built, materialized_paths, previous_files, None)
+                    let disk_manifest = self.disk_manifest(&disk_files);
+                    let summaries =
+                        self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?;
+                    let materialized_paths = disk_manifest.keys().cloned().collect::<Vec<_>>();
+                    if summaries.is_empty() {
+                        self.write_clean_workdir_manifest_from_disk_manifest(
+                            &workdir_path,
+                            &head.root_id,
+                            &disk_manifest,
+                            materialized_paths.iter(),
+                        )?;
+                        return Ok(AgentRecordReport {
+                            agent_id: branch.agent_id,
+                            operation: None,
+                            root_id: head.root_id,
+                            changed_paths: Vec::new(),
+                        });
+                    }
+                    let selected_paths = summaries
+                        .iter()
+                        .map(|summary| summary.path.clone())
+                        .collect::<Vec<_>>();
+                    let previous_files =
+                        self.load_root_files_for_paths(&head.root_id, &selected_paths)?;
+                    let built = self.build_root_for_selected_disk_files_incremental(
+                        &head.root_id,
+                        &previous_files,
+                        &disk_files,
+                        &selected_paths,
+                        &change_id,
+                    )?;
+                    (
+                        built,
+                        materialized_paths,
+                        previous_files,
+                        Some(disk_manifest),
+                    )
+                }
             }
         };
         let diff = self.diff_file_maps(&previous_files, &built.files)?;

@@ -11,12 +11,11 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
             let mut db = open_db(ctx)?;
             let materialize = if args.no_materialize {
                 false
+            } else if args.workdir.is_some() || !args.paths.is_empty() {
+                args.materialize.unwrap_or(true)
             } else {
-                args.materialize.unwrap_or(
-                    args.workdir.is_some()
-                        || !args.paths.is_empty()
-                        || db.default_agent_materialize(),
-                )
+                args.materialize
+                    .unwrap_or(db.default_agent_materialize_for_ref(args.from.as_deref())?)
             };
             let report = db.spawn_agent_with_workdir_paths_and_neighbors(
                 &args.name,

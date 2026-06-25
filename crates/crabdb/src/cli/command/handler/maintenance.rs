@@ -220,9 +220,13 @@ pub(super) fn handle_fsck_command(ctx: &RuntimeContext) -> Result<()> {
 
 pub(super) fn handle_index_command(ctx: &RuntimeContext, index: IndexCommand) -> Result<()> {
     match index.command {
-        IndexSubcommand::Rebuild => {
+        IndexSubcommand::Rebuild(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.rebuild_indexes()?;
+            let report = if args.rich_text {
+                db.rebuild_indexes_with_rich_text()?
+            } else {
+                db.rebuild_indexes()?
+            };
             render_index_rebuild(&report, ctx.json, ctx.quiet)
         }
         IndexSubcommand::Watch(args) => {

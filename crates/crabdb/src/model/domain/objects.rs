@@ -60,6 +60,10 @@ pub struct TextContent {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TextRepresentation {
     TreeText,
+    LazyText {
+        blob_id: ObjectId,
+        introduced_by: ChangeId,
+    },
     OpaqueText {
         blob_id: ObjectId,
         reason: OpaqueReason,

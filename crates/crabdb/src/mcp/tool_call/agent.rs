@@ -10,9 +10,12 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
     let value = match name {
         "crabdb.agent_spawn" => {
             let args: AgentSpawnArgs = parse_args(arguments)?;
-            let materialize = args.materialize.unwrap_or(
-                args.workdir.is_some() || !args.paths.is_empty() || db.default_agent_materialize(),
-            );
+            let materialize = if args.workdir.is_some() || !args.paths.is_empty() {
+                args.materialize.unwrap_or(true)
+            } else {
+                args.materialize
+                    .unwrap_or(db.default_agent_materialize_for_ref(args.from_ref.as_deref())?)
+            };
             tool_result(db.spawn_agent_with_workdir_paths_and_neighbors(
                 &args.name,
                 args.from_ref.as_deref(),

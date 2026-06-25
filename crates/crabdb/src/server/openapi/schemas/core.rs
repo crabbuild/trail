@@ -36,6 +36,26 @@ pub(super) fn core_schemas() -> Value {
                 "value": { "type": "string" }
             }
         },
+        "RecordRequest": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "ref_name": { "type": "string" },
+                "branch": { "type": "string" },
+                "message": { "type": "string" },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["file-edit", "multi-file-edit", "format", "manual-checkpoint", "manual-record"]
+                },
+                "session_id": { "type": "string" },
+                "session": { "type": "string" },
+                "allow_ignored": { "type": "boolean" }
+            }
+        },
         "IgnorePatternRequest": {
             "type": "object",
             "required": ["pattern"],

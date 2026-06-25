@@ -236,7 +236,7 @@ pub mod prolly;
 
 // Re-export public API from prolly module
 pub use prolly::boundary::{is_boundary, is_boundary_config};
-pub use prolly::builder::BatchBuilder;
+pub use prolly::builder::{BatchBuilder, SortedBatchBuilder};
 pub use prolly::cid::Cid;
 pub use prolly::config::{Config, ConfigBuilder};
 pub use prolly::cursor::{Cursor, CursorIterator, DiffCursor};

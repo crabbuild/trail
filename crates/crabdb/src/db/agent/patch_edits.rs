@@ -39,9 +39,12 @@ impl CrabDb {
             } => {
                 let path = normalize_relative_path(&path)?;
                 let previous = files.get(&path);
+                let bytes = content.into_bytes();
+                let content_hash = sha256_hex(&bytes);
                 let built = self.build_file_entry(
                     &path,
-                    content.into_bytes(),
+                    bytes,
+                    content_hash,
                     executable,
                     change_id,
                     previous,
@@ -66,8 +69,16 @@ impl CrabDb {
                     Error::PatchRejected(format!("invalid bytes_hex for `{path}`: {err}"))
                 })?;
                 let previous = files.get(&path);
+                let content_hash = sha256_hex(&bytes);
                 let built = self.build_file_entry(
-                    &path, bytes, executable, change_id, previous, file_seq, line_seq,
+                    &path,
+                    bytes,
+                    content_hash,
+                    executable,
+                    change_id,
+                    previous,
+                    file_seq,
+                    line_seq,
                 )?;
                 manual_line_changes.extend(
                     built

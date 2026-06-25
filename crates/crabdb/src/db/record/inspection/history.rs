@@ -3,9 +3,13 @@ use super::*;
 impl CrabDb {
     pub fn history_for_path(&self, path: &str) -> Result<HistoryResult> {
         let path = normalize_relative_path(path)?;
+        let mut file_history = self.file_history_by_path(&path)?;
+        if let Some(initial) = self.compacted_initial_file_history_for_path(&path, &file_history)? {
+            file_history.insert(0, initial);
+        }
         Ok(HistoryResult {
             selector: path.clone(),
-            file_history: self.file_history_by_path(&path)?,
+            file_history,
             line_history: Vec::new(),
         })
     }
@@ -73,5 +77,46 @@ impl CrabDb {
             selector: selector.to_string(),
             operations,
         })
+    }
+
+    fn compacted_initial_file_history_for_path(
+        &self,
+        path: &str,
+        existing: &[FileHistoryEntry],
+    ) -> Result<Option<FileHistoryEntry>> {
+        let head = self.resolve_branch_ref(&self.current_branch()?)?;
+        let files = self.load_root_files_for_paths(&head.root_id, &[path.to_string()])?;
+        let Some(entry) = files.get(path) else {
+            return Ok(None);
+        };
+        if existing
+            .iter()
+            .any(|history| history.change_id == entry.created_by)
+        {
+            return Ok(None);
+        }
+        let row = self
+            .conn
+            .query_row(
+                "SELECT created_at FROM operations \
+                 WHERE change_id = ?1 AND before_root IS NULL \
+                 AND kind IN ('Init', 'GitImport')",
+                params![entry.created_by.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(created_at) = row else {
+            return Ok(None);
+        };
+        Ok(Some(FileHistoryEntry {
+            file_id: file_id_key(&entry.file_id),
+            change_id: entry.created_by.clone(),
+            path: path.to_string(),
+            old_path: None,
+            kind: FileChangeKind::Added,
+            before_hash: None,
+            after_hash: Some(entry.content_hash.clone()),
+            created_at,
+        }))
     }
 }

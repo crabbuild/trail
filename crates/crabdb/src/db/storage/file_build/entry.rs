@@ -5,13 +5,13 @@ impl CrabDb {
         &self,
         path: &str,
         bytes: Vec<u8>,
+        content_hash: String,
         executable: bool,
         change_id: &ChangeId,
         previous: Option<&FileEntry>,
         file_seq: &mut u64,
         line_seq: &mut u64,
     ) -> Result<FileBuildResult> {
-        let content_hash = sha256_hex(&bytes);
         let file_id = previous
             .map(|entry| entry.file_id.clone())
             .unwrap_or_else(|| {
@@ -29,6 +29,8 @@ impl CrabDb {
         let should_store_small_text = self.config.text.small_text_max_bytes > 0
             && bytes.len() as u64 <= self.config.text.small_text_max_bytes;
         let below_tree_text_threshold = (bytes.len() as u64) < self.config.text.tree_text_min_bytes;
+        let should_store_lazy_text =
+            below_tree_text_threshold && !should_store_small_text && previous_text.is_none();
         let (kind, content, line_changes) = if looks_binary(&bytes) {
             let blob_id = self.put_blob(bytes.clone())?;
             (
@@ -57,13 +59,6 @@ impl CrabDb {
                 FileContentRef::Opaque(blob_id),
                 Vec::new(),
             )
-        } else if below_tree_text_threshold && !should_store_small_text {
-            let blob_id = self.put_blob(bytes.clone())?;
-            (
-                FileKind::OpaqueText,
-                FileContentRef::Opaque(blob_id),
-                Vec::new(),
-            )
         } else {
             let built_text = self.build_text_content(
                 &bytes,
@@ -72,6 +67,7 @@ impl CrabDb {
                 line_seq,
                 self.config.text.preserve_similarity,
                 should_store_small_text,
+                should_store_lazy_text,
             )?;
             (
                 FileKind::Text,
@@ -100,9 +96,15 @@ impl CrabDb {
             last_path_change: previous.and_then(|entry| entry.last_path_change.clone()),
         };
         let _ = path;
+        let disk_manifest = DiskManifest {
+            kind: entry.kind.clone(),
+            executable: entry.executable,
+            content_hash: entry.content_hash.clone(),
+        };
         Ok(FileBuildResult {
             entry,
             line_changes,
+            disk_manifest,
         })
     }
 }

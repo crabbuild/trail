@@ -59,12 +59,13 @@ impl CrabDb {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
+        let mut exact_sources = BTreeMap::new();
         for selection in selections {
             let selection = normalize_relative_path(selection)?;
             let exact = self.root_prolly.get(&tree, selection.as_bytes())?;
             if let Some(value) = exact {
                 let entry: FileEntry = from_cbor(&value)?;
-                self.load_dependency_neighbors_for_file(&tree, &selection, &entry, &mut out)?;
+                exact_sources.insert(selection.clone(), entry.clone());
                 out.insert(selection.clone(), entry);
                 if let Some(parent_prefix) = parent_directory_prefix(&selection) {
                     self.load_root_files_for_prefix(&tree, &parent_prefix, &mut out)?;
@@ -74,26 +75,28 @@ impl CrabDb {
             let prefix = format!("{selection}/");
             self.load_root_files_for_prefix(&tree, &prefix, &mut out)?;
         }
+        self.load_dependency_neighbors_for_files(&tree, &exact_sources, &mut out)?;
         Ok(out)
     }
 
-    fn load_dependency_neighbors_for_file(
+    fn load_dependency_neighbors_for_files(
         &self,
         tree: &Tree,
-        source_path: &str,
-        source_entry: &FileEntry,
+        source_entries: &BTreeMap<String, FileEntry>,
         out: &mut BTreeMap<String, FileEntry>,
     ) -> Result<()> {
-        let bytes = self.materialize_entry_bytes(source_entry)?;
-        let Ok(source) = std::str::from_utf8(&bytes) else {
-            return Ok(());
-        };
-        for candidate in dependency_neighbor_candidates(source_path, source)? {
-            if out.contains_key(&candidate) {
+        let source_bytes = self.materialize_entries_bytes(source_entries)?;
+        for (source_path, bytes) in source_bytes {
+            let Ok(source) = std::str::from_utf8(&bytes) else {
                 continue;
-            }
-            if let Some(value) = self.root_prolly.get(tree, candidate.as_bytes())? {
-                out.insert(candidate, from_cbor(&value)?);
+            };
+            for candidate in dependency_neighbor_candidates(&source_path, source)? {
+                if out.contains_key(&candidate) {
+                    continue;
+                }
+                if let Some(value) = self.root_prolly.get(tree, candidate.as_bytes())? {
+                    out.insert(candidate, from_cbor(&value)?);
+                }
             }
         }
         Ok(())
@@ -146,9 +149,9 @@ impl CrabDb {
         text_id: &ObjectId,
         content: TextContent,
     ) -> Result<Vec<LineEntry>> {
-        match content.representation {
-            TextRepresentation::SmallText { lines } => Ok(lines),
-            TextRepresentation::SmallTextTable { table } => decode_small_text_table(&table),
+        match &content.representation {
+            TextRepresentation::SmallText { lines } => Ok(lines.clone()),
+            TextRepresentation::SmallTextTable { table } => decode_small_text_table(table),
             TextRepresentation::TreeText => {
                 let tree = tree_from_root_hex(content.order_map_root.as_deref())?;
                 let iter = self.prolly.range(&tree, &[], None)?;
@@ -159,8 +162,16 @@ impl CrabDb {
                 }
                 Ok(out)
             }
+            TextRepresentation::LazyText {
+                blob_id,
+                introduced_by,
+            } => {
+                let blob: Blob = self.get_object(BLOB_KIND, blob_id)?;
+                validate_full_text_blob(&content, &blob)?;
+                Ok(lazy_text_lines(&blob.bytes, introduced_by))
+            }
             TextRepresentation::OpaqueText { blob_id, .. } => {
-                let blob: Blob = self.get_object(BLOB_KIND, &blob_id)?;
+                let blob: Blob = self.get_object(BLOB_KIND, blob_id)?;
                 Ok(split_lines(&blob.bytes)
                     .into_iter()
                     .enumerate()
@@ -277,6 +288,14 @@ impl CrabDb {
                 Ok(materialize_lines(&decode_small_text_table(table)?))
             }
             TextRepresentation::TreeText => self.load_text_bytes(text_id),
+            TextRepresentation::LazyText { blob_id, .. } => {
+                let blob = blobs.get(blob_id).ok_or_else(|| Error::ObjectNotFound {
+                    kind: BLOB_KIND,
+                    id: blob_id.0.clone(),
+                })?;
+                validate_full_text_blob(content, blob)?;
+                Ok(blob.bytes.clone())
+            }
             TextRepresentation::OpaqueText { blob_id, .. } => {
                 let blob = blobs.get(blob_id).ok_or_else(|| Error::ObjectNotFound {
                     kind: BLOB_KIND,
@@ -327,6 +346,26 @@ impl CrabDb {
             |batch| self.materialize_entries_bytes(batch),
         )
     }
+}
+
+pub(crate) fn lazy_text_lines(bytes: &[u8], introduced_by: &ChangeId) -> Vec<LineEntry> {
+    split_lines(bytes)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let text_hash = sha256_hex(&line.text);
+            LineEntry {
+                line_id: LineId::new(introduced_by.clone(), idx as u64 + 1),
+                text: line.text,
+                newline: line.newline,
+                text_hash,
+                introduced_by: introduced_by.clone(),
+                last_content_change: introduced_by.clone(),
+                last_move_change: None,
+                flags: LineFlags::default(),
+            }
+        })
+        .collect()
 }
 
 fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -466,7 +505,7 @@ fn push_dependency_candidate(out: &mut BTreeSet<String>, path: &str) {
     }
 }
 
-fn validate_full_text_blob(content: &TextContent, blob: &Blob) -> Result<()> {
+pub(crate) fn validate_full_text_blob(content: &TextContent, blob: &Blob) -> Result<()> {
     if blob.content_hash != content.content_hash {
         return Err(Error::Corrupt(format!(
             "full text blob hash {} does not match text content hash {}",

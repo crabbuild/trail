@@ -1,8 +1,22 @@
 use super::*;
 
+const LARGE_AGENT_MATERIALIZE_FILE_THRESHOLD: u64 = 10_000;
+
 impl CrabDb {
     pub fn default_agent_materialize(&self) -> bool {
         self.config.agent.default_materialize
+    }
+
+    pub fn default_agent_materialize_for_ref(&self, from: Option<&str>) -> Result<bool> {
+        if !self.config.agent.default_materialize {
+            return Ok(false);
+        }
+        let source = match from {
+            Some(refish) => self.resolve_refish(refish)?,
+            None => self.resolve_branch_ref(&self.current_branch()?)?,
+        };
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &source.root_id)?;
+        Ok(root.file_count <= LARGE_AGENT_MATERIALIZE_FILE_THRESHOLD)
     }
 
     pub fn spawn_agent(

@@ -27,6 +27,8 @@ pub struct IndexRebuildReport {
     pub file_history_rows: u64,
     pub line_history_rows: u64,
     pub messages: u64,
+    #[serde(default)]
+    pub rich_text_hydrated: u64,
     pub errors: Vec<String>,
 }
 

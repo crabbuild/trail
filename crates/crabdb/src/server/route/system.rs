@@ -1,3 +1,4 @@
+use crate::model::{Actor, OperationKind, RecordOptions};
 use crate::server::transport::{HttpRequest, HttpResponse};
 use crate::{Error, Result};
 
@@ -25,6 +26,35 @@ pub(super) fn handle_system_route(
 
     if request.method == "GET" && path == "/v1/status" {
         let report = db.status(None)?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "POST" && path == "/v1/record" {
+        use crate::server::request_types::RecordRequest;
+        let body: RecordRequest = if request.body.is_empty() {
+            RecordRequest {
+                ref_name: None,
+                message: None,
+                paths: Vec::new(),
+                kind: None,
+                session_id: None,
+                allow_ignored: false,
+            }
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let kind = body.kind.as_deref().map(parse_record_kind).transpose()?;
+        let report = db.record_with_options(
+            body.ref_name.as_deref(),
+            body.message,
+            Actor::human(),
+            RecordOptions {
+                paths: body.paths,
+                kind,
+                session_id: body.session_id,
+                allow_ignored: body.allow_ignored,
+            },
+        )?;
         return Ok(Some(utils::json_response(200, "OK", &report)?));
     }
 
@@ -168,4 +198,17 @@ pub(super) fn handle_system_route(
     }
 
     Ok(None)
+}
+
+fn parse_record_kind(value: &str) -> Result<OperationKind> {
+    match value {
+        "file-edit" => Ok(OperationKind::FileEdit),
+        "multi-file-edit" => Ok(OperationKind::MultiFileEdit),
+        "format" => Ok(OperationKind::Format),
+        "manual-checkpoint" => Ok(OperationKind::ManualCheckpoint),
+        "manual-record" => Ok(OperationKind::ManualRecord),
+        other => Err(Error::InvalidInput(format!(
+            "record kind must be file-edit, multi-file-edit, format, manual-checkpoint, or manual-record, got `{other}`"
+        ))),
+    }
 }

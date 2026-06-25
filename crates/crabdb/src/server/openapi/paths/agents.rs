@@ -64,6 +64,11 @@ pub(super) fn agent_paths() -> Value {
                 openapi_path_param("agent_or_id", "string")
             ], Some("SyncWorkdirRequest"), true)
         },
+        "/v1/agents/{agent_or_id}/record": {
+            "post": openapi_operation("agentRecordWorkdir", "Record agent workdir", "Record materialized agent workdir changes into the agent branch.", vec![
+                openapi_path_param("agent_or_id", "string")
+            ], Some("AgentRecordRequest"), true)
+        },
         "/v1/agents/{agent_or_id}/tests": {
             "post": openapi_operation("agentRunTest", "Run agent test", "Run a command in an agent workdir and record test events.", vec![
                 openapi_path_param("agent_or_id", "string")

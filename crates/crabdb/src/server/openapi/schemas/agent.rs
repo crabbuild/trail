@@ -133,6 +133,12 @@ pub(super) fn agent_schemas() -> Value {
                 "include_neighbors": { "type": "boolean" },
                 "include_neighborhood": { "type": "boolean" }
             }
+        },
+        "AgentRecordRequest": {
+            "type": "object",
+            "properties": {
+                "message": { "type": "string" }
+            }
         }
     })
 }

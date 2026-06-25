@@ -195,9 +195,12 @@ impl CrabDb {
                     content,
                     executable,
                 } => {
+                    let bytes = content.into_bytes();
+                    let content_hash = sha256_hex(&bytes);
                     let built = self.build_file_entry(
                         &path,
-                        content.into_bytes(),
+                        bytes,
+                        content_hash,
                         executable,
                         change_id,
                         previous,

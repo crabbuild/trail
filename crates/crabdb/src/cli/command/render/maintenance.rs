@@ -125,6 +125,9 @@ pub(crate) fn render_index_rebuild(
             report.line_history_rows,
             report.messages
         );
+        if report.rich_text_hydrated > 0 {
+            println!("Hydrated {} lazy text object(s)", report.rich_text_hydrated);
+        }
         for error in &report.errors {
             println!("  warning: {error}");
         }

@@ -16,6 +16,9 @@ pub(super) fn core_paths() -> Value {
         "/v1/status": {
             "get": openapi_operation("status", "Workspace status", "Return current branch status and changed paths.", vec![], None, true)
         },
+        "/v1/record": {
+            "post": openapi_operation("record", "Record workspace changes", "Record current workspace changes into a branch.", vec![], Some("RecordRequest"), true)
+        },
         "/v1/diff": {
             "get": openapi_operation("diff", "Diff", "Show a ref range, root range, or dirty worktree diff.", vec![
                 openapi_query("range", "string"),

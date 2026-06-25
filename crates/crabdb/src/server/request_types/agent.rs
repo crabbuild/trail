@@ -117,6 +117,12 @@ pub(crate) struct SyncWorkdirRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct AgentRecordRequest {
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct AgentClaimRequest {
     pub(crate) path: String,
     #[serde(default, alias = "ttl")]

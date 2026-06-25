@@ -131,6 +131,22 @@ bench-cli-scale-large: ## Run large manual CLI scale benchmark (override CRABDB_
 	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-manual-large} \
 	scripts/cli-scale-bench.sh
 
+.PHONY: bench-cli-scale-nightly
+bench-cli-scale-nightly: ## Run manual/nightly 10k, 100k, and 1M CLI scale benchmark
+	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-10000,100000,1000000} \
+	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/Volumes/Workspace} \
+	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-nightly-scale} \
+	scripts/cli-scale-bench.sh
+
+.PHONY: bench-cli-scale-1m-headless
+bench-cli-scale-1m-headless: ## Run 1M no-materialize scale benchmark without backup/materialized workdirs
+	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-1000000} \
+	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/Volumes/Workspace} \
+	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-manual-1m-headless} \
+	CRABDB_SCALE_MATERIALIZED=$${CRABDB_SCALE_MATERIALIZED:-0} \
+	CRABDB_SCALE_BACKUP=$${CRABDB_SCALE_BACKUP:-0} \
+	scripts/cli-scale-bench.sh
+
 # ── Lint & Format ──────────────────────────────────────────────────
 
 .PHONY: fmt

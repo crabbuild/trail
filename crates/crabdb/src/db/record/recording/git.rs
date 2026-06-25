@@ -10,13 +10,27 @@ impl CrabDb {
         let branch = branch.map(str::to_string).unwrap_or(self.current_branch()?);
         let ref_name = branch_ref(&branch);
         let head = self.get_ref(&ref_name)?;
-        let previous_files = self.load_root_files(&head.root_id)?;
-        let disk_files = self.scan_git_tracked_files_required()?;
+        let tracked_paths = self.scan_git_tracked_paths_impl(true)?.ok_or_else(|| {
+            Error::Git(format!(
+                "git ls-files did not produce tracked paths in {}",
+                self.workspace_root.display()
+            ))
+        })?;
         let actor = Actor::system();
         let change_id = self.allocate_change_id(&actor.id, "git-import-update")?;
-        let built =
-            self.build_root_from_disk_files(&disk_files, &change_id, Some(&previous_files))?;
-        let diff = self.diff_file_maps(&previous_files, &built.files)?;
+        let built = self.build_root_from_git_tracked_paths_incremental(
+            &tracked_paths,
+            &head.root_id,
+            &change_id,
+        )?;
+        let mut patch_left = BTreeMap::new();
+        let mut patch_right = BTreeMap::new();
+        let diff = self.diff_root_file_maps(
+            &head.root_id,
+            &built.root_id,
+            &mut patch_left,
+            &mut patch_right,
+        )?;
 
         if diff.changes.is_empty() {
             return Ok(GitImportReport {
@@ -47,6 +61,7 @@ impl CrabDb {
         };
         let operation_id = self.store_operation(&operation)?;
         self.advance_ref_cas(&head, &change_id, &built.root_id, &operation_id)?;
+        self.update_worktree_index_from_paths_and_manifest(&tracked_paths, &built.disk_manifest)?;
         let mapping = self.insert_git_mapping("import", &branch, &change_id, &built.root_id)?;
 
         Ok(GitImportReport {

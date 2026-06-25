@@ -78,7 +78,7 @@ pub(super) struct DaemonArgs {
 #[derive(Subcommand)]
 pub(super) enum IndexSubcommand {
     /// Rebuild all derived indexes from current workspace state.
-    Rebuild,
+    Rebuild(IndexRebuildArgs),
     /// Continuously refresh the persisted worktree file index.
     Watch(IndexWatchArgs),
 }
@@ -87,6 +87,12 @@ pub(super) enum IndexSubcommand {
 pub(super) struct IndexCommand {
     #[command(subcommand)]
     pub(super) command: IndexSubcommand,
+}
+
+#[derive(Args)]
+pub(super) struct IndexRebuildArgs {
+    #[arg(long = "rich-text")]
+    pub(super) rich_text: bool,
 }
 
 #[derive(Args)]

@@ -252,8 +252,7 @@ impl CrabDb {
             let head_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
             self.diff_file_maps_to_manifest_for_paths(&head_files, &disk_manifest, &candidate_paths)
         } else {
-            let head_files = self.load_root_files(&head.root_id)?;
-            self.diff_file_maps_to_manifest(&head_files, &disk_manifest)
+            self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?
         };
         Ok(Some(changed_paths))
     }

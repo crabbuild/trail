@@ -60,6 +60,61 @@ impl CrabDb {
         Ok(summaries)
     }
 
+    pub(crate) fn diff_root_to_disk_manifest(
+        &self,
+        root_id: &ObjectId,
+        manifest: &BTreeMap<String, DiskManifest>,
+    ) -> Result<Vec<FileDiffSummary>> {
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let mut root_iter = self.root_prolly.range(&tree, &[], None)?;
+        let mut manifest_iter = manifest.iter();
+        let mut left = next_root_file(&mut root_iter)?;
+        let mut right = manifest_iter.next();
+        let mut summaries = Vec::new();
+
+        loop {
+            match (left.as_ref(), right) {
+                (Some((left_path, left_entry)), Some((right_path, right_entry))) => {
+                    match left_path.cmp(right_path) {
+                        std::cmp::Ordering::Less => {
+                            summaries.push(deleted_manifest_summary(left_path.clone(), left_entry));
+                            left = next_root_file(&mut root_iter)?;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            summaries.push(added_manifest_summary(right_path.clone(), right_entry));
+                            right = manifest_iter.next();
+                        }
+                        std::cmp::Ordering::Equal => {
+                            if left_entry.content_hash != right_entry.content_hash
+                                || left_entry.executable != right_entry.executable
+                                || left_entry.kind != right_entry.kind
+                            {
+                                summaries.push(changed_manifest_summary(
+                                    left_path.clone(),
+                                    left_entry,
+                                    right_entry,
+                                ));
+                            }
+                            left = next_root_file(&mut root_iter)?;
+                            right = manifest_iter.next();
+                        }
+                    }
+                }
+                (Some((left_path, left_entry)), None) => {
+                    summaries.push(deleted_manifest_summary(left_path.clone(), left_entry));
+                    left = next_root_file(&mut root_iter)?;
+                }
+                (None, Some((right_path, right_entry))) => {
+                    summaries.push(added_manifest_summary(right_path.clone(), right_entry));
+                    right = manifest_iter.next();
+                }
+                (None, None) => break,
+            }
+        }
+        Ok(summaries)
+    }
+
     pub(crate) fn disk_manifest(&self, disk_files: &[DiskFile]) -> BTreeMap<String, DiskManifest> {
         disk_files
             .iter()
@@ -149,8 +204,8 @@ impl CrabDb {
             .map(|file| file.path.clone())
             .collect::<BTreeSet<_>>();
         self.prune_worktree_index_for_selections(candidate_paths, &disk_paths)?;
-        self.update_worktree_index_from_disk_files(&disk_files)?;
         let disk_manifest = self.disk_manifest(&disk_files);
+        self.update_worktree_index_from_disk_files_and_manifest(&disk_files, &disk_manifest)?;
         let summaries =
             self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths);
         let paths = summaries

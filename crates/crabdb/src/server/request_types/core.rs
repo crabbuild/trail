@@ -1,6 +1,22 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct RecordRequest {
+    #[serde(default, alias = "branch")]
+    pub(crate) ref_name: Option<String>,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) paths: Vec<String>,
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+    #[serde(default, alias = "session")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default)]
+    pub(crate) allow_ignored: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct IgnorePatternRequest {
     pub(crate) pattern: String,
 }

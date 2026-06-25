@@ -19,11 +19,6 @@ struct WorktreeFileStamp {
 }
 
 #[derive(Debug)]
-struct IndexedWorktreeManifest {
-    stamp: WorktreeFileStamp,
-}
-
-#[derive(Debug)]
 struct WorktreeIndexReadCandidate {
     path: String,
     abs_path: PathBuf,
@@ -141,7 +136,7 @@ impl CrabDb {
         &self,
         scan_id: i64,
     ) -> Result<WorktreeIndexRefresh> {
-        let mut cached_entries = self.load_worktree_index_entries()?;
+        let indexed_entries = self.worktree_index_count()?;
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -153,7 +148,12 @@ impl CrabDb {
 
         let walker = builder.build();
         let mut count = 0u64;
+        let mut indexed_seen = 0u64;
         let mut read_candidates = Vec::new();
+        let mut cached_stmt = self.conn.prepare(
+            "SELECT size_bytes, modified_ns, changed_ns, device_id, inode, executable \
+             FROM worktree_file_index WHERE path = ?1",
+        )?;
         for item in walker {
             let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
             let path = entry.path();
@@ -176,12 +176,12 @@ impl CrabDb {
 
             let metadata = fs::symlink_metadata(path)?;
             let stamp = worktree_file_stamp(&metadata);
-            if cached_entries
-                .remove(&rel)
-                .is_some_and(|cached| cached.stamp == stamp)
-            {
-                count += 1;
-                continue;
+            if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
+                indexed_seen += 1;
+                if cached_stamp == stamp {
+                    count += 1;
+                    continue;
+                }
             }
 
             read_candidates.push(WorktreeIndexReadCandidate {
@@ -191,8 +191,10 @@ impl CrabDb {
             });
             count += 1;
         }
+        drop(cached_stmt);
 
-        let changed = !read_candidates.is_empty() || !cached_entries.is_empty();
+        let has_deleted_index_entries = indexed_seen < indexed_entries;
+        let changed = !read_candidates.is_empty() || has_deleted_index_entries;
         let updates = read_worktree_index_candidates(&read_candidates, &self.config.text)?;
         for update in updates {
             self.upsert_worktree_index_manifest_for_scan(
@@ -202,8 +204,9 @@ impl CrabDb {
                 scan_id,
             )?;
         }
-        for path in cached_entries.keys() {
-            self.delete_worktree_index_path_row(path)?;
+        if has_deleted_index_entries {
+            let seen = self.scan_visible_worktree_paths()?;
+            self.prune_worktree_index(&seen)?;
         }
         if changed {
             self.clear_worktree_index_baseline()?;
@@ -212,31 +215,6 @@ impl CrabDb {
             files: count,
             changed,
         })
-    }
-
-    fn load_worktree_index_entries(&self) -> Result<HashMap<String, IndexedWorktreeManifest>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, size_bytes, modified_ns, changed_ns, device_id, inode, executable \
-             FROM worktree_file_index",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let executable = row.get::<_, i64>(6)? != 0;
-            Ok((
-                row.get::<_, String>(0)?,
-                IndexedWorktreeManifest {
-                    stamp: WorktreeFileStamp {
-                        size_bytes: row.get::<_, i64>(1)?.max(0) as u64,
-                        modified_ns: row.get(2)?,
-                        changed_ns: row.get(3)?,
-                        device_id: row.get(4)?,
-                        inode: row.get(5)?,
-                        executable,
-                    },
-                },
-            ))
-        })?;
-        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(Error::from)
     }
 
     pub(crate) fn scan_worktree_manifest_indexed(&self) -> Result<BTreeMap<String, DiskManifest>> {
@@ -293,31 +271,116 @@ impl CrabDb {
         Ok(manifest)
     }
 
-    pub(crate) fn update_worktree_index_from_disk_files(&self, files: &[DiskFile]) -> Result<()> {
-        if !files.is_empty() {
+    fn scan_visible_worktree_paths(&self) -> Result<BTreeSet<String>> {
+        let root = self.workspace_root.canonicalize()?;
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .hidden(false)
+            .git_ignore(self.config.recording.ignore_gitignored)
+            .git_exclude(self.config.recording.ignore_gitignored)
+            .git_global(self.config.recording.ignore_gitignored)
+            .add_custom_ignore_filename(".crabignore");
+
+        let walker = builder.build();
+        let mut paths = BTreeSet::new();
+        for item in walker {
+            let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
+            let path = entry.path();
+            if path == root {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .map_err(|err| Error::InvalidInput(err.to_string()))?;
+            let rel = normalize_relative_path(&rel.to_string_lossy())?;
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) && is_default_ignored(&rel) {
+                continue;
+            }
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            if is_default_ignored(&rel) {
+                continue;
+            }
+            paths.insert(rel);
+        }
+        Ok(paths)
+    }
+
+    pub(crate) fn update_worktree_index_from_disk_files_and_manifest(
+        &self,
+        files: &[DiskFile],
+        manifests: &BTreeMap<String, DiskManifest>,
+    ) -> Result<()> {
+        let paths = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        self.update_worktree_index_from_paths_and_manifest(&paths, manifests)
+    }
+
+    pub(crate) fn update_worktree_index_from_paths_and_manifest(
+        &self,
+        paths: &[String],
+        manifests: &BTreeMap<String, DiskManifest>,
+    ) -> Result<()> {
+        if !paths.is_empty() {
             self.clear_worktree_index_baseline()?;
         }
-        for file in files {
-            let abs = self.workspace_root.join(path_from_rel(&file.path));
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result =
+            self.update_worktree_index_from_paths_and_manifest_in_transaction(paths, manifests);
+        if result.is_ok() {
+            self.conn.execute_batch("COMMIT;")?;
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+        result
+    }
+
+    fn update_worktree_index_from_paths_and_manifest_in_transaction(
+        &self,
+        paths: &[String],
+        manifests: &BTreeMap<String, DiskManifest>,
+    ) -> Result<()> {
+        let scan_id = worktree_scan_id();
+        let now = now_ts();
+        let mut upsert = self.conn.prepare_cached(
+            "INSERT OR REPLACE INTO worktree_file_index \
+             (path, size_bytes, modified_ns, changed_ns, device_id, inode, executable, kind, content_hash, last_seen_scan, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+        for path in paths {
+            let abs = self.workspace_root.join(path_from_rel(path));
             let metadata = match fs::symlink_metadata(&abs) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    self.delete_worktree_index_path(&file.path)?;
+                    self.delete_worktree_index_path(path)?;
                     continue;
                 }
                 Err(err) => return Err(Error::Io(err)),
             };
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                self.delete_worktree_index_path(&file.path)?;
+                self.delete_worktree_index_path(path)?;
                 continue;
             }
             let stamp = worktree_file_stamp(&metadata);
-            let disk_manifest = DiskManifest {
-                kind: classify_file_kind(&file.bytes, &self.config.text),
-                executable: stamp.executable,
-                content_hash: sha256_hex(&file.bytes),
-            };
-            self.upsert_worktree_index_manifest(&file.path, stamp, &disk_manifest)?;
+            let disk_manifest = manifests.get(path).ok_or_else(|| {
+                Error::Corrupt(format!("missing computed disk manifest for `{}`", path))
+            })?;
+            upsert.execute(params![
+                path.as_str(),
+                stamp.size_bytes as i64,
+                stamp.modified_ns,
+                stamp.changed_ns,
+                stamp.device_id,
+                stamp.inode,
+                i64::from(stamp.executable),
+                file_kind_index_label(&disk_manifest.kind),
+                disk_manifest.content_hash.as_str(),
+                scan_id,
+                now
+            ])?;
         }
         Ok(())
     }
@@ -381,6 +444,14 @@ impl CrabDb {
             )
             .optional()
             .map_err(Error::from)
+    }
+
+    pub(crate) fn cached_worktree_manifest_for_metadata(
+        &self,
+        path: &str,
+        metadata: &fs::Metadata,
+    ) -> Result<Option<DiskManifest>> {
+        self.cached_worktree_manifest(path, worktree_file_stamp(metadata))
     }
 
     fn upsert_worktree_index_manifest(
@@ -481,6 +552,24 @@ impl CrabDb {
         )?;
         Ok(())
     }
+}
+
+fn cached_worktree_file_stamp(
+    stmt: &mut rusqlite::Statement<'_>,
+    path: &str,
+) -> Result<Option<WorktreeFileStamp>> {
+    stmt.query_row(params![path], |row| {
+        Ok(WorktreeFileStamp {
+            size_bytes: row.get::<_, i64>(0)?.max(0) as u64,
+            modified_ns: row.get(1)?,
+            changed_ns: row.get(2)?,
+            device_id: row.get(3)?,
+            inode: row.get(4)?,
+            executable: row.get::<_, i64>(5)? != 0,
+        })
+    })
+    .optional()
+    .map_err(Error::from)
 }
 
 fn read_worktree_index_candidates(

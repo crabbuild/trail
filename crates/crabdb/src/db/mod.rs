@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
-use prolly::{BatchBuilder, Cid, Config, Diff, Encoding, Prolly, SqliteStore, Tree};
+use prolly::{
+    BatchBuilder, Cid, Config, Diff, Encoding, Prolly, SortedBatchBuilder, SqliteStore, Tree,
+};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -138,15 +140,29 @@ pub(crate) struct DiskFile {
 }
 
 #[derive(Debug)]
+pub(crate) struct WorktreePathScan {
+    paths: Vec<String>,
+    total_bytes: u64,
+}
+
+#[derive(Debug)]
 pub(crate) struct RootBuildResult {
     root_id: ObjectId,
     files: BTreeMap<String, FileEntry>,
+    disk_manifest: BTreeMap<String, DiskManifest>,
     stats: ImportStats,
 }
 
 #[derive(Debug)]
 pub(crate) struct IncrementalRootBuildResult {
     root_id: ObjectId,
+}
+
+#[derive(Debug)]
+pub(crate) struct GitTrackedRootBuildResult {
+    root_id: ObjectId,
+    disk_manifest: BTreeMap<String, DiskManifest>,
+    stats: ImportStats,
 }
 
 #[derive(Debug)]
@@ -159,6 +175,7 @@ pub(crate) struct SelectedWorktreeSnapshot {
 #[derive(Debug)]
 pub(crate) struct FileBuildResult {
     entry: FileEntry,
+    disk_manifest: DiskManifest,
     line_changes: Vec<LineChange>,
 }
 

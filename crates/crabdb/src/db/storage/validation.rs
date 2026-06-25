@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::storage::content::validate_full_text_blob;
 
 impl CrabDb {
     pub(crate) fn validate_worktree_root(&self, root: &WorktreeRoot) -> Result<()> {
@@ -86,6 +87,16 @@ impl CrabDb {
                     }
                 }
                 count
+            }
+            TextRepresentation::LazyText { blob_id, .. } => {
+                if content.order_map_root.is_some() || content.line_index_map_root.is_some() {
+                    return Err(Error::Corrupt(
+                        "lazy text must not have line-order or line-index roots".to_string(),
+                    ));
+                }
+                let blob: Blob = self.get_object(BLOB_KIND, blob_id)?;
+                validate_full_text_blob(&content, &blob)?;
+                split_lines(&blob.bytes).len() as u64
             }
             TextRepresentation::OpaqueText { blob_id, .. } => {
                 let blob: Blob = self.get_object(BLOB_KIND, blob_id)?;

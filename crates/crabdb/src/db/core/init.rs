@@ -1,5 +1,9 @@
 use super::*;
 
+const AUTO_MINIMAL_FILES_THRESHOLD: usize = 10_000;
+const AUTO_MINIMAL_BYTES_THRESHOLD: u64 = 128 * 1024 * 1024;
+const DETAILED_INIT_CHANGES_FILE_THRESHOLD: usize = 10_000;
+
 impl CrabDb {
     pub fn init(
         workspace_root: impl AsRef<Path>,
@@ -34,27 +38,95 @@ impl CrabDb {
         let branch = branch.into();
         let workspace_id = WorkspaceId::new(workspace_root.to_string_lossy().as_bytes());
         let mut config = CrabConfig::new(workspace_id.clone(), branch.clone());
+        let explicit_text_policy = text_policy.is_some();
         apply_text_policy(&mut config.text, text_policy)?;
+        if !explicit_text_policy
+            && mode == InitImportMode::GitTracked
+            && git_tracked_import_is_large(&workspace_root)?
+        {
+            apply_text_policy(&mut config.text, Some("minimal"))?;
+        }
         fs::write(db_dir.join(CONFIG_FILE), toml::to_string_pretty(&config)?)?;
         fs::write(db_dir.join(HEAD_FILE), format!("{branch}\n"))?;
         write_default_crabignore(&workspace_root)?;
 
-        let db = Self::open_at(workspace_root, db_dir, config)?;
+        let mut db = Self::open_at(workspace_root, db_dir, config)?;
         db.init_schema()?;
 
         let actor = Actor::system();
         let change_id = db.allocate_change_id(&actor.id, "init")?;
-        let disk_files = match mode {
-            InitImportMode::Empty => Vec::new(),
-            InitImportMode::GitTracked => db.scan_git_tracked_files()?,
-            InitImportMode::WorkingTree => db.scan_worktree_files()?,
+        let built = match mode {
+            InitImportMode::Empty => {
+                let disk_files = Vec::new();
+                let built = db.build_root_from_disk_files(&disk_files, &change_id, None)?;
+                db.update_worktree_index_from_disk_files_and_manifest(
+                    &disk_files,
+                    &built.disk_manifest,
+                )?;
+                built
+            }
+            InitImportMode::GitTracked => {
+                if let Some(paths) = db.scan_git_tracked_paths_impl(false)? {
+                    let built = db.build_root_from_git_tracked_paths(&paths, &change_id)?;
+                    let imported_paths = built.disk_manifest.keys().cloned().collect::<Vec<_>>();
+                    db.update_worktree_index_from_paths_and_manifest(
+                        &imported_paths,
+                        &built.disk_manifest,
+                    )?;
+                    built
+                } else {
+                    let scan = db.scan_worktree_file_paths()?;
+                    apply_minimal_text_policy_for_large_worktree_scan(
+                        &mut db,
+                        explicit_text_policy,
+                        &scan,
+                    )?;
+                    let built = db.build_root_from_worktree_paths(&scan.paths, &change_id)?;
+                    let imported_paths = built.disk_manifest.keys().cloned().collect::<Vec<_>>();
+                    db.update_worktree_index_from_paths_and_manifest(
+                        &imported_paths,
+                        &built.disk_manifest,
+                    )?;
+                    built
+                }
+            }
+            InitImportMode::WorkingTree => {
+                let scan = db.scan_worktree_file_paths()?;
+                apply_minimal_text_policy_for_large_worktree_scan(
+                    &mut db,
+                    explicit_text_policy,
+                    &scan,
+                )?;
+                let built = db.build_root_from_worktree_paths(&scan.paths, &change_id)?;
+                let imported_paths = built.disk_manifest.keys().cloned().collect::<Vec<_>>();
+                db.update_worktree_index_from_paths_and_manifest(
+                    &imported_paths,
+                    &built.disk_manifest,
+                )?;
+                built
+            }
         };
-        let built = db.build_root_from_disk_files(&disk_files, &change_id, None)?;
-        db.update_worktree_index_from_disk_files(&disk_files)?;
         let kind = if mode == InitImportMode::Empty {
             OperationKind::Init
         } else {
             OperationKind::GitImport
+        };
+        let changes = if built.files.len() <= DETAILED_INIT_CHANGES_FILE_THRESHOLD {
+            built
+                .files
+                .iter()
+                .map(|(path, entry)| FileChange {
+                    path: path.clone(),
+                    old_path: None,
+                    file_id: Some(entry.file_id.clone()),
+                    kind: FileChangeKind::Added,
+                    before_hash: None,
+                    after_hash: Some(entry.content_hash.clone()),
+                    line_changes: Vec::new(),
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         let operation = Operation {
             version: OP_OBJECT_VERSION,
@@ -67,19 +139,7 @@ impl CrabDb {
             actor,
             session_id: None,
             message: Some("Initialize CrabDB workspace".to_string()),
-            changes: built
-                .files
-                .iter()
-                .map(|(path, entry)| FileChange {
-                    path: path.clone(),
-                    old_path: None,
-                    file_id: Some(entry.file_id.clone()),
-                    kind: FileChangeKind::Added,
-                    before_hash: None,
-                    after_hash: Some(entry.content_hash.clone()),
-                    line_changes: Vec::new(),
-                })
-                .collect(),
+            changes,
             created_at: now_ts(),
         };
         let operation_id = db.store_operation(&operation)?;
@@ -249,6 +309,63 @@ impl CrabDb {
         writeln!(file, "pid={} created_at={}", std::process::id(), now_ts())?;
         Ok(WorkspaceLock { path })
     }
+}
+
+fn git_tracked_import_is_large(workspace_root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("ls-files")
+        .arg("-z")
+        .output()
+        .map_err(|err| Error::Git(err.to_string()))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let path = normalize_relative_path(&String::from_utf8_lossy(raw))?;
+        if is_default_ignored(&path) {
+            continue;
+        }
+        let abs = workspace_root.join(path_from_rel(&path));
+        let metadata = match fs::symlink_metadata(&abs) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(Error::Io(err)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        files += 1;
+        bytes = bytes.saturating_add(metadata.len());
+        if files > AUTO_MINIMAL_FILES_THRESHOLD || bytes > AUTO_MINIMAL_BYTES_THRESHOLD {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_minimal_text_policy_for_large_worktree_scan(
+    db: &mut CrabDb,
+    explicit_text_policy: bool,
+    scan: &WorktreePathScan,
+) -> Result<()> {
+    if explicit_text_policy || !worktree_path_scan_is_large(scan) {
+        return Ok(());
+    }
+    apply_text_policy(&mut db.config.text, Some("minimal"))?;
+    write_config(&db.db_dir, &db.config)
+}
+
+fn worktree_path_scan_is_large(scan: &WorktreePathScan) -> bool {
+    scan.paths.len() > AUTO_MINIMAL_FILES_THRESHOLD
+        || scan.total_bytes > AUTO_MINIMAL_BYTES_THRESHOLD
 }
 
 fn is_stale_lock_holder(holder: &str) -> bool {

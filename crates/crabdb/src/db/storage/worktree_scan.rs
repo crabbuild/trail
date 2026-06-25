@@ -91,15 +91,10 @@ impl CrabDb {
         Ok(files.into_values().collect())
     }
 
-    pub(crate) fn scan_git_tracked_files(&self) -> Result<Vec<DiskFile>> {
-        self.scan_git_tracked_files_impl(false)
-    }
-
-    pub(crate) fn scan_git_tracked_files_required(&self) -> Result<Vec<DiskFile>> {
-        self.scan_git_tracked_files_impl(true)
-    }
-
-    pub(crate) fn scan_git_tracked_files_impl(&self, required: bool) -> Result<Vec<DiskFile>> {
+    pub(crate) fn scan_git_tracked_paths_impl(
+        &self,
+        required: bool,
+    ) -> Result<Option<Vec<String>>> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
@@ -116,9 +111,9 @@ impl CrabDb {
                     stderr.trim()
                 )));
             }
-            return self.scan_worktree_files();
+            return Ok(None);
         }
-        let mut files = Vec::new();
+        let mut paths = Vec::new();
         for raw in output.stdout.split(|byte| *byte == 0) {
             if raw.is_empty() {
                 continue;
@@ -128,29 +123,14 @@ impl CrabDb {
             if is_default_ignored(&path) {
                 continue;
             }
-            let abs = self.workspace_root.join(path_from_rel(&path));
-            let metadata = match fs::symlink_metadata(&abs) {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(Error::Io(err)),
-            };
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if metadata.is_file() {
-                files.push(DiskFile {
-                    path,
-                    bytes: fs::read(&abs)?,
-                    executable: executable_from_metadata(&metadata),
-                });
-            }
+            paths.push(path);
         }
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(files)
+        paths.sort();
+        Ok(Some(paths))
     }
 
-    pub(crate) fn scan_worktree_files(&self) -> Result<Vec<DiskFile>> {
-        self.scan_files_under(&self.workspace_root)
+    pub(crate) fn scan_worktree_file_paths(&self) -> Result<WorktreePathScan> {
+        self.scan_file_paths_under(&self.workspace_root)
     }
 
     pub(crate) fn scan_files_under_for_paths(
@@ -233,6 +213,52 @@ impl CrabDb {
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
+    }
+
+    fn scan_file_paths_under(&self, root: &Path) -> Result<WorktreePathScan> {
+        let root = root.canonicalize()?;
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .hidden(false)
+            .git_ignore(self.config.recording.ignore_gitignored)
+            .git_exclude(self.config.recording.ignore_gitignored)
+            .git_global(self.config.recording.ignore_gitignored)
+            .add_custom_ignore_filename(".crabignore");
+        let walker = builder.build();
+        let mut paths = Vec::new();
+        let mut total_bytes = 0u64;
+        for item in walker {
+            let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
+            let path = entry.path();
+            if path == root {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .map_err(|err| Error::InvalidInput(err.to_string()))?;
+            let rel = normalize_relative_path(&rel.to_string_lossy())?;
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) && is_default_ignored(&rel) {
+                continue;
+            }
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            if is_default_ignored(&rel) {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            paths.push(rel);
+        }
+        paths.sort();
+        Ok(WorktreePathScan { paths, total_bytes })
     }
 }
 

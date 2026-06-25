@@ -107,6 +107,8 @@ pub enum Error {
     Conflict(Conflict),
     /// Mutation buffer is full - adding a mutation would exceed the buffer size limit
     BufferFull,
+    /// Sorted bulk loading received keys out of order.
+    UnsortedInput { previous: Vec<u8>, next: Vec<u8> },
 }
 
 impl std::fmt::Display for Error {
@@ -118,6 +120,11 @@ impl std::fmt::Display for Error {
             Error::Store(e) => write!(f, "storage error: {}", e),
             Error::Conflict(c) => write!(f, "merge conflict at key: {:?}", c.key),
             Error::BufferFull => write!(f, "mutation buffer is full"),
+            Error::UnsortedInput { previous, next } => write!(
+                f,
+                "sorted input keys are out of order: previous={:?} next={:?}",
+                previous, next
+            ),
         }
     }
 }

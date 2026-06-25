@@ -8,6 +8,7 @@ RUN_LABEL="${CRABDB_SCALE_LABEL:-$(date +%Y%m%d-%H%M%S)}"
 RUN_MATERIALIZED="${CRABDB_SCALE_MATERIALIZED:-1}"
 RUN_BACKUP="${CRABDB_SCALE_BACKUP:-1}"
 RUN_DAEMON="${CRABDB_SCALE_DAEMON:-1}"
+RUN_GIT_IMPORT="${CRABDB_SCALE_GIT_IMPORT:-1}"
 
 if [ -z "$BIN" ]; then
   cargo build -p crabdb --release >/dev/null
@@ -64,7 +65,7 @@ root = pathlib.Path(sys.argv[1])
 total = 0
 count = 0
 for path in root.rglob("*"):
-    if ".crabdb" in path.parts:
+    if ".crabdb" in path.parts or ".git" in path.parts:
         continue
     if path.is_file():
         total += path.stat().st_size
@@ -88,6 +89,22 @@ object_count() {
     sqlite3 "$db" 'SELECT COUNT(*) FROM objects;' 2>/dev/null || printf '0'
   else
     printf '0'
+  fi
+}
+
+dbstat_bytes() {
+  local repo="$1"
+  local prefix="$2"
+  local db="$repo/.crabdb/index/crabdb.sqlite"
+  if [ -f "$db" ]; then
+    sqlite3 "$db" \
+      'SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC;' \
+      2>/dev/null \
+      | awk -F '|' -v prefix="$prefix" '{
+          name = $1
+          gsub(/[^A-Za-z0-9_.-]/, "_", name)
+          print "dbstat_" prefix "_" name "\t" $2
+        }'
   fi
 }
 
@@ -181,6 +198,7 @@ for scale in ${SCALES//,/ }; do
 
   WORK="$RUN_ROOT/$scale"
   REPO="$WORK/repo"
+  GIT_REPO="$WORK/git-repo"
   RESULTS="$WORK/results.tsv"
   rm -rf "$WORK"
   mkdir -p "$REPO" "$WORK/out"
@@ -247,6 +265,61 @@ PY
   run_timed "$scale" diff_dirty "$BIN" --workspace "$REPO" --json diff --dirty
   run_timed "$scale" record_dirty "$BIN" --workspace "$REPO" --json record -m "scale dirty record"
 
+  if [ "$RUN_GIT_IMPORT" = "1" ]; then
+    if command -v git >/dev/null 2>&1; then
+      mkdir -p "$GIT_REPO"
+      run_timed "$scale" git_generate_repo python3 - "$GIT_REPO" "$scale" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = int(sys.argv[2])
+per_dir = 100
+dirs = (files + per_dir - 1) // per_dir
+for d in range(dirs):
+    pkg = root / f"pkg_{d:05d}"
+    pkg.mkdir(parents=True, exist_ok=True)
+    for f in range(per_dir):
+        idx = d * per_dir + f
+        if idx >= files:
+            break
+        path = pkg / f"module_{f:03d}.rs"
+        path.write_text(
+            f"// package {d:05d} module {f:03d}\n"
+            f"pub fn value_{idx:08d}() -> usize {{\n"
+            f"    {idx}\n"
+            "}\n"
+        )
+(root / "README.md").write_text(f"# CrabDB Git import scale {files}\n")
+(root / ".gitignore").write_text("target/\nnode_modules/\n.DS_Store\n")
+PY
+      run_timed "$scale" git_init git -C "$GIT_REPO" init
+      run_timed "$scale" git_add_tracked git -C "$GIT_REPO" add .
+      run_timed "$scale" git_init_from_git "$BIN" --workspace "$GIT_REPO" --json init --from-git
+      run_timed "$scale" git_mutate_tracked python3 - "$GIT_REPO" "$scale" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = int(sys.argv[2])
+edit_count = max(1, min(100, files // 100))
+for i in range(edit_count):
+    idx = (i * 7919) % files
+    d, f = divmod(idx, 100)
+    path = root / f"pkg_{d:05d}" / f"module_{f:03d}.rs"
+    with path.open("a") as fh:
+        fh.write(f"\n// git import update edit {i}\npub const IMPORT_EDIT_{i}: usize = {i};\n")
+new_path = root / "pkg_00000" / "new_git_tracked.rs"
+new_path.write_text("pub fn new_git_tracked() -> usize { 1 }\n")
+(root / "scratch-untracked.txt").write_text("not tracked by git import\n")
+if files > 101:
+    (root / "pkg_00001" / "module_001.rs").unlink()
+PY
+      run_timed "$scale" git_add_new_tracked git -C "$GIT_REPO" add pkg_00000/new_git_tracked.rs
+      run_timed "$scale" git_import_update "$BIN" --workspace "$GIT_REPO" --json git import-update -m "scale git import update"
+      run_timed "$scale" git_import_update_noop "$BIN" --workspace "$GIT_REPO" --json git import-update -m "scale git import update noop"
+      run_timed "$scale" git_status_after_import "$BIN" --workspace "$GIT_REPO" --json status
+    else
+      printf 'scale=%s %-36s %8s rss=%s exit=%s\n' "$scale" git_import_update "skipped" 0 0
+    fi
+  fi
+
   DAEMON_RSS=0
   if [ "$RUN_DAEMON" = "1" ]; then
     DAEMON_PORT="$(free_loopback_port)"
@@ -305,6 +378,19 @@ PY
     run_timed "$scale" daemon_auto_cli_agent_readiness "$BIN" --workspace "$REPO" --json agent readiness daemonbot
     run_timed "$scale" daemon_cli_status "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
     run_timed "$scale" daemon_cli_diff_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json diff --dirty
+    run_timed "$scale" daemon_cli_mutate_worktree python3 - "$REPO" "$scale" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = int(sys.argv[2])
+for i in range(max(1, min(25, files // 400))):
+    idx = (i * 1871 + 7) % files
+    d, f = divmod(idx, 100)
+    path = root / f"pkg_{d:05d}" / f"module_{f:03d}.rs"
+    with path.open("a") as fh:
+        fh.write(f"\n// daemon CLI workspace record {i}\n")
+PY
+    run_timed "$scale" daemon_cli_record_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json record -m "scale daemon CLI dirty record"
+    run_timed "$scale" daemon_cli_status_after_record "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
     run_timed "$scale" daemon_cli_agent_spawn "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent spawn daemonclibot --from main --no-materialize
     python3 - "$REPO" "$WORK/daemon-cli-patch.json" "$scale" <<'PY'
 import json, pathlib, sys
@@ -393,6 +479,27 @@ PY
     run_timed "$scale" agent_status_sparse_hydrated "$BIN" --workspace "$REPO" --json agent status sparsebot
     run_timed "$scale" agent_spawn_materialized "$BIN" --workspace "$REPO" --json agent spawn matbot --from main --materialize
     run_timed "$scale" agent_status_materialized "$BIN" --workspace "$REPO" --json agent status matbot
+    MATBOT_WORKDIR="$(python3 - "$WORK/out/agent_spawn_materialized.stdout" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("workdir")
+print(value or "")
+PY
+)"
+    if [ -n "$MATBOT_WORKDIR" ]; then
+      run_timed "$scale" mutate_agent_materialized_workdir python3 - "$MATBOT_WORKDIR" "$scale" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = int(sys.argv[2])
+for i in range(max(1, min(25, files // 400))):
+    idx = (i * 2371 + 13) % files
+    d, f = divmod(idx, 100)
+    path = root / f"pkg_{d:05d}" / f"module_{f:03d}.rs"
+    with path.open("a") as fh:
+        fh.write(f"\n// materialized record {i}\n")
+PY
+      run_timed "$scale" agent_record_materialized "$BIN" --workspace "$REPO" --json agent record matbot -m "scale materialized record"
+      run_timed "$scale" agent_status_materialized_recorded "$BIN" --workspace "$REPO" --json agent status matbot
+    fi
   fi
 
   run_timed "$scale" index_rebuild "$BIN" --workspace "$REPO" --json index rebuild
@@ -408,6 +515,15 @@ PY
     printf 'source_bytes\t%s\n' "$source_bytes"
     printf 'sqlite_bytes\t%s\n' "$(sqlite_bytes "$REPO")"
     printf 'object_count\t%s\n' "$(object_count "$REPO")"
+    dbstat_bytes "$REPO" "repo"
+    if [ -d "$GIT_REPO/.crabdb" ]; then
+      read -r git_source_file_count git_source_bytes < <(repo_source_bytes "$GIT_REPO")
+      printf 'git_source_file_count\t%s\n' "$git_source_file_count"
+      printf 'git_source_bytes\t%s\n' "$git_source_bytes"
+      printf 'git_sqlite_bytes\t%s\n' "$(sqlite_bytes "$GIT_REPO")"
+      printf 'git_object_count\t%s\n' "$(object_count "$GIT_REPO")"
+      dbstat_bytes "$GIT_REPO" "git"
+    fi
     printf 'daemon_rss_bytes\t%s\n' "$DAEMON_RSS"
     du -sk "$REPO" "$REPO/.crabdb" 2>/dev/null | awk '{print "du_kb_" $2 "\t" $1}'
   } > "$WORK/metrics.tsv"

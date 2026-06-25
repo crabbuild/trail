@@ -58,6 +58,19 @@ pub(super) fn try_handle_daemon_command(
             render_diff(&summary, ctx.json, ctx.quiet, args.stat)?;
             Ok(true)
         }
+        Command::Record(args) => {
+            let body = serde_json::json!({
+                "ref_name": ctx.branch,
+                "message": args.message,
+                "paths": args.paths,
+                "kind": args.kind,
+                "session_id": args.session,
+                "allow_ignored": args.allow_ignored,
+            });
+            let report: RecordReport = client.post_json("/v1/record", &body)?;
+            render_record(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         Command::Agent(agent) => handle_agent_command(ctx, &client, agent),
         Command::MergeAgent(args) => {
             validate_merge_strategy(args.strategy.as_deref())?;
@@ -79,12 +92,15 @@ pub(super) fn try_handle_daemon_command(
 fn daemon_supports_command(command: &Command) -> bool {
     match command {
         Command::Status(args) => args.branch.is_none(),
-        Command::Diff(_) | Command::MergeAgent(_) | Command::MergeQueue(_) => true,
+        Command::Record(_) | Command::Diff(_) | Command::MergeAgent(_) | Command::MergeQueue(_) => {
+            true
+        }
         Command::Agent(agent) => matches!(
             agent.command,
             AgentSubcommand::Spawn(_)
                 | AgentSubcommand::Status(_)
                 | AgentSubcommand::Readiness(_)
+                | AgentSubcommand::Record(_)
                 | AgentSubcommand::Read(_)
                 | AgentSubcommand::SyncWorkdir(_)
                 | AgentSubcommand::ApplyPatch(_)
@@ -150,6 +166,15 @@ fn handle_agent_command(
             let report: AgentReadinessReport =
                 client.get_json(&format!("/v1/agents/{}/readiness", args.name))?;
             render_agent_readiness(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Record(args) => {
+            let body = serde_json::json!({
+                "message": args.message,
+            });
+            let report: AgentRecordReport =
+                client.post_json(&format!("/v1/agents/{}/record", args.name), &body)?;
+            render_agent_record(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         AgentSubcommand::SyncWorkdir(args) => {

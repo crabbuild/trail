@@ -14,6 +14,8 @@ use super::tree::Tree;
 
 use rayon::prelude::*;
 
+const SORTED_BUILDER_NODE_BATCH: usize = 256;
+
 #[derive(Debug)]
 struct BuiltNode {
     cid: Cid,
@@ -53,6 +55,21 @@ pub struct BatchBuilder<S: Store> {
     config: Config,
     /// Key-value pairs to insert (will be sorted before build)
     entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Streaming bulk builder for entries that are already sorted by key.
+///
+/// Unlike [`BatchBuilder`], this builder does not retain all leaf key/value
+/// pairs. It flushes leaf nodes as soon as the same content-defined boundary
+/// rules used by [`BatchBuilder`] allow it, then builds upper levels from the
+/// compact child summaries.
+pub struct SortedBatchBuilder<S: Store> {
+    store: S,
+    config: Config,
+    current: Node,
+    last_key: Option<Vec<u8>>,
+    leaf_nodes: Vec<NodeSummary>,
+    pending_nodes: Vec<BuiltNode>,
 }
 
 impl<S: Store + Clone + Send + Sync> BatchBuilder<S>
@@ -147,15 +164,7 @@ where
         let nodes: Vec<BuiltNode> = chunk_ranges
             .par_iter()
             .map(|range| {
-                let mut node = Node::builder()
-                    .leaf(true)
-                    .level(INIT_LEVEL)
-                    .min_chunk_size(config.min_chunk_size)
-                    .max_chunk_size(config.max_chunk_size)
-                    .chunking_factor(config.chunking_factor)
-                    .hash_seed(config.hash_seed)
-                    .encoding(config.encoding.clone())
-                    .build();
+                let mut node = new_builder_node(config, true, INIT_LEVEL);
 
                 for i in range.clone() {
                     node.keys.push(entries[i].0.clone());
@@ -265,15 +274,7 @@ where
             let start = *range.start();
             let end = *range.end();
 
-            let mut node = Node::builder()
-                .leaf(false)
-                .level(level)
-                .min_chunk_size(self.config.min_chunk_size)
-                .max_chunk_size(self.config.max_chunk_size)
-                .chunking_factor(self.config.chunking_factor)
-                .hash_seed(self.config.hash_seed)
-                .encoding(self.config.encoding.clone())
-                .build();
+            let mut node = new_builder_node(&self.config, false, level);
 
             for i in start..=end {
                 node.keys.push(children[i].first_key.clone());
@@ -301,18 +302,126 @@ where
     }
 
     fn persist_nodes(&self, nodes: &[BuiltNode]) -> Result<(), Error> {
-        if nodes.is_empty() {
+        persist_nodes(&self.store, nodes)
+    }
+}
+
+impl<S: Store + Clone + Send + Sync> SortedBatchBuilder<S>
+where
+    S::Error: Send + Sync,
+{
+    /// Create a sorted streaming builder.
+    pub fn new(store: S, config: Config) -> Self {
+        let current = new_builder_node(&config, true, INIT_LEVEL);
+        Self {
+            store,
+            config,
+            current,
+            last_key: None,
+            leaf_nodes: Vec::new(),
+            pending_nodes: Vec::new(),
+        }
+    }
+
+    /// Add the next sorted key/value pair.
+    ///
+    /// Keys must be added in nondecreasing byte order. Duplicate keys are
+    /// accepted here for parity with [`BatchBuilder`], though callers usually
+    /// provide unique keys.
+    pub fn add(&mut self, key: Vec<u8>, val: Vec<u8>) -> Result<(), Error> {
+        if let Some(previous) = &self.last_key {
+            if key < *previous {
+                return Err(Error::UnsortedInput {
+                    previous: previous.clone(),
+                    next: key,
+                });
+            }
+        }
+
+        let is_hash_boundary = is_hash_boundary_config(&self.config, &key, &val);
+        self.last_key = Some(key.clone());
+        self.current.keys.push(key);
+        self.current.vals.push(val);
+
+        let count = self.current.keys.len();
+        if count >= self.config.min_chunk_size
+            && (count >= self.config.max_chunk_size || is_hash_boundary)
+        {
+            self.flush_leaf()?;
+        }
+
+        Ok(())
+    }
+
+    /// Build a tree from the streamed entries.
+    pub fn build(mut self) -> Result<Tree, Error> {
+        self.flush_leaf()?;
+        self.flush_pending_nodes()?;
+        let builder = BatchBuilder::new(self.store.clone(), self.config.clone());
+        builder.build_from_chunks(self.leaf_nodes)
+    }
+
+    fn flush_leaf(&mut self) -> Result<(), Error> {
+        if self.current.keys.is_empty() {
             return Ok(());
         }
 
-        let entries = nodes
-            .iter()
-            .map(|node| (node.cid.as_bytes(), node.bytes.as_slice()))
-            .collect::<Vec<_>>();
-        self.store
-            .batch_put(&entries)
-            .map_err(|e| Error::Store(Box::new(e)))
+        let node = std::mem::replace(
+            &mut self.current,
+            new_builder_node(&self.config, true, INIT_LEVEL),
+        );
+        let first_key = node.keys.first().cloned().unwrap_or_default();
+        let bytes = node.to_bytes();
+        let cid = Cid::from_bytes(&bytes);
+        self.leaf_nodes.push(NodeSummary {
+            cid: cid.clone(),
+            first_key: first_key.clone(),
+        });
+        self.pending_nodes.push(BuiltNode {
+            cid,
+            first_key,
+            bytes,
+        });
+        if self.pending_nodes.len() >= SORTED_BUILDER_NODE_BATCH {
+            self.flush_pending_nodes()?;
+        }
+        Ok(())
     }
+
+    fn flush_pending_nodes(&mut self) -> Result<(), Error> {
+        persist_nodes(&self.store, &self.pending_nodes)?;
+        self.pending_nodes.clear();
+        Ok(())
+    }
+}
+
+fn new_builder_node(config: &Config, leaf: bool, level: u8) -> Node {
+    Node::builder()
+        .leaf(leaf)
+        .level(level)
+        .min_chunk_size(config.min_chunk_size)
+        .max_chunk_size(config.max_chunk_size)
+        .chunking_factor(config.chunking_factor)
+        .hash_seed(config.hash_seed)
+        .encoding(config.encoding.clone())
+        .build()
+}
+
+fn persist_nodes<S: Store>(store: &S, nodes: &[BuiltNode]) -> Result<(), Error>
+where
+    S::Error: Send + Sync,
+{
+    if nodes.is_empty() {
+        return Ok(());
+    }
+
+    let entries = nodes
+        .iter()
+        .map(|node| (node.cid.as_bytes(), node.bytes.as_slice()))
+        .collect::<Vec<_>>();
+    store
+        .batch_put(&entries)
+        .map_err(|e| Error::Store(Box::new(e)))
 }
 
 fn chunk_ranges_from_hash_boundaries(
@@ -508,5 +617,42 @@ mod tests {
         assert_eq!(leaf_lengths, vec![4; 16]);
         assert_eq!(level_one_lengths, vec![4; 4]);
         assert_eq!(root_length, Some(4));
+    }
+
+    #[test]
+    fn sorted_batch_builder_matches_batch_builder_for_sorted_entries() {
+        let config = Config::builder()
+            .min_chunk_size(4)
+            .max_chunk_size(16)
+            .chunking_factor(8)
+            .build();
+        let batch_store = CountingStore::default();
+        let sorted_store = CountingStore::default();
+        let mut batch = BatchBuilder::new(batch_store, config.clone());
+        let mut sorted = SortedBatchBuilder::new(sorted_store, config);
+
+        for i in 0..257 {
+            let key = format!("k{i:04}").into_bytes();
+            let val = format!("value-{i:04}").into_bytes();
+            batch.add(key.clone(), val.clone());
+            sorted.add(key, val).unwrap();
+        }
+
+        let batch_tree = batch.build().unwrap();
+        let sorted_tree = sorted.build().unwrap();
+
+        assert_eq!(batch_tree.root, sorted_tree.root);
+    }
+
+    #[test]
+    fn sorted_batch_builder_rejects_out_of_order_keys() {
+        let store = CountingStore::default();
+        let config = Config::default();
+        let mut builder = SortedBatchBuilder::new(store, config);
+
+        builder.add(b"b".to_vec(), b"1".to_vec()).unwrap();
+        let err = builder.add(b"a".to_vec(), b"2".to_vec()).unwrap_err();
+
+        assert!(matches!(err, Error::UnsortedInput { .. }));
     }
 }

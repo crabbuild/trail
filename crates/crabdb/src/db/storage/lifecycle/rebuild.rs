@@ -6,6 +6,65 @@ impl CrabDb {
         self.rebuild_indexes_unlocked()
     }
 
+    pub fn rebuild_indexes_with_rich_text(&mut self) -> Result<IndexRebuildReport> {
+        let _lock = self.acquire_write_lock()?;
+        let hydrated = self.hydrate_current_branch_rich_text_unlocked()?;
+        let mut report = self.rebuild_indexes_unlocked()?;
+        report.rich_text_hydrated = hydrated;
+        Ok(report)
+    }
+
+    fn hydrate_current_branch_rich_text_unlocked(&self) -> Result<u64> {
+        let branch = self.current_branch()?;
+        let head = self.resolve_branch_ref(&branch)?;
+        let mut files = self.load_root_files(&head.root_id)?;
+        let mut lazy_texts = Vec::new();
+
+        for (path, entry) in &files {
+            let FileContentRef::Text(text_id) = &entry.content else {
+                continue;
+            };
+            let content: TextContent = self.get_object(TEXT_CONTENT_KIND, text_id)?;
+            if matches!(content.representation, TextRepresentation::LazyText { .. }) {
+                lazy_texts.push((path.clone(), text_id.clone()));
+            }
+        }
+
+        if lazy_texts.is_empty() {
+            return Ok(0);
+        }
+
+        for (path, text_id) in &lazy_texts {
+            let lines = self.load_text_lines(text_id)?;
+            let rich_text_id = self.put_text_content_from_lines(&lines)?;
+            if let Some(entry) = files.get_mut(path) {
+                entry.content = FileContentRef::Text(rich_text_id);
+            }
+        }
+
+        let actor = Actor::system();
+        let change_id = self.allocate_change_id(&actor.id, "hydrate-rich-text")?;
+        let built = self.build_root_from_file_entries(files, &change_id)?;
+        let operation = Operation {
+            version: OP_OBJECT_VERSION,
+            change_id: change_id.clone(),
+            kind: OperationKind::ManualCheckpoint,
+            parents: vec![head.change_id.clone()],
+            before_root: Some(head.root_id.clone()),
+            after_root: built.root_id.clone(),
+            branch,
+            actor,
+            session_id: None,
+            message: Some("Hydrate lazy text indexes".to_string()),
+            changes: Vec::new(),
+            created_at: now_ts(),
+        };
+        let operation_id = self.store_operation(&operation)?;
+        self.advance_ref_cas(&head, &change_id, &built.root_id, &operation_id)?;
+        self.set_worktree_index_baseline(&built.root_id)?;
+        Ok(lazy_texts.len() as u64)
+    }
+
     pub(crate) fn rebuild_indexes_unlocked(&self) -> Result<IndexRebuildReport> {
         let (operation_objects, mut errors) = self.operation_objects()?;
         let reachable_changes =

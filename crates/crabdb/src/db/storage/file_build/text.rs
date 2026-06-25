@@ -9,7 +9,30 @@ impl CrabDb {
         line_seq: &mut u64,
         similarity_threshold: f32,
         small_text: bool,
+        lazy_text: bool,
     ) -> Result<TextBuildResult> {
+        if lazy_text {
+            let blob_id = self.put_blob(bytes.to_vec())?;
+            let content = TextContent {
+                version: TEXT_OBJECT_VERSION,
+                content_hash: sha256_hex(bytes),
+                line_count: split_lines(bytes).len() as u64,
+                byte_count: bytes.len() as u64,
+                full_bytes_blob_id: Some(blob_id.clone()),
+                order_map_root: None,
+                line_index_map_root: None,
+                representation: TextRepresentation::LazyText {
+                    blob_id,
+                    introduced_by: change_id.clone(),
+                },
+            };
+            let object_id = self.put_object(TEXT_CONTENT_KIND, TEXT_OBJECT_VERSION, &content)?;
+            return Ok(TextBuildResult {
+                object_id,
+                line_changes: Vec::new(),
+            });
+        }
+
         let new_lines = split_lines(bytes);
         let previous = previous.unwrap_or(&[]);
         let new_hashes = new_lines

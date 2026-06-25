@@ -8,8 +8,8 @@ pub(crate) fn apply_text_policy(config: &mut TextConfig, policy: Option<&str>) -
         "balanced" => Ok(()),
         "minimal" => {
             config.small_text_max_bytes = 4 * 1024;
-            config.tree_text_min_bytes = 64 * 1024 + 1;
-            config.opaque_text_max_bytes = 64 * 1024;
+            config.tree_text_min_bytes = 64 * 1024 * 1024 + 1;
+            config.opaque_text_max_bytes = 64 * 1024 * 1024;
             config.max_line_bytes = 256 * 1024;
             config.preserve_similarity = 0.35;
             Ok(())
