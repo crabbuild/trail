@@ -518,6 +518,74 @@ fn record_paths_records_only_selected_changes() {
 }
 
 #[test]
+fn git_tracked_dirty_paths_record_modified_and_deleted_files() {
+    if !git_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "crabdb@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "CrabDB"]);
+    fs::write(temp.path().join("a.txt"), "a1\n").unwrap();
+    fs::write(temp.path().join("b.txt"), "b1\n").unwrap();
+    run_git(temp.path(), &["add", "."]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    CrabDb::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+
+    fs::write(temp.path().join("a.txt"), "a1\na2\n").unwrap();
+    fs::remove_file(temp.path().join("b.txt")).unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    let status = db.status(Some("main")).unwrap();
+    let status_paths = status
+        .changed_paths
+        .iter()
+        .map(|path| (path.path.as_str(), path.kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        status_paths.get("a.txt"),
+        Some(&crabdb::FileChangeKind::Modified)
+    );
+    assert_eq!(
+        status_paths.get("b.txt"),
+        Some(&crabdb::FileChangeKind::Deleted)
+    );
+
+    let record = db
+        .record(
+            Some("main"),
+            Some("record tracked dirty paths".to_string()),
+            Actor::human(),
+            false,
+        )
+        .unwrap();
+    assert!(record.operation.is_some());
+    assert_eq!(record.changed_paths.len(), 2);
+    assert!(record
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "a.txt" && path.kind == crabdb::FileChangeKind::Modified));
+    assert!(record
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "b.txt" && path.kind == crabdb::FileChangeKind::Deleted));
+
+    let clean = db.status(Some("main")).unwrap();
+    assert!(clean.changed_paths.is_empty());
+    let diff = db.diff_dirty(false, false).unwrap();
+    assert!(diff.files.is_empty());
+    let noop = db
+        .record(
+            Some("main"),
+            Some("ignore stale git dirty paths".to_string()),
+            Actor::human(),
+            false,
+        )
+        .unwrap();
+    assert!(noop.operation.is_none());
+}
+
+#[test]
 fn record_kind_session_and_allow_ignored_path_are_audited() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();

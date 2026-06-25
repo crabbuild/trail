@@ -1,9 +1,25 @@
 use super::*;
 use crate::db::util::*;
 
+mod agent_gates;
+mod agent_lookup;
+mod agent_runs;
 mod agents;
+mod content;
+mod diff;
+mod file_build;
 mod files;
 mod git;
+mod ids;
 mod lifecycle;
+mod line_changes;
+mod manifest;
 mod objects;
+mod patches;
 mod query;
+mod record_selection;
+mod refs;
+mod root_diff;
+mod schema;
+mod validation;
+mod worktree_scan;

@@ -87,6 +87,13 @@ pub(crate) struct RootBuildResult {
 }
 
 #[derive(Debug)]
+pub(crate) struct SelectedWorktreeSnapshot {
+    paths: Vec<String>,
+    files: Vec<DiskFile>,
+    summaries: Vec<FileDiffSummary>,
+}
+
+#[derive(Debug)]
 pub(crate) struct FileBuildResult {
     entry: FileEntry,
     line_changes: Vec<LineChange>,
