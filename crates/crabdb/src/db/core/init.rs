@@ -381,17 +381,3 @@ fn lock_holder_pid(holder: &str) -> Option<u32> {
             .and_then(|value| value.parse::<u32>().ok())
     })
 }
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
-    true
-}

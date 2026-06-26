@@ -705,6 +705,12 @@ cargo run -p crabdb -- agent --help
 cargo run -p crabdb -- api openapi --output /tmp/crabdb.openapi.json
 ```
 
+## License
+
+CrabDB is distributed under the terms in [LICENSE](LICENSE). The checked-in
+license file contains the MIT License; the Rust workspace metadata currently
+declares `MIT OR Apache-2.0`.
+
 ## Current Boundaries
 
 CrabDB is local-first. It does not require a hosted service, and its HTTP daemon

@@ -120,7 +120,7 @@ impl CrabDb {
         {
             return Ok(None);
         }
-        if !daemon_snapshot_process_is_alive(snapshot.pid) {
+        if !process_is_alive(snapshot.pid) {
             let _ = fs::remove_file(path);
             return Ok(None);
         }
@@ -1119,22 +1119,6 @@ fn write_persisted_daemon_worktree_snapshot(
     fs::write(&tmp, serde_json::to_vec(snapshot)?)?;
     fs::rename(tmp, path)?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn daemon_snapshot_process_is_alive(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(unix))]
-fn daemon_snapshot_process_is_alive(_pid: u32) -> bool {
-    true
 }
 
 impl Drop for DaemonWorktreeCache {

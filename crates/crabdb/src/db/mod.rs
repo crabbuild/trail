@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

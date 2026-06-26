@@ -19,7 +19,7 @@ serde_cbor = "0.11"
 serde_json = "1.0"
 sha2 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
