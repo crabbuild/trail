@@ -2,7 +2,7 @@
 
 CrabDB is a local-first operation database for code and text worktrees. It records meaningful operations, preserves stable file and line identity, and gives humans and coding agents a branch, provenance, and review layer above a normal workspace.
 
-These docs are written from the current Rust code, CLI definitions, exported model types, OpenAPI paths, MCP tools, and e2e tests. The old large guide files are kept only as compatibility entry points.
+These docs are written from the current Rust code, CLI definitions, exported model types, OpenAPI paths, MCP tools, and e2e tests.
 
 ## Start Here
 
