@@ -44,6 +44,8 @@ pub(super) enum AgentSubcommand {
     Trace(AgentTraceCommand),
     /// Record all current agent workdir changes as one operation.
     Record(AgentRecordArgs),
+    /// Rewind an agent branch to a known-good change or root.
+    Rewind(AgentRewindArgs),
     /// Watch and record agent workdir changes continuously.
     Watch(AgentWatchArgs),
     /// Run a command in agent workdir and record test gate metadata.
@@ -179,6 +181,17 @@ pub(super) struct AgentRecordArgs {
     pub(super) name: String,
     #[arg(short, long)]
     pub(super) message: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AgentRewindArgs {
+    pub(super) name: String,
+    #[arg(long = "to")]
+    pub(super) target: String,
+    #[arg(long)]
+    pub(super) record_current: bool,
+    #[arg(long)]
+    pub(super) sync_workdir: bool,
 }
 
 #[derive(Args)]

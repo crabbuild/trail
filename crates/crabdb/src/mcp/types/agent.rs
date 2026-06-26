@@ -50,6 +50,18 @@ pub(crate) struct AgentRemoveArgs {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct AgentRewindArgs {
+    #[serde(alias = "agent_or_id", alias = "name")]
+    pub(crate) agent: String,
+    #[serde(alias = "target")]
+    pub(crate) to: String,
+    #[serde(default)]
+    pub(crate) record_current: bool,
+    #[serde(default)]
+    pub(crate) sync_workdir: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct LeaseAcquireArgs {
     pub(crate) agent: String,
     #[serde(default)]

@@ -32,6 +32,7 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 - `crabdb.gate_history`
 - `crabdb.agent_readiness`
 - `crabdb.agent_handoff`
+- `crabdb.agent_rewind`
 - `crabdb.agent_remove`
 
 ## Sessions, Approvals, Runs, Leases, Anchors
@@ -65,7 +66,7 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 - `crabdb.merge_queue_run`
 - `crabdb.merge_queue_remove`
 - `crabdb.conflict_list`
-- `crabdb.conflict_show`
+- `crabdb.conflict_show` returns conflict details plus deterministic explanation evidence and conservative next steps.
 - `crabdb.conflict_resolve`
 
 ## Turns, Events, Spans, Patches, Gates, Workdirs
@@ -90,7 +91,7 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 
 ## Tool Risk Annotations
 
-The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only examples include status, diff, timeline, why, history, agent status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check.
+The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only examples include status, diff, timeline, why, history, agent status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Destructive-write examples include `crabdb.agent_rewind` because it intentionally moves an agent ref and may refresh a materialized workdir.
 
 Open-world write examples are `crabdb.run_test` and `crabdb.run_eval` because they execute commands in agent workdirs.
 

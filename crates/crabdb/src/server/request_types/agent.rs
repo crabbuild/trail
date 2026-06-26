@@ -123,6 +123,16 @@ pub(crate) struct AgentRecordRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct AgentRewindRequest {
+    #[serde(alias = "target")]
+    pub(crate) to: String,
+    #[serde(default)]
+    pub(crate) record_current: bool,
+    #[serde(default)]
+    pub(crate) sync_workdir: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct AgentClaimRequest {
     pub(crate) path: String,
     #[serde(default, alias = "ttl")]

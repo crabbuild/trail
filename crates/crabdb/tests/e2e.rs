@@ -10,10 +10,10 @@ use std::thread;
 use std::time::Duration;
 
 use crabdb::{
-    Actor, AgentGateOptions, AgentMessageReport, AgentPatchReport, AgentTurnDetails,
-    AgentTurnEndReport, AgentTurnEventReport, AgentTurnStartReport, ConflictManualFile,
-    ConflictManualResolution, CrabDb, Error, InitImportMode, PatchDocument, ShowResult,
-    TextContent, TextRepresentation, WorktreeState,
+    Actor, AgentGateOptions, AgentMessageReport, AgentPatchReport, AgentRewindReport,
+    AgentTurnDetails, AgentTurnEndReport, AgentTurnEventReport, AgentTurnStartReport,
+    ConflictManualFile, ConflictManualResolution, CrabDb, Error, InitImportMode, PatchDocument,
+    ShowResult, TextContent, TextRepresentation, WorktreeState,
 };
 use rusqlite::Connection;
 
@@ -4283,6 +4283,10 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(prompt_messages[0]["content"]["text"]
         .as_str()
         .unwrap()
+        .contains("crabdb.agent_rewind"));
+    assert!(prompt_messages[0]["content"]["text"]
+        .as_str()
+        .unwrap()
         .contains("mcp-agent"));
     assert!(prompt_messages
         .iter()
@@ -4412,6 +4416,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         .any(|tool| tool["name"] == "crabdb.agent_remove"));
     assert!(tools
         .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_rewind"));
+    assert!(tools
+        .iter()
         .any(|tool| tool["name"] == "crabdb.apply_patch"));
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.run_test"));
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.read_file"));
@@ -4444,6 +4451,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(!tool_annotation("crabdb.status", "destructiveHint"));
     assert!(!tool_annotation("crabdb.apply_patch", "readOnlyHint"));
     assert!(tool_annotation("crabdb.apply_patch", "destructiveHint"));
+    assert!(tool_annotation("crabdb.agent_rewind", "destructiveHint"));
     assert!(tool_annotation("crabdb.run_test", "openWorldHint"));
     assert!(tool_annotation("crabdb.guardrail_check", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_review", "readOnlyHint"));
@@ -6854,6 +6862,164 @@ fn agent_patch_incrementally_handles_rename_delete_and_write() {
 }
 
 #[test]
+fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_agent("rewind-bot", Some("main"), true, None, None)
+        .unwrap();
+    let base_change = spawned.base_change;
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    fs::write(workdir.join("README.md"), "bad workdir\n").unwrap();
+    drop(db);
+
+    let cli = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "rewind",
+            "rewind-bot",
+            "--to",
+            &base_change.0,
+            "--record-current",
+            "--sync-workdir",
+        ],
+    );
+    assert_eq!(cli["target_change"], base_change.0);
+    assert_eq!(cli["workdir_synced"], true);
+    assert!(cli["recorded_current"].as_str().is_some());
+    let preserved_branch = cli["preserved_branch"].as_str().unwrap().to_string();
+    assert!(preserved_branch.starts_with("rewind/rewind-bot/"));
+
+    let db = CrabDb::open(temp.path()).unwrap();
+    let details = db.agent_details("rewind-bot").unwrap();
+    assert_eq!(details.branch.head_change.0, cli["operation"]);
+    assert_eq!(details.branch.head_root.0, cli["target_root"]);
+    assert_eq!(
+        fs::read_to_string(workdir.join("README.md")).unwrap(),
+        "base\n"
+    );
+
+    let rewind_op = db.show(cli["operation"].as_str().unwrap()).unwrap();
+    match rewind_op {
+        ShowResult::Operation { value } => {
+            assert!(matches!(
+                value.operation.kind,
+                crabdb::OperationKind::AgentRewind
+            ));
+            assert_eq!(value.operation.parents[0].0, cli["previous_change"]);
+            assert_eq!(value.operation.after_root.0, cli["target_root"]);
+        }
+        other => panic!("expected rewind operation, got {other:?}"),
+    }
+
+    let preserved_ref = format!("refs/branches/{preserved_branch}");
+    let preserved_line = db.why("README.md:1", Some(&preserved_ref)).unwrap();
+    assert_eq!(preserved_line.current_text, "bad workdir");
+    let rewound_line = db
+        .why("README.md:1", Some("refs/agents/rewind-bot"))
+        .unwrap();
+    assert_eq!(rewound_line.current_text, "base");
+
+    let events = db
+        .list_agent_events(Some("rewind-bot"), None, None, Some("agent_rewound"), 10)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].change_id.as_ref().unwrap().0, cli["operation"]);
+    assert_eq!(
+        events[0].payload.as_ref().unwrap()["preserved_branch"],
+        preserved_branch
+    );
+}
+
+#[test]
+fn agent_rewind_is_available_through_http_and_mcp() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    db.spawn_agent("api-rewind", Some("main"), false, None, None)
+        .unwrap();
+    let base_change = db.agent_details("api-rewind").unwrap().branch.base_change;
+    let bad_patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "bad api edit",
+        "edits": [
+            {"op": "write", "path": "README.md", "content": "bad api\n"}
+        ]
+    }))
+    .unwrap();
+    db.apply_agent_patch("api-rewind", bad_patch).unwrap();
+
+    let response = crabdb::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/agents/api-rewind/rewind",
+            serde_json::json!({
+                "to": base_change.0.clone(),
+                "record_current": true
+            }),
+        ),
+    );
+    assert_eq!(response.status, 200);
+    let http_report: AgentRewindReport = response.body_json().unwrap();
+    assert_eq!(http_report.target_change, base_change);
+    assert!(http_report.preserved_branch.is_some());
+    assert_eq!(
+        db.why("README.md:1", Some("refs/agents/api-rewind"))
+            .unwrap()
+            .current_text,
+        "base"
+    );
+
+    let second_bad_patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "bad mcp edit",
+        "edits": [
+            {"op": "write", "path": "README.md", "content": "bad mcp\n"}
+        ]
+    }))
+    .unwrap();
+    db.apply_agent_patch("api-rewind", second_bad_patch)
+        .unwrap();
+    let mcp = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_rewind",
+                "arguments": {
+                    "agent": "api-rewind",
+                    "to": base_change.0.clone(),
+                    "record_current": true
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["target_change"],
+        base_change.0
+    );
+    assert!(mcp["result"]["structuredContent"]["preserved_branch"]
+        .as_str()
+        .unwrap()
+        .starts_with("rewind/api-rewind/"));
+    assert_eq!(
+        db.why("README.md:1", Some("refs/agents/api-rewind"))
+            .unwrap()
+            .current_text,
+        "base"
+    );
+}
+
+#[test]
 fn agent_merge_combines_non_overlapping_text_line_edits() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "one\ntwo\nthree\n").unwrap();
@@ -9143,6 +9309,31 @@ fn merge_queue_pauses_on_conflict() {
         .any(|detail| detail.contains("README.md")));
     let shown = db.show_conflict(&conflicts[0].conflict_set_id).unwrap();
     assert_eq!(shown.conflict_set_id, conflicts[0].conflict_set_id);
+    let explanation = shown.explanation.as_ref().unwrap();
+    assert_eq!(explanation.merge.source_ref, "refs/agents/doc-bot");
+    assert_eq!(explanation.merge.target_ref, "refs/branches/main");
+    assert_eq!(explanation.paths.len(), 1);
+    assert_eq!(explanation.paths[0].path, "README.md");
+    assert_eq!(explanation.paths[0].recommendation.resolution, "manual");
+    assert_eq!(explanation.paths[0].recommendation.confidence, "high");
+    assert_eq!(explanation.paths[0].lines.len(), 1);
+    assert_eq!(
+        explanation.paths[0].lines[0].target.as_deref(),
+        Some("human\n")
+    );
+    assert_eq!(
+        explanation.paths[0].lines[0].source.as_deref(),
+        Some("agent\n")
+    );
+    assert_eq!(
+        explanation.paths[0].lines[0]
+            .target_change
+            .as_ref()
+            .unwrap()
+            .message
+            .as_deref(),
+        Some("human edit")
+    );
 
     let resolved = db
         .resolve_conflict(&conflicts[0].conflict_set_id, "source")
@@ -9206,6 +9397,23 @@ fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
     let (temp, db, conflict_id) =
         conflicted_readme_workspace("hello\nagent-cli\n", "hello\nhuman-cli\n");
     drop(db);
+    let shown = run_crabdb_json(
+        temp.path(),
+        &["conflicts", "show", &conflict_id, "--limit", "1"],
+    );
+    assert_eq!(shown["conflict_set_id"], conflict_id);
+    assert_eq!(shown["explanation"]["paths"][0]["path"], "README.md");
+    assert_eq!(
+        shown["explanation"]["paths"][0]["recommendation"]["resolution"],
+        "manual"
+    );
+    assert_eq!(
+        shown["explanation"]["paths"][0]["lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let resolution_path = temp.path().join("resolution.json");
     fs::write(
         &resolution_path,
@@ -9411,6 +9619,18 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     assert_eq!(shown.status, 200);
     let shown: serde_json::Value = shown.body_json().unwrap();
     assert_eq!(shown["conflict_set_id"], conflict_id);
+    assert_eq!(
+        shown["explanation"]["paths"][0]["recommendation"]["resolution"],
+        "manual"
+    );
+    assert_eq!(
+        shown["explanation"]["paths"][0]["lines"][0]["target"],
+        "human-api\n"
+    );
+    assert_eq!(
+        shown["explanation"]["paths"][0]["lines"][0]["source"],
+        "agent-api\n"
+    );
 
     let mcp_show = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -9431,6 +9651,11 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     assert_eq!(
         mcp_show["result"]["structuredContent"]["conflict_set_id"],
         conflict_id
+    );
+    assert_eq!(
+        mcp_show["result"]["structuredContent"]["explanation"]["paths"][0]["recommendation"]
+            ["resolution"],
+        "manual"
     );
 
     let mcp_resolve = crabdb::mcp::handle_json_rpc(

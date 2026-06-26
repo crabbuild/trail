@@ -48,11 +48,13 @@ Default priority is 0.
 
 ```text
 crabdb conflicts list
-crabdb conflicts show <CONFLICT_SET_ID>
+crabdb conflicts show <CONFLICT_SET_ID> [--limit <N>]
 crabdb conflicts resolve <CONFLICT_SET_ID> --take source
 crabdb conflicts resolve <CONFLICT_SET_ID> --take target
 crabdb conflicts resolve <CONFLICT_SET_ID> --manual <JSON_FILE>
 ```
+
+`conflicts show` includes a deterministic explanation section with source/target operation provenance, best-effort logical line evidence, conservative resolution recommendations, and next steps. The default explanation limit is 50.
 
 Manual conflict files can be plain text values or objects with `content`, `delete`, and `executable`.
 
@@ -61,4 +63,3 @@ Manual conflict files can be plain text values or objects with `content`, `delet
 - Args: `crates/crabdb/src/cli/command/worktree_args.rs`, `crates/crabdb/src/cli/command/collaboration_args/merge.rs`
 - Merge logic: `crates/crabdb/src/db/merge`
 - Conflict reports: `crates/crabdb/src/model/reports/merge.rs`
-

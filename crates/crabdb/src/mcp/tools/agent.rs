@@ -107,6 +107,18 @@ pub(super) fn tools() -> Value {
                 "agent": { "type": "string" },
                 "force": { "type": "boolean" }
             }), vec!["agent"])
+        },
+        {
+            "name": "crabdb.agent_rewind",
+            "title": "Rewind Agent",
+            "description": "Move an agent branch back to a known-good change or root, optionally preserving the current head and syncing the materialized workdir.",
+            "inputSchema": object_schema(json!({
+                "agent": { "type": "string" },
+                "to": { "type": "string" },
+                "target": { "type": "string" },
+                "record_current": { "type": "boolean" },
+                "sync_workdir": { "type": "boolean" }
+            }), vec!["agent", "to"])
         }
     ])
 }

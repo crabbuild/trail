@@ -55,6 +55,15 @@ crabdb agent contribution doc-bot
 
 `readiness` reports blockers and warnings, including pending approvals, conflicts, dirty materialized workdirs, and required test/eval gates.
 
+## Rewind an Agent
+
+If an agent branch should return to a known-good state, rewind it and preserve
+the failed head for review:
+
+```sh
+crabdb agent rewind doc-bot --to <change-or-root> --record-current --sync-workdir
+```
+
 ## Merge
 
 Preview first:
@@ -83,4 +92,5 @@ crabdb conflicts show <conflict-set-id>
 - Merge queue args: `crates/crabdb/src/cli/command/collaboration_args/merge.rs`
 - Patch schema: `crates/crabdb/src/model/inspect/patch.rs`
 - Readiness: `crates/crabdb/src/db/agent/readiness.rs`
+- Rewind: `crates/crabdb/src/db/agent/rewind.rs`
 - Tests: `agent_patch_can_merge_into_main`, `merge_agent_and_queue_enforce_readiness_blockers`, `merge_queue_pauses_on_conflict`

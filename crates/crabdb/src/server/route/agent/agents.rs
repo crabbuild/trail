@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use crate::model::AgentGateOptions;
 use crate::server::request_types::{
-    AgentClaimRequest, AgentReadFileRequest, AgentRecordRequest, AgentTestRequest,
-    SpawnAgentRequest, SyncWorkdirRequest,
+    AgentClaimRequest, AgentReadFileRequest, AgentRecordRequest, AgentRewindRequest,
+    AgentTestRequest, SpawnAgentRequest, SyncWorkdirRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
@@ -133,6 +133,18 @@ pub(super) fn handle_agent_resources(
             serde_json::from_slice(&request.body)?
         };
         let report = db.record_agent_workdir(&agent, body.message)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "agents"
+        && parts[3] == "rewind"
+        && request.method == "POST"
+    {
+        let agent = db.resolve_agent_handle(parts[2])?;
+        let body: AgentRewindRequest = serde_json::from_slice(&request.body)?;
+        let report = db.rewind_agent(&agent, &body.to, body.record_current, body.sync_workdir)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

@@ -45,9 +45,10 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.conflict_show",
             "title": "Show Merge Conflict",
-            "description": "Show one structured conflict set with source, target, status, and details.",
+            "description": "Show one structured conflict set with source, target, status, details, and deterministic conflict explanation evidence.",
             "inputSchema": object_schema(json!({
-                "conflict_set_id": { "type": "string" }
+                "conflict_set_id": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "default": 50 }
             }), vec!["conflict_set_id"])
         },
         {

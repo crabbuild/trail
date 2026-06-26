@@ -70,6 +70,8 @@ pub(in crate::cli::command) struct ConflictsCommand {
 #[derive(Args)]
 pub(in crate::cli::command) struct ConflictShowArgs {
     pub(in crate::cli::command) conflict_set_id: String,
+    #[arg(long, default_value_t = 50)]
+    pub(in crate::cli::command) limit: usize,
 }
 
 #[derive(Args)]

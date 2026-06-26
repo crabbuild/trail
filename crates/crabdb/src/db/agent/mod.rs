@@ -11,5 +11,6 @@ mod patch_edits;
 mod patch_policy;
 mod patching;
 mod readiness;
+mod rewind;
 mod turns;
 mod workdir;

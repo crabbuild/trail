@@ -128,6 +128,7 @@ fn daemon_supports_command(command: &Command) -> bool {
             | AgentSubcommand::Handoff(_)
             | AgentSubcommand::Claim(_)
             | AgentSubcommand::Record(_)
+            | AgentSubcommand::Rewind(_)
             | AgentSubcommand::Events(_)
             | AgentSubcommand::Read(_)
             | AgentSubcommand::Workdir(_)
@@ -262,6 +263,17 @@ fn handle_agent_command(
             let report: AgentRecordReport =
                 client.post_json(&format!("/v1/agents/{}/record", args.name), &body)?;
             render_agent_record(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Rewind(args) => {
+            let body = serde_json::json!({
+                "to": args.target,
+                "record_current": args.record_current,
+                "sync_workdir": args.sync_workdir,
+            });
+            let report: AgentRewindReport =
+                client.post_json(&format!("/v1/agents/{}/rewind", args.name), &body)?;
+            render_agent_rewind(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         AgentSubcommand::Events(args) => {

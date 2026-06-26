@@ -94,6 +94,92 @@ pub(super) fn collaboration_schemas() -> Value {
             "type": "object",
             "properties": { "limit": { "type": "integer", "minimum": 1 } }
         },
+        "ConflictSetSummary": {
+            "type": "object",
+            "required": ["conflict_set_id", "status", "details", "created_at"],
+            "properties": {
+                "conflict_set_id": { "type": "string" },
+                "merge_id": { "type": "string" },
+                "source_ref": { "type": "string" },
+                "target_ref": { "type": "string" },
+                "status": { "type": "string" },
+                "details": { "type": "array", "items": { "type": "string" } },
+                "created_at": { "type": "integer" },
+                "explanation": { "$ref": "#/components/schemas/ConflictExplanation" }
+            }
+        },
+        "ConflictExplanation": {
+            "type": "object",
+            "required": ["merge", "paths", "recommendations", "next_steps"],
+            "properties": {
+                "merge": { "$ref": "#/components/schemas/ConflictMergeContext" },
+                "paths": { "type": "array", "items": { "$ref": "#/components/schemas/ConflictPathExplanation" } },
+                "recommendations": { "type": "array", "items": { "$ref": "#/components/schemas/ConflictResolutionCandidate" } },
+                "next_steps": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "ConflictMergeContext": {
+            "type": "object",
+            "required": ["merge_id", "source_ref", "target_ref", "base_change", "target_change", "source_change"],
+            "properties": {
+                "merge_id": { "type": "string" },
+                "queue_id": { "type": "string" },
+                "source_ref": { "type": "string" },
+                "target_ref": { "type": "string" },
+                "base_change": { "type": "string" },
+                "target_change": { "type": "string" },
+                "source_change": { "type": "string" }
+            }
+        },
+        "ConflictPathExplanation": {
+            "type": "object",
+            "required": ["path", "summary", "reason", "lines", "recommendation"],
+            "properties": {
+                "path": { "type": "string" },
+                "summary": { "type": "string" },
+                "reason": { "type": "string" },
+                "target": { "$ref": "#/components/schemas/ConflictSideProvenance" },
+                "source": { "$ref": "#/components/schemas/ConflictSideProvenance" },
+                "lines": { "type": "array", "items": { "$ref": "#/components/schemas/ConflictLineExplanation" } },
+                "recommendation": { "$ref": "#/components/schemas/ConflictResolutionCandidate" }
+            }
+        },
+        "ConflictSideProvenance": {
+            "type": "object",
+            "required": ["side", "change_id", "kind", "branch", "actor_id", "created_at"],
+            "properties": {
+                "side": { "type": "string" },
+                "change_id": { "type": "string" },
+                "kind": { "type": "string" },
+                "branch": { "type": "string" },
+                "actor_id": { "type": "string" },
+                "session_id": { "type": "string" },
+                "message": { "type": "string" },
+                "created_at": { "type": "integer" }
+            }
+        },
+        "ConflictLineExplanation": {
+            "type": "object",
+            "required": ["line_id", "reason"],
+            "properties": {
+                "line_id": { "type": "string" },
+                "base": { "type": "string" },
+                "target": { "type": "string" },
+                "source": { "type": "string" },
+                "target_change": { "$ref": "#/components/schemas/ConflictSideProvenance" },
+                "source_change": { "$ref": "#/components/schemas/ConflictSideProvenance" },
+                "reason": { "type": "string" }
+            }
+        },
+        "ConflictResolutionCandidate": {
+            "type": "object",
+            "required": ["resolution", "confidence", "reason"],
+            "properties": {
+                "resolution": { "type": "string", "enum": ["source", "target", "manual"] },
+                "confidence": { "type": "string" },
+                "reason": { "type": "string" }
+            }
+        },
         "ConflictResolveRequest": {
             "type": "object",
             "properties": {

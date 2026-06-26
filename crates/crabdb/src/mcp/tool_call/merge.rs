@@ -22,7 +22,9 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
         "crabdb.conflict_list" => tool_result(db.list_conflicts()?),
         "crabdb.conflict_show" => {
             let args: ConflictIdArgs = parse_args(arguments)?;
-            tool_result(db.show_conflict(&args.conflict_set_id)?)
+            tool_result(
+                db.show_conflict_with_limit(&args.conflict_set_id, args.limit.unwrap_or(50))?,
+            )
         }
         "crabdb.conflict_resolve" => {
             let args: ConflictResolveArgs = parse_args(arguments)?;

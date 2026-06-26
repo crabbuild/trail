@@ -55,6 +55,19 @@ crabdb approvals list --agent doc-bot
 
 Stop if readiness reports blockers.
 
+## Rewind
+
+Use rewind when an agent branch has gone in the wrong direction and a known-good
+change or root should become the new agent head:
+
+```sh
+crabdb agent rewind doc-bot --to <change-or-root> --record-current --sync-workdir
+```
+
+`--record-current` preserves the previous head under a `rewind/...` branch and
+records dirty materialized workdir edits before the rewind when possible.
+`--sync-workdir` refreshes a clean materialized workdir to the rewound head.
+
 ## Merge
 
 ```sh
@@ -68,6 +81,7 @@ Use the queue when multiple branches may target the same branch.
 ## Code Facts Used
 
 - Handoff/readiness: `crates/crabdb/src/db/agent/readiness.rs`
+- Rewind: `crates/crabdb/src/db/agent/rewind.rs`
 - Contribution: `crates/crabdb/src/db/agent/identity.rs`
 - Merge queue: `crates/crabdb/src/db/merge/queue.rs`
 - Tests: `merge_queue_runs_agent_branch_into_main`, `merge_agent_and_queue_enforce_readiness_blockers`

@@ -87,6 +87,7 @@ pub(crate) fn conflict_set_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conf
         status: row.get(4)?,
         details,
         created_at: row.get(6)?,
+        explanation: None,
     })
 }
 

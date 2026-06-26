@@ -12,7 +12,17 @@ impl CrabDb {
     }
 
     pub fn show_conflict(&self, conflict_set_id: &str) -> Result<ConflictSetSummary> {
-        self.conn
+        self.show_conflict_with_limit(conflict_set_id, 50)
+    }
+
+    pub fn show_conflict_with_limit(
+        &self,
+        conflict_set_id: &str,
+        limit: usize,
+    ) -> Result<ConflictSetSummary> {
+        let limit = normalize_query_limit(limit, 1000)?;
+        let mut summary = self
+            .conn
             .query_row(
                 "SELECT conflict_set_id, merge_id, source_ref, target_ref, status, details_json, created_at \
                  FROM conflict_sets WHERE conflict_set_id = ?1",
@@ -20,7 +30,11 @@ impl CrabDb {
                 conflict_set_row,
             )
             .optional()?
-            .ok_or_else(|| Error::InvalidInput(format!("conflict set `{conflict_set_id}` not found")))
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("conflict set `{conflict_set_id}` not found"))
+            })?;
+        summary.explanation = self.conflict_explanation(&summary, limit)?;
+        Ok(summary)
     }
 
     pub fn resolve_conflict(
@@ -170,6 +184,221 @@ impl CrabDb {
         })
     }
 
+    fn conflict_explanation(
+        &self,
+        summary: &ConflictSetSummary,
+        limit: usize,
+    ) -> Result<Option<ConflictExplanation>> {
+        let pending = match self.pending_conflict_merge(&summary.conflict_set_id) {
+            Ok(pending) => pending,
+            Err(_) => return Ok(None),
+        };
+        let conflict_paths = match conflict_paths_from_details(&summary.details) {
+            Ok(paths) => paths,
+            Err(_) => return Ok(None),
+        };
+        let base_ref = self.ref_from_change(&pending.base_change)?;
+        let target_ref = self.ref_from_change(&pending.left_change)?;
+        let source_ref = self.ref_from_change(&pending.right_change)?;
+        let paths = conflict_paths.into_iter().collect::<Vec<_>>();
+        let base_files = self.load_root_files_for_paths(&base_ref.root_id, &paths)?;
+        let target_files = self.load_root_files_for_paths(&target_ref.root_id, &paths)?;
+        let source_files = self.load_root_files_for_paths(&source_ref.root_id, &paths)?;
+        let mut explanations = Vec::new();
+        let mut recommendations = Vec::new();
+        for path in paths.into_iter().take(limit) {
+            let explanation = self.explain_conflict_path(
+                &path,
+                base_files.get(&path),
+                target_files.get(&path),
+                source_files.get(&path),
+                &pending,
+                limit,
+            )?;
+            recommendations.push(explanation.recommendation.clone());
+            explanations.push(explanation);
+        }
+        Ok(Some(ConflictExplanation {
+            merge: ConflictMergeContext {
+                merge_id: pending.merge_id,
+                queue_id: pending.queue_id,
+                source_ref: pending.source_ref,
+                target_ref: pending.target_ref,
+                base_change: pending.base_change,
+                target_change: pending.left_change,
+                source_change: pending.right_change,
+            },
+            paths: explanations,
+            recommendations,
+            next_steps: vec![
+                "Inspect each conflicted path and choose source, target, or manual content."
+                    .to_string(),
+                format!(
+                    "Resolve with `crabdb conflicts resolve {} --take source`, `--take target`, or `--manual <JSON_FILE>`.",
+                    summary.conflict_set_id
+                ),
+                "Run status, diff, and the relevant test/eval gates after resolution.".to_string(),
+            ],
+        }))
+    }
+
+    fn explain_conflict_path(
+        &self,
+        path: &str,
+        base_entry: Option<&FileEntry>,
+        target_entry: Option<&FileEntry>,
+        source_entry: Option<&FileEntry>,
+        pending: &PendingConflictMerge,
+        limit: usize,
+    ) -> Result<ConflictPathExplanation> {
+        let target_changed = entry_hash(base_entry) != entry_hash(target_entry);
+        let source_changed = entry_hash(base_entry) != entry_hash(source_entry);
+        let target = self.side_provenance(
+            "target",
+            target_entry
+                .map(|entry| entry.last_content_change.clone())
+                .unwrap_or_else(|| pending.left_change.clone()),
+        );
+        let source = self.side_provenance(
+            "source",
+            source_entry
+                .map(|entry| entry.last_content_change.clone())
+                .unwrap_or_else(|| pending.right_change.clone()),
+        );
+        let lines = self.explain_conflict_lines(base_entry, target_entry, source_entry, limit)?;
+        let reason = if !lines.is_empty() {
+            "both sides changed the same logical line differently".to_string()
+        } else if !matches!(
+            (base_entry, target_entry, source_entry),
+            (Some(_), Some(_), Some(_))
+        ) {
+            "one side changed or deleted a path that the other side also changed".to_string()
+        } else {
+            "both sides changed the same path and CrabDB could not prove a safe line merge"
+                .to_string()
+        };
+        let recommendation = match (target_changed, source_changed, lines.is_empty()) {
+            (false, true, _) => ConflictResolutionCandidate {
+                resolution: "source".to_string(),
+                confidence: "high".to_string(),
+                reason: "Only source differs from the recorded base for this path.".to_string(),
+            },
+            (true, false, _) => ConflictResolutionCandidate {
+                resolution: "target".to_string(),
+                confidence: "high".to_string(),
+                reason: "Only target differs from the recorded base for this path.".to_string(),
+            },
+            (_, _, false) => ConflictResolutionCandidate {
+                resolution: "manual".to_string(),
+                confidence: "high".to_string(),
+                reason: "Manual resolution is safest because both sides edited the same logical content."
+                    .to_string(),
+            },
+            _ => ConflictResolutionCandidate {
+                resolution: "manual".to_string(),
+                confidence: "medium".to_string(),
+                reason: "Review source and target content before choosing a side.".to_string(),
+            },
+        };
+        let summary = match (target_changed, source_changed) {
+            (true, true) => "target and source both changed this path".to_string(),
+            (true, false) => "target changed this path".to_string(),
+            (false, true) => "source changed this path".to_string(),
+            (false, false) => {
+                "path is listed in the conflict, but no content delta was detected".to_string()
+            }
+        };
+        Ok(ConflictPathExplanation {
+            path: path.to_string(),
+            summary,
+            reason,
+            target,
+            source,
+            lines,
+            recommendation,
+        })
+    }
+
+    fn explain_conflict_lines(
+        &self,
+        base_entry: Option<&FileEntry>,
+        target_entry: Option<&FileEntry>,
+        source_entry: Option<&FileEntry>,
+        limit: usize,
+    ) -> Result<Vec<ConflictLineExplanation>> {
+        let (Some(base_entry), Some(target_entry), Some(source_entry)) =
+            (base_entry, target_entry, source_entry)
+        else {
+            return Ok(Vec::new());
+        };
+        if base_entry.kind != FileKind::Text
+            || target_entry.kind != FileKind::Text
+            || source_entry.kind != FileKind::Text
+            || base_entry.file_id != target_entry.file_id
+            || base_entry.file_id != source_entry.file_id
+        {
+            return Ok(Vec::new());
+        }
+        let (
+            FileContentRef::Text(base_text),
+            FileContentRef::Text(target_text),
+            FileContentRef::Text(source_text),
+        ) = (
+            &base_entry.content,
+            &target_entry.content,
+            &source_entry.content,
+        )
+        else {
+            return Ok(Vec::new());
+        };
+        let base_lines = self.load_text_lines(base_text)?;
+        let target_lines = self.load_text_lines(target_text)?;
+        let source_lines = self.load_text_lines(source_text)?;
+        let target_by_id = line_map_by_id(&target_lines);
+        let source_by_id = line_map_by_id(&source_lines);
+        let mut out = Vec::new();
+        for base_line in &base_lines {
+            let line_id = base_line.line_id_key();
+            let target_line = target_by_id.get(&line_id).copied();
+            let source_line = source_by_id.get(&line_id).copied();
+            let target_changed = !line_content_equal(Some(base_line), target_line);
+            let source_changed = !line_content_equal(Some(base_line), source_line);
+            if target_changed && source_changed && !line_content_equal(target_line, source_line) {
+                out.push(ConflictLineExplanation {
+                    line_id,
+                    base: Some(line_preview(base_line)),
+                    target: target_line.map(line_preview),
+                    source: source_line.map(line_preview),
+                    target_change: target_line.and_then(|line| {
+                        self.side_provenance("target", line.last_content_change.clone())
+                    }),
+                    source_change: source_line.and_then(|line| {
+                        self.side_provenance("source", line.last_content_change.clone())
+                    }),
+                    reason: "target and source changed this stable line differently".to_string(),
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn side_provenance(&self, side: &str, change_id: ChangeId) -> Option<ConflictSideProvenance> {
+        let operation = self.operation(&change_id).ok()?;
+        Some(ConflictSideProvenance {
+            side: side.to_string(),
+            change_id: operation.change_id,
+            kind: format!("{:?}", operation.kind),
+            branch: operation.branch,
+            actor_id: operation.actor.id,
+            session_id: operation.session_id,
+            message: operation.message,
+            created_at: operation.created_at,
+        })
+    }
+
     pub(crate) fn apply_manual_conflict_files(
         &self,
         merged_files: &mut BTreeMap<String, FileEntry>,
@@ -213,4 +442,19 @@ impl CrabDb {
         }
         Ok(())
     }
+}
+
+fn line_preview(line: &LineEntry) -> String {
+    let mut value = String::from_utf8_lossy(&line.text).to_string();
+    match line.newline {
+        NewlineKind::None => {}
+        NewlineKind::Lf => value.push('\n'),
+        NewlineKind::Crlf => value.push_str("\r\n"),
+    }
+    const MAX_PREVIEW_CHARS: usize = 160;
+    if value.chars().count() > MAX_PREVIEW_CHARS {
+        value = value.chars().take(MAX_PREVIEW_CHARS - 3).collect();
+        value.push_str("...");
+    }
+    value
 }

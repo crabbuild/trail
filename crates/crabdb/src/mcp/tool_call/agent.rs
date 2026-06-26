@@ -68,6 +68,16 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             let agent = db.resolve_agent_handle(&args.agent)?;
             tool_result(db.remove_agent(&agent, args.force)?)
         }
+        "crabdb.agent_rewind" => {
+            let args: AgentRewindArgs = parse_args(arguments)?;
+            let agent = db.resolve_agent_handle(&args.agent)?;
+            tool_result(db.rewind_agent(
+                &agent,
+                &args.to,
+                args.record_current,
+                args.sync_workdir,
+            )?)
+        }
         "crabdb.lease_acquire" => {
             let args: LeaseAcquireArgs = parse_args(arguments)?;
             let mode = args.mode.unwrap_or_else(default_lease_mode);

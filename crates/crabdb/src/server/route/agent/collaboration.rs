@@ -3,7 +3,8 @@ use crate::server::request_types::{
     MergeAgentRequest, MergeQueueAddRequest, MergeQueueRunRequest,
 };
 use crate::server::route::utils::{
-    json_response, query_flag, query_value, resolve_conflict_request, validate_merge_strategy,
+    json_response, query_flag, query_usize, query_value, resolve_conflict_request,
+    validate_merge_strategy,
 };
 use crate::server::transport::{HttpRequest, HttpResponse};
 use crate::{CrabDb, Error, Result};
@@ -95,7 +96,7 @@ pub(super) fn handle_collaboration_routes(
     }
 
     if parts.len() == 3 && parts[0] == "v1" && parts[1] == "conflicts" && request.method == "GET" {
-        let conflict = db.show_conflict(parts[2])?;
+        let conflict = db.show_conflict_with_limit(parts[2], query_usize(query, "limit", 50)?)?;
         return Ok(Some(json_response(200, "OK", &conflict)?));
     }
 

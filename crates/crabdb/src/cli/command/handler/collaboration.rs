@@ -47,7 +47,7 @@ pub(super) fn handle_conflicts_command(
         }
         ConflictsSubcommand::Show(args) => {
             let db = open_db(ctx)?;
-            let conflict = db.show_conflict(&args.conflict_set_id)?;
+            let conflict = db.show_conflict_with_limit(&args.conflict_set_id, args.limit)?;
             render_conflict(&conflict, ctx.json, ctx.quiet)
         }
         ConflictsSubcommand::Resolve(args) => {

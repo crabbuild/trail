@@ -19,6 +19,8 @@ MCP tools mirror the main workflows:
 - Session, approval, run, lease, and anchor tools.
 - Merge queue and conflict tools.
 - Turn, event, span, patch, test, eval, read, and sync tools.
+- Rewind tools for returning an agent branch to a known-good root without losing
+  the failed attempt.
 
 See [MCP tools reference](../reference/mcp-tools.md) for the complete list.
 
@@ -37,6 +39,21 @@ Built-in prompts:
 - `crabdb.resolve_conflict`
 
 These guide hosts through safe agent tasks, review, and conflict resolution.
+
+## Host Capture Contract
+
+CrabDB cannot capture a coding agent transcript unless the host calls the MCP
+tools. Hosts such as Codex, Claude, Cursor, or custom runners should wrap each
+task with:
+
+```text
+crabdb.begin_turn -> crabdb.add_message -> crabdb.span_start/span_end or crabdb.add_event -> crabdb.apply_patch or crabdb.sync_workdir -> crabdb.end_turn
+```
+
+When a run pauses for approval or interruption, use `crabdb.run_pause` and later
+`crabdb.run_resume`. If a branch goes sideways, use `crabdb.agent_rewind` with
+`record_current=true` to preserve the failed head before returning to a
+known-good state.
 
 ## Code Facts Used
 

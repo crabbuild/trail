@@ -26,7 +26,9 @@ Workflow:\n\
 6. Request human approval with `crabdb.approval_request` when `crabdb.guardrail_check` returns `approval_required`; keep the returned run checkpoint and resume it with `crabdb.run_resume` after approval.\n\
 7. Run `crabdb.run_test` and, when model/policy quality matters, `crabdb.run_eval`.\n\
 8. End the turn with `crabdb.end_turn`, inspect `crabdb.agent_status`, `crabdb.agent_handoff`, and `crabdb.diff_agent`, then queue or merge only after review.\n\
-9. If merge conflicts appear, use `crabdb.conflict_show` and `crabdb.conflict_resolve`; do not overwrite target changes silently."
+9. Treat `crabdb.agent_claim` leases as advisory coordination, not hard locks; rely on readiness, conflict sets, and merge review before accepting work.\n\
+10. If the agent goes sideways, use `crabdb.agent_rewind` with `record_current = true` before returning to a known-good change or root.\n\
+11. If merge conflicts appear, use `crabdb.conflict_show` and `crabdb.conflict_resolve`; do not overwrite target changes silently."
                 ),
                 Some((RESOURCE_AGENT_WORKFLOWS, "text/markdown", AGENT_WORKFLOWS_MD)),
             )
@@ -47,7 +49,8 @@ Checklist:\n\
 7. Confirm latest tests and evals passed or explain why warnings are acceptable.\n\
 8. Use `crabdb.approval_request` for any unresolved human decision and inspect linked paused runs with `crabdb.run_list`.\n\
 9. Prefer `crabdb.merge_queue_add` plus `crabdb.merge_queue_run` for shared target branches; use direct `merge-agent` only for one-off merges.\n\
-10. If conflicts exist, stop review and switch to the `{PROMPT_RESOLVE_CONFLICT}` prompt."
+10. If the work should be abandoned, use `crabdb.agent_rewind` with `record_current = true` instead of silently moving refs.\n\
+11. If conflicts exist, stop review and switch to the `{PROMPT_RESOLVE_CONFLICT}` prompt."
                 ),
                 Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),
             )
@@ -59,7 +62,7 @@ Checklist:\n\
                 format!(
                     "Resolve CrabDB conflict `{conflict_set_id}` safely.\n\n\
 Workflow:\n\
-1. Call `crabdb.conflict_show` with `conflict_set_id = {conflict_set_id}` and inspect every path in the conflict set.\n\
+1. Call `crabdb.conflict_show` with `conflict_set_id = {conflict_set_id}` and inspect the explanation before reading raw path details.\n\
 2. Read `crabdb://workspace/conflicts` and confirm this conflict is still open.\n\
 3. Decide per conflicted path whether source, target, or manual content should win. Keep non-conflicting source changes merged.\n\
 4. Use `crabdb.conflict_resolve` with either `take: source`, `take: target`, or `manual.files` covering every conflicted path and no unrelated paths.\n\

@@ -55,6 +55,7 @@ x-crabdb-token: <token>
 | POST | `/v1/agents/{agent_or_id}/read-file` | Read agent file. |
 | POST | `/v1/agents/{agent_or_id}/sync-workdir` | Sync workdir. |
 | POST | `/v1/agents/{agent_or_id}/record` | Record agent workdir. |
+| POST | `/v1/agents/{agent_or_id}/rewind` | Rewind agent branch. |
 | POST | `/v1/agents/{agent_or_id}/tests` | Run test gate. |
 | POST | `/v1/agents/{agent_or_id}/evals` | Run eval gate. |
 | POST | `/v1/agents/{agent_or_id}/patches` | Apply agent patch. |
@@ -80,7 +81,7 @@ x-crabdb-token: <token>
 | POST | `/v1/merge-queue/run` | Run queue. |
 | DELETE | `/v1/merge-queue/{selector}` | Remove queue item. |
 | GET | `/v1/conflicts` | List conflicts. |
-| GET | `/v1/conflicts/{conflict_set_id}` | Show conflict. |
+| GET | `/v1/conflicts/{conflict_set_id}?limit=50` | Show conflict with explanation evidence. |
 | POST | `/v1/conflicts/{conflict_set_id}/resolve` | Resolve conflict. |
 | POST | `/v1/branches/{branch}/merge-agent` | Merge agent branch. |
 

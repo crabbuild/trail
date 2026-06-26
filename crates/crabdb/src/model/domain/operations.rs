@@ -30,6 +30,7 @@ pub enum OperationKind {
     AgentSpawn,
     AgentPatch,
     AgentRecord,
+    AgentRewind,
     AgentMerge,
     GitExport,
 }

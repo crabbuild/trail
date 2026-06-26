@@ -98,6 +98,16 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
             let report = db.record_agent_workdir(&args.name, args.message)?;
             render_agent_record(&report, ctx.json, ctx.quiet)
         }
+        AgentSubcommand::Rewind(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.rewind_agent(
+                &args.name,
+                &args.target,
+                args.record_current,
+                args.sync_workdir,
+            )?;
+            render_agent_rewind(&report, ctx.json, ctx.quiet)
+        }
         AgentSubcommand::Watch(args) => work::handle_watch_command(ctx, args),
         AgentSubcommand::Test(args) => {
             work::handle_gate_command(ctx, args, work::AgentGateKind::Test)

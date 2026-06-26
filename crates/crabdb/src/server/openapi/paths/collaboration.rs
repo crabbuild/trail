@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use super::{openapi_operation, openapi_path_param, openapi_query};
+use super::{
+    openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+};
 
 pub(super) fn collaboration_paths() -> Value {
     json!({
@@ -93,9 +95,10 @@ pub(super) fn collaboration_paths() -> Value {
             "get": openapi_operation("conflictList", "List conflicts", "List structured conflict sets.", vec![], None, true)
         },
         "/v1/conflicts/{conflict_set_id}": {
-            "get": openapi_operation("conflictShow", "Show conflict", "Show one structured conflict set.", vec![
-                openapi_path_param("conflict_set_id", "string")
-            ], None, true)
+            "get": openapi_operation_with_response_schema("conflictShow", "Show conflict", "Show one structured conflict set with deterministic explanation evidence.", vec![
+                openapi_path_param("conflict_set_id", "string"),
+                openapi_query("limit", "integer")
+            ], None, "ConflictSetSummary", true)
         },
         "/v1/conflicts/{conflict_set_id}/resolve": {
             "post": openapi_operation("conflictResolve", "Resolve conflict", "Resolve a conflict by taking source, target, or manual content.", vec![

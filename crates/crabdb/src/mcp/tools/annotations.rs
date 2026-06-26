@@ -104,6 +104,7 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
             ToolRiskClass::IdempotentWrite
         }
         "crabdb.agent_remove"
+        | "crabdb.agent_rewind"
         | "crabdb.anchor_delete"
         | "crabdb.merge_queue_remove"
         | "crabdb.conflict_resolve"

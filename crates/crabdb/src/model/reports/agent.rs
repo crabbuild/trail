@@ -23,6 +23,29 @@ pub struct AgentRecordReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRewindReport {
+    pub agent_id: String,
+    pub ref_name: String,
+    pub target: String,
+    pub previous_change: ChangeId,
+    pub previous_root: ObjectId,
+    pub target_change: ChangeId,
+    pub target_root: ObjectId,
+    pub operation: ChangeId,
+    pub root_id: ObjectId,
+    pub changed_paths: Vec<FileDiffSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_current: Option<ChangeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    pub workdir_synced: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentWorkdirReport {
     pub agent_id: String,
     pub workdir: Option<String>,

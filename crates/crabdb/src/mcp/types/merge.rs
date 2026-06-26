@@ -25,6 +25,8 @@ pub(crate) struct MergeQueueRemoveArgs {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConflictIdArgs {
     pub(crate) conflict_set_id: String,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -11,6 +11,7 @@ crabdb agent diff doc-bot --patch
 crabdb agent review doc-bot
 crabdb agent readiness doc-bot
 crabdb agent handoff doc-bot
+crabdb agent rewind doc-bot --to <change-or-root> --record-current --sync-workdir
 ```
 
 ## Agent Branches
@@ -46,6 +47,10 @@ Before merge, inspect contribution, readiness, gates, approvals, and diff.
 crabdb agent contribution doc-bot
 crabdb merge-agent doc-bot --into main --dry-run
 ```
+
+If the branch should be abandoned back to a known-good state, use `agent rewind`
+instead of silently moving refs. It records an auditable rewind operation and can
+preserve the current head for later inspection.
 
 ## Code Facts Used
 

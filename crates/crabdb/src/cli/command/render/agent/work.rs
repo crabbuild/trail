@@ -26,6 +26,40 @@ pub(crate) fn render_agent_record(
     Ok(())
 }
 
+pub(crate) fn render_agent_rewind(
+    report: &AgentRewindReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Rewound agent {} from {} to {}",
+            report.agent_id, report.previous_change.0, report.operation.0
+        );
+        println!("Target: {} ({})", report.target, report.target_change.0);
+        if let Some(operation) = &report.recorded_current {
+            println!("Recorded current workdir: {}", operation.0);
+        }
+        if let Some(branch) = &report.preserved_branch {
+            println!("Preserved previous head: {branch}");
+        }
+        if report.workdir_synced {
+            if let Some(workdir) = &report.workdir {
+                println!("Synced workdir: {workdir}");
+            }
+        } else if report.workdir.is_some() {
+            println!("Workdir not synced");
+        }
+        for path in &report.changed_paths {
+            println!("  {:?} {}", path.kind, path.path);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_watch(report: &AgentWatchReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);

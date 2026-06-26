@@ -59,6 +59,68 @@ pub struct ConflictSetSummary {
     pub status: String,
     pub details: Vec<String>,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<ConflictExplanation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictExplanation {
+    pub merge: ConflictMergeContext,
+    pub paths: Vec<ConflictPathExplanation>,
+    pub recommendations: Vec<ConflictResolutionCandidate>,
+    pub next_steps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictMergeContext {
+    pub merge_id: String,
+    pub queue_id: Option<String>,
+    pub source_ref: String,
+    pub target_ref: String,
+    pub base_change: ChangeId,
+    pub target_change: ChangeId,
+    pub source_change: ChangeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictPathExplanation {
+    pub path: String,
+    pub summary: String,
+    pub reason: String,
+    pub target: Option<ConflictSideProvenance>,
+    pub source: Option<ConflictSideProvenance>,
+    pub lines: Vec<ConflictLineExplanation>,
+    pub recommendation: ConflictResolutionCandidate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictSideProvenance {
+    pub side: String,
+    pub change_id: ChangeId,
+    pub kind: String,
+    pub branch: String,
+    pub actor_id: String,
+    pub session_id: Option<String>,
+    pub message: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictLineExplanation {
+    pub line_id: String,
+    pub base: Option<String>,
+    pub target: Option<String>,
+    pub source: Option<String>,
+    pub target_change: Option<ConflictSideProvenance>,
+    pub source_change: Option<ConflictSideProvenance>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictResolutionCandidate {
+    pub resolution: String,
+    pub confidence: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

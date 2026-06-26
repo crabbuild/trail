@@ -51,6 +51,7 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `AgentHandoffReport`
 - `AgentPatchReport`
 - `AgentRecordReport`
+- `AgentRewindReport`
 - `AgentTestReport`
 - `AgentGateHistoryReport`
 
@@ -71,6 +72,10 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `MergeQueueEntry`
 - `MergeQueueRunReport`
 - `ConflictSetSummary`
+- `ConflictExplanation`
+- `ConflictPathExplanation`
+- `ConflictLineExplanation`
+- `ConflictResolutionCandidate`
 - `ConflictManualResolution`
 - `ConflictResolveReport`
 

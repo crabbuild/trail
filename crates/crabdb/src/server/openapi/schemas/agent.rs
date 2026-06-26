@@ -200,6 +200,16 @@ pub(super) fn agent_schemas() -> Value {
             "properties": {
                 "message": { "type": "string" }
             }
+        },
+        "AgentRewindRequest": {
+            "type": "object",
+            "required": ["to"],
+            "properties": {
+                "to": { "type": "string" },
+                "target": { "type": "string" },
+                "record_current": { "type": "boolean" },
+                "sync_workdir": { "type": "boolean" }
+            }
         }
     })
 }

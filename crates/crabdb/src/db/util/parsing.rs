@@ -125,6 +125,7 @@ pub(crate) fn parse_operation_kind(value: &str) -> OperationKind {
         "AgentSpawn" => OperationKind::AgentSpawn,
         "AgentPatch" => OperationKind::AgentPatch,
         "AgentRecord" => OperationKind::AgentRecord,
+        "AgentRewind" => OperationKind::AgentRewind,
         "AgentMerge" => OperationKind::AgentMerge,
         "GitExport" => OperationKind::GitExport,
         _ => OperationKind::Init,

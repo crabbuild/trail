@@ -82,6 +82,11 @@ pub(super) fn agent_paths() -> Value {
                 openapi_path_param("agent_or_id", "string")
             ], Some("AgentRecordRequest"), true)
         },
+        "/v1/agents/{agent_or_id}/rewind": {
+            "post": openapi_operation("agentRewind", "Rewind agent", "Rewind an agent branch to a known-good change or root, optionally preserving the current head and syncing its workdir.", vec![
+                openapi_path_param("agent_or_id", "string")
+            ], Some("AgentRewindRequest"), true)
+        },
         "/v1/agents/{agent_or_id}/tests": {
             "post": openapi_operation("agentRunTest", "Run agent test", "Run a command in an agent workdir and record test events.", vec![
                 openapi_path_param("agent_or_id", "string")
