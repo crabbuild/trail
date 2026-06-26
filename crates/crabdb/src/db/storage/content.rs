@@ -346,6 +346,37 @@ impl CrabDb {
             |batch| self.materialize_entries_bytes(batch),
         )
     }
+
+    pub(crate) fn materialize_new_files_best_effort_at_with_workspace_cow(
+        &self,
+        output_root: &Path,
+        target: &BTreeMap<String, FileEntry>,
+    ) -> Result<()> {
+        if target.is_empty() {
+            return Ok(());
+        }
+        reject_case_insensitive_collisions(output_root, target)?;
+        let mut remaining = BTreeMap::new();
+        let mut cow_available = true;
+        for (path, entry) in target {
+            if cow_available {
+                match materialize_workspace_file_cow_status_if_matching(
+                    &self.workspace_root,
+                    output_root,
+                    path,
+                    entry,
+                )? {
+                    WorkspaceCowMaterializeStatus::Cloned => continue,
+                    WorkspaceCowMaterializeStatus::Skipped => {}
+                    WorkspaceCowMaterializeStatus::Unavailable => {
+                        cow_available = false;
+                    }
+                }
+            }
+            remaining.insert(path.clone(), entry.clone());
+        }
+        self.materialize_files_best_effort_at(output_root, &BTreeMap::new(), &remaining)
+    }
 }
 
 pub(crate) fn lazy_text_lines(bytes: &[u8], introduced_by: &ChangeId) -> Vec<LineEntry> {

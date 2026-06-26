@@ -187,7 +187,12 @@ impl CrabDb {
         }
         fs::create_dir_all(&workdir_path)?;
         if path_scoped {
-            self.materialize_files_best_effort_at(&workdir_path, &BTreeMap::new(), &target_files)?;
+            let write_files =
+                self.sparse_hydration_write_files(&workdir_path, &target_files, force)?;
+            self.materialize_new_files_best_effort_at_with_workspace_cow(
+                &workdir_path,
+                &write_files,
+            )?;
             let mut materialized_paths = sparse_paths.unwrap_or_default();
             materialized_paths.extend(target_files.keys().cloned());
             materialized_paths.sort();
@@ -298,7 +303,8 @@ impl CrabDb {
             )));
         }
 
-        self.materialize_files_best_effort_at(&workdir_path, &BTreeMap::new(), &target_files)?;
+        let write_files = self.sparse_hydration_write_files(&workdir_path, &target_files, force)?;
+        self.materialize_new_files_best_effort_at_with_workspace_cow(&workdir_path, &write_files)?;
         let mut materialized_paths = sparse_paths;
         materialized_paths.extend(target_files.keys().cloned());
         materialized_paths.sort();
@@ -312,6 +318,32 @@ impl CrabDb {
             &target_files,
         )?;
         Ok(target_files.keys().cloned().collect())
+    }
+
+    fn sparse_hydration_write_files(
+        &self,
+        workdir_path: &Path,
+        target_files: &BTreeMap<String, FileEntry>,
+        force: bool,
+    ) -> Result<BTreeMap<String, FileEntry>> {
+        if force {
+            return Ok(target_files.clone());
+        }
+        let mut write_files = BTreeMap::new();
+        for (path, entry) in target_files {
+            let abs = safe_join(workdir_path, path)?;
+            match fs::symlink_metadata(&abs) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    write_files.insert(path.clone(), entry.clone());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    write_files.insert(path.clone(), entry.clone());
+                }
+                Err(err) => return Err(Error::Io(err)),
+            }
+        }
+        Ok(write_files)
     }
 
     fn sparse_hydration_changed_paths(

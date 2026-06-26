@@ -34,6 +34,11 @@ Use `--include-neighbors` when selected files should include nearby context.
 
 Sparse workdirs contain CrabDB manifest files under their own `.crabdb` directory so CrabDB can track what was materialized.
 
+Sparse hydration writes only missing or explicitly forced paths. When the live
+workspace already has matching file bytes and the filesystem supports
+copy-on-write file cloning, CrabDB clones that file into the agent workdir;
+otherwise it hydrates the path from CrabDB objects.
+
 ## Read and Hydrate Files
 
 ```sh
@@ -59,4 +64,3 @@ Dirty workdirs require recording or force refresh.
 - Spawn/read/sync args: `crates/crabdb/src/cli/command/agent_args.rs`
 - Workdir lifecycle: `crates/crabdb/src/db/agent/lifecycle.rs`, `crates/crabdb/src/db/agent/workdir`
 - Tests: `agent_spawn_supports_custom_and_configured_workdirs`, `large_roots_default_agents_to_no_materialize`, `agent_workdir_sync_refuses_dirty_and_force_refreshes`
-

@@ -1,4 +1,11 @@
 use super::*;
+use sha2::{Digest, Sha256};
+
+pub(crate) enum WorkspaceCowMaterializeStatus {
+    Cloned,
+    Skipped,
+    Unavailable,
+}
 
 pub(crate) fn materialize_from_workspace_cow(
     workspace_root: &Path,
@@ -7,31 +14,101 @@ pub(crate) fn materialize_from_workspace_cow(
 ) -> Result<bool> {
     reject_case_insensitive_collisions(output_root, target)?;
     for (path, entry) in target {
-        let source = safe_join(workspace_root, path)?;
-        let destination = safe_join(output_root, path)?;
-        let source_metadata = match fs::symlink_metadata(&source) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(Error::Io(err)),
-        };
-        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-            return Ok(false);
-        }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match cow_clone_file(&source, &destination) {
-            Ok(true) => {
-                set_executable(&destination, entry.executable)?;
-                if !clear_cloned_xattrs(&destination)? {
-                    return Ok(false);
-                }
+        match materialize_workspace_file_cow_status_if_matching(
+            workspace_root,
+            output_root,
+            path,
+            entry,
+        )? {
+            WorkspaceCowMaterializeStatus::Cloned => {}
+            WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable => {
+                return Ok(false);
             }
-            Ok(false) => return Ok(false),
-            Err(err) => return Err(Error::Io(err)),
         }
     }
     Ok(true)
+}
+
+pub(crate) fn materialize_workspace_file_cow_status_if_matching(
+    workspace_root: &Path,
+    output_root: &Path,
+    path: &str,
+    entry: &FileEntry,
+) -> Result<WorkspaceCowMaterializeStatus> {
+    let source = safe_join(workspace_root, path)?;
+    let destination = safe_join(output_root, path)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => return Ok(WorkspaceCowMaterializeStatus::Skipped),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Io(err)),
+    }
+    if !workspace_file_matches_entry(&source, entry)? {
+        return Ok(WorkspaceCowMaterializeStatus::Skipped);
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    clone_file_cow_clean(&source, &destination, entry.executable)
+}
+
+fn workspace_file_matches_entry(source: &Path, entry: &FileEntry) -> Result<bool> {
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Ok(false);
+    }
+    if source_metadata.len() != entry.size_bytes {
+        return Ok(false);
+    }
+    Ok(sha256_file_hex(source)? == entry.content_hash)
+}
+
+fn clone_file_cow_clean(
+    source: &Path,
+    destination: &Path,
+    executable: bool,
+) -> Result<WorkspaceCowMaterializeStatus> {
+    match cow_clone_file(source, destination) {
+        Ok(true) => {
+            let result = (|| -> Result<bool> {
+                set_executable(destination, executable)?;
+                Ok(clear_cloned_xattrs(destination)?)
+            })();
+            if !matches!(result, Ok(true)) {
+                let _ = fs::remove_file(destination);
+            }
+            if result? {
+                Ok(WorkspaceCowMaterializeStatus::Cloned)
+            } else {
+                Ok(WorkspaceCowMaterializeStatus::Unavailable)
+            }
+        }
+        Ok(false) => {
+            let _ = fs::remove_file(destination);
+            Ok(WorkspaceCowMaterializeStatus::Unavailable)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(destination);
+            Err(Error::Io(err))
+        }
+    }
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

@@ -7615,6 +7615,21 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let sparse_hydrated = db.agent_status("sparse-bot").unwrap();
     assert_eq!(sparse_hydrated.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_hydrated.workdir_changed_paths.is_empty());
+    #[cfg(unix)]
+    let clean_hydrated_inode = fs::metadata(sparse_workdir.join("src/lib.rs"))
+        .unwrap()
+        .ino();
+    let repeat_hydrate = db
+        .sync_agent_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
+        .unwrap();
+    assert!(repeat_hydrate.changed_paths.is_empty());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(sparse_workdir.join("src/lib.rs"))
+            .unwrap()
+            .ino(),
+        clean_hydrated_inode
+    );
     fs::write(sparse_workdir.join("src/lib.rs"), "pub fn dirty() {}\n").unwrap();
     let err = db
         .sync_agent_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])

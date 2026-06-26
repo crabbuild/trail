@@ -228,7 +228,11 @@ impl CrabDb {
             && self.workspace_matches_file_entries(&files)?
             && materialize_from_workspace_cow(&self.workspace_root, dir, &files)?;
         if !cloned_from_workspace {
-            self.materialize_files_best_effort_at(dir, &empty, &files)?;
+            if sparse_paths.is_empty() {
+                self.materialize_files_best_effort_at(dir, &empty, &files)?;
+            } else {
+                self.materialize_new_files_best_effort_at_with_workspace_cow(dir, &files)?;
+            }
         }
         if sparse_paths.is_empty() {
             remove_sparse_workdir_manifest(dir)?;

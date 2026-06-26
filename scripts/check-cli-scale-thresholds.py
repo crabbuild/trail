@@ -72,10 +72,11 @@ def main() -> int:
 
     if metrics_path is not None:
         metrics = read_metrics(metrics_path)
+        missing_hint = format_available_metrics(metrics)
         for key, max_value in metric_thresholds.items():
             value = metrics.get(key)
             if value is None:
-                failures.append(f"{key}: missing from {metrics_path}")
+                failures.append(f"{key}: missing from {metrics_path}{missing_hint}")
                 continue
             if value > max_value:
                 failures.append(f"{key}: {value:.0f} > {max_value:.0f}")
@@ -102,11 +103,47 @@ def read_metrics(metrics_path: pathlib.Path) -> dict[str, float]:
             if len(parts) != 2:
                 continue
             key, value = parts
+            key = key.strip()
+            value = value.strip()
             try:
                 metrics[key] = float(value)
             except ValueError:
                 continue
+    add_derived_file_metrics(metrics_path, metrics)
     return metrics
+
+
+def add_derived_file_metrics(metrics_path: pathlib.Path, metrics: dict[str, float]) -> None:
+    root = metrics_path.parent
+    add_file_size_metric(
+        metrics,
+        "sqlite_bytes",
+        root / "repo" / ".crabdb" / "index" / "crabdb.sqlite",
+    )
+    add_file_size_metric(
+        metrics,
+        "git_sqlite_bytes",
+        root / "git-repo" / ".crabdb" / "index" / "crabdb.sqlite",
+    )
+
+
+def add_file_size_metric(
+    metrics: dict[str, float],
+    key: str,
+    path: pathlib.Path,
+) -> None:
+    if key not in metrics and path.is_file():
+        metrics[key] = float(path.stat().st_size)
+
+
+def format_available_metrics(metrics: dict[str, float]) -> str:
+    if not metrics:
+        return "; no valid metrics were read"
+    keys = sorted(metrics)
+    preview = ", ".join(keys[:12])
+    if len(keys) > 12:
+        preview += f", ... ({len(keys)} total)"
+    return f"; available metrics: {preview}"
 
 
 if __name__ == "__main__":

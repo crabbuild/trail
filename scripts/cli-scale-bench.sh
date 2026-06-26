@@ -76,11 +76,11 @@ PY
 
 sqlite_bytes() {
   local db="$1/.crabdb/index/crabdb.sqlite"
-  if [ -f "$db" ]; then
-    stat -f '%z' "$db" 2>/dev/null || stat -c '%s' "$db"
-  else
-    printf '0'
-  fi
+  python3 - "$db" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+print(path.stat().st_size if path.is_file() else 0)
+PY
 }
 
 object_count() {
