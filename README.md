@@ -145,6 +145,10 @@ CrabDB is organized around one core library object, `CrabDb`. The CLI, HTTP
 daemon, MCP server, tests, and Rust callers all route through that same core so
 they can share behavior and report types.
 
+![CrabDB architecture diagram](diagram/crabdb-architecture/crabdb-architecture@2x.png)
+
+The same architecture in text form:
+
 ```text
                          entry points
   +-----------+   +---------------+   +--------------+   +-------------+
@@ -324,33 +328,203 @@ workdirs, stale refs, and conflicted merges before changes are accepted.
 ## Quick Start
 
 CrabDB is a Rust workspace. The repository declares Rust 1.81 in `Cargo.toml`.
+Build from source with the Makefile:
 
 ```sh
+# Build the debug binary at target/debug/crabdb.
+make build
+
+# Print CLI help from the local debug binary.
+target/debug/crabdb --help
+```
+
+Install a local optimized binary with the Makefile. By default this installs to
+`$HOME/.cargo/bin/crabdb`:
+
+```sh
+# Build the release binary and install crabdb locally.
+make install
+
+# Verify the installed crabdb command is on your PATH.
+crabdb --help
+```
+
+For a project-local install directory, override `PREFIX`:
+
+```sh
+# Install to ./.local/bin/crabdb instead of $HOME/.cargo/bin/crabdb.
+make install PREFIX="$PWD/.local"
+```
+
+The equivalent direct Cargo build command is:
+
+```sh
+# Build the debug binary without using the Makefile.
 cargo build -p crabdb
+
+# Print CLI help from the Cargo-built debug binary.
 target/debug/crabdb --help
 ```
 
 Initialize a workspace from the current working tree:
 
 ```sh
-target/debug/crabdb init --working-tree
+# Import visible working tree files into .crabdb/.
+crabdb init --working-tree
 ```
 
 Inspect and record an edit:
 
 ```sh
-target/debug/crabdb status
-target/debug/crabdb record -m "record current edit"
-target/debug/crabdb timeline --limit 10
-target/debug/crabdb show <change-id>
+# Show whether the current worktree differs from CrabDB's recorded root.
+crabdb status
+
+# Record the current edit as a named local operation.
+crabdb record -m "record current edit"
+
+# List recent recorded operations.
+crabdb timeline --limit 10
+
+# Inspect one recorded operation from the timeline output.
+crabdb show <change-id>
 ```
 
 Ask provenance questions:
 
 ```sh
-target/debug/crabdb why README.md:2
-target/debug/crabdb history README.md
-target/debug/crabdb diff --dirty --patch
+# Explain what operation introduced the current README.md line 2.
+crabdb why README.md:2
+
+# Show recorded history for README.md.
+crabdb history README.md
+
+# Show the current unrecorded worktree diff as a patch.
+crabdb diff --dirty --patch
+```
+
+Example CLI output from a tiny workspace looks like this. IDs, object hashes,
+workspace IDs, and actor names will differ on your machine.
+
+## Common ID prefixes:
+
+| Prefix | Meaning | Example use |
+| --- | --- | --- |
+| `wk_` | Workspace ID derived when `.crabdb/` is initialized | Identifies one local CrabDB workspace |
+| `ch_` | Change/operation ID allocated when CrabDB records an operation | Appears as `Head`, `Initial operation`, timeline entries, and `show` selectors |
+| `obj_` | Content-addressed object ID | Identifies stored roots, operations, text objects, blobs, and other durable objects |
+| `msg_` | Message ID | Used for durable operation, agent, or review messages |
+| `anc_` | Anchor ID | Used for durable labels tied to file and line identity |
+| `ch_...:<n>` | Stable file or line identity with an origin change and local sequence | Appears in `why` output as a `Line ID` |
+
+## Example output
+
+1. Initialize CrabDB from the visible files in the current working tree. The
+   output shows the workspace ID, active branch, initial operation ID, and import
+   summary.
+
+```text
+$ crabdb init --working-tree
+Initialized CrabDB workspace
+Workspace: wk_24ec99f68d1db8716f4df8a87580e3da
+Branch: main
+Initial operation: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Imported: 1 files (1 text, 0 opaque, 0 binary)
+```
+
+2. Check the recorded branch and worktree state. Immediately after
+   initialization, the worktree is clean.
+
+```text
+$ crabdb status
+Branch: main
+Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+Worktree: clean
+```
+
+3. After editing `README.md`, run `status` again. CrabDB reports the worktree as
+   dirty and lists the modified path.
+
+```text
+$ crabdb status
+Branch: main
+Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+Worktree: dirty
+  Modified README.md
+```
+
+4. Record the edit as a named local operation. The output returns the new
+   operation ID and the changed path summary.
+
+```text
+$ crabdb record -m "record current edit"
+Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+  Modified README.md
+```
+
+5. Read the recent operation timeline. The newest record appears first, followed
+   by the initial import operation.
+
+```text
+$ crabdb timeline --limit 10
+ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa ManualRecord main record current edit
+ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize CrabDB workspace
+```
+
+6. Inspect one operation from the timeline. `show` expands the operation kind,
+   actor, message, parent, before/after roots, and path-level summary.
+
+```text
+$ crabdb show ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+Operation: ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+Kind: ManualRecord
+Branch: main
+Actor: demo
+Message: record current edit
+Parents:
+  ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Before root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+After root: obj_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
+  Modified README.md (+1 -0)
+```
+
+7. Ask why a current line exists. `why` resolves the path and line number to a
+   stable line ID, then shows the operation that introduced it and the last
+   operation that changed its content.
+
+```text
+$ crabdb why README.md:2
+README.md:2 First recorded line
+Line ID: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6:2
+Introduced by: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Last content change: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+```
+
+8. Show file history. `history` lists operations that affected the selected
+   file.
+
+```text
+$ crabdb history README.md
+README.md
+ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 Added README.md
+ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa Modified README.md
+```
+
+9. After making another edit without recording it, inspect the dirty diff. The
+   patch shows what is currently in the worktree but not yet recorded by CrabDB.
+
+```text
+$ crabdb diff --dirty --patch
+Diff main..dirty
+  Modified README.md (+1 -0)
+diff --crabdb a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+ CrabDB sample
+ First recorded line
+ Second recorded line
++Unrecorded working tree line
 ```
 
 Initialization creates `.crabdb/` state and a `.crabignore` file when needed.
@@ -358,7 +532,7 @@ Default ignore patterns protect CrabDB/Git internals, environment files, private
 key/certificate files, dependency folders, build output, and coverage output.
 
 Later examples use `crabdb` for readability. If the binary is not on your PATH,
-replace `crabdb` with `target/debug/crabdb`.
+install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 
 ## Core Local Workflows
 
@@ -490,6 +664,7 @@ scripts/         Local helper and benchmark scripts
 Start with the docs home:
 
 - [CrabDB documentation](docs/README.md)
+- [Roadmap](ROADMAP.md)
 - [Install and build](docs/getting-started/install-and-build.md)
 - [Initialize a workspace](docs/getting-started/initialize-a-workspace.md)
 - [First record and provenance query](docs/getting-started/first-record-and-query.md)
