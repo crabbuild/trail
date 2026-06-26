@@ -534,6 +534,39 @@ key/certificate files, dependency folders, build output, and coverage output.
 Later examples use `crabdb` for readability. If the binary is not on your PATH,
 install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 
+## Common CLI Reference
+
+| Command | Description |
+| --- | --- |
+| `crabdb init --working-tree` | Initialize `.crabdb/` from visible working tree files |
+| `crabdb status` | Show branch head, root object, cleanliness, and changed paths |
+| `crabdb record -m "<message>"` | Record current worktree changes as a named local operation |
+| `crabdb record --paths <path>... -m "<message>"` | Record only selected paths |
+| `crabdb watch --once` | Watch for changes and record once after debounce |
+| `crabdb timeline --limit <n>` | List recent operations, newest first |
+| `crabdb show <selector>` | Inspect an operation, message, ref, or object |
+| `crabdb diff --dirty --patch` | Show unrecorded worktree changes as a patch |
+| `crabdb why <path:line>` | Explain which operation introduced a current line |
+| `crabdb history <path>` | Show recorded history for a file or selector |
+| `crabdb code-from <selector>` | Find changed paths connected to a message, session, or agent |
+| `crabdb branch` | List local CrabDB branches |
+| `crabdb branch <name> --from <ref>` | Create a branch from another ref |
+| `crabdb checkout <branch> --dry-run` | Preview checkout effects before changing the worktree |
+| `crabdb merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
+| `crabdb ignore check <path>` | Check whether ignore policy records or skips a path |
+| `crabdb guardrails check --action <action>` | Preflight a risky action against workspace policy |
+| `crabdb agent spawn <name> --from <ref>` | Create an isolated agent branch |
+| `crabdb agent apply-patch <name> --patch <file>` | Apply a structured patch to an agent branch |
+| `crabdb agent readiness <name>` | Report blockers before merging an agent branch |
+| `crabdb agent handoff <name>` | Produce a review and continuation packet for an agent |
+| `crabdb merge-agent <name> --into <branch> --dry-run` | Preview merging an agent branch into a target branch |
+| `crabdb merge-queue run` | Run queued agent merges with readiness and conflict checks |
+| `crabdb daemon` | Start the loopback HTTP daemon for editor and automation integrations |
+| `crabdb mcp` | Start the MCP stdio server for agent hosts |
+| `crabdb doctor` | Run workspace and integration diagnostics |
+| `crabdb backup create <output>` | Create a CrabDB workspace backup |
+| `crabdb fsck` | Verify repository integrity |
+
 ## Core Local Workflows
 
 Record the whole worktree:
