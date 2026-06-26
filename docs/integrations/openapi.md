@@ -26,7 +26,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 The OpenAPI path builder groups routes as:
 
 - Core: health, OpenAPI, doctor, status, record, diff, timeline, why, history, code-from, config, ignore, guardrails.
-- Agents: list/spawn/show/remove, status, contribution, gates, readiness, handoff, workdir, diff, read-file, sync-workdir, record, tests, evals, patches.
+- Agents: list/spawn/show/remove, status, review, contribution, gates, readiness, handoff, workdir, diff, read-file, sync-workdir, record, tests, evals, patches.
 - Collaboration: sessions, approvals, leases, claims, anchors, merge queue, conflicts, merge-agent.
 - Turns and traces: turns, messages, events, spans, runs.
 
@@ -36,4 +36,3 @@ The OpenAPI path builder groups routes as:
 - Paths: `crates/crabdb/src/server/openapi/paths`
 - Schemas: `crates/crabdb/src/server/openapi/schemas`
 - Tests: `local_api_and_cli_export_openapi_contract`
-

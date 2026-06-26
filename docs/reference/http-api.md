@@ -45,6 +45,7 @@ x-crabdb-token: <token>
 | GET | `/v1/agents/{agent_or_id}` | Show agent. |
 | DELETE | `/v1/agents/{agent_or_id}` | Remove agent. |
 | GET | `/v1/agents/{agent_or_id}/status` | Agent status. |
+| GET | `/v1/agents/{agent_or_id}/review` | Review packet. |
 | GET | `/v1/agents/{agent_or_id}/contribution` | Review bundle. |
 | GET | `/v1/agents/{agent_or_id}/gates` | Gate history. |
 | GET | `/v1/agents/{agent_or_id}/readiness` | Merge readiness. |
@@ -108,4 +109,3 @@ x-crabdb-token: <token>
 - OpenAPI paths: `crates/crabdb/src/server/openapi/paths`
 - Route handlers: `crates/crabdb/src/server/route`
 - Request types: `crates/crabdb/src/server/request_types`
-

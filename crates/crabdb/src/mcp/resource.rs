@@ -44,6 +44,17 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     if let Some(agent) = template_uri_argument(
         uri,
         "crabdb://workspace/agents/",
+        "/review",
+        RESOURCE_AGENT_REVIEW_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_review_packet(&agent, 50)?)?,
+        ));
+    }
+    if let Some(agent) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agents/",
         "/contribution",
         RESOURCE_AGENT_CONTRIBUTION_TEMPLATE,
     )? {

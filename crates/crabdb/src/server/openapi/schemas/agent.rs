@@ -2,6 +2,67 @@ use serde_json::{json, Value};
 
 pub(super) fn agent_schemas() -> Value {
     json!({
+        "AgentReviewEvidenceSummary": {
+            "type": "object",
+            "required": [
+                "operations",
+                "sessions",
+                "events",
+                "spans",
+                "approvals",
+                "pending_approvals",
+                "conflicts",
+                "queued_merges",
+                "gates"
+            ],
+            "properties": {
+                "operations": { "type": "integer" },
+                "sessions": { "type": "integer" },
+                "events": { "type": "integer" },
+                "spans": { "type": "integer" },
+                "approvals": { "type": "integer" },
+                "pending_approvals": { "type": "integer" },
+                "conflicts": { "type": "integer" },
+                "queued_merges": { "type": "integer" },
+                "gates": { "type": "integer" }
+            }
+        },
+        "AgentReviewPacketReport": {
+            "type": "object",
+            "required": [
+                "agent",
+                "readiness",
+                "changed_paths",
+                "workdir_state",
+                "evidence_summary",
+                "latest_test",
+                "recent_gates",
+                "recent_operations",
+                "recent_sessions",
+                "recent_events",
+                "recent_spans",
+                "recent_approvals",
+                "conflicts",
+                "next_steps"
+            ],
+            "properties": {
+                "agent": { "$ref": "#/components/schemas/JsonValue" },
+                "readiness": { "$ref": "#/components/schemas/JsonValue" },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "workdir_state": { "$ref": "#/components/schemas/JsonValue" },
+                "evidence_summary": { "$ref": "#/components/schemas/AgentReviewEvidenceSummary" },
+                "latest_test": { "$ref": "#/components/schemas/JsonValue" },
+                "latest_eval": { "$ref": "#/components/schemas/JsonValue" },
+                "recent_gates": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "recent_operations": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "recent_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "recent_events": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "recent_spans": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "recent_approvals": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "conflicts": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "next_steps": { "type": "array", "items": { "type": "string" } }
+            }
+        },
         "SpawnAgentRequest": {
             "type": "object",
             "required": ["name"],

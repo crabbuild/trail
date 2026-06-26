@@ -7,13 +7,14 @@ crabdb agent spawn <NAME> [--from <REF>] [--materialize[=true|false]] [--no-mate
 crabdb agent list
 crabdb agent show <NAME>
 crabdb agent status <NAME>
+crabdb agent review <NAME> [--limit <N>]
 crabdb agent contribution <NAME> [--limit <N>]
 crabdb agent readiness <NAME>
 crabdb agent handoff <NAME> [--limit <N>]
 crabdb agent rm <NAME> [--force]
 ```
 
-Default limits are 50 for contribution/handoff.
+Default limits are 50 for review, contribution, and handoff.
 
 ## Coordination and Messages
 
@@ -64,4 +65,3 @@ See [Sessions, approvals, anchors, and leases](sessions-approvals-anchors-and-le
 - Args: `crates/crabdb/src/cli/command/agent_args.rs`
 - Agent handlers: `crates/crabdb/src/cli/command/handler/agent.rs`
 - Reports: `crates/crabdb/src/model/reports/agent.rs`, `crates/crabdb/src/model/agent`
-

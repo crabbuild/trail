@@ -75,6 +75,10 @@ pub(super) fn handle_agent_resources(
                 let report = db.agent_status(&agent)?;
                 json_response(200, "OK", &report)?
             }
+            "review" => {
+                let report = db.agent_review_packet(&agent, query_usize(query, "limit", 50)?)?;
+                json_response(200, "OK", &report)?
+            }
             "contribution" => {
                 let report = db.agent_contribution(&agent, query_usize(query, "limit", 50)?)?;
                 json_response(200, "OK", &report)?

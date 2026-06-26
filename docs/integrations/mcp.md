@@ -26,7 +26,7 @@ See [MCP tools reference](../reference/mcp-tools.md) for the complete list.
 
 Static resources include status, doctor, agents, merge queue, conflicts, OpenAPI, and the three compatibility docs.
 
-Resource templates expose agent details, status, contribution, gates, readiness, handoff, diff, sessions, turns, conflicts, approvals, run states, and trace spans.
+Resource templates expose agent details, status, review packets, contribution, gates, readiness, handoff, diff, sessions, turns, conflicts, approvals, run states, and trace spans.
 
 ## Prompts
 
@@ -45,4 +45,3 @@ These guide hosts through safe agent tasks, review, and conflict resolution.
 - Resources: `crates/crabdb/src/mcp/capabilities/resources.rs`
 - Prompts: `crates/crabdb/src/mcp/capabilities/prompts.rs`
 - Tests: `mcp_stdio_tools_drive_agent_turn_workflow`, `local_api_and_mcp_drive_merge_queue_and_conflicts`
-

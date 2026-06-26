@@ -43,6 +43,28 @@ pub(super) fn openapi_operation(
     operation
 }
 
+pub(super) fn openapi_operation_with_response_schema(
+    operation_id: &str,
+    summary: &str,
+    description: &str,
+    parameters: Vec<serde_json::Value>,
+    request_schema: Option<&str>,
+    response_schema: &str,
+    authenticated: bool,
+) -> Value {
+    let mut operation = openapi_operation(
+        operation_id,
+        summary,
+        description,
+        parameters,
+        request_schema,
+        authenticated,
+    );
+    operation["responses"]["200"]["content"]["application/json"]["schema"] =
+        json!({ "$ref": format!("#/components/schemas/{response_schema}") });
+    operation
+}
+
 pub(super) fn openapi_query(name: &str, value_type: &str) -> Value {
     openapi_parameter(name, "query", false, value_type)
 }

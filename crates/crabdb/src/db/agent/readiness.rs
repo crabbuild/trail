@@ -204,4 +204,68 @@ impl CrabDb {
             next_steps,
         })
     }
+
+    pub fn agent_review_packet(
+        &self,
+        agent: &str,
+        limit: usize,
+    ) -> Result<AgentReviewPacketReport> {
+        let limit = normalize_query_limit(limit, 1000)?;
+        let readiness = self.agent_readiness(agent)?;
+        let agent_details = readiness.agent.clone();
+        let current_session = agent_details
+            .branch
+            .session_id
+            .as_deref()
+            .map(|session_id| self.show_agent_session(session_id))
+            .transpose()?;
+        let recent_operations = self.agent_timeline(agent, limit)?;
+        let recent_sessions = self
+            .list_agent_sessions(Some(agent))?
+            .into_iter()
+            .take(limit)
+            .collect::<Vec<_>>();
+        let recent_events = self.list_agent_events(Some(agent), None, None, None, limit)?;
+        let recent_spans = self.list_agent_trace_spans(Some(agent), None, None, None, limit)?;
+        let approvals = self.list_agent_approvals(Some(agent), None)?;
+        let recent_approvals = approvals.iter().take(limit).cloned().collect::<Vec<_>>();
+        let recent_gates =
+            self.agent_gate_history_for_id(&agent_details.branch.agent_id, None, limit)?;
+        let conflicts = readiness
+            .conflicts
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_steps = handoff_next_steps(&readiness, current_session.as_ref());
+        let evidence_summary = AgentReviewEvidenceSummary {
+            operations: recent_operations.len(),
+            sessions: recent_sessions.len(),
+            events: recent_events.len(),
+            spans: recent_spans.len(),
+            approvals: recent_approvals.len(),
+            pending_approvals: readiness.pending_approvals.len(),
+            conflicts: readiness.conflicts.len(),
+            queued_merges: readiness.queued_merges,
+            gates: recent_gates.len(),
+        };
+
+        Ok(AgentReviewPacketReport {
+            agent: agent_details,
+            changed_paths: readiness.changed_paths.clone(),
+            workdir_state: readiness.workdir_state.clone(),
+            latest_test: readiness.latest_test.clone(),
+            latest_eval: readiness.latest_eval.clone(),
+            readiness,
+            evidence_summary,
+            recent_gates,
+            recent_operations,
+            recent_sessions,
+            recent_events,
+            recent_spans,
+            recent_approvals,
+            conflicts,
+            next_steps,
+        })
+    }
 }

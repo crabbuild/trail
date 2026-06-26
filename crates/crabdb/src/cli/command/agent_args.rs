@@ -20,6 +20,8 @@ pub(super) enum AgentSubcommand {
     Show(AgentShowArgs),
     /// Show current status for an agent branch including readiness signals.
     Status(AgentStatusArgs),
+    /// Produce a compact review packet for an agent branch.
+    Review(AgentReviewArgs),
     /// Build an agent change review bundle with operation history.
     Contribution(AgentContributionArgs),
     /// List recent agent test/eval gate results by kind.
@@ -124,6 +126,13 @@ pub(super) struct AgentShowArgs {
 #[derive(Args)]
 pub(super) struct AgentStatusArgs {
     pub(super) name: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentReviewArgs {
+    pub(super) name: String,
+    #[arg(long, default_value_t = 50)]
+    pub(super) limit: usize,
 }
 
 #[derive(Args)]

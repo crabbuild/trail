@@ -47,6 +47,7 @@ crabdb agent apply-patch doc-bot --patch patch.json
 
 ```sh
 crabdb agent diff doc-bot --patch --show-line-ids
+crabdb agent review doc-bot
 crabdb agent status doc-bot
 crabdb agent readiness doc-bot
 crabdb agent contribution doc-bot
@@ -83,4 +84,3 @@ crabdb conflicts show <conflict-set-id>
 - Patch schema: `crates/crabdb/src/model/inspect/patch.rs`
 - Readiness: `crates/crabdb/src/db/agent/readiness.rs`
 - Tests: `agent_patch_can_merge_into_main`, `merge_agent_and_queue_enforce_readiness_blockers`, `merge_queue_pauses_on_conflict`
-

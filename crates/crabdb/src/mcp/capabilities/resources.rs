@@ -31,6 +31,13 @@ pub(crate) fn resource_templates() -> Value {
             "mimeType": "application/json"
         },
         {
+            "uriTemplate": RESOURCE_AGENT_REVIEW_TEMPLATE,
+            "name": "agent-review",
+            "title": "Agent Review Packet",
+            "description": "Read one compact review packet with readiness, evidence summaries, gates, approvals, conflicts, operations, and next steps.",
+            "mimeType": "application/json"
+        },
+        {
             "uriTemplate": RESOURCE_AGENT_CONTRIBUTION_TEMPLATE,
             "name": "agent-contribution",
             "title": "Agent Contribution",

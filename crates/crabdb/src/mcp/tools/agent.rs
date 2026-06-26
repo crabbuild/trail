@@ -55,6 +55,15 @@ pub(super) fn tools() -> Value {
             }), vec!["agent"])
         },
         {
+            "name": "crabdb.agent_review",
+            "title": "Agent Review Packet",
+            "description": "Produce a compact read-only review packet for one agent branch with readiness, evidence summaries, gates, approvals, conflicts, operations, and next steps.",
+            "inputSchema": object_schema(json!({
+                "agent": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1 }
+            }), vec!["agent"])
+        },
+        {
             "name": "crabdb.agent_contribution",
             "title": "Agent Contribution",
             "description": "Summarize one agent branch for review with status, changed paths, operations, sessions, events, approvals, and latest gates.",

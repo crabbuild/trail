@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use super::{openapi_operation, openapi_path_param, openapi_query};
+use super::{
+    openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+};
 
 pub(super) fn agent_paths() -> Value {
     json!({
@@ -21,6 +23,12 @@ pub(super) fn agent_paths() -> Value {
             "get": openapi_operation("agentStatus", "Agent status", "Show an agent branch status.", vec![
                 openapi_path_param("agent_or_id", "string")
             ], None, true)
+        },
+        "/v1/agents/{agent_or_id}/review": {
+            "get": openapi_operation_with_response_schema("agentReview", "Agent review packet", "Produce a compact review packet for one agent branch with readiness, evidence summaries, gates, approvals, conflicts, operations, and next steps.", vec![
+                openapi_path_param("agent_or_id", "string"),
+                openapi_query("limit", "integer")
+            ], None, "AgentReviewPacketReport", true)
         },
         "/v1/agents/{agent_or_id}/contribution": {
             "get": openapi_operation("agentContribution", "Agent contribution", "Summarize an agent branch for review with status, changed paths, operations, sessions, events, and approvals.", vec![

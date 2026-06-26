@@ -12,6 +12,7 @@ pub(crate) const RESOURCE_AGENT_WORKFLOWS: &str = "crabdb://docs/agent-workflows
 pub(crate) const RESOURCE_CLI_REFERENCE: &str = "crabdb://docs/cli-reference";
 pub(crate) const RESOURCE_AGENT_TEMPLATE: &str = "crabdb://workspace/agents/{agent}";
 pub(crate) const RESOURCE_AGENT_STATUS_TEMPLATE: &str = "crabdb://workspace/agents/{agent}/status";
+pub(crate) const RESOURCE_AGENT_REVIEW_TEMPLATE: &str = "crabdb://workspace/agents/{agent}/review";
 pub(crate) const RESOURCE_AGENT_CONTRIBUTION_TEMPLATE: &str =
     "crabdb://workspace/agents/{agent}/contribution";
 pub(crate) const RESOURCE_AGENT_GATES_TEMPLATE: &str = "crabdb://workspace/agents/{agent}/gates";

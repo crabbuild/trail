@@ -8,6 +8,7 @@ CrabDB agent support is built around isolated agent branches, optional materiali
 crabdb agent spawn doc-bot --from main
 crabdb agent status doc-bot
 crabdb agent diff doc-bot --patch
+crabdb agent review doc-bot
 crabdb agent readiness doc-bot
 crabdb agent handoff doc-bot
 ```
@@ -51,4 +52,3 @@ crabdb merge-agent doc-bot --into main --dry-run
 - Agent CLI surface: `crates/crabdb/src/cli/command/agent_args.rs`
 - Agent models: `crates/crabdb/src/model/agent`
 - Tests: `agent_management_commands_have_backing_apis`, `agent_patch_can_merge_into_main`
-

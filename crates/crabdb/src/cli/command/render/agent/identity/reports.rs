@@ -114,6 +114,99 @@ pub(crate) fn render_agent_contribution(
     Ok(())
 }
 
+pub(crate) fn render_agent_review_packet(
+    report: &AgentReviewPacketReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent review: {} ({})",
+            report.agent.record.name, report.readiness.status
+        );
+        println!("Ref: {}", report.agent.branch.ref_name);
+        println!(
+            "Ready: {}  Changed paths: {}  Blockers: {}  Warnings: {}",
+            report.readiness.ready,
+            report.changed_paths.len(),
+            report.readiness.blockers.len(),
+            report.readiness.warnings.len()
+        );
+        println!(
+            "Evidence: {} operation(s), {} session(s), {} event(s), {} span(s), {} approval(s), {} gate(s), {} conflict(s), {} queued merge(s)",
+            report.evidence_summary.operations,
+            report.evidence_summary.sessions,
+            report.evidence_summary.events,
+            report.evidence_summary.spans,
+            report.evidence_summary.approvals,
+            report.evidence_summary.gates,
+            report.evidence_summary.conflicts,
+            report.evidence_summary.queued_merges
+        );
+        if !report.readiness.blockers.is_empty() {
+            println!("Blockers:");
+            for blocker in &report.readiness.blockers {
+                println!("  {}: {}", blocker.code, blocker.message);
+            }
+        }
+        if !report.readiness.warnings.is_empty() {
+            println!("Warnings:");
+            for warning in &report.readiness.warnings {
+                println!("  {}: {}", warning.code, warning.message);
+            }
+        }
+        if let Some(test) = &report.latest_test {
+            println!("Latest test: {} ({})", test.status, test.command.join(" "));
+        }
+        if let Some(eval) = &report.latest_eval {
+            println!("Latest eval: {} ({})", eval.status, eval.command.join(" "));
+        }
+        if report.evidence_summary.pending_approvals > 0 {
+            println!(
+                "Pending approvals: {}",
+                report.evidence_summary.pending_approvals
+            );
+        }
+        if !report.conflicts.is_empty() {
+            println!("Conflicts:");
+            for conflict in &report.conflicts {
+                println!("  {} {}", conflict.conflict_set_id, conflict.status);
+                for detail in &conflict.details {
+                    println!("    {detail}");
+                }
+            }
+        }
+        if !report.changed_paths.is_empty() {
+            println!("Changed paths:");
+            for path in &report.changed_paths {
+                println!("  {:?} {}", path.kind, path.path);
+            }
+        }
+        if !report.recent_operations.is_empty() {
+            println!("Recent operations:");
+            for operation in &report.recent_operations {
+                println!(
+                    "  {} {:?} {} path(s) {}",
+                    operation.change_id.0,
+                    operation.kind,
+                    operation.path_count,
+                    operation.message.as_deref().unwrap_or("")
+                );
+            }
+        }
+        if !report.next_steps.is_empty() {
+            println!("Next steps:");
+            for step in &report.next_steps {
+                println!("  {step}");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_gate_history(
     report: &AgentGateHistoryReport,
     json: bool,

@@ -1,6 +1,21 @@
 # Handoff, Review, and Merge
 
-Use handoff and contribution reports to transfer agent state to a reviewer or another host.
+Use review, handoff, and contribution reports to inspect agent state before merge or transfer it to another host.
+
+## Review Packet
+
+```sh
+crabdb agent review doc-bot --limit 50
+```
+
+The review packet combines:
+
+- Readiness report.
+- Evidence summary counts.
+- Changed paths.
+- Latest and recent gates.
+- Recent operations, sessions, events, trace spans, approvals, and conflicts.
+- Next steps.
 
 ## Handoff Packet
 
@@ -30,6 +45,7 @@ The contribution report focuses on status, changed paths, operations, sessions, 
 ## Review Checklist
 
 ```sh
+crabdb agent review doc-bot
 crabdb agent status doc-bot
 crabdb agent readiness doc-bot
 crabdb agent gates doc-bot
@@ -55,4 +71,3 @@ Use the queue when multiple branches may target the same branch.
 - Contribution: `crates/crabdb/src/db/agent/identity.rs`
 - Merge queue: `crates/crabdb/src/db/merge/queue.rs`
 - Tests: `merge_queue_runs_agent_branch_into_main`, `merge_agent_and_queue_enforce_readiness_blockers`
-

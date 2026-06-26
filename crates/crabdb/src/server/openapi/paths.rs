@@ -6,7 +6,8 @@ mod core;
 mod turns;
 
 use super::helpers::{
-    openapi_operation, openapi_path_param, openapi_query, openapi_required_query,
+    openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+    openapi_required_query,
 };
 
 pub(super) fn openapi_paths() -> Value {

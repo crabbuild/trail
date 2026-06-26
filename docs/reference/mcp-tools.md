@@ -27,6 +27,7 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 - `crabdb.agent_list`
 - `crabdb.agent_show`
 - `crabdb.agent_status`
+- `crabdb.agent_review`
 - `crabdb.agent_contribution`
 - `crabdb.gate_history`
 - `crabdb.agent_readiness`
@@ -89,7 +90,7 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 
 ## Tool Risk Annotations
 
-The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only examples include status, diff, timeline, why, history, agent status, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check.
+The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only examples include status, diff, timeline, why, history, agent status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check.
 
 Open-world write examples are `crabdb.run_test` and `crabdb.run_eval` because they execute commands in agent workdirs.
 
@@ -101,7 +102,7 @@ Open-world write examples are `crabdb.run_test` and `crabdb.run_eval` because th
 
 ## Resources
 
-Static resources include workspace status, doctor, agents, merge queue, conflicts, OpenAPI, and compatibility guide resources. Resource templates cover individual agents, sessions, turns, conflicts, approvals, run states, and trace spans.
+Static resources include workspace status, doctor, agents, merge queue, conflicts, OpenAPI, and compatibility guide resources. Resource templates cover individual agents, agent review packets, sessions, turns, conflicts, approvals, run states, and trace spans.
 
 ## Code Facts Used
 
@@ -109,4 +110,3 @@ Static resources include workspace status, doctor, agents, merge queue, conflict
 - Tool calls: `crates/crabdb/src/mcp/tool_call`
 - Risk annotations: `crates/crabdb/src/mcp/tools/annotations.rs`
 - Prompts/resources: `crates/crabdb/src/mcp/capabilities`
-

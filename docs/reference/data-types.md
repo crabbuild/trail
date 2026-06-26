@@ -44,6 +44,8 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 
 - `AgentDetails`
 - `AgentStatusReport`
+- `AgentReviewPacketReport`
+- `AgentReviewEvidenceSummary`
 - `AgentContributionReport`
 - `AgentReadinessReport`
 - `AgentHandoffReport`
@@ -89,4 +91,3 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - Models: `crates/crabdb/src/model`
 - Reports: `crates/crabdb/src/model/reports`
 - Library exports: `crates/crabdb/src/lib.rs`
-

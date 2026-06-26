@@ -70,6 +70,7 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.agent_list"
         | "crabdb.agent_show"
         | "crabdb.agent_status"
+        | "crabdb.agent_review"
         | "crabdb.agent_contribution"
         | "crabdb.gate_history"
         | "crabdb.agent_readiness"

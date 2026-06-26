@@ -3083,6 +3083,60 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         agent_id
     );
 
+    let review_response = crabdb::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            &format!("/v1/agents/{agent_id}/review?limit=5"),
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(review_response.status, 200);
+    let review: serde_json::Value = review_response.body_json().unwrap();
+    assert_eq!(review["agent"]["record"]["name"], "api-branch-agent");
+    assert_eq!(review["readiness"]["ready"], true);
+    assert!(review["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "src/api.rs"));
+    assert_eq!(review["latest_test"]["success"], true);
+    assert!(review["recent_gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|gate| gate["kind"] == "test"));
+    assert!(review["recent_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|operation| operation["message"] == "add API file"));
+    assert!(review["evidence_summary"]["operations"].as_u64().unwrap() >= 1);
+    assert!(review["next_steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step.as_str().unwrap().contains("Start a new session")));
+
+    let cli_review = run_crabdb_json(
+        temp.path(),
+        &["agent", "review", "api-branch-agent", "--limit", "5"],
+    );
+    assert_eq!(cli_review["agent"]["record"]["agent_id"], agent_id);
+    assert_eq!(cli_review["readiness"]["ready"], true);
+
+    let cli_review_text = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "review", "api-branch-agent", "--limit", "5"])
+        .output()
+        .unwrap();
+    assert!(cli_review_text.status.success());
+    let cli_review_stdout = String::from_utf8_lossy(&cli_review_text.stdout);
+    assert!(cli_review_stdout.contains("Agent review: api-branch-agent"));
+    assert!(cli_review_stdout.contains("Evidence:"));
+    assert!(cli_review_stdout.contains("Next steps:"));
+
     let readiness_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
@@ -3547,6 +3601,15 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         &["agent", "contribution", "rpc-bot"],
     );
     assert_eq!(contribution["status"]["agent"]["record"]["name"], "rpc-bot");
+
+    let review = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "review", "rpc-bot"]);
+    assert_eq!(review["agent"]["record"]["name"], "rpc-bot");
+    assert_eq!(review["readiness"]["ready"], true);
+    assert!(review["recent_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|operation| operation["message"] == "daemon CLI patch"));
 
     let gates = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "gates", "rpc-bot"]);
     assert_eq!(gates["agent"]["record"]["name"], "rpc-bot");
@@ -4094,6 +4157,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(template_list
         .iter()
         .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/status"));
+    assert!(template_list
+        .iter()
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/review"));
     assert!(template_list.iter().any(
         |template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/contribution"
     ));
@@ -4183,6 +4249,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         .any(|prompt| prompt["name"] == "crabdb.agent_task"));
     assert!(prompt_list
         .iter()
+        .any(|prompt| prompt["name"] == "crabdb.review_agent"));
+    assert!(prompt_list
+        .iter()
         .any(|prompt| prompt["name"] == "crabdb.resolve_conflict"));
 
     let agent_prompt = crabdb::mcp::handle_json_rpc(
@@ -4218,6 +4287,30 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(prompt_messages
         .iter()
         .any(|message| message["content"]["type"] == "resource"));
+
+    let review_prompt = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 151,
+            "method": "prompts/get",
+            "params": {
+                "name": "crabdb.review_agent",
+                "arguments": {
+                    "agent": "mcp-agent"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        review_prompt["result"]["description"],
+        "CrabDB agent review checklist"
+    );
+    assert!(review_prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("crabdb.agent_review"));
 
     let missing_prompt_argument = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -4298,6 +4391,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.agent_list"));
     assert!(tools
         .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_review"));
+    assert!(tools
+        .iter()
         .any(|tool| tool["name"] == "crabdb.agent_contribution"));
     assert!(tools
         .iter()
@@ -4350,6 +4446,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(tool_annotation("crabdb.apply_patch", "destructiveHint"));
     assert!(tool_annotation("crabdb.run_test", "openWorldHint"));
     assert!(tool_annotation("crabdb.guardrail_check", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_review", "readOnlyHint"));
     assert!(tool_annotation("crabdb.gate_history", "readOnlyHint"));
 
     let spawned = crabdb::mcp::handle_json_rpc(
@@ -4462,6 +4559,55 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         templated_status_json["agent"]["record"]["name"],
         "mcp-lifecycle"
     );
+
+    let review = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 251,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_review",
+                "arguments": {
+                    "agent": "mcp-lifecycle",
+                    "limit": 5
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(review["result"]["isError"], false);
+    assert_eq!(
+        review["result"]["structuredContent"]["agent"]["record"]["name"],
+        "mcp-lifecycle"
+    );
+    assert_eq!(
+        review["result"]["structuredContent"]["readiness"]["ready"],
+        true
+    );
+
+    let templated_review = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 252,
+            "method": "resources/read",
+            "params": {
+                "uri": "crabdb://workspace/agents/mcp-lifecycle/review"
+            }
+        }),
+    )
+    .unwrap();
+    let templated_review_text = templated_review["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    let templated_review_json: serde_json::Value =
+        serde_json::from_str(templated_review_text).unwrap();
+    assert_eq!(
+        templated_review_json["agent"]["record"]["name"],
+        "mcp-lifecycle"
+    );
+    assert_eq!(templated_review_json["readiness"]["ready"], true);
 
     let contribution = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -6817,6 +6963,67 @@ fn agent_management_commands_have_backing_apis() {
         .iter()
         .any(|entry| entry.change_id == applied.operation));
     assert_eq!(contribution.sessions.len(), 1);
+
+    db.run_agent_test(
+        "doc-bot",
+        vec!["sh".to_string(), "-c".to_string(), "printf ok".to_string()],
+        None,
+        5,
+    )
+    .unwrap();
+    db.run_agent_eval(
+        "doc-bot",
+        vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()],
+        None,
+        5,
+    )
+    .unwrap();
+    db.request_agent_approval(
+        "doc-bot",
+        "shell.exec",
+        "Run release smoke tests",
+        None,
+        Some("session-agent-management"),
+        None,
+    )
+    .unwrap();
+
+    let review = db.agent_review_packet("doc-bot", 1).unwrap();
+    assert_eq!(review.agent.record.name, "doc-bot");
+    assert!(!review.readiness.ready);
+    assert!(review
+        .readiness
+        .blockers
+        .iter()
+        .any(|issue| issue.code == "pending_approvals"));
+    assert!(review
+        .readiness
+        .blockers
+        .iter()
+        .any(|issue| issue.code == "latest_eval_failed"));
+    assert!(review
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "README.md"));
+    assert_eq!(review.evidence_summary.pending_approvals, 1);
+    assert_eq!(
+        review.evidence_summary.approvals,
+        review.recent_approvals.len()
+    );
+    assert_eq!(review.evidence_summary.gates, review.recent_gates.len());
+    assert!(review.recent_operations.len() <= 1);
+    assert!(review.recent_events.len() <= 1);
+    assert!(review.recent_spans.len() <= 1);
+    assert!(review.recent_gates.len() <= 1);
+    assert!(review.latest_test.as_ref().is_some_and(|gate| gate.success));
+    assert!(review
+        .latest_eval
+        .as_ref()
+        .is_some_and(|gate| !gate.success));
+    assert!(review
+        .next_steps
+        .iter()
+        .any(|step| step.contains("Resolve pending human approvals")));
 
     db.checkout_agent("doc-bot", true).unwrap();
     assert_eq!(

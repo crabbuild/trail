@@ -39,9 +39,9 @@ Workflow:\n\
                     "Review CrabDB agent `{agent}` before accepting its work.\n\n\
 Checklist:\n\
 1. Read `crabdb://workspace/doctor`, `crabdb://workspace/agents`, and `crabdb://workspace/conflicts`.\n\
-2. Call `crabdb.agent_contribution` for `{agent}` and inspect changed paths, operations, sessions, events, approvals, and latest gates.\n\
-3. Call `crabdb.agent_handoff` for `{agent}` and use its current session context, trace spans, events, and next steps as the transfer packet.\n\
-4. Call `crabdb.agent_readiness` for `{agent}` and treat blockers as stop conditions before merge.\n\
+2. Call `crabdb.agent_review` for `{agent}` first and inspect readiness, evidence summary, gates, approvals, conflicts, changed paths, recent operations, and next steps.\n\
+3. Treat `crabdb.agent_review` readiness blockers as stop conditions before merge.\n\
+4. Call `crabdb.agent_handoff`, `crabdb.agent_contribution`, or `crabdb.agent_status` only when you need deeper session, trace, contribution, or branch/workdir detail.\n\
 5. Call `crabdb.agent_status` for `{agent}` and confirm the branch/workdir state is clean enough to review.\n\
 6. Call `crabdb.diff_agent` with patches and line ids; inspect provenance with `crabdb.why`, `crabdb.history`, and `crabdb.code_from` when a change is unclear.\n\
 7. Confirm latest tests and evals passed or explain why warnings are acceptable.\n\

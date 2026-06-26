@@ -121,6 +121,7 @@ fn daemon_supports_command(command: &Command) -> bool {
             | AgentSubcommand::List
             | AgentSubcommand::Show(_)
             | AgentSubcommand::Status(_)
+            | AgentSubcommand::Review(_)
             | AgentSubcommand::Contribution(_)
             | AgentSubcommand::Gates(_)
             | AgentSubcommand::Readiness(_)
@@ -202,6 +203,14 @@ fn handle_agent_command(
             let report: AgentStatusReport =
                 client.get_json(&format!("/v1/agents/{}/status", args.name))?;
             render_agent_status(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Review(args) => {
+            let report: AgentReviewPacketReport = client.get_json(&format!(
+                "/v1/agents/{}/review?limit={}",
+                args.name, args.limit
+            ))?;
+            render_agent_review_packet(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         AgentSubcommand::Contribution(args) => {

@@ -43,6 +43,11 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             let agent = db.resolve_agent_handle(&args.agent)?;
             tool_result(db.agent_status(&agent)?)
         }
+        "crabdb.agent_review" => {
+            let args: AgentContributionArgs = parse_args(arguments)?;
+            let agent = db.resolve_agent_handle(&args.agent)?;
+            tool_result(db.agent_review_packet(&agent, args.limit.unwrap_or(50))?)
+        }
         "crabdb.agent_contribution" => {
             let args: AgentContributionArgs = parse_args(arguments)?;
             let agent = db.resolve_agent_handle(&args.agent)?;

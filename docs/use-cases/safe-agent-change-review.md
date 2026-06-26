@@ -5,6 +5,7 @@ Use readiness, gates, guardrails, and handoff reports to review agent work befor
 ## Review Flow
 
 ```sh
+crabdb agent review doc-bot
 crabdb agent status doc-bot
 crabdb agent contribution doc-bot
 crabdb agent readiness doc-bot
@@ -41,4 +42,3 @@ crabdb merge-queue run
 - Readiness/handoff: `crates/crabdb/src/db/agent/readiness.rs`
 - Guardrails/approvals: `crates/crabdb/src/db/core/workspace/guardrails.rs`, `crates/crabdb/src/db/agent/control/approvals.rs`
 - Tests: `merge_agent_and_queue_enforce_readiness_blockers`, `local_api_and_mcp_manage_human_approval_gates`
-

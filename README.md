@@ -557,6 +557,7 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb guardrails check --action <action>` | Preflight a risky action against workspace policy |
 | `crabdb agent spawn <name> --from <ref>` | Create an isolated agent branch |
 | `crabdb agent apply-patch <name> --patch <file>` | Apply a structured patch to an agent branch |
+| `crabdb agent review <name>` | Produce a compact review packet for an agent branch |
 | `crabdb agent readiness <name>` | Report blockers before merging an agent branch |
 | `crabdb agent handoff <name>` | Produce a review and continuation packet for an agent |
 | `crabdb merge-agent <name> --into <branch> --dry-run` | Preview merging an agent branch into a target branch |
@@ -621,6 +622,7 @@ Review and gate the work:
 
 ```sh
 crabdb agent diff doc-bot --patch --show-line-ids
+crabdb agent review doc-bot
 crabdb agent contribution doc-bot
 crabdb agent readiness doc-bot
 crabdb agent handoff doc-bot

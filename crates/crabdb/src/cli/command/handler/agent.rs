@@ -44,6 +44,11 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
             let report = db.agent_status(&args.name)?;
             render_agent_status(&report, ctx.json, ctx.quiet)
         }
+        AgentSubcommand::Review(args) => {
+            let db = open_db(ctx)?;
+            let report = db.agent_review_packet(&args.name, args.limit)?;
+            render_agent_review_packet(&report, ctx.json, ctx.quiet)
+        }
         AgentSubcommand::Contribution(args) => {
             let db = open_db(ctx)?;
             let report = db.agent_contribution(&args.name, args.limit)?;

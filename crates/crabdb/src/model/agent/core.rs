@@ -52,6 +52,39 @@ pub struct AgentContributionReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewEvidenceSummary {
+    pub operations: usize,
+    pub sessions: usize,
+    pub events: usize,
+    pub spans: usize,
+    pub approvals: usize,
+    pub pending_approvals: usize,
+    pub conflicts: usize,
+    pub queued_merges: u64,
+    pub gates: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewPacketReport {
+    pub agent: AgentDetails,
+    pub readiness: AgentReadinessReport,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub workdir_state: Option<WorktreeState>,
+    pub evidence_summary: AgentReviewEvidenceSummary,
+    pub latest_test: Option<AgentTestSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_eval: Option<AgentTestSummary>,
+    pub recent_gates: Vec<AgentTestSummary>,
+    pub recent_operations: Vec<TimelineEntry>,
+    pub recent_sessions: Vec<AgentSession>,
+    pub recent_events: Vec<AgentEventRecord>,
+    pub recent_spans: Vec<AgentTraceSpan>,
+    pub recent_approvals: Vec<AgentApproval>,
+    pub conflicts: Vec<ConflictSetSummary>,
+    pub next_steps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentReadinessReport {
     pub agent: AgentDetails,
     pub ready: bool,
