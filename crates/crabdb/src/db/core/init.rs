@@ -211,7 +211,7 @@ impl CrabDb {
         let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());
-        let root_prolly = Prolly::new(store.clone(), worktree_root_map_prolly_config());
+        let root_prolly = Prolly::new(store.clone(), root_map_prolly_config());
         let db = Self {
             workspace_root,
             db_dir,

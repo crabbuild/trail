@@ -498,6 +498,42 @@ fn crabdb_refuses_workspaces_with_newer_schema_versions() {
 }
 
 #[test]
+fn init_creates_agent_observability_indexes() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
+    let indexes = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for expected in [
+        "agent_turns_session_started_idx",
+        "agent_turns_agent_started_idx",
+        "agent_events_agent_created_idx",
+        "agent_events_session_created_idx",
+        "agent_events_turn_created_idx",
+        "agent_events_type_created_idx",
+        "agent_events_agent_type_created_idx",
+        "agent_events_session_type_created_idx",
+        "agent_events_turn_type_created_idx",
+        "agent_trace_span_events_span_created_idx",
+        "agent_trace_span_events_trace_created_idx",
+    ] {
+        assert!(
+            indexes.iter().any(|index| index == expected),
+            "missing index {expected}"
+        );
+    }
+}
+
+#[test]
 fn init_text_policy_sets_text_tracking_thresholds() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -2274,6 +2310,24 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     assert_eq!(http_end["span"]["status"], "completed");
     assert!(http_end["span"]["ended_at"].is_number());
 
+    let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
+    let child_span_event_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_trace_span_events WHERE span_id = ?1",
+            [&child_span_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(child_span_event_count, 2);
+    let root_span_event_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_trace_span_events WHERE span_id = ?1",
+            [&root_span_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(root_span_event_count, 1);
+
     let tools = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -2513,6 +2567,32 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
         .span_type_counts
         .iter()
         .any(|count| count.name == "evaluation" && count.count == 1));
+
+    conn.execute("DELETE FROM agent_trace_span_events", [])
+        .unwrap();
+    let fallback_spans = db
+        .list_agent_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 10)
+        .unwrap();
+    assert_eq!(fallback_spans.len(), 4);
+    assert!(fallback_spans
+        .iter()
+        .any(|span| span.span_id == child_span_id));
+    let fallback_summary = db
+        .summarize_agent_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 5)
+        .unwrap();
+    assert_eq!(fallback_summary.span_count, 4);
+    assert_eq!(fallback_summary.failed_span_count, 1);
+
+    let rebuild = db.rebuild_indexes().unwrap();
+    assert_eq!(rebuild.errors, Vec::<String>::new());
+    let restored_span_event_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_trace_span_events WHERE trace_id = ?1",
+            [&trace_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(restored_span_event_count, 7);
 
     let events = db
         .list_agent_events(None, None, Some(&turn_id), None, 50)
@@ -3229,6 +3309,160 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     assert_eq!(spawn["ref_name"], "refs/agents/rpc-bot");
     assert!(spawn["workdir"].is_null());
 
+    let list = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "list"]);
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|agent| agent["record"]["name"] == "rpc-bot"));
+
+    let show = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "show", "rpc-bot"]);
+    assert_eq!(show["record"]["name"], "rpc-bot");
+    assert_eq!(show["branch"]["ref_name"], "refs/agents/rpc-bot");
+
+    let no_workdir =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "workdir", "rpc-bot"]);
+    assert!(no_workdir["workdir"].is_null());
+
+    let claim = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "claim",
+            "rpc-bot",
+            "README.md",
+            "--ttl-secs",
+            "120",
+        ],
+    );
+    assert_eq!(claim["claimed"], true);
+    assert_eq!(claim["path"], "README.md");
+
+    let lease = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "lease",
+            "acquire",
+            "rpc-bot",
+            "--path",
+            "NOTES.md",
+            "--ttl-secs",
+            "120",
+        ],
+    );
+    let lease_id = lease["lease"]["lease_id"].as_str().unwrap().to_string();
+    assert_eq!(lease["lease"]["path"], "NOTES.md");
+    let leases = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lease", "list"]);
+    assert!(leases
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|lease| lease["lease_id"] == lease_id));
+    let released =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["lease", "release", &lease_id]);
+    assert_eq!(released["lease_id"], lease_id);
+
+    let session = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["session", "start", "rpc-bot", "--title", "daemon session"],
+    );
+    let session_id = session["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(session["session"]["title"], "daemon session");
+    let current_session =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["session", "current", "rpc-bot"]);
+    assert!(current_session
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|report| report["session"]["session_id"] == session_id));
+    let session_list = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["session", "list", "--agent", "rpc-bot"],
+    );
+    assert!(session_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["session_id"] == session_id));
+    let session_show =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["session", "show", &session_id]);
+    assert_eq!(session_show["session"]["session_id"], session_id);
+    let session_context = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["session", "context", &session_id, "--limit", "5"],
+    );
+    assert_eq!(session_context["session"]["session_id"], session_id);
+
+    let approval = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "approvals",
+            "request",
+            "rpc-bot",
+            "--action",
+            "deploy",
+            "--summary",
+            "daemon approval",
+            "--session",
+            &session_id,
+            "--payload-json",
+            r#"{"risk":"low"}"#,
+        ],
+    );
+    let approval_id = approval["approval"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(approval["approval"]["status"], "pending");
+    let approvals = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "approvals",
+            "list",
+            "--agent",
+            "rpc-bot",
+            "--status",
+            "pending",
+        ],
+    );
+    assert!(approvals
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|approval| approval["approval_id"] == approval_id));
+    let approval_show = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["approvals", "show", &approval_id],
+    );
+    assert_eq!(approval_show["approval_id"], approval_id);
+    let approval_decision = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "approvals",
+            "decide",
+            &approval_id,
+            "--decision",
+            "approved",
+            "--reviewer",
+            "daemon-reviewer",
+            "--note",
+            "ok",
+        ],
+    );
+    assert_eq!(approval_decision["approval"]["status"], "approved");
+
     let patch_path = temp.path().join("rpc-patch.json");
     fs::write(
         &patch_path,
@@ -3268,9 +3502,231 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         .iter()
         .any(|path| path["path"] == "README.md"));
 
+    let doctor = run_crabdb_json_daemon(temp.path(), &daemon_url, &["doctor"]);
+    assert_eq!(doctor["status"], "ok");
+    let why = run_crabdb_json_daemon(temp.path(), &daemon_url, &["why", "README.md:1"]);
+    assert_eq!(why["path"], "README.md");
+    let history = run_crabdb_json_daemon(temp.path(), &daemon_url, &["history", "README.md"]);
+    assert!(history["file_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "README.md"));
+    let code_from = run_crabdb_json_daemon(temp.path(), &daemon_url, &["code-from", "rpc-bot"]);
+    assert!(code_from["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|operation| operation["message"] == "daemon CLI patch"));
+
+    let agent_timeline =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "timeline", "rpc-bot"]);
+    assert!(agent_timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["message"] == "daemon CLI patch"));
+    let timeline = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["timeline", "--agent", "rpc-bot", "--limit", "20"],
+    );
+    assert!(timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["message"] == "daemon CLI patch"));
+
     let readiness =
         run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "readiness", "rpc-bot"]);
     assert_eq!(readiness["ready"], true);
+
+    let contribution = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "contribution", "rpc-bot"],
+    );
+    assert_eq!(contribution["status"]["agent"]["record"]["name"], "rpc-bot");
+
+    let gates = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "gates", "rpc-bot"]);
+    assert_eq!(gates["agent"]["record"]["name"], "rpc-bot");
+
+    let events = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "events", "--agent", "rpc-bot"],
+    );
+    assert!(events
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["agent_id"] == spawn["agent_id"]));
+
+    let turn = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "turn",
+            "start",
+            "rpc-bot",
+            "--from",
+            "main",
+            "--title",
+            "daemon trace routing",
+        ],
+    );
+    let turn_id = turn["turn"]["turn_id"].as_str().unwrap().to_string();
+
+    let turn_message = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "turn",
+            "message",
+            &turn_id,
+            "--role",
+            "user",
+            "--text",
+            "daemon turn message",
+        ],
+    );
+    assert_eq!(turn_message["role"], "user");
+
+    let turn_event = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "turn",
+            "event",
+            &turn_id,
+            "--event-type",
+            "checkpoint",
+            "--payload-json",
+            r#"{"via":"daemon"}"#,
+        ],
+    );
+    assert_eq!(turn_event["event"]["event_type"], "checkpoint");
+
+    let turn_patch_path = temp.path().join("rpc-turn-patch.json");
+    fs::write(
+        &turn_patch_path,
+        serde_json::to_vec(&serde_json::json!({
+            "message": "daemon turn patch",
+            "edits": [
+                {"op": "write", "path": "TURN.md", "content": "turn rpc\n"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let turn_patch_path = turn_patch_path.to_string_lossy().to_string();
+    let turn_patch = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "turn",
+            "apply-patch",
+            &turn_id,
+            "--patch",
+            &turn_patch_path,
+        ],
+    );
+    assert!(turn_patch["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "TURN.md"));
+    fs::remove_file(temp.path().join("rpc-turn-patch.json")).unwrap();
+
+    let turn_details = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "turn", "show", &turn_id],
+    );
+    assert_eq!(turn_details["turn"]["turn_id"].as_str().unwrap(), turn_id);
+    assert!(turn_details["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["body"] == "daemon turn message"));
+    assert!(turn_details["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["event_type"] == "checkpoint"));
+
+    let trace_start = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent",
+            "trace",
+            "start",
+            &turn_id,
+            "--type",
+            "tool_call",
+            "--name",
+            "daemon rpc trace",
+        ],
+    );
+    let span_id = trace_start["span"]["span_id"].as_str().unwrap().to_string();
+    let trace_id = trace_start["span"]["trace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(trace_start["span"]["turn_id"].as_str().unwrap(), turn_id);
+
+    let trace_end = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "trace", "end", &span_id, "--status", "completed"],
+    );
+    assert_eq!(trace_end["span"]["status"], "completed");
+
+    let trace_list = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &[
+            "agent", "trace", "list", "--turn", &turn_id, "--limit", "10",
+        ],
+    );
+    assert!(trace_list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|span| span["span_id"] == span_id));
+
+    let trace_summary = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "trace", "summary", "--trace-id", &trace_id],
+    );
+    assert_eq!(trace_summary["trace_id"].as_str().unwrap(), trace_id);
+    assert_eq!(trace_summary["span_count"], 1);
+    assert_eq!(trace_summary["ended_span_count"], 1);
+
+    let trace_show = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "trace", "show", &span_id],
+    );
+    assert_eq!(trace_show["span_id"].as_str().unwrap(), span_id);
+    assert_eq!(trace_show["trace_id"].as_str().unwrap(), trace_id);
+
+    let turn_end = run_crabdb_json_daemon(
+        temp.path(),
+        &daemon_url,
+        &["agent", "turn", "end", &turn_id, "--status", "completed"],
+    );
+    assert_eq!(turn_end["turn"]["status"], "completed");
+
+    let handoff =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "handoff", "rpc-bot"]);
+    assert_eq!(handoff["agent"]["record"]["name"], "rpc-bot");
 
     fs::write(
         temp.path().join("NOTES.md"),
@@ -3310,6 +3766,12 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         ],
     );
     let materialized_workdir = materialized["workdir"].as_str().unwrap();
+    let materialized_workdir_report =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "workdir", "mat-rpc"]);
+    assert_eq!(
+        materialized_workdir_report["workdir"].as_str().unwrap(),
+        materialized_workdir
+    );
     fs::write(
         Path::new(materialized_workdir).join("README.md"),
         "hello\nrecorded through daemon\n",
@@ -7480,6 +7942,20 @@ fn large_roots_default_agents_to_no_materialize() {
         .spawn_agent("large-default-bot", Some("main"), materialize, None, None)
         .unwrap();
     assert!(report.workdir.is_none());
+
+    db.begin_agent_turn(
+        "large-turn-bot",
+        Some("main"),
+        Some("large turn".to_string()),
+        None,
+    )
+    .unwrap();
+    assert!(db
+        .agent_details("large-turn-bot")
+        .unwrap()
+        .branch
+        .workdir
+        .is_none());
 }
 
 #[test]
@@ -9336,6 +9812,27 @@ fn index_rebuild_restores_derived_history_from_objects() {
     )
     .unwrap();
     db.apply_agent_patch("doc-bot", patch).unwrap();
+    let turn = db
+        .begin_agent_turn(
+            "doc-bot",
+            Some("main"),
+            Some("rebuild trace span index".to_string()),
+            None,
+        )
+        .unwrap();
+    let span = db
+        .start_agent_trace_span(
+            &turn.turn.turn_id,
+            "tool_call",
+            "cargo test",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let span_id = span.span.span_id.clone();
+    db.end_agent_trace_span(&span_id, "completed", None)
+        .unwrap();
 
     let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
     conn.execute_batch(
@@ -9345,6 +9842,7 @@ fn index_rebuild_restores_derived_history_from_objects() {
         DELETE FROM file_history;
         DELETE FROM line_history;
         DELETE FROM messages;
+        DELETE FROM agent_trace_span_events;
         ",
     )
     .unwrap();
@@ -9359,6 +9857,14 @@ fn index_rebuild_restores_derived_history_from_objects() {
         .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
         .unwrap();
     assert_eq!(messages, 1);
+    let span_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_trace_span_events WHERE span_id = ?1",
+            [&span_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(span_events, 2);
 }
 
 #[test]

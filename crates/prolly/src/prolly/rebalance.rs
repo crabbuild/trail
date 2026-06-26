@@ -741,7 +741,7 @@ pub fn split_into_chunks<S: Store>(prolly: &Prolly<S>, node: &Node, max_size: us
     }
 
     // Calculate the number of chunks needed
-    let num_chunks = (node.len() + capacity - 1) / capacity; // Ceiling division
+    let num_chunks = node.len().div_ceil(capacity);
 
     let mut chunks: Vec<Node> = Vec::new();
     let mut start = 0;

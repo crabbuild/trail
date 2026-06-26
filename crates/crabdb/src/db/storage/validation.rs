@@ -3,8 +3,8 @@ use crate::db::storage::content::validate_full_text_blob;
 
 impl CrabDb {
     pub(crate) fn validate_worktree_root(&self, root: &WorktreeRoot) -> Result<()> {
-        let path_tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
-        let index_tree = worktree_root_map_tree_from_root_hex(root.file_index_map_root.as_deref())?;
+        let path_tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let index_tree = root_map_tree_from_root_hex(root.file_index_map_root.as_deref())?;
         let path_entries = self
             .root_prolly
             .range(&path_tree, &[], None)?

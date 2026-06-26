@@ -71,7 +71,13 @@ pub(super) fn try_handle_daemon_command(
             render_record(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
+        Command::Timeline(args) => handle_timeline_command(ctx, &client, args),
+        Command::Why(args) => handle_why_command(ctx, &client, args),
+        Command::History(args) => handle_history_command(ctx, &client, args),
+        Command::CodeFrom(args) => handle_code_from_command(ctx, &client, args),
         Command::Agent(agent) => handle_agent_command(ctx, &client, agent),
+        Command::Session(session) => handle_session_command(ctx, &client, session),
+        Command::Approvals(approvals) => handle_approvals_command(ctx, &client, approvals),
         Command::MergeAgent(args) => {
             validate_merge_strategy(args.strategy.as_deref())?;
             let body = serde_json::json!({
@@ -85,6 +91,12 @@ pub(super) fn try_handle_daemon_command(
             Ok(true)
         }
         Command::MergeQueue(queue) => handle_merge_queue_command(ctx, &client, queue),
+        Command::Lease(lease) => handle_lease_command(ctx, &client, lease),
+        Command::Doctor => {
+            let report: DoctorReport = client.get_json("/v1/doctor")?;
+            render_doctor(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         _ => Ok(false),
     }
 }
@@ -92,20 +104,40 @@ pub(super) fn try_handle_daemon_command(
 fn daemon_supports_command(command: &Command) -> bool {
     match command {
         Command::Status(args) => args.branch.is_none(),
-        Command::Record(_) | Command::Diff(_) | Command::MergeAgent(_) | Command::MergeQueue(_) => {
-            true
-        }
-        Command::Agent(agent) => matches!(
-            agent.command,
+        Command::Record(_)
+        | Command::Diff(_)
+        | Command::Timeline(_)
+        | Command::Why(_)
+        | Command::History(_)
+        | Command::CodeFrom(_)
+        | Command::Session(_)
+        | Command::Approvals(_)
+        | Command::MergeAgent(_)
+        | Command::MergeQueue(_)
+        | Command::Lease(_)
+        | Command::Doctor => true,
+        Command::Agent(agent) => match &agent.command {
             AgentSubcommand::Spawn(_)
-                | AgentSubcommand::Status(_)
-                | AgentSubcommand::Readiness(_)
-                | AgentSubcommand::Record(_)
-                | AgentSubcommand::Read(_)
-                | AgentSubcommand::SyncWorkdir(_)
-                | AgentSubcommand::ApplyPatch(_)
-                | AgentSubcommand::Diff(_)
-        ),
+            | AgentSubcommand::List
+            | AgentSubcommand::Show(_)
+            | AgentSubcommand::Status(_)
+            | AgentSubcommand::Contribution(_)
+            | AgentSubcommand::Gates(_)
+            | AgentSubcommand::Readiness(_)
+            | AgentSubcommand::Handoff(_)
+            | AgentSubcommand::Claim(_)
+            | AgentSubcommand::Record(_)
+            | AgentSubcommand::Events(_)
+            | AgentSubcommand::Read(_)
+            | AgentSubcommand::Workdir(_)
+            | AgentSubcommand::SyncWorkdir(_)
+            | AgentSubcommand::ApplyPatch(_)
+            | AgentSubcommand::Diff(_)
+            | AgentSubcommand::Timeline(_) => true,
+            AgentSubcommand::Turn(_) => true,
+            AgentSubcommand::Trace(_) => true,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -156,16 +188,62 @@ fn handle_agent_command(
             render_agent_spawn(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
+        AgentSubcommand::List => {
+            let agents: Vec<AgentDetails> = client.get_json("/v1/agents")?;
+            render_agent_list(&agents, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Show(args) => {
+            let details: AgentDetails = client.get_json(&format!("/v1/agents/{}", args.name))?;
+            render_agent_details(&details, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         AgentSubcommand::Status(args) => {
             let report: AgentStatusReport =
                 client.get_json(&format!("/v1/agents/{}/status", args.name))?;
             render_agent_status(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
+        AgentSubcommand::Contribution(args) => {
+            let report: AgentContributionReport = client.get_json(&format!(
+                "/v1/agents/{}/contribution?limit={}",
+                args.name, args.limit
+            ))?;
+            render_agent_contribution(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Gates(args) => {
+            let mut params = vec![format!("limit={}", args.limit)];
+            if let Some(kind) = &args.kind {
+                params.push(format!("kind={kind}"));
+            }
+            let path = append_query(&format!("/v1/agents/{}/gates", args.name), params);
+            let report: AgentGateHistoryReport = client.get_json(&path)?;
+            render_agent_gate_history(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         AgentSubcommand::Readiness(args) => {
             let report: AgentReadinessReport =
                 client.get_json(&format!("/v1/agents/{}/readiness", args.name))?;
             render_agent_readiness(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Handoff(args) => {
+            let report: AgentHandoffReport = client.get_json(&format!(
+                "/v1/agents/{}/handoff?limit={}",
+                args.name, args.limit
+            ))?;
+            render_agent_handoff(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Claim(args) => {
+            let body = serde_json::json!({
+                "path": args.path,
+                "ttl_secs": args.ttl_secs,
+            });
+            let report: AgentClaimReport =
+                client.post_json(&format!("/v1/agents/{}/claims", args.name), &body)?;
+            render_agent_claim(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         AgentSubcommand::Record(args) => {
@@ -175,6 +253,25 @@ fn handle_agent_command(
             let report: AgentRecordReport =
                 client.post_json(&format!("/v1/agents/{}/record", args.name), &body)?;
             render_agent_record(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Events(args) => {
+            let mut params = vec![format!("limit={}", args.limit)];
+            if let Some(agent) = &args.agent {
+                params.push(format!("agent={agent}"));
+            }
+            if let Some(session) = &args.session {
+                params.push(format!("session={session}"));
+            }
+            if let Some(turn) = &args.turn {
+                params.push(format!("turn={turn}"));
+            }
+            if let Some(event_type) = &args.event_type {
+                params.push(format!("type={event_type}"));
+            }
+            let path = append_query("/v1/agent/events", params);
+            let events: Vec<AgentEventRecord> = client.get_json(&path)?;
+            render_agent_events(&events, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         AgentSubcommand::SyncWorkdir(args) => {
@@ -208,6 +305,12 @@ fn handle_agent_command(
             render_agent_file_read(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
+        AgentSubcommand::Workdir(args) => {
+            let report: AgentWorkdirReport =
+                client.get_json(&format!("/v1/agents/{}/workdir", args.name))?;
+            render_agent_workdir(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         AgentSubcommand::ApplyPatch(args) => {
             let mut patch: PatchDocument =
                 serde_json::from_slice(&std::fs::read(&args.patch).map_err(Error::from)?)?;
@@ -233,8 +336,416 @@ fn handle_agent_command(
             render_diff(&summary, ctx.json, ctx.quiet, false)?;
             Ok(true)
         }
+        AgentSubcommand::Timeline(args) => {
+            let path = append_query(
+                "/v1/timeline",
+                vec![
+                    format!("agent={}", args.name),
+                    format!("limit={}", args.limit),
+                ],
+            );
+            let entries: Vec<TimelineEntry> = client.get_json(&path)?;
+            render_timeline(&entries, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentSubcommand::Turn(turn) => handle_agent_turn_command(ctx, client, turn),
+        AgentSubcommand::Trace(trace) => handle_agent_trace_command(ctx, client, trace),
         _ => Ok(false),
     }
+}
+
+fn handle_timeline_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    args: &TimelineArgs,
+) -> Result<bool> {
+    let mut params = vec![format!("limit={}", args.limit)];
+    if let Some(branch) = &args.branch {
+        params.push(format!("branch={branch}"));
+    }
+    if let Some(session) = &args.session {
+        params.push(format!("session={session}"));
+    }
+    if let Some(agent) = &args.agent {
+        params.push(format!("agent={agent}"));
+    }
+    let entries: Vec<TimelineEntry> = client.get_json(&append_query("/v1/timeline", params))?;
+    render_timeline(&entries, ctx.json, ctx.quiet)?;
+    Ok(true)
+}
+
+fn handle_why_command(ctx: &RuntimeContext, client: &DaemonClient, args: &WhyArgs) -> Result<bool> {
+    let mut params = Vec::new();
+    match (&args.path_line, &args.line_id) {
+        (Some(path_line), None) => params.push(format!("path_line={path_line}")),
+        (None, Some(line_id)) => params.push(format!("line_id={line_id}")),
+        (Some(_), Some(_)) => {
+            return Err(Error::InvalidInput(
+                "why accepts either PATH:LINE or --line-id, not both".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(Error::InvalidInput(
+                "why requires PATH:LINE or --line-id".to_string(),
+            ));
+        }
+    }
+    if let Some(at) = args.at.as_ref().or(ctx.branch.as_ref()) {
+        params.push(format!("at={at}"));
+    }
+    let result: WhyResult = client.get_json(&append_query("/v1/why", params))?;
+    render_why(&result, ctx.json, ctx.quiet)?;
+    Ok(true)
+}
+
+fn handle_history_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    args: &HistoryArgs,
+) -> Result<bool> {
+    let params = match (
+        args.selector.as_deref(),
+        args.file_id.as_deref(),
+        args.line_id.as_deref(),
+    ) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            return Err(Error::InvalidInput(
+                "history accepts one path, --file-id, or --line-id selector".to_string(),
+            ));
+        }
+        (_, Some(file_id), None) => vec![format!("file_id={file_id}")],
+        (_, None, Some(line_id)) => vec![format!("line_id={line_id}")],
+        (Some(path), None, None) => vec![format!("selector={path}")],
+        (None, None, None) => {
+            return Err(Error::InvalidInput(
+                "history requires a path, --file-id, or --line-id".to_string(),
+            ));
+        }
+    };
+    let result: HistoryResult = client.get_json(&append_query("/v1/history", params))?;
+    render_history(&result, ctx.json, ctx.quiet)?;
+    Ok(true)
+}
+
+fn handle_code_from_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    args: &CodeFromArgs,
+) -> Result<bool> {
+    let result: CodeFromResult = client.get_json(&append_query(
+        "/v1/code-from",
+        vec![format!("selector={}", args.selector)],
+    ))?;
+    render_code_from(&result, ctx.json, ctx.quiet)?;
+    Ok(true)
+}
+
+fn handle_session_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    session: &SessionCommand,
+) -> Result<bool> {
+    match &session.command {
+        SessionSubcommand::Start(args) => {
+            let body = serde_json::json!({
+                "agent": args.agent,
+                "title": args.title,
+                "id": args.id,
+            });
+            let report: AgentSessionStartReport = client.post_json("/v1/sessions", &body)?;
+            render_session_start(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        SessionSubcommand::Current(args) => {
+            let path = match &args.agent {
+                Some(agent) => append_query("/v1/sessions/current", vec![format!("agent={agent}")]),
+                None => "/v1/sessions/current".to_string(),
+            };
+            let reports: Vec<AgentSessionCurrentReport> = client.get_json(&path)?;
+            render_session_current(&reports, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        SessionSubcommand::List(args) => {
+            let path = match &args.agent {
+                Some(agent) => append_query("/v1/sessions", vec![format!("agent={agent}")]),
+                None => "/v1/sessions".to_string(),
+            };
+            let sessions: Vec<AgentSession> = client.get_json(&path)?;
+            render_session_list(&sessions, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        SessionSubcommand::Show(args) => {
+            let details: AgentSessionDetails =
+                client.get_json(&format!("/v1/sessions/{}", args.session_id))?;
+            render_session_details(&details, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        SessionSubcommand::Context(args) => {
+            let path = append_query(
+                &format!("/v1/sessions/{}/context", args.session_id),
+                vec![format!("limit={}", args.limit)],
+            );
+            let report: AgentSessionContextReport = client.get_json(&path)?;
+            render_session_context(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        SessionSubcommand::End(args) => {
+            let body = serde_json::json!({
+                "status": args.status,
+            });
+            let report: AgentSessionEndReport =
+                client.post_json(&format!("/v1/sessions/{}/end", args.session_id), &body)?;
+            render_session_end(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+    }
+}
+
+fn handle_approvals_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    approvals: &ApprovalsCommand,
+) -> Result<bool> {
+    match &approvals.command {
+        ApprovalsSubcommand::Request(args) => {
+            let mut body = Map::new();
+            body.insert("agent".to_string(), Value::String(args.agent.clone()));
+            body.insert("action".to_string(), Value::String(args.action.clone()));
+            body.insert("summary".to_string(), Value::String(args.summary.clone()));
+            if let Some(payload) = parse_optional_json(args.payload_json.as_deref())? {
+                body.insert("payload".to_string(), payload);
+            }
+            if let Some(session) = &args.session {
+                body.insert("session_id".to_string(), Value::String(session.clone()));
+            }
+            if let Some(turn) = &args.turn {
+                body.insert("turn_id".to_string(), Value::String(turn.clone()));
+            }
+            let report: AgentApprovalRequestReport =
+                client.post_json("/v1/approvals", &Value::Object(body))?;
+            render_approval_request(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        ApprovalsSubcommand::List(args) => {
+            let mut params = Vec::new();
+            if let Some(agent) = &args.agent {
+                params.push(format!("agent={agent}"));
+            }
+            if let Some(status) = &args.status {
+                params.push(format!("status={status}"));
+            }
+            let approvals: Vec<AgentApproval> =
+                client.get_json(&append_query("/v1/approvals", params))?;
+            render_approval_list(&approvals, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        ApprovalsSubcommand::Show(args) => {
+            let approval: AgentApproval =
+                client.get_json(&format!("/v1/approvals/{}", args.approval_id))?;
+            render_approval(&approval, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        ApprovalsSubcommand::Decide(args) => {
+            let body = serde_json::json!({
+                "decision": args.decision.as_str(),
+                "reviewer": args.reviewer,
+                "note": args.note,
+            });
+            let report: AgentApprovalDecisionReport = client.post_json(
+                &format!("/v1/approvals/{}/decision", args.approval_id),
+                &body,
+            )?;
+            render_approval_decision(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+    }
+}
+
+fn handle_agent_turn_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    turn: &AgentTurnCommand,
+) -> Result<bool> {
+    match &turn.command {
+        AgentTurnSubcommand::Start(args) => {
+            let mut body = Map::new();
+            body.insert("agent".to_string(), Value::String(args.name.clone()));
+            if let Some(from) = &args.from {
+                body.insert("branch".to_string(), Value::String(from.clone()));
+            }
+            if let Some(title) = &args.title {
+                body.insert("session_title".to_string(), Value::String(title.clone()));
+            }
+            if let Some(base_change) = &args.base_change {
+                body.insert(
+                    "base_change".to_string(),
+                    Value::String(base_change.clone()),
+                );
+            }
+            let report: AgentTurnStartReport =
+                client.post_json("/v1/agent/turns", &Value::Object(body))?;
+            render_agent_turn_start(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTurnSubcommand::Show(args) => {
+            let details: AgentTurnDetails =
+                client.get_json(&format!("/v1/agent/turns/{}", args.turn_id))?;
+            render_agent_turn_details(&details, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTurnSubcommand::Message(args) => {
+            let body = serde_json::json!({
+                "role": args.role,
+                "text": args.text,
+            });
+            let report: AgentMessageReport =
+                client.post_json(&format!("/v1/agent/turns/{}/messages", args.turn_id), &body)?;
+            render_agent_message(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTurnSubcommand::Event(args) => {
+            let mut body = Map::new();
+            body.insert(
+                "event_type".to_string(),
+                Value::String(args.event_type.clone()),
+            );
+            if let Some(payload) = parse_optional_json(args.payload_json.as_deref())? {
+                body.insert("payload".to_string(), payload);
+            }
+            if let Some(change) = &args.change {
+                body.insert("change_id".to_string(), Value::String(change.clone()));
+            }
+            if let Some(message) = &args.message {
+                body.insert("message_id".to_string(), Value::String(message.clone()));
+            }
+            let report: AgentTurnEventReport = client.post_json(
+                &format!("/v1/agent/turns/{}/events", args.turn_id),
+                &Value::Object(body),
+            )?;
+            render_agent_turn_event(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTurnSubcommand::ApplyPatch(args) => {
+            let mut patch: PatchDocument =
+                serde_json::from_slice(&std::fs::read(&args.patch).map_err(Error::from)?)?;
+            if args.allow_ignored {
+                patch.allow_ignored = true;
+            }
+            let body = serde_json::to_value(&patch)?;
+            let report: AgentPatchReport =
+                client.post_json(&format!("/v1/agent/turns/{}/patches", args.turn_id), &body)?;
+            render_agent_patch(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTurnSubcommand::End(args) => {
+            let body = serde_json::json!({
+                "status": args.status,
+            });
+            let report: AgentTurnEndReport =
+                client.post_json(&format!("/v1/agent/turns/{}/end", args.turn_id), &body)?;
+            render_agent_turn_end(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+    }
+}
+
+fn handle_agent_trace_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    trace: &AgentTraceCommand,
+) -> Result<bool> {
+    match &trace.command {
+        AgentTraceSubcommand::Start(args) => {
+            let mut body = Map::new();
+            body.insert(
+                "span_type".to_string(),
+                Value::String(args.span_type.clone()),
+            );
+            body.insert("name".to_string(), Value::String(args.name.clone()));
+            if let Some(parent) = &args.parent {
+                body.insert("parent".to_string(), Value::String(parent.clone()));
+            }
+            if let Some(trace_id) = &args.trace_id {
+                body.insert("trace".to_string(), Value::String(trace_id.clone()));
+            }
+            if let Some(attributes) = parse_optional_json(args.attributes_json.as_deref())? {
+                body.insert("attributes".to_string(), attributes);
+            }
+            let report: AgentTraceSpanStartReport = client.post_json(
+                &format!("/v1/agent/turns/{}/spans", args.turn_id),
+                &Value::Object(body),
+            )?;
+            render_agent_trace_span_start(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTraceSubcommand::End(args) => {
+            let mut body = Map::new();
+            body.insert("status".to_string(), Value::String(args.status.clone()));
+            if let Some(result) = parse_optional_json(args.result_json.as_deref())? {
+                body.insert("result".to_string(), result);
+            }
+            let report: AgentTraceSpanEndReport = client.post_json(
+                &format!("/v1/agent/spans/{}/end", args.span_id),
+                &Value::Object(body),
+            )?;
+            render_agent_trace_span_end(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTraceSubcommand::List(args) => {
+            let mut params = trace_filter_params(
+                args.agent.as_deref(),
+                args.session.as_deref(),
+                args.turn.as_deref(),
+                args.trace_id.as_deref(),
+            );
+            params.push(format!("limit={}", args.limit));
+            let path = append_query("/v1/agent/spans", params);
+            let spans: Vec<AgentTraceSpan> = client.get_json(&path)?;
+            render_agent_trace_spans(&spans, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTraceSubcommand::Summary(args) => {
+            let mut params = trace_filter_params(
+                args.agent.as_deref(),
+                args.session.as_deref(),
+                args.turn.as_deref(),
+                args.trace_id.as_deref(),
+            );
+            params.push(format!("slowest={}", args.slowest_limit));
+            let path = append_query("/v1/agent/spans/summary", params);
+            let report: AgentTraceSummaryReport = client.get_json(&path)?;
+            render_agent_trace_summary(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        AgentTraceSubcommand::Show(args) => {
+            let span: AgentTraceSpan =
+                client.get_json(&format!("/v1/agent/spans/{}", args.span_id))?;
+            render_agent_trace_span(&span, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+    }
+}
+
+fn trace_filter_params(
+    agent: Option<&str>,
+    session: Option<&str>,
+    turn: Option<&str>,
+    trace_id: Option<&str>,
+) -> Vec<String> {
+    let mut params = Vec::new();
+    if let Some(agent) = agent {
+        params.push(format!("agent={agent}"));
+    }
+    if let Some(session) = session {
+        params.push(format!("session={session}"));
+    }
+    if let Some(turn) = turn {
+        params.push(format!("turn={turn}"));
+    }
+    if let Some(trace_id) = trace_id {
+        params.push(format!("trace={trace_id}"));
+    }
+    params
 }
 
 fn handle_merge_queue_command(
@@ -271,6 +782,42 @@ fn handle_merge_queue_command(
             let report: MergeQueueRemoveReport =
                 client.delete_json(&format!("/v1/merge-queue/{}", args.selector))?;
             render_merge_queue_remove(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+    }
+}
+
+fn handle_lease_command(
+    ctx: &RuntimeContext,
+    client: &DaemonClient,
+    lease: &LeaseCommand,
+) -> Result<bool> {
+    match &lease.command {
+        LeaseSubcommand::Acquire(args) => {
+            let body = serde_json::json!({
+                "agent": args.agent,
+                "path": args.path,
+                "mode": args.mode.as_str(),
+                "ttl_secs": args.ttl_secs,
+            });
+            let report: LeaseAcquireReport = client.post_json("/v1/leases", &body)?;
+            render_lease_acquire(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        LeaseSubcommand::List(args) => {
+            let path = if args.all {
+                append_query("/v1/leases", vec!["all=1".to_string()])
+            } else {
+                "/v1/leases".to_string()
+            };
+            let leases: Vec<LeaseRecord> = client.get_json(&path)?;
+            render_lease_list(&leases, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
+        LeaseSubcommand::Release(args) => {
+            let report: LeaseReleaseReport =
+                client.delete_json(&format!("/v1/leases/{}", args.lease_id))?;
+            render_lease_release(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
     }

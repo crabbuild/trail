@@ -303,10 +303,10 @@ impl<S: Store> ParallelRebalancer<S> for DefaultParallelRebalancer {
                 .num_threads(config.max_threads)
                 .build()
                 .map_err(|e| {
-                    Error::Store(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to create thread pool: {}", e),
-                    )))
+                    Error::Store(Box::new(std::io::Error::other(format!(
+                        "Failed to create thread pool: {}",
+                        e
+                    ))))
                 })?;
 
             pool.install(|| {

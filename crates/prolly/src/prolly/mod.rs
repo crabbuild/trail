@@ -1907,10 +1907,10 @@ mod tests {
         assert_eq!(results.len(), 20);
 
         // Verify keys are in order
-        for i in 0..20 {
+        for (i, item) in results.iter().enumerate().take(20) {
             let expected_key = format!("key{:02}", i).into_bytes();
             let expected_val = format!("val{:02}", i).into_bytes();
-            assert_eq!(results[i], (expected_key, expected_val));
+            assert_eq!(item, &(expected_key, expected_val));
         }
     }
 

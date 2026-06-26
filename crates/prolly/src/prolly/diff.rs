@@ -111,6 +111,7 @@ use super::tree::Tree;
 use super::Prolly;
 
 const SPARSE_MERGE_POINT_CHECK_THRESHOLD: usize = 1024;
+type ChildSpanCid<'a> = (Option<&'a [u8]>, Cid);
 
 /// Compute the difference between two trees.
 ///
@@ -903,7 +904,7 @@ fn overlapping_child_cids<'a>(
     span_end: Option<&'a [u8]>,
     range_start: &[u8],
     range_end: Option<&[u8]>,
-) -> Result<Vec<(Option<&'a [u8]>, Cid)>, Error> {
+) -> Result<Vec<ChildSpanCid<'a>>, Error> {
     let mut children = Vec::new();
     for idx in 0..node.len() {
         let child_start = node.keys[idx].as_slice();
@@ -947,7 +948,11 @@ fn span_overlaps_range(
 }
 
 fn key_in_range(key: &[u8], start: &[u8], end: Option<&[u8]>) -> bool {
-    key >= start && end.is_none_or(|end| key < end)
+    key >= start
+        && match end {
+            Some(end) => key < end,
+            None => true,
+        }
 }
 
 fn lower_bound(keys: &[Vec<u8>], key: &[u8]) -> usize {
@@ -1269,11 +1274,11 @@ fn key_is_after_tree<S: Store>(prolly: &Prolly<S>, key: &[u8], tree: &Tree) -> R
 pub fn build_change_map(diffs: &[Diff]) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
     diffs
         .iter()
-        .filter_map(|d| match d {
+        .map(|d| match d {
             Diff::Added { key, val } | Diff::Changed { key, new: val, .. } => {
-                Some((key.clone(), Some(val.clone())))
+                (key.clone(), Some(val.clone()))
             }
-            Diff::Removed { key, .. } => Some((key.clone(), None)),
+            Diff::Removed { key, .. } => (key.clone(), None),
         })
         .collect()
 }
@@ -1634,8 +1639,11 @@ mod tests {
 
         let change_map = build_change_map(&diffs);
 
-        assert_eq!(change_map.get(&b"a".to_vec()), Some(&Some(b"1".to_vec())));
-        assert_eq!(change_map.get(&b"b".to_vec()), Some(&Some(b"new".to_vec())));
-        assert_eq!(change_map.get(&b"c".to_vec()), Some(&None));
+        assert_eq!(change_map.get(b"a".as_slice()), Some(&Some(b"1".to_vec())));
+        assert_eq!(
+            change_map.get(b"b".as_slice()),
+            Some(&Some(b"new".to_vec()))
+        );
+        assert_eq!(change_map.get(b"c".as_slice()), Some(&None));
     }
 }

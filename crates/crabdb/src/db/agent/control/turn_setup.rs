@@ -34,7 +34,7 @@ impl CrabDb {
                 "agent `{agent}` already exists"
             )));
         }
-        let workdir = if self.config.agent.default_materialize {
+        let workdir = if self.default_agent_materialize_for_ref(Some(&source_selector))? {
             let dir = self.materialize_agent_workdir(agent, &source.root_id, None)?;
             Some(dir.to_string_lossy().to_string())
         } else {

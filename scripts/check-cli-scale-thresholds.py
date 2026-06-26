@@ -7,14 +7,27 @@ import sys
 def main() -> int:
     if len(sys.argv) < 3:
         print(
-            "usage: check-cli-scale-thresholds.py RESULTS.tsv name=max_seconds ...",
+            "usage: check-cli-scale-thresholds.py RESULTS.tsv name=max_seconds ... "
+            "[--metrics METRICS.tsv key=max_value ...]",
             file=sys.stderr,
         )
         return 2
 
     results_path = pathlib.Path(sys.argv[1])
+    args = sys.argv[2:]
+    metrics_path = None
+    metric_specs = []
+    if "--metrics" in args:
+        marker = args.index("--metrics")
+        if marker + 1 >= len(args):
+            print("missing METRICS.tsv after --metrics", file=sys.stderr)
+            return 2
+        metrics_path = pathlib.Path(args[marker + 1])
+        metric_specs = args[marker + 2 :]
+        args = args[:marker]
+
     thresholds = {}
-    for spec in sys.argv[2:]:
+    for spec in args:
         if "=" not in spec:
             print(f"invalid threshold `{spec}`; expected name=max_seconds", file=sys.stderr)
             return 2
@@ -23,6 +36,18 @@ def main() -> int:
             thresholds[name] = float(value)
         except ValueError:
             print(f"invalid threshold seconds for `{name}`: {value}", file=sys.stderr)
+            return 2
+
+    metric_thresholds = {}
+    for spec in metric_specs:
+        if "=" not in spec:
+            print(f"invalid metric threshold `{spec}`; expected key=max_value", file=sys.stderr)
+            return 2
+        key, value = spec.split("=", 1)
+        try:
+            metric_thresholds[key] = float(value)
+        except ValueError:
+            print(f"invalid metric threshold value for `{key}`: {value}", file=sys.stderr)
             return 2
 
     with results_path.open(newline="") as handle:
@@ -45,14 +70,43 @@ def main() -> int:
         if seconds > max_seconds:
             failures.append(f"{name}: {seconds:.2f}s > {max_seconds:.2f}s")
 
+    if metrics_path is not None:
+        metrics = read_metrics(metrics_path)
+        for key, max_value in metric_thresholds.items():
+            value = metrics.get(key)
+            if value is None:
+                failures.append(f"{key}: missing from {metrics_path}")
+                continue
+            if value > max_value:
+                failures.append(f"{key}: {value:.0f} > {max_value:.0f}")
+
     if failures:
         print("CLI scale threshold failures:", file=sys.stderr)
         for failure in failures:
             print(f"  - {failure}", file=sys.stderr)
         return 1
 
-    print(f"checked {len(thresholds)} CLI scale thresholds in {results_path}")
+    checked = len(thresholds) + len(metric_thresholds)
+    print(f"checked {checked} CLI scale thresholds")
     return 0
+
+
+def read_metrics(metrics_path: pathlib.Path) -> dict[str, float]:
+    metrics = {}
+    with metrics_path.open(newline="") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                continue
+            key, value = parts
+            try:
+                metrics[key] = float(value)
+            except ValueError:
+                continue
+    return metrics
 
 
 if __name__ == "__main__":

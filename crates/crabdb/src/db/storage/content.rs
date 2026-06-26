@@ -9,7 +9,7 @@ impl CrabDb {
         paths: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
         for path in paths {
             let path = normalize_relative_path(path)?;
@@ -26,7 +26,7 @@ impl CrabDb {
         selections: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
         for selection in selections {
             let selection = normalize_relative_path(selection)?;
@@ -57,7 +57,7 @@ impl CrabDb {
         selections: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
         let mut exact_sources = BTreeMap::new();
         for selection in selections {
@@ -126,7 +126,7 @@ impl CrabDb {
         root_id: &ObjectId,
     ) -> Result<BTreeMap<String, FileEntry>> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let iter = self.root_prolly.range(&tree, &[], None)?;
         let mut out = BTreeMap::new();
         for item in iter {

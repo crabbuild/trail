@@ -22,7 +22,8 @@ impl CrabDb {
                 }
             })
             .transpose()?;
-        let events = self.list_agent_trace_span_events(agent, session_id, turn_id)?;
+        let events =
+            self.list_agent_trace_span_events_filtered(agent, session_id, turn_id, trace_id)?;
         let mut spans = build_agent_trace_spans(events);
         if let Some(trace_id) = trace_id {
             spans.retain(|span| span.trace_id == trace_id);
@@ -62,7 +63,12 @@ impl CrabDb {
             })
             .transpose()?;
 
-        let events = self.list_agent_trace_span_events(agent, session_id, turn_id)?;
+        let events = self.list_agent_trace_span_events_filtered(
+            agent,
+            session_id,
+            turn_id,
+            trace_id.as_deref(),
+        )?;
         let mut spans = build_agent_trace_spans(events);
         if let Some(trace_id) = trace_id.as_deref() {
             spans.retain(|span| span.trace_id == trace_id);
@@ -146,10 +152,34 @@ impl CrabDb {
         if span_id.is_empty() {
             return Err(Error::InvalidInput("span id cannot be empty".to_string()));
         }
+        let indexed_events = self.agent_trace_span_events_for_span_id(span_id)?;
+        if !indexed_events.is_empty() {
+            return build_agent_trace_spans(indexed_events)
+                .into_iter()
+                .find(|span| span.span_id == span_id)
+                .ok_or_else(|| Error::InvalidInput(format!("span `{span_id}` not found")));
+        }
+
         build_agent_trace_spans(self.list_agent_trace_span_events(None, None, None)?)
             .into_iter()
             .find(|span| span.span_id == span_id)
             .ok_or_else(|| Error::InvalidInput(format!("span `{span_id}` not found")))
+    }
+
+    pub(crate) fn agent_trace_span_events_for_span_id(
+        &self,
+        span_id: &str,
+    ) -> Result<Vec<AgentEventRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.event_id, e.agent_id, e.session_id, e.turn_id, e.event_type, e.change_id, e.message_id, e.payload_json, e.created_at \
+             FROM agent_trace_span_events s \
+             JOIN agent_events e ON e.event_id = s.event_id \
+             WHERE s.span_id = ?1 \
+             ORDER BY e.created_at ASC, e.rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![span_id], agent_event_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     pub(crate) fn list_agent_trace_span_events(
@@ -158,6 +188,42 @@ impl CrabDb {
         session_id: Option<&str>,
         turn_id: Option<&str>,
     ) -> Result<Vec<AgentEventRecord>> {
+        self.list_agent_trace_span_events_filtered(agent, session_id, turn_id, None)
+    }
+
+    fn list_agent_trace_span_events_filtered(
+        &self,
+        agent: Option<&str>,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<Vec<AgentEventRecord>> {
+        let filters =
+            self.resolve_agent_trace_span_event_filters(agent, session_id, turn_id, trace_id)?;
+        if filters.trace_id.is_some() {
+            let indexed_events = self.list_agent_trace_span_events_indexed(&filters)?;
+            if !indexed_events.is_empty()
+                || self.agent_trace_span_event_index_matches_raw_events(&filters)?
+            {
+                return Ok(indexed_events);
+            }
+            return self.list_agent_trace_span_events_raw(&filters);
+        }
+
+        if self.agent_trace_span_event_index_matches_raw_events(&filters)? {
+            return self.list_agent_trace_span_events_indexed(&filters);
+        }
+
+        self.list_agent_trace_span_events_raw(&filters)
+    }
+
+    fn resolve_agent_trace_span_event_filters(
+        &self,
+        agent: Option<&str>,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<AgentTraceSpanEventFilters> {
         let agent_id = agent
             .map(|agent| self.agent_branch(agent).map(|branch| branch.agent_id))
             .transpose()?;
@@ -167,18 +233,185 @@ impl CrabDb {
         if let Some(turn_id) = turn_id {
             self.agent_turn(turn_id)?;
         }
+        let trace_id = trace_id
+            .map(str::trim)
+            .map(|trace_id| {
+                if trace_id.is_empty() {
+                    Err(Error::InvalidInput(
+                        "trace id filter cannot be empty".to_string(),
+                    ))
+                } else {
+                    Ok(trace_id.to_string())
+                }
+            })
+            .transpose()?;
 
-        let mut stmt = self.conn.prepare(
-            "SELECT event_id, agent_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
-             FROM agent_events \
-             WHERE (?1 IS NULL OR agent_id = ?1) \
-               AND (?2 IS NULL OR session_id = ?2) \
-               AND (?3 IS NULL OR turn_id = ?3) \
-               AND event_type IN ('span_started', 'span_ended') \
-             ORDER BY created_at ASC, rowid ASC",
+        Ok(AgentTraceSpanEventFilters {
+            agent_id,
+            session_id: session_id.map(str::to_string),
+            turn_id: turn_id.map(str::to_string),
+            trace_id,
+        })
+    }
+
+    fn agent_trace_span_event_index_matches_raw_events(
+        &self,
+        filters: &AgentTraceSpanEventFilters,
+    ) -> Result<bool> {
+        let mut base_filters = filters.clone();
+        base_filters.trace_id = None;
+        Ok(self.count_agent_trace_span_events_raw(&base_filters)?
+            == self.count_agent_trace_span_events_indexed(&base_filters)?)
+    }
+
+    fn count_agent_trace_span_events_raw(
+        &self,
+        filters: &AgentTraceSpanEventFilters,
+    ) -> Result<i64> {
+        let (sql, values) = agent_trace_span_events_sql(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type IN ('span_started', 'span_ended')",
+            "agent_id",
+            "session_id",
+            "turn_id",
+            "trace_id",
+            false,
+            filters,
+        );
+        self.conn
+            .query_row(
+                &sql,
+                params_from_iter(values.iter().map(String::as_str)),
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+    }
+
+    fn count_agent_trace_span_events_indexed(
+        &self,
+        filters: &AgentTraceSpanEventFilters,
+    ) -> Result<i64> {
+        let (sql, values) = agent_trace_span_events_sql(
+            "SELECT COUNT(*) FROM agent_trace_span_events WHERE 1 = 1",
+            "agent_id",
+            "session_id",
+            "turn_id",
+            "trace_id",
+            true,
+            filters,
+        );
+        self.conn
+            .query_row(
+                &sql,
+                params_from_iter(values.iter().map(String::as_str)),
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+    }
+
+    fn list_agent_trace_span_events_indexed(
+        &self,
+        filters: &AgentTraceSpanEventFilters,
+    ) -> Result<Vec<AgentEventRecord>> {
+        let (mut sql, values) = agent_trace_span_events_sql(
+            "SELECT e.event_id, e.agent_id, e.session_id, e.turn_id, e.event_type, e.change_id, e.message_id, e.payload_json, e.created_at \
+             FROM agent_trace_span_events s \
+             JOIN agent_events e ON e.event_id = s.event_id \
+             WHERE 1 = 1",
+            "s.agent_id",
+            "s.session_id",
+            "s.turn_id",
+            "s.trace_id",
+            true,
+            filters,
+        );
+        sql.push_str(" ORDER BY e.created_at ASC, e.rowid ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(values.iter().map(String::as_str)),
+            agent_event_row,
         )?;
-        let rows = stmt.query_map(params![agent_id, session_id, turn_id], agent_event_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
     }
+
+    fn list_agent_trace_span_events_raw(
+        &self,
+        filters: &AgentTraceSpanEventFilters,
+    ) -> Result<Vec<AgentEventRecord>> {
+        let mut sql = "SELECT event_id, agent_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
+             FROM agent_events \
+             WHERE event_type IN ('span_started', 'span_ended')"
+            .to_string();
+        let mut values = Vec::new();
+        if let Some(agent_id) = &filters.agent_id {
+            sql.push_str(" AND agent_id = ?");
+            values.push(agent_id.clone());
+        }
+        if let Some(session_id) = &filters.session_id {
+            sql.push_str(" AND session_id = ?");
+            values.push(session_id.clone());
+        }
+        if let Some(turn_id) = &filters.turn_id {
+            sql.push_str(" AND turn_id = ?");
+            values.push(turn_id.clone());
+        }
+        sql.push_str(" ORDER BY created_at ASC, rowid ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(values.iter().map(String::as_str)),
+            agent_event_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+}
+
+#[derive(Clone)]
+struct AgentTraceSpanEventFilters {
+    agent_id: Option<String>,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    trace_id: Option<String>,
+}
+
+fn agent_trace_span_events_sql(
+    base_sql: &str,
+    agent_column: &str,
+    session_column: &str,
+    turn_column: &str,
+    trace_column: &str,
+    include_trace_id: bool,
+    filters: &AgentTraceSpanEventFilters,
+) -> (String, Vec<String>) {
+    let mut sql = base_sql.to_string();
+    let mut values = Vec::new();
+    if let Some(agent_id) = &filters.agent_id {
+        sql.push_str(" AND ");
+        sql.push_str(agent_column);
+        sql.push_str(" = ?");
+        values.push(agent_id.clone());
+    }
+    if let Some(session_id) = &filters.session_id {
+        sql.push_str(" AND ");
+        sql.push_str(session_column);
+        sql.push_str(" = ?");
+        values.push(session_id.clone());
+    }
+    if let Some(turn_id) = &filters.turn_id {
+        sql.push_str(" AND ");
+        sql.push_str(turn_column);
+        sql.push_str(" = ?");
+        values.push(turn_id.clone());
+    }
+    if include_trace_id {
+        if let Some(trace_id) = &filters.trace_id {
+            sql.push_str(" AND ");
+            sql.push_str(trace_column);
+            sql.push_str(" = ?");
+            values.push(trace_id.clone());
+        }
+    }
+    (sql, values)
 }

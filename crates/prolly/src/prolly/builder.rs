@@ -276,9 +276,9 @@ where
 
             let mut node = new_builder_node(&self.config, false, level);
 
-            for i in start..=end {
-                node.keys.push(children[i].first_key.clone());
-                node.vals.push(children[i].cid.0.to_vec());
+            for child in children.iter().take(end + 1).skip(start) {
+                node.keys.push(child.first_key.clone());
+                node.vals.push(child.cid.0.to_vec());
             }
 
             let first_key = node.keys.first().cloned().unwrap_or_default();

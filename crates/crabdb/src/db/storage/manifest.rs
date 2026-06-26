@@ -7,7 +7,7 @@ impl CrabDb {
         root_id: &ObjectId,
     ) -> Result<Vec<FileDiffSummary>> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut root_iter = self.root_prolly.range(&tree, &[], None)?;
         let mut stmt = self.conn.prepare(
             "SELECT path, kind, executable, content_hash \
@@ -66,7 +66,7 @@ impl CrabDb {
         manifest: &BTreeMap<String, DiskManifest>,
     ) -> Result<Vec<FileDiffSummary>> {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = worktree_root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut root_iter = self.root_prolly.range(&tree, &[], None)?;
         let mut manifest_iter = manifest.iter();
         let mut left = next_root_file(&mut root_iter)?;

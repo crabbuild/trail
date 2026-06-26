@@ -8,8 +8,8 @@ impl CrabDb {
     ) -> Result<Vec<FileDiffSummary>> {
         let left_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, left_root_id)?;
         let right_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, right_root_id)?;
-        let left_tree = worktree_root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
-        let right_tree = worktree_root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
+        let left_tree = root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
+        let right_tree = root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
         let diffs = self
             .root_prolly
             .range_diff(&left_tree, &right_tree, &[], None)?;
@@ -130,8 +130,8 @@ impl CrabDb {
     ) -> Result<RootDiff> {
         let left_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, left_root_id)?;
         let right_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, right_root_id)?;
-        let left_tree = worktree_root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
-        let right_tree = worktree_root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
+        let left_tree = root_map_tree_from_root_hex(left_root.path_map_root.as_deref())?;
+        let right_tree = root_map_tree_from_root_hex(right_root.path_map_root.as_deref())?;
         let diffs = self
             .root_prolly
             .range_diff(&left_tree, &right_tree, &[], None)?;

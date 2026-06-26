@@ -46,6 +46,11 @@ pub(super) fn agent_paths() -> Value {
                 openapi_query("limit", "integer")
             ], None, true)
         },
+        "/v1/agents/{agent_or_id}/workdir": {
+            "get": openapi_operation("agentWorkdir", "Agent workdir", "Return the materialized workdir path for an agent, if one exists.", vec![
+                openapi_path_param("agent_or_id", "string")
+            ], None, true)
+        },
         "/v1/agents/{agent_or_id}/diff": {
             "get": openapi_operation("agentDiff", "Agent diff", "Show the diff from an agent branch base to head.", vec![
                 openapi_path_param("agent_or_id", "string"),

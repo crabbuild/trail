@@ -10,11 +10,11 @@ pub(crate) fn prolly_config() -> Config {
         .build()
 }
 
-pub(crate) fn worktree_root_map_prolly_config() -> Config {
+pub(crate) fn root_map_prolly_config() -> Config {
     Config::builder()
-        .min_chunk_size(16)
-        .max_chunk_size(128)
-        .chunking_factor(64)
+        .min_chunk_size(64)
+        .max_chunk_size(512)
+        .chunking_factor(256)
         .hash_seed(0xC0DB)
         .encoding(Encoding::Raw)
         .build()

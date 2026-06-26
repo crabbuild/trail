@@ -260,12 +260,13 @@ pub type CustomMergeFn = Arc<dyn Fn(&[u8], &[u8], &[u8]) -> Vec<u8> + Send + Syn
 /// Merge strategy for conflict-free merging.
 ///
 /// Determines how conflicts are resolved when both branches modify the same key.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum MergeStrategy {
     /// Last-Writer-Wins: value with higher timestamp wins.
     ///
     /// Requires values to be serialized using [`TimestampedValue`] format,
     /// or a custom timestamp extractor to be provided in [`CrdtConfig`].
+    #[default]
     LastWriterWins,
 
     /// Multi-Value: preserve all concurrent values as a set.
@@ -289,12 +290,6 @@ impl std::fmt::Debug for MergeStrategy {
             MergeStrategy::MultiValue => write!(f, "MultiValue"),
             MergeStrategy::Custom(_) => write!(f, "Custom(<fn>)"),
         }
-    }
-}
-
-impl Default for MergeStrategy {
-    fn default() -> Self {
-        MergeStrategy::LastWriterWins
     }
 }
 
@@ -832,11 +827,11 @@ fn build_tree_from_entries<S: Store>(
         current_node.vals.push(val.clone());
 
         // Check if we should split (using boundary detection)
-        if current_node.keys.len() >= config.min_chunk_size as usize {
+        if current_node.keys.len() >= config.min_chunk_size {
             let last_key = current_node.keys.last().unwrap();
             let last_val = current_node.vals.last().unwrap();
             if is_boundary_config(config, current_node.keys.len(), last_key, last_val)
-                || current_node.keys.len() >= config.max_chunk_size as usize
+                || current_node.keys.len() >= config.max_chunk_size
             {
                 leaf_nodes.push(current_node);
                 current_node = create_leaf_node(config);
@@ -874,11 +869,11 @@ fn build_tree_from_entries<S: Store>(
             current_node.vals.push(cid.as_bytes().to_vec());
 
             // Check if we should split
-            if current_node.keys.len() >= config.min_chunk_size as usize {
+            if current_node.keys.len() >= config.min_chunk_size {
                 let last_key = current_node.keys.last().unwrap();
                 let last_val = current_node.vals.last().unwrap();
                 if is_boundary_config(config, current_node.keys.len(), last_key, last_val)
-                    || current_node.keys.len() >= config.max_chunk_size as usize
+                    || current_node.keys.len() >= config.max_chunk_size
                 {
                     let bytes = current_node.to_bytes();
                     let node_cid = Cid::from_bytes(&bytes);

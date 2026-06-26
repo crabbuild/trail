@@ -269,14 +269,14 @@ impl PartialEq for TreeStats {
                 other
                     .avg_node_size_per_level
                     .get(k)
-                    .map_or(false, |ov| float_eq(*v, *ov))
+                    .is_some_and(|ov| float_eq(*v, *ov))
             })
             && self.avg_entries_per_level.len() == other.avg_entries_per_level.len()
             && self.avg_entries_per_level.iter().all(|(k, v)| {
                 other
                     .avg_entries_per_level
                     .get(k)
-                    .map_or(false, |ov| float_eq(*v, *ov))
+                    .is_some_and(|ov| float_eq(*v, *ov))
             })
             && self.min_entries_per_level == other.min_entries_per_level
             && self.max_entries_per_level == other.max_entries_per_level

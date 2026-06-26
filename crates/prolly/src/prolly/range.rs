@@ -85,6 +85,8 @@ use super::tree::Tree;
 
 use super::Prolly;
 
+type RangeItem = Result<(Vec<u8>, Vec<u8>), Error>;
+
 /// Create a range iterator over key-value pairs.
 ///
 /// Returns an iterator that yields `(key, value)` pairs in lexicographic order,
@@ -157,7 +159,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
     ///
     /// Called on the first iteration to find the correct starting position
     /// in the leaf node.
-    fn position_at_start(&mut self) -> Option<Result<(Vec<u8>, Vec<u8>), Error>> {
+    fn position_at_start(&mut self) -> Option<RangeItem> {
         self.started = true;
 
         // If stack is empty, tree is empty
@@ -206,7 +208,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
     ///
     /// Follows child pointers until reaching a leaf node, then returns
     /// the first entry from that leaf.
-    fn descend_to_leaf(&mut self) -> Option<Result<(Vec<u8>, Vec<u8>), Error>> {
+    fn descend_to_leaf(&mut self) -> Option<RangeItem> {
         loop {
             let (node, idx) = self.stack.last()?;
 
@@ -259,7 +261,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
     ///
     /// Pops nodes from the stack until finding a parent with more children,
     /// then descends to the next child's leftmost leaf.
-    fn advance_to_next_leaf(&mut self) -> Option<Result<(Vec<u8>, Vec<u8>), Error>> {
+    fn advance_to_next_leaf(&mut self) -> Option<RangeItem> {
         loop {
             // Pop the current node
             self.stack.pop();

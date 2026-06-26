@@ -35,9 +35,9 @@ impl CrabDb {
         let mut files = BTreeMap::new();
         let mut disk_manifest = BTreeMap::new();
         let mut path_builder =
-            SortedBatchBuilder::new(self.store.clone(), worktree_root_map_prolly_config());
+            SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
         let mut file_index_builder =
-            SortedBatchBuilder::new(self.store.clone(), worktree_root_map_prolly_config());
+            SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
         let mut file_seq = 1;
         let mut line_seq = 1;
         let mut stats = ImportStats::default();
@@ -96,10 +96,9 @@ impl CrabDb {
         change_id: &ChangeId,
     ) -> Result<GitTrackedRootBuildResult> {
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let mut path_tree =
-            worktree_root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
+        let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
-            worktree_root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
+            root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
         let previous_tree = path_tree.clone();
         let new_paths = paths.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut previous_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
@@ -376,10 +375,9 @@ impl CrabDb {
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let mut path_tree =
-            worktree_root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
+        let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
-            worktree_root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
+            root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
         let mut file_count = previous_root.file_count as i128;
         let mut total_text_bytes = previous_root.total_text_bytes as i128;
         let selected_disk_files = disk_files
@@ -509,10 +507,9 @@ impl CrabDb {
         change_id: &ChangeId,
     ) -> Result<IncrementalRootBuildResult> {
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let mut path_tree =
-            worktree_root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
+        let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
-            worktree_root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
+            root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
         let mut file_count = previous_root.file_count as i128;
         let mut total_text_bytes = previous_root.total_text_bytes as i128;
 
@@ -596,9 +593,9 @@ impl CrabDb {
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
         let mut path_builder =
-            SortedBatchBuilder::new(self.store.clone(), worktree_root_map_prolly_config());
+            SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
         let mut file_index_builder =
-            BatchBuilder::new(self.store.clone(), worktree_root_map_prolly_config());
+            BatchBuilder::new(self.store.clone(), root_map_prolly_config());
         for (path, entry) in &files {
             path_builder.add(path.as_bytes().to_vec(), cbor(entry)?)?;
             file_index_builder.add(entry.file_id.encode_key(), path.as_bytes().to_vec());

@@ -9,6 +9,15 @@ use super::encoding::{
 };
 use super::error::Error;
 
+const COMPACT_MAGIC: &[u8; 4] = b"CRAB";
+const COMPACT_VERSION: u64 = 1;
+const ENCODING_RAW: u8 = 0;
+const ENCODING_CBOR: u8 = 1;
+const ENCODING_JSON: u8 = 2;
+const ENCODING_CUSTOM: u8 = 3;
+const INTERNAL_VALUE_CID: u8 = 0;
+const INTERNAL_VALUE_BYTES: u8 = 1;
+
 /// A node in the Prolly Tree
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
@@ -84,19 +93,265 @@ impl Node {
         self.keys.binary_search_by(|k| k.as_slice().cmp(key))
     }
 
-    /// Serialize to bytes (deterministic CBOR)
+    /// Serialize to compact, deterministic bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_cbor::ser::to_vec_packed(self).expect("serialization should not fail")
+        self.to_compact_bytes()
     }
 
-    /// Deserialize from bytes
+    /// Deserialize from compact bytes, falling back to legacy CBOR.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
+        if data.starts_with(COMPACT_MAGIC) {
+            return Self::from_compact_bytes(data);
+        }
+
         serde_cbor::from_slice(data).map_err(|e| Error::Deserialize(e.to_string()))
     }
 
     /// Compute CID of this node
     pub fn cid(&self) -> Cid {
         Cid::from_bytes(&self.to_bytes())
+    }
+
+    fn to_compact_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(COMPACT_MAGIC);
+        write_varint(COMPACT_VERSION, &mut out);
+        write_varint(if self.leaf { 1 } else { 0 }, &mut out);
+        write_varint(self.level as u64, &mut out);
+        write_varint(self.min_chunk_size as u64, &mut out);
+        write_varint(self.max_chunk_size as u64, &mut out);
+        write_varint(self.chunking_factor as u64, &mut out);
+        write_varint(self.hash_seed, &mut out);
+        write_encoding(&self.encoding, &mut out);
+        write_varint(self.keys.len() as u64, &mut out);
+
+        let mut previous_key: &[u8] = &[];
+        for (key, val) in self.keys.iter().zip(&self.vals) {
+            let shared = common_prefix_len(previous_key, key);
+            let suffix = &key[shared..];
+            write_varint(shared as u64, &mut out);
+            write_varint(suffix.len() as u64, &mut out);
+            out.extend_from_slice(suffix);
+
+            if self.leaf {
+                write_varint(val.len() as u64, &mut out);
+                out.extend_from_slice(val);
+            } else if val.len() == 32 {
+                out.push(INTERNAL_VALUE_CID);
+                out.extend_from_slice(val);
+            } else {
+                out.push(INTERNAL_VALUE_BYTES);
+                write_varint(val.len() as u64, &mut out);
+                out.extend_from_slice(val);
+            }
+
+            previous_key = key;
+        }
+
+        out
+    }
+
+    fn from_compact_bytes(data: &[u8]) -> Result<Self, Error> {
+        let mut cursor = CompactCursor::new(data);
+        cursor.expect_magic()?;
+        let version = cursor.read_varint()?;
+        if version != COMPACT_VERSION {
+            return Err(compact_error(format!(
+                "unsupported compact node version {version}"
+            )));
+        }
+
+        let leaf = match cursor.read_varint()? {
+            0 => false,
+            1 => true,
+            other => return Err(compact_error(format!("invalid leaf flag {other}"))),
+        };
+        let level = cursor.read_u8_varint("level")?;
+        let min_chunk_size = cursor.read_usize("min_chunk_size")?;
+        let max_chunk_size = cursor.read_usize("max_chunk_size")?;
+        let chunking_factor = cursor.read_u32("chunking_factor")?;
+        let hash_seed = cursor.read_varint()?;
+        let encoding = cursor.read_encoding()?;
+        let entry_count = cursor.read_usize("entry_count")?;
+
+        let mut keys = Vec::with_capacity(entry_count);
+        let mut vals = Vec::with_capacity(entry_count);
+        let mut previous_key = Vec::new();
+
+        for _ in 0..entry_count {
+            let shared = cursor.read_usize("shared key prefix length")?;
+            if shared > previous_key.len() {
+                return Err(compact_error("shared key prefix exceeds previous key"));
+            }
+            let suffix_len = cursor.read_usize("key suffix length")?;
+            let suffix = cursor.read_bytes(suffix_len)?.to_vec();
+            let mut key = previous_key[..shared].to_vec();
+            key.extend_from_slice(&suffix);
+
+            let val = if leaf {
+                let value_len = cursor.read_usize("value length")?;
+                cursor.read_bytes(value_len)?.to_vec()
+            } else {
+                match cursor.read_byte()? {
+                    INTERNAL_VALUE_CID => cursor.read_bytes(32)?.to_vec(),
+                    INTERNAL_VALUE_BYTES => {
+                        let value_len = cursor.read_usize("internal value length")?;
+                        cursor.read_bytes(value_len)?.to_vec()
+                    }
+                    tag => return Err(compact_error(format!("invalid internal value tag {tag}"))),
+                }
+            };
+
+            previous_key = key.clone();
+            keys.push(key);
+            vals.push(val);
+        }
+
+        if !cursor.is_done() {
+            return Err(compact_error("trailing bytes in compact node"));
+        }
+
+        Ok(Self {
+            keys,
+            vals,
+            leaf,
+            level,
+            min_chunk_size,
+            max_chunk_size,
+            chunking_factor,
+            hash_seed,
+            encoding,
+        })
+    }
+}
+
+fn compact_error(message: impl Into<String>) -> Error {
+    Error::Deserialize(format!("compact node: {}", message.into()))
+}
+
+fn write_encoding(encoding: &Encoding, out: &mut Vec<u8>) {
+    match encoding {
+        Encoding::Raw => out.push(ENCODING_RAW),
+        Encoding::Cbor => out.push(ENCODING_CBOR),
+        Encoding::Json => out.push(ENCODING_JSON),
+        Encoding::Custom(name) => {
+            out.push(ENCODING_CUSTOM);
+            write_varint(name.len() as u64, out);
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+}
+
+fn write_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+struct CompactCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CompactCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn expect_magic(&mut self) -> Result<(), Error> {
+        if self.data.len() < COMPACT_MAGIC.len()
+            || &self.data[..COMPACT_MAGIC.len()] != COMPACT_MAGIC
+        {
+            return Err(compact_error("missing compact node magic"));
+        }
+        self.pos = COMPACT_MAGIC.len();
+        Ok(())
+    }
+
+    fn read_encoding(&mut self) -> Result<Encoding, Error> {
+        match self.read_byte()? {
+            ENCODING_RAW => Ok(Encoding::Raw),
+            ENCODING_CBOR => Ok(Encoding::Cbor),
+            ENCODING_JSON => Ok(Encoding::Json),
+            ENCODING_CUSTOM => {
+                let len = self.read_usize("custom encoding length")?;
+                let bytes = self.read_bytes(len)?;
+                let name = String::from_utf8(bytes.to_vec())
+                    .map_err(|e| compact_error(format!("custom encoding is not UTF-8: {e}")))?;
+                Ok(Encoding::Custom(name))
+            }
+            tag => Err(compact_error(format!("invalid encoding tag {tag}"))),
+        }
+    }
+
+    fn read_u8_varint(&mut self, field: &str) -> Result<u8, Error> {
+        let value = self.read_varint()?;
+        u8::try_from(value).map_err(|_| compact_error(format!("{field} exceeds u8")))
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, Error> {
+        let value = self.read_varint()?;
+        u32::try_from(value).map_err(|_| compact_error(format!("{field} exceeds u32")))
+    }
+
+    fn read_usize(&mut self, field: &str) -> Result<usize, Error> {
+        let value = self.read_varint()?;
+        usize::try_from(value).map_err(|_| compact_error(format!("{field} exceeds usize")))
+    }
+
+    fn read_varint(&mut self) -> Result<u64, Error> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+
+        for _ in 0..10 {
+            let byte = self.read_byte()?;
+            let part = u64::from(byte & 0x7f);
+            if shift == 63 && part > 1 {
+                return Err(compact_error("varint overflow"));
+            }
+            value |= part << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+
+        Err(compact_error("varint overflow"))
+    }
+
+    fn read_byte(&mut self) -> Result<u8, Error> {
+        let byte = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| compact_error("unexpected end of bytes"))?;
+        self.pos += 1;
+        Ok(byte)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| compact_error("byte range overflow"))?;
+        let bytes = self
+            .data
+            .get(self.pos..end)
+            .ok_or_else(|| compact_error("unexpected end of bytes"))?;
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn is_done(&self) -> bool {
+        self.pos == self.data.len()
     }
 }
 
@@ -272,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_roundtrip() {
+    fn compact_leaf_serialization_roundtrip() {
         let node = Node::builder()
             .keys(vec![b"key1".to_vec(), b"key2".to_vec()])
             .vals(vec![b"val1".to_vec(), b"val2".to_vec()])
@@ -281,12 +536,37 @@ mod tests {
             .build();
 
         let bytes = node.to_bytes();
+        assert!(bytes.starts_with(COMPACT_MAGIC));
         let restored = Node::from_bytes(&bytes).unwrap();
         assert_eq!(node, restored);
     }
 
     #[test]
-    fn packed_serialization_reads_legacy_cbor_and_reduces_size() {
+    fn compact_internal_serialization_roundtrip() {
+        let mut cid_a = [0u8; 32];
+        cid_a[0] = 1;
+        let mut cid_b = [0u8; 32];
+        cid_b[0] = 2;
+        let node = Node::builder()
+            .keys(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .vals(vec![cid_a.to_vec(), cid_b.to_vec(), b"fallback".to_vec()])
+            .leaf(false)
+            .level(1)
+            .min_chunk_size(2)
+            .max_chunk_size(128)
+            .chunking_factor(64)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build();
+
+        let bytes = node.to_bytes();
+        assert!(bytes.starts_with(COMPACT_MAGIC));
+        let restored = Node::from_bytes(&bytes).unwrap();
+        assert_eq!(node, restored);
+    }
+
+    #[test]
+    fn compact_serialization_reads_legacy_cbor_and_reduces_size() {
         let node = Node::builder()
             .keys(vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()])
             .vals(vec![b"val1".to_vec(), b"val2".to_vec(), b"val3".to_vec()])
@@ -300,11 +580,55 @@ mod tests {
             .build();
 
         let legacy_bytes = serde_cbor::to_vec(&node).unwrap();
-        let packed_bytes = node.to_bytes();
+        let legacy_packed_bytes = serde_cbor::ser::to_vec_packed(&node).unwrap();
+        let compact_bytes = node.to_bytes();
 
         assert_eq!(Node::from_bytes(&legacy_bytes).unwrap(), node);
-        assert_eq!(Node::from_bytes(&packed_bytes).unwrap(), node);
-        assert!(packed_bytes.len() < legacy_bytes.len());
+        assert_eq!(Node::from_bytes(&legacy_packed_bytes).unwrap(), node);
+        assert_eq!(Node::from_bytes(&compact_bytes).unwrap(), node);
+        assert!(compact_bytes.len() < legacy_bytes.len());
+    }
+
+    #[test]
+    fn malformed_compact_serialization_returns_error() {
+        assert!(Node::from_bytes(COMPACT_MAGIC).is_err());
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(COMPACT_MAGIC);
+        bytes.push(99);
+        assert!(Node::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn compact_serialization_prefix_compresses_path_like_keys() {
+        let keys = (0..32)
+            .map(|i| format!("crates/crabdb/src/db/storage/path/to/file_{i:04}.rs").into_bytes())
+            .collect::<Vec<_>>();
+        let vals = (0..32)
+            .map(|i| format!("value-{i:04}").into_bytes())
+            .collect::<Vec<_>>();
+        let node = Node::builder()
+            .keys(keys)
+            .vals(vals)
+            .leaf(true)
+            .level(0)
+            .min_chunk_size(16)
+            .max_chunk_size(512)
+            .chunking_factor(256)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build();
+
+        let legacy_packed_bytes = serde_cbor::ser::to_vec_packed(&node).unwrap();
+        let compact_bytes = node.to_bytes();
+
+        assert_eq!(Node::from_bytes(&compact_bytes).unwrap(), node);
+        assert!(
+            compact_bytes.len() < legacy_packed_bytes.len(),
+            "compact={} legacy_packed={}",
+            compact_bytes.len(),
+            legacy_packed_bytes.len()
+        );
     }
 
     #[test]

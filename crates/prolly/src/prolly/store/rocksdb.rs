@@ -8,7 +8,7 @@ use rocksdb::{DBCompressionType, Options, WriteBatch, DB};
 use super::{BatchOp, Store};
 
 /// Compression type for RocksDB
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionType {
     /// No compression
     None,
@@ -17,17 +17,12 @@ pub enum CompressionType {
     /// Zlib compression (slower, better compression)
     Zlib,
     /// LZ4 compression (very fast, good compression)
+    #[default]
     Lz4,
     /// LZ4HC compression (slower than LZ4, better compression)
     Lz4hc,
     /// Zstd compression (good balance of speed and compression)
     Zstd,
-}
-
-impl Default for CompressionType {
-    fn default() -> Self {
-        CompressionType::Lz4
-    }
 }
 
 impl From<CompressionType> for DBCompressionType {

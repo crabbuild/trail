@@ -95,6 +95,10 @@ pub(super) fn handle_agent_resources(
                 let report = db.agent_handoff(&agent, query_usize(query, "limit", 50)?)?;
                 json_response(200, "OK", &report)?
             }
+            "workdir" => {
+                let report = db.agent_workdir(&agent)?;
+                json_response(200, "OK", &report)?
+            }
             "diff" => {
                 let diff = db.diff_agent_with_options(
                     &agent,

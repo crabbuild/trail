@@ -290,7 +290,7 @@ impl CrabDb {
             "version": 1,
             "materialized_paths": normalized.into_iter().collect::<Vec<_>>()
         });
-        fs::write(manifest, serde_json::to_vec_pretty(&body)?)?;
+        fs::write(manifest, serde_json::to_vec(&body)?)?;
         Ok(())
     }
 

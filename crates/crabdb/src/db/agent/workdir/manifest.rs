@@ -155,7 +155,7 @@ impl CrabDb {
             root_id: root_id.0.clone(),
             files: entries,
         };
-        fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+        fs::write(path, serde_json::to_vec(&manifest)?)?;
         Ok(())
     }
 
@@ -310,7 +310,7 @@ impl CrabDb {
             root_id: root_id.0.clone(),
             files: entries,
         };
-        fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+        fs::write(path, serde_json::to_vec(&manifest)?)?;
         Ok(())
     }
 

@@ -8,8 +8,8 @@ pub(crate) fn tree_from_root_hex(root: Option<&str>) -> Result<Tree> {
     tree_from_root_hex_with_config(root, prolly_config())
 }
 
-pub(crate) fn worktree_root_map_tree_from_root_hex(root: Option<&str>) -> Result<Tree> {
-    tree_from_root_hex_with_config(root, worktree_root_map_prolly_config())
+pub(crate) fn root_map_tree_from_root_hex(root: Option<&str>) -> Result<Tree> {
+    tree_from_root_hex_with_config(root, root_map_prolly_config())
 }
 
 fn tree_from_root_hex_with_config(root: Option<&str>, config: Config) -> Result<Tree> {

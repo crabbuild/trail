@@ -32,17 +32,37 @@ impl CrabDb {
             })
             .transpose()?;
 
-        let mut stmt = self.conn.prepare(
-            "SELECT event_id, agent_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
-             FROM agent_events \
-             WHERE (?1 IS NULL OR agent_id = ?1) \
-               AND (?2 IS NULL OR session_id = ?2) \
-               AND (?3 IS NULL OR turn_id = ?3) \
-               AND (?4 IS NULL OR event_type = ?4) \
-             ORDER BY created_at DESC, rowid DESC LIMIT ?5",
-        )?;
+        let mut sql = "SELECT event_id, agent_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
+             FROM agent_events"
+            .to_string();
+        let mut filters = Vec::new();
+        let mut values = Vec::new();
+        if let Some(agent_id) = agent_id {
+            filters.push("agent_id = ?");
+            values.push(agent_id);
+        }
+        if let Some(session_id) = session_id {
+            filters.push("session_id = ?");
+            values.push(session_id.to_string());
+        }
+        if let Some(turn_id) = turn_id {
+            filters.push("turn_id = ?");
+            values.push(turn_id.to_string());
+        }
+        if let Some(event_type) = event_type {
+            filters.push("event_type = ?");
+            values.push(event_type.to_string());
+        }
+        if !filters.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filters.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC, rowid DESC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![agent_id, session_id, turn_id, event_type, limit as i64],
+            params_from_iter(values.iter().map(String::as_str)),
             agent_event_row,
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

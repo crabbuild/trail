@@ -1,0 +1,175 @@
+# Performance and Scale Benchmarks
+
+Use the CLI scale benchmark to verify large-repo and agent orchestration behavior before treating a change as production ready.
+
+## CI Smoke
+
+```sh
+make bench-cli-scale-smoke
+```
+
+The smoke target defaults to 1,000 synthetic files and is intended for pull-request CI. It exercises init, clean and dirty status, dirty diff, record, no-materialize agent patching, sparse and materialized workdirs, merge queue, daemon hot-path calls, Git import/update, index rebuild, GC dry-run, and backup create/verify. CI also checks selected wall-time and storage ceilings with:
+
+```sh
+python3 scripts/check-cli-scale-thresholds.py <results.tsv> name=max_seconds ... --metrics <metrics.tsv> key=max_value ...
+```
+
+## Local and Large Runs
+
+```sh
+make bench-cli-scale
+make bench-cli-scale-large
+make bench-cli-scale-nightly
+make bench-cli-scale-1m-headless
+```
+
+Defaults:
+
+- `bench-cli-scale`: 10,000 files under `/Volumes/Workspace`.
+- `bench-cli-scale-large`: 100,000 files under `/Volumes/Workspace`.
+- `bench-cli-scale-nightly`: 10,000, 100,000, and 1,000,000 files.
+- `bench-cli-scale-1m-headless`: 1,000,000 files without backup or materialized-workdir cases.
+
+Override scale and location with:
+
+```sh
+CRABDB_SCALE_FILES=10000,100000,1000000 \
+CRABDB_SCALE_BASE=/Volumes/Workspace \
+CRABDB_SCALE_LABEL=manual-scale \
+scripts/cli-scale-bench.sh
+```
+
+Optional toggles:
+
+- `CRABDB_SCALE_MATERIALIZED=0|1`
+- `CRABDB_SCALE_BACKUP=0|1`
+- `CRABDB_SCALE_DAEMON=0|1`
+- `CRABDB_SCALE_GIT_IMPORT=0|1`
+
+## Output
+
+Each scale writes:
+
+- `results.tsv`: command name, wall time, maximum RSS, and exit code.
+- `metrics.tsv`: source file count, source bytes, SQLite bytes, object count, object-kind bytes, SQLite `dbstat` bytes, daemon RSS, and clean/sparse workdir manifest bytes.
+- `out/*.stdout` and `out/*.stderr`: captured command output.
+
+Important storage signals:
+
+- `sqlite_bytes`
+- `object_kind_repo_TextContent_bytes`
+- `dbstat_repo_prolly_nodes`
+- `manifest_repo_clean_workdir_bytes`
+- `manifest_repo_sparse_workdir_bytes`
+
+Important hot-path rows:
+
+- `status_clean`
+- `status_dirty`
+- `diff_dirty`
+- `git_dirty_status`
+- `git_dirty_diff`
+- `git_dirty_record`
+- `git_status_after_dirty_record`
+- `daemon_wait_for_health`
+- `daemon_wait_for_hot_cache`
+- `daemon_persisted_snapshot_status`
+- `daemon_persisted_snapshot_record_clean`
+- `daemon_persisted_snapshot_diff_dirty`
+- `agent_apply_patch`
+- `agent_readiness`
+- `merge_queue_run`
+- `daemon_cli_status`
+- `daemon_cli_session_start`
+- `daemon_cli_approval_request`
+- `daemon_cli_lease_acquire`
+- `daemon_cli_agent_readiness`
+- `daemon_cli_agent_trace_summary`
+- `daemon_cli_timeline`
+- `daemon_cli_why`
+- `daemon_cli_history`
+- `daemon_cli_code_from`
+
+`git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_persisted_snapshot_*` rows hide daemon endpoint discovery while keeping the live daemon process and persisted watcher snapshot, so they verify separate CrabDB handles can avoid the full direct fallback without using HTTP RPC. Use `daemon_cli_*` rows for repeated agent-command hot paths.
+
+## Current Evidence
+
+The latest local `/Volumes/Workspace` runs were measured on June 25, 2026 with the release binary:
+
+| Scale | Init | Direct clean status | Direct dirty diff | Direct dirty record | Daemon status | Daemon CLI record | Agent patch | Agent readiness | Merge apply |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10k files | 1.29s | 0.06s | 0.71s | 0.60s | 0.05s | 0.21s | 0.33s | 0.02s | 0.14s |
+| 100k files | 29.59s | 0.43s | 1.86s | 1.65s | 0.07s | 0.67s | 0.63s | 0.03s | 0.30s |
+| 1M files | 418.39s | 24.94s | 31.16s | 30.55s | 0.11s | 0.80s | 0.78s | 0.05s | 0.44s |
+
+The fresh 100k run at `/Volumes/Workspace/crabdb-cli-scale-codex-100k-git-daemon-20260625/100000` used no backup or materialized-workdir cases and passed 31 threshold checks. Its Git fallback rows measured `git_dirty_status=1.52s`, `git_dirty_diff=2.52s`, `git_dirty_record=1.86s`, and `git_status_after_dirty_record=0.90s`. Its persisted daemon snapshot rows measured `daemon_persisted_snapshot_status=0.01s`, `daemon_persisted_snapshot_record_clean=0.01s`, and `daemon_persisted_snapshot_diff_dirty=0.65s`.
+
+The fresh 1M Git+daemon run at `/Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000` used no backup or materialized-workdir cases. It produced 1,000,029 source files, 75.9 MiB source bytes, 1.46 GiB SQLite, 1,000,460 objects, 452.5 MiB `TextContent` object bytes, and 667.5 MiB `repo_prolly_nodes` bytes. It passed 31 calibrated hot-path and storage threshold checks:
+
+```sh
+python3 scripts/check-cli-scale-thresholds.py \
+  /Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000/results.tsv \
+  daemon_wait_for_health=60 daemon_wait_for_hot_cache=120 \
+  daemon_status=5 daemon_persisted_snapshot_status=5 \
+  daemon_persisted_snapshot_record_clean=5 daemon_persisted_snapshot_diff_dirty=10 \
+  daemon_cli_status=5 daemon_cli_record_dirty=10 \
+  daemon_cli_agent_readiness=5 daemon_cli_agent_trace_summary=5 \
+  daemon_cli_merge_dry_run=10 daemon_cli_session_start=10 \
+  daemon_cli_approval_request=10 daemon_cli_lease_acquire=10 \
+  daemon_cli_timeline=10 daemon_cli_why=10 daemon_cli_history=10 \
+  daemon_cli_code_from=10 agent_apply_patch=10 agent_readiness=10 \
+  merge_agent_dry_run=10 merge_agent_apply=10 merge_queue_run=10 \
+  git_dirty_status=120 git_dirty_diff=120 git_dirty_record=120 \
+  git_status_after_dirty_record=90 \
+  --metrics /Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000/metrics.tsv \
+  sqlite_bytes=4000000000 dbstat_repo_prolly_nodes=2500000000 \
+  object_kind_repo_TextContent_bytes=1200000000 object_count=2000000
+```
+
+The 1M artifact contains one obsolete failed `daemon_cli_doctor` row from before that auxiliary probe was removed from the harness. The rows after it were completed with a daemon continuation run and metrics were generated afterward. The measured rows are the important signal: direct cold `status`/`diff --dirty`/`record` were 24.94s, 31.16s, and 30.55s; Git fallback `status`/`diff --dirty`/`record` were 89.03s, 87.42s, and 88.84s; daemon `status`, persisted-snapshot `status`, persisted-snapshot clean `record`, persisted-snapshot dirty `diff --dirty`, and daemon CLI dirty `record` were 0.11s, 0.01s, 0.00s, 1.67s, and 0.80s. This validates the daemon snapshot path as the production large-repo loop and the Git path as a correctness fallback rather than a 1M hot path.
+
+The compact prolly-node slice was measured on June 25, 2026 after switching newly written nodes to the `CRAB` binary encoding and widening the root-map fanout to min/max/chunking-factor `64/512/256`. The standalone SQLite prolly bench was run with `PROLLY_SQLITE_SCALE_STAGES=1000,100000 cargo bench -p prolly --features sqlite --bench sqlite_scale_bench` because SQLite support remains an optional `prolly` feature:
+
+| Target records | Total records | DB bytes | Bytes/record | Stage time | Reopen verified |
+| ---: | ---: | ---: | ---: | ---: | :---: |
+| 1,000 | 1,000 | 98,696 | 98.70 | 0.699ms | yes |
+| 100,000 | 100,000 | 3,897,336 | 38.97 | 52.729ms | yes |
+
+The end-to-end CLI smoke was also run at 1k and 100k files with no backup or materialized-workdir cases:
+
+| Scale | Source bytes | SQLite bytes | `repo_prolly_nodes` | `TextContent` bytes | Init | Direct clean status | Direct dirty diff | Direct dirty record | Daemon status | Daemon CLI record | Agent patch | Agent readiness | Merge apply |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k files | 73,759 | 10,895,360 | 8,916,992 | 460,369 | 0.31s | 0.02s | 0.05s | 0.05s | 0.05s | 0.01s | 0.02s | 0.00s | 0.01s |
+| 100k files | 7,496,402 | 279,113,728 | 191,139,840 | 45,043,050 | 11.23s | 0.49s | 1.42s | 1.36s | 0.05s | 0.20s | 0.41s | 0.03s | 0.24s |
+
+## Production Recommendation
+
+Large agent orchestration should use the daemon and no-materialize/sparse workdirs by default. The production hot path is:
+
+- Spawn agents without full materialization unless a task explicitly needs filesystem access.
+- Prefer structured patches, MCP/API file reads, readiness, merge preflight, and merge queue operations over full worktree scans.
+- If filesystem access is needed, materialize selected paths with `--paths` and hydrate more paths lazily through `agent read`.
+- Keep the daemon running for repeated CLI calls so status, record, trace, gate, handoff, and merge queue commands use a hot SQLite connection and watcher-backed dirty path cache.
+- Separate CrabDB handles can reuse the daemon's watcher-backed dirty snapshot only while the persisted snapshot is initialized, belongs to the same workspace, and the daemon PID is still alive. If the snapshot is missing, stale, overflowed, or too large, commands fall back to Git dirty paths when a committed Git baseline is available, then to the full persisted-index scan.
+
+## Known Limits
+
+Direct non-daemon `status`, `diff --dirty`, and `record` still fall back to a full filesystem walk plus root/index comparison when there is no valid live daemon snapshot. At 1M files those direct commands measured roughly 25-33s. The Git dirty-path fallback is correct and useful for smaller committed repositories, but the fresh 1M fixture measured roughly 56-89s for Git fallback status/diff/record rows because Git itself had to inspect a 1M-file index. Both paths should be treated as fallbacks for large repos, not the production agent loop.
+
+A read-only component probe on the saved 1M artifact also showed why direct cold status cannot become a millisecond path without a trusted change source: walking and stating 1,000,029 visible files took 54.20s in a Python probe, while loading all `worktree_file_index` rows took 2.84s and 100k indexed point lookups took 0.38s. The dominant cost is discovering whether the filesystem changed, not fetching indexed metadata. The daemon's watcher-backed persisted snapshot is the production mechanism that avoids that discovery scan.
+
+The next storage target is reducing prolly-node and `TextContent` amplification further. `SmallTextTable` is active for small text, and compact `CRAB` prolly nodes plus wider root-map fanout are active for newly written nodes, but the measured 100k run still shows 191.1 MiB of `repo_prolly_nodes` for 7.5 MiB of source bytes. Zstd for cold nodes and global path-component interning remain deferred until the compact encoding slice is compared against larger saved-repo baselines.
+
+## Measured Non-Solutions
+
+Do not try to fix 1M direct status by replacing each `worktree_file_index` point lookup with bounded `WHERE path IN (...)` batches. A 512-path bounded-batch experiment still had to stat every file and measured 49.93s with about 633 MiB RSS on the saved 1M repo, worse than the prior direct status baseline. The direct-path fix needs a watcher-backed persisted changed-path generation, Git-index integration, or another design that avoids walking/stating every file when the tree is clean.
+
+Do not replace the point lookup loop with an eager sorted filesystem snapshot plus sorted index merge unless it also avoids holding both sides in memory. A release-build experiment on the saved 1M repo collected all scanned paths, parallel-statted them, loaded the stored index, sorted/merged both sides, and then ran direct `status`. It measured 38.31s with about 645 MiB max RSS and reported 75 dirty paths, also worse than the prior direct fallback baseline.
+
+## Code Facts Used
+
+- Benchmark harness: `scripts/cli-scale-bench.sh`
+- Threshold checker: `scripts/check-cli-scale-thresholds.py`
+- Make targets: `Makefile`
+- CI workflow: `.github/workflows/ci.yml`
+- Nightly/manual workflow: `.github/workflows/scale.yml`

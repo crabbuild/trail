@@ -92,6 +92,23 @@ object_count() {
   fi
 }
 
+object_kind_stats() {
+  local repo="$1"
+  local prefix="$2"
+  local db="$repo/.crabdb/index/crabdb.sqlite"
+  if [ -f "$db" ]; then
+    sqlite3 "$db" \
+      'SELECT kind, COUNT(*), COALESCE(SUM(size_bytes), 0) FROM objects GROUP BY kind ORDER BY kind;' \
+      2>/dev/null \
+      | awk -F '|' -v prefix="$prefix" '{
+          name = $1
+          gsub(/[^A-Za-z0-9_.-]/, "_", name)
+          print "object_kind_" prefix "_" name "_count\t" $2
+          print "object_kind_" prefix "_" name "_bytes\t" $3
+        }'
+  fi
+}
+
 dbstat_bytes() {
   local repo="$1"
   local prefix="$2"
@@ -106,6 +123,33 @@ dbstat_bytes() {
           print "dbstat_" prefix "_" name "\t" $2
         }'
   fi
+}
+
+workdir_manifest_bytes() {
+  local repo="$1"
+  local prefix="$2"
+  python3 - "$repo" "$prefix" <<'PY'
+import pathlib, sys
+repo = pathlib.Path(sys.argv[1])
+prefix = sys.argv[2]
+patterns = {
+    "clean_workdir": ".crabdb/workdir-manifest.json",
+    "sparse_workdir": ".crabdb/sparse-workdir.json",
+}
+counts = {name: 0 for name in patterns}
+sizes = {name: 0 for name in patterns}
+worktrees = repo / ".crabdb" / "worktrees"
+if worktrees.exists():
+    for path in worktrees.rglob("*.json"):
+        for name, suffix in patterns.items():
+            parent, filename = suffix.split("/")
+            if path.parent.name == parent and path.name == filename:
+                counts[name] += 1
+                sizes[name] += path.stat().st_size
+for name in sorted(patterns):
+    print(f"manifest_{prefix}_{name}_count\t{counts[name]}")
+    print(f"manifest_{prefix}_{name}_bytes\t{sizes[name]}")
+PY
 }
 
 free_loopback_port() {
@@ -177,6 +221,33 @@ request = urllib.request.Request(base_url + path, data=data, method=method, head
 with urllib.request.urlopen(request, timeout=30) as response:
     sys.stdout.buffer.write(response.read())
 PY
+}
+
+run_without_daemon_endpoint() {
+  local scale="$1"
+  local name="$2"
+  local bin="$3"
+  local repo="$4"
+  shift 4
+  run_timed "$scale" "$name" bash -s -- "$bin" "$repo" "$@" <<'SH'
+set -euo pipefail
+bin="$1"
+repo="$2"
+shift 2
+endpoint="$repo/.crabdb/daemon.json"
+hidden="$repo/.crabdb/daemon.json.persisted-snapshot-bench"
+restore_endpoint() {
+  if [ -f "$hidden" ]; then
+    mv "$hidden" "$endpoint"
+  fi
+}
+trap restore_endpoint EXIT
+rm -f "$hidden"
+if [ -f "$endpoint" ]; then
+  mv "$endpoint" "$hidden"
+fi
+"$bin" --workspace "$repo" --json "$@"
+SH
 }
 
 daemon_rss_bytes() {
@@ -293,6 +364,9 @@ for d in range(dirs):
 PY
       run_timed "$scale" git_init git -C "$GIT_REPO" init
       run_timed "$scale" git_add_tracked git -C "$GIT_REPO" add .
+      git -C "$GIT_REPO" config user.email "crabdb@example.com"
+      git -C "$GIT_REPO" config user.name "CrabDB"
+      run_timed "$scale" git_commit_initial git -C "$GIT_REPO" commit -m "scale initial"
       run_timed "$scale" git_init_from_git "$BIN" --workspace "$GIT_REPO" --json init --from-git
       run_timed "$scale" git_mutate_tracked python3 - "$GIT_REPO" "$scale" <<'PY'
 import pathlib, sys
@@ -312,9 +386,29 @@ if files > 101:
     (root / "pkg_00001" / "module_001.rs").unlink()
 PY
       run_timed "$scale" git_add_new_tracked git -C "$GIT_REPO" add pkg_00000/new_git_tracked.rs
+      run_timed "$scale" git_dirty_status "$BIN" --workspace "$GIT_REPO" --json status
+      run_timed "$scale" git_dirty_diff "$BIN" --workspace "$GIT_REPO" --json diff --dirty
       run_timed "$scale" git_import_update "$BIN" --workspace "$GIT_REPO" --json git import-update -m "scale git import update"
       run_timed "$scale" git_import_update_noop "$BIN" --workspace "$GIT_REPO" --json git import-update -m "scale git import update noop"
       run_timed "$scale" git_status_after_import "$BIN" --workspace "$GIT_REPO" --json status
+      rm -f "$GIT_REPO/scratch-untracked.txt"
+      run_timed "$scale" git_mutate_for_dirty_record python3 - "$GIT_REPO" "$scale" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = int(sys.argv[2])
+edit_count = max(1, min(25, files // 400))
+for i in range(edit_count):
+    idx = (i * 6151 + 11) % files
+    d, f = divmod(idx, 100)
+    path = root / f"pkg_{d:05d}" / f"module_{f:03d}.rs"
+    with path.open("a") as fh:
+        fh.write(f"\n// git dirty record edit {i}\n")
+(root / "pkg_00000" / "git_dirty_record_new.rs").write_text("pub fn git_dirty_record_new() -> usize { 1 }\n")
+(root / "git_dirty_record_untracked.txt").write_text("record me through git dirty shortcut\n")
+PY
+      run_timed "$scale" git_add_dirty_record_new git -C "$GIT_REPO" add pkg_00000/git_dirty_record_new.rs
+      run_timed "$scale" git_dirty_record "$BIN" --workspace "$GIT_REPO" --json record -m "scale git dirty record"
+      run_timed "$scale" git_status_after_dirty_record "$BIN" --workspace "$GIT_REPO" --json status
     else
       printf 'scale=%s %-36s %8s rss=%s exit=%s\n' "$scale" git_import_update "skipped" 0 0
     fi
@@ -328,9 +422,40 @@ PY
       >"$WORK/out/daemon.stdout" 2>"$WORK/out/daemon.stderr" &
     DAEMON_PID=$!
     trap 'kill "$DAEMON_PID" >/dev/null 2>&1 || true' EXIT
-    wait_for_daemon "$DAEMON_URL"
-    wait_for_daemon_hot_cache "$REPO/.crabdb/daemon.json" "$DAEMON_URL"
+    run_timed "$scale" daemon_wait_for_health python3 - "$DAEMON_URL" <<'PY'
+import sys, time, urllib.request
+url = sys.argv[1]
+deadline = time.time() + 180
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url + "/v1/health", timeout=0.5) as response:
+            if response.status == 200:
+                sys.exit(0)
+    except Exception:
+        time.sleep(0.1)
+print("daemon did not become ready", file=sys.stderr)
+sys.exit(1)
+PY
+    run_timed "$scale" daemon_wait_for_hot_cache python3 - "$REPO/.crabdb/daemon.json" "$DAEMON_URL" <<'PY'
+import json, pathlib, sys, time
+endpoint = pathlib.Path(sys.argv[1])
+url = sys.argv[2]
+deadline = time.time() + 300
+while time.time() < deadline:
+    try:
+        payload = json.loads(endpoint.read_text())
+    except Exception:
+        time.sleep(0.1)
+        continue
+    if payload.get("url") == url:
+        sys.exit(0)
+    time.sleep(0.1)
+print("daemon hot cache did not become ready", file=sys.stderr)
+sys.exit(1)
+PY
     run_http_timed "$scale" daemon_status "$DAEMON_URL" GET /v1/status
+    run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_status "$BIN" "$REPO" status
+    run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_record_clean "$BIN" "$REPO" record -m "scale persisted snapshot clean record"
     python3 - "$WORK/daemon-spawn.json" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
@@ -389,9 +514,73 @@ for i in range(max(1, min(25, files // 400))):
     with path.open("a") as fh:
         fh.write(f"\n// daemon CLI workspace record {i}\n")
 PY
+    run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_diff_dirty "$BIN" "$REPO" diff --dirty
     run_timed "$scale" daemon_cli_record_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json record -m "scale daemon CLI dirty record"
     run_timed "$scale" daemon_cli_status_after_record "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
     run_timed "$scale" daemon_cli_agent_spawn "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent spawn daemonclibot --from main --no-materialize
+    run_timed "$scale" daemon_cli_agent_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent list
+    run_timed "$scale" daemon_cli_agent_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent show daemonclibot
+    run_timed "$scale" daemon_cli_agent_workdir "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent workdir daemonclibot
+    run_timed "$scale" daemon_cli_agent_claim "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent claim daemonclibot README.md --ttl-secs 120
+    run_timed "$scale" daemon_cli_lease_acquire "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lease acquire daemonclibot --path pkg_00000/module_000.rs --ttl-secs 120
+    DAEMON_CLI_LEASE_ID="$(python3 - "$WORK/out/daemon_cli_lease_acquire.stdout" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["lease"]["lease_id"])
+PY
+)"
+    run_timed "$scale" daemon_cli_lease_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lease list
+    run_timed "$scale" daemon_cli_lease_release "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lease release "$DAEMON_CLI_LEASE_ID"
+    run_timed "$scale" daemon_cli_session_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session start daemonclibot --title "scale daemon CLI session"
+    DAEMON_CLI_SESSION_ID="$(python3 - "$WORK/out/daemon_cli_session_start.stdout" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["session"]["session_id"])
+PY
+)"
+    run_timed "$scale" daemon_cli_session_current "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session current daemonclibot
+    run_timed "$scale" daemon_cli_session_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session list --agent daemonclibot
+    run_timed "$scale" daemon_cli_session_context "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session context "$DAEMON_CLI_SESSION_ID" --limit 5
+    run_timed "$scale" daemon_cli_approval_request "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals request daemonclibot --action scale-check --summary "scale daemon CLI approval" --session "$DAEMON_CLI_SESSION_ID" --payload-json '{"scale":"daemon-cli"}'
+    DAEMON_CLI_APPROVAL_ID="$(python3 - "$WORK/out/daemon_cli_approval_request.stdout" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["approval"]["approval_id"])
+PY
+)"
+    run_timed "$scale" daemon_cli_approval_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals list --agent daemonclibot --status pending
+    run_timed "$scale" daemon_cli_approval_decide "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals decide "$DAEMON_CLI_APPROVAL_ID" --decision approved --reviewer scale
+    run_timed "$scale" daemon_cli_session_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session end "$DAEMON_CLI_SESSION_ID" --status completed
+    run_timed "$scale" daemon_cli_agent_turn_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn start daemonclibot --from main --title "scale daemon CLI turn"
+    DAEMON_CLI_TURN_ID="$(python3 - "$WORK/out/daemon_cli_agent_turn_start.stdout" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["turn"]["turn_id"])
+PY
+)"
+    run_timed "$scale" daemon_cli_agent_turn_message "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn message "$DAEMON_CLI_TURN_ID" --role user --text "scale daemon CLI turn message"
+    run_timed "$scale" daemon_cli_agent_turn_event "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn event "$DAEMON_CLI_TURN_ID" --event-type checkpoint --payload-json '{"scale":"daemon-cli-turn"}'
+    python3 - "$WORK/daemon-cli-turn-patch.json" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    "message": "scale daemon CLI turn patch",
+    "edits": [{
+        "op": "write",
+        "path": "README.md",
+        "content": "# CrabDB daemon CLI turn scale\n",
+    }],
+}))
+PY
+    run_timed "$scale" daemon_cli_agent_turn_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn apply-patch "$DAEMON_CLI_TURN_ID" --patch "$WORK/daemon-cli-turn-patch.json"
+    run_timed "$scale" daemon_cli_agent_turn_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn show "$DAEMON_CLI_TURN_ID"
+    run_timed "$scale" daemon_cli_agent_trace_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace start "$DAEMON_CLI_TURN_ID" --type tool_call --name daemon-cli-scale
+    read -r DAEMON_CLI_SPAN_ID DAEMON_CLI_TRACE_ID < <(python3 - "$WORK/out/daemon_cli_agent_trace_start.stdout" <<'PY'
+import json, pathlib, sys
+span = json.loads(pathlib.Path(sys.argv[1]).read_text())["span"]
+print(span["span_id"], span["trace_id"])
+PY
+)
+    run_timed "$scale" daemon_cli_agent_trace_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace end "$DAEMON_CLI_SPAN_ID" --status completed
+    run_timed "$scale" daemon_cli_agent_trace_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace list --turn "$DAEMON_CLI_TURN_ID" --limit 20
+    run_timed "$scale" daemon_cli_agent_trace_summary "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace summary --trace-id "$DAEMON_CLI_TRACE_ID" --slowest 3
+    run_timed "$scale" daemon_cli_agent_trace_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace show "$DAEMON_CLI_SPAN_ID"
+    run_timed "$scale" daemon_cli_agent_turn_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn end "$DAEMON_CLI_TURN_ID" --status completed
     python3 - "$REPO" "$WORK/daemon-cli-patch.json" "$scale" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -412,7 +601,16 @@ PY
     run_timed "$scale" daemon_cli_agent_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent apply-patch daemonclibot --patch "$WORK/daemon-cli-patch.json"
     run_timed "$scale" daemon_cli_agent_read "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent read daemonclibot README.md
     run_timed "$scale" daemon_cli_agent_diff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent diff daemonclibot
+    run_timed "$scale" daemon_cli_why "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json why README.md:1
+    run_timed "$scale" daemon_cli_history "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json history README.md
+    run_timed "$scale" daemon_cli_code_from "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json code-from daemonclibot
     run_timed "$scale" daemon_cli_agent_readiness "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent readiness daemonclibot
+    run_timed "$scale" daemon_cli_agent_contribution "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent contribution daemonclibot
+    run_timed "$scale" daemon_cli_agent_gates "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent gates daemonclibot
+    run_timed "$scale" daemon_cli_agent_events "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent events --agent daemonclibot
+    run_timed "$scale" daemon_cli_agent_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent timeline daemonclibot --limit 20
+    run_timed "$scale" daemon_cli_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json timeline --agent daemonclibot --limit 20
+    run_timed "$scale" daemon_cli_agent_handoff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent handoff daemonclibot
     run_timed "$scale" daemon_cli_merge_dry_run "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-agent daemonclibot --into main --dry-run
     run_timed "$scale" daemon_cli_merge_queue_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue list
     run_timed "$scale" daemon_cli_merge_queue_run_empty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue run
@@ -515,14 +713,18 @@ PY
     printf 'source_bytes\t%s\n' "$source_bytes"
     printf 'sqlite_bytes\t%s\n' "$(sqlite_bytes "$REPO")"
     printf 'object_count\t%s\n' "$(object_count "$REPO")"
+    object_kind_stats "$REPO" "repo"
     dbstat_bytes "$REPO" "repo"
+    workdir_manifest_bytes "$REPO" "repo"
     if [ -d "$GIT_REPO/.crabdb" ]; then
       read -r git_source_file_count git_source_bytes < <(repo_source_bytes "$GIT_REPO")
       printf 'git_source_file_count\t%s\n' "$git_source_file_count"
       printf 'git_source_bytes\t%s\n' "$git_source_bytes"
       printf 'git_sqlite_bytes\t%s\n' "$(sqlite_bytes "$GIT_REPO")"
       printf 'git_object_count\t%s\n' "$(object_count "$GIT_REPO")"
+      object_kind_stats "$GIT_REPO" "git"
       dbstat_bytes "$GIT_REPO" "git"
+      workdir_manifest_bytes "$GIT_REPO" "git"
     fi
     printf 'daemon_rss_bytes\t%s\n' "$DAEMON_RSS"
     du -sk "$REPO" "$REPO/.crabdb" 2>/dev/null | awk '{print "du_kb_" $2 "\t" $1}'

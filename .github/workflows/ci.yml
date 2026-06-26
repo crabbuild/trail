@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Check
+        run: cargo check -p crabdb
+      - name: Test
+        run: cargo test -p crabdb
+      - name: Scale Benchmark Syntax
+        run: bash -n scripts/cli-scale-bench.sh
+      - name: Scale Benchmark Smoke
+        run: make bench-cli-scale-smoke
+        env:
+          CRABDB_SCALE_BASE: ${{ runner.temp }}
+          CRABDB_SCALE_LABEL: ci-${{ github.run_id }}
+      - name: Scale Benchmark Thresholds
+        run: >
+          python3 scripts/check-cli-scale-thresholds.py
+          "${{ runner.temp }}/crabdb-cli-scale-ci-${{ github.run_id }}/1000/results.tsv"
+          init_working_tree=60
+          status_clean=15
+          status_dirty=20
+          diff_dirty=25
+          record_dirty=25
+          git_dirty_status=15
+          git_dirty_diff=20
+          git_dirty_record=20
+          git_status_after_dirty_record=15
+          daemon_wait_for_health=60
+          daemon_wait_for_hot_cache=60
+          daemon_persisted_snapshot_status=10
+          daemon_persisted_snapshot_record_clean=10
+          daemon_persisted_snapshot_diff_dirty=10
+          daemon_cli_session_start=10
+          daemon_cli_approval_request=10
+          daemon_cli_lease_acquire=10
+          daemon_cli_timeline=10
+          daemon_cli_why=10
+          daemon_cli_history=10
+          daemon_cli_code_from=10
+          agent_apply_patch=30
+          merge_queue_run=30
+          agent_spawn_sparse=15
+          agent_read_sparse_hydrate_neighbors=15
+          agent_sync_sparse_dir=15
+          agent_spawn_materialized=30
+          agent_status_materialized=15
+          agent_record_materialized=30
+          backup_create=30
+          backup_verify=30
+          --metrics
+          "${{ runner.temp }}/crabdb-cli-scale-ci-${{ github.run_id }}/1000/metrics.tsv"
+          sqlite_bytes=64000000
+          dbstat_repo_prolly_nodes=32000000
+          object_kind_repo_TextContent_bytes=16000000
+          object_count=20000

@@ -7,6 +7,8 @@ use rayon::prelude::*;
 
 const DAEMON_STATUS_DIRTY_PATH_LIMIT: usize = 16_384;
 const WORKTREE_INDEX_BASELINE_ROOT_KEY: &str = "worktree.index.baseline_root";
+const DAEMON_WORKTREE_SNAPSHOT_FILE: &str = "worktree-daemon-cache.json";
+const DAEMON_WORKTREE_SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorktreeFileStamp {
@@ -38,6 +40,19 @@ pub(crate) struct WorktreeIndexRefresh {
     pub(crate) changed: bool,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedDaemonWorktreeSnapshot {
+    version: u32,
+    pid: u32,
+    workspace_root: String,
+    generation: u64,
+    initialized: bool,
+    overflow: bool,
+    baseline_root_id: Option<String>,
+    dirty_paths: Vec<String>,
+    updated_ns: i64,
+}
+
 impl CrabDb {
     pub fn enable_daemon_worktree_cache(&mut self) -> Result<()> {
         let warmup = self.start_daemon_worktree_cache()?;
@@ -45,11 +60,12 @@ impl CrabDb {
     }
 
     pub fn start_daemon_worktree_cache(&mut self) -> Result<DaemonWorktreeCacheWarmup> {
-        let cache = DaemonWorktreeCache::start(&self.workspace_root)?;
+        let cache = DaemonWorktreeCache::start(&self.workspace_root, &self.db_dir)?;
         let warmup = DaemonWorktreeCacheWarmup {
             workspace_root: self.workspace_root.clone(),
             db_dir: self.db_dir.clone(),
             state: Arc::clone(&cache.state),
+            persist: cache.persist.clone(),
             generation: cache.generation(),
         };
         self.daemon_worktree_cache = Some(cache);
@@ -59,6 +75,7 @@ impl CrabDb {
     fn finish_daemon_worktree_cache_baseline(
         &self,
         state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+        persist: Option<&DaemonWorktreeCachePersist>,
         generation: u64,
     ) -> Result<()> {
         let branch = self.current_branch()?;
@@ -66,6 +83,7 @@ impl CrabDb {
         let changed_paths = self.status_changed_paths_uncached(&branch, &branch, &head.root_id)?;
         DaemonWorktreeCache::finish_initial_baseline(
             state,
+            persist,
             generation,
             &head.root_id,
             &changed_paths,
@@ -74,13 +92,53 @@ impl CrabDb {
     }
 
     pub(crate) fn daemon_worktree_snapshot(&self) -> Option<DaemonWorktreeSnapshot> {
-        self.daemon_worktree_cache
+        if let Some(snapshot) = self
+            .daemon_worktree_cache
             .as_ref()
             .map(DaemonWorktreeCache::snapshot)
+        {
+            return Some(snapshot);
+        }
+        self.persisted_daemon_worktree_snapshot().ok().flatten()
     }
 
     pub(crate) fn daemon_dirty_path_limit(&self) -> usize {
         DAEMON_STATUS_DIRTY_PATH_LIMIT
+    }
+
+    fn persisted_daemon_worktree_snapshot(&self) -> Result<Option<DaemonWorktreeSnapshot>> {
+        let path = daemon_worktree_snapshot_path(&self.db_dir);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let snapshot: PersistedDaemonWorktreeSnapshot = serde_json::from_slice(&bytes)?;
+        if snapshot.version != DAEMON_WORKTREE_SNAPSHOT_VERSION
+            || snapshot.workspace_root != self.workspace_root.to_string_lossy()
+            || !snapshot.initialized
+        {
+            return Ok(None);
+        }
+        if !daemon_snapshot_process_is_alive(snapshot.pid) {
+            let _ = fs::remove_file(path);
+            return Ok(None);
+        }
+        if snapshot.overflow {
+            return Ok(Some(DaemonWorktreeSnapshot::Overflow {
+                generation: snapshot.generation,
+            }));
+        }
+        if snapshot.dirty_paths.is_empty() {
+            return Ok(Some(DaemonWorktreeSnapshot::Clean {
+                generation: snapshot.generation,
+                root_id: snapshot.baseline_root_id.map(ObjectId),
+            }));
+        }
+        Ok(Some(DaemonWorktreeSnapshot::Dirty {
+            generation: snapshot.generation,
+            paths: snapshot.dirty_paths,
+        }))
     }
 
     pub(crate) fn reconcile_daemon_status_paths(
@@ -692,12 +750,26 @@ pub(crate) fn file_kind_from_index(value: &str) -> std::result::Result<FileKind,
 }
 
 impl DaemonWorktreeCache {
-    fn start(workspace_root: &Path) -> Result<Self> {
+    fn start(workspace_root: &Path, db_dir: &Path) -> Result<Self> {
         let state = Arc::new(Mutex::new(DaemonWorktreeCacheState::default()));
         let root = workspace_root.to_path_buf();
+        let persist = DaemonWorktreeCachePersist {
+            path: daemon_worktree_snapshot_path(db_dir),
+            workspace_root: workspace_root.to_path_buf(),
+            pid: std::process::id(),
+        };
+        persist_daemon_worktree_state(&persist, &state);
         let state_for_watcher = Arc::clone(&state);
+        let persist_for_watcher = persist.clone();
         let mut watcher = RecommendedWatcher::new(
-            move |event| handle_daemon_watch_event(&root, &state_for_watcher, event),
+            move |event| {
+                handle_daemon_watch_event(
+                    &root,
+                    &state_for_watcher,
+                    Some(&persist_for_watcher),
+                    event,
+                )
+            },
             NotifyConfig::default(),
         )
         .map_err(notify_error)?;
@@ -706,6 +778,7 @@ impl DaemonWorktreeCache {
             .map_err(notify_error)?;
         Ok(Self {
             state,
+            persist: Some(persist),
             _watcher: watcher,
         })
     }
@@ -738,24 +811,30 @@ impl DaemonWorktreeCache {
 
     fn finish_initial_baseline(
         state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+        persist: Option<&DaemonWorktreeCachePersist>,
         generation: u64,
         root_id: &ObjectId,
         summaries: &[FileDiffSummary],
     ) {
-        let mut state = state.lock().expect("daemon worktree cache poisoned");
-        if state.initialized {
-            return;
+        {
+            let mut state = state.lock().expect("daemon worktree cache poisoned");
+            if state.initialized {
+                return;
+            }
+            for path in summary_paths(summaries) {
+                state.dirty_paths.insert(path);
+            }
+            state.initialized = true;
+            if state.generation == generation && !state.overflow && state.dirty_paths.is_empty() {
+                state.baseline_root_id = Some(root_id.clone());
+            } else {
+                state.baseline_root_id = None;
+            }
+            state.generation = state.generation.saturating_add(1);
         }
-        for path in summary_paths(summaries) {
-            state.dirty_paths.insert(path);
+        if let Some(persist) = persist {
+            persist_daemon_worktree_state(persist, state);
         }
-        state.initialized = true;
-        if state.generation == generation && !state.overflow && state.dirty_paths.is_empty() {
-            state.baseline_root_id = Some(root_id.clone());
-        } else {
-            state.baseline_root_id = None;
-        }
-        state.generation = state.generation.saturating_add(1);
     }
 
     fn reconcile_selected(
@@ -765,23 +844,28 @@ impl DaemonWorktreeCache {
         summaries: &[FileDiffSummary],
         generation: u64,
     ) {
-        let mut state = self.state.lock().expect("daemon worktree cache poisoned");
-        if state.generation != generation || state.overflow {
-            return;
+        {
+            let mut state = self.state.lock().expect("daemon worktree cache poisoned");
+            if state.generation != generation || state.overflow {
+                return;
+            }
+            state.initialized = true;
+            for path in checked_paths {
+                state.dirty_paths.remove(path);
+            }
+            for path in summary_paths(summaries) {
+                state.dirty_paths.insert(path);
+            }
+            if state.dirty_paths.is_empty() {
+                state.baseline_root_id = Some(root_id.clone());
+            } else {
+                state.baseline_root_id = None;
+            }
+            state.generation = state.generation.saturating_add(1);
         }
-        state.initialized = true;
-        for path in checked_paths {
-            state.dirty_paths.remove(path);
+        if let Some(persist) = &self.persist {
+            persist_daemon_worktree_state(persist, &self.state);
         }
-        for path in summary_paths(summaries) {
-            state.dirty_paths.insert(path);
-        }
-        if state.dirty_paths.is_empty() {
-            state.baseline_root_id = Some(root_id.clone());
-        } else {
-            state.baseline_root_id = None;
-        }
-        state.generation = state.generation.saturating_add(1);
     }
 
     fn reconcile_full(
@@ -790,48 +874,60 @@ impl DaemonWorktreeCache {
         summaries: &[FileDiffSummary],
         generation: Option<u64>,
     ) {
-        let mut state = self.state.lock().expect("daemon worktree cache poisoned");
-        if generation.is_some_and(|expected| expected != state.generation) {
-            for path in summary_paths(summaries) {
-                state.dirty_paths.insert(path);
+        {
+            let mut state = self.state.lock().expect("daemon worktree cache poisoned");
+            if generation.is_some_and(|expected| expected != state.generation) {
+                for path in summary_paths(summaries) {
+                    state.dirty_paths.insert(path);
+                }
+                state.baseline_root_id = None;
+            } else {
+                state.overflow = false;
+                state.initialized = true;
+                state.dirty_paths = summary_paths(summaries).into_iter().collect();
+                if state.dirty_paths.is_empty() {
+                    state.baseline_root_id = Some(root_id.clone());
+                } else {
+                    state.baseline_root_id = None;
+                }
+                state.generation = state.generation.saturating_add(1);
             }
-            state.baseline_root_id = None;
-            return;
         }
-
-        state.overflow = false;
-        state.initialized = true;
-        state.dirty_paths = summary_paths(summaries).into_iter().collect();
-        if state.dirty_paths.is_empty() {
-            state.baseline_root_id = Some(root_id.clone());
-        } else {
-            state.baseline_root_id = None;
+        if let Some(persist) = &self.persist {
+            persist_daemon_worktree_state(persist, &self.state);
         }
-        state.generation = state.generation.saturating_add(1);
     }
 }
 
 fn handle_daemon_watch_event(
     root: &Path,
     state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+    persist: Option<&DaemonWorktreeCachePersist>,
     event: notify::Result<Event>,
 ) {
     let Ok(event) = event else {
-        mark_daemon_cache_overflow(state);
+        mark_daemon_cache_overflow(state, persist);
         return;
     };
     if matches!(event.kind, EventKind::Access(_)) {
+        return;
+    }
+    if daemon_event_paths_all_default_ignored(root, &event.paths) {
+        return;
+    }
+    if daemon_event_touches_ignore_file(root, &event.paths) {
+        mark_daemon_cache_overflow(state, persist);
         return;
     }
     if matches!(
         event.kind,
         EventKind::Modify(ModifyKind::Name(RenameMode::Both))
     ) {
-        handle_daemon_rename_both_event(root, state, event.paths);
+        handle_daemon_rename_both_event(root, state, persist, event.paths);
         return;
     }
     if event_requires_full_reconcile(&event.kind) {
-        mark_daemon_cache_overflow(state);
+        mark_daemon_cache_overflow(state, persist);
         return;
     }
 
@@ -840,10 +936,6 @@ fn handle_daemon_watch_event(
         let Some(path) = daemon_event_relative_path(root, &path) else {
             continue;
         };
-        if path == ".crabignore" || path == ".gitignore" {
-            mark_daemon_cache_overflow(state);
-            return;
-        }
         if is_default_ignored(&path) {
             continue;
         }
@@ -854,7 +946,7 @@ fn handle_daemon_watch_event(
         return;
     }
 
-    mark_daemon_cache_dirty_paths(state, paths);
+    mark_daemon_cache_dirty_paths(state, persist, paths);
 }
 
 fn daemon_event_relative_path(root: &Path, path: &Path) -> Option<String> {
@@ -865,13 +957,28 @@ fn daemon_event_relative_path(root: &Path, path: &Path) -> Option<String> {
     normalize_relative_path(&rel.to_string_lossy()).ok()
 }
 
+fn daemon_event_paths_all_default_ignored(root: &Path, paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            daemon_event_relative_path(root, path).is_some_and(|path| is_default_ignored(&path))
+        })
+}
+
+fn daemon_event_touches_ignore_file(root: &Path, paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| {
+        daemon_event_relative_path(root, path)
+            .is_some_and(|path| path == ".crabignore" || path == ".gitignore")
+    })
+}
+
 fn handle_daemon_rename_both_event(
     root: &Path,
     state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+    persist: Option<&DaemonWorktreeCachePersist>,
     paths: Vec<PathBuf>,
 ) {
     if paths.len() != 2 {
-        mark_daemon_cache_overflow(state);
+        mark_daemon_cache_overflow(state, persist);
         return;
     }
 
@@ -881,10 +988,6 @@ fn handle_daemon_rename_both_event(
         let Some(path) = daemon_event_relative_path(root, &path) else {
             continue;
         };
-        if path == ".crabignore" || path == ".gitignore" {
-            mark_daemon_cache_overflow(state);
-            return;
-        }
         let abs = root.join(path_from_rel(&path));
         match fs::symlink_metadata(&abs) {
             Ok(metadata) if metadata.is_dir() || metadata.is_file() => {
@@ -893,7 +996,7 @@ fn handle_daemon_rename_both_event(
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {
-                mark_daemon_cache_overflow(state);
+                mark_daemon_cache_overflow(state, persist);
                 return;
             }
         }
@@ -903,13 +1006,13 @@ fn handle_daemon_rename_both_event(
     }
 
     if !has_existing_path && !dirty_paths.is_empty() {
-        mark_daemon_cache_overflow(state);
+        mark_daemon_cache_overflow(state, persist);
         return;
     }
     if dirty_paths.is_empty() {
         return;
     }
-    mark_daemon_cache_dirty_paths(state, dirty_paths);
+    mark_daemon_cache_dirty_paths(state, persist, dirty_paths);
 }
 
 fn event_requires_full_reconcile(kind: &EventKind) -> bool {
@@ -923,26 +1026,47 @@ fn event_requires_full_reconcile(kind: &EventKind) -> bool {
     )
 }
 
-fn mark_daemon_cache_dirty_paths(state: &Arc<Mutex<DaemonWorktreeCacheState>>, paths: Vec<String>) {
-    let mut state = state.lock().expect("daemon worktree cache poisoned");
-    for path in paths {
-        state.dirty_paths.insert(path);
+fn mark_daemon_cache_dirty_paths(
+    state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+    persist: Option<&DaemonWorktreeCachePersist>,
+    paths: Vec<String>,
+) {
+    {
+        let mut state = state.lock().expect("daemon worktree cache poisoned");
+        for path in paths {
+            state.dirty_paths.insert(path);
+        }
+        state.baseline_root_id = None;
+        state.generation = state.generation.saturating_add(1);
     }
-    state.baseline_root_id = None;
-    state.generation = state.generation.saturating_add(1);
+    if let Some(persist) = persist {
+        persist_daemon_worktree_state(persist, state);
+    }
 }
 
-fn mark_daemon_cache_overflow(state: &Arc<Mutex<DaemonWorktreeCacheState>>) {
-    let mut state = state.lock().expect("daemon worktree cache poisoned");
-    state.overflow = true;
-    state.baseline_root_id = None;
-    state.generation = state.generation.saturating_add(1);
+fn mark_daemon_cache_overflow(
+    state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+    persist: Option<&DaemonWorktreeCachePersist>,
+) {
+    {
+        let mut state = state.lock().expect("daemon worktree cache poisoned");
+        state.overflow = true;
+        state.baseline_root_id = None;
+        state.generation = state.generation.saturating_add(1);
+    }
+    if let Some(persist) = persist {
+        persist_daemon_worktree_state(persist, state);
+    }
 }
 
 impl DaemonWorktreeCacheWarmup {
     pub fn run(self) -> Result<()> {
         let db = CrabDb::open_with_db_dir(&self.workspace_root, &self.db_dir)?;
-        db.finish_daemon_worktree_cache_baseline(&self.state, self.generation)
+        db.finish_daemon_worktree_cache_baseline(
+            &self.state,
+            self.persist.as_ref(),
+            self.generation,
+        )
     }
 }
 
@@ -959,6 +1083,66 @@ fn summary_paths(summaries: &[FileDiffSummary]) -> Vec<String> {
 
 fn notify_error(err: notify::Error) -> Error {
     Error::InvalidInput(format!("daemon worktree watcher failed: {err}"))
+}
+
+fn daemon_worktree_snapshot_path(db_dir: &Path) -> PathBuf {
+    db_dir.join(DAEMON_WORKTREE_SNAPSHOT_FILE)
+}
+
+fn persist_daemon_worktree_state(
+    persist: &DaemonWorktreeCachePersist,
+    state: &Arc<Mutex<DaemonWorktreeCacheState>>,
+) {
+    let snapshot = {
+        let state = state.lock().expect("daemon worktree cache poisoned");
+        PersistedDaemonWorktreeSnapshot {
+            version: DAEMON_WORKTREE_SNAPSHOT_VERSION,
+            pid: persist.pid,
+            workspace_root: persist.workspace_root.to_string_lossy().to_string(),
+            generation: state.generation,
+            initialized: state.initialized,
+            overflow: state.overflow,
+            baseline_root_id: state.baseline_root_id.as_ref().map(|id| id.0.clone()),
+            dirty_paths: state.dirty_paths.iter().cloned().collect(),
+            updated_ns: worktree_scan_id(),
+        }
+    };
+    let _ = write_persisted_daemon_worktree_snapshot(&persist.path, &snapshot, persist.pid);
+}
+
+fn write_persisted_daemon_worktree_snapshot(
+    path: &Path,
+    snapshot: &PersistedDaemonWorktreeSnapshot,
+    pid: u32,
+) -> Result<()> {
+    let tmp = path.with_file_name(format!("{DAEMON_WORKTREE_SNAPSHOT_FILE}.{pid}.tmp"));
+    fs::write(&tmp, serde_json::to_vec(snapshot)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn daemon_snapshot_process_is_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn daemon_snapshot_process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+impl Drop for DaemonWorktreeCache {
+    fn drop(&mut self) {
+        if let Some(persist) = &self.persist {
+            let _ = fs::remove_file(&persist.path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -978,7 +1162,7 @@ mod tests {
             .add_path(temp.path().join("old.txt"))
             .add_path(temp.path().join("renamed.txt"));
 
-        handle_daemon_watch_event(temp.path(), &state, Ok(event));
+        handle_daemon_watch_event(temp.path(), &state, None, Ok(event));
 
         let state = state.lock().unwrap();
         assert!(!state.overflow);
@@ -1000,7 +1184,7 @@ mod tests {
             .add_path(temp.path().join("old"))
             .add_path(temp.path().join("renamed"));
 
-        handle_daemon_watch_event(temp.path(), &state, Ok(event));
+        handle_daemon_watch_event(temp.path(), &state, None, Ok(event));
 
         let state = state.lock().unwrap();
         assert!(!state.overflow);
@@ -1022,12 +1206,14 @@ mod tests {
         handle_daemon_watch_event(
             temp.path(),
             &state,
+            None,
             Ok(Event::new(EventKind::Create(CreateKind::Folder))
                 .add_path(temp.path().join("created"))),
         );
         handle_daemon_watch_event(
             temp.path(),
             &state,
+            None,
             Ok(Event::new(EventKind::Remove(RemoveKind::Folder))
                 .add_path(temp.path().join("removed"))),
         );
@@ -1037,6 +1223,95 @@ mod tests {
         assert_eq!(state.baseline_root_id, None);
         assert!(state.dirty_paths.contains("created"));
         assert!(state.dirty_paths.contains("removed"));
+    }
+
+    #[test]
+    fn persisted_daemon_worktree_snapshot_is_available_to_second_db_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let mut daemon_db = CrabDb::open(temp.path()).unwrap();
+        daemon_db.enable_daemon_worktree_cache().unwrap();
+        let head = daemon_db.resolve_branch_ref("main").unwrap();
+        let reader = CrabDb::open(temp.path()).unwrap();
+        match reader.daemon_worktree_snapshot().unwrap() {
+            DaemonWorktreeSnapshot::Clean {
+                root_id: Some(root_id),
+                ..
+            } => assert_eq!(root_id, head.root_id),
+            other => panic!("expected persisted clean snapshot, got {other:?}"),
+        }
+
+        fs::write(temp.path().join("README.md"), "hello\ndirty\n").unwrap();
+        let cache = daemon_db.daemon_worktree_cache.as_ref().unwrap();
+        handle_daemon_watch_event(
+            temp.path(),
+            &cache.state,
+            cache.persist.as_ref(),
+            Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(temp.path().join("README.md"))),
+        );
+
+        let reader = CrabDb::open(temp.path()).unwrap();
+        match reader.daemon_worktree_snapshot().unwrap() {
+            DaemonWorktreeSnapshot::Dirty { paths, .. } => {
+                assert_eq!(paths, vec!["README.md".to_string()]);
+            }
+            other => panic!("expected persisted dirty snapshot, got {other:?}"),
+        }
+
+        drop(daemon_db);
+        let reader = CrabDb::open(temp.path()).unwrap();
+        assert!(reader.daemon_worktree_snapshot().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_persisted_daemon_worktree_snapshot_is_ignored_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = CrabDb::open(temp.path()).unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        let path = daemon_worktree_snapshot_path(db.db_dir());
+
+        write_persisted_daemon_worktree_snapshot(
+            &path,
+            &PersistedDaemonWorktreeSnapshot {
+                version: DAEMON_WORKTREE_SNAPSHOT_VERSION,
+                pid: u32::MAX,
+                workspace_root: db.workspace_root.to_string_lossy().to_string(),
+                generation: 42,
+                initialized: true,
+                overflow: false,
+                baseline_root_id: Some(head.root_id.0),
+                dirty_paths: Vec::new(),
+                updated_ns: worktree_scan_id(),
+            },
+            u32::MAX,
+        )
+        .unwrap();
+
+        let reader = CrabDb::open(temp.path()).unwrap();
+        assert!(reader.daemon_worktree_snapshot().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn corrupt_persisted_daemon_worktree_snapshot_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = CrabDb::open(temp.path()).unwrap();
+        let path = daemon_worktree_snapshot_path(db.db_dir());
+        fs::write(&path, b"not json").unwrap();
+
+        let reader = CrabDb::open(temp.path()).unwrap();
+        assert!(reader.daemon_worktree_snapshot().is_none());
+        assert!(path.exists());
     }
 
     #[test]
@@ -1165,6 +1440,7 @@ mod tests {
                 baseline_root_id: None,
                 generation: 1,
             })),
+            persist: None,
             _watcher: watcher,
         });
     }

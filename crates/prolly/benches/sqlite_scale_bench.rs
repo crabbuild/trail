@@ -195,9 +195,9 @@ fn remove_sqlite_files(path: &Path) {
 
 fn bench_config() -> Config {
     Config::builder()
-        .min_chunk_size(16)
-        .max_chunk_size(128)
-        .chunking_factor(64)
+        .min_chunk_size(64)
+        .max_chunk_size(512)
+        .chunking_factor(256)
         .hash_seed(0xC0DA)
         .build()
 }

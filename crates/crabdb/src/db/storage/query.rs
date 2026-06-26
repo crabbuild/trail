@@ -36,6 +36,7 @@ impl CrabDb {
         );
         let event_id = format!("evt_{}", crate::ids::short_hash(event_seed.as_bytes(), 16));
         let payload = redact_sensitive_json(payload.clone());
+        let created_at = now_ts();
         self.conn.execute(
             "INSERT INTO agent_events \
              (event_id, agent_id, turn_id, session_id, event_type, change_id, message_id, payload_json, created_at) \
@@ -49,10 +50,86 @@ impl CrabDb {
                 change_id.map(|id| id.0.clone()),
                 message_id.map(|id| id.0.clone()),
                 serde_json::to_string(&payload)?,
-                now_ts()
+                created_at
             ],
         )?;
+        self.index_agent_trace_span_event(
+            &event_id, agent_id, session_id, turn_id, event_type, &payload, created_at,
+        )?;
         Ok(event_id)
+    }
+
+    pub(crate) fn index_agent_trace_span_event(
+        &self,
+        event_id: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        event_type: &str,
+        payload: &serde_json::Value,
+        created_at: i64,
+    ) -> Result<()> {
+        if !matches!(event_type, "span_started" | "span_ended") {
+            return Ok(());
+        }
+        let Some(span_id) = payload_string(payload, "span_id") else {
+            return Ok(());
+        };
+        let trace_id = payload_string(payload, "trace_id");
+        self.conn.execute(
+            "INSERT OR REPLACE INTO agent_trace_span_events \
+             (span_id, event_id, event_type, trace_id, agent_id, session_id, turn_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                span_id, event_id, event_type, trace_id, agent_id, session_id, turn_id, created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_agent_trace_span_event_index(&self) -> Result<u64> {
+        self.conn
+            .execute("DELETE FROM agent_trace_span_events", [])?;
+        let rows = {
+            let mut stmt = self.conn.prepare(
+                "SELECT event_id, agent_id, session_id, turn_id, event_type, payload_json, created_at \
+                 FROM agent_events \
+                 WHERE event_type IN ('span_started', 'span_ended') \
+                 ORDER BY created_at ASC, event_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut indexed = 0u64;
+        for (event_id, agent_id, session_id, turn_id, event_type, payload_json, created_at) in rows
+        {
+            let payload = match serde_json::from_str::<serde_json::Value>(&payload_json) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            self.index_agent_trace_span_event(
+                &event_id,
+                &agent_id,
+                session_id.as_deref(),
+                turn_id.as_deref(),
+                &event_type,
+                &payload,
+                created_at,
+            )?;
+            indexed += 1;
+        }
+        Ok(indexed)
     }
 
     pub(crate) fn messages_for_change(&self, change_id: &ChangeId) -> Result<Vec<Message>> {

@@ -144,6 +144,8 @@ impl CrabDb {
                 ended_at INTEGER,
                 metadata_json TEXT
             );
+            CREATE INDEX IF NOT EXISTS agent_turns_session_started_idx ON agent_turns(session_id, started_at);
+            CREATE INDEX IF NOT EXISTS agent_turns_agent_started_idx ON agent_turns(agent_id, started_at);
             CREATE TABLE IF NOT EXISTS agent_events (
                 event_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -155,6 +157,25 @@ impl CrabDb {
                 payload_json TEXT,
                 created_at INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS agent_events_agent_created_idx ON agent_events(agent_id, created_at);
+            CREATE INDEX IF NOT EXISTS agent_events_session_created_idx ON agent_events(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS agent_events_turn_created_idx ON agent_events(turn_id, created_at);
+            CREATE INDEX IF NOT EXISTS agent_events_type_created_idx ON agent_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS agent_events_agent_type_created_idx ON agent_events(agent_id, event_type, created_at);
+            CREATE INDEX IF NOT EXISTS agent_events_session_type_created_idx ON agent_events(session_id, event_type, created_at);
+            CREATE INDEX IF NOT EXISTS agent_events_turn_type_created_idx ON agent_events(turn_id, event_type, created_at);
+            CREATE TABLE IF NOT EXISTS agent_trace_span_events (
+                span_id TEXT NOT NULL,
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                trace_id TEXT,
+                agent_id TEXT NOT NULL,
+                session_id TEXT,
+                turn_id TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS agent_trace_span_events_span_created_idx ON agent_trace_span_events(span_id, created_at);
+            CREATE INDEX IF NOT EXISTS agent_trace_span_events_trace_created_idx ON agent_trace_span_events(trace_id, created_at);
             CREATE TABLE IF NOT EXISTS agent_approvals (
                 approval_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -271,7 +271,15 @@ pub(crate) struct DiskManifest {
 
 pub(crate) struct DaemonWorktreeCache {
     state: Arc<Mutex<DaemonWorktreeCacheState>>,
+    persist: Option<DaemonWorktreeCachePersist>,
     _watcher: notify::RecommendedWatcher,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonWorktreeCachePersist {
+    path: PathBuf,
+    workspace_root: PathBuf,
+    pid: u32,
 }
 
 #[derive(Debug)]
@@ -279,6 +287,7 @@ pub struct DaemonWorktreeCacheWarmup {
     workspace_root: PathBuf,
     db_dir: PathBuf,
     state: Arc<Mutex<DaemonWorktreeCacheState>>,
+    persist: Option<DaemonWorktreeCachePersist>,
     generation: u64,
 }
 

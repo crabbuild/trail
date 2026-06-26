@@ -4234,10 +4234,12 @@ mod tests {
 
     impl std::error::Error for CountingStoreError {}
 
+    type HintMap = BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>;
+
     #[derive(Default)]
     struct CountingStore {
         data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
-        hints: Mutex<BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>>,
+        hints: Mutex<HintMap>,
         get_calls: AtomicUsize,
         put_calls: AtomicUsize,
         batch_calls: AtomicUsize,
