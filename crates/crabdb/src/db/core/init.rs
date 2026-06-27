@@ -285,26 +285,46 @@ impl CrabDb {
         }
     }
 
+    pub(crate) fn with_write_lock_wait<T>(
+        timeout: Duration,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let previous = WRITE_LOCK_WAIT_DEADLINE
+            .with(|deadline| deadline.replace(Some(Instant::now() + timeout)));
+        let _guard = WriteLockWaitGuard { previous };
+        f()
+    }
+
     pub(crate) fn acquire_write_lock(&self) -> Result<WorkspaceLock> {
         let path = self.db_dir.join("lock");
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder =
-                    fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
-                if is_stale_lock_holder(&holder)
-                    && fs::read_to_string(&path).unwrap_or_default() == holder
-                {
-                    fs::remove_file(&path)?;
-                    OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)?
-                } else {
+        let mut delay = Duration::from_millis(2);
+        let mut file = loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => break file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let holder =
+                        fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
+                    if is_stale_lock_holder(&holder)
+                        && fs::read_to_string(&path).unwrap_or_default() == holder
+                    {
+                        match fs::remove_file(&path) {
+                            Ok(()) => continue,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(err) => return Err(Error::Io(err)),
+                        }
+                    }
+                    let should_wait = WRITE_LOCK_WAIT_DEADLINE
+                        .with(|deadline| deadline.get())
+                        .is_some_and(|deadline| Instant::now() < deadline);
+                    if should_wait {
+                        std::thread::sleep(delay);
+                        delay = (delay * 2).min(Duration::from_millis(50));
+                        continue;
+                    }
                     return Err(Error::WorkspaceLocked(holder.trim().to_string()));
                 }
+                Err(err) => return Err(Error::Io(err)),
             }
-            Err(err) => return Err(Error::Io(err)),
         };
         writeln!(file, "pid={} created_at={}", std::process::id(), now_ts())?;
         Ok(WorkspaceLock { path })

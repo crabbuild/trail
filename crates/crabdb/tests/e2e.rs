@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -12,8 +12,8 @@ use std::time::Duration;
 use crabdb::{
     Actor, ConflictManualFile, ConflictManualResolution, CrabDb, Error, InitImportMode,
     LaneGateOptions, LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails,
-    LaneTurnEndReport, LaneTurnEventReport, LaneTurnStartReport, PatchDocument, ShowResult,
-    TextContent, TextRepresentation, WorktreeState,
+    LaneTurnEndReport, LaneTurnEventReport, LaneTurnStartReport, OperationKind, PatchDocument,
+    ShowResult, TextContent, TextRepresentation, WorktreeState,
 };
 use rusqlite::Connection;
 
@@ -525,12 +525,322 @@ fn init_creates_lane_observability_indexes() {
         "lane_events_turn_type_created_idx",
         "lane_trace_span_events_span_created_idx",
         "lane_trace_span_events_trace_created_idx",
+        "lane_acp_sessions_lane_idx",
+        "lane_acp_sessions_crabdb_session_idx",
     ] {
         assert!(
             indexes.iter().any(|index| index == expected),
             "missing index {expected}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_captures_session_prompt_mcp_and_workdir_edits() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let fake_agent = temp.path().join("fake-acp-agent.sh");
+    let session_request_log = temp.path().join("session-new.jsonl");
+    let lane_workdir = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".crabdb/worktrees/acp-test");
+    fs::write(
+        &fake_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' "$session_new" > "{}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_fake"}}}}'
+IFS= read -r prompt
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess_fake","update":{{"sessionUpdate":"available_commands_update","commands":[{{"name":"write_file","description":"large command description"}}]}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess_fake","update":{{"sessionUpdate":"tool_call","toolCallId":"tool_1","title":"write README","kind":"edit","status":"pending"}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess_fake","update":{{"sessionUpdate":"tool_call_update","toolCallId":"tool_1","status":"completed"}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess_fake","update":{{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{{"type":"text","text":"done"}}}}}}}}'
+printf '%s\n' 'changed by fake agent' > "{}/README.md"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            session_request_log.display(),
+            lane_workdir.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_agent, permissions).unwrap();
+
+    let mut child = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("fake")
+        .arg("--")
+        .arg(&fake_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = std::io::BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let init_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(init_response["result"]["_meta"]["crabdb"]["relay"], true);
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let session_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(session_response["result"]["sessionId"], "sess_fake");
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_fake","prompt":[{{"type":"text","text":"change README"}}]}}}}"#
+    )
+    .unwrap();
+    let mut update_kinds = Vec::new();
+    let prompt_response = loop {
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let message: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        if message.get("id").and_then(|id| id.as_i64()) == Some(2) {
+            break message;
+        }
+        update_kinds.push(
+            message["params"]["update"]["sessionUpdate"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    };
+    assert!(update_kinds
+        .iter()
+        .any(|kind| kind == "available_commands_update"));
+    assert!(update_kinds.iter().any(|kind| kind == "tool_call"));
+    assert!(update_kinds.iter().any(|kind| kind == "tool_call_update"));
+    assert!(update_kinds
+        .iter()
+        .any(|kind| kind == "agent_message_chunk"));
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "relay failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let forwarded_session_new: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session_request_log).unwrap()).unwrap();
+    assert_eq!(
+        forwarded_session_new["params"]["cwd"].as_str().unwrap(),
+        lane_workdir.to_str().unwrap()
+    );
+    let mcp_servers = forwarded_session_new["params"]["mcpServers"]
+        .as_array()
+        .unwrap();
+    assert!(mcp_servers.iter().any(|server| server["name"] == "crabdb"));
+
+    let db = CrabDb::open(temp.path()).unwrap();
+    let mapping = db.try_lane_acp_session("sess_fake").unwrap().unwrap();
+    let lane = db.lane_details("acp-test").unwrap();
+    assert_eq!(mapping.lane_id, lane.record.lane_id);
+    assert_eq!(
+        lane.branch.workdir.as_deref(),
+        Some(lane_workdir.to_str().unwrap())
+    );
+
+    let session = db.show_lane_session(&mapping.crabdb_session_id).unwrap();
+    assert_eq!(session.turns.len(), 1);
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.role == "user" && message.body.contains("change README")));
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.role == "assistant" && message.body.contains("done")));
+    assert!(session
+        .events
+        .iter()
+        .any(|event| event.event_type == "acp_session_started"));
+    for expected in [
+        "acp_available_commands_update",
+        "tool_call",
+        "tool_call_update",
+        "span_started",
+        "span_ended",
+    ] {
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|event| event.event_type == expected),
+            "missing event {expected}"
+        );
+    }
+
+    let turn = db.show_lane_turn(&session.turns[0].turn_id).unwrap();
+    assert!(turn
+        .operations
+        .iter()
+        .any(|operation| operation.kind == OperationKind::LaneRecord));
+    let status = db.lane_status("acp-test").unwrap();
+    assert!(status
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "README.md"));
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_waits_for_transient_workspace_writer_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let fake_agent = temp.path().join("fake-acp-lock-agent.sh");
+    fs::write(
+        &fake_agent,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+IFS= read -r session_new
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"sess_wait"}}'
+IFS= read -r prompt
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_wait","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_1","content":{"type":"text","text":"captured"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_agent, permissions).unwrap();
+
+    let mut child = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-lock-wait")
+        .arg("--no-materialize")
+        .arg("--provider")
+        .arg("fake")
+        .arg("--")
+        .arg(&fake_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = std::io::BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let init_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(init_response["result"]["_meta"]["crabdb"]["relay"], true);
+
+    let lock_path = temp.path().join(".crabdb/lock");
+    fs::write(
+        &lock_path,
+        format!("pid={} created_at=0", std::process::id()),
+    )
+    .unwrap();
+    let lock_remover = {
+        let lock_path = lock_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            fs::remove_file(lock_path).unwrap();
+        })
+    };
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let session_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(session_response["result"]["sessionId"], "sess_wait");
+    lock_remover.join().unwrap();
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_wait","prompt":[{{"type":"text","text":"capture after wait"}}]}}}}"#
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let update: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        "agent_message_chunk"
+    );
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let prompt_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "relay failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("capture warning"),
+        "unexpected capture warning\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db = CrabDb::open(temp.path()).unwrap();
+    let mapping = db.try_lane_acp_session("sess_wait").unwrap().unwrap();
+    let session = db.show_lane_session(&mapping.crabdb_session_id).unwrap();
+    assert_eq!(session.turns.len(), 1);
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.role == "assistant" && message.body.contains("captured")));
 }
 
 #[test]

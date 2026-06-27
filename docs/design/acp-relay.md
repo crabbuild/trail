@@ -1,6 +1,6 @@
 # ACP Relay Design
 
-Status: proposal.
+Status: initial implementation.
 
 This design describes how CrabDB can become the neutral capture, branch, and
 recovery layer for ACP-compatible coding agents without becoming an agent
@@ -32,9 +32,82 @@ CrabDB already has the primitives the relay needs:
 - Structured patches through `lane apply-patch` and MCP `crabdb.apply_patch`.
 - `lane rewind` for auditable recovery to a known-good change or root.
 
-The missing piece is not a new storage model. It is an adapter that sits between
+The missing piece is not a new storage model. It is a relay that sits between
 ACP editors and real coding agents, mirrors the protocol activity into CrabDB,
 and ensures the real agent can see CrabDB's MCP tools.
+
+## Implementation Status
+
+The first production slice is implemented in `crabdb acp relay`.
+
+Implemented:
+
+- New CLI group: `crabdb acp relay -- <upstream-command>`.
+- Newline-delimited JSON-RPC stdio relay for local ACP agents.
+- Upstream child process lifecycle and stderr isolation.
+- `_meta.crabdb` initialization metadata.
+- Lane creation/reuse for ACP sessions.
+- Durable ACP-to-CrabDB session mapping in `lane_acp_sessions`.
+- CrabDB MCP injection into `session/new`, `session/load`, and
+  `session/resume`.
+- Optional materialized lane workdir routing via `--materialize`.
+- Prompt capture as CrabDB turns with user/assistant messages.
+- `session/update` capture for plans, generic updates, tool spans, and
+  assistant message chunks.
+- Privacy-conscious ACP update filtering: internal agent thought chunks are not
+  persisted, and available-command lists are summarized instead of storing full
+  command descriptions.
+- Relay-scoped writer-lock waiting so concurrent ACP relay processes do not
+  drop capture events when another process is briefly writing the workspace.
+- ACP permission requests mirrored into CrabDB approvals/run state.
+- Workdir recording at prompt completion linked to the active prompt turn.
+- Conservative structured ACP `diff` content capture as CrabDB `write` patch
+  edits for non-materialized sessions.
+
+Not yet implemented:
+
+- Editor config generation commands such as `crabdb acp init`.
+- Broad structured edit conversion beyond ACP `diff` content with `newText`.
+- Remote ACP transports while the HTTP transport remains draft.
+- Long-running assistant message checkpointing before prompt completion.
+
+## Performance Validation
+
+A release-build synthetic ACP benchmark was run on June 26, 2026 using real
+`crabdb acp relay` processes and fake ACP agents. The relay uses an in-process
+batched turn-event writer so high-volume ACP updates are buffered during a turn
+and committed to CrabDB under one writer lock at flush points. Each materialized
+turn emitted usage, tool, tool-update, and assistant-message updates, wrote one
+file into the lane workdir, and let CrabDB record the prompt checkpoint.
+
+Materialized edit checkpoint results after batched event capture:
+
+| Concurrent relays | Turns | Wall time | Throughput | p50 prompt | p95 prompt | p99 prompt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 320 | 2.48s | 129 turns/s | 9.2ms | 442ms | 994ms |
+
+The 16-relay materialized run captured all 16 lanes, 16 ACP session mappings,
+320 turns, 5,248 events, 321 operations, and 2,576 streamed updates with zero
+relay warnings and zero persisted thought events.
+
+A separate 16-relay capture-only run with `--no-materialize` captured 800 turns,
+12,128 events, and 6,416 streamed updates in 5.36s, or 149 turns/s. Prompt
+latency was p50 17ms, p95 426ms, p99 873ms, with zero relay warnings.
+
+Compared with the pre-batching baseline, the 16-relay materialized run improved
+from 102 to 129 turns/s and reduced p50 prompt latency from 20.5ms to 9.2ms.
+The 16-relay capture-only run improved from 129 to 149 turns/s and reduced p95
+prompt latency from 492ms to 426ms.
+
+Interpretation:
+
+- Aggregate throughput is acceptable for multi-agent coding workflows because
+  model/tool latency will usually dominate these local capture costs.
+- Tail latency grows under high write concurrency because CrabDB intentionally
+  serializes workspace mutations through its writer lock.
+- The remaining performance improvement is a daemon-backed cross-process writer
+  that can coalesce writes from many relay processes while preserving CrabDB's
+  single-writer correctness model.
 
 ## Protocol Assumptions
 
@@ -63,6 +136,7 @@ References:
 - https://agentclientprotocol.com/protocol/v1/session-setup
 - https://agentclientprotocol.com/protocol/v1/prompt-turn
 - https://agentclientprotocol.com/protocol/v1/content
+- https://agentclientprotocol.com/protocol/v1/transports
 - https://agentclientprotocol.com/protocol/v1/extensibility
 - https://github.com/agentclientprotocol/agent-client-protocol
 - https://modelcontextprotocol.io/specification/2025-06-18
@@ -97,9 +171,9 @@ CrabDB keeps each lane on its own branch-backed ref.
 CrabDB lets me review, merge, or rewind.
 ```
 
-## Proposed CLI Surface
+## CLI Surface
 
-Add an ACP command group later:
+Run a local ACP relay in front of a real ACP agent:
 
 ```sh
 crabdb acp relay \
@@ -110,6 +184,18 @@ crabdb acp relay \
   --materialize \
   -- claude-acp-agent --stdio
 ```
+
+Useful flags:
+
+- `--lane <name>` pins the ACP session to a stable CrabDB lane.
+- `--from <ref>` selects the base ref used when the lane is first created.
+- `--materialize` routes the upstream ACP session `cwd` to a materialized lane
+  workdir and records filesystem edits at prompt completion. This is the relay
+  default because most coding agents edit files directly.
+- `--no-materialize` leaves `cwd` untouched and relies on structured CrabDB MCP
+  operations or later manual recording.
+- `--provider` and `--model` annotate the lane, turns, and session mapping.
+- `--no-mcp` disables dynamic CrabDB MCP injection.
 
 Supporting setup commands can come after the relay works:
 
@@ -188,7 +274,7 @@ message structs if relay support is not mature enough.
 
 The relay needs a durable mapping between ACP sessions and CrabDB sessions.
 
-Add a small table in a later schema migration:
+The initial implementation adds this table:
 
 ```sql
 CREATE TABLE IF NOT EXISTS lane_acp_sessions (
@@ -206,9 +292,9 @@ CREATE TABLE IF NOT EXISTS lane_acp_sessions (
 );
 ```
 
-MVP can keep this mapping in memory for one process, but durable mapping is
-needed for `session/load`, `session/resume`, crash recovery, and cross-editor
-handoff.
+The relay also keeps an in-memory cache for active process state, but the
+durable table is the source of truth for `session/load`, `session/resume`,
+crash recovery, and cross-editor handoff.
 
 ### Capture Coordinator
 
@@ -273,7 +359,10 @@ MCP injection should look conceptually like:
   "name": "crabdb",
   "command": "crabdb",
   "args": ["mcp"],
-  "env": []
+  "env": [
+    {"name": "CRABDB_WORKSPACE", "value": "/repo"},
+    {"name": "CRABDB_DIR", "value": "/repo/.crabdb"}
+  ]
 }
 ```
 

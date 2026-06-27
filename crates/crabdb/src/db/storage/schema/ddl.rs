@@ -132,6 +132,21 @@ impl CrabDb {
                 ended_at INTEGER,
                 metadata_json TEXT
             );
+            CREATE TABLE IF NOT EXISTS lane_acp_sessions (
+                acp_session_id TEXT PRIMARY KEY,
+                upstream_session_id TEXT,
+                lane_id TEXT NOT NULL,
+                crabdb_session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                upstream_command_json TEXT,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS lane_acp_sessions_lane_idx ON lane_acp_sessions(lane_id, updated_at);
+            CREATE INDEX IF NOT EXISTS lane_acp_sessions_crabdb_session_idx ON lane_acp_sessions(crabdb_session_id);
             CREATE TABLE IF NOT EXISTS lane_turns (
                 turn_id TEXT PRIMARY KEY,
                 lane_id TEXT NOT NULL,

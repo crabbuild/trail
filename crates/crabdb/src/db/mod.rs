@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
@@ -34,6 +35,10 @@ const MAIN_REF_PREFIX: &str = "refs/branches/";
 const LANE_REF_PREFIX: &str = "refs/lanes/";
 const ROOT_OBJECT_VERSION: u16 = 1;
 const TEXT_OBJECT_VERSION: u16 = 1;
+
+thread_local! {
+    static WRITE_LOCK_WAIT_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 const OP_OBJECT_VERSION: u16 = 1;
 const BLOB_OBJECT_VERSION: u16 = 1;
 const MESSAGE_OBJECT_VERSION: u16 = 1;
@@ -468,6 +473,16 @@ pub(crate) struct WorkspaceLock {
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct WriteLockWaitGuard {
+    previous: Option<Instant>,
+}
+
+impl Drop for WriteLockWaitGuard {
+    fn drop(&mut self) {
+        WRITE_LOCK_WAIT_DEADLINE.with(|deadline| deadline.set(self.previous));
     }
 }
 

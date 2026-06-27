@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod acp_args;
 mod collaboration_args;
 mod handler;
 mod inspect_args;
@@ -11,6 +12,7 @@ mod render;
 mod workspace_args;
 mod worktree_args;
 
+use acp_args::*;
 use collaboration_args::*;
 use inspect_args::*;
 use lane_args::*;
@@ -116,6 +118,8 @@ enum Command {
     /// Manage lane branches, metadata, sessions, patches, tests, and traces.
     /// This command group covers the full CLI-facing lane workflow.
     Lane(LaneCommand),
+    /// Run Agent Client Protocol relay integrations for coding agents.
+    Acp(AcpCommand),
     /// Create and manage lane sessions, context packets, and lifecycle.
     Session(SessionCommand),
     /// Handle sensitive action approvals and reviewer decisions.

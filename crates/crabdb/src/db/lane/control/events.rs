@@ -1,6 +1,42 @@
 use super::*;
 
 impl CrabDb {
+    pub fn add_lane_session_event(
+        &mut self,
+        lane: &str,
+        session_id: &str,
+        event_type: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<LaneTurnEventReport> {
+        let _lock = self.acquire_write_lock()?;
+        validate_ref_segment(lane)?;
+        let event_type = event_type.trim();
+        if event_type.is_empty() {
+            return Err(Error::InvalidInput(
+                "event type cannot be empty".to_string(),
+            ));
+        }
+        let branch = self.lane_branch(lane)?;
+        let session = self.lane_session(session_id)?;
+        if session.lane_id != branch.lane_id {
+            return Err(Error::InvalidInput(format!(
+                "session `{session_id}` does not belong to lane `{lane}`"
+            )));
+        }
+        let event_id = self.insert_lane_event_with_context(
+            &branch.lane_id,
+            Some(session_id),
+            None,
+            event_type,
+            None,
+            None,
+            &payload.unwrap_or(serde_json::Value::Null),
+        )?;
+        Ok(LaneTurnEventReport {
+            event: self.lane_event(&event_id)?,
+        })
+    }
+
     pub fn list_lane_events(
         &self,
         lane: Option<&str>,

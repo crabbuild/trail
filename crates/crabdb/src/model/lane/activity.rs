@@ -23,6 +23,21 @@ pub struct LaneSessionContextReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneAcpSession {
+    pub acp_session_id: String,
+    pub upstream_session_id: Option<String>,
+    pub lane_id: String,
+    pub crabdb_session_id: String,
+    pub cwd: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub upstream_command_json: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneTurn {
     pub turn_id: String,
     pub lane_id: String,

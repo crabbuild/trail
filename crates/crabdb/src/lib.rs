@@ -6,6 +6,7 @@
 //! records meaningful operations, preserves stable file and line identity, and
 //! gives humans and coding lanes a safe branch/provenance layer above Git.
 
+pub mod acp;
 pub mod db;
 pub mod error;
 pub mod ids;

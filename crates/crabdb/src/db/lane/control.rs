@@ -1,5 +1,6 @@
 use super::*;
 
+mod acp_sessions;
 mod approvals;
 mod conversations;
 mod events;

@@ -5,10 +5,11 @@ use clap::Parser;
 use super::{render::*, *};
 
 use crabdb::{
-    Actor, CrabDb, Error, InitImportMode, LaneGateOptions, OperationKind, PatchDocument,
-    RecordOptions, Result,
+    acp::AcpRelayOptions, Actor, CrabDb, Error, InitImportMode, LaneGateOptions, OperationKind,
+    PatchDocument, RecordOptions, Result,
 };
 
+mod acp;
 mod collaboration;
 mod daemon_rpc;
 mod errors;
@@ -128,6 +129,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::History(args) => inspect::handle_history_command(&ctx, args),
         Command::CodeFrom(args) => inspect::handle_code_from_command(&ctx, args),
         Command::Lane(lane_command) => lane::handle_lane_command(&ctx, lane_command),
+        Command::Acp(acp_command) => acp::handle_acp_command(&ctx, acp_command),
         Command::Session(session_command) => {
             collaboration::handle_session_command(&ctx, session_command)
         }

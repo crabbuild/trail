@@ -7,8 +7,44 @@ impl CrabDb {
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
         let _lock = self.acquire_write_lock()?;
+        self.record_lane_workdir_locked(lane, message, None)
+    }
+
+    pub fn record_lane_workdir_for_turn(
+        &mut self,
+        lane: &str,
+        turn_id: &str,
+        message: Option<String>,
+    ) -> Result<LaneRecordReport> {
+        let _lock = self.acquire_write_lock()?;
+        self.record_lane_workdir_locked(lane, message, Some(turn_id))
+    }
+
+    fn record_lane_workdir_locked(
+        &mut self,
+        lane: &str,
+        message: Option<String>,
+        existing_turn_id: Option<&str>,
+    ) -> Result<LaneRecordReport> {
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
+        let existing_turn = existing_turn_id
+            .map(|turn_id| self.lane_turn(turn_id))
+            .transpose()?;
+        if let Some(turn) = &existing_turn {
+            if turn.lane_id != branch.lane_id {
+                return Err(Error::InvalidInput(format!(
+                    "turn `{}` does not belong to lane `{lane}`",
+                    turn.turn_id
+                )));
+            }
+            if turn.ended_at.is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "turn `{}` is already ended",
+                    turn.turn_id
+                )));
+            }
+        }
         let Some(workdir) = branch.workdir.clone() else {
             return Err(Error::InvalidInput(format!(
                 "lane `{lane}` does not have a materialized workdir"
@@ -213,16 +249,20 @@ impl CrabDb {
         if let Some(session_id) = &branch.session_id {
             self.ensure_lane_session(&branch.lane_id, session_id, None)?;
         }
-        let turn_id = self.open_lane_turn(
-            &branch.lane_id,
-            branch.session_id.as_deref(),
-            &branch.base_change,
-            &head.change_id,
-            Some(&serde_json::json!({
-                "kind": "workdir_record",
-                "path_count": diff.summaries.len()
-            })),
-        )?;
+        let turn_id = if let Some(turn) = &existing_turn {
+            turn.turn_id.clone()
+        } else {
+            self.open_lane_turn(
+                &branch.lane_id,
+                branch.session_id.as_deref(),
+                &branch.base_change,
+                &head.change_id,
+                Some(&serde_json::json!({
+                    "kind": "workdir_record",
+                    "path_count": diff.summaries.len()
+                })),
+            )?
+        };
 
         let operation = Operation {
             version: OP_OBJECT_VERSION,
@@ -288,7 +328,11 @@ impl CrabDb {
                 "changed_paths": diff.summaries.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
             }),
         )?;
-        self.finish_lane_turn(&turn_id, "completed", Some(&change_id))?;
+        if existing_turn.is_some() {
+            self.update_lane_turn_progress(&turn_id, "workdir_recorded", Some(&change_id))?;
+        } else {
+            self.finish_lane_turn(&turn_id, "completed", Some(&change_id))?;
+        }
         Ok(LaneRecordReport {
             lane_id: branch.lane_id,
             operation: Some(change_id),

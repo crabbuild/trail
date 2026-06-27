@@ -169,6 +169,54 @@ impl CrabDb {
         })
     }
 
+    pub fn ensure_lane_workdir_materialized(
+        &mut self,
+        lane: &str,
+        workdir: Option<PathBuf>,
+    ) -> Result<LaneWorkdirReport> {
+        let _lock = self.acquire_write_lock()?;
+        validate_ref_segment(lane)?;
+        let branch = self.lane_branch(lane)?;
+        if let Some(existing) = branch.workdir.clone() {
+            if let Some(requested) = workdir.as_deref() {
+                let requested = self.resolve_lane_workdir_path(lane, Some(requested))?;
+                let existing_path = normalize_workdir_path(&PathBuf::from(&existing))?;
+                if requested != existing_path {
+                    return Err(Error::InvalidInput(format!(
+                        "lane `{lane}` already has materialized workdir `{}`",
+                        existing_path.display()
+                    )));
+                }
+            }
+            return Ok(LaneWorkdirReport {
+                lane_id: branch.lane_id,
+                workdir: Some(existing),
+            });
+        }
+
+        let head = self.get_ref(&branch.ref_name)?;
+        let dir = self.materialize_lane_workdir(lane, &head.root_id, workdir.as_deref())?;
+        let workdir = dir.to_string_lossy().to_string();
+        self.conn.execute(
+            "UPDATE lane_branches SET workdir = ?1, updated_at = ?2 WHERE lane_id = ?3",
+            params![workdir, now_ts(), branch.lane_id],
+        )?;
+        self.insert_lane_event(
+            &branch.lane_id,
+            "workdir_materialized",
+            Some(&head.change_id),
+            None,
+            &serde_json::json!({
+                "workdir": workdir,
+                "root_id": head.root_id.0
+            }),
+        )?;
+        Ok(LaneWorkdirReport {
+            lane_id: branch.lane_id,
+            workdir: Some(dir.to_string_lossy().to_string()),
+        })
+    }
+
     pub(crate) fn materialize_lane_workdir(
         &self,
         name: &str,
