@@ -48,8 +48,44 @@ Lane:
 - `lane.require_eval_gate`
 - `lane.required_test_suites`
 - `lane.required_eval_suites`
+- `lane.claim_enforcement`: `off`, `warn`, or `reject`; controls whether active
+  write claims/leases are enforced for lane patches and lane workdir records.
+- `lane.enforce_sparse_paths`: turns sparse lane `--paths` selections into a
+  hard write boundary.
+- `lane.max_patch_bytes`: maximum serialized structured patch size; `0`
+  disables the limit.
+- `lane.max_patch_file_bytes`: maximum per-file patch or lane-record file size;
+  `0` disables the limit.
+- `lane.max_changed_paths`: maximum touched paths per lane mutation; `0`
+  disables the limit.
+- `lane.max_event_payload_bytes`: maximum lane event payload size; `0`
+  disables the limit.
+- `lane.max_trace_payload_bytes`: maximum trace span payload size; `0`
+  disables the limit.
 - `lane.worktrees_dir`
 - `lane.merge_strategy`: currently `conservative`.
+
+For agent-heavy workspaces, start with warning-mode hardening:
+
+```sh
+crabdb config set lane.claim_enforcement warn
+crabdb config set lane.enforce_sparse_paths true
+crabdb config set lane.max_changed_paths 25
+crabdb config set lane.max_patch_bytes 1048576
+crabdb config set lane.max_patch_file_bytes 262144
+crabdb config set lane.max_event_payload_bytes 65536
+crabdb config set lane.max_trace_payload_bytes 65536
+```
+
+After agents reliably claim or lease paths before writing, switch claims to
+rejection:
+
+```sh
+crabdb config set lane.claim_enforcement reject
+```
+
+See [Hardening agent workflows](hardening-agent-workflows.md) for the full
+operator model.
 
 Git:
 

@@ -49,11 +49,10 @@ crabdb config set lane.required_eval_suites policy-smoke
 
 ## Merge Paths
 
-Use direct merge for a one-off merge:
+Preview the lane merge first:
 
 ```sh
 crabdb merge-lane doc-bot --into main --dry-run
-crabdb merge-lane doc-bot --into main
 ```
 
 Use the queue for shared targets:
@@ -62,6 +61,8 @@ Use the queue for shared targets:
 crabdb merge-queue add doc-bot --into main --priority 10
 crabdb merge-queue run
 ```
+
+Direct non-dry-run merges into the default branch require `--direct`.
 
 ## Code Facts Used
 

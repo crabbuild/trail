@@ -22,6 +22,57 @@ pub(crate) fn render_lane_record(report: &LaneRecordReport, json: bool, quiet: b
     Ok(())
 }
 
+pub(crate) fn render_lane_record_preview(
+    report: &LaneRecordPreviewReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Lane workdir record preview: {}", report.workdir);
+        println!("Head: {}", report.head_change.0);
+        println!("Policy allowed: {}", report.policy.allowed);
+        if let Some(error) = &report.policy.error {
+            println!("Policy error: {error}");
+        }
+        for warning in &report.policy.warnings {
+            println!("Policy warning: {warning}");
+        }
+        if report.clean {
+            println!("No lane workdir changes to record");
+        } else {
+            println!("Changed paths:");
+            for path in &report.changed_paths {
+                println!("  {:?} {}", path.kind, path.path);
+            }
+        }
+        if !report.oversized_files.is_empty() {
+            println!("Oversized files:");
+            for file in &report.oversized_files {
+                println!(
+                    "  {} ({} bytes > {} bytes)",
+                    file.path, file.size_bytes, file.limit_bytes
+                );
+            }
+        }
+        if !report.ignored_paths.is_empty() {
+            println!("Ignored paths:");
+            for path in &report.ignored_paths {
+                println!("  {} ({})", path.path, path.source);
+            }
+        }
+        if !report.risky_paths.is_empty() {
+            println!("Risky paths:");
+            for path in &report.risky_paths {
+                println!("  {} [{}] {}", path.path, path.kind, path.message);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn render_lane_rewind(report: &LaneRewindReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);

@@ -60,30 +60,14 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
                 },
             })
         }
-        "fake" => Ok(AcpProviderProfile {
-            agent: "fake".to_string(),
-            display_name: "Fake local ACP test agent".to_string(),
-            available: true,
-            relay_command: vec![
-                "crabdb".to_string(),
-                "acp".to_string(),
-                "relay".to_string(),
-                "--provider".to_string(),
-                "fake".to_string(),
-                "--materialize".to_string(),
-                "--".to_string(),
-                "<fake-acp-agent>".to_string(),
-            ],
-            notes: vec!["for diagnostics and tests only".to_string()],
-        }),
         other => Err(Error::InvalidInput(format!(
-            "unsupported ACP agent `{other}`; supported agents: claude-code, fake"
+            "unsupported ACP agent `{other}`; supported agents: claude-code"
         ))),
     }
 }
 
 pub fn acp_provider_profiles() -> Vec<AcpProviderProfile> {
-    ["claude-code", "fake"]
+    ["claude-code"]
         .into_iter()
         .filter_map(|agent| acp_provider_profile(agent).ok())
         .collect()
@@ -217,15 +201,16 @@ fn command_in_path(command: &str) -> bool {
 fn acp_editor_snippet(editor: &str, relay_command: &[String]) -> String {
     let command = shell_join(relay_command);
     match editor {
-        "zed" => serde_json::json!({
+        "zed" => serde_json::to_string_pretty(&serde_json::json!({
             "agent_servers": {
                 "crabdb-claude-code": {
+                    "type": "custom",
                     "command": relay_command.first().cloned().unwrap_or_default(),
                     "args": relay_command.iter().skip(1).cloned().collect::<Vec<_>>()
                 }
             }
-        })
-        .to_string(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string()),
         _ => format!("ACP command:\n{command}"),
     }
 }

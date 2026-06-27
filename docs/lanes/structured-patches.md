@@ -60,7 +60,7 @@ Direct lane patches require `base_change` to match the current lane head. Turn-l
 }
 ```
 
-`expected_text` is optional but useful for safety.
+`expected_text` is required for `replace_line`. It must match the current line text or the patch is rejected before mutation.
 
 ## Delete and Rename
 
@@ -72,11 +72,15 @@ Direct lane patches require `base_change` to match the current lane head. Turn-l
 { "op": "rename", "from": "README.md", "to": "docs/README.md" }
 ```
 
-## HTTP Alternate Shape
+## HTTP/MCP Alternate Shape
 
-The HTTP patch parser also accepts a `files` array with `add_text`, `modify_text`, `write_bytes`, `delete`, and `rename` entries. The parser converts these entries into the same patch edits.
+The HTTP and MCP patch parsers also accept a `files` array with `add_text`, `modify_text`, `write_bytes`, `delete`, and `rename` entries. The parser converts these entries into the same patch edits. External patch requests must use either a non-empty `edits` array or a non-empty `files` array, not both.
 
 Structured patch messages and edit payloads are secret-scanned before storage. Assignment-style credentials, bearer tokens, and private-key PEM blocks reject the patch rather than writing those bytes into CrabDB objects.
+Patch paths are normalized and reject parent-directory escapes, absolute paths,
+backslash separators on non-Windows platforms, non-NFC Unicode spellings, slash
+lookalikes, invisible Unicode format controls, Windows-reserved device names and
+aliases, internal paths, and hardcoded private paths.
 
 ## Code Facts Used
 

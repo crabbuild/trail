@@ -63,6 +63,10 @@ enum ToolRiskClass {
 }
 
 fn tool_risk_class(name: &str) -> ToolRiskClass {
+    classified_tool_risk_class(name).unwrap_or(ToolRiskClass::Write)
+}
+
+fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
     match name {
         "crabdb.doctor"
         | "crabdb.status"
@@ -71,6 +75,36 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.why"
         | "crabdb.history"
         | "crabdb.code_from"
+        | "crabdb.agent_status"
+        | "crabdb.agent_inbox"
+        | "crabdb.agent_next"
+        | "crabdb.agent_ask"
+        | "crabdb.agent_view"
+        | "crabdb.agent_brief"
+        | "crabdb.agent_summary"
+        | "crabdb.agent_validate"
+        | "crabdb.agent_report"
+        | "crabdb.agent_receipt"
+        | "crabdb.agent_pr"
+        | "crabdb.agent_story"
+        | "crabdb.agent_risk"
+        | "crabdb.agent_ready"
+        | "crabdb.agent_diagnose"
+        | "crabdb.agent_workdir"
+        | "crabdb.agent_changes"
+        | "crabdb.agent_delta"
+        | "crabdb.agent_new"
+        | "crabdb.agent_change"
+        | "crabdb.agent_timeline"
+        | "crabdb.agent_files"
+        | "crabdb.agent_file"
+        | "crabdb.agent_checkpoints"
+        | "crabdb.agent_why"
+        | "crabdb.agent_turn"
+        | "crabdb.agent_compare"
+        | "crabdb.agent_diff"
+        | "crabdb.agent_review"
+        | "crabdb.agent_focus"
         | "crabdb.lane_list"
         | "crabdb.lane_show"
         | "crabdb.lane_status"
@@ -78,6 +112,7 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.lane_contribution"
         | "crabdb.gate_history"
         | "crabdb.lane_readiness"
+        | "crabdb.lane_refresh_preview"
         | "crabdb.lane_handoff"
         | "crabdb.config_list"
         | "crabdb.config_get"
@@ -93,6 +128,7 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.anchor_list"
         | "crabdb.anchor_resolve"
         | "crabdb.merge_queue_list"
+        | "crabdb.merge_queue_explain"
         | "crabdb.conflict_list"
         | "crabdb.conflict_show"
         | "crabdb.event_list"
@@ -103,19 +139,97 @@ fn tool_risk_class(name: &str) -> ToolRiskClass {
         | "crabdb.diff_lane"
         | "crabdb.ignore_list"
         | "crabdb.ignore_check"
-        | "crabdb.guardrail_check" => ToolRiskClass::ReadOnly,
+        | "crabdb.guardrail_check" => Some(ToolRiskClass::ReadOnly),
         "crabdb.config_set" | "crabdb.ignore_add" | "crabdb.ignore_remove" => {
-            ToolRiskClass::IdempotentWrite
+            Some(ToolRiskClass::IdempotentWrite)
         }
+        "crabdb.session_start"
+        | "crabdb.session_end"
+        | "crabdb.agent_mark_reviewed"
+        | "crabdb.approval_request"
+        | "crabdb.approval_decide"
+        | "crabdb.run_pause"
+        | "crabdb.run_resume"
+        | "crabdb.lease_acquire"
+        | "crabdb.lease_release"
+        | "crabdb.anchor_create"
+        | "crabdb.lane_spawn"
+        | "crabdb.lane_claim"
+        | "crabdb.merge_queue_add"
+        | "crabdb.begin_turn"
+        | "crabdb.add_message"
+        | "crabdb.add_event"
+        | "crabdb.span_start"
+        | "crabdb.span_end"
+        | "crabdb.end_turn" => Some(ToolRiskClass::Write),
         "crabdb.lane_remove"
+        | "crabdb.agent_apply"
+        | "crabdb.agent_rewind"
+        | "crabdb.agent_undo"
         | "crabdb.lane_rewind"
         | "crabdb.anchor_delete"
+        | "crabdb.merge_queue_run"
         | "crabdb.merge_queue_remove"
         | "crabdb.conflict_resolve"
         | "crabdb.apply_patch"
         | "crabdb.read_file"
-        | "crabdb.sync_workdir" => ToolRiskClass::DestructiveWrite,
-        "crabdb.run_test" | "crabdb.run_eval" => ToolRiskClass::OpenWorldWrite,
-        _ => ToolRiskClass::Write,
+        | "crabdb.sync_workdir" => Some(ToolRiskClass::DestructiveWrite),
+        "crabdb.agent_test" | "crabdb.agent_eval" | "crabdb.run_test" | "crabdb.run_eval" => {
+            Some(ToolRiskClass::OpenWorldWrite)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_annotations_match_enforcement_for_all_declared_tools() {
+        let tools = crate::mcp::tools::tools();
+        let tools = tools.as_array().expect("tools must be an array");
+        assert!(!tools.is_empty());
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool has a name");
+            let read_only_hint = tool["annotations"]["readOnlyHint"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("tool {name} missing readOnlyHint"));
+            assert_eq!(
+                read_only_hint,
+                tool_is_read_only(name),
+                "tool {name} advertises readOnlyHint={read_only_hint} but enforcement is {}",
+                tool_is_read_only(name)
+            );
+        }
+    }
+
+    #[test]
+    fn all_declared_tools_have_explicit_risk_classification() {
+        let tools = crate::mcp::tools::tools();
+        let tools = tools.as_array().expect("tools must be an array");
+        assert!(!tools.is_empty());
+
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool has a name");
+            assert!(
+                classified_tool_risk_class(name).is_some(),
+                "tool {name} is declared but falls back to generic write annotations"
+            );
+        }
+    }
+
+    #[test]
+    fn all_declared_tools_have_unique_names() {
+        let tools = crate::mcp::tools::tools();
+        let tools = tools.as_array().expect("tools must be an array");
+        assert!(!tools.is_empty());
+
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool has a name");
+            assert!(seen.insert(name), "duplicate MCP tool declaration `{name}`");
+        }
     }
 }

@@ -39,8 +39,19 @@ fn prompt_completion_candidates(
         (PROMPT_LANE_TASK | PROMPT_REVIEW_LANE, "lane") => lane_completion_candidates(db),
         (PROMPT_LANE_TASK, "branch") => branch_completion_candidates(db),
         (PROMPT_RESOLVE_CONFLICT, "conflict_set_id") => conflict_completion_candidates(db),
+        (PROMPT_REVIEW_AGENT | PROMPT_RECOVER_AGENT | PROMPT_APPLY_AGENT, "selector") => {
+            agent_completion_candidates(db)
+        }
         (PROMPT_LANE_TASK, "task") => Ok(Vec::new()),
-        (PROMPT_LANE_TASK | PROMPT_REVIEW_LANE | PROMPT_RESOLVE_CONFLICT, _) => Ok(Vec::new()),
+        (
+            PROMPT_LANE_TASK
+            | PROMPT_REVIEW_LANE
+            | PROMPT_RESOLVE_CONFLICT
+            | PROMPT_REVIEW_AGENT
+            | PROMPT_RECOVER_AGENT
+            | PROMPT_APPLY_AGENT,
+            _,
+        ) => Ok(Vec::new()),
         (other, _) => Err(Error::InvalidInput(format!(
             "MCP prompt `{other}` not found"
         ))),
@@ -96,6 +107,23 @@ fn lane_completion_candidates(db: &CrabDb) -> Result<Vec<String>> {
     for lane in db.list_lanes()? {
         values.insert(lane.record.name);
         values.insert(lane.record.lane_id);
+    }
+    Ok(values.into_iter().collect())
+}
+
+fn agent_completion_candidates(db: &CrabDb) -> Result<Vec<String>> {
+    let mut values = BTreeSet::new();
+    values.insert("latest".to_string());
+    for task in db.list_agent_tasks()?.tasks {
+        values.insert(task.name);
+        values.insert(task.task_id);
+        values.insert(task.lane);
+        if let Some(session_id) = task.session_id {
+            values.insert(session_id);
+        }
+        if let Some(acp_session_id) = task.acp_session_id {
+            values.insert(acp_session_id);
+        }
     }
     Ok(values.into_iter().collect())
 }

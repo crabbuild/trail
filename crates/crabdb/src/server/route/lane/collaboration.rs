@@ -3,8 +3,8 @@ use crate::server::request_types::{
     MergeLaneRequest, MergeQueueAddRequest, MergeQueueRunRequest,
 };
 use crate::server::route::utils::{
-    json_response, query_flag, query_usize, query_value, resolve_conflict_request,
-    validate_merge_strategy,
+    json_response, query_flag, query_usize, query_value, reject_unexpected_body, required_query,
+    resolve_conflict_request, validate_merge_strategy,
 };
 use crate::server::transport::{HttpRequest, HttpResponse};
 use crate::{CrabDb, Error, Result};
@@ -65,12 +65,18 @@ pub(super) fn handle_collaboration_routes(
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
+    if request.method == "GET" && path == "/v1/merge-queue/explain" {
+        let report = db.explain_merge_queue(required_query(query, "selector")?)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
     if request.method == "GET" && path == "/v1/conflicts" {
         let conflicts = db.list_conflicts()?;
         return Ok(Some(json_response(200, "OK", &conflicts)?));
     }
 
     if parts.len() == 3 && parts[0] == "v1" && parts[1] == "leases" && request.method == "DELETE" {
+        reject_unexpected_body(request, "DELETE /v1/leases/{lease_id}")?;
         let report = db.release_lease(parts[2])?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
@@ -81,6 +87,7 @@ pub(super) fn handle_collaboration_routes(
             return Ok(Some(json_response(200, "OK", &report)?));
         }
         if request.method == "DELETE" {
+            reject_unexpected_body(request, "DELETE /v1/anchors/{anchor_id}")?;
             let report = db.delete_anchor(parts[2])?;
             return Ok(Some(json_response(200, "OK", &report)?));
         }
@@ -91,7 +98,18 @@ pub(super) fn handle_collaboration_routes(
         && parts[1] == "merge-queue"
         && request.method == "DELETE"
     {
+        reject_unexpected_body(request, "DELETE /v1/merge-queue/{queue_id}")?;
         let report = db.remove_merge_queue(parts[2])?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "merge-queue"
+        && parts[3] == "explain"
+        && request.method == "GET"
+    {
+        let report = db.explain_merge_queue(parts[2])?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
@@ -123,7 +141,7 @@ pub(super) fn handle_collaboration_routes(
             Error::InvalidInput("merge-lane request requires `lane_id`".to_string())
         })?;
         let lane = db.resolve_lane_handle(&lane)?;
-        let report = db.merge_lane_with_options(&lane, parts[2], body.dry_run)?;
+        let report = db.merge_lane_user_with_options(&lane, parts[2], body.dry_run, body.direct)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

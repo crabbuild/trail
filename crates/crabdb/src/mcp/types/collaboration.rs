@@ -14,12 +14,14 @@ pub(crate) struct SessionStartArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionListArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionCurrentArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
@@ -32,6 +34,7 @@ pub(crate) struct SessionIdArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionContextArgs {
     pub(crate) session_id: String,
     #[serde(default)]
@@ -61,6 +64,7 @@ pub(crate) struct ApprovalRequestArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovalListArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
@@ -69,6 +73,7 @@ pub(crate) struct ApprovalListArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovalShowArgs {
     pub(crate) approval_id: String,
 }
@@ -101,6 +106,7 @@ pub(crate) struct LaneRunPauseArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRunListArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
@@ -109,6 +115,7 @@ pub(crate) struct LaneRunListArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRunShowArgs {
     pub(crate) run_id: String,
 }
@@ -133,6 +140,7 @@ pub(crate) struct AnchorCreateArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AnchorIdArgs {
     pub(crate) anchor_id: String,
     #[serde(default)]

@@ -10,6 +10,7 @@ use crabdb::{
 };
 
 mod acp;
+mod agent;
 mod collaboration;
 mod daemon_rpc;
 mod errors;
@@ -130,6 +131,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::CodeFrom(args) => inspect::handle_code_from_command(&ctx, args),
         Command::Lane(lane_command) => lane::handle_lane_command(&ctx, lane_command),
         Command::Acp(acp_command) => acp::handle_acp_command(&ctx, acp_command),
+        Command::Agent(agent_command) => agent::handle_agent_command(&ctx, agent_command),
         Command::Transcript(args) => acp::handle_transcript_command(&ctx, args),
         Command::Turn(turn) => acp::handle_top_turn_command(&ctx, turn),
         Command::Demo(demo) => acp::handle_demo_command(&ctx, demo),

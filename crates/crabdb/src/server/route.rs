@@ -16,7 +16,10 @@ pub(crate) fn route_request(
     auth: &ServerAuth,
 ) -> HttpResponse {
     let audit = audit::HttpMutationAudit::from_request(&request);
-    let idempotency = if utils::origin_allowed(&request) && utils::authorized(&request, auth) {
+    let idempotency = if utils::host_allowed(&request)
+        && utils::origin_allowed(&request)
+        && utils::authorized(&request, auth)
+    {
         match idempotency::HttpIdempotency::from_request(&request) {
             Ok(idempotency) => idempotency,
             Err(err) => {
@@ -34,7 +37,7 @@ pub(crate) fn route_request(
         match idempotency.replay(db) {
             Ok(Some(response)) => {
                 if let Some(audit) = audit {
-                    audit.record(db, &response);
+                    audit.record_idempotency_replay(db, &response);
                 }
                 return response;
             }

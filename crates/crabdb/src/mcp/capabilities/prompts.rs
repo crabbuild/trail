@@ -55,6 +55,42 @@ pub(crate) fn prompts() -> Value {
                     "required": true
                 }
             ]
+        },
+        {
+            "name": PROMPT_REVIEW_AGENT,
+            "title": "Review a CrabDB Agent Task",
+            "description": "Guide a host through reviewing an agent task using the high-level agent tools.",
+            "arguments": [
+                {
+                    "name": "selector",
+                    "description": "Agent task, lane, session, ACP session, or latest. Defaults to latest.",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": PROMPT_RECOVER_AGENT,
+            "title": "Recover a CrabDB Agent Task",
+            "description": "Guide a host through safe agent undo/rewind using friendly checkpoint targets.",
+            "arguments": [
+                {
+                    "name": "selector",
+                    "description": "Agent task, lane, session, ACP session, or latest. Defaults to latest.",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": PROMPT_APPLY_AGENT,
+            "title": "Apply a CrabDB Agent Task",
+            "description": "Guide a host through testing, dry-run apply, and confirmed safe apply for an agent task.",
+            "arguments": [
+                {
+                    "name": "selector",
+                    "description": "Agent task, lane, session, ACP session, or latest. Defaults to latest.",
+                    "required": false
+                }
+            ]
         }
     ])
 }

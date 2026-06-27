@@ -109,6 +109,10 @@ pub struct ConflictPathExplanation {
     pub source: Option<ConflictSideProvenance>,
     pub lines: Vec<ConflictLineExplanation>,
     pub recommendation: ConflictResolutionCandidate,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_resolutions: Vec<ConflictKnownResolution>,
+    #[serde(default, skip_serializing)]
+    pub signature: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,20 +145,51 @@ pub struct ConflictResolutionCandidate {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConflictKnownResolution {
+    pub resolution: String,
+    pub confidence: String,
+    pub reason: String,
+    pub conflict_set_id: String,
+    pub operation: ChangeId,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictManualResolution {
     #[serde(default)]
     pub files: std::collections::BTreeMap<String, ConflictManualFile>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, Serialize)]
 pub enum ConflictManualFile {
     Text(String),
     Spec(ConflictManualFileSpec),
 }
 
+impl<'de> serde::Deserialize<'de> for ConflictManualFile {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(text) => Ok(Self::Text(text)),
+            serde_json::Value::Object(_) => {
+                serde_json::from_value::<ConflictManualFileSpec>(value)
+                    .map(Self::Spec)
+                    .map_err(serde::de::Error::custom)
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "invalid manual conflict file value {other}; expected string content or object spec"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictManualFileSpec {
     #[serde(default)]
     pub content: Option<String>,

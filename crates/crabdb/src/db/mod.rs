@@ -215,10 +215,12 @@ pub(crate) struct CommandRunResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalMutationAuditInput {
+    pub(crate) actor: String,
     pub(crate) surface: String,
     pub(crate) command: String,
     pub(crate) target_ref: Option<String>,
     pub(crate) lane_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
     pub(crate) status: String,
     pub(crate) status_code: Option<i64>,
     pub(crate) change_id: Option<ChangeId>,
@@ -573,6 +575,7 @@ impl Drop for WriteLockWaitGuard {
     }
 }
 
+mod agent;
 mod core;
 mod lane;
 mod merge;
@@ -603,9 +606,107 @@ mod tests {
     }
 
     #[test]
+    fn case_fold_collision_validation_rejects_unicode_compatibility_aliases() {
+        let paths = ["src/Ｋ.rs".to_string(), "src/k.rs".to_string()];
+        let err = validate_no_case_fold_collisions(paths.iter()).unwrap_err();
+        match err {
+            Error::InvalidPath { path, reason } => {
+                assert_eq!(path, "src/k.rs");
+                assert!(reason.contains("src/Ｋ.rs"));
+            }
+            other => panic!("expected invalid path error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn case_fold_collision_validation_allows_distinct_paths() {
         let paths = ["src/foo.rs".to_string(), "src/bar.rs".to_string()];
         validate_no_case_fold_collisions(paths.iter()).unwrap();
+    }
+
+    #[test]
+    fn relative_path_normalization_rejects_unicode_aliases() {
+        let composed = normalize_relative_path("docs/caf\u{00E9}.md").unwrap();
+        assert_eq!(composed, "docs/caf\u{00E9}.md");
+
+        let err = normalize_relative_path("docs/cafe\u{0301}.md").unwrap_err();
+        match err {
+            Error::InvalidPath { path, reason } => {
+                assert_eq!(path, "docs/cafe\u{0301}.md");
+                assert!(reason.contains("Unicode NFC"));
+            }
+            other => panic!("expected invalid path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_path_normalization_rejects_separator_lookalikes() {
+        for separator in [
+            '\u{2044}', '\u{2215}', '\u{2216}', '\u{29F8}', '\u{29F9}', '\u{FE68}', '\u{FF0F}',
+            '\u{FF3C}',
+        ] {
+            let path = format!("docs{separator}README.md");
+            let err = normalize_relative_path(&path).unwrap_err();
+            match err {
+                Error::InvalidPath { reason, .. } => {
+                    assert!(reason.contains("slash lookalike"));
+                }
+                other => panic!("expected invalid path error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relative_path_normalization_rejects_invisible_format_controls() {
+        for control in [
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
+            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}', '\u{FEFF}',
+        ] {
+            let path = format!("docs/readme{control}.md");
+            let err = normalize_relative_path(&path).unwrap_err();
+            match err {
+                Error::InvalidPath { reason, .. } => {
+                    assert!(reason.contains("invisible Unicode format controls"));
+                }
+                other => panic!("expected invalid path error, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_path_normalization_rejects_backslash_separators() {
+        let err = normalize_relative_path("docs\\README.md").unwrap_err();
+        match err {
+            Error::InvalidPath { reason, .. } => {
+                assert!(reason.contains("backslash"));
+                assert!(reason.contains("use `/`"));
+            }
+            other => panic!("expected invalid path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_path_normalization_rejects_windows_device_aliases() {
+        for path in [
+            "CONIN$",
+            "CONOUT$",
+            "COM\u{00B9}.txt",
+            "COM\u{00B2}.txt",
+            "COM\u{00B3}.txt",
+            "LPT\u{00B9}",
+            "LPT\u{00B2}",
+            "LPT\u{00B3}",
+        ] {
+            let err = normalize_relative_path(path).unwrap_err();
+            match err {
+                Error::InvalidPath { reason, .. } => {
+                    assert!(reason.contains("reserved on Windows"));
+                }
+                other => panic!("expected invalid path error for {path}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -623,6 +724,28 @@ mod tests {
                     assert_ne!(part, "..", "seed {seed}: {normalized}");
                     assert!(!part.contains(':'), "seed {seed}: {normalized}");
                     assert!(!part.ends_with([' ', '.']), "seed {seed}: {normalized}");
+                    assert!(
+                        !part.chars().any(|ch| matches!(
+                            ch,
+                            '\u{200B}'
+                                | '\u{200C}'
+                                | '\u{200D}'
+                                | '\u{200E}'
+                                | '\u{200F}'
+                                | '\u{202A}'
+                                | '\u{202B}'
+                                | '\u{202C}'
+                                | '\u{202D}'
+                                | '\u{202E}'
+                                | '\u{2060}'
+                                | '\u{2066}'
+                                | '\u{2067}'
+                                | '\u{2068}'
+                                | '\u{2069}'
+                                | '\u{FEFF}'
+                        )),
+                        "seed {seed}: {normalized}"
+                    );
                 }
             }
         }
@@ -666,6 +789,10 @@ mod tests {
             "nested\\path",
             "normal-name",
             "\u{2215}",
+            "\u{29F8}",
+            "cafe\u{0301}.md",
+            "spoof\u{202E}txt",
+            "zero\u{200B}width",
             "emoji",
             ".git",
             ".crabdb",

@@ -1,17 +1,22 @@
 # Integration Overview
 
-CrabDB exposes four integration surfaces:
+CrabDB exposes five integration surfaces:
 
 - CLI: primary human and scripting interface.
 - HTTP daemon: JSON API for editor and automation integrations.
 - MCP server: stdio server with tools, resources, prompts, and completions for agent hosts.
+- ACP relay: stdio relay in front of ACP-capable coding agents.
 - Rust library: public `CrabDb` API and exported model/report types.
 
 Git interop is also available through the CLI and library.
 
-The proposed [ACP relay design](../design/acp-relay.md) describes a future
-adapter that would sit between ACP-capable editors and real coding agents while
-mirroring sessions, turns, prompts, tool events, and edits into CrabDB.
+The [ACP integration guide](./acp.md) and
+[ACP Agent Usage Runbook](./acp-agent-usage.md) show how CrabDB sits between
+ACP-capable editors and real coding agents while mirroring sessions, turns,
+prompts, tool events, and edits into CrabDB.
+The [VS Code ACP chat view design](../design/vscode-acp-chat-view.md) describes
+how a VS Code extension can render ACP chat components while treating CrabDB as
+the durable source of truth for tasks, turns, checkpoints, review, and recovery.
 
 ## Choose a Surface
 
@@ -32,7 +37,7 @@ Use MCP when:
 - An agent host supports MCP tools and resources.
 - You need guided prompts for agent tasks, review, or conflict resolution.
 
-Use the future ACP relay when:
+Use the ACP relay when:
 
 - An editor speaks Agent Client Protocol.
 - You want the editor to keep its normal agent UX while CrabDB records the run.
@@ -48,5 +53,7 @@ Use the Rust library when:
 - CLI entrypoint: `crates/crabdb/src/cli`
 - HTTP server: `crates/crabdb/src/server`
 - MCP server: `crates/crabdb/src/mcp`
+- ACP usage: `docs/integrations/acp-agent-usage.md`
 - Library exports: `crates/crabdb/src/lib.rs`
 - ACP relay proposal: `docs/design/acp-relay.md`
+- VS Code ACP chat view: `docs/design/vscode-acp-chat-view.md`

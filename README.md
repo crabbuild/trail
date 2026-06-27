@@ -361,8 +361,8 @@ For ACP coding-agent setup, keep installation simple and use the guided CrabDB
 commands after the binary is installed:
 
 ```sh
-crabdb acp doctor --agent claude-code
-crabdb acp install --agent claude-code --print
+crabdb agent doctor --provider claude-code
+crabdb agent setup --provider claude-code --editor vscode
 ```
 
 For a project-local install directory, override `PREFIX`:
@@ -587,6 +587,60 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
 | `crabdb ignore check <path>` | Check whether ignore policy records or skips a path |
 | `crabdb guardrails check --action <action>` | Preflight a risky action against workspace policy |
+| `crabdb agent setup --provider claude-code --editor vscode` | Print editor config for fresh CrabDB agent tasks |
+| `crabdb agent` | Open the agent inbox home view with grouped tasks, review-first hints, and one next action |
+| `crabdb agent ask what needs attention` | Route a plain-language question to the inbox home view |
+| `crabdb agent ask what changed` | Route a plain-language question to the right task view |
+| `crabdb agent ask last prompt` | Route a plain-language question to the latest prompt turn |
+| `crabdb agent ask what changed in the last prompt` | Route a plain-language question to the newest prompt delta |
+| `crabdb agent ask what changed in README.md in the last prompt` | Route a plain-language question to a file-scoped prompt delta |
+| `crabdb agent ask show transcript` | Route a plain-language question to the task transcript |
+| `crabdb agent home` | Alias for the agent inbox home view |
+| `crabdb agent inbox` | Group all agent tasks by attention state, new changes, and review-first file |
+| `crabdb agent next` | Show the one next useful action for the latest agent task |
+| `crabdb agent todo` | Friendly alias for the one next useful action |
+| `crabdb agent status` | Show the latest agent task, risk, and next useful action |
+| `crabdb agent brief latest` | Show a compact task brief with risk, next action, changes, and tools |
+| `crabdb agent summary latest` | Show one post-run cockpit with readiness, risk, receipt, PR draft, and next command |
+| `crabdb agent validate latest` | Show latest gates and suggested validation commands without running anything |
+| `crabdb agent receipt latest` | Print a copyable post-run receipt with validation, changes, risk, and next command |
+| `crabdb agent pr latest` | Print a pull request draft title and body without creating a remote PR |
+| `crabdb agent report latest --markdown` | Print a copyable review/handoff report for an agent task |
+| `crabdb agent story latest` | Explain what happened in plain language |
+| `crabdb agent risk latest` | Show apply risk, reasons, and concrete mitigations |
+| `crabdb agent ready latest` | Check apply readiness without mutating Git |
+| `crabdb agent can-land latest` | Friendly alias for safe apply readiness |
+| `crabdb agent diagnose latest` | Explain likely issues and safe recovery options before undo/rewind |
+| `crabdb agent recover latest` | Friendly alias for recovery diagnosis |
+| `crabdb agent compare <TASK_A> <TASK_B>` | Compare two agent tasks, shared files, risk, and next action |
+| `crabdb agent test latest -- cargo test` | Run and record a test gate in the task workdir |
+| `crabdb agent eval latest -- <command>` | Run and record an eval gate in the task workdir |
+| `crabdb agent workdir latest` | Print the task workdir and a copyable `cd` command |
+| `crabdb agent view latest` | Inspect transcript, tools, changed paths, and checkpoint |
+| `crabdb agent changes latest` | Show high-level change cards plus turn/checkpoint details |
+| `crabdb agent delta latest` | Show the newest completed turn or operation delta |
+| `crabdb agent last latest` | Friendly alias for the newest completed turn or operation delta |
+| `crabdb agent new latest` | Show changes since the task was last marked reviewed |
+| `crabdb agent what-changed latest` | Friendly alias for changes since the last reviewed checkpoint |
+| `crabdb agent mark-reviewed latest` | Mark the current task checkpoint as reviewed |
+| `crabdb agent done latest` | Friendly alias for marking the current checkpoint reviewed |
+| `crabdb agent turn` | Inspect the latest completed turn with prompt, tools, checkpoint, and files |
+| `crabdb agent turn-diff latest --patch` | Show the latest or selected turn diff without spelling out diff flags |
+| `crabdb agent files latest` | Show changed files with the turns and commands behind each file |
+| `crabdb agent changed-files latest` | Friendly alias for changed files with provenance |
+| `crabdb agent inspect README.md` | Friendly alias for file-centered agent context |
+| `crabdb agent checkpoints latest` | List friendly rewind targets and checkpoint ids |
+| `crabdb agent rewind-points latest` | Friendly alias for checkpoint and rewind targets |
+| `crabdb agent why latest README.md` | Explain which prompt, turn, tools, and checkpoint changed a file |
+| `crabdb agent explain README.md` | Friendly alias for explaining why a file changed |
+| `crabdb agent review-plan latest` | Show readiness, risk, review-priority files, and next commands |
+| `crabdb agent review latest` | Short alias for the review-priority dashboard |
+| `crabdb agent focus latest` | Inspect the next file to review with why and focused diff summary |
+| `crabdb agent apply latest --dry-run` | Preview safe Git apply for an agent task |
+| `crabdb agent apply latest` | Record, merge, export, and fast-forward with a task-title commit message |
+| `crabdb agent land latest` | Friendly alias for applying an agent task safely |
+| `crabdb agent undo latest` | Undo the latest agent turn without copying checkpoint ids |
+| `crabdb agent undo-last latest` | Friendly alias for undoing the latest agent turn |
 | `crabdb lane spawn <name> --from <ref>` | Create an isolated lane branch |
 | `crabdb lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
 | `crabdb lane review <name>` | Produce a compact review packet for a lane branch |
@@ -639,11 +693,239 @@ crabdb fsck
 Use `--json` or `--format json` on commands when a script, editor, or agent
 needs machine-readable output.
 
+## Agent Workflow
+
+Use `crabdb agent` when you want CrabDB to hide lane names, ACP sessions, export
+ranges, and Git handoff details. Each task gets a fresh lane by default.
+Task lists and summaries show a human title first, derived from the prompt or
+from `--name`; the stable task id is still shown when you need precision.
+When a task has a materialized filesystem, summaries also show `Workdir`, the
+exact directory where the agent edited files.
+
+Configure an ACP editor once:
+
+```sh
+crabdb agent setup --provider claude-code --editor vscode
+```
+
+Paste the printed snippet into the editor's ACP custom-agent settings. After one
+prompt, ask CrabDB what needs attention:
+
+```sh
+crabdb agent
+```
+
+Bare `agent` is the inbox home view. It shows the task queue, the attention
+state, new files/lines since the last review, the first file to inspect, and the
+one next command. Use `agent status` for only the latest task or
+`agent todo latest` for a single primary command. Then drill into a task only as
+needed:
+
+```sh
+crabdb agent
+crabdb agent ask what needs attention
+crabdb agent ask what should I do next
+crabdb agent ask what did the agent do
+crabdb agent ask where is the workdir
+crabdb agent ask where did the agent edit
+crabdb agent ask which prompt changed README.md
+crabdb agent ask last prompt
+crabdb agent ask what changed in the last prompt
+crabdb agent ask what changed in README.md in the last prompt
+crabdb agent ask show transcript
+crabdb agent ask what should I review
+crabdb agent ask what should I review first
+crabdb agent ask open review
+crabdb agent ask review this task
+crabdb agent ask what tools were used
+crabdb agent ask can I merge
+crabdb agent ask what changed since I looked
+crabdb agent ask explain README.md
+crabdb agent ask show patch for README.md
+crabdb agent ask show turn diff
+crabdb agent story latest
+crabdb agent summary latest
+crabdb agent ask what tests should I run
+crabdb agent validate latest
+crabdb agent risk latest
+crabdb agent can-land latest
+crabdb agent recover latest
+crabdb agent compare <TASK_A> <TASK_B>
+crabdb agent receipt latest
+crabdb agent pr latest
+crabdb agent report latest --markdown
+crabdb agent test latest -- cargo test
+crabdb agent brief latest
+crabdb agent workdir latest
+crabdb agent last latest
+crabdb agent what-changed latest
+crabdb agent done latest
+crabdb agent changes latest
+crabdb agent turn
+crabdb agent turn-diff latest --patch
+crabdb agent changed-files latest
+crabdb agent rewind-points latest
+crabdb agent explain README.md
+crabdb agent turn-diff latest --file README.md --patch
+crabdb agent review-plan latest
+crabdb agent focus latest
+crabdb agent view latest
+crabdb agent land latest --dry-run
+crabdb agent land latest
+```
+
+If the latest prompt went sideways, undo by task language instead of copying a
+checkpoint id:
+
+```sh
+crabdb agent rewind-points latest
+crabdb agent undo-last latest
+crabdb agent undo-last latest --turn 2
+crabdb agent undo-last latest --prompt 'Add hook support'
+```
+
+For terminal-first work, create a fresh materialized lane and launch Claude Code
+inside it:
+
+```sh
+crabdb agent start --provider claude-code --name docs-edit
+crabdb agent
+crabdb agent ask what should I do next
+crabdb agent todo
+crabdb agent last latest
+crabdb agent what-changed latest
+crabdb agent changes latest
+crabdb agent change latest 1
+crabdb agent inspect README.md
+crabdb agent timeline latest
+crabdb agent turn
+crabdb agent turn-diff latest --patch
+crabdb agent validate latest
+crabdb agent test latest -- cargo test
+crabdb agent can-land latest
+crabdb agent explain README.md
+crabdb agent turn-diff latest --file README.md --patch
+crabdb agent land latest
+```
+
+`agent land` is an alias for `agent apply`; use whichever verb feels more
+natural. Both record dirty lane workdirs first, check that the current Git tree
+matches CrabDB's internal apply base, merges the task into CrabDB, creates a Git
+commit using the task title by default, and fast-forwards the current Git branch
+only when safe. Use `-m` only when you want to override the generated commit
+message.
+
+`agent summary latest` is the easiest post-run view for one task. It combines
+readiness, risk, validation, Git preflight, receipt and PR pointers, and the one
+next command. Use it when you are not sure whether to review, test, apply, or
+draft a PR.
+
+`agent validate latest` is the read-only validation guide. It shows the latest
+test/eval gates, whether more validation is needed, and suggested
+`agent test`/`agent eval` commands. Risk, review, readiness, and summary views
+point here before suggesting commands that execute validation. `agent tests
+latest` is an alias, and `agent ask what tests should I run` routes here.
+
+`agent receipt latest` is the copyable after-action note. It prints Markdown by
+default with validation gates, changed files, turns, tools, risk, checkpoint,
+and the next command; use `--json` when an editor panel needs the same data.
+
+`agent pr latest` prints a pull request draft title and body from the same
+recorded task state. It is read-only: it does not create a GitHub/GitLab PR or
+touch Git. Use `--title-only` or `--body-only` for scripts.
+
+`agent ask ...` is the easiest front door when you do not remember a command.
+It uses deterministic routing, not model inference, and reuses the normal agent
+reports. Examples: `agent ask what needs attention`,
+`agent ask what should I do next`,
+`agent ask what did the agent do`, `agent ask where is the workdir`,
+`agent ask where did the agent edit`, `agent ask which prompt changed README.md`,
+`agent ask last prompt`, `agent ask what changed in the last prompt`,
+`agent ask what changed in README.md in the last prompt`,
+`agent ask show transcript`,
+`agent ask what should I review`,
+`agent ask what should I review first`, `agent ask open review`,
+`agent ask review this task`,
+`agent ask what tools were used`, `agent ask what just changed`,
+`agent ask what changed since I looked`, `agent ask changed files`,
+`agent ask what tests should I run`, `agent ask can I merge`,
+`agent ask is it safe to land`,
+`agent ask recover`, and `agent ask explain README.md`.
+Patch and diff phrasing also works:
+`agent ask show last patch`, `agent ask show turn diff`, and
+`agent ask show patch for README.md`.
+
+`agent todo latest` is the "what should I do now?" command. It is an alias for
+`agent next latest` and returns one primary next action plus a few alternatives.
+
+`agent can-land latest` is the "is it safe?" command. It is an alias for
+`agent ready latest` and combines task readiness, risk, Git preflight, blockers,
+warnings, and the next command without mutating Git.
+
+`agent recover latest` is the recovery front door. It is an alias for
+`agent diagnose latest`. It explains the likely issue, shows evidence, lists
+friendly checkpoint targets, and prints safe
+inspection/recovery commands before you run destructive undo or rewind actions.
+
+`agent timeline latest` is the chronological view. It connects prompts,
+assistant responses, tool summaries, checkpoints, changed files, and exact
+follow-up commands so you can understand what happened without chasing turn ids
+or operation ids manually. Use `--by-operation` when you need the lower-level
+CrabDB operation timeline.
+
+`agent last latest` starts with the newest completed turn. It is the fastest
+way to answer "what just changed?" after an editor or terminal agent finishes a
+prompt. It is an alias for `agent delta latest`. Add `--patch` for exact hunks
+or `--file <PATH> --patch` to keep the view pinned to one open file.
+
+`agent what-changed latest` starts from the last reviewed checkpoint. It is
+the fastest way to answer "what changed since I looked?" without manually
+comparing turns or operation ids. If no reviewed marker exists yet, it shows the
+whole task as unreviewed. Run `agent done latest` after inspection to make the
+current checkpoint the next baseline. It is an alias for `agent new latest`;
+`agent mark-reviewed latest` remains the explicit reviewed-marker form.
+
+`agent changes latest` is the start-here review map for the whole task. It
+prints one `Next` command, then ranks change cards by likely review importance.
+Each card includes ready `Review`, `Focus`, `Why`, and `Diff` commands so you can
+open the card, inspect the first file, explain provenance, or jump straight to a
+patch without copying turn ids or checkpoint ids.
+
+`agent change latest 1` expands one change card into a focused change set:
+files, provenance, tools, ready commands, and optional focused patches with
+`--patch`. You can select by rank or key, for example `agent change latest docs`.
+
+`agent turn-diff latest` is the shortcut for prompt-sized code review. It shows
+the newest completed turn diff without requiring `agent diff --last-turn`.
+Pass `--turn 3` for a specific prompt, `--file <PATH>` for the file open in your
+editor, and `--patch` when you want exact hunks.
+
+`agent changed-files latest` is the code-review-shaped view. It is an alias for
+`agent files latest` and lists every changed file with the prompt, turn,
+operation, and ready commands behind that file.
+
+`agent inspect README.md` starts from the file you are looking at. It shows
+whether the agent changed that path, which change set contains it, which turn or
+operation touched it, and the next command. It is an alias for
+`agent file README.md`. Add `--patch` for the focused diff.
+
+`agent explain README.md` answers why one file changed: the captured prompt,
+turn, tools, checkpoint, and focused diff command. It is an alias for
+`agent why README.md`.
+
+`agent rewind-points latest` lists friendly recovery targets before you undo or
+rewind. It is an alias for `agent checkpoints latest`.
+
+`agent undo-last latest` is the everyday recovery command. It is an alias for
+`agent undo latest` and rewinds to the state before the latest completed turn by
+default; pass `--turn` or `--prompt` when you need a specific prompt-sized undo.
+
 ## Lane Workflow
 
 Lanes work on isolated CrabDB refs instead of immediately changing `main`.
 External coding agents such as Claude Code or Codex can work inside these lanes,
-but `crabdb lane` itself does not launch an AI agent.
+but `crabdb lane` itself is the lower-level workflow. Prefer `crabdb agent` for
+day-to-day agent tasks.
 
 ```sh
 crabdb lane spawn doc-bot --from main --materialize=true
@@ -726,6 +1008,18 @@ crabdb mcp
 MCP exposes tools, resources, resource templates, prompts, completions, and risk
 annotations for host permission UX. The MCP and HTTP layers call the same
 `CrabDb` methods and return the same report shapes used by CLI JSON output.
+Editor hosts can call `crabdb.agent_ask` with plain-language questions such as
+`what needs attention`, `what changed since I looked`,
+`what did the agent do`, `where is the workdir`, `where did the agent edit`,
+`which prompt changed README.md`, `what should I review`,
+`what should I review first`, `open review`, `review this task`, `last prompt`,
+`what changed in the last prompt`,
+`what changed in README.md in the last prompt`, `show transcript`,
+`what tools were used`, `can I merge`, or `explain README.md`; it routes to the
+matching read-only agent report and includes the routed tool name.
+Agent-focused MCP prompts include `crabdb.review_agent`,
+`crabdb.recover_agent`, and `crabdb.apply_agent` for editor hosts that want a
+guided workflow instead of making users choose individual tools.
 
 Rust callers can depend on the `crabdb` crate and use exported types such as
 `CrabDb`, `InitImportMode`, IDs, `PatchDocument`, and report structs through the
@@ -755,6 +1049,7 @@ Read by topic:
 
 - [Core concepts](docs/concepts/operation-database.md)
 - [Guides](docs/guides/record-worktree-changes.md)
+- [Harden agent workflows](docs/guides/hardening-agent-workflows.md)
 - [Use cases](docs/use-cases/local-code-history.md)
 - [Lane workflows](docs/lanes/overview.md)
 - [Lane work model](docs/lanes/work-model.md)

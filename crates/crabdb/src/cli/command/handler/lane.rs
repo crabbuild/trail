@@ -64,6 +64,11 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             let report = db.lane_readiness(&args.name)?;
             render_lane_readiness(&report, ctx.json, ctx.quiet)
         }
+        LaneSubcommand::RefreshPreview(args) => {
+            let db = open_db(ctx)?;
+            let report = db.preview_lane_refresh(&args.name, &args.target)?;
+            render_lane_refresh_preview(&report, ctx.json, ctx.quiet)
+        }
         LaneSubcommand::Handoff(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_handoff(&args.name, args.limit)?;
@@ -95,8 +100,13 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
         LaneSubcommand::Trace(trace) => traces::handle_trace_command(ctx, trace),
         LaneSubcommand::Record(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.record_lane_workdir(&args.name, args.message)?;
-            render_lane_record(&report, ctx.json, ctx.quiet)
+            if args.preview {
+                let report = db.preview_lane_workdir_record(&args.name)?;
+                render_lane_record_preview(&report, ctx.json, ctx.quiet)
+            } else {
+                let report = db.record_lane_workdir(&args.name, args.message)?;
+                render_lane_record(&report, ctx.json, ctx.quiet)
+            }
         }
         LaneSubcommand::Rewind(args) => {
             let mut db = open_db(ctx)?;

@@ -50,6 +50,7 @@ pub(crate) fn pretty_json<T: serde::Serialize>(value: &T) -> Result<String> {
 
 pub(crate) fn resource_error_response(id: Value, err: &Error) -> Value {
     let code = match err {
+        Error::Json(_) => -32602,
         Error::InvalidInput(_) => -32002,
         _ => -32603,
     };

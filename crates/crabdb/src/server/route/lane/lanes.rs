@@ -7,6 +7,7 @@ use crate::server::request_types::{
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
+    reject_unexpected_body,
 };
 use crate::server::transport::{HttpRequest, HttpResponse};
 use crate::{CrabDb, Error, Result};
@@ -51,6 +52,7 @@ pub(super) fn handle_lane_resources(
             return Ok(Some(json_response(200, "OK", &details)?));
         }
         if request.method == "DELETE" {
+            reject_unexpected_body(request, "DELETE /v1/lanes/{lane_or_id}")?;
             let report = db.remove_lane(&lane, query_flag(query, "force"))?;
             return Ok(Some(json_response(200, "OK", &report)?));
         }
@@ -95,6 +97,11 @@ pub(super) fn handle_lane_resources(
                 let report = db.lane_readiness(&lane)?;
                 json_response(200, "OK", &report)?
             }
+            "refresh-preview" => {
+                let target = query_value(query, "target").unwrap_or("main");
+                let report = db.preview_lane_refresh(&lane, target)?;
+                json_response(200, "OK", &report)?
+            }
             "handoff" => {
                 let report = db.lane_handoff(&lane, query_usize(query, "limit", 50)?)?;
                 json_response(200, "OK", &report)?
@@ -128,10 +135,17 @@ pub(super) fn handle_lane_resources(
     {
         let lane = db.resolve_lane_handle(parts[2])?;
         let body = if request.body.is_empty() {
-            LaneRecordRequest { message: None }
+            LaneRecordRequest {
+                message: None,
+                preview: false,
+            }
         } else {
             serde_json::from_slice(&request.body)?
         };
+        if body.preview {
+            let report = db.preview_lane_workdir_record(&lane)?;
+            return Ok(Some(json_response(200, "OK", &report)?));
+        }
         let report = db.record_lane_workdir(&lane, body.message)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }

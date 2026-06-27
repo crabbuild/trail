@@ -35,25 +35,46 @@ pub(crate) fn contains_sensitive_json(value: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn redact_sensitive_text(input: &str) -> String {
-    if !may_contain_sensitive_text(input) {
+    if !may_contain_sensitive_text(input) && !contains_private_key_pem(input) {
+        return input.to_string();
+    }
+    let without_private_keys = redact_private_key_pem_blocks(input);
+    let mut output = String::with_capacity(without_private_keys.len());
+    for chunk in without_private_keys.split_inclusive('\n') {
+        let (line, ending) = split_line_ending(chunk);
+        output.push_str(&redact_sensitive_line(line));
+        output.push_str(ending);
+    }
+    if without_private_keys.is_empty() {
+        output.clear();
+    }
+    output
+}
+
+fn redact_private_key_pem_blocks(input: &str) -> String {
+    if !contains_private_key_pem(input) {
         return input.to_string();
     }
     let mut output = String::with_capacity(input.len());
+    let mut in_private_key = false;
     for chunk in input.split_inclusive('\n') {
-        if let Some(line) = chunk.strip_suffix('\n') {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            output.push_str(&redact_sensitive_line(line));
-            if chunk.ends_with("\r\n") {
-                output.push_str("\r\n");
-            } else {
-                output.push('\n');
+        let (line, ending) = split_line_ending(chunk);
+        let upper = line.to_ascii_uppercase();
+        let starts_private_key =
+            upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY-----");
+        let ends_private_key = upper.contains("-----END ") && upper.contains("PRIVATE KEY-----");
+        if starts_private_key {
+            output.push_str("[REDACTED]");
+            output.push_str(ending);
+            in_private_key = !ends_private_key;
+        } else if in_private_key {
+            if ends_private_key {
+                in_private_key = false;
             }
         } else {
-            output.push_str(&redact_sensitive_line(chunk));
+            output.push_str(line);
+            output.push_str(ending);
         }
-    }
-    if input.is_empty() {
-        output.clear();
     }
     output
 }
@@ -78,6 +99,7 @@ pub(crate) fn may_contain_sensitive_text(input: &str) -> bool {
         "apikey",
         "private_key",
         "private-key",
+        "private key",
         "bearer ",
     ]
     .iter()
@@ -87,6 +109,16 @@ pub(crate) fn may_contain_sensitive_text(input: &str) -> bool {
 fn contains_private_key_pem(input: &str) -> bool {
     let upper = input.to_ascii_uppercase();
     upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY-----")
+}
+
+fn split_line_ending(chunk: &str) -> (&str, &str) {
+    if let Some(line) = chunk.strip_suffix("\r\n") {
+        (line, "\r\n")
+    } else if let Some(line) = chunk.strip_suffix('\n') {
+        (line, "\n")
+    } else {
+        (chunk, "")
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +255,18 @@ mod tests {
         assert!(contains_sensitive_text(
             "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
         ));
+    }
+
+    #[test]
+    fn sensitive_text_redaction_removes_private_key_pem_blocks() {
+        let redacted = redact_sensitive_text(
+            "before\n-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----\nafter\n",
+        );
+        assert!(redacted.contains("before"));
+        assert!(redacted.contains("after"));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("key-material"));
+        assert!(!redacted.contains("PRIVATE KEY"));
     }
 
     #[test]

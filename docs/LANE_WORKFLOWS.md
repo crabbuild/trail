@@ -12,5 +12,6 @@ Lane workflow references:
 - [Events, traces, and spans](lanes/events-traces-and-spans.md)
 - [Tests, evals, gates, and readiness](lanes/tests-evals-gates-and-readiness.md)
 - [Handoff, review, and merge](lanes/handoff-review-and-merge.md)
+- [Harden agent workflows](guides/hardening-agent-workflows.md)
 
 For daemon-backed automation patterns, see [Daemon-backed automation](use-cases/daemon-backed-automation.md) and [Parallel lane work](use-cases/parallel-lane-work.md).

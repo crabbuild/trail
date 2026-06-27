@@ -268,9 +268,20 @@ fn merge_queue_readiness_next_steps(lane: &str, readiness: &LaneReadinessReport)
                 ));
             }
             "pending_approvals" => {
-                steps.push(format!(
-                    "Review pending approvals with `crabdb approvals list --lane {lane}`."
-                ));
+                let approval_ids = readiness
+                    .pending_approvals
+                    .iter()
+                    .map(|approval| approval.approval_id.as_str())
+                    .collect::<Vec<_>>();
+                if let Some(first_id) = approval_ids.first() {
+                    steps.push(format!(
+                        "Review pending approvals with `crabdb approvals list --lane {lane}`; unblock this queue item with `crabdb approvals decide {first_id} --decision approved` after review."
+                    ));
+                } else {
+                    steps.push(format!(
+                        "Review pending approvals with `crabdb approvals list --lane {lane}`."
+                    ));
+                }
             }
             "open_conflicts" => {
                 steps.push(

@@ -84,6 +84,7 @@ pub(super) fn try_handle_daemon_command(
                 "lane_id": args.name,
                 "strategy": args.strategy,
                 "dry_run": args.dry_run,
+                "direct": args.direct,
             });
             let report: MergeReport =
                 client.post_json(&format!("/v1/branches/{}/merge-lane", args.into), &body)?;
@@ -125,6 +126,7 @@ fn daemon_supports_command(command: &Command) -> bool {
             | LaneSubcommand::Contribution(_)
             | LaneSubcommand::Gates(_)
             | LaneSubcommand::Readiness(_)
+            | LaneSubcommand::RefreshPreview(_)
             | LaneSubcommand::Handoff(_)
             | LaneSubcommand::Claim(_)
             | LaneSubcommand::Record(_)
@@ -238,6 +240,15 @@ fn handle_lane_command(
             render_lane_readiness(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
+        LaneSubcommand::RefreshPreview(args) => {
+            let path = append_query(
+                &format!("/v1/lanes/{}/refresh-preview", args.name),
+                vec![format!("target={}", args.target)],
+            );
+            let report: LaneRefreshPreviewReport = client.get_json(&path)?;
+            render_lane_refresh_preview(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         LaneSubcommand::Handoff(args) => {
             let report: LaneHandoffReport = client.get_json(&format!(
                 "/v1/lanes/{}/handoff?limit={}",
@@ -259,10 +270,17 @@ fn handle_lane_command(
         LaneSubcommand::Record(args) => {
             let body = serde_json::json!({
                 "message": args.message,
+                "preview": args.preview,
             });
-            let report: LaneRecordReport =
-                client.post_json(&format!("/v1/lanes/{}/record", args.name), &body)?;
-            render_lane_record(&report, ctx.json, ctx.quiet)?;
+            if args.preview {
+                let report: LaneRecordPreviewReport =
+                    client.post_json(&format!("/v1/lanes/{}/record", args.name), &body)?;
+                render_lane_record_preview(&report, ctx.json, ctx.quiet)?;
+            } else {
+                let report: LaneRecordReport =
+                    client.post_json(&format!("/v1/lanes/{}/record", args.name), &body)?;
+                render_lane_record(&report, ctx.json, ctx.quiet)?;
+            }
             Ok(true)
         }
         LaneSubcommand::Rewind(args) => {
@@ -796,7 +814,14 @@ fn handle_merge_queue_command(
             render_merge_queue_list(&entries, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        MergeQueueSubcommand::Explain(_) => Ok(false),
+        MergeQueueSubcommand::Explain(args) => {
+            let report: MergeQueueExplainReport = client.get_json(&format!(
+                "/v1/merge-queue/explain?selector={}",
+                args.selector
+            ))?;
+            render_merge_queue_explain(&report, ctx.json, ctx.quiet)?;
+            Ok(true)
+        }
         MergeQueueSubcommand::Run(args) => {
             let body = match args.limit {
                 Some(limit) => serde_json::json!({ "limit": limit }),

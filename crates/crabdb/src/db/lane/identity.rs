@@ -85,12 +85,31 @@ impl CrabDb {
         Ok(LaneStatusReport {
             latest_test: self.latest_lane_test(&details.branch.lane_id)?,
             latest_eval: self.latest_lane_gate(&details.branch.lane_id, "eval")?,
+            base_status: self.lane_base_status(&details.branch)?,
             lane: details,
             changed_paths,
             queued_merges: queued_merges as u64,
             workdir_state,
             workdir_changed_paths,
         })
+    }
+
+    pub(crate) fn lane_base_status(&self, branch: &LaneBranch) -> Result<Option<LaneBaseStatus>> {
+        let target_branch = self.config.workspace.default_branch.as_str();
+        let target_ref = match self.resolve_branch_ref(target_branch) {
+            Ok(target_ref) => target_ref,
+            Err(_) => return Ok(None),
+        };
+        let operations_behind =
+            self.first_parent_distance(&target_ref.change_id, &branch.base_change)?;
+        Ok(Some(LaneBaseStatus {
+            target_branch: target_branch.to_string(),
+            target_ref: target_ref.name,
+            target_change: target_ref.change_id,
+            lane_base_change: branch.base_change.clone(),
+            stale: operations_behind.is_some_and(|behind| behind > 0),
+            operations_behind,
+        }))
     }
 
     pub fn lane_contribution(&self, lane: &str, limit: usize) -> Result<LaneContributionReport> {

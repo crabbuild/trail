@@ -47,6 +47,7 @@ pub(crate) struct AddEventArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EventListArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
@@ -86,6 +87,7 @@ pub(crate) struct SpanEndArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpanListArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
@@ -100,6 +102,7 @@ pub(crate) struct SpanListArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpanSummaryArgs {
     #[serde(default)]
     pub(crate) lane: Option<String>,
@@ -114,6 +117,7 @@ pub(crate) struct SpanSummaryArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpanShowArgs {
     pub(crate) span_id: String,
 }

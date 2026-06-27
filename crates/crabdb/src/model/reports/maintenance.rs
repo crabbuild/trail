@@ -42,6 +42,7 @@ pub struct WorktreeIndexReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExternalMutationAuditRecord {
     pub audit_id: String,
+    pub actor: String,
     pub surface: String,
     pub command: String,
     pub target_ref: Option<String>,

@@ -54,10 +54,50 @@ impl CrabDb {
             let count = self.conn.query_row(&sql, [], |row| row.get::<_, i64>(0))?;
             tables.push((name, count));
         }
+        let files = self.read_only_file_fingerprint()?;
         Ok(ReadOnlyFingerprint {
             data_version,
             tables,
+            files,
         })
+    }
+
+    fn read_only_file_fingerprint(&self) -> Result<Vec<ReadOnlyFileFingerprint>> {
+        let mut files = Vec::new();
+        for rel in [
+            CONFIG_FILE,
+            HEAD_FILE,
+            "refs",
+            "daemon.json",
+            "daemon.token",
+            "worktree-daemon-cache.json",
+        ] {
+            collect_read_only_file_fingerprints(
+                &self.db_dir.join(rel),
+                &format!("db:{rel}"),
+                &mut files,
+            )?;
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT workdir FROM lane_branches WHERE workdir IS NOT NULL ORDER BY workdir",
+        )?;
+        let workdirs = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for workdir in workdirs {
+            let metadata_dir = PathBuf::from(&workdir).join(".crabdb");
+            collect_read_only_file_fingerprints(
+                &metadata_dir,
+                &format!("workdir:{}/.crabdb", workdir),
+                &mut files,
+            )?;
+        }
+
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
     }
 }
 
@@ -65,10 +105,80 @@ impl CrabDb {
 struct ReadOnlyFingerprint {
     data_version: i64,
     tables: Vec<(String, i64)>,
+    files: Vec<ReadOnlyFileFingerprint>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadOnlyFileFingerprint {
+    path: String,
+    kind: &'static str,
+    len: Option<u64>,
+    hash: Option<String>,
+    symlink_target: Option<String>,
 }
 
 fn quote_sql_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn collect_read_only_file_fingerprints(
+    path: &Path,
+    label: &str,
+    out: &mut Vec<ReadOnlyFileFingerprint>,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        out.push(ReadOnlyFileFingerprint {
+            path: label.to_string(),
+            kind: "dir",
+            len: None,
+            hash: None,
+            symlink_target: None,
+        });
+        let mut entries = fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            collect_read_only_file_fingerprints(&entry.path(), &format!("{label}/{name}"), out)?;
+        }
+        return Ok(());
+    }
+
+    if metadata.file_type().is_symlink() {
+        out.push(ReadOnlyFileFingerprint {
+            path: label.to_string(),
+            kind: "symlink",
+            len: None,
+            hash: None,
+            symlink_target: Some(fs::read_link(path)?.to_string_lossy().to_string()),
+        });
+        return Ok(());
+    }
+
+    if metadata.is_file() {
+        let bytes = fs::read(path)?;
+        out.push(ReadOnlyFileFingerprint {
+            path: label.to_string(),
+            kind: "file",
+            len: Some(metadata.len()),
+            hash: Some(sha256_hex(&bytes)),
+            symlink_target: None,
+        });
+        return Ok(());
+    }
+
+    out.push(ReadOnlyFileFingerprint {
+        path: label.to_string(),
+        kind: "other",
+        len: Some(metadata.len()),
+        hash: None,
+        symlink_target: None,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -119,6 +229,68 @@ mod tests {
                 Ok(())
             })
             .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput(message) if message.contains("attempted to mutate"))
+        );
+    }
+
+    #[test]
+    fn read_only_tool_guard_detects_config_sidecar_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = CrabDb::open(temp.path()).unwrap();
+
+        let err = db
+            .enforce_read_only_mcp_call("crabdb.status", |db| {
+                fs::write(db.db_dir.join(CONFIG_FILE), b"mutated = true\n")?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidInput(message) if message.contains("attempted to mutate"))
+        );
+    }
+
+    #[test]
+    fn read_only_tool_guard_detects_ref_sidecar_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = CrabDb::open(temp.path()).unwrap();
+
+        let err = db
+            .enforce_read_only_mcp_call("crabdb.status", |db| {
+                fs::write(db.db_dir.join("refs/branches/sidecar"), b"mutated\n")?;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidInput(message) if message.contains("attempted to mutate"))
+        );
+    }
+
+    #[test]
+    fn read_only_tool_guard_detects_lane_workdir_metadata_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = CrabDb::open(temp.path()).unwrap();
+        let spawned = db
+            .spawn_lane("readonly-meta-bot", Some("main"), true, None, None)
+            .unwrap();
+        let workdir_metadata = PathBuf::from(spawned.workdir.unwrap()).join(".crabdb");
+
+        let err = db
+            .enforce_read_only_mcp_call("crabdb.status", |_| {
+                fs::write(
+                    workdir_metadata.join("workdir-manifest.json"),
+                    b"{\"mutated\":true}\n",
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+
         assert!(
             matches!(err, Error::InvalidInput(message) if message.contains("attempted to mutate"))
         );

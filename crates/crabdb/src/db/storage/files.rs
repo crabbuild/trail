@@ -32,6 +32,9 @@ impl CrabDb {
         paths: &[String],
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
+        let paths = normalize_root_build_paths(paths)?;
+        validate_no_case_fold_collisions(paths.iter())?;
+
         let mut files = BTreeMap::new();
         let mut disk_manifest = BTreeMap::new();
         let mut path_builder =
@@ -95,6 +98,9 @@ impl CrabDb {
         previous_root_id: &ObjectId,
         change_id: &ChangeId,
     ) -> Result<GitTrackedRootBuildResult> {
+        let paths = normalize_root_build_paths(paths)?;
+        self.ensure_git_tracked_incremental_final_paths_safe(previous_root_id, &paths)?;
+
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
         let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
@@ -131,10 +137,7 @@ impl CrabDb {
         let mut file_seq = 1;
         let mut line_seq = 1;
         for chunk in paths.chunks(PATH_READ_BATCH) {
-            let normalized_paths = chunk
-                .iter()
-                .map(|path| normalize_relative_path(path))
-                .collect::<Result<Vec<_>>>()?;
+            let normalized_paths = chunk.to_vec();
             let mut read_paths = Vec::new();
             for path in normalized_paths {
                 let previous_same_path = self
@@ -278,12 +281,39 @@ impl CrabDb {
         })
     }
 
+    fn ensure_git_tracked_incremental_final_paths_safe(
+        &self,
+        previous_root_id: &ObjectId,
+        paths: &[String],
+    ) -> Result<()> {
+        let mut final_paths = self
+            .load_root_paths(previous_root_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for path in paths {
+            final_paths.remove(path);
+            let abs = self.workspace_root.join(path_from_rel(path));
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            final_paths.insert(path.clone());
+        }
+        validate_no_case_fold_collisions(final_paths.iter())
+    }
+
     pub(crate) fn build_root_from_disk_files(
         &self,
         disk_files: &[DiskFile],
         change_id: &ChangeId,
         previous: Option<&BTreeMap<String, FileEntry>>,
     ) -> Result<RootBuildResult> {
+        validate_disk_file_root_paths(disk_files)?;
+
         let mut files = BTreeMap::new();
         let mut disk_manifest = BTreeMap::new();
         let mut file_seq = 1;
@@ -374,12 +404,6 @@ impl CrabDb {
         selected_paths: &[String],
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
-        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
-        let mut file_index_tree =
-            root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
-        let mut file_count = previous_root.file_count as i128;
-        let mut total_text_bytes = previous_root.total_text_bytes as i128;
         let selected_disk_files = disk_files
             .iter()
             .filter(|file| {
@@ -389,6 +413,18 @@ impl CrabDb {
             })
             .cloned()
             .collect::<Vec<_>>();
+        self.ensure_selected_disk_final_root_paths_safe(
+            previous_root_id,
+            selected_paths,
+            &selected_disk_files,
+        )?;
+
+        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
+        let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
+        let mut file_index_tree =
+            root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
+        let mut file_count = previous_root.file_count as i128;
+        let mut total_text_bytes = previous_root.total_text_bytes as i128;
 
         let mut files = previous.clone();
         let mut removed_entries = Vec::new();
@@ -499,6 +535,24 @@ impl CrabDb {
         })
     }
 
+    fn ensure_selected_disk_final_root_paths_safe(
+        &self,
+        previous_root_id: &ObjectId,
+        selected_paths: &[String],
+        selected_disk_files: &[DiskFile],
+    ) -> Result<()> {
+        let mut paths = self
+            .load_root_paths(previous_root_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for selected in selected_paths {
+            let selected = normalize_relative_path(selected)?;
+            paths.retain(|path| !path_matches_selection(path, &selected));
+        }
+        paths.extend(selected_disk_files.iter().map(|file| file.path.clone()));
+        validate_no_case_fold_collisions(paths.iter())
+    }
+
     pub(crate) fn build_root_from_touched_file_entries_incremental(
         &self,
         previous_root_id: &ObjectId,
@@ -506,6 +560,8 @@ impl CrabDb {
         target: &BTreeMap<String, FileEntry>,
         change_id: &ChangeId,
     ) -> Result<IncrementalRootBuildResult> {
+        self.ensure_touched_final_root_paths_safe(previous_root_id, previous, target)?;
+
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
         let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
@@ -565,6 +621,23 @@ impl CrabDb {
         Ok(IncrementalRootBuildResult { root_id })
     }
 
+    fn ensure_touched_final_root_paths_safe(
+        &self,
+        previous_root_id: &ObjectId,
+        previous: &BTreeMap<String, FileEntry>,
+        target: &BTreeMap<String, FileEntry>,
+    ) -> Result<()> {
+        let mut paths = self
+            .load_root_paths(previous_root_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for path in previous.keys() {
+            paths.remove(path);
+        }
+        paths.extend(target.keys().cloned());
+        validate_no_case_fold_collisions(paths.iter())
+    }
+
     pub(crate) fn build_root_from_file_entries(
         &self,
         files: BTreeMap<String, FileEntry>,
@@ -592,6 +665,9 @@ impl CrabDb {
         disk_manifest: BTreeMap<String, DiskManifest>,
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
+        validate_no_case_fold_collisions(files.keys())?;
+        validate_no_case_fold_collisions(disk_manifest.keys())?;
+
         let mut path_builder =
             SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
         let mut file_index_builder =
@@ -619,6 +695,34 @@ impl CrabDb {
             stats,
         })
     }
+}
+
+fn normalize_root_build_paths(paths: &[String]) -> Result<Vec<String>> {
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        normalized.insert(normalize_relative_path(path)?);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn validate_disk_file_root_paths(disk_files: &[DiskFile]) -> Result<()> {
+    let mut paths = BTreeSet::new();
+    for disk_file in disk_files {
+        let normalized = normalize_relative_path(&disk_file.path)?;
+        if normalized != disk_file.path {
+            return Err(Error::InvalidPath {
+                path: disk_file.path.clone(),
+                reason: format!("disk file path must be normalized as `{normalized}`"),
+            });
+        }
+        if !paths.insert(disk_file.path.clone()) {
+            return Err(Error::InvalidPath {
+                path: disk_file.path.clone(),
+                reason: "duplicate disk file path".to_string(),
+            });
+        }
+    }
+    validate_no_case_fold_collisions(paths.iter())
 }
 
 fn read_path_file_batch(root: &Path, paths: &[String]) -> Result<Vec<PathFileRead>> {
@@ -685,4 +789,197 @@ fn root_stats(files: &BTreeMap<String, FileEntry>) -> (ImportStats, u64) {
         }
     }
     (stats, total_text_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touched_incremental_root_rejects_final_case_fold_collisions_before_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = CrabDb::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &["README.md".to_string()])
+            .unwrap();
+        let mut target = previous.clone();
+        target.insert(
+            "readme.md".to_string(),
+            previous.get("README.md").unwrap().clone(),
+        );
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_nodes_before = count_rows("prolly_nodes");
+
+        let err = db
+            .build_root_from_touched_file_entries_incremental(
+                &head.root_id,
+                &previous,
+                &target,
+                &ChangeId("ch_collision_test".to_string()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
+            "expected final root collision, got {err:?}"
+        );
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    #[test]
+    fn full_file_entry_root_rejects_case_fold_collisions_before_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = CrabDb::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let mut files = db.load_root_files(&head.root_id).unwrap();
+        let entry = files.get("README.md").unwrap().clone();
+        files.insert("ＲＥＡＤＭＥ.md".to_string(), entry);
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_nodes_before = count_rows("prolly_nodes");
+
+        let err = db
+            .build_root_from_file_entries(files, &ChangeId("ch_full_collision_test".to_string()))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
+            "expected full root collision, got {err:?}"
+        );
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    #[test]
+    fn disk_file_root_rejects_case_fold_collisions_before_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+
+        let db = CrabDb::open(temp.path()).unwrap();
+        let disk_files = vec![
+            DiskFile {
+                path: "README.md".to_string(),
+                bytes: b"hello\n".to_vec(),
+                executable: false,
+            },
+            DiskFile {
+                path: "readme.md".to_string(),
+                bytes: b"collision\n".to_vec(),
+                executable: false,
+            },
+        ];
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_nodes_before = count_rows("prolly_nodes");
+
+        let err = db
+            .build_root_from_disk_files(
+                &disk_files,
+                &ChangeId("ch_disk_file_collision_test".to_string()),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
+            "expected disk-file root collision, got {err:?}"
+        );
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    #[test]
+    fn path_list_root_build_rejects_case_fold_collisions_before_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        fs::write(temp.path().join("readme.md"), "collision\n").unwrap();
+
+        let db = CrabDb::open(temp.path()).unwrap();
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_nodes_before = count_rows("prolly_nodes");
+
+        let err = db
+            .build_root_from_worktree_paths(
+                &["README.md".to_string(), "readme.md".to_string()],
+                &ChangeId("ch_path_list_collision_test".to_string()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
+            "expected path-list root collision, got {err:?}"
+        );
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    #[test]
+    fn git_tracked_incremental_root_rejects_final_case_fold_collisions_before_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        fs::write(temp.path().join("readme.md"), "collision\n").unwrap();
+
+        let db = CrabDb::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_nodes_before = count_rows("prolly_nodes");
+
+        let err = db
+            .build_root_from_git_tracked_paths_incremental(
+                &["readme.md".to_string()],
+                &head.root_id,
+                &ChangeId("ch_git_incremental_collision_test".to_string()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
+            "expected git-tracked incremental collision, got {err:?}"
+        );
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
 }

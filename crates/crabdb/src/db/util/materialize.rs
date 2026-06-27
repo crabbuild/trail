@@ -1,4 +1,5 @@
 use super::*;
+use unicode_normalization::UnicodeNormalization;
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<u64> {
     if !source.exists() {
@@ -176,7 +177,7 @@ where
 {
     let mut seen = HashMap::new();
     for path in paths {
-        let folded = path.to_lowercase();
+        let folded = case_insensitive_path_key(path);
         if let Some(previous) = seen.insert(folded, path.clone()) {
             if previous != *path {
                 return Err(Error::InvalidPath {
@@ -187,6 +188,37 @@ where
         }
     }
     Ok(())
+}
+
+fn case_insensitive_path_key(path: &str) -> String {
+    let folded: String = path.nfkc().flat_map(char::to_lowercase).collect();
+    folded.nfc().collect()
+}
+
+pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| Error::InvalidPath {
+        path: path.to_string_lossy().to_string(),
+        reason: "path has no parent directory".to_string(),
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let (tmp, mut file) = create_materialize_temp_file(parent, path)?;
+    let result = (|| -> Result<()> {
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+        }
+        drop(file);
+        fs::rename(&tmp, path)?;
+        if durable {
+            sync_directory(parent);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub(crate) fn is_case_insensitive_filesystem(root: &Path) -> Result<bool> {

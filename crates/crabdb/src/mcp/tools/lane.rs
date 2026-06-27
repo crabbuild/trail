@@ -91,6 +91,15 @@ pub(super) fn tools() -> Value {
             }), vec!["lane"])
         },
         {
+            "name": "crabdb.lane_refresh_preview",
+            "title": "Lane Refresh Preview",
+            "description": "Preview refreshing one lane onto a target branch, including operations-behind, incoming changed paths, conflicts, and next steps, without mutating refs or recording conflict state.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "target": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
             "name": "crabdb.lane_handoff",
             "title": "Lane Handoff",
             "description": "Package one lane branch for transfer with readiness, current session context, recent events, spans, operations, and next steps.",

@@ -35,11 +35,23 @@ pub struct LaneStatusReport {
     pub lane: LaneDetails,
     pub changed_paths: Vec<FileDiffSummary>,
     pub queued_merges: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_status: Option<LaneBaseStatus>,
     pub workdir_state: Option<WorktreeState>,
     pub workdir_changed_paths: Vec<FileDiffSummary>,
     pub latest_test: Option<LaneTestSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_eval: Option<LaneTestSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneBaseStatus {
+    pub target_branch: String,
+    pub target_ref: String,
+    pub target_change: ChangeId,
+    pub lane_base_change: ChangeId,
+    pub operations_behind: Option<u64>,
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

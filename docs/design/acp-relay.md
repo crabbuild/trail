@@ -79,7 +79,7 @@ Not yet implemented:
 ## Performance Validation
 
 A release-build synthetic ACP benchmark was run on June 26, 2026 using real
-`crabdb acp relay` processes and fake ACP agents. The relay uses an in-process
+`crabdb acp relay` processes and local stub ACP agents. The relay uses an in-process
 batched turn-event writer so high-volume ACP updates are buffered during a turn
 and committed to CrabDB under one writer lock at flush points. Each materialized
 turn emitted usage, tool, tool-update, and assistant-message updates, wrote one
@@ -624,14 +624,14 @@ require editors or upstream agents to preserve it.
 Deliverables:
 
 - Confirm chosen ACP Rust crate or local schema strategy.
-- Build a tiny fake ACP agent fixture for tests.
+- Build a tiny ACP agent fixture for tests.
 - Build a transcript fixture covering `initialize`, `session/new`,
   `session/prompt`, `session/update`, tool call updates, and final response.
 - Document which ACP updates are observed from one real provider.
 
 Acceptance criteria:
 
-- A local test can relay JSON-RPC messages between a fake editor and fake agent.
+- A local test can relay JSON-RPC messages between a stub editor and stub agent.
 - Request IDs, notifications, errors, and EOF are preserved.
 
 ### Phase 1: Pass-Through ACP Relay
@@ -744,7 +744,7 @@ Unit tests:
 
 Integration tests:
 
-- Fake editor -> relay -> fake ACP agent.
+- Stub editor -> relay -> stub ACP agent.
 - `session/new` creates CrabDB session mapping.
 - `session/prompt` records a CrabDB turn and messages.
 - `session/update` tool calls produce spans.

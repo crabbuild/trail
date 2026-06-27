@@ -3,7 +3,8 @@ use super::*;
 pub(super) fn handle_merge_lane_command(ctx: &RuntimeContext, args: MergeLaneArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     validate_merge_strategy(args.strategy.as_deref())?;
-    let report = db.merge_lane_with_options(&args.name, &args.into, args.dry_run)?;
+    let report =
+        db.merge_lane_user_with_options(&args.name, &args.into, args.dry_run, args.direct)?;
     render_merge(&report, ctx.json, ctx.quiet)
 }
 

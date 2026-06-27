@@ -67,6 +67,12 @@ pub(super) struct DaemonArgs {
     pub(super) once: bool,
     #[arg(long)]
     pub(super) max_requests: Option<usize>,
+    #[arg(long = "rate-limit-requests", default_value_t = 600)]
+    pub(super) rate_limit_requests: usize,
+    #[arg(long = "rate-limit-window-secs", default_value_t = 60)]
+    pub(super) rate_limit_window_secs: u64,
+    #[arg(long = "connection-timeout-secs", default_value_t = 30)]
+    pub(super) connection_timeout_secs: u64,
     #[arg(long)]
     pub(super) auth_token: Option<String>,
     #[arg(long)]

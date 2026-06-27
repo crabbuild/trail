@@ -13,6 +13,28 @@ pub(super) fn core_schemas() -> Value {
                 { "type": "null" }
             ]
         },
+        "FileDiffSummary": {
+            "type": "object",
+            "required": ["path", "kind", "additions", "deletions"],
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string" },
+                "old_path": { "type": ["string", "null"] },
+                "kind": {
+                    "type": "string",
+                    "enum": ["Added", "Modified", "Deleted", "Renamed", "TypeChanged"]
+                },
+                "before_hash": { "type": ["string", "null"] },
+                "after_hash": { "type": ["string", "null"] },
+                "additions": { "type": "integer" },
+                "deletions": { "type": "integer" },
+                "line_changes": {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/JsonValue" }
+                },
+                "patch": { "type": ["string", "null"] }
+            }
+        },
         "ErrorBody": {
             "type": "object",
             "required": ["error"],

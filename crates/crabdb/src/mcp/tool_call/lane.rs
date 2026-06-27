@@ -58,6 +58,11 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             let lane = db.resolve_lane_handle(&args.lane)?;
             tool_result(db.lane_readiness(&lane)?)
         }
+        "crabdb.lane_refresh_preview" => {
+            let args: LaneRefreshPreviewArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.preview_lane_refresh(&lane, args.target.as_deref().unwrap_or("main"))?)
+        }
         "crabdb.lane_handoff" => {
             let args: LaneContributionArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;

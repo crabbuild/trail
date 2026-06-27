@@ -24,6 +24,7 @@ impl CrabDb {
         message_id: Option<&MessageId>,
         payload: &serde_json::Value,
     ) -> Result<String> {
+        validate_lane_event_type_for_storage(event_type)?;
         let event_seed = format!(
             "{}:{}:{}:{}:{}:{}:{}",
             lane_id,
@@ -35,6 +36,8 @@ impl CrabDb {
             now_nanos()
         );
         let event_id = format!("evt_{}", crate::ids::short_hash(event_seed.as_bytes(), 16));
+        let raw_payload_json = serde_json::to_string(payload)?;
+        self.ensure_lane_event_payload_limit(event_type, &raw_payload_json)?;
         let payload = redact_sensitive_json(payload.clone());
         let payload_json = serde_json::to_string(&payload)?;
         self.ensure_lane_event_payload_limit(event_type, &payload_json)?;
@@ -269,4 +272,37 @@ impl CrabDb {
         };
         self.get_object(OPERATION_KIND, &ObjectId(object_id))
     }
+}
+
+fn validate_lane_event_type_for_storage(event_type: &str) -> Result<()> {
+    if event_type.is_empty() {
+        return Err(Error::InvalidInput(
+            "event type cannot be empty".to_string(),
+        ));
+    }
+    if event_type.trim() != event_type {
+        return Err(Error::InvalidInput(
+            "event type cannot contain leading or trailing whitespace".to_string(),
+        ));
+    }
+    if contains_sensitive_text(event_type) {
+        return Err(Error::InvalidInput(
+            "secret scan rejected lane event type; remove credentials from event metadata"
+                .to_string(),
+        ));
+    }
+    if event_type.len() > 128 {
+        return Err(Error::InvalidInput(
+            "event type cannot exceed 128 bytes".to_string(),
+        ));
+    }
+    if !event_type
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(Error::InvalidInput(
+            "event type may contain only ASCII letters, digits, `_`, `-`, and `.`".to_string(),
+        ));
+    }
+    Ok(())
 }

@@ -30,7 +30,8 @@ impl CrabDb {
             return Ok(CachedWorkdirManifestStatus::Missing);
         }
 
-        let stamps = self.scan_workdir_file_stamps(dir)?;
+        let manifest_paths = manifest.files.keys().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths(dir, &manifest_paths)?;
         let root_matches = manifest.root_id == root_id.0;
         let clean = root_matches
             && stamps.len() == manifest.files.len()
@@ -105,7 +106,8 @@ impl CrabDb {
             .into_iter()
             .map(|path| normalize_relative_path(path))
             .collect::<Result<BTreeSet<_>>>()?;
-        let stamps = self.scan_workdir_file_stamps(dir)?;
+        let pinned_paths = expected.iter().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths(dir, &pinned_paths)?;
         self.write_clean_workdir_manifest_from_stamps_for_paths(
             dir, root_id, files, expected, stamps,
         )
@@ -182,7 +184,8 @@ impl CrabDb {
             .into_iter()
             .map(|path| normalize_relative_path(path))
             .collect::<Result<BTreeSet<_>>>()?;
-        let stamps = self.scan_workdir_file_stamps(dir)?;
+        let pinned_paths = expected.iter().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths(dir, &pinned_paths)?;
         self.write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
             dir,
             root_id,
@@ -353,8 +356,49 @@ impl CrabDb {
             root_id: root_id.0.clone(),
             files: entries,
         };
-        fs::write(path, serde_json::to_vec(&manifest)?)?;
+        write_file_atomic(&path, &serde_json::to_vec(&manifest)?, false)?;
         Ok(())
+    }
+
+    pub(crate) fn clean_workdir_manifest_tracks_file_subset(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        target: &BTreeMap<String, FileEntry>,
+    ) -> Result<bool> {
+        let Some(manifest) = self.read_clean_workdir_manifest(dir)? else {
+            return Ok(false);
+        };
+        if manifest.version != CLEAN_WORKDIR_MANIFEST_VERSION {
+            remove_clean_workdir_manifest(dir)?;
+            return Ok(false);
+        }
+        if manifest.root_id != root_id.0 {
+            return Ok(false);
+        }
+
+        for (path, entry) in target {
+            let Some(cached) = manifest.files.get(path) else {
+                return Ok(false);
+            };
+            if cached.kind != entry.kind || cached.content_hash != entry.content_hash {
+                return Ok(false);
+            }
+            let abs = safe_join(dir, path)?;
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Ok(false);
+            }
+            if cached.stamp != WorkdirFileStamp::from_metadata(&metadata) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     fn read_clean_workdir_manifest(&self, dir: &Path) -> Result<Option<CleanWorkdirManifest>> {
@@ -408,6 +452,33 @@ impl CrabDb {
                 continue;
             }
             files.insert(rel, WorkdirFileStamp::from_metadata(&metadata));
+        }
+        Ok(files)
+    }
+
+    fn scan_workdir_file_stamps_with_pinned_paths(
+        &self,
+        root: &Path,
+        pinned_paths: &[String],
+    ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
+        let root = root.canonicalize()?;
+        let mut files = self.scan_workdir_file_stamps(&root)?;
+        for path in pinned_paths {
+            let path = normalize_relative_path(path)?;
+            let abs = safe_join(&root, &path)?;
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    files.remove(&path);
+                    continue;
+                }
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                files.remove(&path);
+                continue;
+            }
+            files.insert(path, WorkdirFileStamp::from_metadata(&metadata));
         }
         Ok(files)
     }
@@ -512,6 +583,27 @@ mod tests {
             }
             _ => panic!("expected dirty manifest status"),
         }
+    }
+
+    #[test]
+    fn workdir_manifest_subset_tracking_detects_stale_target() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let target = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        db.write_clean_workdir_manifest(workdir.path(), &head.root_id, &files, files.keys())
+            .unwrap();
+        assert!(db
+            .clean_workdir_manifest_tracks_file_subset(workdir.path(), &head.root_id, &target)
+            .unwrap());
+
+        fs::write(workdir.path().join("a.txt"), "a1\ndirty\n").unwrap();
+
+        assert!(!db
+            .clean_workdir_manifest_tracks_file_subset(workdir.path(), &head.root_id, &target)
+            .unwrap());
     }
 
     #[test]

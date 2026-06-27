@@ -23,6 +23,8 @@ crabdb config set <KEY> <VALUE>
 ```
 
 Config values are typed and validated. See [Configuration reference](../config.md).
+For production lane isolation and quota settings, see
+[Hardening agent workflows](../../guides/hardening-agent-workflows.md).
 
 ## `ignore`
 

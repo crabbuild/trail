@@ -271,8 +271,22 @@ impl CrabDb {
                 details_json TEXT,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS conflict_resolution_suggestions (
+                suggestion_id TEXT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                path TEXT NOT NULL,
+                conflict_class TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                conflict_set_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                source_ref TEXT,
+                target_ref TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS conflict_resolution_suggestions_signature_idx ON conflict_resolution_suggestions(signature, created_at);
             CREATE TABLE IF NOT EXISTS external_mutation_audit (
                 audit_id TEXT PRIMARY KEY,
+                actor TEXT NOT NULL DEFAULT 'unknown',
                 surface TEXT NOT NULL,
                 command TEXT NOT NULL,
                 target_ref TEXT,
@@ -328,6 +342,12 @@ impl CrabDb {
         ensure_column(&self.conn, "merge_results", "base_root", "TEXT")?;
         ensure_column(&self.conn, "merge_results", "left_root", "TEXT")?;
         ensure_column(&self.conn, "merge_results", "right_root", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "external_mutation_audit",
+            "actor",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
         ensure_column(&self.conn, "lane_events", "session_id", "TEXT")?;
         ensure_column(
             &self.conn,

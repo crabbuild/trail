@@ -398,8 +398,10 @@ Common blockers include:
 - Failed latest required test or eval gate.
 - Removed or invalid lane state.
 
-Readiness also warns when the lane's saved base is behind the workspace default
-branch, for example: `lane started 14 operations behind main`.
+Lane status and readiness also expose when the lane's saved base is behind the
+workspace default branch. JSON status includes `base_status.operations_behind`
+and `base_status.stale`; readiness emits a `stale_lane_base` warning, for
+example: `lane started 14 operations behind main`.
 
 ## Optional Lane Hardening
 
@@ -416,7 +418,8 @@ crabdb config set lane.max_trace_payload_bytes 65536
 ```
 
 `lane.claim_enforcement=warn` records a `lane_policy_warning` event when a lane
-touches paths outside its active write claims. `reject` blocks the mutation.
+touches paths outside its active write claims/leases. `reject` blocks the
+mutation. Read leases do not grant write permission under this policy.
 `lane.enforce_sparse_paths=true` turns sparse lane `--paths` selections into a
 hard write boundary for lane patches and materialized workdir records.
 
@@ -451,7 +454,6 @@ Merge uses the lane ref as source:
 
 ```sh
 crabdb merge-lane docs-lane --into main --dry-run
-crabdb merge-lane docs-lane --into main
 ```
 
 Use the merge queue for shared targets:
@@ -466,8 +468,9 @@ you export, checkout, or commit through the Git workflow.
 
 If a merge pauses on conflict, CrabDB records the base, target, and source root
 snapshots for that merge. Conflict explanations and resolutions use those stored
-roots and label each path with a conservative conflict class, so later ref
-movement does not change what is being resolved.
+roots and label each path with a conservative conflict class, so later source
+lane movement does not change what is being resolved. If the target ref moves,
+CrabDB rejects the stale resolution instead of overwriting newer target work.
 
 ```text
 refs/lanes/docs-lane              refs/branches/main

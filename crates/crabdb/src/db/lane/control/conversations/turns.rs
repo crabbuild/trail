@@ -135,12 +135,6 @@ impl CrabDb {
         message_id: Option<&str>,
     ) -> Result<LaneTurnEventReport> {
         let _lock = self.acquire_write_lock()?;
-        let event_type = event_type.trim();
-        if event_type.is_empty() {
-            return Err(Error::InvalidInput(
-                "event type cannot be empty".to_string(),
-            ));
-        }
         let turn = self.lane_turn(turn_id)?;
         if turn.ended_at.is_some() {
             return Err(Error::InvalidInput(format!(
@@ -195,12 +189,6 @@ impl CrabDb {
         }
         let mut inserted = 0usize;
         for (event_type, payload, change_id, message_id) in events {
-            let event_type = event_type.trim().to_string();
-            if event_type.is_empty() {
-                return Err(Error::InvalidInput(
-                    "event type cannot be empty".to_string(),
-                ));
-            }
             let change_id = change_id
                 .map(|change_id| {
                     let change = ChangeId(change_id);

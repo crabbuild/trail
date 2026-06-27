@@ -1,3 +1,4 @@
+use crate::model::validate_external_patch_edit_sources;
 use crate::model::ConflictResolveReport;
 use crate::server::request_types::{
     ApiPatchFile, ApiPatchRequest, ApiTextEdit, ConflictResolveRequest,
@@ -24,8 +25,22 @@ pub(crate) fn resolve_conflict_request(
     }
 }
 
+pub(crate) fn reject_unexpected_body(request: &HttpRequest, endpoint: &str) -> Result<()> {
+    if request.body.is_empty() {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "{endpoint} does not accept a request body"
+    )))
+}
+
 pub(crate) fn parse_patch_request(body: &[u8]) -> Result<PatchDocument> {
     let request: ApiPatchRequest = serde_json::from_slice(body)?;
+    validate_external_patch_edit_sources(
+        "patch request",
+        request.edits.len(),
+        request.files.len(),
+    )?;
     let mut edits = request.edits;
     for file in request.files {
         match file {
@@ -78,6 +93,179 @@ pub(crate) fn parse_patch_request(body: &[u8]) -> Result<PatchDocument> {
         allow_stale: request.allow_stale,
         edits,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_patch_request_rejects_empty_or_ambiguous_edit_sources() {
+        let empty = parse_patch_request(br#"{"message":"empty"}"#).unwrap_err();
+        assert!(empty
+            .to_string()
+            .contains("requires at least one edit in `edits` or `files`"));
+
+        let ambiguous = parse_patch_request(
+            br#"{
+                "message":"ambiguous",
+                "edits":[{"op":"delete","path":"old.md"}],
+                "files":[{"type":"delete","path":"new.md"}]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(ambiguous
+            .to_string()
+            .contains("must use either `edits` or `files`, not both"));
+    }
+
+    #[test]
+    fn parse_patch_request_fuzz_corpus_preserves_adapter_invariants() {
+        for seed in 0..256_u64 {
+            let value = generated_api_patch_json(seed);
+            let body = serde_json::to_vec(&value).unwrap();
+            match parse_patch_request(&body) {
+                Ok(document) => {
+                    let edits_len = value
+                        .get("edits")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len);
+                    let files_len = value
+                        .get("files")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len);
+                    assert_ne!(edits_len + files_len, 0, "seed {seed}");
+                    assert!(
+                        (edits_len == 0) ^ (files_len == 0),
+                        "seed {seed} accepted mixed edit sources"
+                    );
+                    assert!(!document.edits.is_empty(), "seed {seed}");
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("unknown field")
+                            || message.contains("unknown variant")
+                            || message.contains("missing field")
+                            || message.contains("invalid type")
+                            || message.contains("requires at least one edit")
+                            || message.contains("must use either `edits` or `files`"),
+                        "unexpected parse error for seed {seed}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_loopback_origin_accepts_well_formed_loopback_hosts() {
+        for origin in [
+            "http://localhost",
+            "https://localhost:8765",
+            "http://127.0.0.1:8765",
+            "http://[::1]:8765",
+        ] {
+            assert!(local_loopback_origin(origin), "{origin}");
+        }
+    }
+
+    #[test]
+    fn local_loopback_origin_rejects_malformed_or_non_loopback_hosts() {
+        for origin in [
+            "null",
+            "https://example.com",
+            "https://user@localhost",
+            "https://localhost/path",
+            "http://localhost:999999",
+            "http:// localhost",
+            "http://localhost :8765",
+            "http://127.0.0.1 :8765",
+            "http://[ ::1]:8765",
+        ] {
+            assert!(!local_loopback_origin(origin), "{origin}");
+        }
+    }
+
+    #[test]
+    fn local_loopback_host_accepts_well_formed_loopback_hosts() {
+        for host in [
+            "localhost",
+            "localhost.",
+            "localhost:8765",
+            "127.0.0.1:8765",
+            "[::1]:8765",
+        ] {
+            assert!(local_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn local_loopback_host_rejects_malformed_or_non_loopback_hosts() {
+        for host in [
+            "",
+            "example.com",
+            "localhost:999999",
+            " localhost",
+            "localhost :8765",
+            "127.0.0.1 :8765",
+            "127.0.0.1/path",
+            "user@localhost",
+            "[ ::1]:8765",
+        ] {
+            assert!(!local_loopback_host(host), "{host}");
+        }
+    }
+
+    fn generated_api_patch_json(seed: u64) -> serde_json::Value {
+        let path = format!("docs/generated-{seed}.md");
+        let native_edit = serde_json::json!({
+            "op": "write",
+            "path": path,
+            "content": format!("seed-{seed}\n")
+        });
+        let api_file = serde_json::json!({
+            "type": "modify_text",
+            "path": "README.md",
+            "edits": [{
+                "type": "modify_line",
+                "line_id": format!("ch_seed_{seed}:1"),
+                "expected_text": format!("old-{seed}"),
+                "new_text": format!("new-{seed}")
+            }]
+        });
+        match seed % 8 {
+            0 => serde_json::json!({ "message": "native", "edits": [native_edit] }),
+            1 => serde_json::json!({ "message": "files", "files": [api_file] }),
+            2 => {
+                serde_json::json!({ "message": "ambiguous", "edits": [native_edit], "files": [api_file] })
+            }
+            3 => serde_json::json!({ "message": "empty" }),
+            4 => serde_json::json!({ "message": "unknown", "files": [api_file], "surprise": true }),
+            5 => serde_json::json!({
+                "message": "nested unknown",
+                "files": [{
+                    "type": "add_text",
+                    "path": "docs/nested.md",
+                    "content": "ok\n",
+                    "surprise": true
+                }]
+            }),
+            6 => serde_json::json!({
+                "message": "bad edit type",
+                "edits": [{
+                    "op": "replace_line",
+                    "path": "README.md",
+                    "line_id": 42,
+                    "expected_text": "old",
+                    "new_text": "new"
+                }]
+            }),
+            _ => serde_json::json!({
+                "message": "bad file variant",
+                "files": [{ "type": "surprise", "path": "README.md" }]
+            }),
+        }
+    }
 }
 
 pub(crate) fn query_flag(query: &str, key: &str) -> bool {
@@ -134,6 +322,7 @@ pub(crate) fn json_response<T: Serialize>(
     Ok(HttpResponse {
         status,
         reason,
+        extra_headers: Vec::new(),
         body: serde_json::to_vec(value)?,
     })
 }
@@ -178,23 +367,44 @@ pub(crate) fn origin_allowed(request: &HttpRequest) -> bool {
     local_loopback_origin(origin.trim())
 }
 
+pub(crate) fn host_allowed(request: &HttpRequest) -> bool {
+    let Some(host) = request.headers.get("host") else {
+        return false;
+    };
+    local_loopback_host(host.trim())
+}
+
 fn local_loopback_origin(origin: &str) -> bool {
+    if origin.chars().any(char::is_whitespace) {
+        return false;
+    }
     let Some(rest) = origin
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
     else {
         return false;
     };
-    if rest.is_empty() || rest.contains('/') || rest.contains('@') {
+    local_loopback_host(rest)
+}
+
+fn local_loopback_host(host: &str) -> bool {
+    if host.chars().any(char::is_whitespace)
+        || host.is_empty()
+        || host.contains('/')
+        || host.contains('@')
+    {
         return false;
     }
-    let Some((host, port)) = split_origin_host_port(rest) else {
+    let Some((host, port)) = split_origin_host_port(host) else {
         return false;
     };
     if !valid_optional_port(port) {
         return false;
     }
     let host = host.trim().trim_end_matches('.');
+    if host.is_empty() {
+        return false;
+    }
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -225,7 +435,7 @@ fn valid_optional_port(port: Option<&str>) -> bool {
     let Some(port) = port else {
         return true;
     };
-    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -265,6 +475,7 @@ pub(crate) fn error_response(err: &Error) -> HttpResponse {
     HttpResponse {
         status,
         reason,
+        extra_headers: Vec::new(),
         body,
     }
 }
@@ -291,6 +502,7 @@ pub(crate) fn unauthorized_response() -> HttpResponse {
     HttpResponse {
         status: 401,
         reason: "Unauthorized",
+        extra_headers: Vec::new(),
         body,
     }
 }
@@ -306,6 +518,24 @@ pub(crate) fn forbidden_origin_response() -> HttpResponse {
     HttpResponse {
         status: 403,
         reason: "Forbidden",
+        extra_headers: Vec::new(),
+        body,
+    }
+}
+
+pub(crate) fn forbidden_host_response() -> HttpResponse {
+    let body = serde_json::to_vec(&ErrorBody {
+        error: ErrorDetails {
+            message: "forbidden: request host is missing or is not a local loopback host"
+                .to_string(),
+            code: 11,
+        },
+    })
+    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"forbidden\",\"code\":11}}".to_vec());
+    HttpResponse {
+        status: 403,
+        reason: "Forbidden",
+        extra_headers: Vec::new(),
         body,
     }
 }

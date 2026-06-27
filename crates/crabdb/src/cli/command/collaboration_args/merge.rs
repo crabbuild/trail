@@ -11,6 +11,8 @@ pub(in crate::cli::command) struct MergeLaneArgs {
     pub(in crate::cli::command) strategy: Option<String>,
     #[arg(long)]
     pub(in crate::cli::command) dry_run: bool,
+    #[arg(long)]
+    pub(in crate::cli::command) direct: bool,
 }
 
 #[derive(Subcommand)]

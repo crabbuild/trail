@@ -3,6 +3,67 @@ use super::*;
 pub(crate) type ManualLineChange = (String, FileId, LineChange);
 
 impl CrabDb {
+    pub(crate) fn preflight_replace_line_batch(
+        &self,
+        edits: &[PatchEdit],
+        files: &BTreeMap<String, FileEntry>,
+    ) -> Result<()> {
+        if !edits
+            .iter()
+            .all(|edit| matches!(edit, PatchEdit::ReplaceLine { .. }))
+        {
+            return Ok(());
+        }
+
+        let mut lines_by_path: BTreeMap<String, Vec<LineEntry>> = BTreeMap::new();
+        for edit in edits {
+            let PatchEdit::ReplaceLine {
+                path,
+                line_id,
+                expected_text,
+                new_text,
+            } = edit
+            else {
+                continue;
+            };
+            let path = normalize_relative_path(path)?;
+            if !lines_by_path.contains_key(&path) {
+                let Some(entry) = files.get(&path) else {
+                    return Err(Error::PatchRejected(format!(
+                        "replace_line path `{path}` is absent"
+                    )));
+                };
+                let FileContentRef::Text(text_id) = &entry.content else {
+                    return Err(Error::PatchRejected(format!(
+                        "replace_line path `{path}` is not text"
+                    )));
+                };
+                lines_by_path.insert(path.clone(), self.load_text_lines(text_id)?);
+            }
+            let lines = lines_by_path.get_mut(&path).expect("path was loaded");
+            let Some(line_idx) = lines.iter().position(|line| line.line_id_key() == *line_id)
+            else {
+                return Err(Error::PatchRejected(format!(
+                    "replace_line line_id `{line_id}` not found in `{path}`"
+                )));
+            };
+            let Some(expected_text) = expected_text else {
+                return Err(Error::PatchRejected(format!(
+                    "replace_line for `{path}` requires expected_text; include the current line text so stale edits are rejected"
+                )));
+            };
+            let actual = String::from_utf8_lossy(&lines[line_idx].text);
+            if actual != *expected_text {
+                return Err(Error::PatchRejected(format!(
+                    "replace_line expected text mismatch for `{path}` {line_id}"
+                )));
+            }
+            lines[line_idx].text = new_text.as_bytes().to_vec();
+            lines[line_idx].text_hash = sha256_hex(&lines[line_idx].text);
+        }
+        Ok(())
+    }
+
     pub(crate) fn patch_touched_paths(&self, edits: &[PatchEdit]) -> Result<Vec<String>> {
         let mut paths = BTreeSet::new();
         for edit in edits {
@@ -157,13 +218,16 @@ impl CrabDb {
                 "replace_line line_id `{line_id}` not found in `{path}`"
             )));
         };
-        if let Some(expected_text) = expected_text {
-            let actual = String::from_utf8_lossy(&lines[line_idx].text);
-            if actual != expected_text {
-                return Err(Error::PatchRejected(format!(
-                    "replace_line expected text mismatch for `{path}` {line_id}"
-                )));
-            }
+        let Some(expected_text) = expected_text else {
+            return Err(Error::PatchRejected(format!(
+                "replace_line for `{path}` requires expected_text; include the current line text so stale edits are rejected"
+            )));
+        };
+        let actual = String::from_utf8_lossy(&lines[line_idx].text);
+        if actual != expected_text {
+            return Err(Error::PatchRejected(format!(
+                "replace_line expected text mismatch for `{path}` {line_id}"
+            )));
         }
         let before_hash = lines[line_idx].text_hash.clone();
         lines[line_idx].text = new_text.into_bytes();
@@ -190,5 +254,58 @@ impl CrabDb {
         ));
         files.insert(path, next_entry);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn internal_replace_line_paths_require_expected_text() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = CrabDb::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let files = db.load_root_files(&head.root_id).unwrap();
+        let why = db.why("README.md:1", Some("main")).unwrap();
+        let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+        let edit = PatchEdit::ReplaceLine {
+            path: "README.md".to_string(),
+            line_id,
+            expected_text: None,
+            new_text: "uno".to_string(),
+        };
+
+        let err = db
+            .preflight_replace_line_batch(&[edit.clone()], &files)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PatchRejected(ref message) if message.contains("requires expected_text")),
+            "expected preflight guard rejection, got {err:?}"
+        );
+
+        let mut files = files;
+        let mut manual_line_changes = Vec::new();
+        let mut file_seq = 1;
+        let mut line_seq = 1;
+        let err = db
+            .apply_patch_edit_to_files(
+                edit,
+                &mut files,
+                &ChangeId("ch_internal_replace_line_guard".to_string()),
+                &mut file_seq,
+                &mut line_seq,
+                &mut manual_line_changes,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PatchRejected(ref message) if message.contains("requires expected_text")),
+            "expected applicator guard rejection, got {err:?}"
+        );
+        assert!(manual_line_changes.is_empty());
     }
 }

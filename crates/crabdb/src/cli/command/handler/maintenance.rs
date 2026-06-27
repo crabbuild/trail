@@ -1,5 +1,6 @@
 use super::*;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -64,11 +65,12 @@ pub(super) fn handle_api_command(_ctx: &RuntimeContext, api: ApiCommand) -> Resu
 
 pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
+    let addr = daemon_listen_addr(&args)?;
+    validate_daemon_listen_security(&args, addr)?;
+    let rate_limit = daemon_rate_limit(&args)?;
+    let connection_timeout = daemon_connection_timeout(&args)?;
     let (auth, token_file) = daemon_auth(&db, &args)?;
     let cache_warmup = db.start_daemon_worktree_cache()?;
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .map_err(|err| Error::InvalidInput(format!("invalid listen address: {err}")))?;
     let listener = TcpListener::bind(addr)?;
     let local_addr = listener.local_addr()?;
     let daemon_url = daemon_rpc::daemon_url_for_listener(local_addr);
@@ -95,9 +97,13 @@ pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> R
     });
     if !ctx.quiet {
         println!("CrabDB API listening on {daemon_url}");
-        if args.no_auth {
-            println!("Daemon auth disabled");
-        } else if let Some(path) = token_file {
+    }
+    if args.no_auth {
+        eprintln!(
+            "WARNING: CrabDB daemon auth is disabled; any local process can mutate this workspace through {daemon_url}. Keep the listener on loopback and use this only for trusted local automation."
+        );
+    } else if !ctx.quiet {
+        if let Some(path) = token_file {
             println!("Daemon token file: {}", path.display());
             println!(
                 "Send requests with: Authorization: Bearer $(cat {})",
@@ -113,7 +119,47 @@ pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> R
         args.max_requests
     };
     let _endpoint_registration = endpoint_registration;
-    crabdb::server::serve_listener_with_auth(&mut db, listener, max_requests, auth)
+    crabdb::server::serve_listener_with_auth_rate_limit_and_timeout(
+        &mut db,
+        listener,
+        max_requests,
+        auth,
+        rate_limit,
+        connection_timeout,
+    )
+}
+
+fn daemon_listen_addr(args: &DaemonArgs) -> Result<SocketAddr> {
+    format!("{}:{}", args.host, args.port)
+        .parse()
+        .map_err(|err| Error::InvalidInput(format!("invalid listen address: {err}")))
+}
+
+fn validate_daemon_listen_security(args: &DaemonArgs, addr: SocketAddr) -> Result<()> {
+    if args.no_auth && !addr.ip().is_loopback() {
+        return Err(Error::InvalidInput(format!(
+            "daemon --no-auth requires a loopback --host; refusing to listen on {} without authentication",
+            addr.ip()
+        )));
+    }
+    Ok(())
+}
+
+fn daemon_rate_limit(args: &DaemonArgs) -> Result<crabdb::server::ServerRateLimit> {
+    crabdb::server::ServerRateLimit::per_window(
+        args.rate_limit_requests,
+        Duration::from_secs(args.rate_limit_window_secs),
+    )
+}
+
+fn daemon_connection_timeout(args: &DaemonArgs) -> Result<Duration> {
+    let timeout = Duration::from_secs(args.connection_timeout_secs);
+    if timeout.is_zero() {
+        return Err(Error::InvalidInput(
+            "daemon --connection-timeout-secs must be greater than zero".to_string(),
+        ));
+    }
+    Ok(timeout)
 }
 
 struct DaemonEndpointRegistration {
@@ -286,15 +332,49 @@ fn daemon_auth(
         .auth_token_file
         .clone()
         .unwrap_or_else(|| db.db_dir().join("daemon.token"));
-    let token = if token_path.exists() {
-        fs::read_to_string(&token_path)?.trim().to_string()
-    } else {
-        let token = generate_daemon_token()?;
-        fs::write(&token_path, format!("{token}\n"))?;
-        restrict_secret_file(&token_path)?;
-        token
-    };
+    let token = read_or_create_daemon_token_file(&token_path)?;
     Ok((crabdb::server::ServerAuth::bearer(token)?, Some(token_path)))
+}
+
+fn read_or_create_daemon_token_file(path: &std::path::Path) -> Result<String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            restrict_secret_file(path)?;
+            let token = fs::read_to_string(path)?.trim().to_string();
+            if token.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "daemon auth token file `{}` cannot be empty",
+                    path.display()
+                )));
+            }
+            Ok(token)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => create_daemon_token_file(path),
+        Err(err) => Err(Error::from(err)),
+    }
+}
+
+fn create_daemon_token_file(path: &std::path::Path) -> Result<String> {
+    let token = generate_daemon_token()?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(format!("{token}\n").as_bytes())?;
+            file.sync_all()?;
+            restrict_secret_file(path)?;
+            Ok(token)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_or_create_daemon_token_file(path)
+        }
+        Err(err) => Err(Error::from(err)),
+    }
 }
 
 fn generate_daemon_token() -> Result<String> {
@@ -306,10 +386,23 @@ fn generate_daemon_token() -> Result<String> {
 }
 
 fn restrict_secret_file(path: &std::path::Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::InvalidInput(format!(
+            "daemon auth token file `{}` cannot be a symlink",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(Error::InvalidInput(format!(
+            "daemon auth token file `{}` must be a regular file",
+            path.display()
+        )));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
+        let mut permissions = metadata.permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(path, permissions)?;
     }
@@ -318,4 +411,77 @@ fn restrict_secret_file(path: &std::path::Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon_args_with_token_file(token_file: PathBuf) -> DaemonArgs {
+        DaemonArgs {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            once: true,
+            max_requests: Some(1),
+            rate_limit_requests: 600,
+            rate_limit_window_secs: 60,
+            connection_timeout_secs: 30,
+            auth_token: None,
+            auth_token_file: Some(token_file),
+            no_auth: false,
+        }
+    }
+
+    #[test]
+    fn daemon_auth_restricts_existing_token_file() {
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = CrabDb::open(temp.path()).unwrap();
+        let token_path = db.db_dir().join("daemon.token");
+        fs::write(&token_path, "existing-token\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&token_path).unwrap().permissions();
+            permissions.set_mode(0o644);
+            fs::set_permissions(&token_path, permissions).unwrap();
+        }
+
+        let (auth, token_file) = daemon_auth(&db, &daemon_args_with_token_file(token_path.clone()))
+            .expect("existing token file should be accepted");
+
+        assert!(auth.is_required());
+        assert_eq!(token_file.as_deref(), Some(token_path.as_path()));
+        assert_eq!(fs::read_to_string(&token_path).unwrap(), "existing-token\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_auth_rejects_symlink_token_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = CrabDb::open(temp.path()).unwrap();
+        let target_path = temp.path().join("outside-token");
+        fs::write(&target_path, "linked-token\n").unwrap();
+        let token_path = db.db_dir().join("daemon.token");
+        symlink(&target_path, &token_path).unwrap();
+
+        let err = daemon_auth(&db, &daemon_args_with_token_file(token_path))
+            .expect_err("symlink token files must be rejected");
+
+        assert!(
+            matches!(err, Error::InvalidInput(ref message) if message.contains("cannot be a symlink")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), "linked-token\n");
+    }
 }

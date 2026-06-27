@@ -1,4 +1,5 @@
 use super::*;
+use unicode_normalization::UnicodeNormalization;
 
 pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
     if path.as_bytes().contains(&0) {
@@ -7,10 +8,23 @@ pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
             reason: "NUL bytes are not allowed".to_string(),
         });
     }
-    if path.contains(['\u{2215}', '\u{2044}', '\u{FF0F}']) {
+    if path.chars().any(is_slash_lookalike) {
         return Err(Error::InvalidPath {
             path: path.to_string(),
             reason: "path contains a slash lookalike; use `/` as the separator".to_string(),
+        });
+    }
+    #[cfg(not(windows))]
+    if path.contains('\\') {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path contains a backslash separator; use `/` as the separator".to_string(),
+        });
+    }
+    if path.nfc().ne(path.chars()) {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path must use Unicode NFC normalization".to_string(),
         });
     }
     let path = path.replace('\\', "/");
@@ -43,11 +57,31 @@ pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+fn is_slash_lookalike(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2044}' // fraction slash
+            | '\u{2215}' // division slash
+            | '\u{2216}' // set minus
+            | '\u{29F8}' // big solidus
+            | '\u{29F9}' // big reverse solidus
+            | '\u{FE68}' // small reverse solidus
+            | '\u{FF0F}' // fullwidth solidus
+            | '\u{FF3C}' // fullwidth reverse solidus
+    )
+}
+
 fn validate_relative_path_component(path: &str, part: &str) -> Result<()> {
     if part.chars().any(char::is_control) {
         return Err(Error::InvalidPath {
             path: path.to_string(),
             reason: "path components cannot contain control characters".to_string(),
+        });
+    }
+    if part.chars().any(is_invisible_path_format_control) {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path components cannot contain invisible Unicode format controls".to_string(),
         });
     }
     if part.contains(':') {
@@ -62,13 +96,15 @@ fn validate_relative_path_component(path: &str, part: &str) -> Result<()> {
             reason: "path components cannot end with a space or dot".to_string(),
         });
     }
-    let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
+    let stem = windows_reserved_stem(part);
     if matches!(
         stem.as_str(),
         "CON"
             | "PRN"
             | "AUX"
             | "NUL"
+            | "CONIN$"
+            | "CONOUT$"
             | "COM1"
             | "COM2"
             | "COM3"
@@ -94,6 +130,42 @@ fn validate_relative_path_component(path: &str, part: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn windows_reserved_stem(part: &str) -> String {
+    part.split('.')
+        .next()
+        .unwrap_or(part)
+        .chars()
+        .map(|ch| match ch {
+            '\u{00B9}' => '1',
+            '\u{00B2}' => '2',
+            '\u{00B3}' => '3',
+            other => other.to_ascii_uppercase(),
+        })
+        .collect()
+}
+
+fn is_invisible_path_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}' // zero width space
+            | '\u{200C}' // zero width non-joiner
+            | '\u{200D}' // zero width joiner
+            | '\u{200E}' // left-to-right mark
+            | '\u{200F}' // right-to-left mark
+            | '\u{202A}' // left-to-right embedding
+            | '\u{202B}' // right-to-left embedding
+            | '\u{202C}' // pop directional formatting
+            | '\u{202D}' // left-to-right override
+            | '\u{202E}' // right-to-left override
+            | '\u{2060}' // word joiner
+            | '\u{2066}' // left-to-right isolate
+            | '\u{2067}' // right-to-left isolate
+            | '\u{2068}' // first strong isolate
+            | '\u{2069}' // pop directional isolate
+            | '\u{FEFF}' // zero width no-break space / BOM
+    )
 }
 
 pub(crate) fn normalize_workdir_path(path: &Path) -> Result<PathBuf> {

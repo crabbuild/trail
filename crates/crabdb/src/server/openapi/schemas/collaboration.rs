@@ -10,7 +10,8 @@ pub(super) fn collaboration_schemas() -> Value {
                 "name": { "type": "string" },
                 "strategy": { "type": "string" },
                 "dry_run": { "type": "boolean" },
-                "dry-run": { "type": "boolean" }
+                "dry-run": { "type": "boolean" },
+                "direct": { "type": "boolean" }
             }
         },
         "SessionStartRequest": {
@@ -120,7 +121,7 @@ pub(super) fn collaboration_schemas() -> Value {
         },
         "ConflictMergeContext": {
             "type": "object",
-            "required": ["merge_id", "source_ref", "target_ref", "base_change", "target_change", "source_change"],
+            "required": ["merge_id", "source_ref", "target_ref", "base_change", "target_change", "source_change", "base_root", "target_root", "source_root"],
             "properties": {
                 "merge_id": { "type": "string" },
                 "queue_id": { "type": "string" },
@@ -128,20 +129,28 @@ pub(super) fn collaboration_schemas() -> Value {
                 "target_ref": { "type": "string" },
                 "base_change": { "type": "string" },
                 "target_change": { "type": "string" },
-                "source_change": { "type": "string" }
+                "source_change": { "type": "string" },
+                "base_root": { "type": "string" },
+                "target_root": { "type": "string" },
+                "source_root": { "type": "string" }
             }
         },
         "ConflictPathExplanation": {
             "type": "object",
-            "required": ["path", "summary", "reason", "lines", "recommendation"],
+            "required": ["path", "conflict_class", "summary", "reason", "lines", "recommendation"],
             "properties": {
                 "path": { "type": "string" },
+                "conflict_class": {
+                    "type": "string",
+                    "enum": ["modify/modify", "delete/modify", "rename/modify", "binary", "mode", "same_insertion_gap"]
+                },
                 "summary": { "type": "string" },
                 "reason": { "type": "string" },
                 "target": { "$ref": "#/components/schemas/ConflictSideProvenance" },
                 "source": { "$ref": "#/components/schemas/ConflictSideProvenance" },
                 "lines": { "type": "array", "items": { "$ref": "#/components/schemas/ConflictLineExplanation" } },
-                "recommendation": { "$ref": "#/components/schemas/ConflictResolutionCandidate" }
+                "recommendation": { "$ref": "#/components/schemas/ConflictResolutionCandidate" },
+                "known_resolutions": { "type": "array", "items": { "$ref": "#/components/schemas/ConflictKnownResolution" } }
             }
         },
         "ConflictSideProvenance": {
@@ -180,12 +189,29 @@ pub(super) fn collaboration_schemas() -> Value {
                 "reason": { "type": "string" }
             }
         },
+        "ConflictKnownResolution": {
+            "type": "object",
+            "required": ["resolution", "confidence", "reason", "conflict_set_id", "operation", "created_at"],
+            "properties": {
+                "resolution": { "type": "string", "enum": ["source", "target", "manual"] },
+                "confidence": { "type": "string" },
+                "reason": { "type": "string" },
+                "conflict_set_id": { "type": "string" },
+                "operation": { "type": "string" },
+                "created_at": { "type": "integer" }
+            }
+        },
         "ConflictResolveRequest": {
             "type": "object",
+            "oneOf": [
+                { "required": ["take"], "not": { "required": ["manual"] } },
+                { "required": ["manual"], "not": { "required": ["take"] } }
+            ],
             "properties": {
                 "take": { "type": "string", "enum": ["source", "target"] },
                 "manual": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "files": {
                             "type": "object",
@@ -194,6 +220,7 @@ pub(super) fn collaboration_schemas() -> Value {
                                     { "type": "string" },
                                     {
                                         "type": "object",
+                                        "additionalProperties": false,
                                         "properties": {
                                             "content": { "type": "string" },
                                             "delete": { "type": "boolean" },

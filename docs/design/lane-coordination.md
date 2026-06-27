@@ -196,7 +196,13 @@ Guardrail checks can detect matching pending, approved, or rejected approvals. A
 
 ## Leases and Claims
 
-Leases are advisory coordination records. They do not replace branch isolation or merge conflict detection.
+Leases are advisory coordination records by default. When
+`lane.claim_enforcement` is set to `warn` or `reject`, active write leases also
+define the allowed write boundary for lane patches and materialized workdir
+records. They do not replace branch isolation or merge conflict detection.
+Sparse lane path selections are also persisted with the lane. When
+`lane.enforce_sparse_paths=true`, that persisted selection is the fallback hard
+boundary if the workdir's sparse manifest is missing.
 
 Lease fields include:
 

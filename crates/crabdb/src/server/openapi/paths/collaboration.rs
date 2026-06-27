@@ -86,8 +86,18 @@ pub(super) fn collaboration_paths() -> Value {
         "/v1/merge-queue/run": {
             "post": openapi_operation("mergeQueueRun", "Run merge queue", "Run queued merges serially.", vec![], Some("MergeQueueRunRequest"), true)
         },
+        "/v1/merge-queue/explain": {
+            "get": openapi_operation("mergeQueueExplainByQuery", "Explain merge queue entry", "Explain why a queued merge is ready or blocked.", vec![
+                openapi_query("selector", "string")
+            ], None, true)
+        },
         "/v1/merge-queue/{selector}": {
             "delete": openapi_operation("mergeQueueRemove", "Remove queue entry", "Cancel a queued or conflicted merge queue entry.", vec![
+                openapi_path_param("selector", "string")
+            ], None, true)
+        },
+        "/v1/merge-queue/{selector}/explain": {
+            "get": openapi_operation("mergeQueueExplain", "Explain merge queue entry", "Explain why a queued merge is ready or blocked.", vec![
                 openapi_path_param("selector", "string")
             ], None, true)
         },
@@ -106,7 +116,7 @@ pub(super) fn collaboration_paths() -> Value {
             ], Some("ConflictResolveRequest"), true)
         },
         "/v1/branches/{branch}/merge-lane": {
-            "post": openapi_operation("branchMergeLane", "Merge lane", "Merge a lane branch into a target branch.", vec![
+            "post": openapi_operation("branchMergeLane", "Merge lane", "Dry-run a lane merge or explicitly direct-merge a lane branch into a target branch.", vec![
                 openapi_path_param("branch", "string")
             ], Some("MergeLaneRequest"), true)
         }

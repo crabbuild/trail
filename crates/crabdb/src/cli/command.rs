@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 mod acp_args;
+mod agent_args;
 mod collaboration_args;
 mod handler;
 mod inspect_args;
@@ -13,6 +14,7 @@ mod workspace_args;
 mod worktree_args;
 
 use acp_args::*;
+use agent_args::*;
 use collaboration_args::*;
 use inspect_args::*;
 use lane_args::*;
@@ -120,6 +122,8 @@ enum Command {
     Lane(LaneCommand),
     /// Run Agent Client Protocol relay integrations for coding agents.
     Acp(AcpCommand),
+    /// Run high-level agent task workflows without managing lanes directly.
+    Agent(AgentCommand),
     /// Show a readable transcript for a lane, session, or ACP session.
     Transcript(TranscriptArgs),
     /// Work with durable turns using a short top-level alias.

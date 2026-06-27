@@ -44,10 +44,16 @@ When conflicts occur, CrabDB records structured conflict sets for inspection and
 
 ```sh
 crabdb merge-lane doc-bot --into main --dry-run
-crabdb merge-lane doc-bot --into main
 ```
 
-Lane merges run readiness checks before mutating the target branch.
+Non-dry-run lane merges into the default branch use the merge queue by default:
+
+```sh
+crabdb merge-queue add doc-bot --into main
+crabdb merge-queue run
+```
+
+Immediate default-branch merges require `crabdb merge-lane ... --direct`.
 
 ## Merge Queue
 
@@ -91,10 +97,12 @@ Or:
 }
 ```
 
+Manual resolution objects accept only `content`, `delete`, and `executable`;
+unknown keys are rejected.
+
 ## Code Facts Used
 
 - Branch/checkout/merge args: `crates/crabdb/src/cli/command/worktree_args.rs`
 - Merge/conflict args: `crates/crabdb/src/cli/command/collaboration_args/merge.rs`
 - Conflict manual schema: `crates/crabdb/src/model/reports/merge.rs`
 - Tests: `checkout_dry_run_and_alternate_workdir_are_safe`, `merge_dry_run_reports_conflicts_without_opening_conflict_state`, `manual_conflict_resolution_works_through_db_cli_http_and_mcp`
-

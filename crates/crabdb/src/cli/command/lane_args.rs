@@ -28,6 +28,8 @@ pub(super) enum LaneSubcommand {
     Gates(LaneGatesArgs),
     /// Compute lane merge-readiness including blockers and warnings.
     Readiness(LaneReadinessArgs),
+    /// Preview refreshing a lane onto a target branch before merge.
+    RefreshPreview(LaneRefreshPreviewArgs),
     /// Produce a handoff-ready transfer packet for a lane.
     Handoff(LaneHandoffArgs),
     /// Create a best-effort advisory claim for path-level work coordination.
@@ -145,6 +147,13 @@ pub(super) struct LaneReadinessArgs {
 }
 
 #[derive(Args)]
+pub(super) struct LaneRefreshPreviewArgs {
+    pub(super) name: String,
+    #[arg(long, default_value = "main")]
+    pub(super) target: String,
+}
+
+#[derive(Args)]
 pub(super) struct LaneHandoffArgs {
     pub(super) name: String,
     #[arg(long, default_value_t = 50)]
@@ -183,6 +192,8 @@ pub(super) struct LaneRecordArgs {
     pub(super) name: String,
     #[arg(short, long)]
     pub(super) message: Option<String>,
+    #[arg(long)]
+    pub(super) preview: bool,
 }
 
 #[derive(Args)]

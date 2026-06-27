@@ -48,7 +48,7 @@ pub(super) fn lane_schemas() -> Value {
             "properties": {
                 "lane": { "$ref": "#/components/schemas/JsonValue" },
                 "readiness": { "$ref": "#/components/schemas/JsonValue" },
-                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } },
                 "workdir_state": { "$ref": "#/components/schemas/JsonValue" },
                 "evidence_summary": { "$ref": "#/components/schemas/LaneReviewEvidenceSummary" },
                 "latest_test": { "$ref": "#/components/schemas/JsonValue" },
@@ -61,6 +61,127 @@ pub(super) fn lane_schemas() -> Value {
                 "recent_approvals": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
                 "conflicts": { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
                 "next_steps": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "LaneRefreshPreviewReport": {
+            "type": "object",
+            "required": [
+                "lane_id",
+                "ref_name",
+                "base_change",
+                "lane_head_change",
+                "lane_head_root",
+                "target_ref",
+                "target_change",
+                "target_root",
+                "clean",
+                "conflicted",
+                "changed_paths",
+                "conflicts",
+                "next_steps"
+            ],
+            "properties": {
+                "lane_id": { "type": "string" },
+                "ref_name": { "type": "string" },
+                "base_change": { "type": "string" },
+                "lane_head_change": { "type": "string" },
+                "lane_head_root": { "type": "string" },
+                "target_ref": { "type": "string" },
+                "target_change": { "type": "string" },
+                "target_root": { "type": "string" },
+                "operations_behind": { "type": "integer" },
+                "clean": { "type": "boolean" },
+                "conflicted": { "type": "boolean" },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } },
+                "conflicts": { "type": "array", "items": { "type": "string" } },
+                "next_steps": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "LaneRecordWorkdirResponse": {
+            "oneOf": [
+                { "$ref": "#/components/schemas/LaneRecordReport" },
+                { "$ref": "#/components/schemas/LaneRecordPreviewReport" }
+            ]
+        },
+        "LaneRecordReport": {
+            "type": "object",
+            "required": ["lane_id", "operation", "root_id", "changed_paths"],
+            "additionalProperties": false,
+            "properties": {
+                "lane_id": { "type": "string" },
+                "operation": { "type": ["string", "null"] },
+                "root_id": { "type": "string" },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } }
+            }
+        },
+        "LaneRecordPreviewReport": {
+            "type": "object",
+            "required": [
+                "lane_id",
+                "workdir",
+                "head_change",
+                "root_id",
+                "clean",
+                "changed_paths",
+                "ignored_paths",
+                "risky_paths",
+                "oversized_files",
+                "policy"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "lane_id": { "type": "string" },
+                "workdir": { "type": "string" },
+                "head_change": { "type": "string" },
+                "root_id": { "type": "string" },
+                "clean": { "type": "boolean" },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } },
+                "ignored_paths": { "type": "array", "items": { "$ref": "#/components/schemas/LaneWorkdirIgnoredPath" } },
+                "risky_paths": { "type": "array", "items": { "$ref": "#/components/schemas/LaneWorkdirRisk" } },
+                "oversized_files": { "type": "array", "items": { "$ref": "#/components/schemas/LaneRecordOversizedFile" } },
+                "policy": { "$ref": "#/components/schemas/LaneRecordPolicyPreview" }
+            }
+        },
+        "LaneWorkdirIgnoredPath": {
+            "type": "object",
+            "required": ["path", "source"],
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string" },
+                "source": { "type": "string", "enum": ["hardcoded", "workdir"] }
+            }
+        },
+        "LaneWorkdirRisk": {
+            "type": "object",
+            "required": ["path", "kind", "message"],
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["nested_git", "nested_crabdb", "symlink", "hardlink", "external_mount"]
+                },
+                "message": { "type": "string" }
+            }
+        },
+        "LaneRecordOversizedFile": {
+            "type": "object",
+            "required": ["path", "size_bytes", "limit_bytes"],
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string" },
+                "size_bytes": { "type": "integer" },
+                "limit_bytes": { "type": "integer" }
+            }
+        },
+        "LaneRecordPolicyPreview": {
+            "type": "object",
+            "required": ["allowed"],
+            "additionalProperties": false,
+            "properties": {
+                "allowed": { "type": "boolean" },
+                "warnings": { "type": "array", "items": { "type": "string" } },
+                "error": { "type": ["string", "null"] }
             }
         },
         "SpawnLaneRequest": {
@@ -198,7 +319,8 @@ pub(super) fn lane_schemas() -> Value {
         "LaneRecordRequest": {
             "type": "object",
             "properties": {
-                "message": { "type": "string" }
+                "message": { "type": "string" },
+                "preview": { "type": "boolean" }
             }
         },
         "LaneRewindRequest": {

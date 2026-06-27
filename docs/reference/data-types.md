@@ -44,6 +44,7 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 
 - `LaneDetails`
 - `LaneStatusReport`
+- `LaneBaseStatus`
 - `LaneReviewPacketReport`
 - `LaneReviewEvidenceSummary`
 - `LaneContributionReport`
@@ -51,6 +52,8 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `LaneHandoffReport`
 - `LanePatchReport`
 - `LaneRecordReport`
+- `LaneRecordPreviewReport`
+- `LaneRefreshPreviewReport`
 - `LaneRewindReport`
 - `LaneTestReport`
 - `LaneGateHistoryReport`
@@ -66,6 +69,69 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `LeaseRecord`
 - `Anchor`
 
+## Agent and ACP Types
+
+- `AgentTaskReport`
+- `AgentTaskStatus`
+- `AgentTaskListReport`
+- `AgentInboxReport`
+- `AgentInboxGroup`
+- `AgentInboxItem`
+- `AgentInboxReviewTarget`
+- `AgentTaskViewReport`
+- `AgentReviewReport`
+- `AgentReviewPriority`
+- `AgentFocusReport`
+- `AgentReviewBundleReport`
+- `AgentReceiptReport`
+- `AgentPrDraftReport`
+- `AgentSummaryReport`
+- `AgentValidationReport`
+- `AgentCheckpointReport`
+- `AgentCheckpointEntry`
+- `AgentChangesReport`
+- `AgentChangeSetReport`
+- `AgentChangeCard`
+- `AgentChangeGroup`
+- `AgentDeltaReport`
+- `AgentReviewMarker`
+- `AgentNewReport`
+- `AgentMarkReviewedReport`
+- `AgentTimelineReport`
+- `AgentTimelineItem`
+- `AgentFilesReport`
+- `AgentFileReport`
+- `AgentFileEntry`
+- `AgentFileTouch`
+- `AgentStoryReport`
+- `AgentStoryTurn`
+- `AgentRiskReport`
+- `AgentRiskLevel`
+- `AgentRiskReason`
+- `AgentReadyReport`
+- `AgentDiagnosisReport`
+- `AgentCompareReport`
+- `AgentComparePath`
+- `AgentWorkdirReport`
+- `AgentWhyReport`
+- `AgentTurnReport`
+- `AgentDiffReport`
+- `AgentStatusReport`
+- `AgentAskReport`
+- `AgentApplyReport`
+- `AgentGitApplyPlan`
+- `AgentSetupReport`
+- `AgentRunReport`
+- `AcpProviderProfile`
+- `AcpInstallReport`
+- `AcpDoctorReport`
+- `AcpDoctorCheck`
+- `AcpSessionListReport`
+- `TranscriptReport`
+- `TranscriptTurn`
+- `TranscriptMessage`
+- `StatusSuggestion`
+
 ## Merge and Conflict Types
 
 - `MergeReport`
@@ -76,6 +142,7 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `ConflictPathExplanation`
 - `ConflictLineExplanation`
 - `ConflictResolutionCandidate`
+- `ConflictKnownResolution`
 - `ConflictManualResolution`
 - `ConflictResolveReport`
 
@@ -89,6 +156,7 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `BackupCreateReport`
 - `BackupVerifyReport`
 - `BackupRestoreReport`
+- `ExternalMutationAuditRecord`
 
 ## Code Facts Used
 

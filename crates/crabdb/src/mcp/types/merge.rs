@@ -21,11 +21,18 @@ pub(crate) struct MergeQueueRunArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MergeQueueExplainArgs {
+    pub(crate) selector: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeQueueRemoveArgs {
     pub(crate) selector: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConflictIdArgs {
     pub(crate) conflict_set_id: String,
     #[serde(default)]

@@ -56,6 +56,7 @@ impl HttpIdempotency {
         Ok(Some(HttpResponse {
             status: entry.status,
             reason: reason_for_status(entry.status),
+            extra_headers: Vec::new(),
             body: entry.body,
         }))
     }

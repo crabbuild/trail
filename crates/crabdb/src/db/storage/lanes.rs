@@ -37,6 +37,22 @@ impl CrabDb {
         Ok(())
     }
 
+    pub(crate) fn preflight_lane_session_owner(
+        &self,
+        lane_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        validate_session_id(session_id)?;
+        if let Some(existing) = self.try_lane_session(session_id)? {
+            if existing.lane_id != lane_id {
+                return Err(Error::InvalidInput(format!(
+                    "session `{session_id}` belongs to another lane"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_lane_session(&self, session_id: &str) -> Result<Option<LaneSession>> {
         self.conn
             .query_row(

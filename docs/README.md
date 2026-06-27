@@ -29,6 +29,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Inspect history and provenance](guides/inspect-history-and-provenance.md)
 - [Branch, checkout, and merge](guides/branch-checkout-and-merge.md)
 - [Configure CrabDB](guides/configure-crabdb.md)
+- [Harden agent workflows](guides/hardening-agent-workflows.md)
 - [Ignore files and preflight actions](guides/ignore-files-and-preflight-actions.md)
 - [Git interop](guides/git-interop.md)
 - [Maintenance and recovery](guides/maintenance-and-recovery.md)
@@ -52,6 +53,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [OpenAPI](integrations/openapi.md)
 - [MCP](integrations/mcp.md)
 - [ACP relay design](design/acp-relay.md)
+- [VS Code ACP chat view design](design/vscode-acp-chat-view.md)
 - [Rust library](integrations/rust-library.md)
 - [Git](integrations/git.md)
 
@@ -66,4 +68,5 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Data types](reference/data-types.md)
 - [Design notes](design/architecture.md)
 - [ACP relay design](design/acp-relay.md)
+- [VS Code ACP chat view design](design/vscode-acp-chat-view.md)
 - [Code fact map](./_meta/code-fact-map.md)

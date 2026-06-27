@@ -12,27 +12,105 @@ Install CrabDB normally:
 make install
 ```
 
-Check the ACP setup:
+Check the agent setup:
 
 ```sh
-crabdb acp doctor --agent claude-code
+crabdb agent doctor --provider claude-code
 ```
 
-Print a relay command and generic editor snippet:
+Print editor configuration that creates a fresh CrabDB task lane for each ACP
+session:
 
 ```sh
-crabdb acp install --agent claude-code --print
+crabdb agent setup --provider claude-code --editor vscode
 ```
 
-The default Claude Code profile uses:
+After one prompt:
+
+```sh
+crabdb agent next
+```
+
+Then inspect or apply as needed:
+
+```sh
+crabdb agent
+crabdb agent summary latest
+crabdb agent story latest
+crabdb agent risk latest
+crabdb agent ready latest
+crabdb agent diagnose latest
+crabdb agent compare <TASK_A> <TASK_B>
+crabdb agent receipt latest
+crabdb agent pr latest
+crabdb agent report latest --markdown
+crabdb agent validate latest
+crabdb agent test latest -- cargo test
+crabdb agent brief latest
+crabdb agent workdir latest
+crabdb agent delta latest
+crabdb agent new latest
+crabdb agent changes latest
+crabdb agent turn
+crabdb agent turn-diff latest --patch
+crabdb agent files latest
+crabdb agent checkpoints latest
+crabdb agent why README.md
+crabdb agent turn-diff latest --file README.md --patch
+crabdb agent review-plan latest
+crabdb agent focus latest
+crabdb agent view latest
+crabdb agent ready latest
+crabdb agent apply latest
+```
+
+The lower-level Claude Code ACP profile still uses:
 
 ```sh
 crabdb acp relay --provider claude-code --materialize -- npx -y @agentclientprotocol/claude-agent-acp@latest
 ```
 
+For a full operator and automation-agent runbook, including real Claude Code
+edit verification and ACP permission responses, see
+[ACP Agent Usage Runbook](./acp-agent-usage.md).
+
 ## Daily Use
 
-After an ACP prompt runs:
+For day-to-day use, prefer the task-oriented commands:
+
+```sh
+crabdb agent
+crabdb agent next
+crabdb agent summary latest
+crabdb agent story latest
+crabdb agent risk latest
+crabdb agent ready latest
+crabdb agent diagnose latest
+crabdb agent compare <TASK_A> <TASK_B>
+crabdb agent receipt latest
+crabdb agent pr latest
+crabdb agent report latest --markdown
+crabdb agent validate latest
+crabdb agent test latest -- cargo test
+crabdb agent brief latest
+crabdb agent workdir latest
+crabdb agent delta latest
+crabdb agent new latest
+crabdb agent changes latest
+crabdb agent turn
+crabdb agent turn-diff latest --patch
+crabdb agent files latest
+crabdb agent checkpoints latest
+crabdb agent why README.md
+crabdb agent turn-diff latest --file README.md --patch
+crabdb agent review-plan latest
+crabdb agent focus latest
+crabdb agent view latest
+crabdb agent ready latest
+crabdb agent apply latest
+```
+
+For low-level ACP inspection:
 
 ```sh
 crabdb acp sessions
@@ -46,5 +124,11 @@ The core terms are:
 - **Turn**: one prompt/response/tool cycle.
 - **Checkpoint**: recorded code state after a turn.
 
-If an agent goes sideways, inspect the transcript and use lane rewind to return
-to a known-good checkpoint.
+If an agent goes sideways, use task-level undo instead of copying checkpoint
+ids:
+
+```sh
+crabdb agent undo latest
+crabdb agent undo latest --turn 2
+crabdb agent undo latest --prompt 'Add hook support'
+```

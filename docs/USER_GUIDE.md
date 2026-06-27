@@ -12,6 +12,7 @@ Start here:
 - [Record worktree changes](guides/record-worktree-changes.md)
 - [Inspect history and provenance](guides/inspect-history-and-provenance.md)
 - [Branch checkout and merge](guides/branch-checkout-and-merge.md)
+- [Harden agent workflows](guides/hardening-agent-workflows.md)
 - [Maintenance and recovery](guides/maintenance-and-recovery.md)
 
 For production scale guidance, see [Performance and Scale Benchmarks](guides/performance-and-scale-benchmarks.md).

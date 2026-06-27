@@ -15,6 +15,10 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             let args: MergeQueueRunArgs = parse_args(arguments)?;
             tool_result(db.run_merge_queue(args.limit)?)
         }
+        "crabdb.merge_queue_explain" => {
+            let args: MergeQueueExplainArgs = parse_args(arguments)?;
+            tool_result(db.explain_merge_queue(&args.selector)?)
+        }
         "crabdb.merge_queue_remove" => {
             let args: MergeQueueRemoveArgs = parse_args(arguments)?;
             tool_result(db.remove_merge_queue(&args.selector)?)

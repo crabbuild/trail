@@ -13,6 +13,8 @@ pub(crate) struct MergeLaneRequest {
     pub(crate) strategy: Option<String>,
     #[serde(default, alias = "dry-run")]
     pub(crate) dry_run: bool,
+    #[serde(default)]
+    pub(crate) direct: bool,
 }
 
 #[derive(Debug, Deserialize)]

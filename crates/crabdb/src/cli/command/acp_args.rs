@@ -14,9 +14,6 @@ pub(super) enum AcpSubcommand {
     Sessions(AcpSessionsArgs),
     /// Run a local ACP stdio relay in front of a real ACP coding agent.
     Relay(AcpRelayArgs),
-    /// Internal fake ACP agent used by diagnostics and tests.
-    #[command(hide = true)]
-    TestAgent(AcpTestAgentArgs),
 }
 
 #[derive(Args)]
@@ -80,22 +77,6 @@ pub(super) struct AcpRelayArgs {
 }
 
 #[derive(Args)]
-pub(super) struct AcpTestAgentArgs {
-    #[arg(long = "session-id", default_value = "sess_fake_doctor")]
-    pub(super) session_id: String,
-    #[arg(long = "crash-after-update")]
-    pub(super) crash_after_update: bool,
-    #[arg(long = "malformed-after-update")]
-    pub(super) malformed_after_update: bool,
-    #[arg(long = "huge-message-bytes")]
-    pub(super) huge_message_bytes: Option<usize>,
-    #[arg(long = "request-permission")]
-    pub(super) request_permission: bool,
-    #[arg(long = "sleep-before-result-ms")]
-    pub(super) sleep_before_result_ms: Option<u64>,
-}
-
-#[derive(Args)]
 pub(super) struct TranscriptArgs {
     pub(super) selector: String,
 }
@@ -131,6 +112,6 @@ pub(super) struct DemoCommand {
 
 #[derive(Args)]
 pub(super) struct DemoAcpArgs {
-    #[arg(long, default_value = "fake")]
+    #[arg(long, default_value = "claude-code")]
     pub(super) agent: String,
 }

@@ -42,3 +42,19 @@ pub enum PatchEdit {
         to: String,
     },
 }
+
+pub(crate) fn validate_external_patch_edit_sources(
+    label: &str,
+    edits_len: usize,
+    files_len: usize,
+) -> crate::Result<()> {
+    match (edits_len > 0, files_len > 0) {
+        (true, false) | (false, true) => Ok(()),
+        (false, false) => Err(crate::Error::InvalidInput(format!(
+            "{label} requires at least one edit in `edits` or `files`"
+        ))),
+        (true, true) => Err(crate::Error::InvalidInput(format!(
+            "{label} must use either `edits` or `files`, not both"
+        ))),
+    }
+}

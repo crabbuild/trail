@@ -1,6 +1,53 @@
 use super::*;
 
 impl CrabDb {
+    pub fn preview_lane_workdir_record(&self, lane: &str) -> Result<LaneRecordPreviewReport> {
+        validate_ref_segment(lane)?;
+        let branch = self.lane_branch(lane)?;
+        let Some(workdir) = branch.workdir.clone() else {
+            return Err(Error::InvalidInput(format!(
+                "lane `{lane}` does not have a materialized workdir"
+            )));
+        };
+        let workdir_path = PathBuf::from(&workdir);
+        if !workdir_path.is_dir() {
+            return Err(Error::WorkspaceNotFound(workdir_path));
+        }
+        let head = self.get_ref(&branch.ref_name)?;
+        let changed_paths =
+            self.lane_workdir_record_changed_paths(&branch, &head, &workdir_path)?;
+        let (ignored_paths, risky_paths) =
+            self.preview_lane_workdir_path_warnings(&workdir_path)?;
+        let oversized_files =
+            self.lane_record_oversized_files_on_disk(&workdir_path, &changed_paths)?;
+        let mut policy = self.preview_lane_record_policy(&branch, &changed_paths)?;
+        if policy.error.is_none() {
+            if let Err(err) = self
+                .ensure_record_final_root_paths_safe_from_summaries(&head.root_id, &changed_paths)
+            {
+                policy.allowed = false;
+                policy.error = Some(err.to_string());
+            }
+        }
+        if !oversized_files.is_empty() && policy.error.is_none() {
+            policy.allowed = false;
+            policy.error = Some(lane_record_oversized_error(&oversized_files));
+        }
+
+        Ok(LaneRecordPreviewReport {
+            lane_id: branch.lane_id,
+            workdir,
+            head_change: head.change_id,
+            root_id: head.root_id,
+            clean: changed_paths.is_empty(),
+            changed_paths,
+            ignored_paths,
+            risky_paths,
+            oversized_files,
+            policy,
+        })
+    }
+
     pub fn record_lane_workdir(
         &mut self,
         lane: &str,
@@ -28,6 +75,7 @@ impl CrabDb {
     ) -> Result<LaneRecordReport> {
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
+        ensure_lane_record_message_has_no_secrets(message.as_deref())?;
         let existing_turn = existing_turn_id
             .map(|turn_id| self.lane_turn(turn_id))
             .transpose()?;
@@ -55,7 +103,7 @@ impl CrabDb {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
         let head = self.get_ref(&branch.ref_name)?;
-        let sparse_paths = self.sparse_workdir_paths(&workdir_path)?;
+        let sparse_paths = self.lane_sparse_workdir_paths(&branch, &workdir_path)?;
         let is_sparse = sparse_paths.is_some();
         let cached_status = self.cached_workdir_manifest_status(&workdir_path, &head.root_id)?;
         if matches!(cached_status, CachedWorkdirManifestStatus::Clean) {
@@ -65,6 +113,9 @@ impl CrabDb {
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
             });
+        }
+        if let Some(session_id) = &branch.session_id {
+            self.preflight_lane_session_owner(&branch.lane_id, session_id)?;
         }
 
         let actor = Actor::lane(lane);
@@ -247,6 +298,7 @@ impl CrabDb {
             });
         }
         self.ensure_lane_record_policy(&branch, &diff.summaries)?;
+        self.ensure_lane_record_file_size_policy(&built.files, &diff.summaries)?;
         if let Some(session_id) = &branch.session_id {
             self.ensure_lane_session(&branch.lane_id, session_id, None)?;
         }
@@ -342,6 +394,154 @@ impl CrabDb {
         })
     }
 
+    fn lane_workdir_record_changed_paths(
+        &self,
+        branch: &LaneBranch,
+        head: &RefRecord,
+        workdir_path: &Path,
+    ) -> Result<Vec<FileDiffSummary>> {
+        let sparse_paths = self.lane_sparse_workdir_paths(branch, workdir_path)?;
+        match self.cached_workdir_manifest_status(workdir_path, &head.root_id)? {
+            CachedWorkdirManifestStatus::Clean => Ok(Vec::new()),
+            CachedWorkdirManifestStatus::Dirty {
+                disk_manifest,
+                candidate_paths,
+            } => {
+                if let Some(mut selected_paths) = sparse_paths {
+                    selected_paths.extend(disk_manifest.keys().cloned());
+                    selected_paths.sort();
+                    selected_paths.dedup();
+                    let previous_files =
+                        self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
+                    Ok(self.diff_file_maps_to_manifest_for_paths(
+                        &previous_files,
+                        &disk_manifest,
+                        &selected_paths,
+                    ))
+                } else if let Some(candidate_paths) = candidate_paths {
+                    let previous_files =
+                        self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
+                    Ok(self.diff_file_maps_to_manifest_for_paths(
+                        &previous_files,
+                        &disk_manifest,
+                        &candidate_paths,
+                    ))
+                } else {
+                    self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)
+                }
+            }
+            CachedWorkdirManifestStatus::Missing => {
+                let disk_files = self.scan_files_under(workdir_path)?;
+                let disk_manifest = self.disk_manifest(&disk_files);
+                if let Some(mut selected_paths) = sparse_paths {
+                    selected_paths.extend(disk_files.iter().map(|file| file.path.clone()));
+                    selected_paths.sort();
+                    selected_paths.dedup();
+                    let previous_files =
+                        self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
+                    Ok(self.diff_file_maps_to_manifest_for_paths(
+                        &previous_files,
+                        &disk_manifest,
+                        &selected_paths,
+                    ))
+                } else {
+                    self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)
+                }
+            }
+        }
+    }
+
+    fn preview_lane_workdir_path_warnings(
+        &self,
+        workdir_path: &Path,
+    ) -> Result<(Vec<LaneWorkdirIgnoredPath>, Vec<LaneWorkdirRisk>)> {
+        let root = workdir_path.canonicalize()?;
+        let matcher = lane_workdir_ignore_matcher(&root)?;
+        let mut ignored_paths = Vec::new();
+        let mut risky_paths = Vec::new();
+        let root_metadata = fs::symlink_metadata(&root)?;
+        scan_lane_workdir_preview_paths(
+            &root,
+            &root,
+            root_metadata,
+            &matcher,
+            &mut ignored_paths,
+            &mut risky_paths,
+        )?;
+        Ok((ignored_paths, risky_paths))
+    }
+
+    fn lane_record_oversized_files_on_disk(
+        &self,
+        workdir_path: &Path,
+        summaries: &[FileDiffSummary],
+    ) -> Result<Vec<LaneRecordOversizedFile>> {
+        let max_file_bytes = self.config.lane.max_patch_file_bytes;
+        if max_file_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let mut oversized = BTreeMap::new();
+        for summary in summaries {
+            let path = normalize_relative_path(&summary.path)?;
+            let abs = safe_join(workdir_path, &path)?;
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            let size_bytes = metadata.len();
+            if size_bytes > max_file_bytes {
+                oversized.insert(
+                    path.clone(),
+                    LaneRecordOversizedFile {
+                        path,
+                        size_bytes,
+                        limit_bytes: max_file_bytes,
+                    },
+                );
+            }
+        }
+        Ok(oversized.into_values().collect())
+    }
+
+    fn ensure_lane_record_file_size_policy(
+        &self,
+        files: &BTreeMap<String, FileEntry>,
+        summaries: &[FileDiffSummary],
+    ) -> Result<()> {
+        let max_file_bytes = self.config.lane.max_patch_file_bytes;
+        if max_file_bytes == 0 {
+            return Ok(());
+        }
+        let mut oversized = BTreeMap::new();
+        for summary in summaries {
+            let path = normalize_relative_path(&summary.path)?;
+            let Some(entry) = files.get(&path) else {
+                continue;
+            };
+            if entry.size_bytes > max_file_bytes {
+                oversized.insert(
+                    path.clone(),
+                    LaneRecordOversizedFile {
+                        path,
+                        size_bytes: entry.size_bytes,
+                        limit_bytes: max_file_bytes,
+                    },
+                );
+            }
+        }
+        if oversized.is_empty() {
+            return Ok(());
+        }
+        let oversized = oversized.into_values().collect::<Vec<_>>();
+        Err(Error::PatchRejected(lane_record_oversized_error(
+            &oversized,
+        )))
+    }
+
     pub fn watch_lane_workdir(
         &mut self,
         lane: &str,
@@ -376,4 +576,177 @@ impl CrabDb {
         }
         Ok(report)
     }
+}
+
+fn lane_workdir_ignore_matcher(root: &Path) -> Result<ignore::gitignore::Gitignore> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    for filename in [".crabignore", ".gitignore"] {
+        let path = root.join(filename);
+        if path.exists() {
+            if let Some(err) = builder.add(path) {
+                return Err(Error::InvalidInput(err.to_string()));
+            }
+        }
+    }
+    builder
+        .build()
+        .map_err(|err| Error::InvalidInput(err.to_string()))
+}
+
+fn scan_lane_workdir_preview_paths(
+    root: &Path,
+    dir: &Path,
+    root_metadata: fs::Metadata,
+    matcher: &ignore::gitignore::Gitignore,
+    ignored_paths: &mut Vec<LaneWorkdirIgnoredPath>,
+    risky_paths: &mut Vec<LaneWorkdirRisk>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        let rel = normalize_relative_path(&rel.to_string_lossy())?;
+
+        if rel == ".crabdb" {
+            continue;
+        }
+
+        append_lane_workdir_risks(&rel, &metadata, &root_metadata, risky_paths);
+        if let Some(source) = lane_workdir_ignore_source(&rel, &metadata, matcher) {
+            ignored_paths.push(LaneWorkdirIgnoredPath { path: rel, source });
+            if metadata.is_dir() {
+                continue;
+            }
+        }
+
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() && !is_external_mount(&metadata, &root_metadata) {
+            scan_lane_workdir_preview_paths(
+                root,
+                &path,
+                root_metadata.clone(),
+                matcher,
+                ignored_paths,
+                risky_paths,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn lane_workdir_ignore_source(
+    rel: &str,
+    metadata: &fs::Metadata,
+    matcher: &ignore::gitignore::Gitignore,
+) -> Option<String> {
+    if is_default_ignored(rel) {
+        return Some("hardcoded".to_string());
+    }
+    matcher
+        .matched_path_or_any_parents(path_from_rel(rel), metadata.is_dir())
+        .is_ignore()
+        .then(|| "workdir".to_string())
+}
+
+fn append_lane_workdir_risks(
+    rel: &str,
+    metadata: &fs::Metadata,
+    root_metadata: &fs::Metadata,
+    risky_paths: &mut Vec<LaneWorkdirRisk>,
+) {
+    if path_has_component(rel, ".git") {
+        risky_paths.push(LaneWorkdirRisk {
+            path: rel.to_string(),
+            kind: "nested_git".to_string(),
+            message:
+                "nested .git content is ignored by record and can hide unrelated repository state"
+                    .to_string(),
+        });
+    }
+    if rel != ".crabdb" && path_has_component(rel, ".crabdb") {
+        risky_paths.push(LaneWorkdirRisk {
+            path: rel.to_string(),
+            kind: "nested_crabdb".to_string(),
+            message: "nested .crabdb content is ignored by record and can hide CrabDB metadata"
+                .to_string(),
+        });
+    }
+    if metadata.file_type().is_symlink() {
+        risky_paths.push(LaneWorkdirRisk {
+            path: rel.to_string(),
+            kind: "symlink".to_string(),
+            message: "symlinks are skipped by workdir record".to_string(),
+        });
+    }
+    if metadata.is_file() && has_multiple_hardlinks(metadata) {
+        risky_paths.push(LaneWorkdirRisk {
+            path: rel.to_string(),
+            kind: "hardlink".to_string(),
+            message: "file has multiple hardlinks; recording it can hide writes made through another path".to_string(),
+        });
+    }
+    if is_external_mount(metadata, root_metadata) {
+        risky_paths.push(LaneWorkdirRisk {
+            path: rel.to_string(),
+            kind: "external_mount".to_string(),
+            message: "path is on a different filesystem device from the lane workdir root"
+                .to_string(),
+        });
+    }
+}
+
+fn path_has_component(path: &str, needle: &str) -> bool {
+    path.split('/').any(|component| component == needle)
+}
+
+#[cfg(unix)]
+fn has_multiple_hardlinks(metadata: &fs::Metadata) -> bool {
+    std::os::unix::fs::MetadataExt::nlink(metadata) > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_hardlinks(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_external_mount(metadata: &fs::Metadata, root_metadata: &fs::Metadata) -> bool {
+    std::os::unix::fs::MetadataExt::dev(metadata)
+        != std::os::unix::fs::MetadataExt::dev(root_metadata)
+}
+
+#[cfg(not(unix))]
+fn is_external_mount(_metadata: &fs::Metadata, _root_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn lane_record_oversized_error(files: &[LaneRecordOversizedFile]) -> String {
+    let limit = files
+        .first()
+        .map(|file| file.limit_bytes)
+        .unwrap_or_default();
+    let paths = files
+        .iter()
+        .map(|file| format!("{} ({} bytes)", file.path, file.size_bytes))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("lane record file(s) exceed lane.max_patch_file_bytes {limit}: {paths}")
+}
+
+fn ensure_lane_record_message_has_no_secrets(message: Option<&str>) -> Result<()> {
+    let Some(message) = message else {
+        return Ok(());
+    };
+    if contains_sensitive_text(message) {
+        return Err(Error::PatchRejected(
+            "secret scan rejected lane record message; remove credentials from the record metadata"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }

@@ -12,6 +12,23 @@ impl CrabDb {
         self.ensure_lane_mutation_paths_allowed(branch, touched_paths)
     }
 
+    pub(crate) fn ensure_patch_final_root_paths_safe(
+        &self,
+        head_root_id: &ObjectId,
+        previous_touched: &BTreeMap<String, FileEntry>,
+        target_touched: &BTreeMap<String, FileEntry>,
+    ) -> Result<()> {
+        let mut paths = self
+            .load_root_paths(head_root_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for path in previous_touched.keys() {
+            paths.remove(path);
+        }
+        paths.extend(target_touched.keys().cloned());
+        validate_no_case_fold_collisions(paths.iter())
+    }
+
     pub(crate) fn ensure_lane_record_policy(
         &self,
         branch: &LaneBranch,
@@ -19,6 +36,37 @@ impl CrabDb {
     ) -> Result<()> {
         let paths = diff_summary_policy_paths(summaries)?;
         self.ensure_lane_mutation_paths_allowed(branch, &paths)
+    }
+
+    pub(crate) fn ensure_record_final_root_paths_safe_from_summaries(
+        &self,
+        head_root_id: &ObjectId,
+        summaries: &[FileDiffSummary],
+    ) -> Result<()> {
+        let mut paths = self
+            .load_root_paths(head_root_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for summary in summaries {
+            let path = normalize_relative_path(&summary.path)?;
+            if let Some(old_path) = &summary.old_path {
+                paths.remove(&normalize_relative_path(old_path)?);
+            }
+            paths.remove(&path);
+            if summary.kind != FileChangeKind::Deleted {
+                paths.insert(path);
+            }
+        }
+        validate_no_case_fold_collisions(paths.iter())
+    }
+
+    pub(crate) fn preview_lane_record_policy(
+        &self,
+        branch: &LaneBranch,
+        summaries: &[FileDiffSummary],
+    ) -> Result<LaneRecordPolicyPreview> {
+        let paths = diff_summary_policy_paths(summaries)?;
+        self.preview_lane_mutation_paths_policy(branch, &paths)
     }
 
     pub(crate) fn ensure_patch_edit_allowed(
@@ -29,10 +77,23 @@ impl CrabDb {
         match edit {
             PatchEdit::Write { path, .. }
             | PatchEdit::WriteBytes { path, .. }
-            | PatchEdit::ReplaceLine { path, .. }
             | PatchEdit::Delete { path } => {
                 let path = normalize_relative_path(path)?;
                 self.ensure_patch_path_allowed(&path, allow_ignored)
+            }
+            PatchEdit::ReplaceLine {
+                path,
+                expected_text,
+                ..
+            } => {
+                let path = normalize_relative_path(path)?;
+                self.ensure_patch_path_allowed(&path, allow_ignored)?;
+                if expected_text.is_none() {
+                    return Err(Error::PatchRejected(format!(
+                        "replace_line for `{path}` requires expected_text; include the current line text so stale edits are rejected"
+                    )));
+                }
+                Ok(())
             }
             PatchEdit::Rename { from, to } => {
                 let from = normalize_relative_path(from)?;
@@ -165,6 +226,96 @@ impl CrabDb {
         self.ensure_claim_policy_paths_allowed(branch, &paths)
     }
 
+    fn preview_lane_mutation_paths_policy(
+        &self,
+        branch: &LaneBranch,
+        paths: &[String],
+    ) -> Result<LaneRecordPolicyPreview> {
+        let paths = normalize_policy_paths(paths)?;
+        let mut preview = LaneRecordPolicyPreview {
+            allowed: true,
+            warnings: Vec::new(),
+            error: None,
+        };
+        if paths.is_empty() {
+            return Ok(preview);
+        }
+        validate_no_case_fold_collisions(paths.iter())?;
+
+        let max_changed_paths = self.config.lane.max_changed_paths;
+        if max_changed_paths > 0 && paths.len() as u64 > max_changed_paths {
+            preview.allowed = false;
+            preview.error = Some(format!(
+                "lane mutation touches {} path(s), exceeding lane.max_changed_paths {max_changed_paths}",
+                paths.len()
+            ));
+            return Ok(preview);
+        }
+
+        if self.config.lane.enforce_sparse_paths {
+            if let Some(workdir) = &branch.workdir {
+                if let Some(allowlist) =
+                    self.lane_sparse_workdir_paths(branch, Path::new(workdir))?
+                {
+                    let blocked = paths
+                        .iter()
+                        .filter(|path| {
+                            !allowlist
+                                .iter()
+                                .any(|selected| path_matches_selection(path, selected))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !blocked.is_empty() {
+                        preview.allowed = false;
+                        preview.error = Some(format!(
+                            "lane sparse path boundary blocks path(s): {}; allowed path(s): {}",
+                            blocked.join(", "),
+                            allowlist.join(", ")
+                        ));
+                        return Ok(preview);
+                    }
+                }
+            }
+        }
+
+        let enforcement = self.config.lane.claim_enforcement.as_str();
+        if enforcement == "off" {
+            return Ok(preview);
+        }
+        let claims = self.active_write_claim_paths(&branch.lane_id)?;
+        let unclaimed = paths
+            .iter()
+            .filter(|path| !path_is_covered_by_claims(path, &claims))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unclaimed.is_empty() {
+            return Ok(preview);
+        }
+        let lane = branch
+            .ref_name
+            .strip_prefix(LANE_REF_PREFIX)
+            .unwrap_or(&branch.lane_id);
+        let message = format!(
+            "lane `{lane}` mutation touches path(s) outside active write claims/leases: {}",
+            unclaimed.join(", ")
+        );
+        match enforcement {
+            "warn" => preview.warnings.push(message),
+            "reject" => {
+                preview.allowed = false;
+                preview.error = Some(message);
+            }
+            other => {
+                preview.allowed = false;
+                preview.error = Some(format!(
+                    "lane.claim_enforcement must be off, warn, or reject, got `{other}`"
+                ));
+            }
+        }
+        Ok(preview)
+    }
+
     fn ensure_changed_path_limit(&self, path_count: usize) -> Result<()> {
         let max_changed_paths = self.config.lane.max_changed_paths;
         if max_changed_paths > 0 && path_count as u64 > max_changed_paths {
@@ -186,7 +337,7 @@ impl CrabDb {
         let Some(workdir) = &branch.workdir else {
             return Ok(());
         };
-        let Some(allowlist) = self.sparse_workdir_paths(Path::new(workdir))? else {
+        let Some(allowlist) = self.lane_sparse_workdir_paths(branch, Path::new(workdir))? else {
             return Ok(());
         };
         let blocked = paths
@@ -231,7 +382,7 @@ impl CrabDb {
             .strip_prefix(LANE_REF_PREFIX)
             .unwrap_or(&branch.lane_id);
         let message = format!(
-            "lane `{lane}` mutation touches path(s) outside active write claims: {}",
+            "lane `{lane}` mutation touches path(s) outside active write claims/leases: {}",
             unclaimed.join(", ")
         );
         match enforcement {

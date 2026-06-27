@@ -1,14 +1,32 @@
 # HTTP API Reference
 
 The daemon serves JSON HTTP routes under `/v1`.
-Accepted HTTP connections use 30-second read/write timeouts. Requests larger
-than 16 MiB are rejected before routing. Requests with an `Origin` header are
-accepted only for loopback origins such as `localhost`, `127.0.0.1`, and `::1`.
+Accepted HTTP connections use 30-second read/write timeouts; slow requests
+receive `408 Request Timeout` without stopping the listener. Total
+requests larger than 16 MiB, including headers and body, are rejected before
+routing.
+CrabDB accepts origin-form `HTTP/1.0` or `HTTP/1.1` request lines and
+fixed-length requests only: malformed request lines, malformed or unterminated
+header lines, bare CR/LF request-head line endings, header names with
+surrounding whitespace, missing header terminators, duplicate or non-decimal
+`Content-Length`, bodies without `Content-Length`, body length mismatches, and
+`Transfer-Encoding` requests are rejected before routing.
+Origin-form request targets must start with `/` and cannot contain fragments,
+control characters, or backslash separators.
+Requests with an `Origin` header are accepted only for well-formed loopback
+origins such as `localhost`, `127.0.0.1`, and `::1`; invalid ports and opaque
+origins such as `null` are rejected.
+Routed requests must also include a `Host` header with a loopback host such as
+`localhost`, `127.0.0.1`, or `[::1]`; missing, malformed, non-loopback, and
+invalid-port hosts are rejected before route handling.
 Daemon listener connections are rate-limited per peer. The default limit is
 600 requests per 60 seconds; excess requests receive `429 Too Many Requests`.
 
 Mutation request bodies are strict JSON objects. Unknown fields are rejected
-with `400 Bad Request`; they are not silently ignored.
+with `400 Bad Request`; they are not silently ignored. Top-level request
+schemas in `/v1/openapi.json` set `additionalProperties: false` to match that
+runtime behavior; patch edit/file variants are also emitted as strict nested
+schemas.
 
 For retry-safe mutation requests, send:
 
@@ -18,11 +36,18 @@ Idempotency-Key: <stable unique key>
 
 CrabDB replays the first stored response when the same key is reused with the
 same method, path, and body. Reusing the key for different request content
-returns `400 Bad Request`. Unauthorized and forbidden responses are not cached.
+returns `400 Bad Request`. Keys must be 1-200 non-control characters.
+Unauthorized and forbidden responses are not cached.
+Replayed mutation responses still produce audit rows, marked with
+`idempotency_replay: true` in the audit summary.
 
-Accepted non-GET mutation attempts are recorded in the local
-`external_mutation_audit` table with method/path, status, inferred lane/ref,
-and a small redacted result summary. Raw request bodies are not stored.
+Non-GET mutation attempts, including unauthorized and forbidden attempts, are
+recorded in the local `external_mutation_audit` table with actor label,
+method/path, status, inferred lane/ref when available, and a small redacted
+result summary. Turn-scoped mutation failures can still be attributed through
+the turn id in the request path. Actor labels identify the HTTP auth path, such
+as `http:bearer`, `http:x-crabdb-token`, or `http:no-auth`; raw request bodies
+and tokens are not stored.
 
 ## Auth
 
@@ -71,6 +96,7 @@ x-crabdb-token: <token>
 | GET | `/v1/lanes/{lane_or_id}/contribution` | Review bundle. |
 | GET | `/v1/lanes/{lane_or_id}/gates` | Gate history. |
 | GET | `/v1/lanes/{lane_or_id}/readiness` | Merge readiness. |
+| GET | `/v1/lanes/{lane_or_id}/refresh-preview?target=main` | Preview refreshing lane onto target branch. |
 | GET | `/v1/lanes/{lane_or_id}/handoff` | Handoff packet. |
 | GET | `/v1/lanes/{lane_or_id}/workdir` | Workdir path. |
 | GET | `/v1/lanes/{lane_or_id}/diff` | Lane branch diff. |
@@ -82,9 +108,26 @@ x-crabdb-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
 | POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
 
+Patch requests accept either native `edits` or compatibility `files`; provide
+one non-empty array, not both.
+
+`GET /v1/lanes/{lane_or_id}/status` includes `base_status` when CrabDB can
+resolve the workspace default branch. It reports the target branch/ref, target
+change, lane base change, `operations_behind`, and whether the lane base is
+stale.
+
 `POST /v1/lanes/{lane_or_id}/sync-workdir` returns `rescue_workdir` when
-`force=true` overwrites dirty materialized workdir files. The rescue directory
-contains copied dirty regular files plus `manifest.json`.
+`force=true` overwrites dirty materialized workdir files or replaces a
+non-directory file at the lane workdir path. The rescue directory contains
+copied recoverable regular files plus `manifest.json`.
+
+`POST /v1/lanes/{lane_or_id}/record` accepts `{"preview": true}` to return a
+non-committing record preview with changed paths, ignored paths, risky workdir
+entries, oversized changed files, and policy allow/block details.
+
+`GET /v1/lanes/{lane_or_id}/refresh-preview?target=<branch>` returns a
+non-committing refresh/rebase preview with operations-behind, conflicts, changed
+paths, and next steps.
 
 ## Collaboration Routes
 
@@ -105,11 +148,31 @@ contains copied dirty regular files plus `manifest.json`.
 | GET/DELETE | `/v1/anchors/{anchor_id}` | Resolve or delete anchor. |
 | GET/POST | `/v1/merge-queue` | List or queue merge. |
 | POST | `/v1/merge-queue/run` | Run queue. |
+| GET | `/v1/merge-queue/explain?selector=<selector>` | Explain why a queue item is ready or blocked. |
+| GET | `/v1/merge-queue/{selector}/explain` | Explain a queue item by path-safe selector. |
 | DELETE | `/v1/merge-queue/{selector}` | Remove queue item. |
 | GET | `/v1/conflicts` | List conflicts. |
 | GET | `/v1/conflicts/{conflict_set_id}?limit=50` | Show conflict with explanation evidence. |
 | POST | `/v1/conflicts/{conflict_set_id}/resolve` | Resolve conflict. |
-| POST | `/v1/branches/{branch}/merge-lane` | Merge lane branch. |
+| POST | `/v1/branches/{branch}/merge-lane` | Dry-run or explicitly direct-merge lane branch. |
+
+Conflict explanations include the stored `base_root`, `target_root`, and
+`source_root` snapshots used to reproduce the conflict, plus per-path
+`conflict_class` values such as `modify/modify`, `delete/modify`,
+`rename/modify`, `binary`, `mode`, and `same_insertion_gap`.
+They also include `known_resolutions` for paths whose path/content conflict
+signature matches a previously resolved conflict.
+`POST /v1/conflicts/{conflict_set_id}/resolve` requires exactly one of `take`
+or `manual`. Manual file values can be plain strings or objects with only
+`content`, `delete`, and `executable`; unknown keys are rejected.
+
+`POST /v1/branches/{branch}/merge-lane` allows `dry_run=true` preflight. A
+non-dry-run merge into the workspace default branch requires `direct=true`;
+otherwise enqueue with `POST /v1/merge-queue` and run the queue.
+
+Bodyless mutation routes reject non-empty request bodies. This applies to
+path-only deletes such as lane removal, lease release, anchor deletion, and
+merge-queue removal.
 
 ## Turn and Trace Routes
 

@@ -2,8 +2,9 @@ use super::*;
 
 impl CrabDb {
     pub(crate) fn store_operation(&self, operation: &Operation) -> Result<ObjectId> {
-        let operation_id = self.put_object(OPERATION_KIND, OP_OBJECT_VERSION, operation)?;
-        self.index_operation(operation, &operation_id)?;
+        let operation = redact_operation_for_storage(operation);
+        let operation_id = self.put_object(OPERATION_KIND, OP_OBJECT_VERSION, &operation)?;
+        self.index_operation(&operation, &operation_id)?;
         Ok(operation_id)
     }
 
@@ -110,5 +111,54 @@ impl CrabDb {
         }
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &operation.after_root)?;
         Ok(root.file_count)
+    }
+}
+
+fn redact_operation_for_storage(operation: &Operation) -> Operation {
+    let mut operation = operation.clone();
+    operation.message = operation
+        .message
+        .map(|message| redact_sensitive_text(&message));
+    operation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InitImportMode;
+
+    #[test]
+    fn store_operation_redacts_message_before_object_and_index_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = CrabDb::open(temp.path()).unwrap();
+        let operation = Operation {
+            version: OP_OBJECT_VERSION,
+            change_id: ChangeId("ch_secret_message".to_string()),
+            kind: OperationKind::ManualCheckpoint,
+            parents: Vec::new(),
+            before_root: None,
+            after_root: ObjectId("root_placeholder".to_string()),
+            branch: "refs/heads/main".to_string(),
+            actor: Actor::human(),
+            session_id: None,
+            message: Some("OPENAI_API_KEY=sk-live-secret".to_string()),
+            changes: Vec::new(),
+            created_at: now_ts(),
+        };
+
+        let operation_id = db.store_operation(&operation).unwrap();
+
+        let stored: Operation = db.get_object(OPERATION_KIND, &operation_id).unwrap();
+        assert_eq!(stored.message.as_deref(), Some("OPENAI_API_KEY=[REDACTED]"));
+        let indexed_message: String = db
+            .conn
+            .query_row(
+                "SELECT message FROM operations WHERE change_id = ?1",
+                params!["ch_secret_message"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_message, "OPENAI_API_KEY=[REDACTED]");
     }
 }

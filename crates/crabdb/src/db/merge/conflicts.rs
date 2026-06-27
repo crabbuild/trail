@@ -69,14 +69,22 @@ impl CrabDb {
             )));
         }
         let pending = self.pending_conflict_merge(conflict_set_id)?;
-        let source_ref = self.get_ref(&pending.source_ref)?;
         let target_ref = self.get_ref(&pending.target_ref)?;
-        if source_ref.change_id != pending.right_change {
-            return Err(Error::StaleBranch(pending.source_ref));
-        }
         if target_ref.change_id != pending.left_change {
             return Err(Error::StaleBranch(pending.target_ref));
         }
+        let (kind, session_id, source_lane_id, source_at_conflict_head) =
+            if let Some(lane) = pending.source_ref.strip_prefix(LANE_REF_PREFIX) {
+                let branch = self.lane_branch(lane)?;
+                (
+                    OperationKind::LaneMerge,
+                    branch.session_id,
+                    Some(branch.lane_id),
+                    branch.head_change == pending.right_change,
+                )
+            } else {
+                (OperationKind::Merge, None, None, true)
+            };
 
         let conflict_paths = conflict_paths_from_details(&summary.details)?;
         let base_root = self.pending_base_root(&pending)?;
@@ -131,19 +139,12 @@ impl CrabDb {
         };
         let built = self.build_root_from_file_entries(merged_files, &change_id)?;
         let diff = self.diff_file_maps(&target_files, &built.files)?;
-        let (kind, session_id) =
-            if let Some(lane) = pending.source_ref.strip_prefix(LANE_REF_PREFIX) {
-                let branch = self.lane_branch(lane)?;
-                (OperationKind::LaneMerge, branch.session_id)
-            } else {
-                (OperationKind::Merge, None)
-            };
         let operation = Operation {
             version: OP_OBJECT_VERSION,
             change_id: change_id.clone(),
             kind,
-            parents: vec![target_ref.change_id.clone(), source_ref.change_id.clone()],
-            before_root: Some(target_ref.root_id.clone()),
+            parents: vec![pending.left_change.clone(), pending.right_change.clone()],
+            before_root: Some(target_root.clone()),
             after_root: built.root_id.clone(),
             branch: pending.target_ref.clone(),
             actor,
@@ -170,10 +171,25 @@ impl CrabDb {
                 params![now_ts(), queue_id],
             )?;
         }
-        if let Some(lane) = pending.source_ref.strip_prefix(LANE_REF_PREFIX) {
+        if let Some(lane_id) = source_lane_id {
+            let status = if source_at_conflict_head {
+                "merged"
+            } else {
+                "active"
+            };
             self.conn.execute(
-                "UPDATE lane_branches SET status = 'merged', updated_at = ?1 WHERE lane_id = ?2",
-                params![now_ts(), self.lane_branch(lane)?.lane_id],
+                "UPDATE lane_branches SET status = ?1, updated_at = ?2 WHERE lane_id = ?3",
+                params![status, now_ts(), lane_id],
+            )?;
+        }
+        if let Some(explanation) = &summary.explanation {
+            self.record_known_conflict_resolutions(
+                explanation,
+                conflict_set_id,
+                &pending.source_ref,
+                &pending.target_ref,
+                &resolution_label,
+                &change_id,
             )?;
         }
         Ok(ConflictResolveReport {
@@ -206,6 +222,30 @@ impl CrabDb {
         let base_files = self.load_root_files_for_paths(&base_root, &paths)?;
         let target_files = self.load_root_files_for_paths(&target_root, &paths)?;
         let source_files = self.load_root_files_for_paths(&source_root, &paths)?;
+        let needs_rename_lookup = paths.iter().any(|path| {
+            matches!(
+                (
+                    base_files.get(path),
+                    target_files.get(path),
+                    source_files.get(path)
+                ),
+                (Some(_), None, Some(_)) | (Some(_), Some(_), None)
+            )
+        });
+        let target_lookup_files;
+        let source_lookup_files;
+        let target_lookup = if needs_rename_lookup {
+            target_lookup_files = self.load_root_files(&target_root)?;
+            &target_lookup_files
+        } else {
+            &target_files
+        };
+        let source_lookup = if needs_rename_lookup {
+            source_lookup_files = self.load_root_files(&source_root)?;
+            &source_lookup_files
+        } else {
+            &source_files
+        };
         let mut explanations = Vec::new();
         let mut recommendations = Vec::new();
         for path in paths.into_iter().take(limit) {
@@ -215,8 +255,8 @@ impl CrabDb {
                 target_files.get(&path),
                 source_files.get(&path),
                 &base_files,
-                &target_files,
-                &source_files,
+                target_lookup,
+                source_lookup,
                 &pending,
                 limit,
             )?;
@@ -290,6 +330,14 @@ impl CrabDb {
             &lines,
             same_insertion_gap,
         );
+        let signature = conflict_path_signature(
+            path,
+            &conflict_class,
+            base_entry,
+            target_entry,
+            source_entry,
+        );
+        let known_resolutions = self.known_conflict_resolutions(&signature)?;
         let reason = if !lines.is_empty() {
             "both sides changed the same logical line differently".to_string()
         } else if !matches!(
@@ -341,7 +389,80 @@ impl CrabDb {
             source,
             lines,
             recommendation,
+            known_resolutions,
+            signature,
         })
+    }
+
+    fn known_conflict_resolutions(&self, signature: &str) -> Result<Vec<ConflictKnownResolution>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT resolution, conflict_set_id, operation, created_at \
+             FROM conflict_resolution_suggestions \
+             WHERE signature = ?1 \
+             ORDER BY created_at DESC, suggestion_id DESC \
+             LIMIT 5",
+        )?;
+        let rows = stmt.query_map(params![signature], |row| {
+            let resolution: String = row.get(0)?;
+            let conflict_set_id: String = row.get(1)?;
+            Ok(ConflictKnownResolution {
+                confidence: "known".to_string(),
+                reason: format!(
+                    "A previous conflict with the same path/content signature was resolved with `{resolution}`."
+                ),
+                resolution,
+                conflict_set_id,
+                operation: ChangeId(row.get(2)?),
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    fn record_known_conflict_resolutions(
+        &self,
+        explanation: &ConflictExplanation,
+        conflict_set_id: &str,
+        source_ref: &str,
+        target_ref: &str,
+        resolution: &str,
+        operation: &ChangeId,
+    ) -> Result<()> {
+        let created_at = now_ts();
+        for path in &explanation.paths {
+            if path.signature.is_empty() {
+                continue;
+            }
+            let suggestion_id = format!(
+                "known_conflict_{}",
+                &sha256_hex(
+                    format!(
+                        "{}:{}:{}:{}",
+                        path.signature, conflict_set_id, resolution, operation.0
+                    )
+                    .as_bytes()
+                )[..16]
+            );
+            self.conn.execute(
+                "INSERT OR REPLACE INTO conflict_resolution_suggestions \
+                 (suggestion_id, signature, path, conflict_class, resolution, conflict_set_id, operation, source_ref, target_ref, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    suggestion_id,
+                    path.signature,
+                    path.path,
+                    path.conflict_class,
+                    resolution,
+                    conflict_set_id,
+                    operation.0,
+                    source_ref,
+                    target_ref,
+                    created_at
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     fn pending_base_root(&self, pending: &PendingConflictMerge) -> Result<ObjectId> {
@@ -607,4 +728,30 @@ fn file_id_at_different_path(
     files
         .iter()
         .any(|(candidate_path, entry)| candidate_path != path && &entry.file_id == file_id)
+}
+
+fn conflict_path_signature(
+    path: &str,
+    conflict_class: &str,
+    base_entry: Option<&FileEntry>,
+    target_entry: Option<&FileEntry>,
+    source_entry: Option<&FileEntry>,
+) -> String {
+    let payload = format!(
+        "v1\0{path}\0{conflict_class}\0{}\0{}\0{}",
+        conflict_entry_signature(base_entry),
+        conflict_entry_signature(target_entry),
+        conflict_entry_signature(source_entry)
+    );
+    sha256_hex(payload.as_bytes())
+}
+
+fn conflict_entry_signature(entry: Option<&FileEntry>) -> String {
+    match entry {
+        Some(entry) => format!(
+            "{}:{}:{}:{:?}",
+            entry.content_hash, entry.executable, entry.mode, entry.kind
+        ),
+        None => "deleted".to_string(),
+    }
 }

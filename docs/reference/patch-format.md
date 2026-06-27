@@ -64,7 +64,7 @@ Fields:
 }
 ```
 
-`expected_text` defaults to absent. When present, it protects against replacing a line whose current text no longer matches.
+`expected_text` is required for `replace_line`. It protects against replacing a line whose current text no longer matches.
 
 ## Edit: `delete`
 
@@ -87,7 +87,7 @@ Fields:
 
 ## HTTP `files` Compatibility Shape
 
-The HTTP parser also accepts:
+The HTTP and MCP parsers also accept:
 
 ```json
 {
@@ -114,11 +114,20 @@ The HTTP parser also accepts:
 }
 ```
 
-`files` entries are converted into the public edit forms.
+`files` entries are converted into the public edit forms. External HTTP/MCP
+patch requests must provide either a non-empty `edits` array or a non-empty
+`files` array, not both.
+The generated OpenAPI schema enumerates the supported `edits`, `files`, and
+nested text-edit variants with `additionalProperties: false`; unknown fields are
+rejected instead of ignored.
 
 ## Policy
 
-Patch paths are normalized and checked. Internal paths and hardcoded private paths are rejected. Workspace-ignored paths require `allow_ignored`.
+Patch paths are normalized and checked. Parent-directory escapes, absolute
+paths, backslash separators on non-Windows platforms, non-NFC Unicode spellings,
+slash lookalikes, invisible Unicode format controls, Windows-reserved device
+names and aliases, internal paths, and hardcoded private paths are rejected.
+Workspace-ignored paths require `allow_ignored`.
 
 Direct lane patches are rejected unless `base_change` matches the current lane head. If a tool intentionally wants to apply against whatever the current head is, it must set `allow_stale: true` or use `--allow-stale`.
 

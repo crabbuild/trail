@@ -131,6 +131,8 @@ pub(crate) struct SyncWorkdirRequest {
 pub(crate) struct LaneRecordRequest {
     #[serde(default)]
     pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) preview: bool,
 }
 
 #[derive(Debug, Deserialize)]

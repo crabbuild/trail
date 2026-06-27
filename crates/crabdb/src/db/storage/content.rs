@@ -133,6 +133,20 @@ impl CrabDb {
         Ok(out)
     }
 
+    pub(crate) fn load_root_paths(&self, root_id: &ObjectId) -> Result<Vec<String>> {
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let iter = self.root_prolly.range(&tree, &[], None)?;
+        let mut paths = Vec::new();
+        for item in iter {
+            let (key, _) = item?;
+            let path = String::from_utf8(key)
+                .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
     pub(crate) fn for_each_root_file_chunk<F>(
         &self,
         root_id: &ObjectId,

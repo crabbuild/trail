@@ -30,17 +30,28 @@ pub(crate) struct LaneClaimArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneHandleArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneContributionArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaneRefreshPreviewArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default)]
+    pub(crate) target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +89,7 @@ pub(crate) struct LeaseAcquireArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LeaseListArgs {
     #[serde(default)]
     pub(crate) all: bool,
@@ -90,6 +102,7 @@ pub(crate) struct LeaseReleaseArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DiffLaneArgs {
     pub(crate) lane: String,
     #[serde(default)]
@@ -99,6 +112,7 @@ pub(crate) struct DiffLaneArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GateHistoryArgs {
     pub(crate) lane: String,
     #[serde(default)]

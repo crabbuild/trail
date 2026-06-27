@@ -98,6 +98,9 @@ impl CrabDb {
                     self.materialize_files_at(output_root, &BTreeMap::new(), &target_files)?;
                 }
             } else {
+                if force {
+                    self.remove_visible_files_absent_from_target(&target_files)?;
+                }
                 self.materialize_files(&current_files, &target_files)?;
             }
         }
@@ -114,5 +117,27 @@ impl CrabDb {
             output_root: output_root.map(|path| path.to_string_lossy().to_string()),
             changed_paths: diff.summaries,
         })
+    }
+
+    fn remove_visible_files_absent_from_target(
+        &self,
+        target_files: &BTreeMap<String, FileEntry>,
+    ) -> Result<()> {
+        for path in self.scan_worktree_file_paths()?.paths {
+            if target_files.contains_key(&path) {
+                continue;
+            }
+            let abs = safe_join(&self.workspace_root, &path)?;
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            fs::remove_file(abs)?;
+        }
+        Ok(())
     }
 }

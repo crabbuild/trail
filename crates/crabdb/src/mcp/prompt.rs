@@ -26,7 +26,7 @@ Workflow:\n\
 6. Request human approval with `crabdb.approval_request` when `crabdb.guardrail_check` returns `approval_required`; keep the returned run checkpoint and resume it with `crabdb.run_resume` after approval.\n\
 7. Run `crabdb.run_test` and, when model/policy quality matters, `crabdb.run_eval`.\n\
 8. End the turn with `crabdb.end_turn`, inspect `crabdb.lane_status`, `crabdb.lane_handoff`, and `crabdb.diff_lane`, then queue or merge only after review.\n\
-9. Treat `crabdb.lane_claim` leases as advisory coordination, not hard locks; rely on readiness, conflict sets, and merge review before accepting work.\n\
+9. Treat `crabdb.lane_claim` leases as advisory coordination unless `lane.claim_enforcement` is set to `warn` or `reject`; rely on readiness, conflict sets, and merge review before accepting work.\n\
 10. If the lane goes sideways, use `crabdb.lane_rewind` with `record_current = true` before returning to a known-good change or root.\n\
 11. If merge conflicts appear, use `crabdb.conflict_show` and `crabdb.conflict_resolve`; do not overwrite target changes silently."
                 ),
@@ -73,6 +73,76 @@ Workflow:\n\
                 None,
             )
         }
+        PROMPT_REVIEW_AGENT => {
+            let selector = prompt_arg_optional(&args.arguments, "selector")?
+                .unwrap_or_else(|| "latest".to_string());
+            prompt_result(
+                "CrabDB agent task review workflow",
+                format!(
+                    "Review CrabDB agent task `{selector}` using the high-level agent tools.\n\n\
+Workflow:\n\
+1. If the user asks a plain-language question such as what needs attention, what changed, what should I do next, what did the agent do, where is the workdir, where did the agent edit, which prompt changed a file, last prompt, what changed in the last prompt, what changed in README.md in the last prompt, show transcript, what should I review, what should I review first, open review, review this task, what tools were used, what tests should I run, can I merge, is it safe to land, recover, explain a file, or show a patch/diff, call `crabdb.agent_ask` for `{selector}` and present the routed report.\n\
+2. Start with `crabdb.agent_summary` for `{selector}` when you need the full review cockpit: readiness, risk, validation, receipt Markdown, PR draft, and the one recommended next action.\n\
+3. Call `crabdb.agent_next` for `{selector}` only when you need a smaller next-action payload.\n\
+4. Call `crabdb.agent_receipt` for `{selector}` when the user asks for a copyable after-action note; call `crabdb.agent_report` only when a deeper review bundle is needed.\n\
+5. Call `crabdb.agent_focus` for `{selector}` when the user asks what to inspect first; it bundles review priority, why, and a focused diff summary.\n\
+6. Call `crabdb.agent_new` for `{selector}` when the user asks what changed since they last reviewed the task; call `crabdb.agent_mark_reviewed` only when the user explicitly says the current checkpoint has been reviewed.\n\
+7. Call `crabdb.agent_delta` for `{selector}` when the user asks what just changed in the latest prompt or wants the newest turn/operation patch.\n\
+8. Call `crabdb.agent_changes` for `{selector}` when the user asks what changed across the whole task; present its `next` command and high-level change cards before exposing raw turns or operation ids.\n\
+9. Call `crabdb.agent_change` for `{selector}` when the user wants one change card expanded into files, provenance, tools, commands, and optional focused patches.\n\
+10. Call `crabdb.agent_timeline` for `{selector}` when the user asks what happened when, which prompt caused a checkpoint, or how turns and operations connect.\n\
+11. Call `crabdb.agent_files` for `{selector}` when the user wants the full file-by-file review. Call `crabdb.agent_file` when the user points at one open file or asks why one path changed.\n\
+12. Call `crabdb.agent_turn` when the user asks what happened in one prompt; use `file` and `patch` only when patch detail is needed.\n\
+13. Call `crabdb.agent_diff` with `last_turn`, a turn selector, or an operation selector only when raw patch detail is needed; include `file` when reviewing one specific path.\n\
+14. Call `crabdb.agent_ready` or `crabdb.agent_risk` and explain blockers or warnings before suggesting apply.\n\
+15. If tests or evals are missing, call `crabdb.agent_validate` first and present its suggested command; only call `crabdb.agent_test` or `crabdb.agent_eval` after the user explicitly asks to run validation.\n\
+16. Call `crabdb.agent_pr` when the user asks for a pull request title/body; it is read-only and does not create a remote PR.\n\
+17. Call `crabdb.agent_diagnose` before suggesting undo or rewind when the task appears stuck, blocked, or sideways.\n\
+18. Do not call `crabdb.agent_apply`, `crabdb.agent_rewind`, or `crabdb.agent_undo` unless the user explicitly asks for apply or recovery.\n\
+19. End with one concrete next command from the receipt, report, diagnosis, new-changes, delta, timeline, change-set, file, or next-action output."
+                ),
+                Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),
+            )
+        }
+        PROMPT_RECOVER_AGENT => {
+            let selector = prompt_arg_optional(&args.arguments, "selector")?
+                .unwrap_or_else(|| "latest".to_string());
+            prompt_result(
+                "CrabDB agent task recovery workflow",
+                format!(
+                    "Recover CrabDB agent task `{selector}` safely.\n\n\
+Workflow:\n\
+1. Call `crabdb.agent_diagnose` for `{selector}` first so the user can see likely issue, evidence, friendly recovery targets, and safe next commands.\n\
+2. Call `crabdb.agent_report` only when the user needs deeper status, changed files, turns, risk, and transcript context.\n\
+3. Call `crabdb.agent_checkpoints` for `{selector}` when the user wants the full target list; present friendly targets such as `before-last-turn`, `before-turn:N`, and `turn:N` with the exact checkpoint ids.\n\
+4. If the user wants to undo a prompt, prefer `crabdb.agent_undo` with `last_turn`, `turn`, or `prompt` because it uses user-facing task language.\n\
+5. If the user wants a specific checkpoint, use `crabdb.agent_rewind` with the friendly target from `crabdb.agent_checkpoints`.\n\
+6. Before calling undo or rewind, clearly state that it is destructive because it moves task state and may refresh the materialized workdir.\n\
+7. After recovery, call `crabdb.agent_diagnose`, `crabdb.agent_summary`, or `crabdb.agent_files` again to verify the task state and show the new next action.\n\
+8. Never guess a checkpoint id when a friendly target is available; ask for confirmation if multiple targets could match."
+                ),
+                Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),
+            )
+        }
+        PROMPT_APPLY_AGENT => {
+            let selector = prompt_arg_optional(&args.arguments, "selector")?
+                .unwrap_or_else(|| "latest".to_string());
+            prompt_result(
+                "CrabDB agent task apply workflow",
+                format!(
+                    "Apply CrabDB agent task `{selector}` safely.\n\n\
+Workflow:\n\
+1. Call `crabdb.agent_summary` and `crabdb.agent_ready` for `{selector}` before applying.\n\
+2. If `crabdb.agent_ready` returns `ready = false`, stop and explain the exact blocker, Git preflight error, or recommended test/eval command.\n\
+3. Use `crabdb.agent_files` and `crabdb.agent_diff` for patch review when the changed files or risk reasons need detail; pass `file` to keep the patch focused on one path.\n\
+4. When the user asks to apply, call `crabdb.agent_apply` in dry-run mode first and summarize the plan, Git branch, changed files, generated commit message, and any safety failure.\n\
+5. Only call non-dry-run `crabdb.agent_apply` after the dry run is clean and the user confirms they want the Git fast-forward/apply action.\n\
+6. If apply fails or reports conflicts, stop. Do not retry with force. Show `crabdb.agent_report`, `crabdb.agent_files`, or conflict/readiness details as the next step.\n\
+7. After successful apply, show the created Git commit/checkpoint and offer `crabdb.agent_pr` for a read-only PR title/body draft or the `markdown` field from `crabdb.agent_receipt` for archival review."
+                ),
+                Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),
+            )
+        }
         other => Err(Error::InvalidInput(format!(
             "MCP prompt `{other}` not found"
         ))),
@@ -102,6 +172,9 @@ fn prompt_arg(arguments: &Value, name: &str) -> Result<String> {
 }
 
 fn prompt_arg_optional(arguments: &Value, name: &str) -> Result<Option<String>> {
+    if arguments.is_null() {
+        return Ok(None);
+    }
     let object = arguments.as_object().ok_or_else(|| {
         Error::InvalidInput("prompts/get `arguments` must be an object".to_string())
     })?;

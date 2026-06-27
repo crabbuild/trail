@@ -5,6 +5,56 @@ impl CrabDb {
         self.merge_lane_with_options(lane, into, false)
     }
 
+    pub fn preview_lane_refresh(
+        &self,
+        lane: &str,
+        target_branch: &str,
+    ) -> Result<LaneRefreshPreviewReport> {
+        validate_ref_segment(lane)?;
+        let lane_branch = self.lane_branch(lane)?;
+        let lane_head = self.get_ref(&lane_branch.ref_name)?;
+        self.ensure_lane_workdir_clean(&lane_branch, &lane_head)?;
+        let target_ref_name = branch_ref(target_branch);
+        let target_ref = self.get_ref(&target_ref_name)?;
+        let base_ref = self.ref_from_change(&lane_branch.base_change)?;
+        let operations_behind =
+            self.first_parent_distance(&target_ref.change_id, &lane_branch.base_change)?;
+
+        let actor = Actor::system();
+        let change_id = self.allocate_change_id(&actor.id, "lane_refresh_preview")?;
+        let merged = self.merge_root_maps_for_changed_paths(
+            &base_ref.root_id,
+            &lane_head.root_id,
+            &target_ref.root_id,
+            &change_id,
+        )?;
+        let conflicted = !merged.conflicts.is_empty();
+        let changed_paths = if conflicted || merged.merged_files == merged.target_files {
+            Vec::new()
+        } else {
+            self.diff_file_maps(&merged.target_files, &merged.merged_files)?
+                .summaries
+        };
+        let clean = !conflicted && changed_paths.is_empty();
+        let next_steps = lane_refresh_preview_next_steps(lane, target_branch, clean, conflicted);
+        Ok(LaneRefreshPreviewReport {
+            lane_id: lane_branch.lane_id,
+            ref_name: lane_branch.ref_name,
+            base_change: lane_branch.base_change,
+            lane_head_change: lane_head.change_id,
+            lane_head_root: lane_head.root_id,
+            target_ref: target_ref_name,
+            target_change: target_ref.change_id,
+            target_root: target_ref.root_id,
+            operations_behind,
+            clean,
+            conflicted,
+            changed_paths,
+            conflicts: merged.conflicts,
+            next_steps,
+        })
+    }
+
     pub fn merge_lane_with_options(
         &mut self,
         lane: &str,
@@ -12,6 +62,18 @@ impl CrabDb {
         dry_run: bool,
     ) -> Result<MergeReport> {
         let _lock = self.acquire_write_lock()?;
+        self.merge_lane_unlocked(lane, into, dry_run, true)
+    }
+
+    pub fn merge_lane_user_with_options(
+        &mut self,
+        lane: &str,
+        into: &str,
+        dry_run: bool,
+        direct: bool,
+    ) -> Result<MergeReport> {
+        let _lock = self.acquire_write_lock()?;
+        self.ensure_direct_lane_merge_allowed(lane, into, dry_run, direct)?;
         self.merge_lane_unlocked(lane, into, dry_run, true)
     }
 
@@ -244,7 +306,9 @@ impl CrabDb {
             disk_files = self.scan_files_under(&workdir_path)?;
             (self.disk_manifest(&disk_files), None)
         };
-        let changed_paths = if let Some(sparse_paths) = self.sparse_workdir_paths(&workdir_path)? {
+        let changed_paths = if let Some(sparse_paths) =
+            self.lane_sparse_workdir_paths(branch, &workdir_path)?
+        {
             let mut selected_paths = sparse_paths;
             selected_paths.extend(disk_manifest.keys().cloned());
             selected_paths.sort();
@@ -259,4 +323,40 @@ impl CrabDb {
         };
         Ok(Some(changed_paths))
     }
+
+    fn ensure_direct_lane_merge_allowed(
+        &self,
+        lane: &str,
+        into: &str,
+        dry_run: bool,
+        direct: bool,
+    ) -> Result<()> {
+        if dry_run || direct || into != self.config.workspace.default_branch {
+            return Ok(());
+        }
+        Err(Error::InvalidInput(format!(
+            "direct merge into shared target `{into}` is disabled by default; run `crabdb merge-queue add {lane} --into {into}` and `crabdb merge-queue run`, or pass `--direct` to merge immediately"
+        )))
+    }
+}
+
+fn lane_refresh_preview_next_steps(
+    lane: &str,
+    target_branch: &str,
+    clean: bool,
+    conflicted: bool,
+) -> Vec<String> {
+    if conflicted {
+        return vec![format!(
+            "Resolve these refresh conflicts before merging `{lane}` into `{target_branch}`."
+        )];
+    }
+    if clean {
+        return vec![format!(
+            "`{lane}` already incorporates `{target_branch}` or has no refresh changes to apply."
+        )];
+    }
+    vec![format!(
+        "Review the changed paths, then merge via `crabdb merge-queue add {lane} --into {target_branch}` when ready."
+    )]
 }

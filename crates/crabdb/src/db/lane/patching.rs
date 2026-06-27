@@ -53,9 +53,25 @@ impl CrabDb {
             self.ensure_patch_edit_allowed(edit, patch.allow_ignored)?;
         }
 
+        let patch_session_id = if let Some(turn) = api_turn {
+            if patch.session_id.is_some() && patch.session_id != turn.session_id {
+                return Err(Error::InvalidInput(format!(
+                    "patch session does not match turn `{}`",
+                    turn.turn_id
+                )));
+            }
+            turn.session_id.clone()
+        } else {
+            patch.session_id.clone().or(lane_row.session_id.clone())
+        };
+        if let Some(session_id) = &patch_session_id {
+            self.preflight_lane_session_owner(&lane_row.lane_id, session_id)?;
+        }
+
         let touched_paths = self.patch_touched_paths(&patch.edits)?;
         self.ensure_lane_patch_policy(&lane_row, &patch, &touched_paths)?;
         let previous_touched = self.load_root_files_for_paths(&head.root_id, &touched_paths)?;
+        self.preflight_replace_line_batch(&patch.edits, &previous_touched)?;
         let actor = Actor::lane(lane);
         let change_id = self.allocate_change_id(&actor.id, "lane_patch")?;
         let mut target_touched = previous_touched.clone();
@@ -73,6 +89,8 @@ impl CrabDb {
                 &mut manual_line_changes,
             )?;
         }
+
+        self.ensure_patch_final_root_paths_safe(&head.root_id, &previous_touched, &target_touched)?;
 
         let built = self.build_root_from_touched_file_entries_incremental(
             &head.root_id,
@@ -104,17 +122,6 @@ impl CrabDb {
         let changed_summaries = diff.summaries.clone();
 
         let patch_message = patch.message.as_deref().map(redact_sensitive_text);
-        let patch_session_id = if let Some(turn) = api_turn {
-            if patch.session_id.is_some() && patch.session_id != turn.session_id {
-                return Err(Error::InvalidInput(format!(
-                    "patch session does not match turn `{}`",
-                    turn.turn_id
-                )));
-            }
-            turn.session_id.clone()
-        } else {
-            patch.session_id.clone().or(lane_row.session_id.clone())
-        };
         if let Some(session_id) = &patch_session_id {
             self.ensure_lane_session(&lane_row.lane_id, session_id, None)?;
         }
@@ -187,9 +194,9 @@ impl CrabDb {
                 lane_row.lane_id
             ],
         )?;
-        if let Some(workdir) = lane_row.workdir {
-            let workdir_path = Path::new(&workdir);
-            let sparse_paths = self.sparse_workdir_paths(workdir_path)?;
+        if let Some(workdir) = &lane_row.workdir {
+            let workdir_path = Path::new(workdir);
+            let sparse_paths = self.lane_sparse_workdir_paths(&lane_row, workdir_path)?;
             let (previous_files, target_files) = if let Some(sparse_paths) = sparse_paths {
                 let mut selected_paths = sparse_paths;
                 for summary in &changed_summaries {

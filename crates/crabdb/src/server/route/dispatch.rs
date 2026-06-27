@@ -12,6 +12,10 @@ pub(crate) fn route_request_result(
     let raw_path = request.path.trim_end_matches('/');
     let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
 
+    if !utils::host_allowed(&request) {
+        return Ok(utils::forbidden_host_response());
+    }
+
     if !utils::origin_allowed(&request) {
         return Ok(utils::forbidden_origin_response());
     }

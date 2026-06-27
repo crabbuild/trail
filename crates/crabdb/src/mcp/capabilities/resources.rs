@@ -17,6 +17,76 @@ pub(crate) fn resources_templates_list_result() -> Value {
 pub(crate) fn resource_templates() -> Value {
     json!([
         {
+            "uriTemplate": RESOURCE_AGENT_SUMMARY_TEMPLATE,
+            "name": "agent-task-summary",
+            "title": "Agent Task Summary",
+            "description": "Read the one-page post-run cockpit with readiness, risk, validation, receipt Markdown, PR draft, and next commands.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_DIAGNOSE_TEMPLATE,
+            "name": "agent-task-diagnose",
+            "title": "Agent Task Diagnose",
+            "description": "Read a recovery-oriented diagnosis with likely issue, evidence, recovery targets, and safe next commands.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_REVIEW_TEMPLATE,
+            "name": "agent-task-review",
+            "title": "Agent Task Review",
+            "description": "Read the agent task review dashboard with readiness, risk, prioritized files, blockers, warnings, and next commands.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_CHANGES_TEMPLATE,
+            "name": "agent-task-changes",
+            "title": "Agent Task Changes",
+            "description": "Read high-level agent change cards plus turn or operation checkpoint groups.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_TIMELINE_TEMPLATE,
+            "name": "agent-task-timeline",
+            "title": "Agent Task Timeline",
+            "description": "Read the chronological prompt/operation timeline with checkpoints, tools, changed files, and follow-up commands.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_FILES_TEMPLATE,
+            "name": "agent-task-files",
+            "title": "Agent Task Files",
+            "description": "Read changed files with the turns, prompts, checkpoints, and focused diff commands behind each file.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_REPORT_TEMPLATE,
+            "name": "agent-task-report",
+            "title": "Agent Task Report",
+            "description": "Read the shareable agent task report bundle with story, risk, readiness, transcript, suggestions, and Markdown.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_RECEIPT_TEMPLATE,
+            "name": "agent-task-receipt",
+            "title": "Agent Task Receipt",
+            "description": "Read the copyable post-run receipt with summary, validation, changed files, turns, risk, checkpoint, and next command.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_PR_TEMPLATE,
+            "name": "agent-task-pr",
+            "title": "Agent PR Draft",
+            "description": "Read a pull request draft title and body for an agent task without creating a remote PR.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_FOCUS_TEMPLATE,
+            "name": "agent-task-focus",
+            "title": "Agent Task Focus",
+            "description": "Read the next file to inspect with its review priority, explanation, and focused diff summary.",
+            "mimeType": "application/json"
+        },
+        {
             "uriTemplate": RESOURCE_LANE_TEMPLATE,
             "name": "lane",
             "title": "Lane Details",
@@ -159,6 +229,76 @@ pub(crate) fn resources() -> Value {
             "name": "openapi",
             "title": "OpenAPI Contract",
             "description": "The local CrabDB HTTP API OpenAPI 3.1 document.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_INBOX,
+            "name": "agent-tasks",
+            "title": "Agent Task Inbox",
+            "description": "Grouped agent tasks and the one next useful action.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_SUMMARY,
+            "name": "latest-agent-summary",
+            "title": "Latest Agent Summary",
+            "description": "One-page post-run cockpit for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_DIAGNOSE,
+            "name": "latest-agent-diagnose",
+            "title": "Latest Agent Diagnose",
+            "description": "Recovery-oriented diagnosis for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_REVIEW,
+            "name": "latest-agent-review",
+            "title": "Latest Agent Review",
+            "description": "Review dashboard for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_CHANGES,
+            "name": "latest-agent-changes",
+            "title": "Latest Agent Changes",
+            "description": "High-level change cards for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_TIMELINE,
+            "name": "latest-agent-timeline",
+            "title": "Latest Agent Timeline",
+            "description": "Chronological prompt/operation timeline for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_FILES,
+            "name": "latest-agent-files",
+            "title": "Latest Agent Files",
+            "description": "Changed-file provenance for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_FOCUS,
+            "name": "latest-agent-focus",
+            "title": "Latest Agent Focus",
+            "description": "Next file to inspect for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_RECEIPT,
+            "name": "latest-agent-receipt",
+            "title": "Latest Agent Receipt",
+            "description": "Copyable receipt for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_PR,
+            "name": "latest-agent-pr",
+            "title": "Latest Agent PR Draft",
+            "description": "Pull request draft for the latest agent task.",
             "mimeType": "application/json"
         },
         {

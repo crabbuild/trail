@@ -23,6 +23,69 @@ pub struct LaneRecordReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneRecordPreviewReport {
+    pub lane_id: String,
+    pub workdir: String,
+    pub head_change: ChangeId,
+    pub root_id: ObjectId,
+    pub clean: bool,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub ignored_paths: Vec<LaneWorkdirIgnoredPath>,
+    pub risky_paths: Vec<LaneWorkdirRisk>,
+    pub oversized_files: Vec<LaneRecordOversizedFile>,
+    pub policy: LaneRecordPolicyPreview,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneWorkdirIgnoredPath {
+    pub path: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneWorkdirRisk {
+    pub path: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneRecordOversizedFile {
+    pub path: String,
+    pub size_bytes: u64,
+    pub limit_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneRecordPolicyPreview {
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneRefreshPreviewReport {
+    pub lane_id: String,
+    pub ref_name: String,
+    pub base_change: ChangeId,
+    pub lane_head_change: ChangeId,
+    pub lane_head_root: ObjectId,
+    pub target_ref: String,
+    pub target_change: ChangeId,
+    pub target_root: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations_behind: Option<u64>,
+    pub clean: bool,
+    pub conflicted: bool,
+    pub changed_paths: Vec<FileDiffSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
+    pub next_steps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneRewindReport {
     pub lane_id: String,
     pub ref_name: String,

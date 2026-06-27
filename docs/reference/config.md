@@ -53,6 +53,49 @@ False values:
 
 `crabdb init --text-policy minimal|balanced|full` applies preset text thresholds before the config is written.
 
+## Lane Hardening Keys
+
+`lane.claim_enforcement` controls whether active write claims/leases are treated
+as a policy boundary for lane patches and materialized workdir records:
+
+- `off`: claims and leases remain advisory only.
+- `warn`: mutations outside active write claims/leases are allowed, but CrabDB
+  records a `lane_policy_warning` event.
+- `reject`: mutations outside active write claims/leases are rejected.
+
+Read leases do not grant write permission. Use `warn` first when introducing
+the policy to an existing workspace, then switch to `reject` after agents
+consistently claim their intended paths.
+
+`lane.enforce_sparse_paths` turns sparse lane `--paths` selections into a hard
+write boundary. When true, lane patches and materialized workdir records must
+stay inside the persisted sparse selection. Rename source and destination paths
+are both checked. The sparse selection is stored in lane metadata so policy
+enforcement still works if the workdir sparse manifest is missing.
+
+The lane quota keys all accept unsigned integers. A value of `0` disables the
+limit.
+
+| Key | Enforced on |
+| --- | --- |
+| `lane.max_patch_bytes` | Serialized structured patch document before storage. |
+| `lane.max_patch_file_bytes` | Per-file structured patch writes and materialized lane-record files. |
+| `lane.max_changed_paths` | Number of paths touched by a lane patch or lane workdir record. |
+| `lane.max_event_payload_bytes` | Lane event payload JSON before storage, before and after redaction. |
+| `lane.max_trace_payload_bytes` | `span_started` and `span_ended` payload JSON before trace indexing. |
+
+Example hardened profile:
+
+```sh
+crabdb config set lane.claim_enforcement warn
+crabdb config set lane.enforce_sparse_paths true
+crabdb config set lane.max_changed_paths 25
+crabdb config set lane.max_patch_bytes 1048576
+crabdb config set lane.max_patch_file_bytes 262144
+crabdb config set lane.max_event_payload_bytes 65536
+crabdb config set lane.max_trace_payload_bytes 65536
+```
+
 ## Guardrail Policy Grammar
 
 Rules are separated by semicolons or newlines:

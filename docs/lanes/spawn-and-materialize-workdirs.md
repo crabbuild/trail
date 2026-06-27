@@ -32,7 +32,11 @@ crabdb lane spawn doc-bot --from main --materialize=true --paths docs README.md
 
 Use `--include-neighbors` when selected files should include nearby context.
 
-Sparse workdirs contain CrabDB manifest files under their own `.crabdb` directory so CrabDB can track what was materialized.
+Sparse workdirs contain CrabDB manifest files under their own `.crabdb`
+directory so CrabDB can track what was materialized. CrabDB also stores the
+sparse path boundary in lane metadata, so `lane.enforce_sparse_paths=true` can
+still reject writes outside the sparse selection if the workdir sparse manifest
+is missing and can recreate the manifest after a valid sparse update.
 
 Sparse hydration writes only missing or explicitly forced paths. When the live
 workspace already has matching file bytes and the filesystem supports
@@ -59,11 +63,27 @@ crabdb lane sync-workdir doc-bot --force
 
 Dirty workdirs require recording or force refresh.
 
-When `--force` overwrites dirty materialized workdir content, CrabDB first saves
-the current dirty regular files under `.crabdb/lane-workdir-rescue/...` and
-returns that path as `rescue_workdir`. The rescue directory also contains a
-`manifest.json` with the dirty path summary and any paths that could not be
+Full workdir refreshes materialize into a hidden sibling staging directory,
+write and verify the workdir manifest there, then replace the visible workdir.
+If staging fails, the existing visible workdir is left in place.
+
+When `--force` overwrites dirty materialized workdir content or replaces a
+non-directory file at the lane workdir path, CrabDB first saves recoverable
+regular files under `.crabdb/lane-workdir-rescue/...` and returns that path as
+`rescue_workdir`. The rescue directory also contains a `manifest.json` with the
+dirty path summary or replaced-path summary and any paths that could not be
 copied, such as deleted files.
+
+## Preview a Record
+
+```sh
+crabdb lane record doc-bot --preview
+```
+
+Record preview does not advance the lane. It reports changed paths, ignored
+paths, risky workdir entries such as nested `.git`, nested `.crabdb`, symlinks,
+hardlinks, or external mounts, oversized changed files, and whether current lane
+policy would allow the record.
 
 ## Code Facts Used
 

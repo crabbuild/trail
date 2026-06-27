@@ -18,6 +18,19 @@ pub(crate) fn render_lane_status(report: &LaneStatusReport, json: bool, quiet: b
         for path in &report.changed_paths {
             println!("  {:?} {}", path.kind, path.path);
         }
+        if let Some(base_status) = &report.base_status {
+            if let Some(behind) = base_status.operations_behind.filter(|behind| *behind > 0) {
+                let plural = if behind == 1 {
+                    "operation"
+                } else {
+                    "operations"
+                };
+                println!(
+                    "Lane started {behind} {plural} behind {}",
+                    base_status.target_branch
+                );
+            }
+        }
         if let Some(state) = &report.workdir_state {
             println!("Workdir: {:?}", state);
             for path in &report.workdir_changed_paths {
@@ -279,6 +292,49 @@ pub(crate) fn render_lane_readiness(
         }
         if let Some(eval) = &report.latest_eval {
             println!("Latest eval: {} ({})", eval.status, eval.command.join(" "));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_lane_refresh_preview(
+    report: &LaneRefreshPreviewReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Lane refresh preview: {} onto {}",
+            report.ref_name, report.target_ref
+        );
+        if let Some(behind) = report.operations_behind {
+            let plural = if behind == 1 {
+                "operation"
+            } else {
+                "operations"
+            };
+            println!("Lane started {behind} {plural} behind target");
+        }
+        println!(
+            "Clean: {}  Conflicted: {}  Changed paths: {}",
+            report.clean,
+            report.conflicted,
+            report.changed_paths.len()
+        );
+        for conflict in &report.conflicts {
+            println!("  conflict {conflict}");
+        }
+        for path in &report.changed_paths {
+            println!("  {:?} {}", path.kind, path.path);
+        }
+        if !report.next_steps.is_empty() {
+            println!("Next steps:");
+            for step in &report.next_steps {
+                println!("  - {step}");
+            }
         }
     }
     Ok(())

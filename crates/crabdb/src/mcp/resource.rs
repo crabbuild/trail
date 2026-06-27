@@ -24,6 +24,42 @@ fn resource_read_response(db: &mut CrabDb, args: ResourceReadArgs) -> Result<Val
             "application/json",
             serde_json::to_string_pretty(&crate::server::openapi_spec())?,
         ),
+        RESOURCE_AGENT_INBOX => ("application/json", pretty_json(&db.agent_inbox()?)?),
+        RESOURCE_AGENT_LATEST_SUMMARY => (
+            "application/json",
+            pretty_json(&db.agent_summary("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_DIAGNOSE => (
+            "application/json",
+            pretty_json(&db.agent_diagnose("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_REVIEW => (
+            "application/json",
+            pretty_json(&db.agent_review("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_CHANGES => (
+            "application/json",
+            pretty_json(&db.agent_changes("latest", false)?)?,
+        ),
+        RESOURCE_AGENT_LATEST_TIMELINE => (
+            "application/json",
+            pretty_json(&db.agent_timeline("latest", false)?)?,
+        ),
+        RESOURCE_AGENT_LATEST_FILES => {
+            ("application/json", pretty_json(&db.agent_files("latest")?)?)
+        }
+        RESOURCE_AGENT_LATEST_FOCUS => (
+            "application/json",
+            pretty_json(&db.agent_focus("latest", None, false)?)?,
+        ),
+        RESOURCE_AGENT_LATEST_RECEIPT => (
+            "application/json",
+            pretty_json(&db.agent_receipt("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_PR => (
+            "application/json",
+            pretty_json(&db.agent_pr_draft("latest")?)?,
+        ),
         RESOURCE_USER_GUIDE => ("text/markdown", USER_GUIDE_MD.to_string()),
         RESOURCE_LANE_WORKFLOWS => ("text/markdown", LANE_WORKFLOWS_MD.to_string()),
         RESOURCE_CLI_REFERENCE => ("text/markdown", CLI_REFERENCE_MD.to_string()),
@@ -41,6 +77,116 @@ fn resource_read_response(db: &mut CrabDb, args: ResourceReadArgs) -> Result<Val
 }
 
 fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, String)> {
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/summary",
+        RESOURCE_AGENT_SUMMARY_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_summary(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/diagnose",
+        RESOURCE_AGENT_DIAGNOSE_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_diagnose(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/review",
+        RESOURCE_AGENT_REVIEW_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_review(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/changes",
+        RESOURCE_AGENT_CHANGES_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_changes(&selector, false)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/timeline",
+        RESOURCE_AGENT_TIMELINE_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_timeline(&selector, false)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/files",
+        RESOURCE_AGENT_FILES_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_files(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/report",
+        RESOURCE_AGENT_REPORT_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_report(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/receipt",
+        RESOURCE_AGENT_RECEIPT_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_receipt(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/pr",
+        RESOURCE_AGENT_PR_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_pr_draft(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/focus",
+        RESOURCE_AGENT_FOCUS_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_focus(&selector, None, false)?)?,
+        ));
+    }
     if let Some(lane) = template_uri_argument(
         uri,
         "crabdb://workspace/lanes/",

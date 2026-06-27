@@ -10,12 +10,6 @@ impl CrabDb {
     ) -> Result<LaneTurnEventReport> {
         let _lock = self.acquire_write_lock()?;
         validate_ref_segment(lane)?;
-        let event_type = event_type.trim();
-        if event_type.is_empty() {
-            return Err(Error::InvalidInput(
-                "event type cannot be empty".to_string(),
-            ));
-        }
         let branch = self.lane_branch(lane)?;
         let session = self.lane_session(session_id)?;
         if session.lane_id != branch.lane_id {

@@ -2,6 +2,49 @@ use serde_json::{json, Value};
 
 use crate::mcp::response::object_schema;
 
+fn conflict_resolve_schema() -> Value {
+    let mut schema = object_schema(
+        json!({
+            "conflict_set_id": { "type": "string" },
+            "take": { "type": "string", "enum": ["source", "target"] },
+            "manual": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "files": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "oneOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "content": { "type": "string" },
+                                        "delete": { "type": "boolean" },
+                                        "executable": { "type": "boolean" }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }),
+        vec!["conflict_set_id"],
+    );
+    if let Value::Object(object) = &mut schema {
+        object.insert(
+            "oneOf".to_string(),
+            json!([
+                { "required": ["take"], "not": { "required": ["manual"] } },
+                { "required": ["manual"], "not": { "required": ["take"] } }
+            ]),
+        );
+    }
+    schema
+}
+
 pub(super) fn tools() -> Value {
     json!([
         {
@@ -27,6 +70,14 @@ pub(super) fn tools() -> Value {
             "inputSchema": object_schema(json!({
                 "limit": { "type": "integer", "minimum": 1 }
             }), vec![])
+        },
+        {
+            "name": "crabdb.merge_queue_explain",
+            "title": "Explain Merge Queue Entry",
+            "description": "Explain why one queued merge is ready or blocked, including readiness blockers, dry-run conflicts, preflight errors, warnings, and next-step commands.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string" }
+            }), vec!["selector"])
         },
         {
             "name": "crabdb.merge_queue_remove",
@@ -55,31 +106,7 @@ pub(super) fn tools() -> Value {
             "name": "crabdb.conflict_resolve",
             "title": "Resolve Merge Conflict",
             "description": "Resolve a conflict set by taking source, taking target, or providing manual content for every conflicted path.",
-            "inputSchema": object_schema(json!({
-                "conflict_set_id": { "type": "string" },
-                "take": { "type": "string", "enum": ["source", "target"] },
-                "manual": {
-                    "type": "object",
-                    "properties": {
-                        "files": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "oneOf": [
-                                    { "type": "string" },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "content": { "type": "string" },
-                                            "delete": { "type": "boolean" },
-                                            "executable": { "type": "boolean" }
-                                        }
-                                    }
-                                ]
-                            }
-                        }
-                    }
-                }
-            }), vec!["conflict_set_id"])
+            "inputSchema": conflict_resolve_schema()
         }
     ])
 }

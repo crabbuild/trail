@@ -109,14 +109,19 @@ impl CrabDb {
             )));
         };
         let workdir_path = PathBuf::from(&workdir);
-        if workdir_path.exists() && !workdir_path.is_dir() {
-            if force {
-                fs::remove_file(&workdir_path)?;
-            } else {
-                return Err(Error::InvalidInput(format!(
-                    "lane `{lane}` workdir path exists but is not a directory"
-                )));
-            }
+        let workdir_path_metadata = match fs::symlink_metadata(&workdir_path) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let workdir_path_is_dir = workdir_path_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+        let workdir_path_is_non_dir = workdir_path_metadata.is_some() && !workdir_path_is_dir;
+        if workdir_path_is_non_dir && !force {
+            return Err(Error::InvalidInput(format!(
+                "lane `{lane}` workdir path exists but is not a directory"
+            )));
         }
         let head = self.get_ref(&branch.ref_name)?;
         let target_files = if path_scoped {
@@ -134,9 +139,9 @@ impl CrabDb {
         } else {
             self.load_root_files(&head.root_id)?
         };
-        let workdir_exists = workdir_path.is_dir();
+        let workdir_exists = workdir_path_is_dir;
         let sparse_paths = if workdir_exists {
-            self.sparse_workdir_paths(&workdir_path)?
+            self.lane_sparse_workdir_paths(&branch, &workdir_path)?
         } else {
             None
         };
@@ -178,33 +183,24 @@ impl CrabDb {
                 "lane `{lane}` workdir has unrecorded changes; run `crabdb lane record {lane}` or pass `--force` to sync: {preview}{suffix}"
             )));
         }
-        let rescue_workdir = if force && workdir_exists && !changed_paths.is_empty() {
+        let rescue_workdir = if force && workdir_path_is_non_dir {
+            Some(self.rescue_replaced_lane_workdir_path(lane, &workdir, &workdir_path)?)
+        } else if force && workdir_exists && !changed_paths.is_empty() {
             Some(self.rescue_dirty_lane_workdir(lane, &workdir, &workdir_path, &changed_paths)?)
         } else {
             None
         };
-        if force && !path_scoped && workdir_path.exists() {
-            fs::remove_dir_all(&workdir_path)?;
-        }
-        fs::create_dir_all(&workdir_path)?;
         if path_scoped {
-            let write_files =
-                self.sparse_hydration_write_files(&workdir_path, &target_files, force)?;
-            self.materialize_new_files_best_effort_at_with_workspace_cow(
-                &workdir_path,
-                &write_files,
-            )?;
-            let mut materialized_paths = sparse_paths.unwrap_or_default();
-            materialized_paths.extend(target_files.keys().cloned());
-            materialized_paths.sort();
-            materialized_paths.dedup();
-            self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
-            self.update_clean_workdir_manifest_from_file_subset(
+            if workdir_path_is_non_dir {
+                remove_existing_lane_workdir_path(&workdir_path)?;
+            }
+            fs::create_dir_all(&workdir_path)?;
+            self.materialize_sparse_lane_workdir_paths(
                 &workdir_path,
                 &head.root_id,
-                &head.root_id,
-                &BTreeMap::new(),
+                sparse_paths.unwrap_or_default(),
                 &target_files,
+                force,
             )?;
         } else {
             let target_files = if let Some(paths) = &sparse_paths {
@@ -212,23 +208,32 @@ impl CrabDb {
             } else {
                 target_files
             };
-            let previous = if force || !workdir_exists {
-                BTreeMap::new()
+            if force || !workdir_exists {
+                self.materialize_full_lane_workdir_staged(
+                    &workdir_path,
+                    &head.root_id,
+                    &target_files,
+                    sparse_paths.is_some(),
+                )?;
             } else {
-                target_files.clone()
-            };
-            if force || !workdir_exists || !changed_paths.is_empty() {
-                self.materialize_files_best_effort_at(&workdir_path, &previous, &target_files)?;
+                fs::create_dir_all(&workdir_path)?;
+                if !changed_paths.is_empty() {
+                    self.materialize_files_best_effort_at(
+                        &workdir_path,
+                        &target_files,
+                        &target_files,
+                    )?;
+                }
+                if sparse_paths.is_some() {
+                    self.write_sparse_workdir_manifest(&workdir_path, target_files.keys())?;
+                }
+                self.write_clean_workdir_manifest(
+                    &workdir_path,
+                    &head.root_id,
+                    &target_files,
+                    target_files.keys(),
+                )?;
             }
-            if sparse_paths.is_some() {
-                self.write_sparse_workdir_manifest(&workdir_path, target_files.keys())?;
-            }
-            self.write_clean_workdir_manifest(
-                &workdir_path,
-                &head.root_id,
-                &target_files,
-                target_files.keys(),
-            )?;
         }
         self.insert_lane_event(
             &branch.lane_id,
@@ -253,6 +258,48 @@ impl CrabDb {
             rescue_workdir,
             changed_paths,
         })
+    }
+
+    fn materialize_full_lane_workdir_staged(
+        &self,
+        workdir_path: &Path,
+        root_id: &ObjectId,
+        target_files: &BTreeMap<String, FileEntry>,
+        sparse: bool,
+    ) -> Result<()> {
+        let parent = workdir_path.parent().ok_or_else(|| Error::InvalidPath {
+            path: workdir_path.to_string_lossy().to_string(),
+            reason: "workdir path has no parent".to_string(),
+        })?;
+        fs::create_dir_all(parent)?;
+        let stage_dir = create_unique_lane_workdir_sync_stage_dir(parent, workdir_path)?;
+        let result = (|| -> Result<()> {
+            let empty = BTreeMap::new();
+            self.materialize_files_best_effort_at(&stage_dir, &empty, target_files)?;
+            if sparse {
+                self.write_sparse_workdir_manifest(&stage_dir, target_files.keys())?;
+            }
+            self.write_clean_workdir_manifest(
+                &stage_dir,
+                root_id,
+                target_files,
+                target_files.keys(),
+            )?;
+            match self.cached_workdir_manifest_status(&stage_dir, root_id)? {
+                CachedWorkdirManifestStatus::Clean => {}
+                _ => {
+                    return Err(Error::Corrupt(format!(
+                        "staged lane workdir `{}` did not verify clean before replacement",
+                        stage_dir.display()
+                    )));
+                }
+            }
+            replace_lane_workdir_with_stage(workdir_path, &stage_dir)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage_dir);
+        }
+        result
     }
 
     fn rescue_dirty_lane_workdir(
@@ -298,7 +345,7 @@ impl CrabDb {
                 skipped_paths.push(format!("{path}: not a regular file"));
                 continue;
             }
-            let destination = files_dir.join(path_from_rel(&path));
+            let destination = safe_join(&files_dir, &path)?;
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -313,6 +360,59 @@ impl CrabDb {
             "changed_paths": changed_paths,
             "copied_paths": copied_paths,
             "skipped_paths": skipped_paths,
+        });
+        fs::write(
+            rescue_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(rescue_dir.to_string_lossy().to_string())
+    }
+
+    fn rescue_replaced_lane_workdir_path(
+        &self,
+        lane: &str,
+        workdir: &str,
+        workdir_path: &Path,
+    ) -> Result<String> {
+        let rescue_root = self.db_dir.join("lane-workdir-rescue");
+        fs::create_dir_all(&rescue_root)?;
+        let rescue_dir = create_unique_lane_workdir_rescue_dir(&rescue_root, lane)?;
+        let files_dir = rescue_dir.join("files");
+        fs::create_dir_all(&files_dir)?;
+
+        let leaf = workdir_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workdir".to_string());
+        let mut copied_paths = Vec::new();
+        let mut skipped_paths = Vec::new();
+        let mut symlink_target = None;
+        let metadata = fs::symlink_metadata(workdir_path)?;
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            fs::copy(workdir_path, files_dir.join(&leaf))?;
+            copied_paths.push(leaf.clone());
+        } else if metadata.file_type().is_symlink() {
+            match fs::read_link(workdir_path) {
+                Ok(target) => {
+                    symlink_target = Some(target.to_string_lossy().to_string());
+                    skipped_paths.push(format!("{leaf}: symlink"));
+                }
+                Err(err) => {
+                    skipped_paths.push(format!("{leaf}: symlink target unavailable: {err}"))
+                }
+            }
+        } else {
+            skipped_paths.push(format!("{leaf}: not a regular file"));
+        }
+
+        let manifest = serde_json::json!({
+            "lane": lane,
+            "workdir": workdir,
+            "created_at": now_ts(),
+            "replaced_workdir_path": true,
+            "copied_paths": copied_paths,
+            "skipped_paths": skipped_paths,
+            "symlink_target": symlink_target,
         });
         fs::write(
             rescue_dir.join("manifest.json"),
@@ -340,7 +440,7 @@ impl CrabDb {
         if !workdir_path.is_dir() {
             return Ok(Vec::new());
         }
-        let Some(sparse_paths) = self.sparse_workdir_paths(&workdir_path)? else {
+        let Some(sparse_paths) = self.lane_sparse_workdir_paths(branch, &workdir_path)? else {
             return Ok(Vec::new());
         };
         let head = self.get_ref(&branch.ref_name)?;
@@ -372,21 +472,119 @@ impl CrabDb {
             )));
         }
 
-        let write_files = self.sparse_hydration_write_files(&workdir_path, &target_files, force)?;
-        self.materialize_new_files_best_effort_at_with_workspace_cow(&workdir_path, &write_files)?;
-        let mut materialized_paths = sparse_paths;
-        materialized_paths.extend(target_files.keys().cloned());
-        materialized_paths.sort();
-        materialized_paths.dedup();
-        self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
-        self.update_clean_workdir_manifest_from_file_subset(
+        self.materialize_sparse_lane_workdir_paths(
             &workdir_path,
             &head.root_id,
-            &head.root_id,
-            &BTreeMap::new(),
+            sparse_paths,
             &target_files,
+            force,
         )?;
         Ok(target_files.keys().cloned().collect())
+    }
+
+    fn materialize_sparse_lane_workdir_paths(
+        &self,
+        workdir_path: &Path,
+        root_id: &ObjectId,
+        sparse_paths: Vec<String>,
+        target_files: &BTreeMap<String, FileEntry>,
+        force: bool,
+    ) -> Result<()> {
+        let write_files = self.sparse_hydration_write_files(workdir_path, target_files, force)?;
+        let transaction = SparseHydrationTransaction::begin(workdir_path, write_files.keys())?;
+        let result = (|| -> Result<()> {
+            self.materialize_new_files_best_effort_at_with_workspace_cow(
+                workdir_path,
+                &write_files,
+            )?;
+
+            let mut materialized_paths = sparse_paths;
+            materialized_paths.extend(target_files.keys().cloned());
+            materialized_paths.sort();
+            materialized_paths.dedup();
+            self.write_sparse_workdir_manifest(workdir_path, materialized_paths.iter())?;
+            let clean_manifest_updated = self.update_clean_workdir_manifest_from_file_subset(
+                workdir_path,
+                root_id,
+                root_id,
+                &BTreeMap::new(),
+                target_files,
+            )?;
+            self.verify_sparse_lane_workdir_hydration(
+                workdir_path,
+                root_id,
+                target_files,
+                clean_manifest_updated,
+            )
+        })();
+        match result {
+            Ok(()) => {
+                transaction.commit();
+                Ok(())
+            }
+            Err(err) => {
+                let original = err.to_string();
+                match transaction.rollback() {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(Error::Corrupt(format!(
+                        "sparse lane workdir hydration failed and rollback failed: {rollback_err}; original error: {original}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn verify_sparse_lane_workdir_hydration(
+        &self,
+        workdir_path: &Path,
+        root_id: &ObjectId,
+        target_files: &BTreeMap<String, FileEntry>,
+        clean_manifest_updated: bool,
+    ) -> Result<()> {
+        let target_paths = target_files.keys().cloned().collect::<Vec<_>>();
+        let Some(sparse_paths) = self.sparse_workdir_paths(workdir_path)? else {
+            return Err(Error::Corrupt(format!(
+                "sparse lane workdir `{}` lost its sparse manifest during hydration",
+                workdir_path.display()
+            )));
+        };
+        let sparse_paths = sparse_paths.into_iter().collect::<BTreeSet<_>>();
+        if let Some(path) = target_paths
+            .iter()
+            .find(|path| !sparse_paths.contains(path.as_str()))
+        {
+            return Err(Error::Corrupt(format!(
+                "sparse lane workdir `{}` manifest omitted hydrated path `{path}`",
+                workdir_path.display()
+            )));
+        }
+
+        let disk_files = self.scan_files_under_for_paths(workdir_path, &target_paths)?;
+        let disk_manifest = self.disk_manifest(&disk_files);
+        let diffs =
+            self.diff_file_maps_to_manifest_for_paths(target_files, &disk_manifest, &target_paths);
+        if let Some(diff) = diffs.first() {
+            return Err(Error::Corrupt(format!(
+                "sparse lane workdir `{}` failed hydration verification for `{}`",
+                workdir_path.display(),
+                diff.path
+            )));
+        }
+
+        if clean_manifest_updated
+            && !self.clean_workdir_manifest_tracks_file_subset(
+                workdir_path,
+                root_id,
+                target_files,
+            )?
+        {
+            return Err(Error::Corrupt(format!(
+                "sparse lane workdir `{}` clean manifest did not track hydrated paths",
+                workdir_path.display()
+            )));
+        }
+
+        Ok(())
     }
 
     fn sparse_hydration_write_files(
@@ -460,7 +658,7 @@ fn branch_has_sparse_workdir(db: &CrabDb, branch: &LaneBranch) -> Result<bool> {
     if !workdir_path.is_dir() {
         return Ok(false);
     }
-    db.sparse_workdir_paths(&workdir_path)
+    db.lane_sparse_workdir_paths(branch, &workdir_path)
         .map(|paths| paths.is_some())
 }
 
@@ -476,4 +674,404 @@ fn create_unique_lane_workdir_rescue_dir(rescue_root: &Path, lane: &str) -> Resu
     Err(Error::InvalidInput(
         "could not create unique lane workdir rescue directory".to_string(),
     ))
+}
+
+fn create_unique_lane_workdir_sync_stage_dir(
+    parent: &Path,
+    workdir_path: &Path,
+) -> Result<PathBuf> {
+    let leaf = workdir_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "workdir".into());
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".{leaf}.crabdb-sync-{}", now_nanos()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+    Err(Error::InvalidInput(
+        "could not create unique lane workdir sync staging directory".to_string(),
+    ))
+}
+
+fn replace_lane_workdir_with_stage(workdir_path: &Path, stage_dir: &Path) -> Result<()> {
+    let backup_path = move_existing_lane_workdir_to_backup(workdir_path)?;
+    let replace_result = fs::rename(stage_dir, workdir_path).map_err(Error::Io);
+    match replace_result {
+        Ok(()) => {
+            if let Some(backup_path) = backup_path {
+                remove_existing_lane_workdir_path(&backup_path)?;
+            }
+        }
+        Err(err) => {
+            if let Some(backup_path) = backup_path {
+                let _ = remove_existing_lane_workdir_path(workdir_path);
+                if let Err(restore_err) = fs::rename(&backup_path, workdir_path) {
+                    return Err(Error::Corrupt(format!(
+                        "failed to replace lane workdir `{}` with staged directory `{}`: {err}; \
+                         failed to restore previous workdir from `{}`: {restore_err}",
+                        workdir_path.display(),
+                        stage_dir.display(),
+                        backup_path.display()
+                    )));
+                }
+                if let Some(parent) = workdir_path.parent() {
+                    sync_directory(parent);
+                }
+            }
+            return Err(err);
+        }
+    }
+    if let Some(parent) = workdir_path.parent() {
+        sync_directory(parent);
+    }
+    Ok(())
+}
+
+fn move_existing_lane_workdir_to_backup(workdir_path: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(workdir_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Error::Io(err)),
+    }
+    let backup_path = create_unique_lane_workdir_replacement_backup_path(workdir_path)?;
+    fs::rename(workdir_path, &backup_path)?;
+    Ok(Some(backup_path))
+}
+
+fn create_unique_lane_workdir_replacement_backup_path(workdir_path: &Path) -> Result<PathBuf> {
+    let parent = workdir_path.parent().ok_or_else(|| Error::InvalidPath {
+        path: workdir_path.to_string_lossy().to_string(),
+        reason: "workdir path has no parent".to_string(),
+    })?;
+    let leaf = workdir_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "workdir".into());
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".{leaf}.crabdb-replace-{}", now_nanos()));
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+    Err(Error::InvalidInput(
+        "could not create unique lane workdir replacement backup path".to_string(),
+    ))
+}
+
+fn remove_existing_lane_workdir_path(workdir_path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(workdir_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(workdir_path)?;
+    } else {
+        fs::remove_file(workdir_path)?;
+    }
+    Ok(())
+}
+
+struct SparseHydrationTransaction {
+    backup_dir: PathBuf,
+    snapshots: Vec<SparseHydrationSnapshot>,
+}
+
+struct SparseHydrationSnapshot {
+    target: PathBuf,
+    state: SparseHydrationSnapshotState,
+}
+
+enum SparseHydrationSnapshotState {
+    Missing,
+    File {
+        backup_path: PathBuf,
+        permissions: fs::Permissions,
+    },
+    #[cfg(unix)]
+    Symlink {
+        target: PathBuf,
+    },
+    Directory,
+    Other,
+}
+
+impl SparseHydrationTransaction {
+    fn begin<'a, I>(workdir_path: &Path, write_paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let parent = workdir_path.parent().ok_or_else(|| Error::InvalidPath {
+            path: workdir_path.to_string_lossy().to_string(),
+            reason: "workdir path has no parent".to_string(),
+        })?;
+        fs::create_dir_all(parent)?;
+        let backup_dir = create_unique_lane_workdir_sync_stage_dir(parent, workdir_path)?;
+        let backup_dir_for_cleanup = backup_dir.clone();
+        let result = (|| -> Result<Self> {
+            let mut paths = BTreeSet::new();
+            paths.insert(".crabdb/sparse-workdir.json".to_string());
+            paths.insert(".crabdb/workdir-manifest.json".to_string());
+            paths.extend(write_paths.into_iter().cloned());
+
+            let mut snapshots = Vec::new();
+            for (index, path) in paths.iter().enumerate() {
+                let target = safe_join(workdir_path, path)?;
+                let backup_path = backup_dir.join(format!("snapshot-{index}"));
+                let state = snapshot_sparse_hydration_target(path, &target, backup_path)?;
+                snapshots.push(SparseHydrationSnapshot { target, state });
+            }
+
+            Ok(Self {
+                backup_dir,
+                snapshots,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&backup_dir_for_cleanup);
+        }
+        result
+    }
+
+    fn commit(self) {
+        let _ = fs::remove_dir_all(&self.backup_dir);
+    }
+
+    fn rollback(self) -> Result<()> {
+        let mut result = Ok(());
+        for snapshot in self.snapshots.iter().rev() {
+            if let Err(err) = restore_sparse_hydration_snapshot(snapshot) {
+                result = Err(err);
+                break;
+            }
+        }
+        let cleanup = fs::remove_dir_all(&self.backup_dir).map_err(Error::Io);
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+        }
+    }
+}
+
+fn snapshot_sparse_hydration_target(
+    rel: &str,
+    target: &Path,
+    backup_path: PathBuf,
+) -> Result<SparseHydrationSnapshotState> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SparseHydrationSnapshotState::Missing);
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            return Ok(SparseHydrationSnapshotState::Symlink {
+                target: fs::read_link(target)?,
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(Error::InvalidPath {
+                path: rel.to_string(),
+                reason: "cannot snapshot symlink on this platform".to_string(),
+            });
+        }
+    }
+    if metadata.is_file() {
+        fs::copy(target, &backup_path)?;
+        return Ok(SparseHydrationSnapshotState::File {
+            backup_path,
+            permissions: metadata.permissions(),
+        });
+    }
+    if metadata.is_dir() {
+        return Ok(SparseHydrationSnapshotState::Directory);
+    }
+    let _ = rel;
+    Ok(SparseHydrationSnapshotState::Other)
+}
+
+fn restore_sparse_hydration_snapshot(snapshot: &SparseHydrationSnapshot) -> Result<()> {
+    match &snapshot.state {
+        SparseHydrationSnapshotState::Missing => remove_sparse_hydration_target(&snapshot.target),
+        SparseHydrationSnapshotState::File {
+            backup_path,
+            permissions,
+        } => {
+            if sparse_hydration_file_matches_snapshot(&snapshot.target, backup_path, permissions)? {
+                return Ok(());
+            }
+            remove_sparse_hydration_target(&snapshot.target)?;
+            if let Some(parent) = snapshot.target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(backup_path, &snapshot.target)?;
+            fs::set_permissions(&snapshot.target, permissions.clone())?;
+            Ok(())
+        }
+        #[cfg(unix)]
+        SparseHydrationSnapshotState::Symlink { target } => {
+            if sparse_hydration_symlink_matches_snapshot(&snapshot.target, target)? {
+                return Ok(());
+            }
+            remove_sparse_hydration_target(&snapshot.target)?;
+            if let Some(parent) = snapshot.target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            symlink_file(target, &snapshot.target)?;
+            Ok(())
+        }
+        SparseHydrationSnapshotState::Directory | SparseHydrationSnapshotState::Other => Ok(()),
+    }
+}
+
+fn sparse_hydration_file_matches_snapshot(
+    target: &Path,
+    backup_path: &Path,
+    permissions: &fs::Permissions,
+) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if fs::read(target)? != fs::read(backup_path)? {
+        return Ok(false);
+    }
+    if sparse_hydration_permissions_match(&metadata.permissions(), permissions) {
+        return Ok(true);
+    }
+    fs::set_permissions(target, permissions.clone())?;
+    Ok(true)
+}
+
+fn sparse_hydration_permissions_match(
+    current: &fs::Permissions,
+    expected: &fs::Permissions,
+) -> bool {
+    #[cfg(unix)]
+    {
+        current.mode() == expected.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        current.readonly() == expected.readonly()
+    }
+}
+
+#[cfg(unix)]
+fn sparse_hydration_symlink_matches_snapshot(target: &Path, expected: &Path) -> Result<bool> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(fs::read_link(target)? == expected),
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+fn remove_sparse_hydration_target(target: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(target)?;
+    } else {
+        fs::remove_file(target)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_lane_workdir_with_stage_replaces_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("lane-workdir");
+        fs::create_dir(&workdir).unwrap();
+        fs::write(workdir.join("old.txt"), "old").unwrap();
+
+        let stage = temp.path().join(".lane-workdir.crabdb-sync-test");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("new.txt"), "new").unwrap();
+
+        replace_lane_workdir_with_stage(&workdir, &stage).unwrap();
+
+        assert_eq!(fs::read_to_string(workdir.join("new.txt")).unwrap(), "new");
+        assert!(!workdir.join("old.txt").exists());
+        assert!(!stage.exists());
+        assert_no_replacement_backups(temp.path());
+    }
+
+    #[test]
+    fn replace_lane_workdir_with_stage_replaces_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("lane-workdir");
+        fs::write(&workdir, "old-file").unwrap();
+
+        let stage = temp.path().join(".lane-workdir.crabdb-sync-test");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("new.txt"), "new").unwrap();
+
+        replace_lane_workdir_with_stage(&workdir, &stage).unwrap();
+
+        assert!(workdir.is_dir());
+        assert_eq!(fs::read_to_string(workdir.join("new.txt")).unwrap(), "new");
+        assert!(!stage.exists());
+        assert_no_replacement_backups(temp.path());
+    }
+
+    #[test]
+    fn replace_lane_workdir_with_stage_handles_missing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("lane-workdir");
+        let stage = temp.path().join(".lane-workdir.crabdb-sync-test");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("new.txt"), "new").unwrap();
+
+        replace_lane_workdir_with_stage(&workdir, &stage).unwrap();
+
+        assert_eq!(fs::read_to_string(workdir.join("new.txt")).unwrap(), "new");
+        assert!(!stage.exists());
+        assert_no_replacement_backups(temp.path());
+    }
+
+    #[test]
+    fn replace_lane_workdir_with_stage_restores_backup_when_stage_rename_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("lane-workdir");
+        fs::create_dir(&workdir).unwrap();
+        fs::write(workdir.join("old.txt"), "old").unwrap();
+        let missing_stage = temp.path().join(".missing-stage");
+
+        let err = replace_lane_workdir_with_stage(&workdir, &missing_stage).unwrap_err();
+
+        assert!(matches!(err, Error::Io(_)));
+        assert_eq!(fs::read_to_string(workdir.join("old.txt")).unwrap(), "old");
+        assert_no_replacement_backups(temp.path());
+    }
+
+    fn assert_no_replacement_backups(parent: &Path) {
+        for entry in fs::read_dir(parent).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".crabdb-replace-"),
+                "unexpected replacement backup left behind: {name}"
+            );
+        }
+    }
 }

@@ -121,10 +121,10 @@ The `replace_line` patch operation takes:
 
 - path
 - line ID
-- optional expected text
+- expected text
 - new text
 
-The line ID makes the patch target stable. `expected_text` adds a content guard so a stale patch can be rejected instead of silently replacing unexpected content.
+The line ID makes the patch target stable. `expected_text` is required as a content guard so a stale patch can be rejected instead of silently replacing unexpected content.
 
 ```mermaid
 sequenceDiagram
@@ -138,9 +138,11 @@ sequenceDiagram
     Patch->>DB: apply structured patch
     DB->>DB: validate path and ignore policy
     DB->>Text: locate stable LineId
-    alt expected_text matches or absent
+    alt expected_text matches
         DB->>Branch: write new text root and operation
         Branch-->>Host: patch applied report
+    else expected_text missing
+        DB-->>Host: PATCH_REJECTED
     else expected_text mismatch
         DB-->>Host: PATCH_REJECTED
     end

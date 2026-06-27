@@ -1,6 +1,7 @@
 use crabdb::Result;
 
 mod acp;
+mod agent;
 mod collaboration;
 mod config;
 mod diff;
@@ -13,6 +14,7 @@ mod maintenance;
 mod workspace;
 
 pub(crate) use acp::*;
+pub(crate) use agent::*;
 pub(crate) use collaboration::*;
 pub(crate) use config::*;
 pub(crate) use diff::*;

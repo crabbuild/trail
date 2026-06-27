@@ -48,6 +48,12 @@ pub(super) fn lane_paths() -> Value {
                 openapi_path_param("lane_or_id", "string")
             ], None, true)
         },
+        "/v1/lanes/{lane_or_id}/refresh-preview": {
+            "get": openapi_operation_with_response_schema("laneRefreshPreview", "Lane refresh preview", "Preview refreshing a lane branch onto a target branch before merge.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("target", "string")
+            ], None, "LaneRefreshPreviewReport", true)
+        },
         "/v1/lanes/{lane_or_id}/handoff": {
             "get": openapi_operation("laneHandoff", "Lane handoff", "Package lane branch, readiness, current session context, recent events, spans, operations, and next steps for transfer to another lane or reviewer.", vec![
                 openapi_path_param("lane_or_id", "string"),
@@ -78,9 +84,9 @@ pub(super) fn lane_paths() -> Value {
             ], Some("SyncWorkdirRequest"), true)
         },
         "/v1/lanes/{lane_or_id}/record": {
-            "post": openapi_operation("laneRecordWorkdir", "Record lane workdir", "Record materialized lane workdir changes into the lane branch.", vec![
+            "post": openapi_operation_with_response_schema("laneRecordWorkdir", "Record lane workdir", "Record materialized lane workdir changes into the lane branch, or return a non-mutating preview when preview=true.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("LaneRecordRequest"), true)
+            ], Some("LaneRecordRequest"), "LaneRecordWorkdirResponse", true)
         },
         "/v1/lanes/{lane_or_id}/rewind": {
             "post": openapi_operation("laneRewind", "Rewind lane", "Rewind a lane branch to a known-good change or root, optionally preserving the current head and syncing its workdir.", vec![

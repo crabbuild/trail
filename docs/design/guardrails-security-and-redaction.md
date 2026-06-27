@@ -42,14 +42,22 @@ flowchart TB
 
 Relative paths are normalized by:
 
-- Replacing backslashes with `/`.
+- Rejecting backslash separators on non-Windows platforms; use `/` for logical CrabDB paths.
 - Removing current-directory components.
 - Rejecting parent directory components.
 - Rejecting root directories and platform prefixes.
 - Rejecting NUL bytes.
+- Rejecting slash/backslash lookalikes.
+- Rejecting non-NFC Unicode path spellings.
+- Rejecting invisible Unicode format controls, including zero-width characters and bidirectional override/isolate marks.
+- Rejecting Windows-reserved path components.
 - Rejecting empty paths.
 
 This prevents commands and patch payloads from escaping the workspace with paths like `../secret` or absolute paths.
+It also avoids ambiguous path aliases such as decomposed Unicode filenames and
+separator lookalikes. On Windows, native filesystem paths may still be normalized
+from OS separators when CrabDB scans disk, but external patch and API paths
+should use `/`.
 
 ## Internal Paths
 
@@ -184,7 +192,18 @@ This lets a human decision persist across related guardrail checks without losin
 
 ## Redaction
 
-Redaction is applied to guardrail summaries/payloads, lane messages, event payloads, and trace metadata before storage. The redaction helpers look for secret-like field names and private-key-like content. Structured patch file content is stricter: secret-like values are rejected before storage because patch content would otherwise become recorded worktree objects.
+Redaction is applied to guardrail summaries/payloads, lane messages, event
+payloads, and trace metadata before storage. Event type metadata is validated
+before insertion and rejects secret-looking values instead of storing them as
+indexed event labels. The redaction helpers look for secret-like field names and
+private-key-like content. Structured patch file content is stricter:
+secret-like values are rejected before storage because patch content would
+otherwise become recorded worktree objects.
+
+Event and trace payload quotas are checked against the incoming JSON payload
+before redaction and again against the redacted stored JSON. This prevents a
+large secret-bearing payload from bypassing size limits by shrinking to
+`[REDACTED]`.
 
 Redaction reduces accidental leakage in:
 
@@ -213,10 +232,24 @@ The HTTP daemon requires auth by default:
 
 - `GET /v1/health` is always unauthenticated.
 - Other routes require `Authorization: Bearer <token>` or `x-crabdb-token`.
-- `--no-auth` disables auth explicitly.
-- Generated daemon token files are restricted to `0600` on Unix.
-- Requests with an `Origin` header must come from a loopback origin. This
-  blocks browser pages on non-local origins from driving the local daemon.
+- `--no-auth` disables auth explicitly, is allowed only with a loopback
+  listener, and prints a stderr `WARNING` even with `--quiet` because any local
+  process can mutate the workspace through that daemon.
+- Daemon token files must be regular files; symlinks are rejected.
+- Generated or reused daemon token files are restricted to `0600` on Unix.
+- Requests with an `Origin` header must be well-formed loopback origins with a
+  valid port if present. This blocks browser pages on non-local or opaque
+  origins from driving the local daemon.
+- Routed requests must include a `Host` header with a loopback host such as
+  `localhost`, `127.0.0.1`, or `::1`; missing Host, DNS names, credentials,
+  paths, whitespace, and invalid ports are rejected before auth or route
+  dispatch.
+- HTTP request framing is fixed-length only: malformed request lines, malformed
+  header lines, duplicate `Content-Length`, body length mismatches, and
+  `Transfer-Encoding` are rejected before routing.
+- Duplicate `Authorization`, `X-CrabDB-Token`, `Origin`, `Host`, and
+  `Idempotency-Key` headers are rejected before routing so security decisions
+  and idempotency replay cannot depend on header order.
 
 CLI daemon routing can read the token from `--daemon-token`, `CRABDB_DAEMON_TOKEN`, or `.crabdb/daemon.token`.
 

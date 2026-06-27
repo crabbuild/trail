@@ -102,6 +102,7 @@ impl CrabDb {
         } else {
             None
         };
+        let mut sparse_policy_paths = None;
         let materialized_workdir = if let Some(dir) = &workdir_path {
             self.materialize_lane_workdir_at_paths_with_neighbors(
                 &source.root_id,
@@ -110,10 +111,22 @@ impl CrabDb {
                 &sparse_paths,
                 include_neighbors,
             )?;
+            if !sparse_paths.is_empty() {
+                sparse_policy_paths = self.sparse_workdir_paths(dir)?;
+            }
             Some(dir.to_string_lossy().to_string())
         } else {
             None
         };
+        let metadata_json = sparse_policy_paths
+            .as_ref()
+            .map(|paths| {
+                serde_json::to_string(&serde_json::json!({
+                    "sparse_paths": paths,
+                    "include_neighbors": include_neighbors
+                }))
+            })
+            .transpose()?;
         self.set_ref(
             &ref_name,
             &source.change_id,
@@ -131,7 +144,7 @@ impl CrabDb {
                 provider,
                 model,
                 now,
-                Option::<String>::None
+                metadata_json
             ],
         )?;
         self.conn.execute(
@@ -158,7 +171,9 @@ impl CrabDb {
             &serde_json::json!({
                 "ref_name": ref_name.clone(),
                 "base_root": source.root_id.0.clone(),
-                "workdir": materialized_workdir.clone()
+                "workdir": materialized_workdir.clone(),
+                "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
+                "include_neighbors": include_neighbors
             }),
         )?;
         Ok(LaneSpawnReport {
@@ -368,6 +383,54 @@ impl CrabDb {
         Ok(Some(normalized.into_iter().collect()))
     }
 
+    pub(crate) fn lane_sparse_workdir_paths(
+        &self,
+        branch: &LaneBranch,
+        dir: &Path,
+    ) -> Result<Option<Vec<String>>> {
+        if let Some(paths) = self.sparse_workdir_paths(dir)? {
+            return Ok(Some(paths));
+        }
+        self.lane_sparse_paths_from_metadata(&branch.lane_id)
+    }
+
+    fn lane_sparse_paths_from_metadata(&self, lane_id: &str) -> Result<Option<Vec<String>>> {
+        let metadata_json = self
+            .conn
+            .query_row(
+                "SELECT metadata_json FROM lanes WHERE lane_id = ?1",
+                params![lane_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(metadata_json) = metadata_json else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        let Some(paths) = value.get("sparse_paths") else {
+            return Ok(None);
+        };
+        let Some(paths) = paths.as_array() else {
+            return Err(Error::Corrupt(format!(
+                "invalid sparse path metadata for lane `{lane_id}`"
+            )));
+        };
+        let mut normalized = BTreeSet::new();
+        for path in paths {
+            let Some(path) = path.as_str() else {
+                return Err(Error::Corrupt(format!(
+                    "invalid sparse path metadata entry for lane `{lane_id}`"
+                )));
+            };
+            normalized.insert(normalize_relative_path(path)?);
+        }
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(normalized.into_iter().collect()))
+    }
+
     pub(crate) fn write_sparse_workdir_manifest<'a, I>(&self, dir: &Path, paths: I) -> Result<()>
     where
         I: IntoIterator<Item = &'a String>,
@@ -386,7 +449,7 @@ impl CrabDb {
             "version": 1,
             "materialized_paths": normalized.into_iter().collect::<Vec<_>>()
         });
-        fs::write(manifest, serde_json::to_vec(&body)?)?;
+        write_file_atomic(&manifest, &serde_json::to_vec(&body)?, false)?;
         Ok(())
     }
 
