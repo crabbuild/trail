@@ -107,6 +107,9 @@ apply safely?" requests.
 `crabdb.agent_guide` returns the compact "how do I use CrabDB from here?"
 workflow: current state, one next command, setup/review/apply or recovery steps,
 and the small mental model to show in editor panels.
+`crabdb.agent_ask` routes "show actions", "what can I do?", "show buttons", and
+similar action-palette questions to structured action data so hosts do not need
+the user to remember `agent action`.
 `crabdb.agent_dashboard` returns one compact task board with next action, focus
 file, optional open command, validation status, changed files, risk, and apply
 readiness. `crabdb.agent_review_data` returns one editor-friendly structured
@@ -115,7 +118,10 @@ confidence, validation, risk, readiness, and typed `actions` so hosts do not
 need to stitch multiple reports together or parse suggestions into buttons.
 Each action includes stable ids, enabled state, disabled reason, safety class,
 exact command, optional `mcp_tool`, and optional `mcp_arguments` for direct MCP
-execution.
+execution. CLI/editor hosts can also show the same command palette with
+`crabdb agent action`, run a published id through `crabdb agent action <id>` for
+the latest task, or use `crabdb agent action <task> <id>` for a specific task;
+confirmation-required actions still need `--confirm`.
 `crabdb.agent_review_flow` returns the procedural checklist for one
 task: inspect new changes, mark the checkpoint reviewed, validate, and preview
 finish/apply. Use it for editor "review checklist" or "walk me through review"

@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::command::render::render_agent_timeline;
-use crabdb::{AgentContinueReport, AgentRunReport, StatusSuggestion};
+use crabdb::{AgentContinueReport, AgentReviewAction, AgentRunReport, StatusSuggestion};
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) -> Result<()> {
@@ -16,6 +16,7 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
         Some(AgentSubcommand::Status) => handle_agent_status(ctx),
         Some(AgentSubcommand::Dashboard(args)) => handle_agent_dashboard(ctx, args),
         Some(AgentSubcommand::ReviewData(args)) => handle_agent_review_data(ctx, args),
+        Some(AgentSubcommand::Action(args)) => handle_agent_action(ctx, args),
         Some(AgentSubcommand::ReviewFlow(args)) => handle_agent_review_flow(ctx, args),
         Some(AgentSubcommand::Inbox(args)) => handle_agent_inbox(ctx, args),
         Some(AgentSubcommand::Board(args)) => handle_agent_board(ctx, args),
@@ -293,6 +294,7 @@ enum AgentAskIntent {
     Guide,
     Dashboard,
     ReviewData,
+    Actions,
     Summary,
     Validate,
     TestPlan,
@@ -338,6 +340,17 @@ fn handle_agent_ask(ctx: &RuntimeContext, args: AgentAskArgs) -> Result<()> {
         AgentAskIntent::Guide => handle_agent_guide(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Dashboard => handle_agent_dashboard(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::ReviewData => handle_agent_review_data(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::Actions => handle_agent_action(
+            ctx,
+            AgentActionArgs {
+                selector_or_action: Some(selector),
+                action: None,
+                print: false,
+                confirm: false,
+                message: None,
+                note: None,
+            },
+        ),
         AgentAskIntent::Summary => handle_agent_summary(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Validate => handle_agent_validate(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::TestPlan => handle_agent_test_plan(ctx, AgentSelectorArgs { selector }),
@@ -516,6 +529,28 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
         || lowered.contains("single packet")
     {
         return Ok(AgentAskIntent::ReviewData);
+    }
+    let asks_actions = lowered.contains("action palette")
+        || lowered.contains("actions palette")
+        || lowered.contains("command palette")
+        || lowered.contains("show actions")
+        || lowered.contains("show action")
+        || lowered.contains("list actions")
+        || lowered.contains("available actions")
+        || lowered.contains("what actions")
+        || lowered.contains("which actions")
+        || lowered.contains("buttons")
+        || lowered.contains("show buttons")
+        || lowered.contains("what buttons")
+        || lowered.contains("what can i do")
+        || lowered.contains("what can we do")
+        || lowered.contains("what are my options")
+        || lowered.contains("what options")
+        || lowered.contains("available commands")
+        || lowered.contains("what commands can i run")
+        || lowered.contains("which commands can i run");
+    if path.is_none() && asks_actions {
+        return Ok(AgentAskIntent::Actions);
     }
     let asks_blocker = lowered.contains("what blocks")
         || lowered.contains("what is blocking")
@@ -1235,6 +1270,274 @@ fn handle_agent_review_data(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Re
     render_agent_review_data(&report, ctx.json, ctx.quiet)
 }
 
+fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let (selector, action_id) = agent_action_selector_args(&mut db, &args)?;
+    let review_data = match db.agent_review_data(&selector) {
+        Ok(report) => report,
+        Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
+            if let Some(action_id) = action_id {
+                return handle_agent_empty_action(ctx, &action_id, &args);
+            }
+            return render_agent_empty_action_palette(ctx.json, ctx.quiet);
+        }
+        Err(err) => return Err(err),
+    };
+    let Some(action_id) = action_id else {
+        return render_agent_action_palette(&review_data, ctx.json, ctx.quiet);
+    };
+    let action = review_data
+        .actions
+        .iter()
+        .find(|action| agent_action_matches(action, &action_id))
+        .cloned()
+        .ok_or_else(|| {
+            let known = review_data
+                .actions
+                .iter()
+                .map(|action| action.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Error::InvalidInput(format!(
+                "agent action `{action_id}` was not found for `{selector}`; available actions: {known}"
+            ))
+        })?;
+
+    if args.print {
+        if ctx.json {
+            return render_json(&serde_json::json!({
+                "task": review_data.task,
+                "action": action
+            }));
+        }
+        if !ctx.quiet {
+            println!("{}", action.command);
+        }
+        return Ok(());
+    }
+    if !action.enabled {
+        return Err(Error::InvalidInput(format!(
+            "agent action `{}` is disabled: {}",
+            action.id,
+            action
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("the current task state does not allow it")
+        )));
+    }
+    if action.requires_confirmation && !args.confirm {
+        return Err(Error::InvalidInput(format!(
+            "agent action `{}` requires --confirm because it is `{}`; inspect first with `crabdb agent action {} {} --print`",
+            action.id, action.safety, review_data.task.lane, action.id
+        )));
+    }
+
+    let lane = review_data.task.lane.clone();
+    match action.id.as_str() {
+        "open_focus_file" => run_agent_shell_action(ctx, &action.command),
+        "inspect_focus_file" => {
+            let report = db.agent_focus(&lane, action.path.as_deref(), false)?;
+            render_agent_focus(&report, ctx.json, ctx.quiet)
+        }
+        "show_focus_patch" => {
+            let report = db.agent_focus(&lane, action.path.as_deref(), true)?;
+            render_agent_focus(&report, ctx.json, ctx.quiet)
+        }
+        "mark_focus_file_reviewed" => {
+            let path = action.path.as_deref().ok_or_else(|| {
+                Error::InvalidInput(
+                    "mark_focus_file_reviewed action did not include a file path".to_string(),
+                )
+            })?;
+            let report = db.agent_mark_file_reviewed(&lane, path, args.note)?;
+            render_agent_mark_file_reviewed(&report, ctx.json, ctx.quiet)
+        }
+        "show_review_map" => {
+            let report = db.agent_review_map(&lane)?;
+            render_agent_review_map(&report, ctx.json, ctx.quiet)
+        }
+        "show_test_plan" => {
+            let report = db.agent_test_plan(&lane)?;
+            render_agent_test_plan(&report, ctx.json, ctx.quiet)
+        }
+        "validation_next" => {
+            if ctx.json {
+                return Err(Error::InvalidInput(
+                    "validation_next runs an open-world shell command and cannot produce one JSON report; use --print or run the printed command directly".to_string(),
+                ));
+            }
+            run_agent_shell_action(ctx, &action.command)
+        }
+        "apply_dry_run" => {
+            let report = db.agent_apply(&lane, true, args.message)?;
+            render_agent_apply(&report, ctx.json, ctx.quiet)
+        }
+        "apply_task" => {
+            let report = db.agent_finish(&lane, false, args.message, args.note)?;
+            render_agent_finish(&report, ctx.json, ctx.quiet)
+        }
+        "mark_task_reviewed" => {
+            let report = db.agent_mark_reviewed(&lane, args.note)?;
+            render_agent_mark_reviewed(&report, ctx.json, ctx.quiet)
+        }
+        _ => Err(Error::InvalidInput(format!(
+            "agent action `{}` is not executable by this CrabDB version; run `{}` directly",
+            action.id, action.command
+        ))),
+    }
+}
+
+fn handle_agent_empty_action(
+    ctx: &RuntimeContext,
+    action_id: &str,
+    args: &AgentActionArgs,
+) -> Result<()> {
+    let action = agent_empty_action_palette_actions()
+        .into_iter()
+        .find(|action| agent_action_matches(action, action_id))
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "agent action `{action_id}` was not found; run `crabdb agent action` to see first-run actions"
+            ))
+        })?;
+
+    if args.print {
+        if ctx.json {
+            return render_json(&serde_json::json!({
+                "status": "empty",
+                "task": null,
+                "action": action
+            }));
+        }
+        if !ctx.quiet {
+            println!("{}", action.command);
+        }
+        return Ok(());
+    }
+    if action.requires_confirmation && !args.confirm {
+        return Err(Error::InvalidInput(format!(
+            "agent action `{}` requires --confirm because it is `{}`; inspect first with `crabdb agent action {} --print`",
+            action.id, action.safety, action.id
+        )));
+    }
+
+    match action.id.as_str() {
+        "setup_vscode" => handle_agent_setup(
+            ctx,
+            AgentSetupArgs {
+                provider: "claude-code".to_string(),
+                editor: "vscode".to_string(),
+            },
+        ),
+        "doctor_claude_code" => handle_agent_doctor(
+            ctx,
+            AgentDoctorArgs {
+                provider: "claude-code".to_string(),
+            },
+        ),
+        "start_terminal_task" => handle_agent_start(
+            ctx,
+            AgentStartArgs {
+                provider: "claude-code".to_string(),
+                name: None,
+                from: None,
+                command: Vec::new(),
+            },
+        ),
+        _ => Err(Error::InvalidInput(format!(
+            "agent action `{}` is not executable by this CrabDB version; run `{}` directly",
+            action.id, action.command
+        ))),
+    }
+}
+
+fn agent_action_selector_args(
+    db: &mut crabdb::CrabDb,
+    args: &AgentActionArgs,
+) -> Result<(String, Option<String>)> {
+    match (&args.selector_or_action, &args.action) {
+        (None, None) => Ok(("latest".to_string(), None)),
+        (Some(selector), Some(action)) => Ok((selector.clone(), Some(action.clone()))),
+        (Some(value), None) => match db.agent_review_data("latest") {
+            Ok(latest)
+                if latest
+                    .actions
+                    .iter()
+                    .any(|action| agent_action_matches(action, value)) =>
+            {
+                Ok(("latest".to_string(), Some(value.clone())))
+            }
+            Err(Error::InvalidInput(message))
+                if message.contains("no agent tasks")
+                    && agent_empty_action_palette_actions()
+                        .iter()
+                        .any(|action| agent_action_matches(action, value)) =>
+            {
+                Ok(("latest".to_string(), Some(value.clone())))
+            }
+            _ => Ok((value.clone(), None)),
+        },
+        (None, Some(action)) => Ok(("latest".to_string(), Some(action.clone()))),
+    }
+}
+
+fn agent_action_matches(action: &AgentReviewAction, requested: &str) -> bool {
+    action.id == requested
+        || action.kind == requested
+        || agent_action_key(&action.label) == agent_action_key(requested)
+}
+
+fn agent_action_key(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else if ch == '_' || ch == '-' || ch.is_ascii_whitespace() {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn run_agent_shell_action(ctx: &RuntimeContext, command: &str) -> Result<()> {
+    if ctx.json {
+        return Err(Error::InvalidInput(
+            "shell-backed agent actions cannot produce one JSON report; use --print to inspect the command".to_string(),
+        ));
+    }
+    let shell = std::env::var_os("SHELL")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "sh".into());
+    let status = ProcessCommand::new(shell)
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(Error::from)?;
+    if !status.success() {
+        return Err(Error::InvalidInput(format!(
+            "agent action command failed with status {}: {command}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string())
+        )));
+    }
+    if !ctx.quiet {
+        println!("Agent action command completed: {command}");
+    }
+    Ok(())
+}
+
 fn handle_agent_review_flow(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_review_flow(&args.selector)?;
@@ -1422,15 +1725,25 @@ fn handle_agent_workdir(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result
 
 fn handle_agent_view(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
-    let report = db.agent_task_view(&args.selector)?;
-    render_agent_view(&report, ctx.json, ctx.quiet)
+    match db.agent_task_view(&args.selector) {
+        Ok(report) => render_agent_view(&report, ctx.json, ctx.quiet),
+        Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
+            render_agent_empty_task_hint("view", ctx.json, ctx.quiet)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn handle_agent_changes(ctx: &RuntimeContext, args: AgentChangesArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let _ = args.by_turn;
-    let report = db.agent_changes_with_options(&args.selector, args.by_operation, args.by_file)?;
-    render_agent_changes(&report, ctx.json, ctx.quiet)
+    match db.agent_changes_with_options(&args.selector, args.by_operation, args.by_file) {
+        Ok(report) => render_agent_changes(&report, ctx.json, ctx.quiet),
+        Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
+            render_agent_empty_task_hint("changes", ctx.json, ctx.quiet)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn handle_agent_delta(ctx: &RuntimeContext, args: AgentDeltaArgs) -> Result<()> {
@@ -1658,8 +1971,13 @@ fn handle_agent_open(ctx: &RuntimeContext, args: AgentOpenArgs) -> Result<()> {
 fn handle_agent_apply(ctx: &RuntimeContext, args: AgentApplyArgs) -> Result<()> {
     let _ = args.into_current_git_branch;
     let mut db = open_db(ctx)?;
-    let report = db.agent_apply(&args.selector, args.dry_run, args.message)?;
-    render_agent_apply(&report, ctx.json, ctx.quiet)
+    match db.agent_apply(&args.selector, args.dry_run, args.message) {
+        Ok(report) => render_agent_apply(&report, ctx.json, ctx.quiet),
+        Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
+            render_agent_empty_task_hint("apply", ctx.json, ctx.quiet)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn handle_agent_finish(ctx: &RuntimeContext, args: AgentFinishArgs) -> Result<()> {
@@ -1720,13 +2038,21 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
             "message": profile.notes.join("; ")
         }));
     }
+    let setup_command = if args.provider == "claude-code" {
+        "crabdb agent setup".to_string()
+    } else {
+        format!(
+            "crabdb agent setup --provider {} --editor vscode",
+            args.provider
+        )
+    };
     let report = serde_json::json!({
         "status": status,
         "provider": profile.agent,
         "checks": checks,
         "suggestions": [
             {
-                "command": format!("crabdb agent setup --provider {} --editor vscode", args.provider),
+                "command": setup_command,
                 "reason": "configure an ACP editor with fresh agent lanes"
             }
         ]

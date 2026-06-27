@@ -519,6 +519,39 @@ fn cli_env_defaults_select_workspace_db_branch_and_format() {
 }
 
 #[test]
+fn agent_help_is_curated_and_hidden_commands_still_work() {
+    let help = Command::new(crabdb_bin())
+        .args(["agent", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        help.status.success(),
+        "agent --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("Daily path:"));
+    assert!(stdout.contains("crabdb agent ask what should I do"));
+    assert!(stdout.contains("  action"));
+    assert!(stdout.contains("  changes"));
+    assert!(!stdout.contains("review-data"));
+    assert!(!stdout.contains("turn-diff"));
+
+    let hidden_help = Command::new(crabdb_bin())
+        .args(["agent", "review-data", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        hidden_help.status.success(),
+        "agent review-data --help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&hidden_help.stdout),
+        String::from_utf8_lossy(&hidden_help.stderr)
+    );
+    assert!(String::from_utf8_lossy(&hidden_help.stdout).contains("review-data"));
+}
+
+#[test]
 fn init_record_why_and_fsck_work() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
@@ -789,6 +822,39 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
+    let default_setup = run_crabdb_json(temp.path(), &["agent", "setup"]);
+    assert_eq!(default_setup["provider"], "claude-code");
+    assert_eq!(default_setup["editor"], "vscode");
+    assert!(default_setup["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("CrabDB Claude Code"));
+    assert!(default_setup["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"] == "crabdb agent"));
+    assert!(default_setup["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent doctor")));
+
+    let generic_setup = run_crabdb_json(temp.path(), &["agent", "setup", "--editor", "generic"]);
+    assert_eq!(generic_setup["editor"], "generic");
+    assert!(generic_setup["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("ACP command:"));
+    assert!(generic_setup["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"] == "crabdb agent action"));
+
     let setup = run_crabdb_json(
         temp.path(),
         &[
@@ -831,31 +897,107 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(empty_status["status"], "empty");
     let empty_next = run_crabdb_json(temp.path(), &["agent", "next"]);
     assert_eq!(empty_next["focus"], "setup");
-    assert!(empty_next["primary"]["command"]
+    assert_eq!(empty_next["primary"]["command"], "crabdb agent setup");
+    let empty_actions = run_crabdb_json(temp.path(), &["agent", "action"]);
+    assert_eq!(empty_actions["status"], "empty");
+    assert!(empty_actions["task"].is_null());
+    assert_eq!(empty_actions["next"]["command"], "crabdb agent setup");
+    assert!(empty_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "setup_vscode" && action["command"] == "crabdb agent setup"));
+    assert!(empty_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "start_terminal_task"
+            && action["requires_confirmation"] == true));
+    let empty_ask_actions = run_crabdb_json(temp.path(), &["agent", "ask", "show", "actions"]);
+    assert_eq!(empty_ask_actions["status"], "empty");
+    assert!(empty_ask_actions["task"].is_null());
+    assert!(empty_ask_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "setup_vscode"));
+    let empty_setup_action = run_crabdb_json(temp.path(), &["agent", "action", "setup_vscode"]);
+    assert_eq!(empty_setup_action["provider"], "claude-code");
+    assert_eq!(empty_setup_action["editor"], "vscode");
+    assert!(empty_setup_action["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| part == "agent" || part == "acp"));
+    let empty_doctor_action =
+        run_crabdb_json(temp.path(), &["agent", "action", "doctor_claude_code"]);
+    assert_eq!(empty_doctor_action["provider"], "claude-code");
+    assert!(empty_doctor_action["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "workspace" && check["status"] == "ok"));
+    let empty_start_print = run_crabdb_json(
+        temp.path(),
+        &["agent", "action", "start_terminal_task", "--print"],
+    );
+    assert_eq!(empty_start_print["status"], "empty");
+    assert!(empty_start_print["task"].is_null());
+    assert_eq!(empty_start_print["action"]["id"], "start_terminal_task");
+    assert!(empty_start_print["action"]["command"]
         .as_str()
         .unwrap()
-        .contains("agent setup"));
+        .contains("agent start"));
+    let empty_start_guard = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "action", "start_terminal_task"])
+        .output()
+        .unwrap();
+    assert!(!empty_start_guard.status.success());
+    let empty_start_stderr: serde_json::Value =
+        serde_json::from_slice(&empty_start_guard.stderr).unwrap();
+    assert!(empty_start_stderr["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("requires --confirm"));
+    for (command, requested) in [
+        (vec!["agent", "view", "latest"], "view"),
+        (vec!["agent", "changes", "latest"], "changes"),
+        (vec!["agent", "apply", "latest", "--dry-run"], "apply"),
+    ] {
+        let empty_hint = run_crabdb_json(temp.path(), &command);
+        assert_eq!(empty_hint["status"], "empty");
+        assert!(empty_hint["task"].is_null());
+        assert_eq!(empty_hint["requested"], requested);
+        assert!(empty_hint["summary"]
+            .as_str()
+            .unwrap()
+            .contains("No agent task is recorded yet"));
+        assert!(!empty_hint["summary"]
+            .as_str()
+            .unwrap()
+            .contains("to changes"));
+        assert_eq!(empty_hint["next"]["command"], "crabdb agent setup");
+        assert!(empty_hint["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["id"] == "setup_vscode"));
+    }
     let empty_dashboard = run_crabdb_json(temp.path(), &["agent", "dashboard"]);
     assert_eq!(empty_dashboard["status"], "empty");
     assert!(empty_dashboard["task"].is_null());
-    assert!(empty_dashboard["next"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("agent setup"));
+    assert_eq!(empty_dashboard["next"]["command"], "crabdb agent setup");
     let empty_inbox = run_crabdb_json(temp.path(), &["agent", "inbox"]);
     assert_eq!(empty_inbox["total"], 0);
     assert_eq!(empty_inbox["attention_count"], 0);
     assert_eq!(empty_inbox["items"].as_array().unwrap().len(), 0);
-    assert!(empty_inbox["next"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("agent setup"));
+    assert_eq!(empty_inbox["next"]["command"], "crabdb agent setup");
     let empty_bare_agent = run_crabdb_json(temp.path(), &["agent"]);
     assert_eq!(empty_bare_agent["total"], 0);
-    assert!(empty_bare_agent["next"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("agent setup"));
+    assert_eq!(empty_bare_agent["next"]["command"], "crabdb agent setup");
 
     let doctor = run_crabdb_json(
         temp.path(),
@@ -867,10 +1009,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|check| { check["name"] == "workspace" && check["status"] == "ok" }));
-    assert!(doctor["suggestions"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains("agent setup"));
+    assert_eq!(doctor["suggestions"][0]["command"], "crabdb agent setup");
 
     let first_agent = write_stub_acp_agent(
         temp.path(),
@@ -1081,6 +1220,62 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .contains("agent why"));
     assert!(review_map["areas"][0]["files"][0]["reviewed"].is_null());
+    let action_palette = run_crabdb_json(temp.path(), &["agent", "action"]);
+    assert_eq!(action_palette["task"]["lane"], view["task"]["lane"]);
+    assert!(action_palette["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "inspect_focus_file"));
+    let selected_action_palette = run_crabdb_json(temp.path(), &["agent", "action", "latest"]);
+    assert_eq!(
+        selected_action_palette["task"]["lane"],
+        view["task"]["lane"]
+    );
+    assert_eq!(
+        selected_action_palette["actions"],
+        action_palette["actions"]
+    );
+    let action_print = run_crabdb_json(
+        temp.path(),
+        &["agent", "action", "latest", "show_focus_patch", "--print"],
+    );
+    assert_eq!(action_print["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(action_print["action"]["id"], "show_focus_patch");
+    assert!(action_print["action"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent focus"));
+    let action_focus = run_crabdb_json(temp.path(), &["agent", "action", "inspect_focus_file"]);
+    assert_eq!(action_focus["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(action_focus["path"], "README.md");
+    let confirm_required = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "action", "validation_next"])
+        .output()
+        .unwrap();
+    assert!(!confirm_required.status.success());
+    let confirm_stderr: serde_json::Value =
+        serde_json::from_slice(&confirm_required.stderr).unwrap();
+    assert!(confirm_stderr["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("requires --confirm"));
+    let action_mark_file = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "action",
+            "mark_focus_file_reviewed",
+            "--note",
+            "reviewed via action",
+        ],
+    );
+    assert_eq!(action_mark_file["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(action_mark_file["path"], "README.md");
+    assert_eq!(action_mark_file["marker"]["note"], "reviewed via action");
     let mark_file_reviewed = run_crabdb_json(
         temp.path(),
         &[
@@ -1180,6 +1375,16 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|action| action["id"] == "apply_dry_run" && action["safety"] == "read_only"));
+    let ask_actions = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "actions", "can", "I", "run"],
+    );
+    assert_eq!(ask_actions["task"]["lane"], view["task"]["lane"]);
+    assert!(ask_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "apply_dry_run"));
     let ask_review_map = run_crabdb_json(temp.path(), &["agent", "ask", "review", "map"]);
     assert_eq!(ask_review_map["task"]["lane"], view["task"]["lane"]);
     assert_eq!(ask_review_map["areas"], review_map_after_alias["areas"]);
@@ -1230,6 +1435,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         next["primary"]["command"],
         format!("crabdb agent new {lane}")
     );
+    assert!(next["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"] == format!("crabdb agent action {lane}")));
     assert!(next["suggestions"]
         .as_array()
         .unwrap()
@@ -2662,10 +2872,7 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|step| step["command"]
-            .as_str()
-            .unwrap()
-            .contains("agent setup --provider claude-code")));
+        .any(|step| step["command"] == "crabdb agent setup"));
     let edit_script = temp.path().join("edit-readme.sh");
     fs::write(
         &edit_script,
@@ -2705,6 +2912,11 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .as_str()
         .unwrap()
         .contains("changed file"));
+    assert!(task_guide["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["command"] == format!("crabdb agent action {task_name}")));
     assert!(task_guide["steps"]
         .as_array()
         .unwrap()
@@ -12357,6 +12569,37 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .unwrap()
             .iter()
             .any(|action| action["id"] == "apply_dry_run")
+    );
+    let agent_ask_actions = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 324,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show actions"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_actions["result"]["structuredContent"]["intent"],
+        "actions"
+    );
+    assert_eq!(
+        agent_ask_actions["result"]["structuredContent"]["tool"],
+        "crabdb.agent_review_data"
+    );
+    assert!(
+        agent_ask_actions["result"]["structuredContent"]["report"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["id"] == "mark_focus_file_reviewed")
     );
     let agent_ask_risky_files = crabdb::mcp::handle_json_rpc(
         &mut db,

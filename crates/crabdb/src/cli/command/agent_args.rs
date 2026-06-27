@@ -5,6 +5,7 @@ pub(super) enum AgentSubcommand {
     /// Print editor setup for the high-level agent task workflow.
     Setup(AgentSetupArgs),
     /// Run a stable ACP entrypoint that creates a fresh CrabDB lane per task.
+    #[command(hide = true)]
     Acp(AgentAcpArgs),
     /// Create a fresh materialized task lane and launch a terminal agent.
     Start(AgentStartArgs),
@@ -25,8 +26,12 @@ pub(super) enum AgentSubcommand {
     #[command(visible_alias = "dash")]
     Dashboard(AgentSelectorArgs),
     /// Show one structured review-data packet for editor panels and integrations.
+    #[command(hide = true)]
     #[command(visible_alias = "cockpit", visible_alias = "side-panel")]
     ReviewData(AgentSelectorArgs),
+    /// Run or print one advertised agent action.
+    #[command(visible_alias = "do")]
+    Action(AgentActionArgs),
     /// Walk one task through review, validation, and finish as a guided checklist.
     #[command(visible_alias = "walkthrough", visible_alias = "review-loop")]
     ReviewFlow(AgentSelectorArgs),
@@ -40,51 +45,70 @@ pub(super) enum AgentSubcommand {
     #[command(visible_alias = "order")]
     Stack(AgentInboxArgs),
     /// Show one compact review brief for an agent task.
+    #[command(hide = true)]
     Brief(AgentSelectorArgs),
     /// Show the one-page post-run summary for an agent task.
+    #[command(hide = true)]
     Summary(AgentSelectorArgs),
     /// Suggest validation commands and show latest test/eval gates.
     #[command(visible_alias = "tests")]
     Validate(AgentSelectorArgs),
     /// Plan the exact test/eval checks to run for an agent task.
+    #[command(hide = true)]
     #[command(visible_alias = "validation-plan", visible_alias = "test-checklist")]
     TestPlan(AgentSelectorArgs),
     /// Create a copyable review report for an agent task.
+    #[command(hide = true)]
     Report(AgentReportArgs),
     /// Print a copyable handoff packet for another human or agent.
+    #[command(hide = true)]
     #[command(visible_alias = "share")]
     Handoff(AgentSelectorArgs),
     /// Print a copyable receipt for what an agent task changed and how to land it.
+    #[command(hide = true)]
     Receipt(AgentSelectorArgs),
     /// Print a pull request draft title and body for an agent task.
+    #[command(hide = true)]
     Pr(AgentPrArgs),
     /// Explain what happened in one plain-language task story.
+    #[command(hide = true)]
     Story(AgentSelectorArgs),
     /// Show tool calls, available commands, and the turns/checkpoints around them.
+    #[command(hide = true)]
     Tools(AgentSelectorArgs),
     /// Show touched areas, blast radius, and recommended review/test checks.
+    #[command(hide = true)]
     Impact(AgentSelectorArgs),
     /// Show a file-by-file review map grouped by changed area.
+    #[command(hide = true)]
     #[command(visible_alias = "review-files", visible_alias = "file-checklist")]
     ReviewMap(AgentSelectorArgs),
     /// Summarize apply risk and concrete mitigation steps.
+    #[command(hide = true)]
     Risk(AgentSelectorArgs),
     /// Show one go/no-go confidence verdict across review, validation, risk, and apply preflight.
+    #[command(hide = true)]
     #[command(visible_alias = "go", visible_alias = "go-no-go")]
     Confidence(AgentSelectorArgs),
     /// Check whether an agent task is ready to apply without mutating Git.
+    #[command(hide = true)]
     #[command(visible_alias = "can-land")]
     Ready(AgentSelectorArgs),
     /// Diagnose a stuck or sideways agent task and show safe recovery options.
+    #[command(hide = true)]
     #[command(visible_alias = "recover")]
     Diagnose(AgentSelectorArgs),
     /// Compare two agent tasks and highlight overlap, risk, and apply order.
+    #[command(hide = true)]
     Compare(AgentCompareArgs),
     /// Run a command in the agent task workdir and record a test gate.
+    #[command(hide = true)]
     Test(AgentGateArgs),
     /// Run a command in the agent task workdir and record an eval gate.
+    #[command(hide = true)]
     Eval(AgentGateArgs),
     /// Print the materialized workdir for an agent task.
+    #[command(hide = true)]
     Workdir(AgentSelectorArgs),
     /// List recorded agent tasks.
     List(AgentListArgs),
@@ -99,44 +123,60 @@ pub(super) enum AgentSubcommand {
     #[command(visible_alias = "what-changed")]
     New(AgentNewArgs),
     /// Mark the current task checkpoint as reviewed.
+    #[command(hide = true)]
     #[command(visible_alias = "done")]
     MarkReviewed(AgentMarkReviewedArgs),
     /// Mark one changed file as reviewed at the current task checkpoint.
+    #[command(hide = true)]
     #[command(visible_alias = "done-file", visible_alias = "reviewed-file")]
     MarkFileReviewed(AgentMarkFileReviewedArgs),
     /// Hide a finished or irrelevant task from the default agent inbox.
+    #[command(hide = true)]
     #[command(visible_alias = "close")]
     Archive(AgentArchiveArgs),
     /// Restore an archived task to the default agent inbox.
+    #[command(hide = true)]
     Unarchive(AgentArchiveArgs),
     /// Inspect one high-level change card as a focused change set.
+    #[command(hide = true)]
     Change(AgentChangeArgs),
     /// Show changed files with the turns, prompts, and commands behind each one.
+    #[command(hide = true)]
     #[command(visible_alias = "changed-files")]
     Files(AgentSelectorArgs),
     /// Inspect one changed file with provenance, change cards, and optional patch.
+    #[command(hide = true)]
     #[command(visible_alias = "inspect")]
     File(AgentFileArgs),
     /// List friendly rewind targets and checkpoint ids for an agent task.
+    #[command(hide = true)]
     #[command(visible_alias = "rewind-points")]
     Checkpoints(AgentSelectorArgs),
     /// Show the prompt-to-checkpoint timeline for an agent task.
+    #[command(hide = true)]
     Timeline(AgentTimelineArgs),
     /// Inspect one agent turn with prompt, tools, checkpoint, files, and optional patch.
+    #[command(hide = true)]
     Turn(AgentTurnArgs),
     /// Show the latest or selected turn diff without spelling out diff flags.
+    #[command(hide = true)]
     TurnDiff(AgentTurnDiffArgs),
     /// Explain why a file changed in an agent task.
+    #[command(hide = true)]
     #[command(visible_alias = "explain")]
     Why(AgentWhyArgs),
     /// Show the whole task diff or a single turn/checkpoint/operation diff.
+    #[command(hide = true)]
     Diff(AgentDiffArgs),
     /// Review readiness, transcript, changes, and next steps for an agent task.
+    #[command(hide = true)]
     #[command(visible_alias = "review-plan")]
     Review(AgentSelectorArgs),
     /// Focus the next file to inspect by combining review, why, and diff.
+    #[command(hide = true)]
     Focus(AgentFocusArgs),
     /// Open the focused file in the configured editor.
+    #[command(hide = true)]
     #[command(visible_alias = "edit")]
     Open(AgentOpenArgs),
     /// Safely apply one agent task back to the current Git branch.
@@ -155,9 +195,14 @@ pub(super) enum AgentSubcommand {
 }
 
 #[derive(Args)]
-#[command(
-    after_help = "Run `crabdb agent` with no subcommand to show the current task dashboard, or the grouped inbox when there are multiple tasks."
-)]
+#[command(after_help = "Daily path:
+  crabdb agent guide
+  crabdb agent ask what should I do
+  crabdb agent action
+  crabdb agent changes latest
+  crabdb agent apply latest --dry-run
+
+Run `crabdb agent` with no subcommand to show the current task dashboard, or the grouped inbox when there are multiple tasks. Specialist commands still work; prefer `crabdb agent ask ...` when you do not remember the exact command.")]
 pub(super) struct AgentCommand {
     #[command(subcommand)]
     pub(super) command: Option<AgentSubcommand>,
@@ -167,7 +212,7 @@ pub(super) struct AgentCommand {
 pub(super) struct AgentSetupArgs {
     #[arg(long, default_value = "claude-code")]
     pub(super) provider: String,
-    #[arg(long, default_value = "generic")]
+    #[arg(long, default_value = "vscode")]
     pub(super) editor: String,
 }
 
@@ -250,6 +295,31 @@ pub(super) struct AgentAskArgs {
         help = "Plain-language question, for example: what changed, is it safe, explain README.md"
     )]
     pub(super) question: Vec<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AgentActionArgs {
+    #[arg(
+        value_name = "SELECTOR_OR_ACTION",
+        help = "Action id, or task selector when ACTION is also provided"
+    )]
+    pub(super) selector_or_action: Option<String>,
+    #[arg(
+        value_name = "ACTION",
+        help = "Action id from `crabdb agent review-data`"
+    )]
+    pub(super) action: Option<String>,
+    #[arg(long, help = "Print the underlying command without running it")]
+    pub(super) print: bool,
+    #[arg(
+        long,
+        help = "Required for actions that need confirmation, such as validation and apply"
+    )]
+    pub(super) confirm: bool,
+    #[arg(short, long, help = "Apply/finish commit message for apply actions")]
+    pub(super) message: Option<String>,
+    #[arg(long, help = "Optional note for review/archive marker actions")]
+    pub(super) note: Option<String>,
 }
 
 #[derive(Args)]

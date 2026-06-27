@@ -24,6 +24,7 @@ enum AgentAskRoute {
     Guide,
     Dashboard,
     ReviewData,
+    Actions,
     Summary,
     Validate,
     TestPlan,
@@ -68,6 +69,7 @@ impl AgentAskRoute {
             AgentAskRoute::Guide => "guide",
             AgentAskRoute::Dashboard => "dashboard",
             AgentAskRoute::ReviewData => "review_data",
+            AgentAskRoute::Actions => "actions",
             AgentAskRoute::Summary => "summary",
             AgentAskRoute::Validate => "validate",
             AgentAskRoute::TestPlan => "test_plan",
@@ -112,6 +114,7 @@ impl AgentAskRoute {
             AgentAskRoute::Guide => "crabdb.agent_guide",
             AgentAskRoute::Dashboard => "crabdb.agent_dashboard",
             AgentAskRoute::ReviewData => "crabdb.agent_review_data",
+            AgentAskRoute::Actions => "crabdb.agent_review_data",
             AgentAskRoute::Summary => "crabdb.agent_summary",
             AgentAskRoute::Validate => "crabdb.agent_validate",
             AgentAskRoute::TestPlan => "crabdb.agent_test_plan",
@@ -157,6 +160,7 @@ impl AgentAskRoute {
             AgentAskRoute::Guide => format!("crabdb agent guide {selector}"),
             AgentAskRoute::Dashboard => format!("crabdb agent dashboard {selector}"),
             AgentAskRoute::ReviewData => format!("crabdb agent review-data {selector}"),
+            AgentAskRoute::Actions => format!("crabdb agent action {selector}"),
             AgentAskRoute::Summary => format!("crabdb agent summary {selector}"),
             AgentAskRoute::Validate => format!("crabdb agent validate {selector}"),
             AgentAskRoute::TestPlan => format!("crabdb agent test-plan {selector}"),
@@ -294,6 +298,23 @@ impl CrabDb {
             } else {
                 profile.notes
             },
+            suggestions: vec![
+                StatusSuggestion {
+                    command: format!("crabdb agent doctor --provider {provider}"),
+                    reason: "verify the workspace and provider before the first editor session"
+                        .to_string(),
+                },
+                StatusSuggestion {
+                    command: "crabdb agent".to_string(),
+                    reason: "after one prompt, show the task inbox and next useful action"
+                        .to_string(),
+                },
+                StatusSuggestion {
+                    command: "crabdb agent action".to_string(),
+                    reason: "show runnable setup, review, validation, apply, and recovery actions"
+                        .to_string(),
+                },
+            ],
         })
     }
 
@@ -426,7 +447,7 @@ impl CrabDb {
         let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
-                command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+                command: "crabdb agent setup".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentStackReport {
@@ -541,7 +562,7 @@ impl CrabDb {
         let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
-                command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+                command: "crabdb agent setup".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentInboxReport {
@@ -600,7 +621,7 @@ impl CrabDb {
             })
             .or_else(|| items.first().map(|item| item.next.clone()))
             .unwrap_or_else(|| StatusSuggestion {
-                command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+                command: "crabdb agent setup".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             });
         let mut suggestions = vec![next.clone()];
@@ -645,8 +666,7 @@ impl CrabDb {
                 latest: None,
                 risk: None,
                 suggestions: vec![StatusSuggestion {
-                    command: "crabdb agent setup --provider claude-code --editor vscode"
-                        .to_string(),
+                    command: "crabdb agent setup".to_string(),
                     reason: "configure an editor once, then start an agent task".to_string(),
                 }],
             });
@@ -667,7 +687,7 @@ impl CrabDb {
     pub fn agent_next(&self, selector: &str) -> Result<AgentNextReport> {
         let Some(lane) = self.resolve_agent_selector(selector)? else {
             let primary = StatusSuggestion {
-                command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+                command: "crabdb agent setup".to_string(),
                 reason:
                     "configure an editor once; CrabDB will create fresh task lanes automatically"
                         .to_string(),
@@ -874,6 +894,13 @@ impl CrabDb {
             AgentAskRoute::Guide => serde_json::to_value(self.agent_guide(selector)?)?,
             AgentAskRoute::Dashboard => serde_json::to_value(self.agent_dashboard(selector)?)?,
             AgentAskRoute::ReviewData => serde_json::to_value(self.agent_review_data(selector)?)?,
+            AgentAskRoute::Actions => match self.agent_review_data(selector) {
+                Ok(report) => serde_json::to_value(report)?,
+                Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
+                    agent_empty_action_palette_value()
+                }
+                Err(err) => return Err(err),
+            },
             AgentAskRoute::Summary => serde_json::to_value(self.agent_summary(selector)?)?,
             AgentAskRoute::Validate => serde_json::to_value(self.agent_validate(selector)?)?,
             AgentAskRoute::TestPlan => serde_json::to_value(self.agent_test_plan(selector)?)?,
@@ -4464,6 +4491,28 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
     {
         return Ok(AgentAskRoute::ReviewData);
     }
+    let asks_actions = lowered.contains("action palette")
+        || lowered.contains("actions palette")
+        || lowered.contains("command palette")
+        || lowered.contains("show actions")
+        || lowered.contains("show action")
+        || lowered.contains("list actions")
+        || lowered.contains("available actions")
+        || lowered.contains("what actions")
+        || lowered.contains("which actions")
+        || lowered.contains("buttons")
+        || lowered.contains("show buttons")
+        || lowered.contains("what buttons")
+        || lowered.contains("what can i do")
+        || lowered.contains("what can we do")
+        || lowered.contains("what are my options")
+        || lowered.contains("what options")
+        || lowered.contains("available commands")
+        || lowered.contains("what commands can i run")
+        || lowered.contains("which commands can i run");
+    if path.is_none() && asks_actions {
+        return Ok(AgentAskRoute::Actions);
+    }
     let asks_blocker = lowered.contains("what blocks")
         || lowered.contains("what is blocking")
         || lowered.contains("what's blocking")
@@ -5072,6 +5121,77 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
     )))
 }
 
+fn agent_empty_action_palette_value() -> serde_json::Value {
+    serde_json::json!({
+        "status": "empty",
+        "task": null,
+        "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
+        "next": {
+            "command": "crabdb agent setup",
+            "reason": "print a stable editor config that creates fresh CrabDB tasks automatically"
+        },
+        "actions": agent_empty_action_palette_actions()
+    })
+}
+
+fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
+    vec![
+        agent_static_action(
+            "setup_vscode",
+            "Set up VS Code",
+            "setup",
+            "crabdb agent setup",
+            "print a copyable ACP editor config that creates fresh task lanes automatically",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "doctor_claude_code",
+            "Check Claude Code",
+            "doctor",
+            "crabdb agent doctor --provider claude-code",
+            "verify CrabDB workspace readiness and provider availability",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "start_terminal_task",
+            "Start terminal task",
+            "start",
+            "crabdb agent start --provider claude-code",
+            "launch a fresh materialized terminal task when you are not using an editor",
+            "open_world",
+            true,
+        ),
+    ]
+}
+
+fn agent_static_action(
+    id: &str,
+    label: &str,
+    kind: &str,
+    command: &str,
+    reason: &str,
+    safety: &str,
+    requires_confirmation: bool,
+) -> AgentReviewAction {
+    AgentReviewAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        kind: kind.to_string(),
+        command: command.to_string(),
+        reason: reason.to_string(),
+        enabled: true,
+        disabled_reason: None,
+        safety: safety.to_string(),
+        requires_confirmation,
+        path: None,
+        open_path: None,
+        mcp_tool: None,
+        mcp_arguments: None,
+    }
+}
+
 fn agent_ask_tokens(question: &str) -> Vec<String> {
     question
         .split_whitespace()
@@ -5338,7 +5458,7 @@ fn agent_inbox_next_for_task(task: &AgentTaskReport) -> StatusSuggestion {
     let lane = &task.lane;
     match &task.status {
         AgentTaskStatus::Empty => StatusSuggestion {
-            command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+            command: "crabdb agent setup".to_string(),
             reason: "configure an editor once, then start an agent task".to_string(),
         },
         AgentTaskStatus::Active => StatusSuggestion {
@@ -5636,7 +5756,7 @@ fn agent_guide_steps(
         return vec![
             agent_guide_step(
                 "Connect an editor",
-                "crabdb agent setup --provider claude-code --editor vscode",
+                "crabdb agent setup",
                 "print a stable ACP editor config that creates fresh CrabDB tasks automatically",
                 "once per editor setup",
             ),
@@ -5663,6 +5783,13 @@ fn agent_guide_steps(
         primary.reason.clone(),
         "right now",
     )];
+    agent_push_guide_step(
+        &mut steps,
+        "Show actions",
+        format!("crabdb agent action {lane}"),
+        "list the safe review, validation, apply, and recovery actions CrabDB can run for this task",
+        "whenever you want a small command palette instead of remembering commands",
+    );
 
     match task.status {
         AgentTaskStatus::Active => {
@@ -11441,7 +11568,7 @@ fn agent_risk_summary(level: &AgentRiskLevel, score: u8, task: &AgentTaskReport)
 fn agent_task_suggestions(lane: &str, status: &AgentTaskStatus) -> Vec<StatusSuggestion> {
     match status {
         AgentTaskStatus::Empty => vec![StatusSuggestion {
-            command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+            command: "crabdb agent setup".to_string(),
             reason: "configure an editor once, then start an agent task".to_string(),
         }],
         AgentTaskStatus::Dirty => vec![StatusSuggestion {
@@ -11484,7 +11611,7 @@ fn agent_next_report_from_view(
             "setup",
             "No agent task is available.",
             StatusSuggestion {
-                command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+                command: "crabdb agent setup".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             },
         ),
@@ -11566,6 +11693,10 @@ fn agent_next_suggestions(
     };
 
     if view.task.status != AgentTaskStatus::Empty {
+        push(
+            format!("crabdb agent action {lane}"),
+            "show the available action palette for this task",
+        );
         push(
             format!("crabdb agent story {lane}"),
             "read the plain-language task summary",

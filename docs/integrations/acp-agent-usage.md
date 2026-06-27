@@ -23,7 +23,7 @@ side is provider-neutral.
 For day-to-day editor use, generate a stable high-level command:
 
 ```sh
-crabdb agent setup --provider claude-code --editor vscode
+crabdb agent setup
 ```
 
 The generated editor entry runs:
@@ -60,7 +60,7 @@ Confirm the provider profile:
 
 ```sh
 crabdb agent doctor --provider claude-code
-crabdb agent setup --provider claude-code --editor vscode
+crabdb agent setup
 crabdb acp list
 ```
 
@@ -96,7 +96,7 @@ and editing without touching your active branch.
 Prefer the high-level setup command:
 
 ```sh
-crabdb agent setup --provider claude-code --editor vscode
+crabdb agent setup
 crabdb agent setup --provider claude-code --editor zed
 ```
 
@@ -156,6 +156,7 @@ crabdb agent ask what changed in the last prompt
 crabdb agent ask what changed in README.md in the last prompt
 crabdb agent ask show transcript
 crabdb agent ask show dashboard
+crabdb agent ask show actions
 crabdb agent ask what should I review
 crabdb agent ask what should I review first
 crabdb agent ask what file should I review first
@@ -420,7 +421,13 @@ Expected signals:
   risk, readiness, typed actions, and next commands in one structured report.
   Each action has a stable id, label, safety class, enabled state, exact command,
   disabled reason, optional MCP tool, and optional MCP arguments so an editor can
-  render and execute buttons without guessing or parsing shell text.
+  render and execute buttons without guessing or parsing shell text. Use
+  `agent action` to list actions for the latest task, `agent action <id>` to run
+  one, or `agent action <task> <id>` for a specific task; add `--print` to
+  inspect the command and `--confirm` for validation/apply actions that require
+  explicit confirmation. Before the first task exists, `agent action` shows
+  runnable setup, doctor, and terminal-start actions instead of failing; for
+  example, `crabdb agent action setup_vscode` prints the VS Code setup report.
 - `agent review-flow latest` walks the task through inspect, mark reviewed,
   validate, and finish as one checklist. Use this after an editor agent finishes
   when you do not want to remember which CrabDB command comes next.

@@ -78,9 +78,13 @@ let state: WebviewState = {
 };
 let announcement = "";
 let composerDraft = "";
-const restoredState = vscode.getState() as { composerDraft?: string } | undefined;
+let reviewVisible = false;
+const restoredState = vscode.getState() as { composerDraft?: string; reviewVisible?: boolean } | undefined;
 if (typeof restoredState?.composerDraft === "string") {
   composerDraft = restoredState.composerDraft;
+}
+if (typeof restoredState?.reviewVisible === "boolean") {
+  reviewVisible = restoredState.reviewVisible;
 }
 
 window.addEventListener("message", (event: MessageEvent) => {
@@ -110,7 +114,7 @@ window.addEventListener("message", (event: MessageEvent) => {
     } else if (state.sending) {
       announcement = "Prompt running.";
     }
-    vscode.setState({ composerDraft });
+    persistWebviewState();
     render();
     return;
   }
@@ -179,8 +183,17 @@ document.addEventListener("click", (event) => {
     vscode.postMessage({ type: "runEvals" });
   } else if (name === "openWorkdir") {
     vscode.postMessage({ type: "openWorkdir" });
+  } else if (name === "toggleReview") {
+    reviewVisible = !reviewVisible;
+    persistWebviewState();
+    render();
+    if (reviewVisible) {
+      focusReview();
+    }
   } else if (name === "focusReview") {
     focusReview();
+  } else if (name === "openSettings") {
+    vscode.postMessage({ type: "openSettings" });
   } else if (name === "startFollowUp") {
     vscode.postMessage({ type: "startFollowUp" });
     focusComposer();
@@ -240,7 +253,7 @@ document.addEventListener("input", (event) => {
   const target = event.target as HTMLInputElement | HTMLTextAreaElement | null;
   if (target?.classList.contains("composer-input")) {
     composerDraft = target.value;
-    vscode.setState({ composerDraft });
+    persistWebviewState();
   } else if (target?.classList.contains("terminal-search") && target instanceof HTMLInputElement) {
     filterTerminalOutput(target);
   }
@@ -336,7 +349,7 @@ function render(): void {
     : true;
   const previousScrollTop = oldTimeline?.scrollTop ?? 0;
   app.innerHTML = `
-    <section class="shell">
+    <section class="shell ${reviewVisible ? "review-open" : ""}">
       <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(announcement)}</div>
       ${skipLinks()}
       ${header(task)}
@@ -346,7 +359,7 @@ function render(): void {
         ${visibleNodes.length ? visibleNodes.map(renderNode).join("") : emptyTimeline()}
       </section>
       ${composer()}
-      ${reviewDrawer(task)}
+      ${reviewVisible ? reviewDrawer(task) : ""}
     </section>
   `;
   const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
@@ -370,7 +383,7 @@ function skipLinks(): string {
     <nav class="skip-links" aria-label="Chat landmarks">
       <a href="#timeline">Transcript</a>
       <a href="#composer">Composer</a>
-      <a href="#review">Review</a>
+      ${reviewVisible ? `<a href="#review">Review</a>` : `<button data-action="toggleReview">Review</button>`}
       <span aria-hidden="true">Alt+1/2/3</span>
     </nav>
   `;
@@ -470,8 +483,13 @@ function header(task: WebviewState["task"]): string {
       </div>
       <div class="header-actions">
         ${usage ? contextMeter(usage.used, usage.size) : ""}
+        ${iconButton("toggleReview", reviewVisible ? "Hide review" : "Open review", "review", {
+          className: reviewVisible ? "active" : "",
+          attrs: `aria-pressed="${reviewVisible ? "true" : "false"}"`
+        })}
         ${iconButton("refresh", "Refresh task", "refresh")}
         ${iconButton("openDiff", "Open diff", "diff")}
+        ${iconButton("openSettings", "Open CrabDB settings", "settings")}
         ${iconButton("dryRunApply", "Dry-run apply", "check", { className: "primary" })}
         ${iconButton("cancel", "Cancel current turn", "stop", { className: "danger", disabled: !state.sending && !state.permissionPending })}
       </div>
@@ -572,19 +590,154 @@ function planNode(node: Extract<RenderNode, { kind: "plan" }>): string {
   `;
 }
 
-function toolNode(node: Extract<RenderNode, { kind: "tool" }>): string {
-  const risky = ["delete", "execute"].includes(node.toolKind) || node.toolStatus === "failed";
+type ToolNodeView = Extract<RenderNode, { kind: "tool" }>;
+
+function toolVisual(kind: ToolNodeView["toolKind"]): {
+  label: string;
+  description: string;
+  icon: IconName;
+  tone: "default" | "file" | "change" | "query" | "terminal" | "risk";
+} {
+  switch (kind) {
+    case "read":
+      return { label: "Read", description: "Inspecting workspace context", icon: "file", tone: "file" };
+    case "edit":
+      return { label: "Edit", description: "Changing file content", icon: "changed", tone: "change" };
+    case "delete":
+      return { label: "Delete", description: "Removing a file or resource", icon: "close", tone: "risk" };
+    case "move":
+      return { label: "Move", description: "Moving or renaming a path", icon: "changed", tone: "change" };
+    case "search":
+      return { label: "Search", description: "Finding matches in the workspace", icon: "search", tone: "query" };
+    case "execute":
+      return { label: "Run", description: "Executing a command", icon: "terminal", tone: "terminal" };
+    case "think":
+      return { label: "Think", description: "Planning or reasoning", icon: "review", tone: "default" };
+    case "fetch":
+      return { label: "Fetch", description: "Reading an external or linked resource", icon: "open", tone: "query" };
+    case "switch_mode":
+      return { label: "Mode", description: "Changing provider session mode", icon: "settings", tone: "default" };
+    default:
+      return { label: "Tool", description: "Provider tool call", icon: "settings", tone: "default" };
+  }
+}
+
+function isRiskyTool(node: ToolNodeView): boolean {
+  return ["delete", "execute"].includes(node.toolKind) || node.toolStatus === "failed";
+}
+
+function toolStatusLabel(status: string): string {
+  switch (status) {
+    case "in_progress":
+      return "running";
+    case "completed":
+      return "done";
+    case "failed":
+      return "failed";
+    case "pending":
+      return "pending";
+    default:
+      return status;
+  }
+}
+
+function toolStats(node: ToolNodeView): Array<[string, string]> {
+  const diffBlocks = node.content.filter((item) => asRecord(item).type === "diff");
+  const terminalBlocks = node.content.filter((item) => asRecord(item).type === "terminal");
+  const contentBlocks = node.content.filter((item) => asRecord(item).type === "content");
+  const stats: Array<[string, string]> = [];
+  if (node.locations.length) {
+    stats.push([`location${node.locations.length === 1 ? "" : "s"}`, String(node.locations.length)]);
+  }
+  if (diffBlocks.length) {
+    stats.push([`diff${diffBlocks.length === 1 ? "" : "s"}`, String(diffBlocks.length)]);
+  }
+  if (terminalBlocks.length) {
+    stats.push([`terminal${terminalBlocks.length === 1 ? "" : "s"}`, String(terminalBlocks.length)]);
+  }
+  if (contentBlocks.length) {
+    stats.push([`content block${contentBlocks.length === 1 ? "" : "s"}`, String(contentBlocks.length)]);
+  }
+  if (!stats.length) {
+    stats.push(["state", toolStatusLabel(node.toolStatus)]);
+  }
+  return stats.slice(0, 4);
+}
+
+function toolInputSummary(node: ToolNodeView): string {
+  const input = asRecord(node.rawInput);
+  if (!Object.keys(input).length) {
+    return "";
+  }
+  const command = terminalCommand(input);
+  const facts: Array<[string, string]> = [];
+  const path = stringChoice(input, ["path", "file", "filePath", "target", "targetPath"]);
+  const from = stringChoice(input, ["from", "oldPath", "source", "sourcePath"]);
+  const to = stringChoice(input, ["to", "newPath", "destination", "destinationPath"]);
+  const query = stringChoice(input, ["query", "pattern", "regex", "search"]);
+  const url = stringChoice(input, ["url", "uri", "href"]);
+  const cwd = stringChoice(input, ["cwd", "workingDirectory", "working_directory"]);
+  const line = numberChoice(input, ["line", "startLine", "start_line"]);
+  if (path) {
+    facts.push(["Path", path]);
+  }
+  if (from || to) {
+    facts.push(["Move", [from, to].filter(Boolean).join(" -> ")]);
+  }
+  if (query) {
+    facts.push(["Query", query]);
+  }
+  if (url) {
+    facts.push(["Resource", url]);
+  }
+  if (command) {
+    facts.push(["Command", command]);
+  }
+  if (cwd) {
+    facts.push(["Cwd", cwd]);
+  }
+  if (typeof line === "number") {
+    facts.push(["Line", String(line)]);
+  }
+  if (!facts.length) {
+    return "";
+  }
   return `
-    <article id="${nodeDomId(node.id)}" class="turn-card tool ${risky ? "risky" : ""}">
+    <dl class="tool-facts">
+      ${facts
+        .slice(0, 5)
+        .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(shortLabel(redactString(value)))}</dd></div>`)
+        .join("")}
+    </dl>
+  `;
+}
+
+function toolNode(node: Extract<RenderNode, { kind: "tool" }>): string {
+  const visual = toolVisual(node.toolKind);
+  const risky = isRiskyTool(node);
+  const open = risky || node.toolStatus === "in_progress";
+  const stats = toolStats(node);
+  return `
+    <article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(node.toolKind)} ${risky ? "risky" : ""}">
       <div class="rail"></div>
-      <details class="card-body" ${risky ? "open" : ""}>
-        <summary>
-          <span class="tool-kind">${escapeHtml(node.toolKind)}</span>
-          <span>${escapeHtml(node.title)}</span>
-          <span class="tool-status">${escapeHtml(node.toolStatus)}</span>
+      <details class="card-body tool-card tool-tone-${visual.tone}" ${open ? "open" : ""}>
+        <summary class="tool-summary">
+          <span class="tool-icon">${iconSvg(visual.icon)}</span>
+          <span class="tool-summary-main">
+            <span class="tool-title">${escapeHtml(node.title || visual.label)}</span>
+            <span class="tool-subtitle">${escapeHtml(visual.description)}</span>
+          </span>
+          <span class="tool-summary-meta">
+            <span class="tool-kind">${escapeHtml(visual.label)}</span>
+            <span class="tool-status tool-status-${escapeClass(node.toolStatus)}">${escapeHtml(toolStatusLabel(node.toolStatus))}</span>
+          </span>
         </summary>
+        <div class="tool-overview">
+          ${stats.map(([label, value]) => `<span><b>${escapeHtml(value)}</b>${escapeHtml(label)}</span>`).join("")}
+        </div>
+        ${toolInputSummary(node)}
         ${node.locations.length ? `<div class="chips">${node.locations.map((loc) => locationChip(String(loc.path || ""), typeof loc.line === "number" ? loc.line : undefined)).join("")}</div>` : ""}
-        ${node.content.length ? `<div class="tool-content">${node.content.map(renderToolContent).join("")}</div>` : ""}
+        ${node.content.length ? `<div class="tool-content">${node.content.map(renderToolContent).join("")}</div>` : `<p class="muted">No rendered tool output yet.</p>`}
         ${node.rawInput || node.rawOutput ? rawDetails({ input: node.rawInput, output: node.rawOutput }) : ""}
       </details>
     </article>
@@ -592,13 +745,21 @@ function toolNode(node: Extract<RenderNode, { kind: "tool" }>): string {
 }
 
 function diffNode(node: Extract<RenderNode, { kind: "diff" }>): string {
+  const stats = diffStats(node.oldText || "", node.newText);
   return `
     <article id="${nodeDomId(node.id)}" class="turn-card diff">
       <div class="rail"></div>
-      <details class="card-body">
-        <summary>
-          <span class="tool-kind">diff</span>
-          <span>${escapeHtml(node.path)}</span>
+      <details class="card-body diff-card">
+        <summary class="tool-summary">
+          <span class="tool-icon">${iconSvg("diff")}</span>
+          <span class="tool-summary-main">
+            <span class="tool-title">${escapeHtml(node.path)}</span>
+            <span class="tool-subtitle">${escapeHtml(diffSummaryText(stats))}</span>
+          </span>
+          <span class="tool-summary-meta">
+            <span class="diff-stat additions">+${stats.additions}</span>
+            <span class="diff-stat deletions">-${stats.deletions}</span>
+          </span>
         </summary>
         <div class="inline-actions">${iconButton("openNodeDiff", "Open native diff", "diff", { attrs: `data-node-id="${escapeHtml(node.id)}"` })}</div>
         ${codeBlock(compactDiff(node.oldText || "", node.newText), { language: "diff", title: node.path })}
@@ -802,9 +963,12 @@ function renderToolContent(content: unknown): string {
   }
   if (type === "diff") {
     const path = String(record.path || "Tool diff");
+    const oldText = String(record.oldText || "");
+    const newText = String(record.newText || "");
+    const stats = diffStats(oldText, newText);
     return codeBlock(compactDiff(String(record.oldText || ""), String(record.newText || "")), {
       language: "diff",
-      title: path
+      title: `${path} (${diffSummaryText(stats)})`
     });
   }
   if (type === "terminal") {
@@ -1011,38 +1175,42 @@ function composer(): string {
   const placeholder = state.permissionPending ? "Permission pending" : "Message agent";
   return `
     <section id="composer" class="composer" aria-label="Prompt composer" tabindex="-1">
-      <div class="composer-tools">
-        <span class="provider-chip">${escapeHtml(state.provider || "provider")}</span>
-        ${providerSelector(disabled)}
-        ${sessionControlSelectors()}
-        ${capabilityChips()}
-        <span class="composer-icon-tools" role="group" aria-label="Context attachments">
-          ${iconButton("attachSelection", "Attach the current editor selection", "selection", { disabled: controlsDisabled })}
-          ${iconButton("attachFile", "Attach the active file", "file", { disabled: controlsDisabled })}
-          ${iconButton("attachDiagnostics", "Attach diagnostics for the active file", "diagnostics", { disabled: controlsDisabled })}
-          ${iconButton("attachTerminalOutput", "Attach the latest terminal output from this chat", "terminal", { disabled: controlsDisabled })}
-          ${iconButton("attachChangedFiles", "Attach the changed file list for this task", "changed", { disabled: controlsDisabled })}
-          ${iconButton("attachHistory", "Attach CrabDB history for the active file", "history", { disabled: controlsDisabled })}
-          ${iconButton("rewind", "Rewind latest turn", "rewind")}
-        </span>
-      </div>
-      ${
-        attachments.length
-          ? `<div class="attachments" aria-label="Attached context">${attachments
-              .map(
-                (attachment) =>
-                  `<span class="attachment-chip"><b>${escapeHtml(attachment.kind)}</b>${escapeHtml(shortLabel(attachment.label))}<small>${escapeHtml(attachmentMode(attachment))}</small>${iconButton("removeAttachment", `Remove ${attachment.label}`, "close", { attrs: `data-attachment-id="${escapeHtml(attachment.id)}"`, className: "micro" })}</span>`
-              )
-              .join("")}</div>`
-          : ""
-      }
-      <textarea class="composer-input" rows="4" placeholder="${escapeHtml(placeholder)}" aria-keyshortcuts="Enter Control+Enter Meta+Enter" ${disabled}>${escapeHtml(composerDraft)}</textarea>
-      <div class="composer-actions">
-        <span>${attachments.length} attachment${attachments.length === 1 ? "" : "s"}</span>
-        ${iconButton("send", state.permissionPending ? "Permission required before sending" : state.sending ? "Sending prompt" : "Send prompt", "send", {
-          className: "primary send-button",
-          disabled: controlsDisabled
-        })}
+      <div class="composer-box">
+        <div class="composer-topbar">
+          <div class="composer-session">
+            <span class="provider-chip">${escapeHtml(state.provider || "provider")}</span>
+            ${providerSelector(disabled)}
+            ${sessionControlSelectors()}
+          </div>
+          ${capabilityChips()}
+        </div>
+        ${
+          attachments.length
+            ? `<div class="attachments" aria-label="Attached context">${attachments
+                .map(
+                  (attachment) =>
+                    `<span class="attachment-chip"><b>${escapeHtml(attachment.kind)}</b>${escapeHtml(shortLabel(attachment.label))}<small>${escapeHtml(attachmentMode(attachment))}</small>${iconButton("removeAttachment", `Remove ${attachment.label}`, "close", { attrs: `data-attachment-id="${escapeHtml(attachment.id)}"`, className: "micro" })}</span>`
+                )
+                .join("")}</div>`
+            : ""
+        }
+        <textarea class="composer-input" rows="4" placeholder="${escapeHtml(placeholder)}" aria-keyshortcuts="Enter Control+Enter Meta+Enter" ${disabled}>${escapeHtml(composerDraft)}</textarea>
+        <div class="composer-actions">
+          <span class="composer-count">${attachments.length} attachment${attachments.length === 1 ? "" : "s"}</span>
+          <span class="composer-icon-tools" role="group" aria-label="Context attachments">
+            ${iconButton("attachSelection", "Attach the current editor selection", "selection", { disabled: controlsDisabled })}
+            ${iconButton("attachFile", "Attach the active file", "file", { disabled: controlsDisabled })}
+            ${iconButton("attachDiagnostics", "Attach diagnostics for the active file", "diagnostics", { disabled: controlsDisabled })}
+            ${iconButton("attachTerminalOutput", "Attach the latest terminal output from this chat", "terminal", { disabled: controlsDisabled })}
+            ${iconButton("attachChangedFiles", "Attach the changed file list for this task", "changed", { disabled: controlsDisabled })}
+            ${iconButton("attachHistory", "Attach CrabDB history for the active file", "history", { disabled: controlsDisabled })}
+            ${iconButton("rewind", "Rewind latest turn", "rewind")}
+            ${iconButton("send", state.permissionPending ? "Permission required before sending" : state.sending ? "Sending prompt" : "Send prompt", "send", {
+              className: "primary send-button",
+              disabled: controlsDisabled
+            })}
+          </span>
+        </div>
       </div>
     </section>
   `;
@@ -1262,6 +1430,11 @@ function focusTranscript(): void {
 }
 
 function focusReview(): void {
+  if (!reviewVisible) {
+    reviewVisible = true;
+    persistWebviewState();
+    render();
+  }
   const review = document.querySelector<HTMLElement>(".review-drawer");
   if (!review) {
     return;
@@ -1694,6 +1867,22 @@ function markdownInline(text: string): string {
     .replace(/\n/g, "<br>");
 }
 
+function diffStats(oldText: string, newText: string): { additions: number; deletions: number; kind: string } {
+  const oldLines = oldText ? oldText.split("\n").filter((line, index, lines) => line || index < lines.length - 1).length : 0;
+  const newLines = newText ? newText.split("\n").filter((line, index, lines) => line || index < lines.length - 1).length : 0;
+  if (!oldText && newText) {
+    return { additions: newLines, deletions: 0, kind: "created" };
+  }
+  if (oldText && !newText) {
+    return { additions: 0, deletions: oldLines, kind: "deleted" };
+  }
+  return { additions: newLines, deletions: oldLines, kind: "changed" };
+}
+
+function diffSummaryText(stats: { additions: number; deletions: number; kind: string }): string {
+  return `${stats.kind} with ${stats.additions} new line${stats.additions === 1 ? "" : "s"} and ${stats.deletions} old line${stats.deletions === 1 ? "" : "s"}`;
+}
+
 function compactDiff(oldText: string, newText: string): string {
   if (!oldText) {
     return `+ ${newText.split("\n").slice(0, 80).join("\n+ ")}`;
@@ -1952,8 +2141,11 @@ type IconName =
   | "open"
   | "refresh"
   | "rewind"
+  | "review"
+  | "search"
   | "selection"
   | "send"
+  | "settings"
   | "stop"
   | "terminal";
 
@@ -1994,10 +2186,16 @@ function iconSvg(icon: IconName): string {
       return `${open}<path d="M4 7a6 6 0 0 1 10-3l2 2"/><path d="M16 2v4h-4"/><path d="M16 13a6 6 0 0 1-10 3l-2-2"/><path d="M4 18v-4h4"/></svg>`;
     case "rewind":
       return `${open}<path d="M11 6l-6 4 6 4V6z"/><path d="M17 6l-6 4 6 4V6z"/></svg>`;
+    case "review":
+      return `${open}<path d="M6 4h8"/><path d="M6 8h8"/><path d="M6 12h5"/><path d="M4 4h.01"/><path d="M4 8h.01"/><path d="M4 12h.01"/><path d="M13 15l2 2 3-5"/></svg>`;
+    case "search":
+      return `${open}<circle cx="9" cy="9" r="5"/><path d="M13 13l4 4"/></svg>`;
     case "selection":
       return `${open}<rect x="4" y="4" width="12" height="12" rx="2" stroke-dasharray="2 2"/><path d="M8 8h4"/><path d="M8 12h2"/></svg>`;
     case "send":
       return `${open}<path d="M3 10l14-7-4 14-3-6-7-1z"/><path d="M10 11l7-8"/></svg>`;
+    case "settings":
+      return `${open}<circle cx="10" cy="10" r="2.5"/><path d="M10 3v2"/><path d="M10 15v2"/><path d="M4.4 5.2l1.4 1.4"/><path d="M14.2 13.4l1.4 1.4"/><path d="M3 10h2"/><path d="M15 10h2"/><path d="M4.4 14.8l1.4-1.4"/><path d="M14.2 6.6l1.4-1.4"/></svg>`;
     case "stop":
       return `${open}<rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`;
     case "terminal":
@@ -2005,6 +2203,10 @@ function iconSvg(icon: IconName): string {
     default:
       return `${open}<circle cx="10" cy="10" r="6"/></svg>`;
   }
+}
+
+function persistWebviewState(): void {
+  vscode.setState({ composerDraft, reviewVisible });
 }
 
 function unsupportedContent(label: string, detail: unknown): string {

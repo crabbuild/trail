@@ -9,6 +9,7 @@ import { attachmentFromSelectionOrFile } from "./model/VsCodePromptAttachments";
 import { ChatPanel } from "./views/ChatPanel";
 import { DiffContentProvider } from "./views/DiffContentProvider";
 import { laneGateLabel, promptLaneGateRequest, type LaneGateKind } from "./views/LaneGatePrompts";
+import { SettingsPanel } from "./views/SettingsPanel";
 import { TasksTreeProvider } from "./views/TasksTreeProvider";
 import { redactedJson } from "./shared/securityRedaction";
 
@@ -273,6 +274,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const result = await requireRepository(repository).doctor(provider);
       output.appendLine(redactedJson(result));
       vscode.window.showInformationMessage(`CrabDB doctor finished for ${provider}.`);
+    }),
+    command("crabdb.openSettings", async () => {
+      SettingsPanel.open(context.extensionUri, requireWorkspaceRoot());
     }),
     command("crabdb.addAcpProvider", async () => {
       await vscode.commands.executeCommand("workbench.action.openSettings", "crabdb.customProviders");

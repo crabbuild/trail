@@ -1205,6 +1205,7 @@ pub struct AgentSetupReport {
     pub snippet: String,
     pub detected: bool,
     pub warnings: Vec<String>,
+    pub suggestions: Vec<StatusSuggestion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

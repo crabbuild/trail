@@ -22,7 +22,7 @@ Print editor configuration that creates a fresh CrabDB task lane for each ACP
 session:
 
 ```sh
-crabdb agent setup --provider claude-code --editor vscode
+crabdb agent setup
 ```
 
 After one prompt:

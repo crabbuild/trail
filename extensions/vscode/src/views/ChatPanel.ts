@@ -231,6 +231,9 @@ export class ChatPanel {
       case "showAcpLogs":
         this.output.show(true);
         break;
+      case "openSettings":
+        await vscode.commands.executeCommand("crabdb.openSettings");
+        break;
       case "cancel":
         this.cancelCurrentTurn();
         break;

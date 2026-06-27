@@ -34,6 +34,7 @@ export async function run(): Promise<void> {
     "crabdb.refreshTasks",
     "crabdb.startDaemon",
     "crabdb.doctor",
+    "crabdb.openSettings",
     "crabdb.addAcpProvider",
     "crabdb.askSelection",
     "crabdb.attachSelection",

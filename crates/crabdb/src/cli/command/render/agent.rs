@@ -21,6 +21,12 @@ pub(crate) fn render_agent_setup(report: &AgentSetupReport, json: bool, quiet: b
         }
         println!("Snippet:");
         println!("{}", report.snippet);
+        println!("Next steps:");
+        println!("  Paste the snippet into your editor's ACP custom-agent settings.");
+        for suggestion in &report.suggestions {
+            println!("  {}", suggestion.command);
+            println!("  {}", suggestion.reason);
+        }
     }
     Ok(())
 }
@@ -155,6 +161,11 @@ pub(crate) fn render_agent_dashboard(
         println!("Next:");
         println!("  {}", report.next.command);
         println!("  {}", report.next.reason);
+        if let Some(task) = &report.task {
+            println!("Actions:");
+            println!("  crabdb agent action {}", task.lane);
+            println!("  show runnable review, validation, apply, and recovery actions");
+        }
         if report.suggestions.len() > 1 {
             println!("Useful commands:");
             for suggestion in report.suggestions.iter().skip(1) {
@@ -230,8 +241,8 @@ pub(crate) fn render_agent_review_data(
                     ""
                 };
                 println!(
-                    "  {} [{}: {}{}]",
-                    action.label, state, action.safety, confirmation
+                    "  {} ({}) [{}: {}{}]",
+                    action.label, action.id, state, action.safety, confirmation
                 );
                 println!("    {}", action.command);
                 println!("    {}", action.reason);
@@ -243,6 +254,199 @@ pub(crate) fn render_agent_review_data(
         print_suggestions(&report.suggestions);
     }
     Ok(())
+}
+
+pub(crate) fn render_agent_action_palette(
+    report: &AgentReviewDataReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(&serde_json::json!({
+            "task": &report.task,
+            "summary": &report.summary,
+            "next": &report.next,
+            "actions": &report.actions
+        }));
+    }
+    if !quiet {
+        println!("Agent actions: {}", agent_task_display_title(&report.task));
+        print_agent_task_id_if_needed(&report.task);
+        println!("{}", report.summary);
+        if report.actions.is_empty() {
+            println!("No actions are currently available.");
+        } else {
+            println!("Actions:");
+            for action in &report.actions {
+                let state = if action.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let confirmation = if action.requires_confirmation {
+                    ", confirmation"
+                } else {
+                    ""
+                };
+                println!(
+                    "  {}  {} [{}: {}{}]",
+                    action.id, action.label, state, action.safety, confirmation
+                );
+                println!(
+                    "    Run: crabdb agent action {} {}",
+                    report.task.lane, action.id
+                );
+                println!(
+                    "    Print: crabdb agent action {} {} --print",
+                    report.task.lane, action.id
+                );
+                println!("    {}", action.reason);
+                if let Some(reason) = &action.disabled_reason {
+                    println!("    Disabled: {reason}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_empty_action_palette(json: bool, quiet: bool) -> Result<()> {
+    let summary = "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.";
+    let next = StatusSuggestion {
+        command: "crabdb agent setup".to_string(),
+        reason: "print a stable editor config that creates fresh CrabDB tasks automatically"
+            .to_string(),
+    };
+    let actions = agent_empty_action_palette_actions();
+    if json {
+        return render_json(&serde_json::json!({
+            "status": "empty",
+            "task": null,
+            "summary": summary,
+            "next": &next,
+            "actions": &actions
+        }));
+    }
+    if !quiet {
+        println!("Agent actions: no agent task yet");
+        println!("{summary}");
+        println!("Next:");
+        println!("  {}", next.command);
+        println!("  {}", next.reason);
+        println!("Actions:");
+        for action in &actions {
+            let confirmation = if action.requires_confirmation {
+                ", confirmation"
+            } else {
+                ""
+            };
+            println!(
+                "  {}  {} [enabled: {}{}]",
+                action.id, action.label, action.safety, confirmation
+            );
+            println!("    Command: {}", action.command);
+            println!("    {}", action.reason);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_empty_task_hint(requested: &str, json: bool, quiet: bool) -> Result<()> {
+    let summary = match requested {
+        "changes" => "No agent task is recorded yet, so there are no agent changes to inspect. Set up an editor, verify the provider, or start a terminal task.".to_string(),
+        "apply" => "No agent task is recorded yet, so there is nothing to apply. Set up an editor, verify the provider, or start a terminal task.".to_string(),
+        "view" => "No agent task is recorded yet, so there is no task to view. Set up an editor, verify the provider, or start a terminal task.".to_string(),
+        _ => format!(
+            "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task before running `{requested}`."
+        ),
+    };
+    let next = StatusSuggestion {
+        command: "crabdb agent setup".to_string(),
+        reason: "print a stable editor config that creates fresh CrabDB tasks automatically"
+            .to_string(),
+    };
+    let actions = agent_empty_action_palette_actions();
+    if json {
+        return render_json(&serde_json::json!({
+            "status": "empty",
+            "task": null,
+            "requested": requested,
+            "summary": summary,
+            "next": &next,
+            "actions": &actions
+        }));
+    }
+    if !quiet {
+        println!("Agent {requested}: no agent task yet");
+        println!("{summary}");
+        println!("Next:");
+        println!("  {}", next.command);
+        println!("  {}", next.reason);
+        println!("Other useful commands:");
+        for action in &actions {
+            println!("  {}", action.command);
+            println!("  {}", action.reason);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
+    vec![
+        agent_static_action(
+            "setup_vscode",
+            "Set up VS Code",
+            "setup",
+            "crabdb agent setup",
+            "print a copyable ACP editor config that creates fresh task lanes automatically",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "doctor_claude_code",
+            "Check Claude Code",
+            "doctor",
+            "crabdb agent doctor --provider claude-code",
+            "verify CrabDB workspace readiness and provider availability",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "start_terminal_task",
+            "Start terminal task",
+            "start",
+            "crabdb agent start --provider claude-code",
+            "launch a fresh materialized terminal task when you are not using an editor",
+            "open_world",
+            true,
+        ),
+    ]
+}
+
+fn agent_static_action(
+    id: &str,
+    label: &str,
+    kind: &str,
+    command: &str,
+    reason: &str,
+    safety: &str,
+    requires_confirmation: bool,
+) -> AgentReviewAction {
+    AgentReviewAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        kind: kind.to_string(),
+        command: command.to_string(),
+        reason: reason.to_string(),
+        enabled: true,
+        disabled_reason: None,
+        safety: safety.to_string(),
+        requires_confirmation,
+        path: None,
+        open_path: None,
+        mcp_tool: None,
+        mcp_arguments: None,
+    }
 }
 
 pub(crate) fn render_agent_review_flow(

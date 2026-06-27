@@ -41,7 +41,7 @@ Starts the MCP stdio server.
 
 ```text
 crabdb agent
-crabdb agent setup --provider claude-code [--editor generic|vscode|zed]
+crabdb agent setup [--provider claude-code] [--editor vscode|zed|generic]
 crabdb agent acp --provider claude-code [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 crabdb agent start --provider claude-code [--name <NAME>] [--from <REF>] [-- <COMMAND>...]
 crabdb agent continue [latest|<TASK_OR_LANE_OR_SESSION>] [--provider <PROVIDER>] [--name <NAME>] [-- <COMMAND>...]
@@ -63,6 +63,8 @@ crabdb agent dash [latest|<TASK_OR_LANE_OR_SESSION>]
 crabdb agent review-data [latest|<TASK_OR_LANE_OR_SESSION>]
 crabdb agent cockpit [latest|<TASK_OR_LANE_OR_SESSION>]
 crabdb agent side-panel [latest|<TASK_OR_LANE_OR_SESSION>]
+crabdb agent action [[latest|<TASK_OR_LANE_OR_SESSION>] <ACTION_ID>] [--print] [--confirm]
+crabdb agent do [[latest|<TASK_OR_LANE_OR_SESSION>] <ACTION_ID>] [--print] [--confirm]
 crabdb agent review-flow [latest|<TASK_OR_LANE_OR_SESSION>]
 crabdb agent walkthrough [latest|<TASK_OR_LANE_OR_SESSION>]
 crabdb agent review-loop [latest|<TASK_OR_LANE_OR_SESSION>]
@@ -141,10 +143,23 @@ by default, resolves `latest`, records dirty lane workdirs before apply, checks
 that the current Git tree matches CrabDB's internal apply base, creates a Git
 commit, and fast-forwards only when safe.
 
+`crabdb agent setup` defaults to Claude Code plus VS Code. Use
+`--editor zed` or `--editor generic` when you want another tested snippet. The
+setup report includes the editor snippet plus copyable next commands for doctor,
+the task inbox, and the action palette.
+
 Run bare `crabdb agent` when you are not sure what to do next. It opens the
 agent inbox home view, groups tasks by what needs attention, shows new
 files/lines since the last review, names the first file to inspect, and prints
 one primary next command. It is equivalent to `crabdb agent inbox`.
+
+`crabdb agent --help` is curated for the common workflow. Specialist commands
+such as editor packets, focused file provenance, turn diffs, and copyable
+reports remain available and documented, but the top-level help keeps the first
+screen centered on guide, ask, actions, changes, validation, apply, and recovery.
+If no task exists yet, daily-path commands such as `agent view latest`,
+`agent changes latest`, and `agent apply latest --dry-run` return setup guidance
+and first-run actions instead of a dead-end error.
 
 Use `agent ask` when you do not remember a command name. It deterministically
 routes common plain-language questions to existing views, so JSON and human
@@ -180,6 +195,7 @@ needs attention`, `crabdb agent ask what should I do next`,
 `crabdb agent ask any red flags`,
 `crabdb agent ask what should I worry about`,
 `crabdb agent ask which files are risky`,
+`crabdb agent ask show actions`,
 `crabdb agent ask what should I put in the PR`,
 `crabdb agent ask give me a summary to share`,
 `crabdb agent ask what commit message should I use`,
@@ -220,8 +236,9 @@ latest task risk level so the first status check carries a safety signal.
 
 Use `agent dashboard latest` when you want one compact task board before
 deciding what command to run. It combines the next action, focus file, open
-command, validation status, changed files, risk, and apply readiness. `agent
-dash` is an alias.
+command, validation status, changed files, risk, and apply readiness. Human
+output also points to `agent action <task>` as the small command palette for
+review, validation, apply, and recovery. `agent dash` is an alias.
 
 Use `agent review-data latest` when an editor side panel or integration needs
 one structured packet instead of calling dashboard, review-map, changes,
@@ -230,8 +247,14 @@ review map, changes by file, confidence, validation, risk, readiness, and next
 commands. It also includes typed actions with stable ids, labels, safety
 classes, enabled state, disabled reasons, file paths, MCP tool names, MCP
 arguments, and exact commands so UIs can render buttons without parsing
-suggestions or shell strings. `agent cockpit` and
-`agent side-panel` are aliases.
+suggestions or shell strings. Use `agent action` to list actions for the latest
+task, `agent action <id>` to execute one for the latest task, or
+`agent action <task> <id>` for a specific task. `--print` shows the command
+without running it; actions marked as confirmation-required need `--confirm`.
+Before the first task exists, `agent action` shows runnable setup, doctor, and
+terminal-start actions instead of failing; for example,
+`crabdb agent action setup_vscode` prints the VS Code setup report. `agent
+cockpit` and `agent side-panel` are aliases.
 
 Use `agent review-flow latest` when you want CrabDB to walk the task through
 review rather than make you chain commands manually. It returns a checklist for
