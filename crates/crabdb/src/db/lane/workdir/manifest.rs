@@ -481,6 +481,40 @@ mod tests {
     }
 
     #[test]
+    fn workdir_manifest_from_materialization_stamps_detects_dirty_file() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let stamps = db.scan_workdir_file_stamps(workdir.path()).unwrap();
+
+        db.write_clean_workdir_manifest_from_stamps(
+            workdir.path(),
+            &head.root_id,
+            &files,
+            files.keys(),
+            stamps,
+        )
+        .unwrap();
+        fs::write(workdir.path().join("a.txt"), "a1\ndirty\n").unwrap();
+
+        match db
+            .cached_workdir_manifest_status(workdir.path(), &head.root_id)
+            .unwrap()
+        {
+            CachedWorkdirManifestStatus::Dirty {
+                disk_manifest,
+                candidate_paths: Some(candidate_paths),
+            } => {
+                assert_ne!(
+                    disk_manifest["a.txt"].content_hash,
+                    files["a.txt"].content_hash
+                );
+                assert!(candidate_paths.contains(&"a.txt".to_string()));
+            }
+            _ => panic!("expected dirty manifest status"),
+        }
+    }
+
+    #[test]
     fn workdir_manifest_from_materialization_stamps_rejects_missing_stamp() {
         let (_workspace, workdir, db, head, files) =
             workdir_manifest_from_materialization_stamps_fixture();

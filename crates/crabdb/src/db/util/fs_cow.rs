@@ -462,4 +462,43 @@ mod tests {
         assert!(report.is_none());
         assert!(!output.path().join("a.txt").exists());
     }
+
+    #[test]
+    fn parallel_cow_clone_probe_rejects_stale_first_stamp_before_workers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let a_bytes = b"a1\n";
+        let b_bytes = b"b1\n";
+        fs::write(workspace.path().join("a.txt"), a_bytes).unwrap();
+        fs::write(workspace.path().join("b.txt"), b_bytes).unwrap();
+
+        let mut target = BTreeMap::new();
+        target.insert("a.txt".to_string(), parallel_cow_clone_test_entry(a_bytes));
+        target.insert("b.txt".to_string(), parallel_cow_clone_test_entry(b_bytes));
+
+        let mut a_stamp = WorktreeFileStamp::from_metadata(
+            &fs::symlink_metadata(workspace.path().join("a.txt")).unwrap(),
+        );
+        a_stamp.size_bytes += 1;
+        let b_stamp = WorktreeFileStamp::from_metadata(
+            &fs::symlink_metadata(workspace.path().join("b.txt")).unwrap(),
+        );
+        let source_stamps = BTreeMap::from([
+            ("a.txt".to_string(), a_stamp),
+            ("b.txt".to_string(), b_stamp),
+        ]);
+
+        let report = materialize_from_workspace_cow_report(
+            workspace.path(),
+            output.path(),
+            &target,
+            &source_stamps,
+            false,
+        )
+        .unwrap();
+
+        assert!(report.is_none());
+        assert!(!output.path().join("a.txt").exists());
+        assert!(!output.path().join("b.txt").exists());
+    }
 }
