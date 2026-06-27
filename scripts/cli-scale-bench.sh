@@ -464,7 +464,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
     "materialize": False,
 }))
 PY
-    run_http_timed "$scale" daemon_agent_spawn "$DAEMON_URL" POST /v1/agents "$WORK/daemon-spawn.json"
+    run_http_timed "$scale" daemon_agent_spawn "$DAEMON_URL" POST /v1/lanes "$WORK/daemon-spawn.json"
     python3 - "$REPO" "$WORK/daemon-patch.json" "$scale" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -482,25 +482,25 @@ for i in range(max(1, min(25, files // 400))):
     })
 json.dump({"message": "scale daemonbot", "edits": edits}, out.open("w"))
 PY
-    run_http_timed "$scale" daemon_agent_patch "$DAEMON_URL" POST /v1/agents/daemonbot/patches "$WORK/daemon-patch.json"
+    run_http_timed "$scale" daemon_agent_patch "$DAEMON_URL" POST /v1/lanes/daemonbot/patches "$WORK/daemon-patch.json"
     python3 - "$WORK/daemon-read.json" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
     "path": "README.md",
 }))
 PY
-    run_http_timed "$scale" daemon_agent_read "$DAEMON_URL" POST /v1/agents/daemonbot/read-file "$WORK/daemon-read.json"
-    run_http_timed "$scale" daemon_agent_readiness "$DAEMON_URL" GET /v1/agents/daemonbot/readiness
+    run_http_timed "$scale" daemon_agent_read "$DAEMON_URL" POST /v1/lanes/daemonbot/read-file "$WORK/daemon-read.json"
+    run_http_timed "$scale" daemon_agent_readiness "$DAEMON_URL" GET /v1/lanes/daemonbot/readiness
     python3 - "$WORK/daemon-merge.json" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
-    "agent": "daemonbot",
+    "lane_id": "daemonbot",
     "dry_run": True,
 }))
 PY
-    run_http_timed "$scale" daemon_merge_dry_run "$DAEMON_URL" POST /v1/branches/main/merge-agent "$WORK/daemon-merge.json"
+    run_http_timed "$scale" daemon_merge_dry_run "$DAEMON_URL" POST /v1/branches/main/merge-lane "$WORK/daemon-merge.json"
     run_timed "$scale" daemon_auto_cli_status "$BIN" --workspace "$REPO" --json status
-    run_timed "$scale" daemon_auto_cli_agent_readiness "$BIN" --workspace "$REPO" --json agent readiness daemonbot
+    run_timed "$scale" daemon_auto_cli_agent_readiness "$BIN" --workspace "$REPO" --json lane readiness daemonbot
     run_timed "$scale" daemon_cli_status "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
     run_timed "$scale" daemon_cli_diff_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json diff --dirty
     run_timed "$scale" daemon_cli_mutate_worktree python3 - "$REPO" "$scale" <<'PY'
@@ -517,11 +517,11 @@ PY
     run_without_daemon_endpoint "$scale" daemon_persisted_snapshot_diff_dirty "$BIN" "$REPO" diff --dirty
     run_timed "$scale" daemon_cli_record_dirty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json record -m "scale daemon CLI dirty record"
     run_timed "$scale" daemon_cli_status_after_record "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
-    run_timed "$scale" daemon_cli_agent_spawn "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent spawn daemonclibot --from main --no-materialize
-    run_timed "$scale" daemon_cli_agent_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent list
-    run_timed "$scale" daemon_cli_agent_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent show daemonclibot
-    run_timed "$scale" daemon_cli_agent_workdir "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent workdir daemonclibot
-    run_timed "$scale" daemon_cli_agent_claim "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent claim daemonclibot README.md --ttl-secs 120
+    run_timed "$scale" daemon_cli_agent_spawn "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane spawn daemonclibot --from main --no-materialize
+    run_timed "$scale" daemon_cli_agent_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane list
+    run_timed "$scale" daemon_cli_agent_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane show daemonclibot
+    run_timed "$scale" daemon_cli_agent_workdir "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane workdir daemonclibot
+    run_timed "$scale" daemon_cli_agent_claim "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane claim daemonclibot README.md --ttl-secs 120
     run_timed "$scale" daemon_cli_lease_acquire "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lease acquire daemonclibot --path pkg_00000/module_000.rs --ttl-secs 120
     DAEMON_CLI_LEASE_ID="$(python3 - "$WORK/out/daemon_cli_lease_acquire.stdout" <<'PY'
 import json, pathlib, sys
@@ -537,7 +537,7 @@ print(json.loads(pathlib.Path(sys.argv[1]).read_text())["session"]["session_id"]
 PY
 )"
     run_timed "$scale" daemon_cli_session_current "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session current daemonclibot
-    run_timed "$scale" daemon_cli_session_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session list --agent daemonclibot
+    run_timed "$scale" daemon_cli_session_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session list --lane daemonclibot
     run_timed "$scale" daemon_cli_session_context "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session context "$DAEMON_CLI_SESSION_ID" --limit 5
     run_timed "$scale" daemon_cli_approval_request "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals request daemonclibot --action scale-check --summary "scale daemon CLI approval" --session "$DAEMON_CLI_SESSION_ID" --payload-json '{"scale":"daemon-cli"}'
     DAEMON_CLI_APPROVAL_ID="$(python3 - "$WORK/out/daemon_cli_approval_request.stdout" <<'PY'
@@ -545,17 +545,17 @@ import json, pathlib, sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text())["approval"]["approval_id"])
 PY
 )"
-    run_timed "$scale" daemon_cli_approval_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals list --agent daemonclibot --status pending
+    run_timed "$scale" daemon_cli_approval_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals list --lane daemonclibot --status pending
     run_timed "$scale" daemon_cli_approval_decide "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json approvals decide "$DAEMON_CLI_APPROVAL_ID" --decision approved --reviewer scale
     run_timed "$scale" daemon_cli_session_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json session end "$DAEMON_CLI_SESSION_ID" --status completed
-    run_timed "$scale" daemon_cli_agent_turn_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn start daemonclibot --from main --title "scale daemon CLI turn"
+    run_timed "$scale" daemon_cli_agent_turn_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn start daemonclibot --from main --title "scale daemon CLI turn"
     DAEMON_CLI_TURN_ID="$(python3 - "$WORK/out/daemon_cli_agent_turn_start.stdout" <<'PY'
 import json, pathlib, sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text())["turn"]["turn_id"])
 PY
 )"
-    run_timed "$scale" daemon_cli_agent_turn_message "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn message "$DAEMON_CLI_TURN_ID" --role user --text "scale daemon CLI turn message"
-    run_timed "$scale" daemon_cli_agent_turn_event "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn event "$DAEMON_CLI_TURN_ID" --event-type checkpoint --payload-json '{"scale":"daemon-cli-turn"}'
+    run_timed "$scale" daemon_cli_agent_turn_message "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn message "$DAEMON_CLI_TURN_ID" --role user --text "scale daemon CLI turn message"
+    run_timed "$scale" daemon_cli_agent_turn_event "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn event "$DAEMON_CLI_TURN_ID" --event-type checkpoint --payload-json '{"scale":"daemon-cli-turn"}'
     python3 - "$WORK/daemon-cli-turn-patch.json" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
@@ -567,20 +567,20 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
     }],
 }))
 PY
-    run_timed "$scale" daemon_cli_agent_turn_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn apply-patch "$DAEMON_CLI_TURN_ID" --patch "$WORK/daemon-cli-turn-patch.json"
-    run_timed "$scale" daemon_cli_agent_turn_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn show "$DAEMON_CLI_TURN_ID"
-    run_timed "$scale" daemon_cli_agent_trace_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace start "$DAEMON_CLI_TURN_ID" --type tool_call --name daemon-cli-scale
+    run_timed "$scale" daemon_cli_agent_turn_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn apply-patch "$DAEMON_CLI_TURN_ID" --patch "$WORK/daemon-cli-turn-patch.json"
+    run_timed "$scale" daemon_cli_agent_turn_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn show "$DAEMON_CLI_TURN_ID"
+    run_timed "$scale" daemon_cli_agent_trace_start "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace start "$DAEMON_CLI_TURN_ID" --type tool_call --name daemon-cli-scale
     read -r DAEMON_CLI_SPAN_ID DAEMON_CLI_TRACE_ID < <(python3 - "$WORK/out/daemon_cli_agent_trace_start.stdout" <<'PY'
 import json, pathlib, sys
 span = json.loads(pathlib.Path(sys.argv[1]).read_text())["span"]
 print(span["span_id"], span["trace_id"])
 PY
 )
-    run_timed "$scale" daemon_cli_agent_trace_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace end "$DAEMON_CLI_SPAN_ID" --status completed
-    run_timed "$scale" daemon_cli_agent_trace_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace list --turn "$DAEMON_CLI_TURN_ID" --limit 20
-    run_timed "$scale" daemon_cli_agent_trace_summary "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace summary --trace-id "$DAEMON_CLI_TRACE_ID" --slowest 3
-    run_timed "$scale" daemon_cli_agent_trace_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent trace show "$DAEMON_CLI_SPAN_ID"
-    run_timed "$scale" daemon_cli_agent_turn_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent turn end "$DAEMON_CLI_TURN_ID" --status completed
+    run_timed "$scale" daemon_cli_agent_trace_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace end "$DAEMON_CLI_SPAN_ID" --status completed
+    run_timed "$scale" daemon_cli_agent_trace_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace list --turn "$DAEMON_CLI_TURN_ID" --limit 20
+    run_timed "$scale" daemon_cli_agent_trace_summary "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace summary --trace-id "$DAEMON_CLI_TRACE_ID" --slowest 3
+    run_timed "$scale" daemon_cli_agent_trace_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace show "$DAEMON_CLI_SPAN_ID"
+    run_timed "$scale" daemon_cli_agent_turn_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn end "$DAEMON_CLI_TURN_ID" --status completed
     python3 - "$REPO" "$WORK/daemon-cli-patch.json" "$scale" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -598,20 +598,20 @@ for i in range(max(1, min(25, files // 400))):
     })
 json.dump({"message": "scale daemonclibot", "edits": edits}, out.open("w"))
 PY
-    run_timed "$scale" daemon_cli_agent_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent apply-patch daemonclibot --patch "$WORK/daemon-cli-patch.json"
-    run_timed "$scale" daemon_cli_agent_read "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent read daemonclibot README.md
-    run_timed "$scale" daemon_cli_agent_diff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent diff daemonclibot
+    run_timed "$scale" daemon_cli_agent_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane apply-patch daemonclibot --patch "$WORK/daemon-cli-patch.json"
+    run_timed "$scale" daemon_cli_agent_read "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane read daemonclibot README.md
+    run_timed "$scale" daemon_cli_agent_diff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane diff daemonclibot
     run_timed "$scale" daemon_cli_why "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json why README.md:1
     run_timed "$scale" daemon_cli_history "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json history README.md
     run_timed "$scale" daemon_cli_code_from "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json code-from daemonclibot
-    run_timed "$scale" daemon_cli_agent_readiness "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent readiness daemonclibot
-    run_timed "$scale" daemon_cli_agent_contribution "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent contribution daemonclibot
-    run_timed "$scale" daemon_cli_agent_gates "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent gates daemonclibot
-    run_timed "$scale" daemon_cli_agent_events "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent events --agent daemonclibot
-    run_timed "$scale" daemon_cli_agent_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent timeline daemonclibot --limit 20
-    run_timed "$scale" daemon_cli_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json timeline --agent daemonclibot --limit 20
-    run_timed "$scale" daemon_cli_agent_handoff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json agent handoff daemonclibot
-    run_timed "$scale" daemon_cli_merge_dry_run "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-agent daemonclibot --into main --dry-run
+    run_timed "$scale" daemon_cli_agent_readiness "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane readiness daemonclibot
+    run_timed "$scale" daemon_cli_agent_contribution "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane contribution daemonclibot
+    run_timed "$scale" daemon_cli_agent_gates "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane gates daemonclibot
+    run_timed "$scale" daemon_cli_agent_events "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane events --lane daemonclibot
+    run_timed "$scale" daemon_cli_agent_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane timeline daemonclibot --limit 20
+    run_timed "$scale" daemon_cli_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json timeline --lane daemonclibot --limit 20
+    run_timed "$scale" daemon_cli_agent_handoff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane handoff daemonclibot
+    run_timed "$scale" daemon_cli_merge_dry_run "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-lane daemonclibot --into main --dry-run
     run_timed "$scale" daemon_cli_merge_queue_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue list
     run_timed "$scale" daemon_cli_merge_queue_run_empty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue run
     DAEMON_RSS="$(daemon_rss_bytes "$DAEMON_PID")"
@@ -620,8 +620,8 @@ PY
     trap - EXIT
   fi
 
-  run_timed "$scale" agent_spawn_headless "$BIN" --workspace "$REPO" --json agent spawn patchbot --from main --no-materialize
-  run_timed "$scale" agent_read_headless "$BIN" --workspace "$REPO" --json agent read patchbot README.md
+  run_timed "$scale" agent_spawn_headless "$BIN" --workspace "$REPO" --json lane spawn patchbot --from main --no-materialize
+  run_timed "$scale" agent_read_headless "$BIN" --workspace "$REPO" --json lane read patchbot README.md
   python3 - "$REPO" "$WORK/patchbot.json" "$scale" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -639,12 +639,12 @@ for i in range(max(1, min(50, files // 200))):
     })
 json.dump({"message": "scale patchbot", "edits": edits}, out.open("w"))
 PY
-  run_timed "$scale" agent_apply_patch "$BIN" --workspace "$REPO" --json agent apply-patch patchbot --patch "$WORK/patchbot.json"
-  run_timed "$scale" agent_readiness "$BIN" --workspace "$REPO" --json agent readiness patchbot
-  run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json merge-agent patchbot --into main --dry-run
-  run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json merge-agent patchbot --into main
+  run_timed "$scale" agent_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch patchbot --patch "$WORK/patchbot.json"
+  run_timed "$scale" agent_readiness "$BIN" --workspace "$REPO" --json lane readiness patchbot
+  run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main --dry-run
+  run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main
 
-  run_timed "$scale" agent_spawn_queuebot "$BIN" --workspace "$REPO" --json agent spawn queuebot --from main --no-materialize
+  run_timed "$scale" agent_spawn_queuebot "$BIN" --workspace "$REPO" --json lane spawn queuebot --from main --no-materialize
   python3 - "$REPO" "$WORK/queuebot.json" "$scale" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -662,21 +662,21 @@ for i in range(max(1, min(25, files // 400))):
     })
 json.dump({"message": "scale queuebot", "edits": edits}, out.open("w"))
 PY
-  run_timed "$scale" queuebot_apply_patch "$BIN" --workspace "$REPO" --json agent apply-patch queuebot --patch "$WORK/queuebot.json"
+  run_timed "$scale" queuebot_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch queuebot --patch "$WORK/queuebot.json"
   run_timed "$scale" merge_queue_add "$BIN" --workspace "$REPO" --json merge-queue add queuebot --into main
   run_timed "$scale" merge_queue_run "$BIN" --workspace "$REPO" --json merge-queue run
 
   if [ "$RUN_MATERIALIZED" = "1" ]; then
-    run_timed "$scale" agent_spawn_sparse "$BIN" --workspace "$REPO" --json agent spawn sparsebot --from main --paths README.md
-    run_timed "$scale" agent_status_sparse "$BIN" --workspace "$REPO" --json agent status sparsebot
-    run_timed "$scale" agent_read_sparse_nohydrate "$BIN" --workspace "$REPO" --json agent read sparsebot pkg_00000/module_001.rs
-    run_timed "$scale" agent_read_sparse_hydrate "$BIN" --workspace "$REPO" --json agent read sparsebot pkg_00000/module_003.rs --hydrate
-    run_timed "$scale" agent_read_sparse_hydrate_neighbors "$BIN" --workspace "$REPO" --json agent read sparsebot pkg_00000/module_002.rs --hydrate --include-neighbors
-    run_timed "$scale" agent_sync_sparse_file "$BIN" --workspace "$REPO" --json agent sync-workdir sparsebot --paths pkg_00000/module_000.rs
-    run_timed "$scale" agent_sync_sparse_dir "$BIN" --workspace "$REPO" --json agent sync-workdir sparsebot --paths pkg_00000
-    run_timed "$scale" agent_status_sparse_hydrated "$BIN" --workspace "$REPO" --json agent status sparsebot
-    run_timed "$scale" agent_spawn_materialized "$BIN" --workspace "$REPO" --json agent spawn matbot --from main --materialize
-    run_timed "$scale" agent_status_materialized "$BIN" --workspace "$REPO" --json agent status matbot
+    run_timed "$scale" agent_spawn_sparse "$BIN" --workspace "$REPO" --json lane spawn sparsebot --from main --paths README.md
+    run_timed "$scale" agent_status_sparse "$BIN" --workspace "$REPO" --json lane status sparsebot
+    run_timed "$scale" agent_read_sparse_nohydrate "$BIN" --workspace "$REPO" --json lane read sparsebot pkg_00000/module_001.rs
+    run_timed "$scale" agent_read_sparse_hydrate "$BIN" --workspace "$REPO" --json lane read sparsebot pkg_00000/module_003.rs --hydrate
+    run_timed "$scale" agent_read_sparse_hydrate_neighbors "$BIN" --workspace "$REPO" --json lane read sparsebot pkg_00000/module_002.rs --hydrate --include-neighbors
+    run_timed "$scale" agent_sync_sparse_file "$BIN" --workspace "$REPO" --json lane sync-workdir sparsebot --paths pkg_00000/module_000.rs
+    run_timed "$scale" agent_sync_sparse_dir "$BIN" --workspace "$REPO" --json lane sync-workdir sparsebot --paths pkg_00000
+    run_timed "$scale" agent_status_sparse_hydrated "$BIN" --workspace "$REPO" --json lane status sparsebot
+    run_timed "$scale" agent_spawn_materialized "$BIN" --workspace "$REPO" --json lane spawn matbot --from main --materialize
+    run_timed "$scale" agent_status_materialized "$BIN" --workspace "$REPO" --json lane status matbot
     MATBOT_WORKDIR="$(python3 - "$WORK/out/agent_spawn_materialized.stdout" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("workdir")
@@ -695,8 +695,8 @@ for i in range(max(1, min(25, files // 400))):
     with path.open("a") as fh:
         fh.write(f"\n// materialized record {i}\n")
 PY
-      run_timed "$scale" agent_record_materialized "$BIN" --workspace "$REPO" --json agent record matbot -m "scale materialized record"
-      run_timed "$scale" agent_status_materialized_recorded "$BIN" --workspace "$REPO" --json agent status matbot
+      run_timed "$scale" agent_record_materialized "$BIN" --workspace "$REPO" --json lane record matbot -m "scale materialized record"
+      run_timed "$scale" agent_status_materialized_recorded "$BIN" --workspace "$REPO" --json lane status matbot
     fi
   fi
 

@@ -1,8 +1,9 @@
 use super::*;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 pub(crate) enum WorkspaceCowMaterializeStatus {
-    Cloned,
+    Cloned(WorkdirFileStamp),
     Skipped,
     Unavailable,
 }
@@ -14,26 +15,99 @@ pub(crate) fn materialize_from_workspace_cow(
     source_stamps: &BTreeMap<String, WorktreeFileStamp>,
     durable: bool,
 ) -> Result<bool> {
+    Ok(materialize_from_workspace_cow_report(
+        workspace_root,
+        output_root,
+        target,
+        source_stamps,
+        durable,
+    )?
+    .is_some())
+}
+
+pub(crate) fn materialize_from_workspace_cow_report(
+    workspace_root: &Path,
+    output_root: &Path,
+    target: &BTreeMap<String, FileEntry>,
+    source_stamps: &BTreeMap<String, WorktreeFileStamp>,
+    durable: bool,
+) -> Result<Option<MaterializedWorkdir>> {
     reject_case_insensitive_collisions(output_root, target)?;
-    for (path, entry) in target {
-        let Some(source_stamp) = source_stamps.get(path) else {
-            return Ok(false);
-        };
-        match materialize_workspace_file_cow_status_if_stamp_matches(
-            workspace_root,
-            output_root,
-            path,
-            entry,
-            *source_stamp,
-            durable,
-        )? {
-            WorkspaceCowMaterializeStatus::Cloned => {}
-            WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable => {
-                return Ok(false);
+    let mut iter = target.iter();
+    let Some((first_path, first_entry)) = iter.next() else {
+        return Ok(Some(MaterializedWorkdir::default()));
+    };
+    let Some(first_source_stamp) = source_stamps.get(first_path) else {
+        return Ok(None);
+    };
+
+    let mut report = MaterializedWorkdir::default();
+    match materialize_workspace_file_cow_status_if_stamp_matches(
+        workspace_root,
+        output_root,
+        first_path,
+        first_entry,
+        *first_source_stamp,
+        durable,
+    )? {
+        WorkspaceCowMaterializeStatus::Cloned(stamp) => {
+            report.insert_stamp(first_path.clone(), stamp);
+        }
+        WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable => {
+            return Ok(None);
+        }
+    }
+
+    let remaining = iter.collect::<Vec<_>>();
+    let results = remaining
+        .par_iter()
+        .map(|(path, entry)| {
+            let status = if let Some(source_stamp) = source_stamps.get(*path) {
+                materialize_workspace_file_cow_status_if_stamp_matches(
+                    workspace_root,
+                    output_root,
+                    path,
+                    entry,
+                    *source_stamp,
+                    durable,
+                )?
+            } else {
+                WorkspaceCowMaterializeStatus::Skipped
+            };
+            Ok(((*path).clone(), status))
+        })
+        .collect::<Vec<Result<(String, WorkspaceCowMaterializeStatus)>>>();
+
+    let mut first_error = None;
+    let mut rejected = false;
+    let mut successful_paths = report.stamps.keys().cloned().collect::<Vec<_>>();
+    for result in results {
+        match result {
+            Ok((path, WorkspaceCowMaterializeStatus::Cloned(stamp))) => {
+                successful_paths.push(path.clone());
+                report.insert_stamp(path, stamp);
+            }
+            Ok((
+                _,
+                WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable,
+            )) => {
+                rejected = true;
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
     }
-    Ok(true)
+    if let Some(err) = first_error {
+        remove_cow_attempt_files(output_root, &successful_paths);
+        return Err(err);
+    }
+    if rejected {
+        return Ok(None);
+    }
+    Ok(Some(report))
 }
 
 pub(crate) fn materialize_workspace_file_cow_status_if_matching(
@@ -144,7 +218,10 @@ fn clone_file_cow_clean(
                 let _ = fs::remove_file(destination);
             }
             if result? {
-                Ok(WorkspaceCowMaterializeStatus::Cloned)
+                let metadata = fs::symlink_metadata(destination)?;
+                Ok(WorkspaceCowMaterializeStatus::Cloned(
+                    WorkdirFileStamp::from_metadata(&metadata),
+                ))
             } else {
                 Ok(WorkspaceCowMaterializeStatus::Unavailable)
             }
@@ -156,6 +233,14 @@ fn clone_file_cow_clean(
         Err(err) => {
             let _ = fs::remove_file(destination);
             Err(Error::Io(err))
+        }
+    }
+}
+
+fn remove_cow_attempt_files(output_root: &Path, paths: &[String]) {
+    for path in paths {
+        if let Ok(abs) = safe_join(output_root, path) {
+            let _ = fs::remove_file(abs);
         }
     }
 }
@@ -315,4 +400,66 @@ fn cow_clone_unavailable(err: rustix::io::Errno) -> bool {
             | rustix::io::Errno::PERM
             | rustix::io::Errno::ACCESS
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parallel_cow_clone_test_entry(bytes: &[u8]) -> FileEntry {
+        let change = ChangeId("ch_test".to_string());
+        FileEntry {
+            file_id: FileId::new(change.clone(), 1),
+            kind: FileKind::Text,
+            mode: 0o100644,
+            executable: false,
+            content: FileContentRef::Binary(ObjectId("blob_test".to_string())),
+            size_bytes: bytes.len() as u64,
+            content_hash: sha256_hex(bytes),
+            created_by: change.clone(),
+            last_content_change: change,
+            last_path_change: None,
+        }
+    }
+
+    #[test]
+    fn parallel_cow_clone_empty_target_returns_empty_report() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let report = materialize_from_workspace_cow_report(
+            workspace.path(),
+            output.path(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.files_written, 0);
+        assert!(report.stamps.is_empty());
+    }
+
+    #[test]
+    fn parallel_cow_clone_missing_stamp_returns_none_without_writing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let bytes = b"a1\n";
+        fs::write(workspace.path().join("a.txt"), bytes).unwrap();
+        let mut target = BTreeMap::new();
+        target.insert("a.txt".to_string(), parallel_cow_clone_test_entry(bytes));
+
+        let report = materialize_from_workspace_cow_report(
+            workspace.path(),
+            output.path(),
+            &target,
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+
+        assert!(report.is_none());
+        assert!(!output.path().join("a.txt").exists());
+    }
 }

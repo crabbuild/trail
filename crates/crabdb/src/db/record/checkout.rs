@@ -43,19 +43,44 @@ impl CrabDb {
             }
         }
         let target = self.resolve_refish(change_or_ref)?;
-        let current_files = self.load_root_files(&current.root_id)?;
-        let target_files = self.load_root_files(&target.root_id)?;
-        let diff = self.diff_file_maps(&current_files, &target_files)?;
         let output_root = workdir
             .map(|path| self.resolve_checkout_workdir_path(path))
             .transpose()?;
+        if target.root_id == current.root_id {
+            if let Some(output_root) = &output_root {
+                let written_files = if dry_run {
+                    0
+                } else {
+                    prepare_checkout_workdir(output_root)?;
+                    self.materialize_root_files_at_streaming(&target.root_id, output_root, true)?
+                        .file_count
+                };
+                return Ok(CheckoutReport {
+                    change_id: target.change_id,
+                    root_id: target.root_id,
+                    written_files,
+                    dry_run,
+                    recorded_dirty,
+                    output_root: Some(output_root.to_string_lossy().to_string()),
+                    changed_paths: Vec::new(),
+                });
+            }
+        }
+        let current_files = self.load_root_files(&current.root_id)?;
+        let target_files = self.load_root_files(&target.root_id)?;
+        let diff = self.diff_file_maps(&current_files, &target_files)?;
         if !dry_run {
             if let Some(output_root) = &output_root {
                 prepare_checkout_workdir(output_root)?;
                 let cloned_from_workspace = if target.root_id == current.root_id {
-                    if let Some(source_stamps) =
-                        self.workspace_file_stamps_if_entries_match(&target_files)?
-                    {
+                    let source_stamps = match self.workspace_file_stamps_if_clean_index_matches(
+                        &target.root_id,
+                        &target_files,
+                    )? {
+                        Some(stamps) => Some(stamps),
+                        None => self.workspace_file_stamps_if_entries_match(&target_files)?,
+                    };
+                    if let Some(source_stamps) = source_stamps {
                         materialize_from_workspace_cow(
                             &self.workspace_root,
                             output_root,

@@ -2,18 +2,6 @@ use super::*;
 
 const CLEAN_WORKDIR_MANIFEST_VERSION: u16 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct WorkdirFileStamp {
-    size_bytes: u64,
-    modified_ns: i64,
-    changed_ns: i64,
-    #[serde(default)]
-    device_id: i64,
-    #[serde(default)]
-    inode: i64,
-    executable: bool,
-}
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct CleanWorkdirManifest {
     version: u16,
@@ -118,6 +106,39 @@ impl CrabDb {
             .map(|path| normalize_relative_path(path))
             .collect::<Result<BTreeSet<_>>>()?;
         let stamps = self.scan_workdir_file_stamps(dir)?;
+        self.write_clean_workdir_manifest_from_stamps_for_paths(
+            dir, root_id, files, expected, stamps,
+        )
+    }
+
+    pub(crate) fn write_clean_workdir_manifest_from_stamps<'a, I>(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        files: &BTreeMap<String, FileEntry>,
+        expected_paths: I,
+        stamps: BTreeMap<String, WorkdirFileStamp>,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let expected = expected_paths
+            .into_iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        self.write_clean_workdir_manifest_from_stamps_for_paths(
+            dir, root_id, files, expected, stamps,
+        )
+    }
+
+    fn write_clean_workdir_manifest_from_stamps_for_paths(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        files: &BTreeMap<String, FileEntry>,
+        expected: BTreeSet<String>,
+        stamps: BTreeMap<String, WorkdirFileStamp>,
+    ) -> Result<()> {
         let stamped = stamps.keys().cloned().collect::<BTreeSet<_>>();
         if stamped != expected {
             remove_clean_workdir_manifest(dir)?;
@@ -144,19 +165,7 @@ impl CrabDb {
             );
         }
 
-        let path = clean_workdir_manifest_path(dir);
-        let parent = path.parent().ok_or_else(|| Error::InvalidPath {
-            path: path.to_string_lossy().to_string(),
-            reason: "clean workdir manifest has no parent".to_string(),
-        })?;
-        fs::create_dir_all(parent)?;
-        let manifest = CleanWorkdirManifest {
-            version: CLEAN_WORKDIR_MANIFEST_VERSION,
-            root_id: root_id.0.clone(),
-            files: entries,
-        };
-        fs::write(path, serde_json::to_vec(&manifest)?)?;
-        Ok(())
+        self.write_clean_workdir_manifest_entries(dir, root_id, entries)
     }
 
     pub(crate) fn write_clean_workdir_manifest_from_disk_manifest<'a, I>(
@@ -174,6 +183,47 @@ impl CrabDb {
             .map(|path| normalize_relative_path(path))
             .collect::<Result<BTreeSet<_>>>()?;
         let stamps = self.scan_workdir_file_stamps(dir)?;
+        self.write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
+            dir,
+            root_id,
+            disk_manifest,
+            expected,
+            stamps,
+        )
+    }
+
+    pub(crate) fn write_clean_workdir_manifest_from_disk_manifest_and_stamps<'a, I>(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        disk_manifest: &BTreeMap<String, DiskManifest>,
+        expected_paths: I,
+        stamps: BTreeMap<String, WorkdirFileStamp>,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let expected = expected_paths
+            .into_iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        self.write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
+            dir,
+            root_id,
+            disk_manifest,
+            expected,
+            stamps,
+        )
+    }
+
+    fn write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
+        &self,
+        dir: &Path,
+        root_id: &ObjectId,
+        disk_manifest: &BTreeMap<String, DiskManifest>,
+        expected: BTreeSet<String>,
+        stamps: BTreeMap<String, WorkdirFileStamp>,
+    ) -> Result<()> {
         let stamped = stamps.keys().cloned().collect::<BTreeSet<_>>();
         if stamped != expected {
             remove_clean_workdir_manifest(dir)?;
@@ -244,14 +294,7 @@ impl CrabDb {
             manifest.files.insert(
                 path.clone(),
                 CleanWorkdirManifestEntry {
-                    stamp: WorkdirFileStamp {
-                        size_bytes: metadata.len(),
-                        modified_ns: metadata_modified_ns(&metadata),
-                        changed_ns: metadata_changed_ns(&metadata),
-                        device_id: metadata_device_id(&metadata),
-                        inode: metadata_inode(&metadata),
-                        executable: executable_from_metadata(&metadata),
-                    },
+                    stamp: WorkdirFileStamp::from_metadata(&metadata),
                     kind: entry.kind.clone(),
                     content_hash: entry.content_hash.clone(),
                 },
@@ -364,17 +407,7 @@ impl CrabDb {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 continue;
             }
-            files.insert(
-                rel,
-                WorkdirFileStamp {
-                    size_bytes: metadata.len(),
-                    modified_ns: metadata_modified_ns(&metadata),
-                    changed_ns: metadata_changed_ns(&metadata),
-                    device_id: metadata_device_id(&metadata),
-                    inode: metadata_inode(&metadata),
-                    executable: executable_from_metadata(&metadata),
-                },
-            );
+            files.insert(rel, WorkdirFileStamp::from_metadata(&metadata));
         }
         Ok(files)
     }
@@ -392,51 +425,97 @@ fn remove_clean_workdir_manifest(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn metadata_modified_ns(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(duration_ns)
-        .unwrap_or(0)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(unix)]
-fn metadata_changed_ns(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .ctime()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(metadata.ctime_nsec())
-}
+    fn workdir_manifest_from_materialization_stamps_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        CrabDb,
+        RefRecord,
+        BTreeMap<String, FileEntry>,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.txt"), "a1\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+        CrabDb::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = CrabDb::open(workspace.path()).unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        let files = db.load_root_files(&head.root_id).unwrap();
 
-#[cfg(not(unix))]
-fn metadata_changed_ns(_metadata: &fs::Metadata) -> i64 {
-    0
-}
+        let workdir = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("a.txt"), "a1\n").unwrap();
+        fs::create_dir(workdir.path().join("src")).unwrap();
+        fs::write(workdir.path().join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+        (workspace, workdir, db, head, files)
+    }
 
-#[cfg(unix)]
-fn metadata_device_id(metadata: &fs::Metadata) -> i64 {
-    metadata.dev().min(i64::MAX as u64) as i64
-}
+    #[test]
+    fn workdir_manifest_from_materialization_stamps_matches_scan_manifest() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let stamps = db.scan_workdir_file_stamps(workdir.path()).unwrap();
 
-#[cfg(not(unix))]
-fn metadata_device_id(_metadata: &fs::Metadata) -> i64 {
-    0
-}
+        db.write_clean_workdir_manifest(workdir.path(), &head.root_id, &files, files.keys())
+            .unwrap();
+        let scan_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(clean_workdir_manifest_path(workdir.path())).unwrap())
+                .unwrap();
+        remove_clean_workdir_manifest(workdir.path()).unwrap();
 
-#[cfg(unix)]
-fn metadata_inode(metadata: &fs::Metadata) -> i64 {
-    metadata.ino().min(i64::MAX as u64) as i64
-}
+        db.write_clean_workdir_manifest_from_stamps(
+            workdir.path(),
+            &head.root_id,
+            &files,
+            files.keys(),
+            stamps,
+        )
+        .unwrap();
+        let stamp_manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(clean_workdir_manifest_path(workdir.path())).unwrap())
+                .unwrap();
 
-#[cfg(not(unix))]
-fn metadata_inode(_metadata: &fs::Metadata) -> i64 {
-    0
-}
+        assert_eq!(stamp_manifest, scan_manifest);
+    }
 
-fn duration_ns(duration: Duration) -> i64 {
-    let ns = (duration.as_secs() as u128)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(duration.subsec_nanos() as u128);
-    ns.min(i64::MAX as u128) as i64
+    #[test]
+    fn workdir_manifest_from_materialization_stamps_rejects_missing_stamp() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let mut stamps = db.scan_workdir_file_stamps(workdir.path()).unwrap();
+        stamps.remove("a.txt");
+
+        db.write_clean_workdir_manifest_from_stamps(
+            workdir.path(),
+            &head.root_id,
+            &files,
+            files.keys(),
+            stamps,
+        )
+        .unwrap();
+
+        assert!(!clean_workdir_manifest_path(workdir.path()).exists());
+    }
+
+    #[test]
+    fn workdir_manifest_from_materialization_stamps_rejects_extra_stamp() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let mut stamps = db.scan_workdir_file_stamps(workdir.path()).unwrap();
+        let stamp = stamps.get("a.txt").unwrap().clone();
+        stamps.insert("extra.txt".to_string(), stamp);
+
+        db.write_clean_workdir_manifest_from_stamps(
+            workdir.path(),
+            &head.root_id,
+            &files,
+            files.keys(),
+            stamps,
+        )
+        .unwrap();
+
+        assert!(!clean_workdir_manifest_path(workdir.path()).exists());
+    }
 }

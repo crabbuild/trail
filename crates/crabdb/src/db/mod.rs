@@ -297,6 +297,56 @@ impl WorktreeFileStamp {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkdirFileStamp {
+    size_bytes: u64,
+    modified_ns: i64,
+    changed_ns: i64,
+    #[serde(default)]
+    device_id: i64,
+    #[serde(default)]
+    inode: i64,
+    executable: bool,
+}
+
+impl WorkdirFileStamp {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            size_bytes: metadata.len(),
+            modified_ns: metadata_modified_ns(metadata),
+            changed_ns: metadata_changed_ns(metadata),
+            device_id: metadata_device_id(metadata),
+            inode: metadata_inode(metadata),
+            executable: metadata_executable(metadata),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MaterializedWorkdir {
+    files_written: usize,
+    stamps: BTreeMap<String, WorkdirFileStamp>,
+}
+
+impl MaterializedWorkdir {
+    pub(crate) fn insert_stamp(&mut self, path: String, stamp: WorkdirFileStamp) {
+        self.files_written += 1;
+        self.stamps.insert(path, stamp);
+    }
+
+    pub(crate) fn extend(&mut self, other: MaterializedWorkdir) {
+        self.files_written += other.files_written;
+        self.stamps.extend(other.stamps);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RootMaterializationReport {
+    file_count: u64,
+    disk_manifest: BTreeMap<String, DiskManifest>,
+    materialized: MaterializedWorkdir,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedDiskManifest {
     manifest: DiskManifest,

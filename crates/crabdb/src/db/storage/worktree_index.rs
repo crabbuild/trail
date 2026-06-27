@@ -6,6 +6,7 @@ use notify::{
 use rayon::prelude::*;
 
 const DAEMON_STATUS_DIRTY_PATH_LIMIT: usize = 16_384;
+const WORKTREE_INDEX_STAMP_LOOKUP_CHUNK: usize = 512;
 const WORKTREE_INDEX_BASELINE_ROOT_KEY: &str = "worktree.index.baseline_root";
 const DAEMON_WORKTREE_SNAPSHOT_FILE: &str = "worktree-daemon-cache.json";
 const DAEMON_WORKTREE_SNAPSHOT_VERSION: u32 = 1;
@@ -345,6 +346,96 @@ impl CrabDb {
                 .map(|(path, indexed)| (path, indexed.stamp))
                 .collect(),
         ))
+    }
+
+    pub(crate) fn workspace_file_stamps_if_clean_index_matches(
+        &self,
+        root_id: &ObjectId,
+        files: &BTreeMap<String, FileEntry>,
+    ) -> Result<Option<BTreeMap<String, WorktreeFileStamp>>> {
+        if self.worktree_index_baseline_root()?.as_ref() != Some(root_id) {
+            return Ok(None);
+        }
+        if files.is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+
+        let paths = files.keys().cloned().collect::<Vec<_>>();
+        let indexed = self.cached_worktree_index_entries_for_paths(&paths)?;
+        if indexed.len() != files.len() {
+            return Ok(None);
+        }
+
+        let mut stamps = BTreeMap::new();
+        for (path, entry) in files {
+            let Some(indexed) = indexed.get(path) else {
+                return Ok(None);
+            };
+            if indexed.manifest.kind != entry.kind
+                || indexed.manifest.executable != entry.executable
+                || indexed.manifest.content_hash != entry.content_hash
+                || indexed.stamp.size_bytes != entry.size_bytes
+                || indexed.stamp.executable != entry.executable
+            {
+                return Ok(None);
+            }
+            stamps.insert(path.clone(), indexed.stamp);
+        }
+        Ok(Some(stamps))
+    }
+
+    fn cached_worktree_index_entries_for_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, IndexedDiskManifest>> {
+        let mut indexed = BTreeMap::new();
+        for chunk in paths.chunks(WORKTREE_INDEX_STAMP_LOOKUP_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT path, size_bytes, modified_ns, changed_ns, device_id, inode, executable, kind, content_hash \
+                 FROM worktree_file_index WHERE path IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows =
+                stmt.query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                    let path: String = row.get(0)?;
+                    let executable = row.get::<_, i64>(6)? != 0;
+                    let kind_label: String = row.get(7)?;
+                    let kind = file_kind_from_index(&kind_label).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+                    Ok((
+                        path,
+                        IndexedDiskManifest {
+                            stamp: WorktreeFileStamp {
+                                size_bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                                modified_ns: row.get(2)?,
+                                changed_ns: row.get(3)?,
+                                device_id: row.get(4)?,
+                                inode: row.get(5)?,
+                                executable,
+                            },
+                            manifest: DiskManifest {
+                                kind,
+                                executable,
+                                content_hash: row.get(8)?,
+                            },
+                        },
+                    ))
+                })?;
+            for row in rows {
+                let (path, entry) = row.map_err(Error::from)?;
+                indexed.insert(path, entry);
+            }
+        }
+        Ok(indexed)
     }
 
     fn scan_visible_worktree_paths(&self) -> Result<BTreeSet<String>> {
@@ -1332,6 +1423,86 @@ mod tests {
             sha256_hex(b"b1\n")
         );
         assert_eq!(updates["b.txt"].disk_manifest.kind, FileKind::Text);
+    }
+
+    fn clean_index_stamp_reuse_fixture() -> (
+        tempfile::TempDir,
+        CrabDb,
+        RefRecord,
+        BTreeMap<String, FileEntry>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), "a1\n").unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+        CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = CrabDb::open(temp.path()).unwrap();
+        db.refresh_worktree_index().unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        db.set_worktree_index_baseline(&head.root_id).unwrap();
+        let files = db.load_root_files(&head.root_id).unwrap();
+        (temp, db, head, files)
+    }
+
+    #[test]
+    fn clean_index_stamp_reuse_returns_stamps_for_matching_baseline() {
+        let (_temp, db, head, files) = clean_index_stamp_reuse_fixture();
+
+        let stamps = db
+            .workspace_file_stamps_if_clean_index_matches(&head.root_id, &files)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stamps.len(), files.len());
+        assert!(stamps.contains_key("a.txt"));
+        assert!(stamps.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn clean_index_stamp_reuse_misses_without_matching_baseline() {
+        let (_temp, db, _head, files) = clean_index_stamp_reuse_fixture();
+
+        let stamps = db
+            .workspace_file_stamps_if_clean_index_matches(&ObjectId("other".to_string()), &files)
+            .unwrap();
+
+        assert!(stamps.is_none());
+    }
+
+    #[test]
+    fn clean_index_stamp_reuse_misses_when_index_row_is_missing() {
+        let (_temp, db, head, files) = clean_index_stamp_reuse_fixture();
+        db.delete_worktree_index_path_row("a.txt").unwrap();
+
+        let stamps = db
+            .workspace_file_stamps_if_clean_index_matches(&head.root_id, &files)
+            .unwrap();
+
+        assert!(stamps.is_none());
+    }
+
+    #[test]
+    fn clean_index_stamp_reuse_misses_when_index_manifest_differs() {
+        let (temp, db, head, files) = clean_index_stamp_reuse_fixture();
+        let metadata = fs::symlink_metadata(temp.path().join("a.txt")).unwrap();
+        let stamp = WorktreeFileStamp::from_metadata(&metadata);
+        db.upsert_worktree_index_manifest_for_scan(
+            "a.txt",
+            stamp,
+            &DiskManifest {
+                kind: FileKind::Text,
+                executable: false,
+                content_hash: sha256_hex(b"different\n"),
+            },
+            worktree_scan_id(),
+        )
+        .unwrap();
+
+        let stamps = db
+            .workspace_file_stamps_if_clean_index_matches(&head.root_id, &files)
+            .unwrap();
+
+        assert!(stamps.is_none());
     }
 
     #[test]

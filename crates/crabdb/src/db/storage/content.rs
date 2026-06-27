@@ -125,18 +125,42 @@ impl CrabDb {
         &self,
         root_id: &ObjectId,
     ) -> Result<BTreeMap<String, FileEntry>> {
+        let mut out = BTreeMap::new();
+        self.for_each_root_file_chunk(root_id, MATERIALIZE_BATCH_FILES, |chunk| {
+            out.extend(chunk);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub(crate) fn for_each_root_file_chunk<F>(
+        &self,
+        root_id: &ObjectId,
+        chunk_size: usize,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(BTreeMap<String, FileEntry>) -> Result<()>,
+    {
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let iter = self.root_prolly.range(&tree, &[], None)?;
-        let mut out = BTreeMap::new();
+        let chunk_size = chunk_size.max(1);
+        let mut chunk = BTreeMap::new();
         for item in iter {
             let (key, value) = item?;
             let path = String::from_utf8(key)
                 .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
             let entry: FileEntry = from_cbor(&value)?;
-            out.insert(path, entry);
+            chunk.insert(path, entry);
+            if chunk.len() >= chunk_size {
+                f(std::mem::take(&mut chunk))?;
+            }
         }
-        Ok(out)
+        if !chunk.is_empty() {
+            f(chunk)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn load_text_lines(&self, text_id: &ObjectId) -> Result<Vec<LineEntry>> {
@@ -321,7 +345,17 @@ impl CrabDb {
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<()> {
-        materialize_into_batched(
+        self.materialize_files_at_report(output_root, previous, target)
+            .map(|_| ())
+    }
+
+    pub(crate) fn materialize_files_at_report(
+        &self,
+        output_root: &Path,
+        previous: &BTreeMap<String, FileEntry>,
+        target: &BTreeMap<String, FileEntry>,
+    ) -> Result<MaterializedWorkdir> {
+        materialize_into_batched_report(
             &self.workspace_root,
             output_root,
             previous,
@@ -337,7 +371,17 @@ impl CrabDb {
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<()> {
-        materialize_into_batched_best_effort(
+        self.materialize_files_best_effort_at_report(output_root, previous, target)
+            .map(|_| ())
+    }
+
+    pub(crate) fn materialize_files_best_effort_at_report(
+        &self,
+        output_root: &Path,
+        previous: &BTreeMap<String, FileEntry>,
+        target: &BTreeMap<String, FileEntry>,
+    ) -> Result<MaterializedWorkdir> {
+        materialize_into_batched_best_effort_report(
             &self.workspace_root,
             output_root,
             previous,
@@ -352,11 +396,21 @@ impl CrabDb {
         output_root: &Path,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<()> {
+        self.materialize_new_files_best_effort_at_with_workspace_cow_report(output_root, target)
+            .map(|_| ())
+    }
+
+    pub(crate) fn materialize_new_files_best_effort_at_with_workspace_cow_report(
+        &self,
+        output_root: &Path,
+        target: &BTreeMap<String, FileEntry>,
+    ) -> Result<MaterializedWorkdir> {
         if target.is_empty() {
-            return Ok(());
+            return Ok(MaterializedWorkdir::default());
         }
         reject_case_insensitive_collisions(output_root, target)?;
         let mut remaining = BTreeMap::new();
+        let mut report = MaterializedWorkdir::default();
         let mut cow_available = true;
         for (path, entry) in target {
             if cow_available {
@@ -366,7 +420,10 @@ impl CrabDb {
                     path,
                     entry,
                 )? {
-                    WorkspaceCowMaterializeStatus::Cloned => continue,
+                    WorkspaceCowMaterializeStatus::Cloned(stamp) => {
+                        report.insert_stamp(path.clone(), stamp);
+                        continue;
+                    }
                     WorkspaceCowMaterializeStatus::Skipped => {}
                     WorkspaceCowMaterializeStatus::Unavailable => {
                         cow_available = false;
@@ -375,7 +432,88 @@ impl CrabDb {
             }
             remaining.insert(path.clone(), entry.clone());
         }
-        self.materialize_files_best_effort_at(output_root, &BTreeMap::new(), &remaining)
+        report.extend(self.materialize_files_best_effort_at_report(
+            output_root,
+            &BTreeMap::new(),
+            &remaining,
+        )?);
+        Ok(report)
+    }
+
+    pub(crate) fn materialize_root_files_at_streaming(
+        &self,
+        root_id: &ObjectId,
+        output_root: &Path,
+        durable: bool,
+    ) -> Result<RootMaterializationReport> {
+        self.validate_streaming_root_case_collisions(root_id, output_root)?;
+        let empty = BTreeMap::new();
+        let clean_index_available = self.worktree_index_baseline_root()?.as_ref() == Some(root_id);
+        let mut report = RootMaterializationReport::default();
+        self.for_each_root_file_chunk(root_id, MATERIALIZE_BATCH_FILES, |chunk| {
+            let mut chunk_report = None;
+            if clean_index_available {
+                if let Some(source_stamps) =
+                    self.workspace_file_stamps_if_clean_index_matches(root_id, &chunk)?
+                {
+                    chunk_report = materialize_from_workspace_cow_report(
+                        &self.workspace_root,
+                        output_root,
+                        &chunk,
+                        &source_stamps,
+                        durable,
+                    )?;
+                }
+            }
+
+            let chunk_report = match chunk_report {
+                Some(report) => report,
+                None if durable => self.materialize_files_at_report(output_root, &empty, &chunk)?,
+                None => {
+                    self.materialize_files_best_effort_at_report(output_root, &empty, &chunk)?
+                }
+            };
+
+            report.file_count += chunk.len() as u64;
+            for (path, entry) in &chunk {
+                report.disk_manifest.insert(
+                    path.clone(),
+                    DiskManifest {
+                        kind: entry.kind.clone(),
+                        executable: entry.executable,
+                        content_hash: entry.content_hash.clone(),
+                    },
+                );
+            }
+            report.materialized.extend(chunk_report);
+            Ok(())
+        })?;
+        Ok(report)
+    }
+
+    fn validate_streaming_root_case_collisions(
+        &self,
+        root_id: &ObjectId,
+        output_root: &Path,
+    ) -> Result<()> {
+        if !is_case_insensitive_filesystem(output_root)? {
+            return Ok(());
+        }
+        let mut seen = HashMap::new();
+        self.for_each_root_file_chunk(root_id, MATERIALIZE_BATCH_FILES, |chunk| {
+            for path in chunk.keys() {
+                let folded = path.to_lowercase();
+                if let Some(previous) = seen.insert(folded, path.clone()) {
+                    if previous != *path {
+                        return Err(Error::InvalidPath {
+                            path: path.clone(),
+                            reason: format!("case-insensitive path collision with `{previous}`"),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -533,6 +671,69 @@ fn path_has_extension(path: &str) -> bool {
 fn push_dependency_candidate(out: &mut BTreeSet<String>, path: &str) {
     if let Ok(path) = normalize_relative_path(path) {
         out.insert(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn streaming_root_materialization_fixture() -> (tempfile::TempDir, CrabDb, RefRecord) {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("b.txt"), "b1\n").unwrap();
+        fs::write(workspace.path().join("a.txt"), "a1\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+        CrabDb::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = CrabDb::open(workspace.path()).unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        (workspace, db, head)
+    }
+
+    #[test]
+    fn streaming_root_materialization_chunks_visit_sorted_files_once() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let mut chunks = Vec::new();
+
+        db.for_each_root_file_chunk(&head.root_id, 2, |chunk| {
+            chunks.push(chunk.keys().cloned().collect::<Vec<_>>());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                vec!["a.txt".to_string(), "b.txt".to_string()],
+                vec!["src/lib.rs".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_root_materialization_writes_files_and_stamps() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let output = tempfile::tempdir().unwrap();
+
+        let report = db
+            .materialize_root_files_at_streaming(&head.root_id, output.path(), false)
+            .unwrap();
+
+        assert_eq!(report.file_count, 3);
+        assert_eq!(report.disk_manifest.len(), 3);
+        assert_eq!(report.materialized.stamps.len(), 3);
+        assert_eq!(
+            fs::read_to_string(output.path().join("a.txt")).unwrap(),
+            "a1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(output.path().join("b.txt")).unwrap(),
+            "b1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(output.path().join("src/lib.rs")).unwrap(),
+            "pub fn lib() {}\n"
+        );
     }
 }
 

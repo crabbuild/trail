@@ -33,14 +33,14 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<u6
     Ok(bytes)
 }
 
-pub(crate) fn materialize_into_batched<F>(
+pub(crate) fn materialize_into_batched_report<F>(
     workspace_root: &Path,
     output_root: &Path,
     previous: &BTreeMap<String, FileEntry>,
     target: &BTreeMap<String, FileEntry>,
     batch_size: usize,
     bytes_for_batch: F,
-) -> Result<()>
+) -> Result<MaterializedWorkdir>
 where
     F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
 {
@@ -55,14 +55,14 @@ where
     )
 }
 
-pub(crate) fn materialize_into_batched_best_effort<F>(
+pub(crate) fn materialize_into_batched_best_effort_report<F>(
     workspace_root: &Path,
     output_root: &Path,
     previous: &BTreeMap<String, FileEntry>,
     target: &BTreeMap<String, FileEntry>,
     batch_size: usize,
     bytes_for_batch: F,
-) -> Result<()>
+) -> Result<MaterializedWorkdir>
 where
     F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
 {
@@ -85,11 +85,12 @@ fn materialize_into_batched_with_durability<F>(
     batch_size: usize,
     durable: bool,
     bytes_for_batch: F,
-) -> Result<()>
+) -> Result<MaterializedWorkdir>
 where
     F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
 {
     reject_case_insensitive_collisions(output_root, target)?;
+    let mut report = MaterializedWorkdir::default();
     for path in previous.keys() {
         if !target.contains_key(path) {
             let abs = safe_join(output_root, path)?;
@@ -104,16 +105,26 @@ where
     for (path, entry) in target {
         batch.insert(path.clone(), entry.clone());
         if batch.len() >= batch_size {
-            materialize_batch(output_root, &batch, durable, &bytes_for_batch)?;
+            report.extend(materialize_batch(
+                output_root,
+                &batch,
+                durable,
+                &bytes_for_batch,
+            )?);
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        materialize_batch(output_root, &batch, durable, &bytes_for_batch)?;
+        report.extend(materialize_batch(
+            output_root,
+            &batch,
+            durable,
+            &bytes_for_batch,
+        )?);
     }
 
     let _ = workspace_root;
-    Ok(())
+    Ok(report)
 }
 
 fn materialize_batch<F>(
@@ -121,11 +132,12 @@ fn materialize_batch<F>(
     batch: &BTreeMap<String, FileEntry>,
     durable: bool,
     bytes_for_batch: &F,
-) -> Result<()>
+) -> Result<MaterializedWorkdir>
 where
     F: Fn(&BTreeMap<String, FileEntry>) -> Result<BTreeMap<String, Vec<u8>>>,
 {
     let bytes = bytes_for_batch(batch)?;
+    let mut report = MaterializedWorkdir::default();
     for (path, entry) in batch {
         let abs = safe_join(output_root, path)?;
         if let Some(parent) = abs.parent() {
@@ -136,9 +148,16 @@ where
                 "missing materialized bytes for `{path}`"
             )));
         };
-        write_materialized_file_with_durability(&abs, path, file_bytes, entry.executable, durable)?;
+        let stamp = write_materialized_file_with_durability(
+            &abs,
+            path,
+            file_bytes,
+            entry.executable,
+            durable,
+        )?;
+        report.insert_stamp(path.clone(), stamp);
     }
-    Ok(())
+    Ok(report)
 }
 
 pub(crate) fn reject_case_insensitive_collisions(
@@ -259,7 +278,7 @@ fn write_materialized_file_with_durability(
     bytes: &[u8],
     executable: bool,
     durable: bool,
-) -> Result<()> {
+) -> Result<WorkdirFileStamp> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(Error::InvalidPath {
@@ -281,7 +300,7 @@ fn write_materialized_file_with_durability(
     fs::create_dir_all(parent)?;
 
     let (tmp, mut file) = create_materialize_temp_file(parent, path)?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<WorkdirFileStamp> {
         file.write_all(bytes)?;
         if durable {
             file.sync_all()?;
@@ -292,7 +311,8 @@ fn write_materialized_file_with_durability(
         if durable {
             sync_directory(parent);
         }
-        Ok(())
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(WorkdirFileStamp::from_metadata(&metadata))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
