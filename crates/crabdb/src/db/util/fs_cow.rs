@@ -11,14 +11,21 @@ pub(crate) fn materialize_from_workspace_cow(
     workspace_root: &Path,
     output_root: &Path,
     target: &BTreeMap<String, FileEntry>,
+    source_stamps: &BTreeMap<String, WorktreeFileStamp>,
+    durable: bool,
 ) -> Result<bool> {
     reject_case_insensitive_collisions(output_root, target)?;
     for (path, entry) in target {
-        match materialize_workspace_file_cow_status_if_matching(
+        let Some(source_stamp) = source_stamps.get(path) else {
+            return Ok(false);
+        };
+        match materialize_workspace_file_cow_status_if_stamp_matches(
             workspace_root,
             output_root,
             path,
             entry,
+            *source_stamp,
+            durable,
         )? {
             WorkspaceCowMaterializeStatus::Cloned => {}
             WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable => {
@@ -48,7 +55,31 @@ pub(crate) fn materialize_workspace_file_cow_status_if_matching(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    clone_file_cow_clean(&source, &destination, entry.executable)
+    clone_file_cow_clean(&source, &destination, entry.executable, false)
+}
+
+fn materialize_workspace_file_cow_status_if_stamp_matches(
+    workspace_root: &Path,
+    output_root: &Path,
+    path: &str,
+    entry: &FileEntry,
+    source_stamp: WorktreeFileStamp,
+    durable: bool,
+) -> Result<WorkspaceCowMaterializeStatus> {
+    let source = safe_join(workspace_root, path)?;
+    let destination = safe_join(output_root, path)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => return Ok(WorkspaceCowMaterializeStatus::Skipped),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Io(err)),
+    }
+    if !workspace_file_matches_stamp_and_entry(&source, source_stamp, entry)? {
+        return Ok(WorkspaceCowMaterializeStatus::Skipped);
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    clone_file_cow_clean(&source, &destination, entry.executable, durable)
 }
 
 fn workspace_file_matches_entry(source: &Path, entry: &FileEntry) -> Result<bool> {
@@ -66,16 +97,48 @@ fn workspace_file_matches_entry(source: &Path, entry: &FileEntry) -> Result<bool
     Ok(sha256_file_hex(source)? == entry.content_hash)
 }
 
+fn workspace_file_matches_stamp_and_entry(
+    source: &Path,
+    source_stamp: WorktreeFileStamp,
+    entry: &FileEntry,
+) -> Result<bool> {
+    if source_stamp.size_bytes != entry.size_bytes || source_stamp.executable != entry.executable {
+        return Ok(false);
+    }
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Ok(false);
+    }
+    Ok(WorktreeFileStamp::from_metadata(&source_metadata) == source_stamp)
+}
+
+fn sync_cloned_file(path: &Path) -> Result<()> {
+    OpenOptions::new().read(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
 fn clone_file_cow_clean(
     source: &Path,
     destination: &Path,
     executable: bool,
+    durable: bool,
 ) -> Result<WorkspaceCowMaterializeStatus> {
     match cow_clone_file(source, destination) {
         Ok(true) => {
             let result = (|| -> Result<bool> {
                 set_executable(destination, executable)?;
-                Ok(clear_cloned_xattrs(destination)?)
+                let clean = clear_cloned_xattrs(destination)?;
+                if clean && durable {
+                    sync_cloned_file(destination)?;
+                    if let Some(parent) = destination.parent() {
+                        sync_directory(parent);
+                    }
+                }
+                Ok(clean)
             })();
             if !matches!(result, Ok(true)) {
                 let _ = fs::remove_file(destination);

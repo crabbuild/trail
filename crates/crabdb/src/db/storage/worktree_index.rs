@@ -10,16 +10,6 @@ const WORKTREE_INDEX_BASELINE_ROOT_KEY: &str = "worktree.index.baseline_root";
 const DAEMON_WORKTREE_SNAPSHOT_FILE: &str = "worktree-daemon-cache.json";
 const DAEMON_WORKTREE_SNAPSHOT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorktreeFileStamp {
-    size_bytes: u64,
-    modified_ns: i64,
-    changed_ns: i64,
-    device_id: i64,
-    inode: i64,
-    executable: bool,
-}
-
 #[derive(Debug)]
 struct WorktreeIndexReadCandidate {
     path: String,
@@ -233,7 +223,7 @@ impl CrabDb {
             }
 
             let metadata = fs::symlink_metadata(path)?;
-            let stamp = worktree_file_stamp(&metadata);
+            let stamp = WorktreeFileStamp::from_metadata(&metadata);
             if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
                 indexed_seen += 1;
                 if cached_stamp == stamp {
@@ -275,7 +265,9 @@ impl CrabDb {
         })
     }
 
-    pub(crate) fn scan_worktree_manifest_indexed(&self) -> Result<BTreeMap<String, DiskManifest>> {
+    pub(crate) fn scan_worktree_manifest_indexed_with_stamps(
+        &self,
+    ) -> Result<BTreeMap<String, IndexedDiskManifest>> {
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -309,7 +301,7 @@ impl CrabDb {
             }
 
             let metadata = fs::symlink_metadata(path)?;
-            let stamp = worktree_file_stamp(&metadata);
+            let stamp = WorktreeFileStamp::from_metadata(&metadata);
             let disk_manifest = if let Some(cached) = self.cached_worktree_manifest(&rel, stamp)? {
                 cached
             } else {
@@ -323,10 +315,36 @@ impl CrabDb {
                 disk_manifest
             };
             seen.insert(rel.clone());
-            manifest.insert(rel, disk_manifest);
+            manifest.insert(
+                rel,
+                IndexedDiskManifest {
+                    manifest: disk_manifest,
+                    stamp,
+                },
+            );
         }
         self.prune_worktree_index(&seen)?;
         Ok(manifest)
+    }
+
+    pub(crate) fn workspace_file_stamps_if_entries_match(
+        &self,
+        files: &BTreeMap<String, FileEntry>,
+    ) -> Result<Option<BTreeMap<String, WorktreeFileStamp>>> {
+        let indexed_manifest = self.scan_worktree_manifest_indexed_with_stamps()?;
+        let manifest = indexed_manifest
+            .iter()
+            .map(|(path, indexed)| (path.clone(), indexed.manifest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if !self.diff_file_maps_to_manifest(files, &manifest).is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            indexed_manifest
+                .into_iter()
+                .map(|(path, indexed)| (path, indexed.stamp))
+                .collect(),
+        ))
     }
 
     fn scan_visible_worktree_paths(&self) -> Result<BTreeSet<String>> {
@@ -422,7 +440,7 @@ impl CrabDb {
                 self.delete_worktree_index_path(path)?;
                 continue;
             }
-            let stamp = worktree_file_stamp(&metadata);
+            let stamp = WorktreeFileStamp::from_metadata(&metadata);
             let disk_manifest = manifests.get(path).ok_or_else(|| {
                 Error::Corrupt(format!("missing computed disk manifest for `{}`", path))
             })?;
@@ -509,7 +527,7 @@ impl CrabDb {
         path: &str,
         metadata: &fs::Metadata,
     ) -> Result<Option<DiskManifest>> {
-        self.cached_worktree_manifest(path, worktree_file_stamp(metadata))
+        self.cached_worktree_manifest(path, WorktreeFileStamp::from_metadata(metadata))
     }
 
     fn upsert_worktree_index_manifest(
@@ -661,59 +679,6 @@ fn read_worktree_index_candidate(
             content_hash: sha256_hex(&bytes),
         },
     })
-}
-
-fn worktree_file_stamp(metadata: &fs::Metadata) -> WorktreeFileStamp {
-    WorktreeFileStamp {
-        size_bytes: metadata.len(),
-        modified_ns: metadata_modified_ns(metadata),
-        changed_ns: metadata_changed_ns(metadata),
-        device_id: metadata_device_id(metadata),
-        inode: metadata_inode(metadata),
-        executable: executable_from_metadata(metadata),
-    }
-}
-
-fn metadata_modified_ns(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(duration_ns)
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn metadata_changed_ns(metadata: &fs::Metadata) -> i64 {
-    metadata
-        .ctime()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(metadata.ctime_nsec())
-}
-
-#[cfg(not(unix))]
-fn metadata_changed_ns(_metadata: &fs::Metadata) -> i64 {
-    0
-}
-
-#[cfg(unix)]
-fn metadata_device_id(metadata: &fs::Metadata) -> i64 {
-    metadata.dev().min(i64::MAX as u64) as i64
-}
-
-#[cfg(not(unix))]
-fn metadata_device_id(_metadata: &fs::Metadata) -> i64 {
-    0
-}
-
-#[cfg(unix)]
-fn metadata_inode(metadata: &fs::Metadata) -> i64 {
-    metadata.ino().min(i64::MAX as u64) as i64
-}
-
-#[cfg(not(unix))]
-fn metadata_inode(_metadata: &fs::Metadata) -> i64 {
-    0
 }
 
 fn duration_ns(duration: Duration) -> i64 {
@@ -1334,7 +1299,8 @@ mod tests {
             .into_iter()
             .map(|path| {
                 let abs_path = temp.path().join(path);
-                let stamp = worktree_file_stamp(&fs::symlink_metadata(&abs_path).unwrap());
+                let stamp =
+                    WorktreeFileStamp::from_metadata(&fs::symlink_metadata(&abs_path).unwrap());
                 WorktreeIndexReadCandidate {
                     path: path.to_string(),
                     abs_path,

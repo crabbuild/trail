@@ -222,9 +222,21 @@ impl CrabDb {
         } else {
             self.load_root_files_for_selections(root_id, sparse_paths)?
         };
-        let cloned_from_workspace = sparse_paths.is_empty()
-            && self.workspace_matches_file_entries(&files)?
-            && materialize_from_workspace_cow(&self.workspace_root, dir, &files)?;
+        let cloned_from_workspace = if sparse_paths.is_empty() {
+            if let Some(source_stamps) = self.workspace_file_stamps_if_entries_match(&files)? {
+                materialize_from_workspace_cow(
+                    &self.workspace_root,
+                    dir,
+                    &files,
+                    &source_stamps,
+                    false,
+                )?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if !cloned_from_workspace {
             if sparse_paths.is_empty() {
                 self.materialize_files_best_effort_at(dir, &empty, &files)?;
@@ -239,11 +251,6 @@ impl CrabDb {
         }
         self.write_clean_workdir_manifest(dir, root_id, &files, files.keys())?;
         Ok(())
-    }
-
-    fn workspace_matches_file_entries(&self, files: &BTreeMap<String, FileEntry>) -> Result<bool> {
-        let manifest = self.scan_worktree_manifest_indexed()?;
-        Ok(self.diff_file_maps_to_manifest(files, &manifest).is_empty())
     }
 
     pub(crate) fn sparse_workdir_paths(&self, dir: &Path) -> Result<Option<Vec<String>>> {

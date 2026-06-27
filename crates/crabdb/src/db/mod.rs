@@ -269,6 +269,94 @@ pub(crate) struct DiskManifest {
     content_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorktreeFileStamp {
+    size_bytes: u64,
+    modified_ns: i64,
+    changed_ns: i64,
+    device_id: i64,
+    inode: i64,
+    executable: bool,
+}
+
+impl WorktreeFileStamp {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            size_bytes: metadata.len(),
+            modified_ns: metadata_modified_ns(metadata),
+            changed_ns: metadata_changed_ns(metadata),
+            device_id: metadata_device_id(metadata),
+            inode: metadata_inode(metadata),
+            executable: metadata_executable(metadata),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedDiskManifest {
+    manifest: DiskManifest,
+    stamp: WorktreeFileStamp,
+}
+
+fn metadata_modified_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(duration_ns)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn metadata_changed_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .ctime()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn metadata_changed_ns(_metadata: &fs::Metadata) -> i64 {
+    0
+}
+
+#[cfg(unix)]
+fn metadata_device_id(metadata: &fs::Metadata) -> i64 {
+    metadata.dev().min(i64::MAX as u64) as i64
+}
+
+#[cfg(not(unix))]
+fn metadata_device_id(_metadata: &fs::Metadata) -> i64 {
+    0
+}
+
+#[cfg(unix)]
+fn metadata_inode(metadata: &fs::Metadata) -> i64 {
+    metadata.ino().min(i64::MAX as u64) as i64
+}
+
+#[cfg(not(unix))]
+fn metadata_inode(_metadata: &fs::Metadata) -> i64 {
+    0
+}
+
+#[cfg(unix)]
+fn metadata_executable(metadata: &fs::Metadata) -> bool {
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn metadata_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn duration_ns(duration: Duration) -> i64 {
+    let ns = (duration.as_secs() as u128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(duration.subsec_nanos() as u128);
+    ns.min(i64::MAX as u128) as i64
+}
+
 pub(crate) struct DaemonWorktreeCache {
     state: Arc<Mutex<DaemonWorktreeCacheState>>,
     persist: Option<DaemonWorktreeCachePersist>,

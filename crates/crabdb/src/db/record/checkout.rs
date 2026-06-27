@@ -52,7 +52,26 @@ impl CrabDb {
         if !dry_run {
             if let Some(output_root) = &output_root {
                 prepare_checkout_workdir(output_root)?;
-                self.materialize_files_at(output_root, &BTreeMap::new(), &target_files)?;
+                let cloned_from_workspace = if target.root_id == current.root_id {
+                    if let Some(source_stamps) =
+                        self.workspace_file_stamps_if_entries_match(&target_files)?
+                    {
+                        materialize_from_workspace_cow(
+                            &self.workspace_root,
+                            output_root,
+                            &target_files,
+                            &source_stamps,
+                            true,
+                        )?
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !cloned_from_workspace {
+                    self.materialize_files_at(output_root, &BTreeMap::new(), &target_files)?;
+                }
             } else {
                 self.materialize_files(&current_files, &target_files)?;
             }
