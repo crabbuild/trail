@@ -13,7 +13,7 @@ pub fn openapi_spec() -> Value {
         "info": {
             "title": "CrabDB Local API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Loopback JSON API for CrabDB editor integrations, agent runners, and local coordinators."
+            "description": "Loopback JSON API for CrabDB editor integrations, lane runners, and local coordinators."
         },
         "servers": [
             {

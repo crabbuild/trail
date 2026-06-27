@@ -8,7 +8,7 @@ CrabDB is built as a local-first operation database for code and text worktrees.
 
 - Keep the workspace local and usable without a daemon.
 - Record operations as durable history, not only snapshots.
-- Preserve stable file and line identity for provenance and agent patching.
+- Preserve stable file and line identity for provenance and lane patching.
 - Let humans and agents work on isolated refs before merge.
 - Share typed reports across CLI, HTTP, MCP, and Rust API surfaces.
 - Keep risky actions inspectable through guardrails, approvals, readiness, and merge queues.
@@ -72,7 +72,7 @@ This means CLI behavior usually has two paths:
 - Local execution through `CrabDb`.
 - Daemon-backed execution for selected hot commands, returning the same report shapes.
 
-The daemon path is intentionally partial. It handles `status`, `record`, `diff`, selected `agent` commands, `merge-agent`, and `merge-queue`. Unsupported commands fall back to local execution unless the user explicitly supplied a daemon URL and the command is not daemon-capable.
+The daemon path is intentionally partial. It handles `status`, `record`, `diff`, selected `lane` commands, `merge-lane`, and `merge-queue`. Unsupported commands fall back to local execution unless the user explicitly supplied a daemon URL and the command is not daemon-capable.
 
 ```mermaid
 sequenceDiagram
@@ -153,7 +153,7 @@ Initialization creates:
 
 - `.crabdb/index`
 - `.crabdb/refs/branches`
-- `.crabdb/refs/agents`
+- `.crabdb/refs/lanes`
 - `.crabdb/worktrees`
 - `config.toml`
 - `HEAD`
@@ -172,7 +172,7 @@ Advisory leases are separate from the write lock. The write lock protects databa
 
 - Refs should point to an operation object and root object that exist.
 - Operation parents form the reachable history graph.
-- Branch refs and agent branch records should agree on current head/root.
+- Branch refs and lane branch records should agree on current head/root.
 - Materialized workdirs should not be trusted if their manifest is missing or dirty without recording/sync.
 - Ignored and internal paths should not be recorded accidentally.
 - Derived indexes may be rebuilt, but object history and refs are the durable source of truth.

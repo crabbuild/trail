@@ -3,7 +3,7 @@ use super::*;
 impl CrabDb {
     pub fn guardrail_check(
         &self,
-        agent: Option<&str>,
+        lane: Option<&str>,
         action: &str,
         summary: Option<&str>,
         payload: Option<serde_json::Value>,
@@ -20,13 +20,13 @@ impl CrabDb {
             .filter(|summary| !summary.is_empty())
             .map(redact_sensitive_text);
         let payload = payload.map(redact_sensitive_json);
-        let agent_details = agent.map(|agent| self.agent_details(agent)).transpose()?;
-        let agent_name = agent_details
+        let lane_details = lane.map(|lane| self.lane_details(lane)).transpose()?;
+        let lane_name = lane_details
             .as_ref()
             .map(|details| details.record.name.clone())
-            .or_else(|| agent.map(str::to_string));
-        let approvals = if let Some(agent) = agent {
-            self.list_agent_approvals(Some(agent), None)?
+            .or_else(|| lane.map(str::to_string));
+        let approvals = if let Some(lane) = lane {
+            self.list_lane_approvals(Some(lane), None)?
         } else {
             Vec::new()
         };
@@ -151,7 +151,7 @@ impl CrabDb {
 
         let approval_request =
             (decision == "approval_required").then(|| GuardrailApprovalRequest {
-                agent: agent_name,
+                lane: lane_name,
                 action: action.to_string(),
                 summary: summary
                     .clone()
@@ -160,7 +160,7 @@ impl CrabDb {
             });
 
         Ok(GuardrailCheckReport {
-            agent: agent_details,
+            lane: lane_details,
             action: action.to_string(),
             summary,
             decision,

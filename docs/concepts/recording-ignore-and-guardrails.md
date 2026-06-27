@@ -27,7 +27,7 @@ crabdb ignore check notes.secret
 crabdb ignore remove notes.secret
 ```
 
-Agent patches and selected records reject ignored paths unless the operation explicitly opts in with `allow_ignored` or `--allow-ignored`. Internal paths such as `.crabdb` remain blocked.
+Lane patches and selected records reject ignored paths unless the operation explicitly opts in with `allow_ignored` or `--allow-ignored`. Internal paths such as `.crabdb` remain blocked.
 
 ## Guardrails
 
@@ -58,5 +58,5 @@ Where decision is `allow`, `approval`, or `block`, and scope is `action`, `keywo
 - Record/watch args: `crates/crabdb/src/cli/command/worktree_args.rs`
 - Ignore behavior: `crates/crabdb/src/db/core/workspace/ignore.rs`, `crates/crabdb/src/db/util/path.rs`
 - Guardrail behavior: `crates/crabdb/src/db/core/workspace/guardrails.rs`, `crates/crabdb/src/db/util/guardrails`
-- Tests: `ignore_cli_manages_crabignore_and_status`, `agent_patch_respects_ignore_policy_and_explicit_opt_in`, `local_api_and_mcp_expose_ignore_controls`
+- Tests: `ignore_cli_manages_crabignore_and_status`, `lane_patch_respects_ignore_policy_and_explicit_opt_in`, `local_api_and_mcp_expose_ignore_controls`
 

@@ -75,18 +75,18 @@ pub(super) fn try_handle_daemon_command(
         Command::Why(args) => handle_why_command(ctx, &client, args),
         Command::History(args) => handle_history_command(ctx, &client, args),
         Command::CodeFrom(args) => handle_code_from_command(ctx, &client, args),
-        Command::Agent(agent) => handle_agent_command(ctx, &client, agent),
+        Command::Lane(lane) => handle_lane_command(ctx, &client, lane),
         Command::Session(session) => handle_session_command(ctx, &client, session),
         Command::Approvals(approvals) => handle_approvals_command(ctx, &client, approvals),
-        Command::MergeAgent(args) => {
+        Command::MergeLane(args) => {
             validate_merge_strategy(args.strategy.as_deref())?;
             let body = serde_json::json!({
-                "agent_id": args.name,
+                "lane_id": args.name,
                 "strategy": args.strategy,
                 "dry_run": args.dry_run,
             });
             let report: MergeReport =
-                client.post_json(&format!("/v1/branches/{}/merge-agent", args.into), &body)?;
+                client.post_json(&format!("/v1/branches/{}/merge-lane", args.into), &body)?;
             render_merge(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
@@ -112,32 +112,32 @@ fn daemon_supports_command(command: &Command) -> bool {
         | Command::CodeFrom(_)
         | Command::Session(_)
         | Command::Approvals(_)
-        | Command::MergeAgent(_)
+        | Command::MergeLane(_)
         | Command::MergeQueue(_)
         | Command::Lease(_)
         | Command::Doctor => true,
-        Command::Agent(agent) => match &agent.command {
-            AgentSubcommand::Spawn(_)
-            | AgentSubcommand::List
-            | AgentSubcommand::Show(_)
-            | AgentSubcommand::Status(_)
-            | AgentSubcommand::Review(_)
-            | AgentSubcommand::Contribution(_)
-            | AgentSubcommand::Gates(_)
-            | AgentSubcommand::Readiness(_)
-            | AgentSubcommand::Handoff(_)
-            | AgentSubcommand::Claim(_)
-            | AgentSubcommand::Record(_)
-            | AgentSubcommand::Rewind(_)
-            | AgentSubcommand::Events(_)
-            | AgentSubcommand::Read(_)
-            | AgentSubcommand::Workdir(_)
-            | AgentSubcommand::SyncWorkdir(_)
-            | AgentSubcommand::ApplyPatch(_)
-            | AgentSubcommand::Diff(_)
-            | AgentSubcommand::Timeline(_) => true,
-            AgentSubcommand::Turn(_) => true,
-            AgentSubcommand::Trace(_) => true,
+        Command::Lane(lane) => match &lane.command {
+            LaneSubcommand::Spawn(_)
+            | LaneSubcommand::List
+            | LaneSubcommand::Show(_)
+            | LaneSubcommand::Status(_)
+            | LaneSubcommand::Review(_)
+            | LaneSubcommand::Contribution(_)
+            | LaneSubcommand::Gates(_)
+            | LaneSubcommand::Readiness(_)
+            | LaneSubcommand::Handoff(_)
+            | LaneSubcommand::Claim(_)
+            | LaneSubcommand::Record(_)
+            | LaneSubcommand::Rewind(_)
+            | LaneSubcommand::Events(_)
+            | LaneSubcommand::Read(_)
+            | LaneSubcommand::Workdir(_)
+            | LaneSubcommand::SyncWorkdir(_)
+            | LaneSubcommand::ApplyPatch(_)
+            | LaneSubcommand::Diff(_)
+            | LaneSubcommand::Timeline(_) => true,
+            LaneSubcommand::Turn(_) => true,
+            LaneSubcommand::Trace(_) => true,
             _ => false,
         },
         _ => false,
@@ -148,13 +148,13 @@ fn auto_daemon_should_fallback(err: &Error) -> bool {
     matches!(err, Error::DaemonUnavailable(_))
 }
 
-fn handle_agent_command(
+fn handle_lane_command(
     ctx: &RuntimeContext,
     client: &DaemonClient,
-    agent: &AgentCommand,
+    lane: &LaneCommand,
 ) -> Result<bool> {
-    match &agent.command {
-        AgentSubcommand::Spawn(args) => {
+    match &lane.command {
+        LaneSubcommand::Spawn(args) => {
             let mut body = Map::new();
             body.insert("name".to_string(), Value::String(args.name.clone()));
             if let Some(from) = &args.from {
@@ -186,100 +186,100 @@ fn handle_agent_command(
             if let Some(model) = &args.model {
                 body.insert("model".to_string(), Value::String(model.clone()));
             }
-            let report: AgentSpawnReport = client.post_json("/v1/agents", &Value::Object(body))?;
-            render_agent_spawn(&report, ctx.json, ctx.quiet)?;
+            let report: LaneSpawnReport = client.post_json("/v1/lanes", &Value::Object(body))?;
+            render_lane_spawn(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::List => {
-            let agents: Vec<AgentDetails> = client.get_json("/v1/agents")?;
-            render_agent_list(&agents, ctx.json, ctx.quiet)?;
+        LaneSubcommand::List => {
+            let lanes: Vec<LaneDetails> = client.get_json("/v1/lanes")?;
+            render_lane_list(&lanes, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Show(args) => {
-            let details: AgentDetails = client.get_json(&format!("/v1/agents/{}", args.name))?;
-            render_agent_details(&details, ctx.json, ctx.quiet)?;
+        LaneSubcommand::Show(args) => {
+            let details: LaneDetails = client.get_json(&format!("/v1/lanes/{}", args.name))?;
+            render_lane_details(&details, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Status(args) => {
-            let report: AgentStatusReport =
-                client.get_json(&format!("/v1/agents/{}/status", args.name))?;
-            render_agent_status(&report, ctx.json, ctx.quiet)?;
+        LaneSubcommand::Status(args) => {
+            let report: LaneStatusReport =
+                client.get_json(&format!("/v1/lanes/{}/status", args.name))?;
+            render_lane_status(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Review(args) => {
-            let report: AgentReviewPacketReport = client.get_json(&format!(
-                "/v1/agents/{}/review?limit={}",
+        LaneSubcommand::Review(args) => {
+            let report: LaneReviewPacketReport = client.get_json(&format!(
+                "/v1/lanes/{}/review?limit={}",
                 args.name, args.limit
             ))?;
-            render_agent_review_packet(&report, ctx.json, ctx.quiet)?;
+            render_lane_review_packet(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Contribution(args) => {
-            let report: AgentContributionReport = client.get_json(&format!(
-                "/v1/agents/{}/contribution?limit={}",
+        LaneSubcommand::Contribution(args) => {
+            let report: LaneContributionReport = client.get_json(&format!(
+                "/v1/lanes/{}/contribution?limit={}",
                 args.name, args.limit
             ))?;
-            render_agent_contribution(&report, ctx.json, ctx.quiet)?;
+            render_lane_contribution(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Gates(args) => {
+        LaneSubcommand::Gates(args) => {
             let mut params = vec![format!("limit={}", args.limit)];
             if let Some(kind) = &args.kind {
                 params.push(format!("kind={kind}"));
             }
-            let path = append_query(&format!("/v1/agents/{}/gates", args.name), params);
-            let report: AgentGateHistoryReport = client.get_json(&path)?;
-            render_agent_gate_history(&report, ctx.json, ctx.quiet)?;
+            let path = append_query(&format!("/v1/lanes/{}/gates", args.name), params);
+            let report: LaneGateHistoryReport = client.get_json(&path)?;
+            render_lane_gate_history(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Readiness(args) => {
-            let report: AgentReadinessReport =
-                client.get_json(&format!("/v1/agents/{}/readiness", args.name))?;
-            render_agent_readiness(&report, ctx.json, ctx.quiet)?;
+        LaneSubcommand::Readiness(args) => {
+            let report: LaneReadinessReport =
+                client.get_json(&format!("/v1/lanes/{}/readiness", args.name))?;
+            render_lane_readiness(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Handoff(args) => {
-            let report: AgentHandoffReport = client.get_json(&format!(
-                "/v1/agents/{}/handoff?limit={}",
+        LaneSubcommand::Handoff(args) => {
+            let report: LaneHandoffReport = client.get_json(&format!(
+                "/v1/lanes/{}/handoff?limit={}",
                 args.name, args.limit
             ))?;
-            render_agent_handoff(&report, ctx.json, ctx.quiet)?;
+            render_lane_handoff(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Claim(args) => {
+        LaneSubcommand::Claim(args) => {
             let body = serde_json::json!({
                 "path": args.path,
                 "ttl_secs": args.ttl_secs,
             });
-            let report: AgentClaimReport =
-                client.post_json(&format!("/v1/agents/{}/claims", args.name), &body)?;
-            render_agent_claim(&report, ctx.json, ctx.quiet)?;
+            let report: LaneClaimReport =
+                client.post_json(&format!("/v1/lanes/{}/claims", args.name), &body)?;
+            render_lane_claim(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Record(args) => {
+        LaneSubcommand::Record(args) => {
             let body = serde_json::json!({
                 "message": args.message,
             });
-            let report: AgentRecordReport =
-                client.post_json(&format!("/v1/agents/{}/record", args.name), &body)?;
-            render_agent_record(&report, ctx.json, ctx.quiet)?;
+            let report: LaneRecordReport =
+                client.post_json(&format!("/v1/lanes/{}/record", args.name), &body)?;
+            render_lane_record(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Rewind(args) => {
+        LaneSubcommand::Rewind(args) => {
             let body = serde_json::json!({
                 "to": args.target,
                 "record_current": args.record_current,
                 "sync_workdir": args.sync_workdir,
             });
-            let report: AgentRewindReport =
-                client.post_json(&format!("/v1/agents/{}/rewind", args.name), &body)?;
-            render_agent_rewind(&report, ctx.json, ctx.quiet)?;
+            let report: LaneRewindReport =
+                client.post_json(&format!("/v1/lanes/{}/rewind", args.name), &body)?;
+            render_lane_rewind(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Events(args) => {
+        LaneSubcommand::Events(args) => {
             let mut params = vec![format!("limit={}", args.limit)];
-            if let Some(agent) = &args.agent {
-                params.push(format!("agent={agent}"));
+            if let Some(lane) = &args.lane {
+                params.push(format!("lane={lane}"));
             }
             if let Some(session) = &args.session {
                 params.push(format!("session={session}"));
@@ -290,23 +290,23 @@ fn handle_agent_command(
             if let Some(event_type) = &args.event_type {
                 params.push(format!("type={event_type}"));
             }
-            let path = append_query("/v1/agent/events", params);
-            let events: Vec<AgentEventRecord> = client.get_json(&path)?;
-            render_agent_events(&events, ctx.json, ctx.quiet)?;
+            let path = append_query("/v1/lane/events", params);
+            let events: Vec<LaneEventRecord> = client.get_json(&path)?;
+            render_lane_events(&events, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::SyncWorkdir(args) => {
+        LaneSubcommand::SyncWorkdir(args) => {
             let body = serde_json::json!({
                 "force": args.force,
                 "paths": args.paths,
                 "include_neighbors": args.include_neighbors,
             });
-            let report: AgentWorkdirSyncReport =
-                client.post_json(&format!("/v1/agents/{}/sync-workdir", args.name), &body)?;
-            render_agent_workdir_sync(&report, ctx.json, ctx.quiet)?;
+            let report: LaneWorkdirSyncReport =
+                client.post_json(&format!("/v1/lanes/{}/sync-workdir", args.name), &body)?;
+            render_lane_workdir_sync(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Read(args) => {
+        LaneSubcommand::Read(args) => {
             let mut body = Map::new();
             body.insert("path".to_string(), Value::String(args.path.clone()));
             if args.hydrate {
@@ -319,32 +319,32 @@ fn handle_agent_command(
                 "include_neighbors".to_string(),
                 Value::Bool(args.include_neighbors),
             );
-            let report: AgentFileReadReport = client.post_json(
-                &format!("/v1/agents/{}/read-file", args.name),
+            let report: LaneFileReadReport = client.post_json(
+                &format!("/v1/lanes/{}/read-file", args.name),
                 &Value::Object(body),
             )?;
-            render_agent_file_read(&report, ctx.json, ctx.quiet)?;
+            render_lane_file_read(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Workdir(args) => {
-            let report: AgentWorkdirReport =
-                client.get_json(&format!("/v1/agents/{}/workdir", args.name))?;
-            render_agent_workdir(&report, ctx.json, ctx.quiet)?;
+        LaneSubcommand::Workdir(args) => {
+            let report: LaneWorkdirReport =
+                client.get_json(&format!("/v1/lanes/{}/workdir", args.name))?;
+            render_lane_workdir(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::ApplyPatch(args) => {
+        LaneSubcommand::ApplyPatch(args) => {
             let mut patch: PatchDocument =
                 serde_json::from_slice(&std::fs::read(&args.patch).map_err(Error::from)?)?;
             if args.allow_ignored {
                 patch.allow_ignored = true;
             }
             let body = serde_json::to_value(&patch)?;
-            let report: AgentPatchReport =
-                client.post_json(&format!("/v1/agents/{}/patches", args.name), &body)?;
-            render_agent_patch(&report, ctx.json, ctx.quiet)?;
+            let report: LanePatchReport =
+                client.post_json(&format!("/v1/lanes/{}/patches", args.name), &body)?;
+            render_lane_patch(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Diff(args) => {
+        LaneSubcommand::Diff(args) => {
             let mut params = Vec::new();
             if args.patch {
                 params.push("patch=1".to_string());
@@ -352,16 +352,16 @@ fn handle_agent_command(
             if args.show_line_ids {
                 params.push("show_line_ids=1".to_string());
             }
-            let path = append_query(&format!("/v1/agents/{}/diff", args.name), params);
+            let path = append_query(&format!("/v1/lanes/{}/diff", args.name), params);
             let summary: DiffSummary = client.get_json(&path)?;
             render_diff(&summary, ctx.json, ctx.quiet, false)?;
             Ok(true)
         }
-        AgentSubcommand::Timeline(args) => {
+        LaneSubcommand::Timeline(args) => {
             let path = append_query(
                 "/v1/timeline",
                 vec![
-                    format!("agent={}", args.name),
+                    format!("lane={}", args.name),
                     format!("limit={}", args.limit),
                 ],
             );
@@ -369,8 +369,8 @@ fn handle_agent_command(
             render_timeline(&entries, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentSubcommand::Turn(turn) => handle_agent_turn_command(ctx, client, turn),
-        AgentSubcommand::Trace(trace) => handle_agent_trace_command(ctx, client, trace),
+        LaneSubcommand::Turn(turn) => handle_lane_turn_command(ctx, client, turn),
+        LaneSubcommand::Trace(trace) => handle_lane_trace_command(ctx, client, trace),
         _ => Ok(false),
     }
 }
@@ -387,8 +387,8 @@ fn handle_timeline_command(
     if let Some(session) = &args.session {
         params.push(format!("session={session}"));
     }
-    if let Some(agent) = &args.agent {
-        params.push(format!("agent={agent}"));
+    if let Some(lane) = &args.lane {
+        params.push(format!("lane={lane}"));
     }
     let entries: Vec<TimelineEntry> = client.get_json(&append_query("/v1/timeline", params))?;
     render_timeline(&entries, ctx.json, ctx.quiet)?;
@@ -469,34 +469,34 @@ fn handle_session_command(
     match &session.command {
         SessionSubcommand::Start(args) => {
             let body = serde_json::json!({
-                "agent": args.agent,
+                "lane": args.lane,
                 "title": args.title,
                 "id": args.id,
             });
-            let report: AgentSessionStartReport = client.post_json("/v1/sessions", &body)?;
+            let report: LaneSessionStartReport = client.post_json("/v1/sessions", &body)?;
             render_session_start(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         SessionSubcommand::Current(args) => {
-            let path = match &args.agent {
-                Some(agent) => append_query("/v1/sessions/current", vec![format!("agent={agent}")]),
+            let path = match &args.lane {
+                Some(lane) => append_query("/v1/sessions/current", vec![format!("lane={lane}")]),
                 None => "/v1/sessions/current".to_string(),
             };
-            let reports: Vec<AgentSessionCurrentReport> = client.get_json(&path)?;
+            let reports: Vec<LaneSessionCurrentReport> = client.get_json(&path)?;
             render_session_current(&reports, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         SessionSubcommand::List(args) => {
-            let path = match &args.agent {
-                Some(agent) => append_query("/v1/sessions", vec![format!("agent={agent}")]),
+            let path = match &args.lane {
+                Some(lane) => append_query("/v1/sessions", vec![format!("lane={lane}")]),
                 None => "/v1/sessions".to_string(),
             };
-            let sessions: Vec<AgentSession> = client.get_json(&path)?;
+            let sessions: Vec<LaneSession> = client.get_json(&path)?;
             render_session_list(&sessions, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         SessionSubcommand::Show(args) => {
-            let details: AgentSessionDetails =
+            let details: LaneSessionDetails =
                 client.get_json(&format!("/v1/sessions/{}", args.session_id))?;
             render_session_details(&details, ctx.json, ctx.quiet)?;
             Ok(true)
@@ -506,7 +506,7 @@ fn handle_session_command(
                 &format!("/v1/sessions/{}/context", args.session_id),
                 vec![format!("limit={}", args.limit)],
             );
-            let report: AgentSessionContextReport = client.get_json(&path)?;
+            let report: LaneSessionContextReport = client.get_json(&path)?;
             render_session_context(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
@@ -514,7 +514,7 @@ fn handle_session_command(
             let body = serde_json::json!({
                 "status": args.status,
             });
-            let report: AgentSessionEndReport =
+            let report: LaneSessionEndReport =
                 client.post_json(&format!("/v1/sessions/{}/end", args.session_id), &body)?;
             render_session_end(&report, ctx.json, ctx.quiet)?;
             Ok(true)
@@ -530,7 +530,7 @@ fn handle_approvals_command(
     match &approvals.command {
         ApprovalsSubcommand::Request(args) => {
             let mut body = Map::new();
-            body.insert("agent".to_string(), Value::String(args.agent.clone()));
+            body.insert("lane".to_string(), Value::String(args.lane.clone()));
             body.insert("action".to_string(), Value::String(args.action.clone()));
             body.insert("summary".to_string(), Value::String(args.summary.clone()));
             if let Some(payload) = parse_optional_json(args.payload_json.as_deref())? {
@@ -542,26 +542,26 @@ fn handle_approvals_command(
             if let Some(turn) = &args.turn {
                 body.insert("turn_id".to_string(), Value::String(turn.clone()));
             }
-            let report: AgentApprovalRequestReport =
+            let report: LaneApprovalRequestReport =
                 client.post_json("/v1/approvals", &Value::Object(body))?;
             render_approval_request(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         ApprovalsSubcommand::List(args) => {
             let mut params = Vec::new();
-            if let Some(agent) = &args.agent {
-                params.push(format!("agent={agent}"));
+            if let Some(lane) = &args.lane {
+                params.push(format!("lane={lane}"));
             }
             if let Some(status) = &args.status {
                 params.push(format!("status={status}"));
             }
-            let approvals: Vec<AgentApproval> =
+            let approvals: Vec<LaneApproval> =
                 client.get_json(&append_query("/v1/approvals", params))?;
             render_approval_list(&approvals, ctx.json, ctx.quiet)?;
             Ok(true)
         }
         ApprovalsSubcommand::Show(args) => {
-            let approval: AgentApproval =
+            let approval: LaneApproval =
                 client.get_json(&format!("/v1/approvals/{}", args.approval_id))?;
             render_approval(&approval, ctx.json, ctx.quiet)?;
             Ok(true)
@@ -572,7 +572,7 @@ fn handle_approvals_command(
                 "reviewer": args.reviewer,
                 "note": args.note,
             });
-            let report: AgentApprovalDecisionReport = client.post_json(
+            let report: LaneApprovalDecisionReport = client.post_json(
                 &format!("/v1/approvals/{}/decision", args.approval_id),
                 &body,
             )?;
@@ -582,15 +582,15 @@ fn handle_approvals_command(
     }
 }
 
-fn handle_agent_turn_command(
+fn handle_lane_turn_command(
     ctx: &RuntimeContext,
     client: &DaemonClient,
-    turn: &AgentTurnCommand,
+    turn: &LaneTurnCommand,
 ) -> Result<bool> {
     match &turn.command {
-        AgentTurnSubcommand::Start(args) => {
+        LaneTurnSubcommand::Start(args) => {
             let mut body = Map::new();
-            body.insert("agent".to_string(), Value::String(args.name.clone()));
+            body.insert("lane".to_string(), Value::String(args.name.clone()));
             if let Some(from) = &args.from {
                 body.insert("branch".to_string(), Value::String(from.clone()));
             }
@@ -603,28 +603,28 @@ fn handle_agent_turn_command(
                     Value::String(base_change.clone()),
                 );
             }
-            let report: AgentTurnStartReport =
-                client.post_json("/v1/agent/turns", &Value::Object(body))?;
-            render_agent_turn_start(&report, ctx.json, ctx.quiet)?;
+            let report: LaneTurnStartReport =
+                client.post_json("/v1/lane/turns", &Value::Object(body))?;
+            render_lane_turn_start(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTurnSubcommand::Show(args) => {
-            let details: AgentTurnDetails =
-                client.get_json(&format!("/v1/agent/turns/{}", args.turn_id))?;
-            render_agent_turn_details(&details, ctx.json, ctx.quiet)?;
+        LaneTurnSubcommand::Show(args) => {
+            let details: LaneTurnDetails =
+                client.get_json(&format!("/v1/lane/turns/{}", args.turn_id))?;
+            render_lane_turn_details(&details, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTurnSubcommand::Message(args) => {
+        LaneTurnSubcommand::Message(args) => {
             let body = serde_json::json!({
                 "role": args.role,
                 "text": args.text,
             });
-            let report: AgentMessageReport =
-                client.post_json(&format!("/v1/agent/turns/{}/messages", args.turn_id), &body)?;
-            render_agent_message(&report, ctx.json, ctx.quiet)?;
+            let report: LaneMessageReport =
+                client.post_json(&format!("/v1/lane/turns/{}/messages", args.turn_id), &body)?;
+            render_lane_message(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTurnSubcommand::Event(args) => {
+        LaneTurnSubcommand::Event(args) => {
             let mut body = Map::new();
             body.insert(
                 "event_type".to_string(),
@@ -639,44 +639,44 @@ fn handle_agent_turn_command(
             if let Some(message) = &args.message {
                 body.insert("message_id".to_string(), Value::String(message.clone()));
             }
-            let report: AgentTurnEventReport = client.post_json(
-                &format!("/v1/agent/turns/{}/events", args.turn_id),
+            let report: LaneTurnEventReport = client.post_json(
+                &format!("/v1/lane/turns/{}/events", args.turn_id),
                 &Value::Object(body),
             )?;
-            render_agent_turn_event(&report, ctx.json, ctx.quiet)?;
+            render_lane_turn_event(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTurnSubcommand::ApplyPatch(args) => {
+        LaneTurnSubcommand::ApplyPatch(args) => {
             let mut patch: PatchDocument =
                 serde_json::from_slice(&std::fs::read(&args.patch).map_err(Error::from)?)?;
             if args.allow_ignored {
                 patch.allow_ignored = true;
             }
             let body = serde_json::to_value(&patch)?;
-            let report: AgentPatchReport =
-                client.post_json(&format!("/v1/agent/turns/{}/patches", args.turn_id), &body)?;
-            render_agent_patch(&report, ctx.json, ctx.quiet)?;
+            let report: LanePatchReport =
+                client.post_json(&format!("/v1/lane/turns/{}/patches", args.turn_id), &body)?;
+            render_lane_patch(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTurnSubcommand::End(args) => {
+        LaneTurnSubcommand::End(args) => {
             let body = serde_json::json!({
                 "status": args.status,
             });
-            let report: AgentTurnEndReport =
-                client.post_json(&format!("/v1/agent/turns/{}/end", args.turn_id), &body)?;
-            render_agent_turn_end(&report, ctx.json, ctx.quiet)?;
+            let report: LaneTurnEndReport =
+                client.post_json(&format!("/v1/lane/turns/{}/end", args.turn_id), &body)?;
+            render_lane_turn_end(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
     }
 }
 
-fn handle_agent_trace_command(
+fn handle_lane_trace_command(
     ctx: &RuntimeContext,
     client: &DaemonClient,
-    trace: &AgentTraceCommand,
+    trace: &LaneTraceCommand,
 ) -> Result<bool> {
     match &trace.command {
-        AgentTraceSubcommand::Start(args) => {
+        LaneTraceSubcommand::Start(args) => {
             let mut body = Map::new();
             body.insert(
                 "span_type".to_string(),
@@ -692,70 +692,70 @@ fn handle_agent_trace_command(
             if let Some(attributes) = parse_optional_json(args.attributes_json.as_deref())? {
                 body.insert("attributes".to_string(), attributes);
             }
-            let report: AgentTraceSpanStartReport = client.post_json(
-                &format!("/v1/agent/turns/{}/spans", args.turn_id),
+            let report: LaneTraceSpanStartReport = client.post_json(
+                &format!("/v1/lane/turns/{}/spans", args.turn_id),
                 &Value::Object(body),
             )?;
-            render_agent_trace_span_start(&report, ctx.json, ctx.quiet)?;
+            render_lane_trace_span_start(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTraceSubcommand::End(args) => {
+        LaneTraceSubcommand::End(args) => {
             let mut body = Map::new();
             body.insert("status".to_string(), Value::String(args.status.clone()));
             if let Some(result) = parse_optional_json(args.result_json.as_deref())? {
                 body.insert("result".to_string(), result);
             }
-            let report: AgentTraceSpanEndReport = client.post_json(
-                &format!("/v1/agent/spans/{}/end", args.span_id),
+            let report: LaneTraceSpanEndReport = client.post_json(
+                &format!("/v1/lane/spans/{}/end", args.span_id),
                 &Value::Object(body),
             )?;
-            render_agent_trace_span_end(&report, ctx.json, ctx.quiet)?;
+            render_lane_trace_span_end(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTraceSubcommand::List(args) => {
+        LaneTraceSubcommand::List(args) => {
             let mut params = trace_filter_params(
-                args.agent.as_deref(),
+                args.lane.as_deref(),
                 args.session.as_deref(),
                 args.turn.as_deref(),
                 args.trace_id.as_deref(),
             );
             params.push(format!("limit={}", args.limit));
-            let path = append_query("/v1/agent/spans", params);
-            let spans: Vec<AgentTraceSpan> = client.get_json(&path)?;
-            render_agent_trace_spans(&spans, ctx.json, ctx.quiet)?;
+            let path = append_query("/v1/lane/spans", params);
+            let spans: Vec<LaneTraceSpan> = client.get_json(&path)?;
+            render_lane_trace_spans(&spans, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTraceSubcommand::Summary(args) => {
+        LaneTraceSubcommand::Summary(args) => {
             let mut params = trace_filter_params(
-                args.agent.as_deref(),
+                args.lane.as_deref(),
                 args.session.as_deref(),
                 args.turn.as_deref(),
                 args.trace_id.as_deref(),
             );
             params.push(format!("slowest={}", args.slowest_limit));
-            let path = append_query("/v1/agent/spans/summary", params);
-            let report: AgentTraceSummaryReport = client.get_json(&path)?;
-            render_agent_trace_summary(&report, ctx.json, ctx.quiet)?;
+            let path = append_query("/v1/lane/spans/summary", params);
+            let report: LaneTraceSummaryReport = client.get_json(&path)?;
+            render_lane_trace_summary(&report, ctx.json, ctx.quiet)?;
             Ok(true)
         }
-        AgentTraceSubcommand::Show(args) => {
-            let span: AgentTraceSpan =
-                client.get_json(&format!("/v1/agent/spans/{}", args.span_id))?;
-            render_agent_trace_span(&span, ctx.json, ctx.quiet)?;
+        LaneTraceSubcommand::Show(args) => {
+            let span: LaneTraceSpan =
+                client.get_json(&format!("/v1/lane/spans/{}", args.span_id))?;
+            render_lane_trace_span(&span, ctx.json, ctx.quiet)?;
             Ok(true)
         }
     }
 }
 
 fn trace_filter_params(
-    agent: Option<&str>,
+    lane: Option<&str>,
     session: Option<&str>,
     turn: Option<&str>,
     trace_id: Option<&str>,
 ) -> Vec<String> {
     let mut params = Vec::new();
-    if let Some(agent) = agent {
-        params.push(format!("agent={agent}"));
+    if let Some(lane) = lane {
+        params.push(format!("lane={lane}"));
     }
     if let Some(session) = session {
         params.push(format!("session={session}"));
@@ -816,7 +816,7 @@ fn handle_lease_command(
     match &lease.command {
         LeaseSubcommand::Acquire(args) => {
             let body = serde_json::json!({
-                "agent": args.agent,
+                "lane": args.lane,
                 "path": args.path,
                 "mode": args.mode.as_str(),
                 "ttl_secs": args.ttl_secs,

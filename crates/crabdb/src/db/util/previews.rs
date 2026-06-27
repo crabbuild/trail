@@ -23,9 +23,9 @@ pub(crate) fn hex_preview(bytes: &[u8], max_bytes: usize) -> (String, bool) {
 }
 
 pub(crate) fn output_preview(bytes: &[u8]) -> (String, bool) {
-    let truncated = bytes.len() > AGENT_TEST_OUTPUT_PREVIEW_BYTES;
+    let truncated = bytes.len() > LANE_TEST_OUTPUT_PREVIEW_BYTES;
     let preview = if truncated {
-        &bytes[..AGENT_TEST_OUTPUT_PREVIEW_BYTES]
+        &bytes[..LANE_TEST_OUTPUT_PREVIEW_BYTES]
     } else {
         bytes
     };

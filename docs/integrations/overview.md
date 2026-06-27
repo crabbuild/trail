@@ -9,6 +9,10 @@ CrabDB exposes four integration surfaces:
 
 Git interop is also available through the CLI and library.
 
+The proposed [ACP relay design](../design/acp-relay.md) describes a future
+adapter that would sit between ACP-capable editors and real coding agents while
+mirroring sessions, turns, prompts, tool events, and edits into CrabDB.
+
 ## Choose a Surface
 
 Use the CLI when:
@@ -28,6 +32,12 @@ Use MCP when:
 - An agent host supports MCP tools and resources.
 - You need guided prompts for agent tasks, review, or conflict resolution.
 
+Use the future ACP relay when:
+
+- An editor speaks Agent Client Protocol.
+- You want the editor to keep its normal agent UX while CrabDB records the run.
+- The real coding agent should receive CrabDB MCP tools automatically.
+
 Use the Rust library when:
 
 - You are embedding CrabDB in another Rust process.
@@ -39,4 +49,4 @@ Use the Rust library when:
 - HTTP server: `crates/crabdb/src/server`
 - MCP server: `crates/crabdb/src/mcp`
 - Library exports: `crates/crabdb/src/lib.rs`
-
+- ACP relay proposal: `docs/design/acp-relay.md`

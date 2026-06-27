@@ -15,11 +15,11 @@ The server implements JSON-RPC methods for tools, resources, resource templates,
 MCP tools mirror the main workflows:
 
 - Core workspace and provenance tools.
-- Agent branch and review tools.
+- Lane branch and review tools.
 - Session, approval, run, lease, and anchor tools.
 - Merge queue and conflict tools.
 - Turn, event, span, patch, test, eval, read, and sync tools.
-- Rewind tools for returning an agent branch to a known-good root without losing
+- Rewind tools for returning a lane branch to a known-good root without losing
   the failed attempt.
 
 See [MCP tools reference](../reference/mcp-tools.md) for the complete list.
@@ -34,8 +34,8 @@ Resource templates expose agent details, status, review packets, contribution, g
 
 Built-in prompts:
 
-- `crabdb.agent_task`
-- `crabdb.review_agent`
+- `crabdb.lane_task`
+- `crabdb.review_lane`
 - `crabdb.resolve_conflict`
 
 These guide hosts through safe agent tasks, review, and conflict resolution.
@@ -51,7 +51,7 @@ crabdb.begin_turn -> crabdb.add_message -> crabdb.span_start/span_end or crabdb.
 ```
 
 When a run pauses for approval or interruption, use `crabdb.run_pause` and later
-`crabdb.run_resume`. If a branch goes sideways, use `crabdb.agent_rewind` with
+`crabdb.run_resume`. If a branch goes sideways, use `crabdb.lane_rewind` with
 `record_current=true` to preserve the failed head before returning to a
 known-good state.
 
@@ -61,4 +61,4 @@ known-good state.
 - Tools: `crates/crabdb/src/mcp/tools`
 - Resources: `crates/crabdb/src/mcp/capabilities/resources.rs`
 - Prompts: `crates/crabdb/src/mcp/capabilities/prompts.rs`
-- Tests: `mcp_stdio_tools_drive_agent_turn_workflow`, `local_api_and_mcp_drive_merge_queue_and_conflicts`
+- Tests: `mcp_stdio_tools_drive_lane_turn_workflow`, `local_api_and_mcp_drive_merge_queue_and_conflicts`

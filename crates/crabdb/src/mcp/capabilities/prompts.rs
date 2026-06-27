@@ -11,13 +11,13 @@ pub(crate) fn prompts_list_result() -> Value {
 pub(crate) fn prompts() -> Value {
     json!([
         {
-            "name": PROMPT_AGENT_TASK,
-            "title": "Run a CrabDB Agent Task",
-            "description": "Guide an MCP host through a safe CrabDB agent task with turn tracking, patching, gates, and merge handoff.",
+            "name": PROMPT_LANE_TASK,
+            "title": "Run a CrabDB Lane Task",
+            "description": "Guide an MCP host through a safe CrabDB lane task with turn tracking, patching, gates, and merge handoff.",
             "arguments": [
                 {
-                    "name": "agent",
-                    "description": "Agent branch name to use or create.",
+                    "name": "lane",
+                    "description": "Lane branch name to use or create.",
                     "required": true
                 },
                 {
@@ -33,13 +33,13 @@ pub(crate) fn prompts() -> Value {
             ]
         },
         {
-            "name": PROMPT_REVIEW_AGENT,
-            "title": "Review a CrabDB Agent",
-            "description": "Guide a host through reviewing an agent branch before merge.",
+            "name": PROMPT_REVIEW_LANE,
+            "title": "Review a CrabDB Lane",
+            "description": "Guide a host through reviewing a lane branch before merge.",
             "arguments": [
                 {
-                    "name": "agent",
-                    "description": "Agent branch name or id to review.",
+                    "name": "lane",
+                    "description": "Lane branch name or id to review.",
                     "required": true
                 }
             ]

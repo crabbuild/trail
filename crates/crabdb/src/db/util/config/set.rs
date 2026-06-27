@@ -65,37 +65,37 @@ pub(crate) fn set_config_value(
             config.text.preserve_similarity = parsed;
             Ok(())
         }
-        "agent.default_materialize" => {
-            config.agent.default_materialize = parse_config_bool(key, value)?;
+        "lane.default_materialize" => {
+            config.lane.default_materialize = parse_config_bool(key, value)?;
             Ok(())
         }
-        "agent.require_test_gate" => {
-            config.agent.require_test_gate = parse_config_bool(key, value)?;
+        "lane.require_test_gate" => {
+            config.lane.require_test_gate = parse_config_bool(key, value)?;
             Ok(())
         }
-        "agent.require_eval_gate" => {
-            config.agent.require_eval_gate = parse_config_bool(key, value)?;
+        "lane.require_eval_gate" => {
+            config.lane.require_eval_gate = parse_config_bool(key, value)?;
             Ok(())
         }
-        "agent.required_test_suites" => {
-            config.agent.required_test_suites = parse_config_suite_list(key, value)?;
+        "lane.required_test_suites" => {
+            config.lane.required_test_suites = parse_config_suite_list(key, value)?;
             Ok(())
         }
-        "agent.required_eval_suites" => {
-            config.agent.required_eval_suites = parse_config_suite_list(key, value)?;
+        "lane.required_eval_suites" => {
+            config.lane.required_eval_suites = parse_config_suite_list(key, value)?;
             Ok(())
         }
-        "agent.worktrees_dir" => {
-            config.agent.worktrees_dir = normalize_relative_path(value)?;
+        "lane.worktrees_dir" => {
+            config.lane.worktrees_dir = normalize_relative_path(value)?;
             Ok(())
         }
-        "agent.merge_strategy" => {
+        "lane.merge_strategy" => {
             if value != "conservative" {
                 return Err(Error::InvalidInput(format!(
-                    "agent.merge_strategy must be conservative, got `{value}`"
+                    "lane.merge_strategy must be conservative, got `{value}`"
                 )));
             }
-            config.agent.merge_strategy = value.to_string();
+            config.lane.merge_strategy = value.to_string();
             Ok(())
         }
         "git.export_trailers" => {

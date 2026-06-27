@@ -1,7 +1,7 @@
 use super::*;
 
-pub(crate) fn build_agent_trace_spans(events: Vec<AgentEventRecord>) -> Vec<AgentTraceSpan> {
-    let mut builders: BTreeMap<String, AgentTraceSpanBuilder> = BTreeMap::new();
+pub(crate) fn build_lane_trace_spans(events: Vec<LaneEventRecord>) -> Vec<LaneTraceSpan> {
+    let mut builders: BTreeMap<String, LaneTraceSpanBuilder> = BTreeMap::new();
 
     for event in events {
         let Some(payload) = event.payload.as_ref() else {
@@ -20,10 +20,10 @@ pub(crate) fn build_agent_trace_spans(events: Vec<AgentEventRecord>) -> Vec<Agen
                         .map(default_trace_id_for_turn)
                         .unwrap_or_else(|| default_trace_id_for_turn(&event.event_id))
                 });
-                let builder = AgentTraceSpanBuilder {
+                let builder = LaneTraceSpanBuilder {
                     span_id: span_id.clone(),
                     trace_id,
-                    agent_id: event.agent_id.clone(),
+                    lane_id: event.lane_id.clone(),
                     session_id: event.session_id.clone(),
                     turn_id: event.turn_id.clone(),
                     parent_span_id: payload_string(payload, "parent_span_id"),
@@ -54,19 +54,19 @@ pub(crate) fn build_agent_trace_spans(events: Vec<AgentEventRecord>) -> Vec<Agen
 
     builders
         .into_values()
-        .map(agent_trace_span_from_builder)
+        .map(lane_trace_span_from_builder)
         .collect()
 }
 
-pub(crate) fn agent_trace_span_from_builder(builder: AgentTraceSpanBuilder) -> AgentTraceSpan {
+pub(crate) fn lane_trace_span_from_builder(builder: LaneTraceSpanBuilder) -> LaneTraceSpan {
     let duration_ms = builder
         .ended_at
         .and_then(|ended_at| ended_at.checked_sub(builder.started_at))
         .map(|seconds| seconds as u64 * 1000);
-    AgentTraceSpan {
+    LaneTraceSpan {
         span_id: builder.span_id,
         trace_id: builder.trace_id,
-        agent_id: builder.agent_id,
+        lane_id: builder.lane_id,
         session_id: builder.session_id,
         turn_id: builder.turn_id,
         parent_span_id: builder.parent_span_id,
@@ -101,7 +101,7 @@ pub(crate) fn tail_limited<T: Clone>(values: &[T], limit: usize) -> Vec<T> {
     values[start..].to_vec()
 }
 
-pub(crate) fn agent_trace_status_is_failed(status: &str) -> bool {
+pub(crate) fn lane_trace_status_is_failed(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
         "failed" | "error" | "errored" | "cancelled" | "canceled" | "timeout" | "timed_out"

@@ -2,11 +2,11 @@ use serde_json::{json, Value};
 
 pub(super) fn collaboration_schemas() -> Value {
     json!({
-        "MergeAgentRequest": {
+        "MergeLaneRequest": {
             "type": "object",
             "properties": {
-                "agent_id": { "type": "string" },
-                "agent": { "type": "string" },
+                "lane_id": { "type": "string" },
+                "lane": { "type": "string" },
                 "name": { "type": "string" },
                 "strategy": { "type": "string" },
                 "dry_run": { "type": "boolean" },
@@ -15,9 +15,9 @@ pub(super) fn collaboration_schemas() -> Value {
         },
         "SessionStartRequest": {
             "type": "object",
-            "required": ["agent"],
+            "required": ["lane"],
             "properties": {
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "title": { "type": "string" },
                 "id": { "type": "string" }
             }
@@ -30,9 +30,9 @@ pub(super) fn collaboration_schemas() -> Value {
         },
         "ApprovalRequest": {
             "type": "object",
-            "required": ["agent", "action", "summary"],
+            "required": ["lane", "action", "summary"],
             "properties": {
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "action": { "type": "string" },
                 "summary": { "type": "string" },
                 "payload": { "type": "object", "additionalProperties": true },
@@ -52,16 +52,16 @@ pub(super) fn collaboration_schemas() -> Value {
         },
         "LeaseAcquireRequest": {
             "type": "object",
-            "required": ["agent"],
+            "required": ["lane"],
             "properties": {
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "path": { "type": "string" },
                 "mode": { "type": "string", "enum": ["read", "write"] },
                 "ttl_secs": { "type": "integer", "minimum": 1 },
                 "ttl": { "type": "integer", "minimum": 1 }
             }
         },
-        "AgentClaimRequest": {
+        "LaneClaimRequest": {
             "type": "object",
             "required": ["path"],
             "properties": {

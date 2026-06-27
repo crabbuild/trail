@@ -1,6 +1,6 @@
 # Use Case: Daemon-Backed Automation
 
-Use the daemon for editor integrations and automation that repeatedly asks for status, diffs, records, and agent reports.
+Use the daemon for editor integrations and automation that repeatedly asks for status, diffs, records, and lane reports.
 
 ## Start the Daemon
 
@@ -38,8 +38,8 @@ Daemon routing supports:
 - `status` without `--branch`
 - `record`
 - `diff`
-- selected `agent` commands
-- `merge-agent`
+- selected `lane` commands
+- `merge-lane`
 - `merge-queue`
 
 If auto-discovery finds a stale daemon endpoint, the CLI falls back to local execution for unavailable daemon errors.
@@ -48,5 +48,4 @@ If auto-discovery finds a stale daemon endpoint, the CLI falls back to local exe
 
 - Daemon args and auth: `crates/crabdb/src/cli/command/maintenance_args.rs`, `crates/crabdb/src/cli/command/handler/maintenance.rs`
 - Daemon CLI routing: `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
-- Tests: `cli_daemon_url_routes_hot_agent_commands`, `cli_auto_discovers_daemon_for_hot_commands_and_falls_back_on_stale_endpoint`
-
+- Tests: `cli_daemon_url_routes_hot_lane_commands`, `cli_auto_discovers_daemon_for_hot_commands_and_falls_back_on_stale_endpoint`

@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn push_pending_approvals_check(db: &CrabDb, checks: &mut Vec<DoctorCheck>) {
-    match db.list_agent_approvals(None, Some("pending")) {
+    match db.list_lane_approvals(None, Some("pending")) {
         Ok(approvals) if approvals.is_empty() => checks.push(doctor_check(
             "pending_approvals",
             "ok",
@@ -135,62 +135,62 @@ pub(super) fn push_conflicts_check(db: &CrabDb, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
-pub(super) fn push_agents_check(db: &CrabDb, checks: &mut Vec<DoctorCheck>) {
-    match db.list_agents() {
-        Ok(agents) => {
-            let mut dirty_agents = Vec::new();
+pub(super) fn push_lanes_check(db: &CrabDb, checks: &mut Vec<DoctorCheck>) {
+    match db.list_lanes() {
+        Ok(lanes) => {
+            let mut dirty_lanes = Vec::new();
             let mut missing_workdirs = Vec::new();
             let mut inspect_errors = Vec::new();
-            for agent in &agents {
-                if agent.branch.workdir.is_none() {
+            for lane in &lanes {
+                if lane.branch.workdir.is_none() {
                     continue;
                 }
-                match db.agent_status(&agent.branch.agent_id) {
+                match db.lane_status(&lane.branch.lane_id) {
                     Ok(status) if !status.workdir_changed_paths.is_empty() => {
-                        dirty_agents.push(agent.record.name.clone());
+                        dirty_lanes.push(lane.record.name.clone());
                     }
                     Ok(_) => {}
                     Err(Error::WorkspaceNotFound(path)) => {
                         missing_workdirs.push(path.to_string_lossy().to_string());
                     }
-                    Err(err) => inspect_errors.push(format!("{}: {err}", agent.record.name)),
+                    Err(err) => inspect_errors.push(format!("{}: {err}", lane.record.name)),
                 }
             }
             let check_status = if !inspect_errors.is_empty() {
                 "error"
-            } else if !dirty_agents.is_empty() || !missing_workdirs.is_empty() {
+            } else if !dirty_lanes.is_empty() || !missing_workdirs.is_empty() {
                 "warning"
             } else {
                 "ok"
             };
             let message = match check_status {
-                "ok" => format!("{} agent branch(es) inspected", agents.len()),
+                "ok" => format!("{} lane branch(es) inspected", lanes.len()),
                 "warning" => format!(
-                    "{} dirty agent workdir(s), {} missing agent workdir(s)",
-                    dirty_agents.len(),
+                    "{} dirty lane workdir(s), {} missing lane workdir(s)",
+                    dirty_lanes.len(),
                     missing_workdirs.len()
                 ),
                 _ => format!(
-                    "{} agent branch(es) could not be inspected",
+                    "{} lane branch(es) could not be inspected",
                     inspect_errors.len()
                 ),
             };
             checks.push(doctor_check(
-                "agents",
+                "lanes",
                 check_status,
                 message,
                 Some(serde_json::json!({
-                    "count": agents.len(),
-                    "dirty_agents": dirty_agents,
+                    "count": lanes.len(),
+                    "dirty_lanes": dirty_lanes,
                     "missing_workdirs": missing_workdirs,
                     "errors": inspect_errors
                 })),
             ));
         }
         Err(err) => checks.push(doctor_check(
-            "agents",
+            "lanes",
             "error",
-            format!("could not list agents: {err}"),
+            format!("could not list lanes: {err}"),
             None,
         )),
     }

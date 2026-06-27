@@ -54,7 +54,7 @@ pub(crate) fn parse_approval_status_filter(value: &str) -> Result<Option<&'stati
     }
 }
 
-pub(crate) fn parse_agent_run_status_filter(value: &str) -> Result<Option<&'static str>> {
+pub(crate) fn parse_lane_run_status_filter(value: &str) -> Result<Option<&'static str>> {
     match value {
         "all" => Ok(None),
         "paused" => Ok(Some("paused")),
@@ -62,7 +62,7 @@ pub(crate) fn parse_agent_run_status_filter(value: &str) -> Result<Option<&'stat
         "blocked" => Ok(Some("blocked")),
         "cancelled" | "canceled" => Ok(Some("cancelled")),
         other => Err(Error::InvalidInput(format!(
-            "agent run status must be paused, resumed, blocked, cancelled, or all, got `{other}`"
+            "lane run status must be paused, resumed, blocked, cancelled, or all, got `{other}`"
         ))),
     }
 }
@@ -122,11 +122,11 @@ pub(crate) fn parse_operation_kind(value: &str) -> OperationKind {
         "Checkout" => OperationKind::Checkout,
         "Branch" => OperationKind::Branch,
         "Merge" => OperationKind::Merge,
-        "AgentSpawn" => OperationKind::AgentSpawn,
-        "AgentPatch" => OperationKind::AgentPatch,
-        "AgentRecord" => OperationKind::AgentRecord,
-        "AgentRewind" => OperationKind::AgentRewind,
-        "AgentMerge" => OperationKind::AgentMerge,
+        "LaneSpawn" => OperationKind::LaneSpawn,
+        "LanePatch" => OperationKind::LanePatch,
+        "LaneRecord" => OperationKind::LaneRecord,
+        "LaneRewind" => OperationKind::LaneRewind,
+        "LaneMerge" => OperationKind::LaneMerge,
         "GitExport" => OperationKind::GitExport,
         _ => OperationKind::Init,
     }

@@ -54,7 +54,7 @@ pub(super) fn handle_guardrails_command(
             let db = open_db(ctx)?;
             let payload = parse_optional_json(args.payload_json.as_deref())?;
             let report = db.guardrail_check(
-                args.agent.as_deref(),
+                args.lane.as_deref(),
                 &args.action,
                 args.summary.as_deref(),
                 payload,

@@ -36,29 +36,29 @@ x-crabdb-token: <token>
 | POST | `/v1/ignore/check` | Check ignored path. |
 | POST | `/v1/guardrails/check` | Preflight guardrails. |
 
-## Agent Routes
+## Lane Routes
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/v1/agents` | List agents. |
-| POST | `/v1/agents` | Spawn agent. |
-| GET | `/v1/agents/{agent_or_id}` | Show agent. |
-| DELETE | `/v1/agents/{agent_or_id}` | Remove agent. |
-| GET | `/v1/agents/{agent_or_id}/status` | Agent status. |
-| GET | `/v1/agents/{agent_or_id}/review` | Review packet. |
-| GET | `/v1/agents/{agent_or_id}/contribution` | Review bundle. |
-| GET | `/v1/agents/{agent_or_id}/gates` | Gate history. |
-| GET | `/v1/agents/{agent_or_id}/readiness` | Merge readiness. |
-| GET | `/v1/agents/{agent_or_id}/handoff` | Handoff packet. |
-| GET | `/v1/agents/{agent_or_id}/workdir` | Workdir path. |
-| GET | `/v1/agents/{agent_or_id}/diff` | Agent branch diff. |
-| POST | `/v1/agents/{agent_or_id}/read-file` | Read agent file. |
-| POST | `/v1/agents/{agent_or_id}/sync-workdir` | Sync workdir. |
-| POST | `/v1/agents/{agent_or_id}/record` | Record agent workdir. |
-| POST | `/v1/agents/{agent_or_id}/rewind` | Rewind agent branch. |
-| POST | `/v1/agents/{agent_or_id}/tests` | Run test gate. |
-| POST | `/v1/agents/{agent_or_id}/evals` | Run eval gate. |
-| POST | `/v1/agents/{agent_or_id}/patches` | Apply agent patch. |
+| GET | `/v1/lanes` | List lanes. |
+| POST | `/v1/lanes` | Spawn lane. |
+| GET | `/v1/lanes/{lane_or_id}` | Show lane. |
+| DELETE | `/v1/lanes/{lane_or_id}` | Remove lane. |
+| GET | `/v1/lanes/{lane_or_id}/status` | Lane status. |
+| GET | `/v1/lanes/{lane_or_id}/review` | Review packet. |
+| GET | `/v1/lanes/{lane_or_id}/contribution` | Review bundle. |
+| GET | `/v1/lanes/{lane_or_id}/gates` | Gate history. |
+| GET | `/v1/lanes/{lane_or_id}/readiness` | Merge readiness. |
+| GET | `/v1/lanes/{lane_or_id}/handoff` | Handoff packet. |
+| GET | `/v1/lanes/{lane_or_id}/workdir` | Workdir path. |
+| GET | `/v1/lanes/{lane_or_id}/diff` | Lane branch diff. |
+| POST | `/v1/lanes/{lane_or_id}/read-file` | Read lane file. |
+| POST | `/v1/lanes/{lane_or_id}/sync-workdir` | Sync workdir. |
+| POST | `/v1/lanes/{lane_or_id}/record` | Record lane workdir. |
+| POST | `/v1/lanes/{lane_or_id}/rewind` | Rewind lane branch. |
+| POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
+| POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
+| POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
 
 ## Collaboration Routes
 
@@ -74,7 +74,7 @@ x-crabdb-token: <token>
 | POST | `/v1/approvals/{approval_id}/decision` | Decide approval. |
 | GET/POST | `/v1/leases` | List or acquire leases. |
 | DELETE | `/v1/leases/{lease_id}` | Release lease. |
-| POST | `/v1/agents/{agent_or_id}/claims` | Claim path. |
+| POST | `/v1/lanes/{lane_or_id}/claims` | Claim path. |
 | GET/POST | `/v1/anchors` | List or create anchors. |
 | GET/DELETE | `/v1/anchors/{anchor_id}` | Resolve or delete anchor. |
 | GET/POST | `/v1/merge-queue` | List or queue merge. |
@@ -83,27 +83,27 @@ x-crabdb-token: <token>
 | GET | `/v1/conflicts` | List conflicts. |
 | GET | `/v1/conflicts/{conflict_set_id}?limit=50` | Show conflict with explanation evidence. |
 | POST | `/v1/conflicts/{conflict_set_id}/resolve` | Resolve conflict. |
-| POST | `/v1/branches/{branch}/merge-agent` | Merge agent branch. |
+| POST | `/v1/branches/{branch}/merge-lane` | Merge lane branch. |
 
 ## Turn and Trace Routes
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/v1/agent/turns` | Begin turn. |
-| GET | `/v1/agent/events` | List events. |
-| GET | `/v1/agent/spans` | List spans. |
-| GET | `/v1/agent/spans/summary` | Span summary. |
-| GET/POST | `/v1/agent/runs` | List or pause runs. |
-| GET | `/v1/agent/runs/{run_id}` | Show run. |
-| POST | `/v1/agent/runs/{run_id}/resume` | Resume run. |
-| GET | `/v1/agent/spans/{span_id}` | Show span. |
-| POST | `/v1/agent/spans/{span_id}/end` | End span. |
-| GET | `/v1/agent/turns/{turn_id}` | Show turn. |
-| POST | `/v1/agent/turns/{turn_id}/messages` | Add message. |
-| POST | `/v1/agent/turns/{turn_id}/events` | Add event. |
-| POST | `/v1/agent/turns/{turn_id}/spans` | Start span. |
-| POST | `/v1/agent/turns/{turn_id}/patches` | Apply turn patch. |
-| POST | `/v1/agent/turns/{turn_id}/end` | End turn. |
+| POST | `/v1/lane/turns` | Begin turn. |
+| GET | `/v1/lane/events` | List events. |
+| GET | `/v1/lane/spans` | List spans. |
+| GET | `/v1/lane/spans/summary` | Span summary. |
+| GET/POST | `/v1/lane/runs` | List or pause runs. |
+| GET | `/v1/lane/runs/{run_id}` | Show run. |
+| POST | `/v1/lane/runs/{run_id}/resume` | Resume run. |
+| GET | `/v1/lane/spans/{span_id}` | Show span. |
+| POST | `/v1/lane/spans/{span_id}/end` | End span. |
+| GET | `/v1/lane/turns/{turn_id}` | Show turn. |
+| POST | `/v1/lane/turns/{turn_id}/messages` | Add message. |
+| POST | `/v1/lane/turns/{turn_id}/events` | Add event. |
+| POST | `/v1/lane/turns/{turn_id}/spans` | Start span. |
+| POST | `/v1/lane/turns/{turn_id}/patches` | Apply turn patch. |
+| POST | `/v1/lane/turns/{turn_id}/end` | End turn. |
 
 ## Code Facts Used
 

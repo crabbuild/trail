@@ -43,8 +43,8 @@ pub(crate) fn render_show(result: &ShowResult, json: bool, quiet: bool) -> Resul
         ShowResult::Message { value } => {
             println!("Message: {}", value.id.0);
             println!("Role: {}", value.role);
-            if let Some(agent_id) = &value.agent_id {
-                println!("Agent: {agent_id}");
+            if let Some(lane_id) = &value.lane_id {
+                println!("Lane: {lane_id}");
             }
             if let Some(session_id) = &value.session_id {
                 println!("Session: {session_id}");
@@ -60,8 +60,8 @@ pub(crate) fn render_show(result: &ShowResult, json: bool, quiet: bool) -> Resul
             println!("Root: {}", value.root_id.0);
             println!("Generation: {}", value.generation);
         }
-        ShowResult::Agent { value } => {
-            println!("Agent: {}", value.agent_id);
+        ShowResult::Lane { value } => {
+            println!("Lane: {}", value.lane_id);
             println!("Ref: {}", value.ref_name);
             println!("Status: {}", value.status);
             println!("Base: {}", value.base_change.0);

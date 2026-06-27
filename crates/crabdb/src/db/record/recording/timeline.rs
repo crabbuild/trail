@@ -37,23 +37,23 @@ impl CrabDb {
         &self,
         branch: Option<&str>,
         session: Option<&str>,
-        agent: Option<&str>,
+        lane: Option<&str>,
         limit: usize,
     ) -> Result<Vec<TimelineEntry>> {
-        let scoped = [branch.is_some(), session.is_some(), agent.is_some()]
+        let scoped = [branch.is_some(), session.is_some(), lane.is_some()]
             .into_iter()
             .filter(|set| *set)
             .count();
         if scoped > 1 {
             return Err(Error::InvalidInput(
-                "timeline accepts only one of branch, session, or agent".to_string(),
+                "timeline accepts only one of branch, session, or lane".to_string(),
             ));
         }
         if let Some(session_id) = session {
             return self.session_timeline(session_id, limit);
         }
-        if let Some(agent) = agent {
-            return self.agent_timeline(agent, limit);
+        if let Some(lane) = lane {
+            return self.lane_timeline(lane, limit);
         }
         self.timeline(branch, limit)
     }
@@ -66,17 +66,17 @@ impl CrabDb {
                 .strip_prefix(MAIN_REF_PREFIX)
                 .map(str::to_string);
             Ok((record.name, bare_branch))
-        } else if record.name.starts_with(AGENT_REF_PREFIX) {
+        } else if record.name.starts_with(LANE_REF_PREFIX) {
             Ok((record.name, None))
         } else {
             Err(Error::InvalidInput(format!(
-                "timeline --branch expects a branch or agent ref, got `{branch}`"
+                "timeline --branch expects a branch or lane ref, got `{branch}`"
             )))
         }
     }
 
     pub fn session_timeline(&self, session_id: &str, limit: usize) -> Result<Vec<TimelineEntry>> {
-        self.agent_session(session_id)?;
+        self.lane_session(session_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT change_id, kind, branch, actor_id, message, created_at, path_count \
              FROM operations WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2",

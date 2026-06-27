@@ -10,7 +10,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Install and build](getting-started/install-and-build.md)
 - [Initialize a workspace](getting-started/initialize-a-workspace.md)
 - [First record and provenance query](getting-started/first-record-and-query.md)
-- [First agent workflow](getting-started/first-agent-workflow.md)
+- [First lane workflow](getting-started/first-lane-workflow.md)
 
 ## Core Concepts
 
@@ -19,7 +19,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Objects, roots, text, and line identity](concepts/objects-roots-text-and-line-identity.md)
 - [Selectors and ref-like inputs](concepts/selectors-and-refish.md)
 - [Recording, ignore rules, and guardrails](concepts/recording-ignore-and-guardrails.md)
-- [Agents, sessions, turns, and traces](concepts/agents-sessions-turns-and-traces.md)
+- [Lanes, sessions, turns, and traces](concepts/lanes-sessions-turns-and-traces.md)
 - [Readiness gates and merge safety](concepts/readiness-gates-and-merge-safety.md)
 - [Storage, indexes, and backups](concepts/storage-indexes-and-backups.md)
 
@@ -34,15 +34,16 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Maintenance and recovery](guides/maintenance-and-recovery.md)
 - [Performance and scale benchmarks](guides/performance-and-scale-benchmarks.md)
 
-## Agent Workflows
+## Lane Workflows
 
-- [Agent overview](agents/overview.md)
-- [Spawn and materialize workdirs](agents/spawn-and-materialize-workdirs.md)
-- [Structured patches](agents/structured-patches.md)
-- [Sessions, turns, messages, and runs](agents/sessions-turns-messages-and-runs.md)
-- [Events, traces, and spans](agents/events-traces-and-spans.md)
-- [Tests, evals, gates, and readiness](agents/tests-evals-gates-and-readiness.md)
-- [Handoff, review, and merge](agents/handoff-review-and-merge.md)
+- [Lane overview](lanes/overview.md)
+- [Lane work model](lanes/work-model.md)
+- [Spawn and materialize workdirs](lanes/spawn-and-materialize-workdirs.md)
+- [Structured patches](lanes/structured-patches.md)
+- [Sessions, turns, messages, and runs](lanes/sessions-turns-messages-and-runs.md)
+- [Events, traces, and spans](lanes/events-traces-and-spans.md)
+- [Tests, evals, gates, and readiness](lanes/tests-evals-gates-and-readiness.md)
+- [Handoff, review, and merge](lanes/handoff-review-and-merge.md)
 
 ## Integrations
 
@@ -50,6 +51,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [HTTP daemon](integrations/http-daemon.md)
 - [OpenAPI](integrations/openapi.md)
 - [MCP](integrations/mcp.md)
+- [ACP relay design](design/acp-relay.md)
 - [Rust library](integrations/rust-library.md)
 - [Git](integrations/git.md)
 
@@ -63,4 +65,5 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [MCP tools](reference/mcp-tools.md)
 - [Data types](reference/data-types.md)
 - [Design notes](design/architecture.md)
+- [ACP relay design](design/acp-relay.md)
 - [Code fact map](./_meta/code-fact-map.md)

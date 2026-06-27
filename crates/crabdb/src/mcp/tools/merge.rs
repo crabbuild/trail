@@ -7,7 +7,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.merge_queue_add",
             "title": "Queue Merge",
-            "description": "Queue an agent or branch ref for serialized merge into a target branch.",
+            "description": "Queue a lane or branch ref for serialized merge into a target branch.",
             "inputSchema": object_schema(json!({
                 "source": { "type": "string" },
                 "target": { "type": "string" },
@@ -31,7 +31,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.merge_queue_remove",
             "title": "Remove Merge Queue Entry",
-            "description": "Cancel a queued or conflicted merge queue entry by queue id, agent, branch, or ref.",
+            "description": "Cancel a queued or conflicted merge queue entry by queue id, lane, branch, or ref.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string" }
             }), vec!["selector"])

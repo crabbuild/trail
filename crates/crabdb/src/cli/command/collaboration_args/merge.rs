@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 #[derive(Args)]
-pub(in crate::cli::command) struct MergeAgentArgs {
+pub(in crate::cli::command) struct MergeLaneArgs {
     pub(in crate::cli::command) name: String,
     #[arg(long, default_value = "main")]
     pub(in crate::cli::command) into: String,

@@ -5,7 +5,7 @@ impl CrabDb {
         &self,
         role: &str,
         body: &str,
-        agent_id: Option<&str>,
+        lane_id: Option<&str>,
         session_id: Option<&str>,
         change_id: Option<&ChangeId>,
         created_at: i64,
@@ -15,7 +15,7 @@ impl CrabDb {
                 "{}:{}:{}:{}:{}",
                 self.config.workspace.id.0,
                 role,
-                agent_id.unwrap_or("none"),
+                lane_id.unwrap_or("none"),
                 created_at,
                 now_nanos()
             );
@@ -31,7 +31,7 @@ impl CrabDb {
             id: message_id.clone(),
             role: role.to_string(),
             body,
-            agent_id: agent_id.map(str::to_string),
+            lane_id: lane_id.map(str::to_string),
             session_id: session_id.map(str::to_string),
             change_id: change_id.cloned(),
             created_at,
@@ -81,13 +81,13 @@ impl CrabDb {
     pub(crate) fn index_message(&self, message: &Message, object_id: &ObjectId) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO messages \
-             (message_id, role, body, agent_id, session_id, change_id, object_id, created_at) \
+             (message_id, role, body, lane_id, session_id, change_id, object_id, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.id.0.clone(),
                 message.role.clone(),
                 message.body.clone(),
-                message.agent_id.clone(),
+                message.lane_id.clone(),
                 message.session_id.clone(),
                 message.change_id.as_ref().map(|id| id.0.clone()),
                 object_id.0.clone(),

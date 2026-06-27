@@ -6,33 +6,33 @@ pub(super) fn tools() -> Value {
     json!([
         {
             "name": "crabdb.session_start",
-            "title": "Start Agent Session",
-            "description": "Start an explicit durable session and attach it to an agent branch.",
+            "title": "Start Lane Session",
+            "description": "Start an explicit durable session and attach it to a lane branch.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "title": { "type": "string" },
                 "id": { "type": "string" }
-            }), vec!["agent"])
+            }), vec!["lane"])
         },
         {
             "name": "crabdb.session_list",
-            "title": "List Agent Sessions",
-            "description": "List durable agent sessions, optionally scoped to one agent.",
+            "title": "List Lane Sessions",
+            "description": "List durable lane sessions, optionally scoped to one lane.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" }
+                "lane": { "type": "string" }
             }), vec![])
         },
         {
             "name": "crabdb.session_current",
-            "title": "Current Agent Session",
-            "description": "Read current agent branch session attachments, optionally for one agent.",
+            "title": "Current Lane Session",
+            "description": "Read current lane branch session attachments, optionally for one lane.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" }
+                "lane": { "type": "string" }
             }), vec![])
         },
         {
             "name": "crabdb.session_show",
-            "title": "Show Agent Session",
+            "title": "Show Lane Session",
             "description": "Return a session with turns, messages, events, and operations.",
             "inputSchema": object_schema(json!({
                 "session_id": { "type": "string" }
@@ -49,8 +49,8 @@ pub(super) fn tools() -> Value {
         },
         {
             "name": "crabdb.session_end",
-            "title": "End Agent Session",
-            "description": "End a durable agent session with completed, failed, cancelled, or archived status.",
+            "title": "End Lane Session",
+            "description": "End a durable lane session with completed, failed, cancelled, or archived status.",
             "inputSchema": object_schema(json!({
                 "session_id": { "type": "string" },
                 "status": { "type": "string", "enum": ["completed", "failed", "cancelled", "archived"] }
@@ -59,22 +59,22 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.approval_request",
             "title": "Request Human Approval",
-            "description": "Create a durable pending approval for a sensitive agent action.",
+            "description": "Create a durable pending approval for a sensitive lane action.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "action": { "type": "string" },
                 "summary": { "type": "string" },
                 "payload": { "type": "object" },
                 "session_id": { "type": "string" },
                 "turn_id": { "type": "string" }
-            }), vec!["agent", "action", "summary"])
+            }), vec!["lane", "action", "summary"])
         },
         {
             "name": "crabdb.approval_list",
             "title": "List Human Approvals",
-            "description": "List durable approval gates, optionally scoped by agent and status.",
+            "description": "List durable approval gates, optionally scoped by lane and status.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "status": { "type": "string", "enum": ["pending", "approved", "rejected", "cancelled", "all"] }
             }), vec![])
         },
@@ -99,38 +99,38 @@ pub(super) fn tools() -> Value {
         },
         {
             "name": "crabdb.run_pause",
-            "title": "Pause Agent Run",
-            "description": "Persist a serialized paused agent run checkpoint for later resume.",
+            "title": "Pause Lane Run",
+            "description": "Persist a serialized paused lane run checkpoint for later resume.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "reason": { "type": "string" },
                 "summary": { "type": "string" },
                 "state": { "type": "object" },
                 "interruption": { "type": "object" },
                 "session_id": { "type": "string" },
                 "turn_id": { "type": "string" }
-            }), vec!["agent", "reason", "summary"])
+            }), vec!["lane", "reason", "summary"])
         },
         {
             "name": "crabdb.run_list",
-            "title": "List Agent Run States",
-            "description": "List durable paused/resumed agent checkpoints, optionally scoped by agent and status.",
+            "title": "List Lane Run States",
+            "description": "List durable paused/resumed lane checkpoints, optionally scoped by lane and status.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "status": { "type": "string", "enum": ["paused", "resumed", "blocked", "cancelled", "all"] }
             }), vec![])
         },
         {
             "name": "crabdb.run_show",
-            "title": "Show Agent Run State",
-            "description": "Show one durable agent run checkpoint by id.",
+            "title": "Show Lane Run State",
+            "description": "Show one durable lane run checkpoint by id.",
             "inputSchema": object_schema(json!({
                 "run_id": { "type": "string" }
             }), vec!["run_id"])
         },
         {
             "name": "crabdb.run_resume",
-            "title": "Resume Agent Run",
+            "title": "Resume Lane Run",
             "description": "Mark a paused checkpoint resumed after any linked approval is approved.",
             "inputSchema": object_schema(json!({
                 "run_id": { "type": "string" },
@@ -141,13 +141,13 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.lease_acquire",
             "title": "Acquire Path Lease",
-            "description": "Acquire an advisory read or write lease for an agent path before editing.",
+            "description": "Acquire an advisory read or write lease for a lane path before editing.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "path": { "type": "string" },
                 "mode": { "type": "string", "enum": ["read", "write"] },
                 "ttl_secs": { "type": "integer", "minimum": 1 }
-            }), vec!["agent"])
+            }), vec!["lane"])
         },
         {
             "name": "crabdb.lease_list",

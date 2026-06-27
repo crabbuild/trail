@@ -5,9 +5,9 @@ use crate::{CrabDb, Error, Result};
 
 use super::{types::*, utils::from_arguments};
 
-mod agent;
 mod collaboration;
 mod core;
+mod lane;
 mod merge;
 mod turns;
 
@@ -16,7 +16,7 @@ pub(crate) fn handle_tool_call(db: &mut CrabDb, params: Value) -> Result<Value> 
     if let Some(value) = core::handle(db, &call.name, &call.arguments)? {
         return Ok(value);
     }
-    if let Some(value) = agent::handle(db, &call.name, &call.arguments)? {
+    if let Some(value) = lane::handle(db, &call.name, &call.arguments)? {
         return Ok(value);
     }
     if let Some(value) = collaboration::handle(db, &call.name, &call.arguments)? {

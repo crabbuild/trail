@@ -1,14 +1,14 @@
 use serde_json::{Map, Value};
 
-mod agent;
 mod collaboration;
 mod core;
+mod lane;
 mod patches;
 
 pub(super) fn openapi_schemas() -> Value {
     let mut schemas = Map::new();
     append_schemas(&mut schemas, core::core_schemas());
-    append_schemas(&mut schemas, agent::agent_schemas());
+    append_schemas(&mut schemas, lane::lane_schemas());
     append_schemas(&mut schemas, collaboration::collaboration_schemas());
     append_schemas(&mut schemas, patches::patch_schemas());
     Value::Object(schemas)

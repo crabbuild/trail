@@ -114,8 +114,8 @@ impl CrabDb {
         if let Some(branch) = refish.strip_prefix("branch:") {
             return self.resolve_branch_ref(branch);
         }
-        if let Some(agent) = refish.strip_prefix("agent:") {
-            return self.get_ref(&agent_ref(agent));
+        if let Some(lane) = refish.strip_prefix("lane:") {
+            return self.get_ref(&lane_ref(lane));
         }
         if let Some(root_id) = refish.strip_prefix("root:") {
             return self.ref_from_root(&ObjectId(root_id.to_string()));
@@ -129,7 +129,7 @@ impl CrabDb {
         if let Ok(record) = self.get_ref(&branch_ref(refish)) {
             return Ok(record);
         }
-        if let Ok(record) = self.get_ref(&agent_ref(refish)) {
+        if let Ok(record) = self.get_ref(&lane_ref(refish)) {
             return Ok(record);
         }
         if refish.starts_with("obj_") {

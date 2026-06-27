@@ -5,7 +5,7 @@ use super::turns::default_completed_status;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionStartArgs {
-    pub(crate) agent: String,
+    pub(crate) lane: String,
     #[serde(default)]
     pub(crate) title: Option<String>,
     #[serde(default)]
@@ -15,13 +15,13 @@ pub(crate) struct SessionStartArgs {
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionListArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionCurrentArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +45,7 @@ pub(crate) struct SessionEndArgs {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApprovalRequestArgs {
-    pub(crate) agent: String,
+    pub(crate) lane: String,
     pub(crate) action: String,
     pub(crate) summary: String,
     #[serde(default)]
@@ -59,7 +59,7 @@ pub(crate) struct ApprovalRequestArgs {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApprovalListArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     #[serde(default)]
     pub(crate) status: Option<String>,
 }
@@ -80,8 +80,8 @@ pub(crate) struct ApprovalDecideArgs {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentRunPauseArgs {
-    pub(crate) agent: String,
+pub(crate) struct LaneRunPauseArgs {
+    pub(crate) lane: String,
     pub(crate) reason: String,
     pub(crate) summary: String,
     #[serde(default)]
@@ -95,20 +95,20 @@ pub(crate) struct AgentRunPauseArgs {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentRunListArgs {
+pub(crate) struct LaneRunListArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     #[serde(default)]
     pub(crate) status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentRunShowArgs {
+pub(crate) struct LaneRunShowArgs {
     pub(crate) run_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentRunResumeArgs {
+pub(crate) struct LaneRunResumeArgs {
     pub(crate) run_id: String,
     #[serde(default)]
     pub(crate) reviewer: Option<String>,

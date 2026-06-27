@@ -28,7 +28,7 @@ pub(crate) struct IgnoreCheckRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GuardrailCheckRequest {
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     pub(crate) action: String,
     pub(crate) summary: Option<String>,
     pub(crate) payload: Option<serde_json::Value>,

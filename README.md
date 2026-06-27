@@ -2,7 +2,7 @@
 
 CrabDB is a local-first operation database for code and text worktrees. It records
 the meaningful work that happens between Git commits: local edits, recorded
-operations, branch movement, agent patches, review handoffs, merges, and
+operations, branch movement, lane patches, review handoffs, merges, and
 line-level provenance.
 
 Git remains the source of shared repository history. CrabDB adds a local layer for
@@ -10,7 +10,7 @@ questions Git does not answer well by itself:
 
 - What operation introduced this current line?
 - What changed on this branch before it became a Git commit?
-- What did an agent do, which paths did it touch, and is it ready to merge?
+- What happened in a lane, which paths changed, and is it ready to merge?
 - Which changes are blocked by conflicts, pending approvals, dirty workdirs, or
   missing test/eval gates?
 - Can an editor, agent host, or local service query the same state through CLI,
@@ -24,16 +24,16 @@ opt-in integration surfaces.
 ## CrabDB vs Git
 
 CrabDB is not a Git replacement. It sits next to Git as a local operation,
-provenance, and agent-coordination layer.
+provenance, and lane-coordination layer.
 
 ```text
-  human edits, editor saves, agent turns, tool calls, patches
+  human edits, editor saves, lane turns, tool calls, patches
                          |
                          v
   +---------------------------------------------------------+
   | CrabDB                                                  |
   | record operations, preserve line identity, isolate      |
-  | agent branches, run guardrails, check readiness,        |
+  | lane branches, run guardrails, check readiness,        |
   | produce review and handoff reports                      |
   +--------------------------+------------------------------+
                              |
@@ -56,7 +56,7 @@ high-frequency, local work that happens before a commit is ready.
 | Shared project history | Excellent: commits, branches, remotes, tags, PR workflows | Complements Git and can import/export mappings |
 | Local in-between work | Mostly unstaged/staged diffs, stash, reflog | First-class recorded operations with messages, actors, roots, and parents |
 | Line provenance | Blame by committed lines | Stable `LineId` history for current and recorded local lines |
-| Agent isolation | Branches and worktrees, but no agent activity model | `refs/agents/<name>`, sessions, turns, traces, patches, gates, handoffs |
+| Lane isolation | Branches and worktrees, but no agent activity model | `refs/lanes/<name>`, sessions, turns, traces, patches, gates, handoffs |
 | Safety before mutation | Hooks and review conventions | Ignore policy, guardrails, approvals, leases, readiness blockers |
 | Machine interfaces | Git CLI and plumbing | CLI JSON, HTTP/OpenAPI, MCP tools/resources/prompts, Rust reports |
 | Merge readiness | Merge attempt plus conflicts | Readiness reports before merge: conflicts, dirty workdirs, approvals, gates |
@@ -66,7 +66,7 @@ The practical position is:
 - Git is the publication and synchronization layer.
 - CrabDB is the local operational memory and coordination layer.
 - Git answers "what committed snapshot did the project accept?"
-- CrabDB answers "what happened locally, why did it happen, which agent did it,
+- CrabDB answers "what happened locally, why did it happen, which lane contains it,
   is it safe to accept, and what still blocks merge?"
 
 ## Why This Matters for AI Agents
@@ -76,25 +76,25 @@ intermediate patches, tool calls, test runs, review notes, approvals, and
 handoffs. Treating all of that as either "unstaged changes" or "a Git commit"
 loses important context.
 
-CrabDB gives agent workflows a native coordination layer:
+CrabDB gives lane workflows a native coordination layer:
 
-- Each agent can work on an isolated CrabDB ref without immediately touching
-  `main`.
+- Each external agent can work inside an isolated CrabDB lane without
+  immediately touching `main`.
 - Structured patches can target stable file and line identity instead of fragile
   line numbers.
-- Sessions, turns, messages, events, and trace spans preserve what the agent did
-  and why.
+- Sessions, turns, messages, events, and trace spans preserve what happened in
+  the lane and why.
 - Guardrail checks and human approvals make risky actions explicit before they
   mutate the workspace or external systems.
 - Test/eval gates, dirty-workdir checks, open conflicts, and pending approvals
   roll up into one readiness signal.
 - Handoff and contribution reports give humans or other agents enough context to
-  continue, review, or reject the work.
-- Merge queues serialize accepted agent work so multiple agents do not silently
+  continue, review, or reject lane work.
+- Merge queues serialize accepted lane work so parallel agents do not silently
   overwrite each other.
 
 In short: Git is where accepted code history lives. CrabDB is where local and
-agent work becomes understandable, reviewable, and mergeable before it becomes
+lane work becomes understandable, reviewable, and mergeable before it becomes
 Git history.
 
 ## Who It Is For
@@ -108,8 +108,8 @@ checkout or merge local refs.
 **Reviewers and maintainers:** inspect provenance, changed paths, operation
 timelines, conflict sets, anchors, and diagnostics before accepting work.
 
-**Coding-agent operators:** give each agent an isolated branch, durable sessions
-and turns, structured patches, trace events/spans, guardrail checks, human
+**Coding-agent operators:** give each external agent an isolated lane, durable
+sessions and turns, structured patches, trace events/spans, guardrail checks, human
 approvals, test/eval gates, readiness reports, handoff packets, and serialized
 merge queues.
 
@@ -127,12 +127,12 @@ with OpenAPI 3.1, an MCP stdio server with tools/resources/prompts, or the Rust
   merge, why, history, and code-from workflows.
 - Ignore policy and guardrail preflight for private paths, ignored files, risky
   shell/network/deploy/destructive actions, and workspace policy rules.
-- Agent branches under `refs/agents/<name>` with optional materialized or sparse
+- Lane branches under `refs/lanes/<name>` with optional materialized or sparse
   workdirs.
-- Durable agent sessions, turns, messages, events, trace spans, paused run
+- Durable lane sessions, turns, messages, events, trace spans, paused run
   checkpoints, approvals, tests, evals, readiness, contribution, and handoff
   reports.
-- Direct agent merges and merge queues with readiness checks, conflict sets, and
+- Direct lane merges and merge queues with readiness checks, conflict sets, and
   manual conflict resolution.
 - Git import/export mappings, backup/restore, fsck, index rebuild, garbage
   collection, and doctor diagnostics.
@@ -161,7 +161,7 @@ The same architecture in text form:
                                      v
   +-------------------------------------------------------------------+
   | CrabDb core                                                       |
-  | workspace policy, refs, objects, records, agents, merges, reports |
+  | workspace policy, refs, objects, records, lanes, merges, reports |
   +-----------+------------------+--------------------+---------------+
               |                  |                    |
               v                  v                    v
@@ -169,7 +169,7 @@ The same architecture in text form:
   | SQLite            |  | Prolly maps      |  | .crabdb sidecars     |
   | objects, refs,    |  | path maps, file  |  | config, HEAD, refs,  |
   | indexes, queues,  |  | indexes, text    |  | daemon files,        |
-  | agent state       |  | and line order   |  | workdir manifests    |
+  | lane state        |  | and line order   |  | workdir manifests    |
   +-------------------+  +------------------+  +----------------------+
 ```
 
@@ -209,7 +209,7 @@ operations point to parent operations and before/after roots; roots point to
 ordered maps and content objects.
 
 ```text
-  refs/branches/main              refs/agents/doc-bot
+  refs/branches/main              refs/lanes/doc-bot
           |                               |
           v                               v
   +----------------+              +----------------+
@@ -260,22 +260,27 @@ objects.
   derived query tables: timeline, history, why, code-from, traces
 ```
 
-### Agent Coordination Model
+### Lane Coordination Model
 
-Agents are modeled as isolated branches plus durable activity records. A normal
-agent workflow writes to `refs/agents/<name>`, reviews readiness, then merges
-into a target branch only after checks pass.
+A lane is a branch-backed work container. A normal branch stores code state; a
+lane stores code state plus the work history around it: sessions, turns,
+messages, events, spans, approvals, gates, workdirs, and rewind checkpoints.
+Use branches for long-lived code lines such as `main` or `release`, and lanes
+for active work by humans, automation, or external coding agents.
+
+A normal lane workflow writes to `refs/lanes/<name>`, reviews readiness, then
+merges into a target branch only after checks pass.
 
 ```text
   +-------------------+        +----------------------+
-  | agents            |        | agent_branches       |
+  | lanes             |        | lane_branches       |
   | identity, model,  |------->| ref, base/head root, |
   | provider, metadata|        | session, workdir,    |
   +-------------------+        | status               |
                                +----------+-----------+
                                           |
                                           v
-                               refs/agents/<name>
+                               refs/lanes/<name>
                                           |
                                           v
                                operation/root history
@@ -291,13 +296,13 @@ into a target branch only after checks pass.
           readiness + handoff + merge queue
 ```
 
-Materialized workdirs are optional. Structured patches can update an agent branch
+Materialized workdirs are optional. Structured patches can update a lane branch
 without checking out a full filesystem tree; materialized or sparse workdirs are
 available when tools need real files and command execution.
 
 ### Safety Boundaries
 
-CrabDB's safety checks sit between user/agent requests and workspace mutation.
+CrabDB's safety checks sit between user, automation, or agent requests and workspace mutation.
 
 ```text
   request
@@ -322,7 +327,7 @@ CrabDB's safety checks sit between user/agent requests and workspace mutation.
 ```
 
 These checks are deliberately local and explainable. They protect CrabDB/Git
-internals, ignored/private paths, risky agent actions, dirty materialized
+internals, ignored/private paths, risky lane actions, dirty materialized
 workdirs, stale refs, and conflicted merges before changes are accepted.
 
 ## Quick Start
@@ -400,6 +405,22 @@ crabdb history README.md
 
 # Show the current unrecorded worktree diff as a patch.
 crabdb diff --dirty --patch
+```
+
+Start a lane for task work:
+
+```sh
+# Create an isolated lane branch with its own materialized workdir.
+crabdb lane spawn docs-lane --from main --materialize=true
+
+# Print the path to that workdir, then edit there or point a coding agent there.
+crabdb lane workdir docs-lane
+
+# Record, review, and check readiness before merge.
+crabdb lane record docs-lane -m "record docs update"
+crabdb lane diff docs-lane --patch
+crabdb lane readiness docs-lane
+crabdb merge-lane docs-lane --into main --dry-run
 ```
 
 Example CLI output from a tiny workspace looks like this. IDs, object hashes,
@@ -555,13 +576,13 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
 | `crabdb ignore check <path>` | Check whether ignore policy records or skips a path |
 | `crabdb guardrails check --action <action>` | Preflight a risky action against workspace policy |
-| `crabdb agent spawn <name> --from <ref>` | Create an isolated agent branch |
-| `crabdb agent apply-patch <name> --patch <file>` | Apply a structured patch to an agent branch |
-| `crabdb agent review <name>` | Produce a compact review packet for an agent branch |
-| `crabdb agent readiness <name>` | Report blockers before merging an agent branch |
-| `crabdb agent handoff <name>` | Produce a review and continuation packet for an agent |
-| `crabdb merge-agent <name> --into <branch> --dry-run` | Preview merging an agent branch into a target branch |
-| `crabdb merge-queue run` | Run queued agent merges with readiness and conflict checks |
+| `crabdb lane spawn <name> --from <ref>` | Create an isolated lane branch |
+| `crabdb lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
+| `crabdb lane review <name>` | Produce a compact review packet for a lane branch |
+| `crabdb lane readiness <name>` | Report blockers before merging a lane branch |
+| `crabdb lane handoff <name>` | Produce a review and continuation packet for a lane |
+| `crabdb merge-lane <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
+| `crabdb merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `crabdb daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `crabdb mcp` | Start the MCP stdio server for agent hosts |
 | `crabdb doctor` | Run workspace and integration diagnostics |
@@ -600,47 +621,57 @@ crabdb doctor
 crabdb fsck
 ```
 
-Use `--json` or `--format json` on commands when a script, editor, or agent needs
-machine-readable output.
+Use `--json` or `--format json` on commands when a script, editor, or agent
+needs machine-readable output.
 
-## Agent Workflow
+## Lane Workflow
 
-Agents work on isolated CrabDB refs instead of immediately changing `main`.
+Lanes work on isolated CrabDB refs instead of immediately changing `main`.
+External coding agents such as Claude Code or Codex can work inside these lanes,
+but `crabdb lane` itself does not launch an AI agent.
 
 ```sh
-crabdb agent spawn doc-bot --from main
-crabdb agent status doc-bot
+crabdb lane spawn doc-bot --from main --materialize=true
+crabdb lane status doc-bot
+crabdb lane workdir doc-bot
 ```
 
-Apply a structured patch directly to the agent branch:
+The printed workdir path is where you edit files or run an external coding
+agent. CrabDB keeps that work isolated until you record it into the lane.
+
+Apply a structured patch directly to the lane branch:
 
 ```sh
-crabdb agent apply-patch doc-bot --patch patch.json
+crabdb lane apply-patch doc-bot --patch patch.json
 ```
 
 Review and gate the work:
 
 ```sh
-crabdb agent diff doc-bot --patch --show-line-ids
-crabdb agent review doc-bot
-crabdb agent contribution doc-bot
-crabdb agent readiness doc-bot
-crabdb agent handoff doc-bot
+crabdb lane diff doc-bot --patch --show-line-ids
+crabdb lane review doc-bot
+crabdb lane contribution doc-bot
+crabdb lane readiness doc-bot
+crabdb lane handoff doc-bot
 ```
 
 When a tool needs a filesystem checkout, create or sync a materialized workdir:
 
 ```sh
-crabdb agent spawn doc-bot --from main --materialize=true
-crabdb agent workdir doc-bot
-crabdb agent record doc-bot -m "record workdir changes"
-crabdb agent sync-workdir doc-bot
+crabdb lane spawn doc-bot --from main --materialize=true
+LANE_DIR="$(crabdb lane workdir doc-bot)"
+cd "$LANE_DIR"
+# Edit files or run external tooling here.
+
+cd /path/to/project
+crabdb lane record doc-bot -m "record workdir changes"
+crabdb lane sync-workdir doc-bot
 ```
 
 Merge only after review and readiness checks:
 
 ```sh
-crabdb merge-agent doc-bot --into main --dry-run
+crabdb merge-lane doc-bot --into main --dry-run
 crabdb merge-queue add doc-bot --into main
 crabdb merge-queue run
 ```
@@ -703,14 +734,15 @@ Start with the docs home:
 - [Install and build](docs/getting-started/install-and-build.md)
 - [Initialize a workspace](docs/getting-started/initialize-a-workspace.md)
 - [First record and provenance query](docs/getting-started/first-record-and-query.md)
-- [First agent workflow](docs/getting-started/first-agent-workflow.md)
+- [First lane workflow](docs/getting-started/first-lane-workflow.md)
 
 Read by topic:
 
 - [Core concepts](docs/concepts/operation-database.md)
 - [Guides](docs/guides/record-worktree-changes.md)
 - [Use cases](docs/use-cases/local-code-history.md)
-- [Agent workflows](docs/agents/overview.md)
+- [Lane workflows](docs/lanes/overview.md)
+- [Lane work model](docs/lanes/work-model.md)
 - [Integrations](docs/integrations/overview.md)
 - [CLI reference](docs/reference/cli/global-options-and-env.md)
 - [HTTP API reference](docs/reference/http-api.md)

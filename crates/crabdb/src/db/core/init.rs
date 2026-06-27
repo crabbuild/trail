@@ -32,7 +32,7 @@ impl CrabDb {
 
         fs::create_dir_all(db_dir.join("index"))?;
         fs::create_dir_all(db_dir.join("refs/branches"))?;
-        fs::create_dir_all(db_dir.join("refs/agents"))?;
+        fs::create_dir_all(db_dir.join("refs/lanes"))?;
         fs::create_dir_all(db_dir.join("worktrees"))?;
 
         let branch = branch.into();

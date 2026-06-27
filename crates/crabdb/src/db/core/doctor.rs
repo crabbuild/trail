@@ -18,7 +18,7 @@ impl CrabDb {
         doctor_activity::push_active_leases_check(self, &mut checks);
         doctor_activity::push_merge_queue_check(self, &mut checks);
         doctor_activity::push_conflicts_check(self, &mut checks);
-        doctor_activity::push_agents_check(self, &mut checks);
+        doctor_activity::push_lanes_check(self, &mut checks);
 
         Ok(doctor_report(checks))
     }

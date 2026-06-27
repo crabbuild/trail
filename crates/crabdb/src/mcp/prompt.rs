@@ -7,49 +7,49 @@ use super::{types::*, utils::from_arguments};
 pub(crate) fn handle_prompt_get(params: Value) -> Result<Value> {
     let args: PromptGetArgs = from_arguments(params)?;
     match args.name.as_str() {
-        PROMPT_AGENT_TASK => {
-            let agent = prompt_arg(&args.arguments, "agent")?;
+        PROMPT_LANE_TASK => {
+            let lane = prompt_arg(&args.arguments, "lane")?;
             let task = prompt_arg(&args.arguments, "task")?;
             let branch = prompt_arg_optional(&args.arguments, "branch")?
                 .unwrap_or_else(|| "main".to_string());
             prompt_result(
-                "Safe CrabDB agent task workflow",
+                "Safe CrabDB lane task workflow",
                 format!(
                     "Run this CrabDB task using the MCP tools and resources.\n\n\
-Agent: `{agent}`\nBase branch: `{branch}`\nTask:\n{task}\n\n\
+Lane: `{lane}`\nBase branch: `{branch}`\nTask:\n{task}\n\n\
 Workflow:\n\
-1. Read `crabdb://workspace/status` and `crabdb://docs/agent-workflows` before mutating anything.\n\
-2. Use `crabdb.agent_spawn` for `{agent}` from `{branch}` if it does not already exist.\n\
+1. Read `crabdb://workspace/status` and `crabdb://docs/lane-workflows` before mutating anything.\n\
+2. Use `crabdb.lane_spawn` for `{lane}` from `{branch}` if it does not already exist.\n\
 3. Start a turn with `crabdb.begin_turn`, then attach the user request with `crabdb.add_message`.\n\
-4. Claim busy paths with `crabdb.agent_claim` when multiple agents may edit the same files, then prefer structured patches through `crabdb.apply_patch`; preflight risky shell, network, deploy, destructive, or ignored-path work with `crabdb.guardrail_check`.\n\
+4. Claim busy paths with `crabdb.lane_claim` when multiple lanes may edit the same files, then prefer structured patches through `crabdb.apply_patch`; preflight risky shell, network, deploy, destructive, or ignored-path work with `crabdb.guardrail_check`.\n\
 5. Record trace spans/events for tool calls, guardrails, and handoffs.\n\
 6. Request human approval with `crabdb.approval_request` when `crabdb.guardrail_check` returns `approval_required`; keep the returned run checkpoint and resume it with `crabdb.run_resume` after approval.\n\
 7. Run `crabdb.run_test` and, when model/policy quality matters, `crabdb.run_eval`.\n\
-8. End the turn with `crabdb.end_turn`, inspect `crabdb.agent_status`, `crabdb.agent_handoff`, and `crabdb.diff_agent`, then queue or merge only after review.\n\
-9. Treat `crabdb.agent_claim` leases as advisory coordination, not hard locks; rely on readiness, conflict sets, and merge review before accepting work.\n\
-10. If the agent goes sideways, use `crabdb.agent_rewind` with `record_current = true` before returning to a known-good change or root.\n\
+8. End the turn with `crabdb.end_turn`, inspect `crabdb.lane_status`, `crabdb.lane_handoff`, and `crabdb.diff_lane`, then queue or merge only after review.\n\
+9. Treat `crabdb.lane_claim` leases as advisory coordination, not hard locks; rely on readiness, conflict sets, and merge review before accepting work.\n\
+10. If the lane goes sideways, use `crabdb.lane_rewind` with `record_current = true` before returning to a known-good change or root.\n\
 11. If merge conflicts appear, use `crabdb.conflict_show` and `crabdb.conflict_resolve`; do not overwrite target changes silently."
                 ),
-                Some((RESOURCE_AGENT_WORKFLOWS, "text/markdown", AGENT_WORKFLOWS_MD)),
+                Some((RESOURCE_LANE_WORKFLOWS, "text/markdown", LANE_WORKFLOWS_MD)),
             )
         }
-        PROMPT_REVIEW_AGENT => {
-            let agent = prompt_arg(&args.arguments, "agent")?;
+        PROMPT_REVIEW_LANE => {
+            let lane = prompt_arg(&args.arguments, "lane")?;
             prompt_result(
-                "CrabDB agent review checklist",
+                "CrabDB lane review checklist",
                 format!(
-                    "Review CrabDB agent `{agent}` before accepting its work.\n\n\
+                    "Review CrabDB lane `{lane}` before accepting its work.\n\n\
 Checklist:\n\
-1. Read `crabdb://workspace/doctor`, `crabdb://workspace/agents`, and `crabdb://workspace/conflicts`.\n\
-2. Call `crabdb.agent_review` for `{agent}` first and inspect readiness, evidence summary, gates, approvals, conflicts, changed paths, recent operations, and next steps.\n\
-3. Treat `crabdb.agent_review` readiness blockers as stop conditions before merge.\n\
-4. Call `crabdb.agent_handoff`, `crabdb.agent_contribution`, or `crabdb.agent_status` only when you need deeper session, trace, contribution, or branch/workdir detail.\n\
-5. Call `crabdb.agent_status` for `{agent}` and confirm the branch/workdir state is clean enough to review.\n\
-6. Call `crabdb.diff_agent` with patches and line ids; inspect provenance with `crabdb.why`, `crabdb.history`, and `crabdb.code_from` when a change is unclear.\n\
+1. Read `crabdb://workspace/doctor`, `crabdb://workspace/lanes`, and `crabdb://workspace/conflicts`.\n\
+2. Call `crabdb.lane_review` for `{lane}` first and inspect readiness, evidence summary, gates, approvals, conflicts, changed paths, recent operations, and next steps.\n\
+3. Treat `crabdb.lane_review` readiness blockers as stop conditions before merge.\n\
+4. Call `crabdb.lane_handoff`, `crabdb.lane_contribution`, or `crabdb.lane_status` only when you need deeper session, trace, contribution, or branch/workdir detail.\n\
+5. Call `crabdb.lane_status` for `{lane}` and confirm the branch/workdir state is clean enough to review.\n\
+6. Call `crabdb.diff_lane` with patches and line ids; inspect provenance with `crabdb.why`, `crabdb.history`, and `crabdb.code_from` when a change is unclear.\n\
 7. Confirm latest tests and evals passed or explain why warnings are acceptable.\n\
 8. Use `crabdb.approval_request` for any unresolved human decision and inspect linked paused runs with `crabdb.run_list`.\n\
-9. Prefer `crabdb.merge_queue_add` plus `crabdb.merge_queue_run` for shared target branches; use direct `merge-agent` only for one-off merges.\n\
-10. If the work should be abandoned, use `crabdb.agent_rewind` with `record_current = true` instead of silently moving refs.\n\
+9. Prefer `crabdb.merge_queue_add` plus `crabdb.merge_queue_run` for shared target branches; use direct `merge-lane` only for one-off merges.\n\
+10. If the work should be abandoned, use `crabdb.lane_rewind` with `record_current = true` instead of silently moving refs.\n\
 11. If conflicts exist, stop review and switch to the `{PROMPT_RESOLVE_CONFLICT}` prompt."
                 ),
                 Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),

@@ -53,7 +53,7 @@ pub(crate) fn normalize_workdir_path(path: &Path) -> Result<PathBuf> {
             Component::ParentDir => {
                 return Err(Error::InvalidPath {
                     path: path.to_string_lossy().to_string(),
-                    reason: "agent workdir cannot contain parent directory components".to_string(),
+                    reason: "lane workdir cannot contain parent directory components".to_string(),
                 });
             }
         }
@@ -77,7 +77,7 @@ pub(crate) fn canonicalize_existing_workdir_prefix(path: &Path) -> Result<PathBu
         missing.push(name.to_os_string());
         existing = existing.parent().ok_or_else(|| Error::InvalidPath {
             path: path.to_string_lossy().to_string(),
-            reason: "agent workdir has no existing ancestor".to_string(),
+            reason: "lane workdir has no existing ancestor".to_string(),
         })?;
     }
     let mut out = existing.canonicalize()?;
@@ -87,24 +87,24 @@ pub(crate) fn canonicalize_existing_workdir_prefix(path: &Path) -> Result<PathBu
     normalize_workdir_path(&out)
 }
 
-pub(crate) fn prepare_agent_workdir(path: &Path, custom_workdir: bool) -> Result<()> {
+pub(crate) fn prepare_lane_workdir(path: &Path, custom_workdir: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
                 return Err(Error::InvalidPath {
                     path: path.to_string_lossy().to_string(),
-                    reason: "agent workdir cannot be a symlink".to_string(),
+                    reason: "lane workdir cannot be a symlink".to_string(),
                 });
             }
             if !metadata.is_dir() {
                 return Err(Error::InvalidPath {
                     path: path.to_string_lossy().to_string(),
-                    reason: "agent workdir path exists but is not a directory".to_string(),
+                    reason: "lane workdir path exists but is not a directory".to_string(),
                 });
             }
             if custom_workdir && fs::read_dir(path)?.next().is_some() {
                 return Err(Error::InvalidInput(format!(
-                    "custom agent workdir `{}` must be empty or absent",
+                    "custom lane workdir `{}` must be empty or absent",
                     path.display()
                 )));
             }

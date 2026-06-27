@@ -1,8 +1,8 @@
 use serde_json::{Map, Value};
 
-mod agents;
 mod collaboration;
 mod core;
+mod lanes;
 mod turns;
 
 use super::helpers::{
@@ -14,7 +14,7 @@ pub(super) fn openapi_paths() -> Value {
     let mut paths = Map::new();
     append_paths(&mut paths, core::core_paths());
     append_paths(&mut paths, collaboration::collaboration_paths());
-    append_paths(&mut paths, agents::agent_paths());
+    append_paths(&mut paths, lanes::lane_paths());
     append_paths(&mut paths, turns::turn_paths());
     Value::Object(paths)
 }

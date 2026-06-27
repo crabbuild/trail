@@ -5,9 +5,9 @@ use crate::model::ConflictManualResolution;
 use super::default_completed_status;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct MergeAgentRequest {
-    #[serde(default, alias = "agent", alias = "name")]
-    pub(crate) agent_id: Option<String>,
+pub(crate) struct MergeLaneRequest {
+    #[serde(default, alias = "lane", alias = "name")]
+    pub(crate) lane_id: Option<String>,
     #[serde(default)]
     pub(crate) strategy: Option<String>,
     #[serde(default, alias = "dry-run")]
@@ -16,7 +16,7 @@ pub(crate) struct MergeAgentRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SessionStartRequest {
-    pub(crate) agent: String,
+    pub(crate) lane: String,
     #[serde(default)]
     pub(crate) title: Option<String>,
     #[serde(default)]
@@ -31,7 +31,7 @@ pub(crate) struct SessionEndRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApprovalRequest {
-    pub(crate) agent: String,
+    pub(crate) lane: String,
     pub(crate) action: String,
     pub(crate) summary: String,
     #[serde(default)]
@@ -52,8 +52,8 @@ pub(crate) struct ApprovalDecisionRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentRunPauseRequest {
-    pub(crate) agent: String,
+pub(crate) struct LaneRunPauseRequest {
+    pub(crate) lane: String,
     pub(crate) reason: String,
     pub(crate) summary: String,
     #[serde(default)]
@@ -67,7 +67,7 @@ pub(crate) struct AgentRunPauseRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentRunResumeRequest {
+pub(crate) struct LaneRunResumeRequest {
     #[serde(default)]
     pub(crate) reviewer: Option<String>,
     #[serde(default)]
@@ -76,7 +76,7 @@ pub(crate) struct AgentRunResumeRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct LeaseAcquireRequest {
-    pub(crate) agent: String,
+    pub(crate) lane: String,
     #[serde(default)]
     pub(crate) path: Option<String>,
     #[serde(default)]

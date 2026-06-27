@@ -17,73 +17,73 @@ pub(crate) fn resources_templates_list_result() -> Value {
 pub(crate) fn resource_templates() -> Value {
     json!([
         {
-            "uriTemplate": RESOURCE_AGENT_TEMPLATE,
-            "name": "agent",
-            "title": "Agent Details",
-            "description": "Read one agent record and branch state by agent name or id.",
+            "uriTemplate": RESOURCE_LANE_TEMPLATE,
+            "name": "lane",
+            "title": "Lane Details",
+            "description": "Read one lane record and branch state by lane name or id.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_STATUS_TEMPLATE,
-            "name": "agent-status",
-            "title": "Agent Status",
-            "description": "Read one agent's branch, workdir, queue, and latest gate status.",
+            "uriTemplate": RESOURCE_LANE_STATUS_TEMPLATE,
+            "name": "lane-status",
+            "title": "Lane Status",
+            "description": "Read one lane's branch, workdir, queue, and latest gate status.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_REVIEW_TEMPLATE,
-            "name": "agent-review",
-            "title": "Agent Review Packet",
+            "uriTemplate": RESOURCE_LANE_REVIEW_TEMPLATE,
+            "name": "lane-review",
+            "title": "Lane Review Packet",
             "description": "Read one compact review packet with readiness, evidence summaries, gates, approvals, conflicts, operations, and next steps.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_CONTRIBUTION_TEMPLATE,
-            "name": "agent-contribution",
-            "title": "Agent Contribution",
-            "description": "Read one review bundle for an agent: status, changed paths, operations, sessions, events, and approvals.",
+            "uriTemplate": RESOURCE_LANE_CONTRIBUTION_TEMPLATE,
+            "name": "lane-contribution",
+            "title": "Lane Contribution",
+            "description": "Read one review bundle for a lane: status, changed paths, operations, sessions, events, and approvals.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_GATES_TEMPLATE,
-            "name": "agent-gates",
-            "title": "Agent Gate History",
-            "description": "Read recent test/eval gate results for one agent.",
+            "uriTemplate": RESOURCE_LANE_GATES_TEMPLATE,
+            "name": "lane-gates",
+            "title": "Lane Gate History",
+            "description": "Read recent test/eval gate results for one lane.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_READINESS_TEMPLATE,
-            "name": "agent-readiness",
-            "title": "Agent Readiness",
+            "uriTemplate": RESOURCE_LANE_READINESS_TEMPLATE,
+            "name": "lane-readiness",
+            "title": "Lane Readiness",
             "description": "Read one merge-readiness report with blockers, warnings, conflicts, approvals, and latest gates.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_HANDOFF_TEMPLATE,
-            "name": "agent-handoff",
-            "title": "Agent Handoff",
+            "uriTemplate": RESOURCE_LANE_HANDOFF_TEMPLATE,
+            "name": "lane-handoff",
+            "title": "Lane Handoff",
             "description": "Read one transfer packet with readiness, current session context, recent events, spans, operations, and next steps.",
             "mimeType": "application/json"
         },
         {
-            "uriTemplate": RESOURCE_AGENT_DIFF_TEMPLATE,
-            "name": "agent-diff",
-            "title": "Agent Diff",
-            "description": "Read one agent branch diff summary without unified patches.",
+            "uriTemplate": RESOURCE_LANE_DIFF_TEMPLATE,
+            "name": "lane-diff",
+            "title": "Lane Diff",
+            "description": "Read one lane branch diff summary without unified patches.",
             "mimeType": "application/json"
         },
         {
             "uriTemplate": RESOURCE_SESSION_TEMPLATE,
             "name": "session",
-            "title": "Agent Session",
-            "description": "Read one durable agent session with turns, messages, events, and operations.",
+            "title": "Lane Session",
+            "description": "Read one durable lane session with turns, messages, events, and operations.",
             "mimeType": "application/json"
         },
         {
             "uriTemplate": RESOURCE_TURN_TEMPLATE,
             "name": "turn",
-            "title": "Agent Turn",
-            "description": "Read one durable agent turn with messages, events, and operations.",
+            "title": "Lane Turn",
+            "description": "Read one durable lane turn with messages, events, and operations.",
             "mimeType": "application/json"
         },
         {
@@ -102,16 +102,16 @@ pub(crate) fn resource_templates() -> Value {
         },
         {
             "uriTemplate": RESOURCE_RUN_TEMPLATE,
-            "name": "agent-run",
-            "title": "Agent Run State",
-            "description": "Read one durable paused/resumed agent run checkpoint.",
+            "name": "lane-run",
+            "title": "Lane Run State",
+            "description": "Read one durable paused/resumed lane run checkpoint.",
             "mimeType": "application/json"
         },
         {
             "uriTemplate": RESOURCE_SPAN_TEMPLATE,
             "name": "trace-span",
             "title": "Trace Span",
-            "description": "Read one derived agent trace span.",
+            "description": "Read one derived lane trace span.",
             "mimeType": "application/json"
         }
     ])
@@ -134,10 +134,10 @@ pub(crate) fn resources() -> Value {
             "mimeType": "application/json"
         },
         {
-            "uri": RESOURCE_AGENTS,
-            "name": "agents",
-            "title": "Agents",
-            "description": "Current agent branches and lifecycle metadata.",
+            "uri": RESOURCE_LANES,
+            "name": "lanes",
+            "title": "Lanes",
+            "description": "Current lane branches and lifecycle metadata.",
             "mimeType": "application/json"
         },
         {
@@ -169,10 +169,10 @@ pub(crate) fn resources() -> Value {
             "mimeType": "text/markdown"
         },
         {
-            "uri": RESOURCE_AGENT_WORKFLOWS,
-            "name": "agent-workflows",
-            "title": "CrabDB Agent Workflows",
-            "description": "Guide for multi-agent coordinators and MCP hosts.",
+            "uri": RESOURCE_LANE_WORKFLOWS,
+            "name": "lane-workflows",
+            "title": "CrabDB Lane Workflows",
+            "description": "Guide for multi-lane coordinators and MCP hosts.",
             "mimeType": "text/markdown"
         },
         {

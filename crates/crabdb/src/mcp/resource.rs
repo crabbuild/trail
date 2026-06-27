@@ -9,7 +9,7 @@ pub(crate) fn handle_resource_read(db: &mut CrabDb, params: Value) -> Result<Val
     let (mime_type, text) = match args.uri.as_str() {
         RESOURCE_STATUS => ("application/json", pretty_json(&db.status(None)?)?),
         RESOURCE_DOCTOR => ("application/json", pretty_json(&db.doctor()?)?),
-        RESOURCE_AGENTS => ("application/json", pretty_json(&db.list_agents()?)?),
+        RESOURCE_LANES => ("application/json", pretty_json(&db.list_lanes()?)?),
         RESOURCE_MERGE_QUEUE => ("application/json", pretty_json(&db.list_merge_queue()?)?),
         RESOURCE_CONFLICTS => ("application/json", pretty_json(&db.list_conflicts()?)?),
         RESOURCE_OPENAPI => (
@@ -17,7 +17,7 @@ pub(crate) fn handle_resource_read(db: &mut CrabDb, params: Value) -> Result<Val
             serde_json::to_string_pretty(&crate::server::openapi_spec())?,
         ),
         RESOURCE_USER_GUIDE => ("text/markdown", USER_GUIDE_MD.to_string()),
-        RESOURCE_AGENT_WORKFLOWS => ("text/markdown", AGENT_WORKFLOWS_MD.to_string()),
+        RESOURCE_LANE_WORKFLOWS => ("text/markdown", LANE_WORKFLOWS_MD.to_string()),
         RESOURCE_CLI_REFERENCE => ("text/markdown", CLI_REFERENCE_MD.to_string()),
         other => templated_resource(db, other)?,
     };
@@ -33,87 +33,81 @@ pub(crate) fn handle_resource_read(db: &mut CrabDb, params: Value) -> Result<Val
 }
 
 fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, String)> {
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/status",
-        RESOURCE_AGENT_STATUS_TEMPLATE,
+        RESOURCE_LANE_STATUS_TEMPLATE,
     )? {
-        return Ok(("application/json", pretty_json(&db.agent_status(&agent)?)?));
+        return Ok(("application/json", pretty_json(&db.lane_status(&lane)?)?));
     }
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/review",
-        RESOURCE_AGENT_REVIEW_TEMPLATE,
+        RESOURCE_LANE_REVIEW_TEMPLATE,
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.agent_review_packet(&agent, 50)?)?,
+            pretty_json(&db.lane_review_packet(&lane, 50)?)?,
         ));
     }
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/contribution",
-        RESOURCE_AGENT_CONTRIBUTION_TEMPLATE,
+        RESOURCE_LANE_CONTRIBUTION_TEMPLATE,
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.agent_contribution(&agent, 50)?)?,
+            pretty_json(&db.lane_contribution(&lane, 50)?)?,
         ));
     }
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/gates",
-        RESOURCE_AGENT_GATES_TEMPLATE,
+        RESOURCE_LANE_GATES_TEMPLATE,
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.agent_gate_history(&agent, None, 50)?)?,
+            pretty_json(&db.lane_gate_history(&lane, None, 50)?)?,
         ));
     }
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/readiness",
-        RESOURCE_AGENT_READINESS_TEMPLATE,
+        RESOURCE_LANE_READINESS_TEMPLATE,
     )? {
-        return Ok((
-            "application/json",
-            pretty_json(&db.agent_readiness(&agent)?)?,
-        ));
+        return Ok(("application/json", pretty_json(&db.lane_readiness(&lane)?)?));
     }
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/handoff",
-        RESOURCE_AGENT_HANDOFF_TEMPLATE,
+        RESOURCE_LANE_HANDOFF_TEMPLATE,
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.agent_handoff(&agent, 50)?)?,
+            pretty_json(&db.lane_handoff(&lane, 50)?)?,
         ));
     }
-    if let Some(agent) = template_uri_argument(
+    if let Some(lane) = template_uri_argument(
         uri,
-        "crabdb://workspace/agents/",
+        "crabdb://workspace/lanes/",
         "/diff",
-        RESOURCE_AGENT_DIFF_TEMPLATE,
+        RESOURCE_LANE_DIFF_TEMPLATE,
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.diff_agent_with_options(&agent, false, false)?)?,
+            pretty_json(&db.diff_lane_with_options(&lane, false, false)?)?,
         ));
     }
-    if let Some(agent) = template_uri_argument(
-        uri,
-        "crabdb://workspace/agents/",
-        "",
-        RESOURCE_AGENT_TEMPLATE,
-    )? {
-        return Ok(("application/json", pretty_json(&db.agent_details(&agent)?)?));
+    if let Some(lane) =
+        template_uri_argument(uri, "crabdb://workspace/lanes/", "", RESOURCE_LANE_TEMPLATE)?
+    {
+        return Ok(("application/json", pretty_json(&db.lane_details(&lane)?)?));
     }
     if let Some(session_id) = template_uri_argument(
         uri,
@@ -123,7 +117,7 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.show_agent_session(&session_id)?)?,
+            pretty_json(&db.show_lane_session(&session_id)?)?,
         ));
     }
     if let Some(turn_id) =
@@ -131,7 +125,7 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     {
         return Ok((
             "application/json",
-            pretty_json(&db.show_agent_turn(&turn_id)?)?,
+            pretty_json(&db.show_lane_turn(&turn_id)?)?,
         ));
     }
     if let Some(conflict_set_id) = template_uri_argument(
@@ -153,7 +147,7 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     )? {
         return Ok((
             "application/json",
-            pretty_json(&db.show_agent_approval(&approval_id)?)?,
+            pretty_json(&db.show_lane_approval(&approval_id)?)?,
         ));
     }
     if let Some(run_id) =
@@ -161,7 +155,7 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     {
         return Ok((
             "application/json",
-            pretty_json(&db.show_agent_run_state(&run_id)?)?,
+            pretty_json(&db.show_lane_run_state(&run_id)?)?,
         ));
     }
     if let Some(span_id) =
@@ -169,7 +163,7 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     {
         return Ok((
             "application/json",
-            pretty_json(&db.show_agent_trace_span(&span_id)?)?,
+            pretty_json(&db.show_lane_trace_span(&span_id)?)?,
         ));
     }
     Err(Error::InvalidInput(format!(

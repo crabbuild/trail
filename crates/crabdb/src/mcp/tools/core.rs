@@ -7,7 +7,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.doctor",
             "title": "CrabDB Doctor",
-            "description": "Run read-only operational diagnostics for workspace health, locks, fsck, approvals, leases, merge queue, conflicts, and agent workdirs.",
+            "description": "Run read-only operational diagnostics for workspace health, locks, fsck, approvals, leases, merge queue, conflicts, and lane workdirs.",
             "inputSchema": object_schema(json!({}), vec![])
         },
         {
@@ -34,11 +34,11 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.timeline",
             "title": "CrabDB Timeline",
-            "description": "Read recent operations, optionally scoped to one branch, session, or agent.",
+            "description": "Read recent operations, optionally scoped to one branch, session, or lane.",
             "inputSchema": object_schema(json!({
                 "branch": { "type": "string" },
                 "session": { "type": "string" },
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "limit": { "type": "integer", "minimum": 1 }
             }), vec![])
         },
@@ -67,7 +67,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.code_from",
             "title": "Trace Code From Source",
-            "description": "Find operations and changed paths produced by a change, message, session, or agent branch.",
+            "description": "Find operations and changed paths produced by a change, message, session, or lane branch.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string" }
             }), vec!["selector"])
@@ -128,9 +128,9 @@ pub(super) fn tools() -> Value {
         {
             "name": "crabdb.guardrail_check",
             "title": "Guardrail Check",
-            "description": "Preflight an agent action against CrabDB path policy, risky tool categories, and pending approvals. Returns allowed, approval_required, or blocked.",
+            "description": "Preflight a lane action against CrabDB path policy, risky tool categories, and pending approvals. Returns allowed, approval_required, or blocked.",
             "inputSchema": object_schema(json!({
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "action": { "type": "string" },
                 "summary": { "type": "string" },
                 "payload": { "type": "object" },

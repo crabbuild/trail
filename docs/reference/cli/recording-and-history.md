@@ -33,7 +33,7 @@ Default interval is 2 seconds. `--debounce` is an alias for `--debounce-ms`.
 ## `timeline`
 
 ```text
-crabdb timeline [--limit <N>] [--branch <BRANCH>] [--session <SESSION>] [--agent <AGENT>]
+crabdb timeline [--limit <N>] [--branch <BRANCH>] [--session <SESSION>] [--lane <LANE>]
 ```
 
 Default limit is 30.
@@ -68,11 +68,10 @@ Uses derived file and line history indexes.
 crabdb code-from <SELECTOR>
 ```
 
-Finds operations and changed paths from a message, session, or agent.
+Finds operations and changed paths from a message, session, or lane.
 
 ## Code Facts Used
 
 - Args: `crates/crabdb/src/cli/command/worktree_args.rs`, `crates/crabdb/src/cli/command/inspect_args.rs`
 - Handler parsing: `crates/crabdb/src/cli/command/handler/parsing.rs`
 - Reports: `crates/crabdb/src/model/reports/worktree.rs`, `crates/crabdb/src/model/inspect`
-

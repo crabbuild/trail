@@ -1,22 +1,22 @@
 use super::*;
 
 impl CrabDb {
-    pub(crate) fn insert_agent_event(
+    pub(crate) fn insert_lane_event(
         &self,
-        agent_id: &str,
+        lane_id: &str,
         event_type: &str,
         change_id: Option<&ChangeId>,
         message_id: Option<&MessageId>,
         payload: &serde_json::Value,
     ) -> Result<String> {
-        self.insert_agent_event_with_context(
-            agent_id, None, None, event_type, change_id, message_id, payload,
+        self.insert_lane_event_with_context(
+            lane_id, None, None, event_type, change_id, message_id, payload,
         )
     }
 
-    pub(crate) fn insert_agent_event_with_context(
+    pub(crate) fn insert_lane_event_with_context(
         &self,
-        agent_id: &str,
+        lane_id: &str,
         session_id: Option<&str>,
         turn_id: Option<&str>,
         event_type: &str,
@@ -26,7 +26,7 @@ impl CrabDb {
     ) -> Result<String> {
         let event_seed = format!(
             "{}:{}:{}:{}:{}:{}:{}",
-            agent_id,
+            lane_id,
             session_id.unwrap_or("none"),
             turn_id.unwrap_or("none"),
             event_type,
@@ -38,12 +38,12 @@ impl CrabDb {
         let payload = redact_sensitive_json(payload.clone());
         let created_at = now_ts();
         self.conn.execute(
-            "INSERT INTO agent_events \
-             (event_id, agent_id, turn_id, session_id, event_type, change_id, message_id, payload_json, created_at) \
+            "INSERT INTO lane_events \
+             (event_id, lane_id, turn_id, session_id, event_type, change_id, message_id, payload_json, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 event_id,
-                agent_id,
+                lane_id,
                 turn_id,
                 session_id,
                 event_type,
@@ -53,16 +53,16 @@ impl CrabDb {
                 created_at
             ],
         )?;
-        self.index_agent_trace_span_event(
-            &event_id, agent_id, session_id, turn_id, event_type, &payload, created_at,
+        self.index_lane_trace_span_event(
+            &event_id, lane_id, session_id, turn_id, event_type, &payload, created_at,
         )?;
         Ok(event_id)
     }
 
-    pub(crate) fn index_agent_trace_span_event(
+    pub(crate) fn index_lane_trace_span_event(
         &self,
         event_id: &str,
-        agent_id: &str,
+        lane_id: &str,
         session_id: Option<&str>,
         turn_id: Option<&str>,
         event_type: &str,
@@ -77,23 +77,23 @@ impl CrabDb {
         };
         let trace_id = payload_string(payload, "trace_id");
         self.conn.execute(
-            "INSERT OR REPLACE INTO agent_trace_span_events \
-             (span_id, event_id, event_type, trace_id, agent_id, session_id, turn_id, created_at) \
+            "INSERT OR REPLACE INTO lane_trace_span_events \
+             (span_id, event_id, event_type, trace_id, lane_id, session_id, turn_id, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                span_id, event_id, event_type, trace_id, agent_id, session_id, turn_id, created_at
+                span_id, event_id, event_type, trace_id, lane_id, session_id, turn_id, created_at
             ],
         )?;
         Ok(())
     }
 
-    pub(crate) fn rebuild_agent_trace_span_event_index(&self) -> Result<u64> {
+    pub(crate) fn rebuild_lane_trace_span_event_index(&self) -> Result<u64> {
         self.conn
-            .execute("DELETE FROM agent_trace_span_events", [])?;
+            .execute("DELETE FROM lane_trace_span_events", [])?;
         let rows = {
             let mut stmt = self.conn.prepare(
-                "SELECT event_id, agent_id, session_id, turn_id, event_type, payload_json, created_at \
-                 FROM agent_events \
+                "SELECT event_id, lane_id, session_id, turn_id, event_type, payload_json, created_at \
+                 FROM lane_events \
                  WHERE event_type IN ('span_started', 'span_ended') \
                  ORDER BY created_at ASC, event_id ASC",
             )?;
@@ -112,15 +112,14 @@ impl CrabDb {
         };
 
         let mut indexed = 0u64;
-        for (event_id, agent_id, session_id, turn_id, event_type, payload_json, created_at) in rows
-        {
+        for (event_id, lane_id, session_id, turn_id, event_type, payload_json, created_at) in rows {
             let payload = match serde_json::from_str::<serde_json::Value>(&payload_json) {
                 Ok(payload) => payload,
                 Err(_) => continue,
             };
-            self.index_agent_trace_span_event(
+            self.index_lane_trace_span_event(
                 &event_id,
-                &agent_id,
+                &lane_id,
                 session_id.as_deref(),
                 turn_id.as_deref(),
                 &event_type,
@@ -221,13 +220,13 @@ impl CrabDb {
             .map_err(Error::from)
     }
 
-    pub(crate) fn agent_change_ids(&self, agent: &str) -> Result<Vec<ChangeId>> {
-        let branch = self.agent_branch(agent)?;
+    pub(crate) fn lane_change_ids(&self, lane: &str) -> Result<Vec<ChangeId>> {
+        let branch = self.lane_branch(lane)?;
         let mut stmt = self.conn.prepare(
             "SELECT change_id FROM operations \
              WHERE branch = ?1 OR actor_id = ?2 ORDER BY created_at ASC, rowid ASC",
         )?;
-        let rows = stmt.query_map(params![branch.ref_name, branch.agent_id], |row| {
+        let rows = stmt.query_map(params![branch.ref_name, branch.lane_id], |row| {
             Ok(ChangeId(row.get(0)?))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

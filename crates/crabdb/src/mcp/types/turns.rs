@@ -5,7 +5,7 @@ use crate::PatchEdit;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct BeginTurnArgs {
-    pub(crate) agent: String,
+    pub(crate) lane: String,
     #[serde(default)]
     pub(crate) branch: Option<String>,
     #[serde(default)]
@@ -45,7 +45,7 @@ pub(crate) struct AddEventArgs {
 #[derive(Debug, Deserialize)]
 pub(crate) struct EventListArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     #[serde(default)]
     pub(crate) session: Option<String>,
     #[serde(default, alias = "turn")]
@@ -82,7 +82,7 @@ pub(crate) struct SpanEndArgs {
 #[derive(Debug, Deserialize)]
 pub(crate) struct SpanListArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     #[serde(default)]
     pub(crate) session: Option<String>,
     #[serde(default, alias = "turn")]
@@ -96,7 +96,7 @@ pub(crate) struct SpanListArgs {
 #[derive(Debug, Deserialize)]
 pub(crate) struct SpanSummaryArgs {
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     #[serde(default)]
     pub(crate) session: Option<String>,
     #[serde(default, alias = "turn")]

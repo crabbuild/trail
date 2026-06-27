@@ -86,14 +86,14 @@ pub(crate) fn render_lease_acquire(
             "Acquired lease {} {} {} {}",
             report.lease.lease_id,
             report.lease.mode,
-            report.lease.agent_id,
+            report.lease.lane_id,
             report.lease.path.as_deref().unwrap_or("<workspace>")
         );
     }
     Ok(())
 }
 
-pub(crate) fn render_agent_claim(report: &AgentClaimReport, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_lane_claim(report: &LaneClaimReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);
     }
@@ -102,10 +102,10 @@ pub(crate) fn render_agent_claim(report: &AgentClaimReport, json: bool, quiet: b
             if let Some(lease) = &report.lease {
                 println!(
                     "Claimed {} for {} until {} ({})",
-                    report.path, report.agent_id, lease.expires_at, lease.lease_id
+                    report.path, report.lane_id, lease.expires_at, lease.lease_id
                 );
             } else {
-                println!("Claimed {} for {}", report.path, report.agent_id);
+                println!("Claimed {} for {}", report.path, report.lane_id);
             }
             if !report.hydrated_paths.is_empty() {
                 println!(
@@ -138,7 +138,7 @@ pub(crate) fn render_lease_list(leases: &[LeaseRecord], json: bool, quiet: bool)
                 "{} {} {} {} expires_at={}",
                 lease.lease_id,
                 lease.mode,
-                lease.agent_id,
+                lease.lane_id,
                 lease.path.as_deref().unwrap_or("<workspace>"),
                 lease.expires_at
             );

@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 pub(in crate::cli::command) enum ApprovalsSubcommand {
     /// Create a new approval request for a sensitive action.
     Request(ApprovalRequestArgs),
-    /// List approval requests, optionally filtered by agent/status.
+    /// List approval requests, optionally filtered by lane/status.
     List(ApprovalListArgs),
     /// Show one approval request record and decision state.
     Show(ApprovalShowArgs),
@@ -20,7 +20,7 @@ pub(in crate::cli::command) struct ApprovalsCommand {
 
 #[derive(Args)]
 pub(in crate::cli::command) struct ApprovalRequestArgs {
-    pub(in crate::cli::command) agent: String,
+    pub(in crate::cli::command) lane: String,
     #[arg(long)]
     pub(in crate::cli::command) action: String,
     #[arg(long)]
@@ -36,7 +36,7 @@ pub(in crate::cli::command) struct ApprovalRequestArgs {
 #[derive(Args)]
 pub(in crate::cli::command) struct ApprovalListArgs {
     #[arg(long)]
-    pub(in crate::cli::command) agent: Option<String>,
+    pub(in crate::cli::command) lane: Option<String>,
     #[arg(long)]
     pub(in crate::cli::command) status: Option<String>,
 }

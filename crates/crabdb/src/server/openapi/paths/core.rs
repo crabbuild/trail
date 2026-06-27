@@ -30,10 +30,10 @@ pub(super) fn core_paths() -> Value {
             ], None, true)
         },
         "/v1/timeline": {
-            "get": openapi_operation("timeline", "Timeline", "Return recent operations, optionally scoped by branch, session, or agent.", vec![
+            "get": openapi_operation("timeline", "Timeline", "Return recent operations, optionally scoped by branch, session, or lane.", vec![
                 openapi_query("branch", "string"),
                 openapi_query("session", "string"),
-                openapi_query("agent", "string"),
+                openapi_query("lane", "string"),
                 openapi_query("limit", "integer")
             ], None, true)
         },
@@ -54,7 +54,7 @@ pub(super) fn core_paths() -> Value {
             ], None, true)
         },
         "/v1/code-from": {
-            "get": openapi_operation("codeFrom", "Trace code from source", "Find operations produced by a change, message, session, or agent branch.", vec![
+            "get": openapi_operation("codeFrom", "Trace code from source", "Find operations produced by a change, message, session, or lane branch.", vec![
                 openapi_required_query("selector", "string")
             ], None, true)
         },
@@ -78,7 +78,7 @@ pub(super) fn core_paths() -> Value {
             "post": openapi_operation("ignoreCheck", "Check ignored path", "Check whether a relative path is ignored.", vec![], Some("IgnoreCheckRequest"), true)
         },
         "/v1/guardrails/check": {
-            "post": openapi_operation("guardrailCheck", "Guardrail check", "Preflight an agent action and return allowed, approval_required, or blocked.", vec![], Some("GuardrailCheckRequest"), true)
+            "post": openapi_operation("guardrailCheck", "Guardrail check", "Preflight a lane action and return allowed, approval_required, or blocked.", vec![], Some("GuardrailCheckRequest"), true)
         }
     })
 }

@@ -1,0 +1,106 @@
+use serde_json::{json, Value};
+
+use super::{
+    openapi_operation, openapi_operation_with_response_schema, openapi_path_param, openapi_query,
+};
+
+pub(super) fn lane_paths() -> Value {
+    json!({
+        "/v1/lanes": {
+            "get": openapi_operation("laneList", "List lanes", "List lane branches with metadata and branch state.", vec![], None, true),
+            "post": openapi_operation("laneSpawn", "Spawn lane", "Create or reuse a lane branch.", vec![], Some("SpawnLaneRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}": {
+            "get": openapi_operation("laneShow", "Show lane", "Show lane metadata and branch state.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true),
+            "delete": openapi_operation("laneRemove", "Remove lane", "Remove a lane branch and its materialized workdir. Requires force when the branch has unmerged changes.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("force", "boolean")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/status": {
+            "get": openapi_operation("laneStatus", "Lane status", "Show a lane branch status.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/review": {
+            "get": openapi_operation_with_response_schema("laneReview", "Lane review packet", "Produce a compact review packet for one lane branch with readiness, evidence summaries, gates, approvals, conflicts, operations, and next steps.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("limit", "integer")
+            ], None, "LaneReviewPacketReport", true)
+        },
+        "/v1/lanes/{lane_or_id}/contribution": {
+            "get": openapi_operation("laneContribution", "Lane contribution", "Summarize a lane branch for review with status, changed paths, operations, sessions, events, and approvals.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("limit", "integer")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/gates": {
+            "get": openapi_operation("laneGates", "Lane gate history", "List recent durable test/eval gate results for one lane branch.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("kind", "string"),
+                openapi_query("limit", "integer")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/readiness": {
+            "get": openapi_operation("laneReadiness", "Lane readiness", "Assess whether a lane branch is ready to merge by checking conflicts, approvals, workdir state, tests, and evals.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/handoff": {
+            "get": openapi_operation("laneHandoff", "Lane handoff", "Package lane branch, readiness, current session context, recent events, spans, operations, and next steps for transfer to another lane or reviewer.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("limit", "integer")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/workdir": {
+            "get": openapi_operation("laneWorkdir", "Lane workdir", "Return the materialized workdir path for a lane, if one exists.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/diff": {
+            "get": openapi_operation("laneDiff", "Lane diff", "Show the diff from a lane branch base to head.", vec![
+                openapi_path_param("lane_or_id", "string"),
+                openapi_query("patch", "boolean"),
+                openapi_query("show_line_ids", "boolean"),
+                openapi_query("show-line-ids", "boolean")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/read-file": {
+            "post": openapi_operation("laneReadFile", "Read lane file", "Read one file from a lane branch. Sparse workdirs hydrate lazily when hydrate is omitted; pass hydrate=false for a side-effect-free read.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneReadFileRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/sync-workdir": {
+            "post": openapi_operation("laneSyncWorkdir", "Sync lane workdir", "Refresh a materialized lane workdir.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("SyncWorkdirRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/record": {
+            "post": openapi_operation("laneRecordWorkdir", "Record lane workdir", "Record materialized lane workdir changes into the lane branch.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneRecordRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/rewind": {
+            "post": openapi_operation("laneRewind", "Rewind lane", "Rewind a lane branch to a known-good change or root, optionally preserving the current head and syncing its workdir.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneRewindRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/tests": {
+            "post": openapi_operation("laneRunTest", "Run lane test", "Run a command in a lane workdir and record test events.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneTestRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/evals": {
+            "post": openapi_operation("laneRunEval", "Run lane eval", "Run an evaluation command in a lane workdir and record eval events.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneTestRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/patches": {
+            "post": openapi_operation("laneApplyPatch", "Apply lane patch", "Apply a patch directly to a lane branch.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("PatchRequest"), true)
+        }
+    })
+}

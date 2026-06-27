@@ -14,8 +14,8 @@ pub(crate) fn render_guardrail_check(
     if !quiet {
         println!("Guardrail decision: {}", report.decision);
         println!("Action: {}", report.action);
-        if let Some(agent) = &report.agent {
-            println!("Agent: {}", agent.record.name);
+        if let Some(lane) = &report.lane {
+            println!("Lane: {}", lane.record.name);
         }
         if !report.reasons.is_empty() {
             println!("Reasons:");

@@ -130,9 +130,9 @@ impl CrabDb {
         let built = self.build_root_from_file_entries(merged_files, &change_id)?;
         let diff = self.diff_file_maps(&target_files, &built.files)?;
         let (kind, session_id) =
-            if let Some(agent) = pending.source_ref.strip_prefix(AGENT_REF_PREFIX) {
-                let branch = self.agent_branch(agent)?;
-                (OperationKind::AgentMerge, branch.session_id)
+            if let Some(lane) = pending.source_ref.strip_prefix(LANE_REF_PREFIX) {
+                let branch = self.lane_branch(lane)?;
+                (OperationKind::LaneMerge, branch.session_id)
             } else {
                 (OperationKind::Merge, None)
             };
@@ -168,10 +168,10 @@ impl CrabDb {
                 params![now_ts(), queue_id],
             )?;
         }
-        if let Some(agent) = pending.source_ref.strip_prefix(AGENT_REF_PREFIX) {
+        if let Some(lane) = pending.source_ref.strip_prefix(LANE_REF_PREFIX) {
             self.conn.execute(
-                "UPDATE agent_branches SET status = 'merged', updated_at = ?1 WHERE agent_id = ?2",
-                params![now_ts(), self.agent_branch(agent)?.agent_id],
+                "UPDATE lane_branches SET status = 'merged', updated_at = ?1 WHERE lane_id = ?2",
+                params![now_ts(), self.lane_branch(lane)?.lane_id],
             )?;
         }
         Ok(ConflictResolveReport {

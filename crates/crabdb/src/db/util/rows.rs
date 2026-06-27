@@ -35,10 +35,10 @@ pub(crate) fn line_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Line
     })
 }
 
-pub(crate) fn agent_details_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentDetails> {
-    Ok(AgentDetails {
-        record: AgentRecord {
-            agent_id: row.get(0)?,
+pub(crate) fn lane_details_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneDetails> {
+    Ok(LaneDetails {
+        record: LaneRecord {
+            lane_id: row.get(0)?,
             name: row.get(1)?,
             kind: row.get(2)?,
             provider: row.get(3)?,
@@ -46,8 +46,8 @@ pub(crate) fn agent_details_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Age
             created_at: row.get(5)?,
             metadata_json: row.get(6)?,
         },
-        branch: AgentBranch {
-            agent_id: row.get(0)?,
+        branch: LaneBranch {
+            lane_id: row.get(0)?,
             ref_name: row.get(7)?,
             base_change: ChangeId(row.get(8)?),
             head_change: ChangeId(row.get(9)?),
@@ -94,7 +94,7 @@ pub(crate) fn conflict_set_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conf
 pub(crate) fn lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRecord> {
     Ok(LeaseRecord {
         lease_id: row.get(0)?,
-        agent_id: row.get(1)?,
+        lane_id: row.get(1)?,
         ref_name: row.get(2)?,
         path: row.get(3)?,
         file_id: row.get(4)?,
@@ -117,10 +117,10 @@ pub(crate) fn git_mapping_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitMa
     })
 }
 
-pub(crate) fn agent_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
-    Ok(AgentSession {
+pub(crate) fn lane_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneSession> {
+    Ok(LaneSession {
         session_id: row.get(0)?,
-        agent_id: row.get(1)?,
+        lane_id: row.get(1)?,
         title: row.get(2)?,
         status: row.get(3)?,
         started_at: row.get(4)?,
@@ -129,10 +129,10 @@ pub(crate) fn agent_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Age
     })
 }
 
-pub(crate) fn agent_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentTurn> {
-    Ok(AgentTurn {
+pub(crate) fn lane_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneTurn> {
+    Ok(LaneTurn {
         turn_id: row.get(0)?,
-        agent_id: row.get(1)?,
+        lane_id: row.get(1)?,
         session_id: row.get(2)?,
         base_change: ChangeId(row.get(3)?),
         before_change: ChangeId(row.get(4)?),
@@ -144,13 +144,13 @@ pub(crate) fn agent_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentT
     })
 }
 
-pub(crate) fn agent_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEventRecord> {
+pub(crate) fn lane_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneEventRecord> {
     let payload_json: Option<String> = row.get(7)?;
     let payload =
         payload_json.and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
-    Ok(AgentEventRecord {
+    Ok(LaneEventRecord {
         event_id: row.get(0)?,
-        agent_id: row.get(1)?,
+        lane_id: row.get(1)?,
         session_id: row.get(2)?,
         turn_id: row.get(3)?,
         event_type: row.get(4)?,
@@ -161,13 +161,13 @@ pub(crate) fn agent_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Agent
     })
 }
 
-pub(crate) fn agent_approval_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentApproval> {
+pub(crate) fn lane_approval_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneApproval> {
     let payload_json: Option<String> = row.get(6)?;
     let payload =
         payload_json.and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
-    Ok(AgentApproval {
+    Ok(LaneApproval {
         approval_id: row.get(0)?,
-        agent_id: row.get(1)?,
+        lane_id: row.get(1)?,
         session_id: row.get(2)?,
         turn_id: row.get(3)?,
         action: row.get(4)?,
@@ -181,16 +181,16 @@ pub(crate) fn agent_approval_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ag
     })
 }
 
-pub(crate) fn agent_run_state_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunState> {
+pub(crate) fn lane_run_state_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneRunState> {
     let state_json: String = row.get(8)?;
     let state =
         serde_json::from_str::<serde_json::Value>(&state_json).unwrap_or(serde_json::Value::Null);
     let interruption_json: Option<String> = row.get(9)?;
     let interruption =
         interruption_json.and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
-    Ok(AgentRunState {
+    Ok(LaneRunState {
         run_id: row.get(0)?,
-        agent_id: row.get(1)?,
+        lane_id: row.get(1)?,
         session_id: row.get(2)?,
         turn_id: row.get(3)?,
         approval_id: row.get(4)?,

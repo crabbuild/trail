@@ -7,7 +7,7 @@ This design section is advanced/internal. It explains the model layer and how it
 The public model namespace is assembled from:
 
 - Domain config, objects, and operations.
-- Agent changes, core records, activity records, and coordination records.
+- Lane changes, core records, activity records, and coordination records.
 - Inspection result types.
 - Report types for worktree, agent, merge, and maintenance commands.
 
@@ -54,14 +54,14 @@ Operations form a graph through `parents`. Refs point at operation/root pairs. D
 ```mermaid
 flowchart LR
     BranchRef["refs/branches/main"] --> Head["Operation C<br/>current head"]
-    AgentRef["refs/agents/reviewer"] --> AgentHead["Operation D<br/>agent head"]
+    LaneRef["refs/lanes/reviewer"] --> LaneHead["Operation D<br/>lane head"]
 
     Head --> ParentB["Operation B"]
-    AgentHead --> ParentB
+    LaneHead --> ParentB
     ParentB --> ParentA["Operation A"]
 
     Head --> RootC["after_root C"]
-    AgentHead --> RootD["after_root D"]
+    LaneHead --> RootD["after_root D"]
     ParentB --> RootB["after_root B"]
 
     Head -. "indexed into" .-> Indexes["operations + operation_parents"]
@@ -157,26 +157,26 @@ Representations:
 
 Change records are stored on operations and indexed into `file_history` and `line_history` for query performance.
 
-## Agent Model
+## Lane Model
 
-Agent state is split into:
+Lane state is split into:
 
-- `AgentRecord`: identity and metadata such as name, kind, provider, model.
-- `AgentBranch`: ref, base/head changes, base/head roots, session, workdir, status.
-- `AgentDetails`: record plus branch.
+- `LaneRecord`: identity and metadata such as name, kind, provider, model.
+- `LaneBranch`: ref, base/head changes, base/head roots, session, workdir, status.
+- `LaneDetails`: record plus branch.
 
-The split matters because an agent's identity can exist independently from branch state, but user-facing reports usually need both.
+The split matters because a lane's identity can exist independently from branch state, but user-facing reports usually need both.
 
 ## Conversation and Activity Model
 
-Agent activity is modeled with:
+Lane activity is modeled with:
 
-- `AgentSession`
-- `AgentTurn`
+- `LaneSession`
+- `LaneTurn`
 - `Message`
-- `AgentEventRecord`
-- `AgentTraceSpan`
-- `AgentRunState`
+- `LaneEventRecord`
+- `LaneTraceSpan`
+- `LaneRunState`
 
 Sessions group long-running work. Turns represent bounded units of work. Messages and events create a reviewable timeline. Trace spans derive from span start/end events and are indexed for duration and status queries.
 
@@ -184,9 +184,9 @@ Sessions group long-running work. Turns represent bounded units of work. Message
 
 Coordination types include:
 
-- `AgentApproval`
+- `LaneApproval`
 - `LeaseRecord`
-- `AgentClaimReport`
+- `LaneClaimReport`
 - `Anchor`
 - `ConflictSetSummary`
 - `MergeQueueEntry`
@@ -197,8 +197,8 @@ Approvals gate sensitive work. Leases are advisory path coordination. Anchors bi
 
 Reports are deliberately not the same as storage rows. Examples:
 
-- `AgentReadinessReport` aggregates branch status, workdir state, approvals, conflicts, and gate status.
-- `AgentHandoffReport` bundles readiness, current session context, recent events, spans, operations, and next steps.
+- `LaneReadinessReport` aggregates branch status, workdir state, approvals, conflicts, and gate status.
+- `LaneHandoffReport` bundles readiness, current session context, recent events, spans, operations, and next steps.
 - `BackupRestoreReport` includes restore effects such as rewritten workdirs.
 - `GuardrailCheckReport` includes decision, reasons, path checks, approvals, and optional approval request instructions.
 
@@ -221,14 +221,14 @@ flowchart LR
 
 - A `RefRecord` should reference an operation object and root object.
 - `Operation.after_root` should match the root written into the ref when advancing a branch.
-- Agent branch head fields should match the backing agent ref.
+- Lane branch head fields should match the backing lane ref.
 - A message may link to an agent, session, or change depending on origin.
 - Readiness and handoff reports should be derived fresh rather than stored as durable truth.
 
 ## Code Facts Used
 
 - Domain objects: `crates/crabdb/src/model/domain`
-- Agent models: `crates/crabdb/src/model/agent`
+- Lane models: `crates/crabdb/src/model/lane`
 - Reports: `crates/crabdb/src/model/reports`
 - Inspection models: `crates/crabdb/src/model/inspect`
 - IDs: `crates/crabdb/src/ids.rs`

@@ -38,7 +38,7 @@ Patterns are stored in `.crabignore`. Empty patterns, comment-only patterns, NUL
 ## `guardrails`
 
 ```text
-crabdb guardrails check --action <ACTION> [--agent <AGENT>] [--summary <TEXT>] [--payload-json <JSON>] [--path <PATH>...]
+crabdb guardrails check --action <ACTION> [--lane <LANE>] [--summary <TEXT>] [--payload-json <JSON>] [--path <PATH>...]
 ```
 
 Returns `allowed`, `approval_required`, or `blocked`.
@@ -48,4 +48,3 @@ Returns `allowed`, `approval_required`, or `blocked`.
 - Args: `crates/crabdb/src/cli/command/workspace_args.rs`, `crates/crabdb/src/cli/command/worktree_args.rs`
 - Config validation: `crates/crabdb/src/db/util/config`
 - Ignore/guardrails: `crates/crabdb/src/db/core/workspace`
-

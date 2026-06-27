@@ -25,10 +25,10 @@ crabdb merge <SOURCE> --into <TARGET> [--strategy <STRATEGY>] [--dry-run]
 
 Allowed strategies are `conservative`, `line-id-aware`, and `line_id_aware`.
 
-## `merge-agent`
+## `merge-lane`
 
 ```text
-crabdb merge-agent <AGENT> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run]
+crabdb merge-lane <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run]
 ```
 
 Default target is `main`.

@@ -61,7 +61,7 @@ impl CrabDb {
 
     pub fn remove_merge_queue(&mut self, selector: &str) -> Result<MergeQueueRemoveReport> {
         let _lock = self.acquire_write_lock()?;
-        let agent_candidate = agent_ref(selector);
+        let lane_candidate = lane_ref(selector);
         let branch_candidate = branch_ref(selector);
         let entry = self
             .conn
@@ -71,7 +71,7 @@ impl CrabDb {
                  WHERE (queue_id = ?1 OR source_ref = ?1 OR source_ref = ?2 OR source_ref = ?3) \
                    AND status NOT IN ('merged', 'cancelled') \
                  ORDER BY priority DESC, created_at ASC LIMIT 1",
-                params![selector, agent_candidate, branch_candidate],
+                params![selector, lane_candidate, branch_candidate],
                 merge_queue_row,
             )
             .optional()?

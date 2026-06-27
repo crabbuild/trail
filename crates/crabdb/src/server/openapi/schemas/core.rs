@@ -73,7 +73,7 @@ pub(super) fn core_schemas() -> Value {
             "required": ["action"],
             "additionalProperties": false,
             "properties": {
-                "agent": { "type": "string" },
+                "lane": { "type": "string" },
                 "action": { "type": "string" },
                 "summary": { "type": "string" },
                 "payload": { "type": "object" },

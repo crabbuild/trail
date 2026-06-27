@@ -20,20 +20,20 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 - `crabdb.ignore_check`
 - `crabdb.guardrail_check`
 
-## Agents
+## Lanes
 
-- `crabdb.agent_spawn`
-- `crabdb.agent_claim`
-- `crabdb.agent_list`
-- `crabdb.agent_show`
-- `crabdb.agent_status`
-- `crabdb.agent_review`
-- `crabdb.agent_contribution`
+- `crabdb.lane_spawn`
+- `crabdb.lane_claim`
+- `crabdb.lane_list`
+- `crabdb.lane_show`
+- `crabdb.lane_status`
+- `crabdb.lane_review`
+- `crabdb.lane_contribution`
 - `crabdb.gate_history`
-- `crabdb.agent_readiness`
-- `crabdb.agent_handoff`
-- `crabdb.agent_rewind`
-- `crabdb.agent_remove`
+- `crabdb.lane_readiness`
+- `crabdb.lane_handoff`
+- `crabdb.lane_rewind`
+- `crabdb.lane_remove`
 
 ## Sessions, Approvals, Runs, Leases, Anchors
 
@@ -83,7 +83,7 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 - `crabdb.apply_patch`
 - `crabdb.end_turn`
 - `crabdb.show_turn`
-- `crabdb.diff_agent`
+- `crabdb.diff_lane`
 - `crabdb.run_test`
 - `crabdb.run_eval`
 - `crabdb.sync_workdir`
@@ -91,19 +91,19 @@ CrabDB MCP tool names are stable strings under the `crabdb.` prefix.
 
 ## Tool Risk Annotations
 
-The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only examples include status, diff, timeline, why, history, agent status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Destructive-write examples include `crabdb.agent_rewind` because it intentionally moves an agent ref and may refresh a materialized workdir.
+The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only examples include status, diff, timeline, why, history, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Destructive-write examples include `crabdb.lane_rewind` because it intentionally moves a lane ref and may refresh a materialized workdir.
 
-Open-world write examples are `crabdb.run_test` and `crabdb.run_eval` because they execute commands in agent workdirs.
+Open-world write examples are `crabdb.run_test` and `crabdb.run_eval` because they execute commands in lane workdirs.
 
 ## Prompts
 
-- `crabdb.agent_task`
-- `crabdb.review_agent`
+- `crabdb.lane_task`
+- `crabdb.review_lane`
 - `crabdb.resolve_conflict`
 
 ## Resources
 
-Static resources include workspace status, doctor, agents, merge queue, conflicts, OpenAPI, and compatibility guide resources. Resource templates cover individual agents, agent review packets, sessions, turns, conflicts, approvals, run states, and trace spans.
+Static resources include workspace status, doctor, lanes, merge queue, conflicts, OpenAPI, and compatibility guide resources. Resource templates cover individual lanes, lane review packets, sessions, turns, conflicts, approvals, run states, and trace spans.
 
 ## Code Facts Used
 

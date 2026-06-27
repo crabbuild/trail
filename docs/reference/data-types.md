@@ -40,29 +40,29 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 - `BranchReport`
 - `CheckoutReport`
 
-## Agent Reports
+## Lane Reports
 
-- `AgentDetails`
-- `AgentStatusReport`
-- `AgentReviewPacketReport`
-- `AgentReviewEvidenceSummary`
-- `AgentContributionReport`
-- `AgentReadinessReport`
-- `AgentHandoffReport`
-- `AgentPatchReport`
-- `AgentRecordReport`
-- `AgentRewindReport`
-- `AgentTestReport`
-- `AgentGateHistoryReport`
+- `LaneDetails`
+- `LaneStatusReport`
+- `LaneReviewPacketReport`
+- `LaneReviewEvidenceSummary`
+- `LaneContributionReport`
+- `LaneReadinessReport`
+- `LaneHandoffReport`
+- `LanePatchReport`
+- `LaneRecordReport`
+- `LaneRewindReport`
+- `LaneTestReport`
+- `LaneGateHistoryReport`
 
 ## Coordination Types
 
-- `AgentSession`
-- `AgentTurn`
-- `AgentEventRecord`
-- `AgentTraceSpan`
-- `AgentRunState`
-- `AgentApproval`
+- `LaneSession`
+- `LaneTurn`
+- `LaneEventRecord`
+- `LaneTraceSpan`
+- `LaneRunState`
+- `LaneApproval`
 - `LeaseRecord`
 - `Anchor`
 

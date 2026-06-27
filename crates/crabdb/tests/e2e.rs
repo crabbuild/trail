@@ -10,10 +10,10 @@ use std::thread;
 use std::time::Duration;
 
 use crabdb::{
-    Actor, AgentGateOptions, AgentMessageReport, AgentPatchReport, AgentRewindReport,
-    AgentTurnDetails, AgentTurnEndReport, AgentTurnEventReport, AgentTurnStartReport,
-    ConflictManualFile, ConflictManualResolution, CrabDb, Error, InitImportMode, PatchDocument,
-    ShowResult, TextContent, TextRepresentation, WorktreeState,
+    Actor, ConflictManualFile, ConflictManualResolution, CrabDb, Error, InitImportMode,
+    LaneGateOptions, LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails,
+    LaneTurnEndReport, LaneTurnEventReport, LaneTurnStartReport, PatchDocument, ShowResult,
+    TextContent, TextRepresentation, WorktreeState,
 };
 use rusqlite::Connection;
 
@@ -175,7 +175,7 @@ fn api_request(method: &str, path: &str, body: serde_json::Value) -> Vec<u8> {
 }
 
 fn conflicted_readme_workspace(
-    agent_content: &str,
+    lane_content: &str,
     human_content: &str,
 ) -> (tempfile::TempDir, CrabDb, String) {
     let temp = tempfile::tempdir().unwrap();
@@ -183,16 +183,16 @@ fn conflicted_readme_workspace(
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("manual-bot", Some("main"), false, None, None)
+    db.spawn_lane("manual-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
-        "message": "agent edits readme",
+        "message": "lane edits readme",
         "edits": [
-            {"op": "write", "path": "README.md", "content": agent_content}
+            {"op": "write", "path": "README.md", "content": lane_content}
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("manual-bot", patch).unwrap();
+    db.apply_lane_patch("manual-bot", patch).unwrap();
 
     fs::write(temp.path().join("README.md"), human_content).unwrap();
     db.record(
@@ -406,7 +406,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 1
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 2
         }));
     }
 
@@ -456,9 +456,9 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
     assert_eq!(mcp["result"]["isError"], false);
     assert_eq!(mcp["result"]["structuredContent"]["status"], "ok");
 
-    db.spawn_agent("doctor-bot", Some("main"), false, None, None)
+    db.spawn_lane("doctor-bot", Some("main"), false, None, None)
         .unwrap();
-    db.request_agent_approval(
+    db.request_lane_approval(
         "doctor-bot",
         "shell.exec",
         "Run release smoke tests",
@@ -498,7 +498,7 @@ fn crabdb_refuses_workspaces_with_newer_schema_versions() {
 }
 
 #[test]
-fn init_creates_agent_observability_indexes() {
+fn init_creates_lane_observability_indexes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -514,17 +514,17 @@ fn init_creates_agent_observability_indexes() {
             .unwrap()
     };
     for expected in [
-        "agent_turns_session_started_idx",
-        "agent_turns_agent_started_idx",
-        "agent_events_agent_created_idx",
-        "agent_events_session_created_idx",
-        "agent_events_turn_created_idx",
-        "agent_events_type_created_idx",
-        "agent_events_agent_type_created_idx",
-        "agent_events_session_type_created_idx",
-        "agent_events_turn_type_created_idx",
-        "agent_trace_span_events_span_created_idx",
-        "agent_trace_span_events_trace_created_idx",
+        "lane_turns_session_started_idx",
+        "lane_turns_lane_started_idx",
+        "lane_events_lane_created_idx",
+        "lane_events_session_created_idx",
+        "lane_events_turn_created_idx",
+        "lane_events_type_created_idx",
+        "lane_events_lane_type_created_idx",
+        "lane_events_session_type_created_idx",
+        "lane_events_turn_type_created_idx",
+        "lane_trace_span_events_span_created_idx",
+        "lane_trace_span_events_trace_created_idx",
     ] {
         assert!(
             indexes.iter().any(|index| index == expected),
@@ -569,7 +569,7 @@ fn backup_create_verify_and_restore_roundtrip() {
         false,
     )
     .unwrap();
-    db.spawn_agent("backup-bot", Some("main"), true, None, None)
+    db.spawn_lane("backup-bot", Some("main"), true, None, None)
         .unwrap();
     drop(db);
 
@@ -610,12 +610,12 @@ fn backup_create_verify_and_restore_roundtrip() {
     let fsck = restored_db.fsck().unwrap();
     assert!(fsck.errors.is_empty(), "{:?}", fsck.errors);
 
-    let agent = restored_db.agent_details("backup-bot").unwrap();
-    let workdir = agent.branch.workdir.as_ref().unwrap();
+    let lane = restored_db.lane_details("backup-bot").unwrap();
+    let workdir = lane.branch.workdir.as_ref().unwrap();
     let restored_db_dir = restored.path().canonicalize().unwrap().join(".crabdb");
     assert!(workdir.starts_with(&restored_db_dir.to_string_lossy().to_string()));
     assert!(PathBuf::from(workdir).is_dir());
-    let status = restored_db.agent_status("backup-bot").unwrap();
+    let status = restored_db.lane_status("backup-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
 }
 
@@ -802,9 +802,9 @@ fn record_kind_session_and_allow_ignored_path_are_audited() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("auditor", Some("main"), false, None, None)
+    db.spawn_lane("auditor", Some("main"), false, None, None)
         .unwrap();
-    db.start_agent_session(
+    db.start_lane_session(
         "auditor",
         Some("Record ignored fixture".to_string()),
         Some("session-record".to_string()),
@@ -863,9 +863,9 @@ fn watch_cli_can_attach_recorded_operations_to_session() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("watch-bot", Some("main"), false, None, None)
+    db.spawn_lane("watch-bot", Some("main"), false, None, None)
         .unwrap();
-    db.start_agent_session(
+    db.start_lane_session(
         "watch-bot",
         Some("Watch session".to_string()),
         Some("session-watch".to_string()),
@@ -954,14 +954,14 @@ fn ignore_cli_manages_crabignore_and_status() {
 }
 
 #[test]
-fn agent_patch_respects_ignore_policy_and_explicit_opt_in() {
+fn lane_patch_respects_ignore_policy_and_explicit_opt_in() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.ignore_add("ignored-agent-output.txt").unwrap();
-    db.spawn_agent("privacy-bot", Some("main"), false, None, None)
+    db.ignore_add("ignored-lane-output.txt").unwrap();
+    db.spawn_lane("privacy-bot", Some("main"), false, None, None)
         .unwrap();
 
     let blocked: PatchDocument = serde_json::from_value(serde_json::json!({
@@ -969,14 +969,14 @@ fn agent_patch_respects_ignore_policy_and_explicit_opt_in() {
         "edits": [
             {
                 "op": "write",
-                "path": "ignored-agent-output.txt",
+                "path": "ignored-lane-output.txt",
                 "content": "secret-ish\n"
             }
         ]
     }))
     .unwrap();
-    let err = db.apply_agent_patch("privacy-bot", blocked).unwrap_err();
-    assert!(matches!(err, Error::IgnoredPath(path) if path == "ignored-agent-output.txt"));
+    let err = db.apply_lane_patch("privacy-bot", blocked).unwrap_err();
+    assert!(matches!(err, Error::IgnoredPath(path) if path == "ignored-lane-output.txt"));
 
     let allowed: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "explicit ignored fixture",
@@ -984,17 +984,17 @@ fn agent_patch_respects_ignore_policy_and_explicit_opt_in() {
         "edits": [
             {
                 "op": "write",
-                "path": "ignored-agent-output.txt",
+                "path": "ignored-lane-output.txt",
                 "content": "intentional fixture\n"
             }
         ]
     }))
     .unwrap();
-    let report = db.apply_agent_patch("privacy-bot", allowed).unwrap();
+    let report = db.apply_lane_patch("privacy-bot", allowed).unwrap();
     assert!(report
         .changed_paths
         .iter()
-        .any(|path| path.path == "ignored-agent-output.txt"));
+        .any(|path| path.path == "ignored-lane-output.txt"));
 
     let internal: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "try internal write",
@@ -1008,7 +1008,7 @@ fn agent_patch_respects_ignore_policy_and_explicit_opt_in() {
         ]
     }))
     .unwrap();
-    let err = db.apply_agent_patch("privacy-bot", internal).unwrap_err();
+    let err = db.apply_lane_patch("privacy-bot", internal).unwrap_err();
     assert!(matches!(err, Error::IgnoredPath(path) if path == ".crabdb/leak.txt"));
 }
 
@@ -1036,20 +1036,20 @@ fn local_api_and_mcp_expose_ignore_controls() {
         &api_request(
             "POST",
             "/v1/ignore/patterns",
-            serde_json::json!({ "pattern": "*.agentlocal" }),
+            serde_json::json!({ "pattern": "*.lanelocal" }),
         ),
     );
     assert_eq!(add_response.status, 200);
     let added: serde_json::Value = add_response.body_json().unwrap();
     assert_eq!(added["added"], true);
 
-    fs::write(temp.path().join("scratch.agentlocal"), "secret\n").unwrap();
+    fs::write(temp.path().join("scratch.lanelocal"), "secret\n").unwrap();
     let check_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
             "/v1/ignore/check",
-            serde_json::json!({ "path": "scratch.agentlocal" }),
+            serde_json::json!({ "path": "scratch.lanelocal" }),
         ),
     );
     assert_eq!(check_response.status, 200);
@@ -1065,7 +1065,7 @@ fn local_api_and_mcp_expose_ignore_controls() {
             serde_json::json!({
                 "action": "file.write",
                 "summary": "write ignored scratch fixture",
-                "paths": ["scratch.agentlocal"]
+                "paths": ["scratch.lanelocal"]
             }),
         ),
     );
@@ -1103,7 +1103,7 @@ fn local_api_and_mcp_expose_ignore_controls() {
         &api_request(
             "DELETE",
             "/v1/ignore/patterns",
-            serde_json::json!({ "pattern": "*.agentlocal" }),
+            serde_json::json!({ "pattern": "*.lanelocal" }),
         ),
     );
     assert_eq!(remove_response.status, 200);
@@ -1213,13 +1213,13 @@ fn local_api_and_mcp_expose_ignore_controls() {
 }
 
 #[test]
-fn local_api_and_mcp_manage_agent_sessions() {
+fn local_api_and_mcp_manage_lane_sessions() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("api-session-bot", Some("main"), false, None, None)
+    db.spawn_lane("api-session-bot", Some("main"), false, None, None)
         .unwrap();
 
     let started = crabdb::server::handle_http_request(
@@ -1228,7 +1228,7 @@ fn local_api_and_mcp_manage_agent_sessions() {
             "POST",
             "/v1/sessions",
             serde_json::json!({
-                "agent": "api-session-bot",
+                "lane": "api-session-bot",
                 "title": "API session",
                 "id": "session-api"
             }),
@@ -1242,20 +1242,20 @@ fn local_api_and_mcp_manage_agent_sessions() {
         &mut db,
         &api_request(
             "GET",
-            "/v1/sessions/current?agent=api-session-bot",
+            "/v1/sessions/current?lane=api-session-bot",
             serde_json::Value::Null,
         ),
     );
     assert_eq!(current.status, 200);
     let current: serde_json::Value = current.body_json().unwrap();
-    assert_eq!(current[0]["agent_name"], "api-session-bot");
+    assert_eq!(current[0]["lane_name"], "api-session-bot");
     assert_eq!(current[0]["session"]["session_id"], "session-api");
 
     let listed = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "GET",
-            "/v1/sessions?agent=api-session-bot",
+            "/v1/sessions?lane=api-session-bot",
             serde_json::Value::Null,
         ),
     );
@@ -1272,14 +1272,14 @@ fn local_api_and_mcp_manage_agent_sessions() {
     let shown: serde_json::Value = shown.body_json().unwrap();
     assert_eq!(shown["session"]["title"], "API session");
 
-    db.add_agent_message(
+    db.add_lane_message(
         "api-session-bot",
         "user",
         "Please improve the docs with a bounded context packet.",
         Some("session-api".to_string()),
     )
     .unwrap();
-    db.add_agent_message(
+    db.add_lane_message(
         "api-session-bot",
         "assistant",
         "Context packet is ready for review.",
@@ -1328,7 +1328,7 @@ fn local_api_and_mcp_manage_agent_sessions() {
         &mut db,
         &api_request(
             "GET",
-            "/v1/sessions/current?agent=api-session-bot",
+            "/v1/sessions/current?lane=api-session-bot",
             serde_json::Value::Null,
         ),
     );
@@ -1336,7 +1336,7 @@ fn local_api_and_mcp_manage_agent_sessions() {
     let current: serde_json::Value = current.body_json().unwrap();
     assert!(current[0]["session"].is_null());
 
-    db.spawn_agent("mcp-session-bot", Some("main"), false, None, None)
+    db.spawn_lane("mcp-session-bot", Some("main"), false, None, None)
         .unwrap();
     let tools = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -1371,7 +1371,7 @@ fn local_api_and_mcp_manage_agent_sessions() {
             "params": {
                 "name": "crabdb.session_start",
                 "arguments": {
-                    "agent": "mcp-session-bot",
+                    "lane": "mcp-session-bot",
                     "title": "MCP session",
                     "id": "session-mcp"
                 }
@@ -1394,7 +1394,7 @@ fn local_api_and_mcp_manage_agent_sessions() {
             "params": {
                 "name": "crabdb.session_current",
                 "arguments": {
-                    "agent": "mcp-session-bot"
+                    "lane": "mcp-session-bot"
                 }
             }
         }),
@@ -1479,10 +1479,10 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("approval-bot", Some("main"), false, None, None)
+    db.spawn_lane("approval-bot", Some("main"), false, None, None)
         .unwrap();
     let turn = db
-        .begin_agent_turn(
+        .begin_lane_turn(
             "approval-bot",
             Some("main"),
             Some("Sensitive action".to_string()),
@@ -1498,7 +1498,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
             "POST",
             "/v1/guardrails/check",
             serde_json::json!({
-                "agent": "approval-bot",
+                "lane": "approval-bot",
                 "action": "shell.exec",
                 "summary": "Run deployment smoke tests",
                 "payload": {
@@ -1512,7 +1512,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     assert_eq!(guardrail.status, 200);
     let guardrail: serde_json::Value = guardrail.body_json().unwrap();
     assert_eq!(guardrail["decision"], "approval_required");
-    assert_eq!(guardrail["agent"]["record"]["name"], "approval-bot");
+    assert_eq!(guardrail["lane"]["record"]["name"], "approval-bot");
     assert_eq!(guardrail["approval_request"]["action"], "shell.exec");
     assert!(guardrail["reasons"]
         .as_array()
@@ -1526,7 +1526,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
             "POST",
             "/v1/approvals",
             serde_json::json!({
-                "agent": "approval-bot",
+                "lane": "approval-bot",
                 "turn_id": turn_id,
                 "action": "shell.exec",
                 "summary": "Run deployment smoke tests",
@@ -1560,7 +1560,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/runs/{run_id}/resume"),
+            &format!("/v1/lane/runs/{run_id}/resume"),
             serde_json::json!({ "reviewer": "human-reviewer" }),
         ),
     );
@@ -1575,7 +1575,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &mut db,
         &api_request(
             "GET",
-            "/v1/agent/runs?agent=approval-bot&status=paused",
+            "/v1/lane/runs?lane=approval-bot&status=paused",
             serde_json::Value::Null,
         ),
     );
@@ -1590,10 +1590,10 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     let cli_run_list = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "run",
             "list",
-            "--agent",
+            "--lane",
             "approval-bot",
             "--status",
             "paused",
@@ -1609,7 +1609,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &mut db,
         &api_request(
             "GET",
-            "/v1/approvals?agent=approval-bot&status=pending",
+            "/v1/approvals?lane=approval-bot&status=pending",
             serde_json::Value::Null,
         ),
     );
@@ -1623,7 +1623,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &[
             "guardrails",
             "check",
-            "--agent",
+            "--lane",
             "approval-bot",
             "--action",
             "shell.exec",
@@ -1640,7 +1640,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         .iter()
         .any(|reason| reason["code"] == "pending_approval"));
 
-    let readiness = db.agent_readiness("approval-bot").unwrap();
+    let readiness = db.lane_readiness("approval-bot").unwrap();
     assert!(!readiness.ready);
     assert_eq!(readiness.status, "blocked");
     assert_eq!(readiness.pending_approvals.len(), 1);
@@ -1720,7 +1720,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
             "params": {
                 "name": "crabdb.run_pause",
                 "arguments": {
-                    "agent": "approval-bot",
+                    "lane": "approval-bot",
                     "reason": "handoff",
                     "summary": "Pause for coordinator review",
                     "session_id": session_id.clone(),
@@ -1751,7 +1751,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
             "params": {
                 "name": "crabdb.run_list",
                 "arguments": {
-                    "agent": "approval-bot",
+                    "lane": "approval-bot",
                     "status": "paused"
                 }
             }
@@ -1845,7 +1845,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/runs/{run_id}/resume"),
+            &format!("/v1/lane/runs/{run_id}/resume"),
             serde_json::json!({
                 "reviewer": "human-reviewer",
                 "note": "Approval accepted; continue"
@@ -1862,7 +1862,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agent/runs/{run_id}"),
+            &format!("/v1/lane/runs/{run_id}"),
             serde_json::Value::Null,
         ),
     );
@@ -1895,7 +1895,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
             "POST",
             "/v1/guardrails/check",
             serde_json::json!({
-                "agent": "approval-bot",
+                "lane": "approval-bot",
                 "action": "shell.exec",
                 "summary": "Run deployment smoke tests",
                 "payload": {
@@ -1925,7 +1925,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         &[
             "guardrails",
             "check",
-            "--agent",
+            "--lane",
             "approval-bot",
             "--action",
             "shell.exec",
@@ -1942,7 +1942,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     );
 
     let rejected = db
-        .request_agent_approval(
+        .request_lane_approval(
             "approval-bot",
             "deploy.preview",
             "Create preview deployment",
@@ -1953,7 +1953,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         .unwrap();
     let rejected_run_id = rejected.run_state.as_ref().unwrap().run_id.clone();
     let rejected_decision = db
-        .decide_agent_approval(
+        .decide_lane_approval(
             &rejected.approval.approval_id,
             "rejected",
             Some("human-reviewer".to_string()),
@@ -1963,7 +1963,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     assert_eq!(rejected_decision.run_states[0].run_id, rejected_run_id);
     assert_eq!(rejected_decision.run_states[0].status, "blocked");
     let rejected_resume = db
-        .resume_agent_run(&rejected_run_id, Some("human-reviewer".to_string()), None)
+        .resume_lane_run(&rejected_run_id, Some("human-reviewer".to_string()), None)
         .unwrap_err();
     assert!(rejected_resume.to_string().contains("cannot be resumed"));
     let rejected_guardrail = db
@@ -1981,7 +1981,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
         .iter()
         .any(|reason| reason.code == "approval_rejected"));
 
-    let details = db.show_agent_turn(&turn_id).unwrap();
+    let details = db.show_lane_turn(&turn_id).unwrap();
     assert!(details
         .events
         .iter()
@@ -2001,7 +2001,7 @@ fn local_api_and_mcp_manage_human_approval_gates() {
 }
 
 #[test]
-fn agent_trace_metadata_redacts_common_secrets() {
+fn lane_trace_metadata_redacts_common_secrets() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -2011,22 +2011,22 @@ fn agent_trace_metadata_redacts_common_secrets() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agent/turns",
+            "/v1/lane/turns",
             serde_json::json!({
-                "agent": "redaction-bot",
+                "lane": "redaction-bot",
                 "branch": "main",
                 "session_title": "Redaction smoke"
             }),
         ),
     );
     assert_eq!(turn_response.status, 201);
-    let turn: AgentTurnStartReport = turn_response.body_json().unwrap();
+    let turn: LaneTurnStartReport = turn_response.body_json().unwrap();
 
     let message_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/messages", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/messages", turn.turn.turn_id),
             serde_json::json!({
                 "role": "user",
                 "content": "Use password=hunter2 but keep token expiration logic visible."
@@ -2039,7 +2039,7 @@ fn agent_trace_metadata_redacts_common_secrets() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/events", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/events", turn.turn.turn_id),
             serde_json::json!({
                 "type": "tool_call",
                 "payload": {
@@ -2058,7 +2058,7 @@ fn agent_trace_metadata_redacts_common_secrets() {
             "POST",
             "/v1/approvals",
             serde_json::json!({
-                "agent": "redaction-bot",
+                "lane": "redaction-bot",
                 "turn_id": turn.turn.turn_id,
                 "action": "shell.exec client_secret=action-secret",
                 "summary": "Run command with api_key=summary-secret",
@@ -2088,8 +2088,8 @@ fn agent_trace_metadata_redacts_common_secrets() {
     );
     assert_eq!(decision_response.status, 200);
 
-    let turn_details = db.show_agent_turn(&turn.turn.turn_id).unwrap();
-    let approval = db.show_agent_approval(approval_id).unwrap();
+    let turn_details = db.show_lane_turn(&turn.turn.turn_id).unwrap();
+    let approval = db.show_lane_approval(approval_id).unwrap();
     let serialized = serde_json::to_string(&(turn_details, approval)).unwrap();
     for secret in [
         "hunter2",
@@ -2111,14 +2111,14 @@ fn agent_trace_metadata_redacts_common_secrets() {
 }
 
 #[test]
-fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
+fn lane_trace_events_are_queryable_across_cli_api_and_mcp() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let turn = db
-        .begin_agent_turn(
+        .begin_lane_turn(
             "trace-bot",
             Some("main"),
             Some("Trace inspection".to_string()),
@@ -2127,7 +2127,7 @@ fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
         .unwrap();
     let turn_id = turn.turn.turn_id.clone();
     let session_id = turn.session.session_id.clone();
-    db.add_agent_turn_event(
+    db.add_lane_turn_event(
         &turn_id,
         "tool_call",
         Some(serde_json::json!({
@@ -2138,7 +2138,7 @@ fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
         None,
     )
     .unwrap();
-    db.add_agent_turn_event(
+    db.add_lane_turn_event(
         &turn_id,
         "guardrail",
         Some(serde_json::json!({
@@ -2151,7 +2151,7 @@ fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
     .unwrap();
 
     let sdk_events = db
-        .list_agent_events(Some("trace-bot"), None, None, Some("tool_call"), 10)
+        .list_lane_events(Some("trace-bot"), None, None, Some("tool_call"), 10)
         .unwrap();
     assert_eq!(sdk_events.len(), 1);
     assert_eq!(sdk_events[0].turn_id.as_deref(), Some(turn_id.as_str()));
@@ -2164,7 +2164,7 @@ fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
         &mut db,
         &api_request(
             "GET",
-            "/v1/agent/events?agent=trace-bot&type=guardrail&limit=10",
+            "/v1/lane/events?lane=trace-bot&type=guardrail&limit=10",
             serde_json::Value::Null,
         ),
     );
@@ -2219,7 +2219,7 @@ fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
     let cli_events = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "events",
             "--session",
             &session_id,
@@ -2234,14 +2234,14 @@ fn agent_trace_events_are_queryable_across_cli_api_and_mcp() {
 }
 
 #[test]
-fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
+fn lane_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let turn = db
-        .begin_agent_turn(
+        .begin_lane_turn(
             "span-bot",
             Some("main"),
             Some("Trace span inspection".to_string()),
@@ -2251,9 +2251,9 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     let turn_id = turn.turn.turn_id.clone();
 
     let root = db
-        .start_agent_trace_span(
+        .start_lane_trace_span(
             &turn_id,
-            "agent",
+            "lane",
             "span-bot turn",
             None,
             None,
@@ -2273,7 +2273,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{turn_id}/spans"),
+            &format!("/v1/lane/turns/{turn_id}/spans"),
             serde_json::json!({
                 "type": "tool_call",
                 "name": "shell.exec",
@@ -2295,7 +2295,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/spans/{child_span_id}/end"),
+            &format!("/v1/lane/spans/{child_span_id}/end"),
             serde_json::json!({
                 "status": "completed",
                 "result": {
@@ -2313,7 +2313,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
     let child_span_event_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM agent_trace_span_events WHERE span_id = ?1",
+            "SELECT COUNT(*) FROM lane_trace_span_events WHERE span_id = ?1",
             [&child_span_id],
             |row| row.get(0),
         )
@@ -2321,7 +2321,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     assert_eq!(child_span_event_count, 2);
     let root_span_event_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM agent_trace_span_events WHERE span_id = ?1",
+            "SELECT COUNT(*) FROM lane_trace_span_events WHERE span_id = ?1",
             [&root_span_id],
             |row| row.get(0),
         )
@@ -2410,7 +2410,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     let cli_start = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "trace",
             "start",
             &turn_id,
@@ -2430,7 +2430,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     let cli_end = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "trace",
             "end",
             &cli_span_id,
@@ -2444,9 +2444,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
 
     let cli_list = run_crabdb_json(
         temp.path(),
-        &[
-            "agent", "trace", "list", "--turn", &turn_id, "--limit", "10",
-        ],
+        &["lane", "trace", "list", "--turn", &turn_id, "--limit", "10"],
     );
     assert!(cli_list
         .as_array()
@@ -2456,7 +2454,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     let cli_summary = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "trace",
             "summary",
             "--turn",
@@ -2483,7 +2481,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agent/spans?trace={trace_id}&limit=10"),
+            &format!("/v1/lane/spans?trace={trace_id}&limit=10"),
             serde_json::Value::Null,
         ),
     );
@@ -2495,7 +2493,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agent/spans/summary?trace={trace_id}&slowest=3"),
+            &format!("/v1/lane/spans/summary?trace={trace_id}&slowest=3"),
             serde_json::Value::Null,
         ),
     );
@@ -2550,14 +2548,14 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     );
 
     let spans = db
-        .list_agent_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 10)
+        .list_lane_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 10)
         .unwrap();
     assert!(spans.iter().any(|span| span.span_id == root_span_id));
     assert!(spans
         .iter()
         .any(|span| span.parent_span_id.as_deref() == Some(root_span_id.as_str())));
     let summary = db
-        .summarize_agent_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 5)
+        .summarize_lane_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 5)
         .unwrap();
     assert_eq!(summary.span_count, 4);
     assert_eq!(summary.open_span_count, 1);
@@ -2568,17 +2566,17 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
         .iter()
         .any(|count| count.name == "evaluation" && count.count == 1));
 
-    conn.execute("DELETE FROM agent_trace_span_events", [])
+    conn.execute("DELETE FROM lane_trace_span_events", [])
         .unwrap();
     let fallback_spans = db
-        .list_agent_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 10)
+        .list_lane_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 10)
         .unwrap();
     assert_eq!(fallback_spans.len(), 4);
     assert!(fallback_spans
         .iter()
         .any(|span| span.span_id == child_span_id));
     let fallback_summary = db
-        .summarize_agent_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 5)
+        .summarize_lane_trace_spans(None, None, Some(&turn_id), Some(&trace_id), 5)
         .unwrap();
     assert_eq!(fallback_summary.span_count, 4);
     assert_eq!(fallback_summary.failed_span_count, 1);
@@ -2587,7 +2585,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     assert_eq!(rebuild.errors, Vec::<String>::new());
     let restored_span_event_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM agent_trace_span_events WHERE trace_id = ?1",
+            "SELECT COUNT(*) FROM lane_trace_span_events WHERE trace_id = ?1",
             [&trace_id],
             |row| row.get(0),
         )
@@ -2595,7 +2593,7 @@ fn agent_trace_spans_are_parentable_redacted_and_available_across_surfaces() {
     assert_eq!(restored_span_event_count, 7);
 
     let events = db
-        .list_agent_events(None, None, Some(&turn_id), None, 50)
+        .list_lane_events(None, None, Some(&turn_id), None, 50)
         .unwrap();
     let serialized = serde_json::to_string(&(
         spans,
@@ -2644,7 +2642,7 @@ fn hardcoded_private_key_denylist_is_not_recorded() {
 }
 
 #[test]
-fn local_agent_http_api_records_turn_messages_and_patches() {
+fn local_lane_http_api_records_turn_messages_and_patches() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -2660,16 +2658,16 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agent/turns",
+            "/v1/lane/turns",
             serde_json::json!({
-                "agent": "api-agent",
+                "lane": "api-lane",
                 "branch": "main",
                 "session_title": "API smoke"
             }),
         ),
     );
     assert_eq!(turn_response.status, 201);
-    let turn: AgentTurnStartReport = turn_response.body_json().unwrap();
+    let turn: LaneTurnStartReport = turn_response.body_json().unwrap();
     assert_eq!(turn.session.title.as_deref(), Some("API smoke"));
     assert_eq!(turn.turn.status, "started");
 
@@ -2677,7 +2675,7 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/messages", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/messages", turn.turn.turn_id),
             serde_json::json!({
                 "role": "user",
                 "content": "Add a small API file."
@@ -2685,7 +2683,7 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         ),
     );
     assert_eq!(message_response.status, 201);
-    let message: AgentMessageReport = message_response.body_json().unwrap();
+    let message: LaneMessageReport = message_response.body_json().unwrap();
     assert_eq!(
         message.session_id.as_deref(),
         Some(turn.session.session_id.as_str())
@@ -2695,7 +2693,7 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/events", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/events", turn.turn.turn_id),
             serde_json::json!({
                 "type": "tool_call",
                 "payload": {
@@ -2708,7 +2706,7 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         ),
     );
     assert_eq!(event_response.status, 201);
-    let event: AgentTurnEventReport = event_response.body_json().unwrap();
+    let event: LaneTurnEventReport = event_response.body_json().unwrap();
     assert_eq!(event.event.event_type, "tool_call");
     assert_eq!(event.event.message_id, Some(message.message_id.clone()));
     assert_eq!(
@@ -2720,7 +2718,7 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/patches", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/patches", turn.turn.turn_id),
             serde_json::json!({
                 "message": "add API file",
                 "files": [
@@ -2734,7 +2732,7 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         ),
     );
     assert_eq!(patch_response.status, 200);
-    let patch: AgentPatchReport = patch_response.body_json().unwrap();
+    let patch: LanePatchReport = patch_response.body_json().unwrap();
     assert_eq!(patch.changed_paths.len(), 1);
     assert_eq!(patch.changed_paths[0].path, "src/api.rs");
 
@@ -2742,12 +2740,12 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agent/turns/{}", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}", turn.turn.turn_id),
             serde_json::Value::Null,
         ),
     );
     assert_eq!(details_response.status, 200);
-    let details: AgentTurnDetails = details_response.body_json().unwrap();
+    let details: LaneTurnDetails = details_response.body_json().unwrap();
     assert_eq!(details.turn.turn_id, turn.turn.turn_id);
     assert_eq!(details.messages.len(), 2);
     assert_eq!(details.operations.len(), 1);
@@ -2764,19 +2762,19 @@ fn local_agent_http_api_records_turn_messages_and_patches() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/end", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/end", turn.turn.turn_id),
             serde_json::json!({ "status": "completed" }),
         ),
     );
     assert_eq!(end_response.status, 200);
-    let ended: AgentTurnEndReport = end_response.body_json().unwrap();
+    let ended: LaneTurnEndReport = end_response.body_json().unwrap();
     assert_eq!(ended.turn.status, "completed");
     assert_eq!(ended.turn.after_change, Some(patch.operation));
 
-    let diff = db.diff_agent("api-agent", false).unwrap();
+    let diff = db.diff_lane("api-lane", false).unwrap();
     assert!(diff.files.iter().any(|file| file.path == "src/api.rs"));
 
-    let session = db.show_agent_session(&turn.session.session_id).unwrap();
+    let session = db.show_lane_session(&turn.session.session_id).unwrap();
     assert_eq!(session.messages.len(), 2);
     assert_eq!(session.operations.len(), 1);
     assert!(session
@@ -2798,22 +2796,22 @@ fn local_api_and_mcp_patch_payloads_respect_ignore_policy() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agent/turns",
+            "/v1/lane/turns",
             serde_json::json!({
-                "agent": "privacy-api",
+                "lane": "privacy-api",
                 "branch": "main",
                 "session_title": "Privacy policy"
             }),
         ),
     );
     assert_eq!(turn_response.status, 201);
-    let turn: AgentTurnStartReport = turn_response.body_json().unwrap();
+    let turn: LaneTurnStartReport = turn_response.body_json().unwrap();
 
     let blocked = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agent/turns/{}/patches", turn.turn.turn_id),
+            &format!("/v1/lane/turns/{}/patches", turn.turn.turn_id),
             serde_json::json!({
                 "message": "blocked ignored write",
                 "files": [
@@ -2884,7 +2882,7 @@ fn local_api_and_mcp_patch_payloads_respect_ignore_policy() {
         "host-secret.txt"
     );
 
-    let details = db.show_agent_turn(&turn.turn.turn_id).unwrap();
+    let details = db.show_lane_turn(&turn.turn.turn_id).unwrap();
     let patch_event = details
         .events
         .iter()
@@ -2897,7 +2895,7 @@ fn local_api_and_mcp_patch_payloads_respect_ignore_policy() {
 }
 
 #[test]
-fn local_agent_http_api_manages_agent_branch_lifecycle() {
+fn local_lane_http_api_manages_lane_branch_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -2915,9 +2913,9 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agents",
+            "/v1/lanes",
             serde_json::json!({
-                "name": "api-branch-agent",
+                "name": "api-branch-lane",
                 "from_ref": "main",
                 "materialize": true
             }),
@@ -2925,40 +2923,37 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
     );
     assert_eq!(spawn_response.status, 201);
     let spawned: serde_json::Value = spawn_response.body_json().unwrap();
-    let agent_id = spawned["agent_id"].as_str().unwrap().to_string();
-    assert_eq!(spawned["ref_name"], "refs/agents/api-branch-agent");
+    let lane_id = spawned["lane_id"].as_str().unwrap().to_string();
+    assert_eq!(spawned["ref_name"], "refs/lanes/api-branch-lane");
     let workdir = spawned["workdir"].as_str().unwrap().to_string();
 
-    let agents_response = crabdb::server::handle_http_request(
+    let lanes_response = crabdb::server::handle_http_request(
         &mut db,
-        &api_request("GET", "/v1/agents", serde_json::Value::Null),
+        &api_request("GET", "/v1/lanes", serde_json::Value::Null),
     );
-    assert_eq!(agents_response.status, 200);
-    let agents: serde_json::Value = agents_response.body_json().unwrap();
-    assert_eq!(agents.as_array().unwrap().len(), 1);
-    assert_eq!(agents[0]["record"]["name"], "api-branch-agent");
-    assert_eq!(
-        agents[0]["branch"]["ref_name"],
-        "refs/agents/api-branch-agent"
-    );
+    assert_eq!(lanes_response.status, 200);
+    let lanes: serde_json::Value = lanes_response.body_json().unwrap();
+    assert_eq!(lanes.as_array().unwrap().len(), 1);
+    assert_eq!(lanes[0]["record"]["name"], "api-branch-lane");
+    assert_eq!(lanes[0]["branch"]["ref_name"], "refs/lanes/api-branch-lane");
 
-    let agent_status_response = crabdb::server::handle_http_request(
+    let lane_status_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agents/{agent_id}/status"),
+            &format!("/v1/lanes/{lane_id}/status"),
             serde_json::Value::Null,
         ),
     );
-    assert_eq!(agent_status_response.status, 200);
-    let agent_status: serde_json::Value = agent_status_response.body_json().unwrap();
-    assert_eq!(agent_status["agent"]["record"]["name"], "api-branch-agent");
+    assert_eq!(lane_status_response.status, 200);
+    let lane_status: serde_json::Value = lane_status_response.body_json().unwrap();
+    assert_eq!(lane_status["lane"]["record"]["name"], "api-branch-lane");
 
     let patch_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{agent_id}/patches"),
+            &format!("/v1/lanes/{lane_id}/patches"),
             serde_json::json!({
                 "message": "add API file",
                 "files": [
@@ -2972,8 +2967,8 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         ),
     );
     assert_eq!(patch_response.status, 200);
-    let patch: AgentPatchReport = patch_response.body_json().unwrap();
-    assert_eq!(patch.agent_id, agent_id);
+    let patch: LanePatchReport = patch_response.body_json().unwrap();
+    assert_eq!(patch.lane_id, lane_id);
     assert_eq!(patch.changed_paths[0].path, "src/api.rs");
     assert_eq!(
         fs::read_to_string(std::path::Path::new(&workdir).join("src/api.rs")).unwrap(),
@@ -2989,7 +2984,7 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{agent_id}/sync-workdir"),
+            &format!("/v1/lanes/{lane_id}/sync-workdir"),
             serde_json::json!({}),
         ),
     );
@@ -2999,7 +2994,7 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{agent_id}/sync-workdir"),
+            &format!("/v1/lanes/{lane_id}/sync-workdir"),
             serde_json::json!({ "force": true }),
         ),
     );
@@ -3015,7 +3010,7 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{agent_id}/tests"),
+            &format!("/v1/lanes/{lane_id}/tests"),
             serde_json::json!({
                 "command": ["sh", "-c", "printf api-test"],
                 "timeout_secs": 5
@@ -3031,7 +3026,7 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agents/{agent_id}/diff?patch=true"),
+            &format!("/v1/lanes/{lane_id}/diff?patch=true"),
             serde_json::Value::Null,
         ),
     );
@@ -3047,15 +3042,15 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agents/{agent_id}/contribution?limit=5"),
+            &format!("/v1/lanes/{lane_id}/contribution?limit=5"),
             serde_json::Value::Null,
         ),
     );
     assert_eq!(contribution_response.status, 200);
     let contribution: serde_json::Value = contribution_response.body_json().unwrap();
     assert_eq!(
-        contribution["status"]["agent"]["record"]["name"],
-        "api-branch-agent"
+        contribution["status"]["lane"]["record"]["name"],
+        "api-branch-lane"
     );
     assert!(contribution["status"]["changed_paths"]
         .as_array()
@@ -3076,24 +3071,24 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
 
     let cli_contribution = run_crabdb_json(
         temp.path(),
-        &["agent", "contribution", "api-branch-agent", "--limit", "5"],
+        &["lane", "contribution", "api-branch-lane", "--limit", "5"],
     );
     assert_eq!(
-        cli_contribution["status"]["agent"]["record"]["agent_id"],
-        agent_id
+        cli_contribution["status"]["lane"]["record"]["lane_id"],
+        lane_id
     );
 
     let review_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agents/{agent_id}/review?limit=5"),
+            &format!("/v1/lanes/{lane_id}/review?limit=5"),
             serde_json::Value::Null,
         ),
     );
     assert_eq!(review_response.status, 200);
     let review: serde_json::Value = review_response.body_json().unwrap();
-    assert_eq!(review["agent"]["record"]["name"], "api-branch-agent");
+    assert_eq!(review["lane"]["record"]["name"], "api-branch-lane");
     assert_eq!(review["readiness"]["ready"], true);
     assert!(review["changed_paths"]
         .as_array()
@@ -3120,20 +3115,20 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
 
     let cli_review = run_crabdb_json(
         temp.path(),
-        &["agent", "review", "api-branch-agent", "--limit", "5"],
+        &["lane", "review", "api-branch-lane", "--limit", "5"],
     );
-    assert_eq!(cli_review["agent"]["record"]["agent_id"], agent_id);
+    assert_eq!(cli_review["lane"]["record"]["lane_id"], lane_id);
     assert_eq!(cli_review["readiness"]["ready"], true);
 
     let cli_review_text = Command::new(crabdb_bin())
         .arg("--workspace")
         .arg(temp.path())
-        .args(["agent", "review", "api-branch-agent", "--limit", "5"])
+        .args(["lane", "review", "api-branch-lane", "--limit", "5"])
         .output()
         .unwrap();
     assert!(cli_review_text.status.success());
     let cli_review_stdout = String::from_utf8_lossy(&cli_review_text.stdout);
-    assert!(cli_review_stdout.contains("Agent review: api-branch-agent"));
+    assert!(cli_review_stdout.contains("Lane review: api-branch-lane"));
     assert!(cli_review_stdout.contains("Evidence:"));
     assert!(cli_review_stdout.contains("Next steps:"));
 
@@ -3141,13 +3136,13 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agents/{agent_id}/readiness"),
+            &format!("/v1/lanes/{lane_id}/readiness"),
             serde_json::Value::Null,
         ),
     );
     assert_eq!(readiness_response.status, 200);
     let readiness: serde_json::Value = readiness_response.body_json().unwrap();
-    assert_eq!(readiness["agent"]["record"]["name"], "api-branch-agent");
+    assert_eq!(readiness["lane"]["record"]["name"], "api-branch-lane");
     assert_eq!(readiness["ready"], true);
     assert!(readiness["blockers"].as_array().unwrap().is_empty());
     assert_eq!(readiness["latest_test"]["success"], true);
@@ -3157,21 +3152,21 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         .iter()
         .any(|issue| issue["code"] == "missing_latest_eval"));
 
-    let cli_readiness = run_crabdb_json(temp.path(), &["agent", "readiness", "api-branch-agent"]);
-    assert_eq!(cli_readiness["agent"]["record"]["agent_id"], agent_id);
+    let cli_readiness = run_crabdb_json(temp.path(), &["lane", "readiness", "api-branch-lane"]);
+    assert_eq!(cli_readiness["lane"]["record"]["lane_id"], lane_id);
     assert_eq!(cli_readiness["ready"], true);
 
     let handoff_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/agents/{agent_id}/handoff?limit=5"),
+            &format!("/v1/lanes/{lane_id}/handoff?limit=5"),
             serde_json::Value::Null,
         ),
     );
     assert_eq!(handoff_response.status, 200);
     let handoff: serde_json::Value = handoff_response.body_json().unwrap();
-    assert_eq!(handoff["agent"]["record"]["name"], "api-branch-agent");
+    assert_eq!(handoff["lane"]["record"]["name"], "api-branch-lane");
     assert_eq!(handoff["readiness"]["ready"], true);
     assert!(handoff["current_session"].is_null());
     assert!(handoff["recent_operations"]
@@ -3192,16 +3187,16 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
 
     let cli_handoff = run_crabdb_json(
         temp.path(),
-        &["agent", "handoff", "api-branch-agent", "--limit", "5"],
+        &["lane", "handoff", "api-branch-lane", "--limit", "5"],
     );
-    assert_eq!(cli_handoff["agent"]["record"]["agent_id"], agent_id);
+    assert_eq!(cli_handoff["lane"]["record"]["lane_id"], lane_id);
     assert_eq!(cli_handoff["readiness"]["ready"], true);
 
     let remove_dirty_response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "DELETE",
-            &format!("/v1/agents/{agent_id}"),
+            &format!("/v1/lanes/{lane_id}"),
             serde_json::Value::Null,
         ),
     );
@@ -3211,16 +3206,16 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-agent",
+            "/v1/branches/main/merge-lane",
             serde_json::json!({
-                "agent_id": agent_id,
+                "lane_id": lane_id,
                 "strategy": "line_id_aware"
             }),
         ),
     );
     assert_eq!(merge_response.status, 200);
     let merge: serde_json::Value = merge_response.body_json().unwrap();
-    assert_eq!(merge["source_ref"], "refs/agents/api-branch-agent");
+    assert_eq!(merge["source_ref"], "refs/lanes/api-branch-lane");
     assert_eq!(merge["target_ref"], "refs/branches/main");
     assert!(merge["changed_paths"]
         .as_array()
@@ -3235,24 +3230,21 @@ fn local_agent_http_api_manages_agent_branch_lifecycle() {
         &mut db,
         &api_request(
             "DELETE",
-            &format!("/v1/agents/{agent_id}"),
+            &format!("/v1/lanes/{lane_id}"),
             serde_json::Value::Null,
         ),
     );
     assert_eq!(remove_response.status, 200);
     let removed: serde_json::Value = remove_response.body_json().unwrap();
-    assert_eq!(removed["agent_id"], agent_id);
+    assert_eq!(removed["lane_id"], lane_id);
     assert_eq!(removed["forced"], false);
     assert_eq!(removed["removed_workdir"], workdir);
     assert!(!std::path::Path::new(&workdir).exists());
-    assert_eq!(
-        db.agent_details(&agent_id).unwrap().branch.status,
-        "removed"
-    );
+    assert_eq!(db.lane_details(&lane_id).unwrap().branch.status, "removed");
 }
 
 #[test]
-fn local_agent_http_api_can_require_bearer_token() {
+fn local_lane_http_api_can_require_bearer_token() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -3271,8 +3263,8 @@ fn local_agent_http_api_can_require_bearer_token() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agent/turns",
-            serde_json::json!({ "agent": "secure-agent", "branch": "main" }),
+            "/v1/lane/turns",
+            serde_json::json!({ "lane": "secure-lane", "branch": "main" }),
         ),
         &auth,
     );
@@ -3282,9 +3274,9 @@ fn local_agent_http_api_can_require_bearer_token() {
         &mut db,
         &api_request_with_headers(
             "POST",
-            "/v1/agent/turns",
+            "/v1/lane/turns",
             &[("Authorization", "Bearer wrong-token")],
-            serde_json::json!({ "agent": "secure-agent", "branch": "main" }),
+            serde_json::json!({ "lane": "secure-lane", "branch": "main" }),
         ),
         &auth,
     );
@@ -3294,23 +3286,23 @@ fn local_agent_http_api_can_require_bearer_token() {
         &mut db,
         &api_request_with_headers(
             "POST",
-            "/v1/agent/turns",
+            "/v1/lane/turns",
             &[("Authorization", "Bearer secret-token")],
-            serde_json::json!({ "agent": "secure-agent", "branch": "main" }),
+            serde_json::json!({ "lane": "secure-lane", "branch": "main" }),
         ),
         &auth,
     );
     assert_eq!(ok.status, 201);
-    let turn: AgentTurnStartReport = ok.body_json().unwrap();
-    assert!(turn.turn.agent_id.starts_with("agent_"));
+    let turn: LaneTurnStartReport = ok.body_json().unwrap();
+    assert!(turn.turn.lane_id.starts_with("lane_"));
 
     let second = crabdb::server::handle_http_request_with_auth(
         &mut db,
         &api_request_with_headers(
             "POST",
-            "/v1/agent/turns",
+            "/v1/lane/turns",
             &[("X-CrabDB-Token", "secret-token")],
-            serde_json::json!({ "agent": "other-secure-agent", "branch": "main" }),
+            serde_json::json!({ "lane": "other-secure-lane", "branch": "main" }),
         ),
         &auth,
     );
@@ -3318,7 +3310,7 @@ fn local_agent_http_api_can_require_bearer_token() {
 }
 
 #[test]
-fn cli_daemon_url_routes_hot_agent_commands() {
+fn cli_daemon_url_routes_hot_lane_commands() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     fs::write(temp.path().join("NOTES.md"), "notes\n").unwrap();
@@ -3352,7 +3344,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "spawn",
             "rpc-bot",
             "--from",
@@ -3360,35 +3352,28 @@ fn cli_daemon_url_routes_hot_agent_commands() {
             "--no-materialize",
         ],
     );
-    assert_eq!(spawn["ref_name"], "refs/agents/rpc-bot");
+    assert_eq!(spawn["ref_name"], "refs/lanes/rpc-bot");
     assert!(spawn["workdir"].is_null());
 
-    let list = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "list"]);
+    let list = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "list"]);
     assert!(list
         .as_array()
         .unwrap()
         .iter()
-        .any(|agent| agent["record"]["name"] == "rpc-bot"));
+        .any(|lane| lane["record"]["name"] == "rpc-bot"));
 
-    let show = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "show", "rpc-bot"]);
+    let show = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "show", "rpc-bot"]);
     assert_eq!(show["record"]["name"], "rpc-bot");
-    assert_eq!(show["branch"]["ref_name"], "refs/agents/rpc-bot");
+    assert_eq!(show["branch"]["ref_name"], "refs/lanes/rpc-bot");
 
     let no_workdir =
-        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "workdir", "rpc-bot"]);
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "workdir", "rpc-bot"]);
     assert!(no_workdir["workdir"].is_null());
 
     let claim = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &[
-            "agent",
-            "claim",
-            "rpc-bot",
-            "README.md",
-            "--ttl-secs",
-            "120",
-        ],
+        &["lane", "claim", "rpc-bot", "README.md", "--ttl-secs", "120"],
     );
     assert_eq!(claim["claimed"], true);
     assert_eq!(claim["path"], "README.md");
@@ -3438,7 +3423,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let session_list = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["session", "list", "--agent", "rpc-bot"],
+        &["session", "list", "--lane", "rpc-bot"],
     );
     assert!(session_list
         .as_array()
@@ -3483,7 +3468,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         &[
             "approvals",
             "list",
-            "--agent",
+            "--lane",
             "rpc-bot",
             "--status",
             "pending",
@@ -3533,7 +3518,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let patch = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "apply-patch", "rpc-bot", "--patch", &patch_path],
+        &["lane", "apply-patch", "rpc-bot", "--patch", &patch_path],
     );
     assert!(patch["changed_paths"]
         .as_array()
@@ -3545,11 +3530,11 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let read = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "read", "rpc-bot", "README.md"],
+        &["lane", "read", "rpc-bot", "README.md"],
     );
     assert_eq!(read["content"], "hello\nrpc\n");
 
-    let diff = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "diff", "rpc-bot"]);
+    let diff = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "diff", "rpc-bot"]);
     assert!(diff["files"]
         .as_array()
         .unwrap()
@@ -3573,9 +3558,9 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         .iter()
         .any(|operation| operation["message"] == "daemon CLI patch"));
 
-    let agent_timeline =
-        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "timeline", "rpc-bot"]);
-    assert!(agent_timeline
+    let lane_timeline =
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "timeline", "rpc-bot"]);
+    assert!(lane_timeline
         .as_array()
         .unwrap()
         .iter()
@@ -3583,7 +3568,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let timeline = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["timeline", "--agent", "rpc-bot", "--limit", "20"],
+        &["timeline", "--lane", "rpc-bot", "--limit", "20"],
     );
     assert!(timeline
         .as_array()
@@ -3592,18 +3577,18 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         .any(|entry| entry["message"] == "daemon CLI patch"));
 
     let readiness =
-        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "readiness", "rpc-bot"]);
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "readiness", "rpc-bot"]);
     assert_eq!(readiness["ready"], true);
 
     let contribution = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "contribution", "rpc-bot"],
+        &["lane", "contribution", "rpc-bot"],
     );
-    assert_eq!(contribution["status"]["agent"]["record"]["name"], "rpc-bot");
+    assert_eq!(contribution["status"]["lane"]["record"]["name"], "rpc-bot");
 
-    let review = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "review", "rpc-bot"]);
-    assert_eq!(review["agent"]["record"]["name"], "rpc-bot");
+    let review = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "review", "rpc-bot"]);
+    assert_eq!(review["lane"]["record"]["name"], "rpc-bot");
     assert_eq!(review["readiness"]["ready"], true);
     assert!(review["recent_operations"]
         .as_array()
@@ -3611,25 +3596,25 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         .iter()
         .any(|operation| operation["message"] == "daemon CLI patch"));
 
-    let gates = run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "gates", "rpc-bot"]);
-    assert_eq!(gates["agent"]["record"]["name"], "rpc-bot");
+    let gates = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "gates", "rpc-bot"]);
+    assert_eq!(gates["lane"]["record"]["name"], "rpc-bot");
 
     let events = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "events", "--agent", "rpc-bot"],
+        &["lane", "events", "--lane", "rpc-bot"],
     );
     assert!(events
         .as_array()
         .unwrap()
         .iter()
-        .any(|event| event["agent_id"] == spawn["agent_id"]));
+        .any(|event| event["lane_id"] == spawn["lane_id"]));
 
     let turn = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "turn",
             "start",
             "rpc-bot",
@@ -3645,7 +3630,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "turn",
             "message",
             &turn_id,
@@ -3661,7 +3646,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "turn",
             "event",
             &turn_id,
@@ -3690,7 +3675,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "turn",
             "apply-patch",
             &turn_id,
@@ -3708,7 +3693,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let turn_details = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "turn", "show", &turn_id],
+        &["lane", "turn", "show", &turn_id],
     );
     assert_eq!(turn_details["turn"]["turn_id"].as_str().unwrap(), turn_id);
     assert!(turn_details["messages"]
@@ -3726,7 +3711,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "trace",
             "start",
             &turn_id,
@@ -3746,16 +3731,14 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let trace_end = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "trace", "end", &span_id, "--status", "completed"],
+        &["lane", "trace", "end", &span_id, "--status", "completed"],
     );
     assert_eq!(trace_end["span"]["status"], "completed");
 
     let trace_list = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &[
-            "agent", "trace", "list", "--turn", &turn_id, "--limit", "10",
-        ],
+        &["lane", "trace", "list", "--turn", &turn_id, "--limit", "10"],
     );
     assert!(trace_list
         .as_array()
@@ -3766,7 +3749,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let trace_summary = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "trace", "summary", "--trace-id", &trace_id],
+        &["lane", "trace", "summary", "--trace-id", &trace_id],
     );
     assert_eq!(trace_summary["trace_id"].as_str().unwrap(), trace_id);
     assert_eq!(trace_summary["span_count"], 1);
@@ -3775,7 +3758,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let trace_show = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "trace", "show", &span_id],
+        &["lane", "trace", "show", &span_id],
     );
     assert_eq!(trace_show["span_id"].as_str().unwrap(), span_id);
     assert_eq!(trace_show["trace_id"].as_str().unwrap(), trace_id);
@@ -3783,13 +3766,12 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let turn_end = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "turn", "end", &turn_id, "--status", "completed"],
+        &["lane", "turn", "end", &turn_id, "--status", "completed"],
     );
     assert_eq!(turn_end["turn"]["status"], "completed");
 
-    let handoff =
-        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "handoff", "rpc-bot"]);
-    assert_eq!(handoff["agent"]["record"]["name"], "rpc-bot");
+    let handoff = run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "handoff", "rpc-bot"]);
+    assert_eq!(handoff["lane"]["record"]["name"], "rpc-bot");
 
     fs::write(
         temp.path().join("NOTES.md"),
@@ -3820,7 +3802,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         temp.path(),
         &daemon_url,
         &[
-            "agent",
+            "lane",
             "spawn",
             "mat-rpc",
             "--from",
@@ -3830,7 +3812,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     );
     let materialized_workdir = materialized["workdir"].as_str().unwrap();
     let materialized_workdir_report =
-        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "workdir", "mat-rpc"]);
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "workdir", "mat-rpc"]);
     assert_eq!(
         materialized_workdir_report["workdir"].as_str().unwrap(),
         materialized_workdir
@@ -3843,7 +3825,7 @@ fn cli_daemon_url_routes_hot_agent_commands() {
     let recorded = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["agent", "record", "mat-rpc", "-m", "daemon CLI record"],
+        &["lane", "record", "mat-rpc", "-m", "daemon CLI record"],
     );
     assert!(recorded["operation"].as_str().is_some());
     assert!(recorded["changed_paths"]
@@ -3852,13 +3834,13 @@ fn cli_daemon_url_routes_hot_agent_commands() {
         .iter()
         .any(|path| path["path"] == "README.md"));
     let materialized_status =
-        run_crabdb_json_daemon(temp.path(), &daemon_url, &["agent", "status", "mat-rpc"]);
+        run_crabdb_json_daemon(temp.path(), &daemon_url, &["lane", "status", "mat-rpc"]);
     assert_eq!(materialized_status["workdir_state"], "Clean");
 
     let merge = run_crabdb_json_daemon(
         temp.path(),
         &daemon_url,
-        &["merge-agent", "rpc-bot", "--into", "main", "--dry-run"],
+        &["merge-lane", "rpc-bot", "--into", "main", "--dry-run"],
     );
     assert_eq!(merge["dry_run"], true);
     assert!(merge["changed_paths"]
@@ -3927,17 +3909,15 @@ fn local_api_and_cli_export_openapi_contract() {
     let cli = run_crabdb_json(temp.path(), &["api", "openapi"]);
     assert_eq!(cli["openapi"], "3.1.0");
     assert!(cli["paths"].get("/v1/openapi.json").is_some());
-    assert!(cli["paths"]["/v1/agents"]["get"].is_object());
-    assert!(cli["paths"]["/v1/agents/{agent_or_id}"]["delete"].is_object());
+    assert!(cli["paths"]["/v1/lanes"]["get"].is_object());
+    assert!(cli["paths"]["/v1/lanes/{lane_or_id}"]["delete"].is_object());
     assert!(cli["paths"]
-        .get("/v1/agents/{agent_or_id}/read-file")
+        .get("/v1/lanes/{lane_or_id}/read-file")
         .is_some());
-    assert!(cli["components"]["schemas"]["AgentReadFileRequest"].is_object());
-    assert!(cli["paths"].get("/v1/agent/events").is_some());
-    assert!(cli["paths"].get("/v1/agent/spans").is_some());
-    assert!(cli["paths"]
-        .get("/v1/agent/turns/{turn_id}/spans")
-        .is_some());
+    assert!(cli["components"]["schemas"]["LaneReadFileRequest"].is_object());
+    assert!(cli["paths"].get("/v1/lane/events").is_some());
+    assert!(cli["paths"].get("/v1/lane/spans").is_some());
+    assert!(cli["paths"].get("/v1/lane/turns/{turn_id}/spans").is_some());
     assert_eq!(
         cli["paths"]["/v1/health"]["get"]["security"]
             .as_array()
@@ -3974,7 +3954,7 @@ fn local_api_and_cli_export_openapi_contract() {
     );
     assert_eq!(response.status, 200);
     let api: serde_json::Value = response.body_json().unwrap();
-    assert!(api["paths"]["/v1/agent/turns/{turn_id}/patches"]["post"]["requestBody"].is_object());
+    assert!(api["paths"]["/v1/lane/turns/{turn_id}/patches"]["post"]["requestBody"].is_object());
 
     let auth = crabdb::server::ServerAuth::bearer("secret-token").unwrap();
     let missing = crabdb::server::handle_http_request_with_auth(
@@ -3998,7 +3978,7 @@ fn local_api_and_cli_export_openapi_contract() {
 }
 
 #[test]
-fn agent_turn_cli_tracks_events_and_closeout() {
+fn lane_turn_cli_tracks_events_and_closeout() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -4006,14 +3986,7 @@ fn agent_turn_cli_tracks_events_and_closeout() {
     let started = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
-            "turn",
-            "start",
-            "cli-agent",
-            "--from",
-            "main",
-            "--title",
-            "CLI turn",
+            "lane", "turn", "start", "cli-lane", "--from", "main", "--title", "CLI turn",
         ],
     );
     let turn_id = started["turn"]["turn_id"].as_str().unwrap().to_string();
@@ -4022,7 +3995,7 @@ fn agent_turn_cli_tracks_events_and_closeout() {
     let message = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "turn",
             "message",
             &turn_id,
@@ -4038,7 +4011,7 @@ fn agent_turn_cli_tracks_events_and_closeout() {
     let event = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "turn",
             "event",
             &turn_id,
@@ -4065,7 +4038,7 @@ fn agent_turn_cli_tracks_events_and_closeout() {
     let patch = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "turn",
             "apply-patch",
             &turn_id,
@@ -4075,7 +4048,7 @@ fn agent_turn_cli_tracks_events_and_closeout() {
     );
     assert_eq!(patch["changed_paths"][0]["path"], "cli-turn.md");
 
-    let details = run_crabdb_json(temp.path(), &["agent", "turn", "show", &turn_id]);
+    let details = run_crabdb_json(temp.path(), &["lane", "turn", "show", &turn_id]);
     assert_eq!(details["turn"]["status"], "patch_applied");
     assert_eq!(details["messages"][0]["body"], "Add a CLI turn note");
     assert!(details["events"]
@@ -4091,22 +4064,22 @@ fn agent_turn_cli_tracks_events_and_closeout() {
 
     let ended = run_crabdb_json(
         temp.path(),
-        &["agent", "turn", "end", &turn_id, "--status", "completed"],
+        &["lane", "turn", "end", &turn_id, "--status", "completed"],
     );
     assert_eq!(ended["turn"]["status"], "completed");
 
-    let details = run_crabdb_json(temp.path(), &["agent", "turn", "show", &turn_id]);
+    let details = run_crabdb_json(temp.path(), &["lane", "turn", "show", &turn_id]);
     assert_eq!(details["turn"]["status"], "completed");
 }
 
 #[test]
-fn mcp_stdio_tools_drive_agent_turn_workflow() {
+fn mcp_stdio_tools_drive_lane_turn_workflow() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.config_set("agent.default_materialize", "true").unwrap();
+    db.config_set("lane.default_materialize", "true").unwrap();
     let init = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -4139,7 +4112,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         .any(|resource| resource["uri"] == "crabdb://workspace/status"));
     assert!(resources_list
         .iter()
-        .any(|resource| resource["uri"] == "crabdb://docs/agent-workflows"));
+        .any(|resource| resource["uri"] == "crabdb://docs/lane-workflows"));
 
     let resource_templates = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -4156,22 +4129,22 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         .unwrap();
     assert!(template_list
         .iter()
-        .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/status"));
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/lanes/{lane}/status"));
     assert!(template_list
         .iter()
-        .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/review"));
-    assert!(template_list.iter().any(
-        |template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/contribution"
-    ));
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/lanes/{lane}/review"));
     assert!(template_list
         .iter()
-        .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/gates"));
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/lanes/{lane}/contribution"));
     assert!(template_list
         .iter()
-        .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/readiness"));
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/lanes/{lane}/gates"));
     assert!(template_list
         .iter()
-        .any(|template| template["uriTemplate"] == "crabdb://workspace/agents/{agent}/handoff"));
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/lanes/{lane}/readiness"));
+    assert!(template_list
+        .iter()
+        .any(|template| template["uriTemplate"] == "crabdb://workspace/lanes/{lane}/handoff"));
     assert!(template_list
         .iter()
         .any(|template| template["uriTemplate"] == "crabdb://workspace/turns/{turn_id}"));
@@ -4205,7 +4178,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 12,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://docs/agent-workflows"
+                "uri": "crabdb://docs/lane-workflows"
             }
         }),
     )
@@ -4217,7 +4190,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(docs_resource["result"]["contents"][0]["text"]
         .as_str()
         .unwrap()
-        .contains("Agent Workflows"));
+        .contains("Lane Workflows"));
 
     let missing_resource = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -4246,24 +4219,24 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     let prompt_list = prompts["result"]["prompts"].as_array().unwrap();
     assert!(prompt_list
         .iter()
-        .any(|prompt| prompt["name"] == "crabdb.agent_task"));
+        .any(|prompt| prompt["name"] == "crabdb.lane_task"));
     assert!(prompt_list
         .iter()
-        .any(|prompt| prompt["name"] == "crabdb.review_agent"));
+        .any(|prompt| prompt["name"] == "crabdb.review_lane"));
     assert!(prompt_list
         .iter()
         .any(|prompt| prompt["name"] == "crabdb.resolve_conflict"));
 
-    let agent_prompt = crabdb::mcp::handle_json_rpc(
+    let lane_prompt = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 15,
             "method": "prompts/get",
             "params": {
-                "name": "crabdb.agent_task",
+                "name": "crabdb.lane_task",
                 "arguments": {
-                    "agent": "mcp-agent",
+                    "lane": "mcp-lane",
                     "task": "Improve README setup notes",
                     "branch": "main"
                 }
@@ -4272,10 +4245,10 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     )
     .unwrap();
     assert_eq!(
-        agent_prompt["result"]["description"],
-        "Safe CrabDB agent task workflow"
+        lane_prompt["result"]["description"],
+        "Safe CrabDB lane task workflow"
     );
-    let prompt_messages = agent_prompt["result"]["messages"].as_array().unwrap();
+    let prompt_messages = lane_prompt["result"]["messages"].as_array().unwrap();
     assert!(prompt_messages[0]["content"]["text"]
         .as_str()
         .unwrap()
@@ -4283,11 +4256,11 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(prompt_messages[0]["content"]["text"]
         .as_str()
         .unwrap()
-        .contains("crabdb.agent_rewind"));
+        .contains("crabdb.lane_rewind"));
     assert!(prompt_messages[0]["content"]["text"]
         .as_str()
         .unwrap()
-        .contains("mcp-agent"));
+        .contains("mcp-lane"));
     assert!(prompt_messages
         .iter()
         .any(|message| message["content"]["type"] == "resource"));
@@ -4299,9 +4272,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 151,
             "method": "prompts/get",
             "params": {
-                "name": "crabdb.review_agent",
+                "name": "crabdb.review_lane",
                 "arguments": {
-                    "agent": "mcp-agent"
+                    "lane": "mcp-lane"
                 }
             }
         }),
@@ -4309,12 +4282,12 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     .unwrap();
     assert_eq!(
         review_prompt["result"]["description"],
-        "CrabDB agent review checklist"
+        "CrabDB lane review checklist"
     );
     assert!(review_prompt["result"]["messages"][0]["content"]["text"]
         .as_str()
         .unwrap()
-        .contains("crabdb.agent_review"));
+        .contains("crabdb.lane_review"));
 
     let missing_prompt_argument = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -4340,7 +4313,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "params": {
                 "ref": {
                     "type": "ref/prompt",
-                    "name": "crabdb.agent_task"
+                    "name": "crabdb.lane_task"
                 },
                 "argument": {
                     "name": "branch",
@@ -4368,7 +4341,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
                     "name": "crabdb.missing"
                 },
                 "argument": {
-                    "name": "agent",
+                    "name": "lane",
                     "value": ""
                 }
             }
@@ -4389,34 +4362,32 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     .unwrap();
     let tools = list["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.begin_turn"));
+    assert!(tools.iter().any(|tool| tool["name"] == "crabdb.lane_spawn"));
+    assert!(tools.iter().any(|tool| tool["name"] == "crabdb.lane_list"));
     assert!(tools
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_spawn"));
-    assert!(tools.iter().any(|tool| tool["name"] == "crabdb.agent_list"));
+        .any(|tool| tool["name"] == "crabdb.lane_review"));
     assert!(tools
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_review"));
-    assert!(tools
-        .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_contribution"));
+        .any(|tool| tool["name"] == "crabdb.lane_contribution"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.gate_history"));
     assert!(tools
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_readiness"));
+        .any(|tool| tool["name"] == "crabdb.lane_readiness"));
     assert!(tools
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_handoff"));
+        .any(|tool| tool["name"] == "crabdb.lane_handoff"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.guardrail_check"));
     assert!(tools
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_remove"));
+        .any(|tool| tool["name"] == "crabdb.lane_remove"));
     assert!(tools
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_rewind"));
+        .any(|tool| tool["name"] == "crabdb.lane_rewind"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.apply_patch"));
@@ -4451,10 +4422,10 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     assert!(!tool_annotation("crabdb.status", "destructiveHint"));
     assert!(!tool_annotation("crabdb.apply_patch", "readOnlyHint"));
     assert!(tool_annotation("crabdb.apply_patch", "destructiveHint"));
-    assert!(tool_annotation("crabdb.agent_rewind", "destructiveHint"));
+    assert!(tool_annotation("crabdb.lane_rewind", "destructiveHint"));
     assert!(tool_annotation("crabdb.run_test", "openWorldHint"));
     assert!(tool_annotation("crabdb.guardrail_check", "readOnlyHint"));
-    assert!(tool_annotation("crabdb.agent_review", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.lane_review", "readOnlyHint"));
     assert!(tool_annotation("crabdb.gate_history", "readOnlyHint"));
 
     let spawned = crabdb::mcp::handle_json_rpc(
@@ -4464,7 +4435,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 20,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_spawn",
+                "name": "crabdb.lane_spawn",
                 "arguments": {
                     "name": "mcp-lifecycle",
                     "from_ref": "main",
@@ -4475,96 +4446,96 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     )
     .unwrap();
     assert_eq!(spawned["result"]["isError"], false);
-    let lifecycle_agent_id = spawned["result"]["structuredContent"]["agent_id"]
+    let lifecycle_lane_id = spawned["result"]["structuredContent"]["lane_id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let agent_list = crabdb::mcp::handle_json_rpc(
+    let lane_list = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 21,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_list",
+                "name": "crabdb.lane_list",
                 "arguments": {}
             }
         }),
     )
     .unwrap();
-    assert_eq!(agent_list["result"]["isError"], false);
-    assert!(agent_list["result"]["structuredContent"]
+    assert_eq!(lane_list["result"]["isError"], false);
+    assert!(lane_list["result"]["structuredContent"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|agent| agent["record"]["name"] == "mcp-lifecycle"));
+        .any(|lane| lane["record"]["name"] == "mcp-lifecycle"));
 
-    let agent_show = crabdb::mcp::handle_json_rpc(
+    let lane_show = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 22,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_show",
+                "name": "crabdb.lane_show",
                 "arguments": {
-                    "agent": lifecycle_agent_id.clone()
+                    "lane": lifecycle_lane_id.clone()
                 }
             }
         }),
     )
     .unwrap();
-    assert_eq!(agent_show["result"]["isError"], false);
+    assert_eq!(lane_show["result"]["isError"], false);
     assert_eq!(
-        agent_show["result"]["structuredContent"]["record"]["name"],
+        lane_show["result"]["structuredContent"]["record"]["name"],
         "mcp-lifecycle"
     );
 
-    let agent_status = crabdb::mcp::handle_json_rpc(
+    let lane_status = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 23,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_status",
+                "name": "crabdb.lane_status",
                 "arguments": {
-                    "agent": lifecycle_agent_id.clone()
+                    "lane": lifecycle_lane_id.clone()
                 }
             }
         }),
     )
     .unwrap();
-    assert_eq!(agent_status["result"]["isError"], false);
+    assert_eq!(lane_status["result"]["isError"], false);
     assert_eq!(
-        agent_status["result"]["structuredContent"]["agent"]["record"]["name"],
+        lane_status["result"]["structuredContent"]["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
 
-    let templated_agent_status = crabdb::mcp::handle_json_rpc(
+    let templated_lane_status = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 25,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://workspace/agents/mcp-lifecycle/status"
+                "uri": "crabdb://workspace/lanes/mcp-lifecycle/status"
             }
         }),
     )
     .unwrap();
     assert_eq!(
-        templated_agent_status["result"]["contents"][0]["mimeType"],
+        templated_lane_status["result"]["contents"][0]["mimeType"],
         "application/json"
     );
-    let templated_status_text = templated_agent_status["result"]["contents"][0]["text"]
+    let templated_status_text = templated_lane_status["result"]["contents"][0]["text"]
         .as_str()
         .unwrap();
     let templated_status_json: serde_json::Value =
         serde_json::from_str(templated_status_text).unwrap();
     assert_eq!(
-        templated_status_json["agent"]["record"]["name"],
+        templated_status_json["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
 
@@ -4575,9 +4546,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 251,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_review",
+                "name": "crabdb.lane_review",
                 "arguments": {
-                    "agent": "mcp-lifecycle",
+                    "lane": "mcp-lifecycle",
                     "limit": 5
                 }
             }
@@ -4586,7 +4557,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     .unwrap();
     assert_eq!(review["result"]["isError"], false);
     assert_eq!(
-        review["result"]["structuredContent"]["agent"]["record"]["name"],
+        review["result"]["structuredContent"]["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
     assert_eq!(
@@ -4601,7 +4572,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 252,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://workspace/agents/mcp-lifecycle/review"
+                "uri": "crabdb://workspace/lanes/mcp-lifecycle/review"
             }
         }),
     )
@@ -4612,7 +4583,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     let templated_review_json: serde_json::Value =
         serde_json::from_str(templated_review_text).unwrap();
     assert_eq!(
-        templated_review_json["agent"]["record"]["name"],
+        templated_review_json["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
     assert_eq!(templated_review_json["readiness"]["ready"], true);
@@ -4624,9 +4595,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 26,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_contribution",
+                "name": "crabdb.lane_contribution",
                 "arguments": {
-                    "agent": "mcp-lifecycle",
+                    "lane": "mcp-lifecycle",
                     "limit": 5
                 }
             }
@@ -4635,7 +4606,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     .unwrap();
     assert_eq!(contribution["result"]["isError"], false);
     assert_eq!(
-        contribution["result"]["structuredContent"]["status"]["agent"]["record"]["name"],
+        contribution["result"]["structuredContent"]["status"]["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
 
@@ -4646,7 +4617,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 27,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://workspace/agents/mcp-lifecycle/contribution"
+                "uri": "crabdb://workspace/lanes/mcp-lifecycle/contribution"
             }
         }),
     )
@@ -4657,7 +4628,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     let templated_contribution_json: serde_json::Value =
         serde_json::from_str(templated_contribution_text).unwrap();
     assert_eq!(
-        templated_contribution_json["status"]["agent"]["record"]["name"],
+        templated_contribution_json["status"]["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
 
@@ -4668,9 +4639,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 29,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_readiness",
+                "name": "crabdb.lane_readiness",
                 "arguments": {
-                    "agent": "mcp-lifecycle"
+                    "lane": "mcp-lifecycle"
                 }
             }
         }),
@@ -4678,7 +4649,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     .unwrap();
     assert_eq!(readiness["result"]["isError"], false);
     assert_eq!(
-        readiness["result"]["structuredContent"]["agent"]["record"]["name"],
+        readiness["result"]["structuredContent"]["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
     assert_eq!(readiness["result"]["structuredContent"]["ready"], true);
@@ -4695,7 +4666,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 30,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://workspace/agents/mcp-lifecycle/readiness"
+                "uri": "crabdb://workspace/lanes/mcp-lifecycle/readiness"
             }
         }),
     )
@@ -4706,7 +4677,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     let templated_readiness_json: serde_json::Value =
         serde_json::from_str(templated_readiness_text).unwrap();
     assert_eq!(
-        templated_readiness_json["agent"]["record"]["name"],
+        templated_readiness_json["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
     assert_eq!(templated_readiness_json["ready"], true);
@@ -4718,9 +4689,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 31,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_handoff",
+                "name": "crabdb.lane_handoff",
                 "arguments": {
-                    "agent": "mcp-lifecycle",
+                    "lane": "mcp-lifecycle",
                     "limit": 5
                 }
             }
@@ -4729,7 +4700,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     .unwrap();
     assert_eq!(handoff["result"]["isError"], false);
     assert_eq!(
-        handoff["result"]["structuredContent"]["agent"]["record"]["name"],
+        handoff["result"]["structuredContent"]["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
     assert_eq!(
@@ -4750,7 +4721,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 32,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://workspace/agents/mcp-lifecycle/handoff"
+                "uri": "crabdb://workspace/lanes/mcp-lifecycle/handoff"
             }
         }),
     )
@@ -4761,12 +4732,12 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
     let templated_handoff_json: serde_json::Value =
         serde_json::from_str(templated_handoff_text).unwrap();
     assert_eq!(
-        templated_handoff_json["agent"]["record"]["name"],
+        templated_handoff_json["lane"]["record"]["name"],
         "mcp-lifecycle"
     );
     assert_eq!(templated_handoff_json["readiness"]["ready"], true);
 
-    let agent_completion = crabdb::mcp::handle_json_rpc(
+    let lane_completion = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -4775,41 +4746,41 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "params": {
                 "ref": {
                     "type": "ref/resource",
-                    "uri": "crabdb://workspace/agents/{agent}/handoff"
+                    "uri": "crabdb://workspace/lanes/{lane}/handoff"
                 },
                 "argument": {
-                    "name": "agent",
+                    "name": "lane",
                     "value": "mcp"
                 }
             }
         }),
     )
     .unwrap();
-    assert!(agent_completion["result"]["completion"]["values"]
+    assert!(lane_completion["result"]["completion"]["values"]
         .as_array()
         .unwrap()
         .iter()
         .any(|value| value.as_str() == Some("mcp-lifecycle")));
 
-    let agent_remove = crabdb::mcp::handle_json_rpc(
+    let lane_remove = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 24,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_remove",
+                "name": "crabdb.lane_remove",
                 "arguments": {
-                    "agent": lifecycle_agent_id.clone()
+                    "lane": lifecycle_lane_id.clone()
                 }
             }
         }),
     )
     .unwrap();
-    assert_eq!(agent_remove["result"]["isError"], false);
+    assert_eq!(lane_remove["result"]["isError"], false);
     assert_eq!(
-        agent_remove["result"]["structuredContent"]["agent_id"],
-        lifecycle_agent_id
+        lane_remove["result"]["structuredContent"]["lane_id"],
+        lifecycle_lane_id
     );
 
     let begin = crabdb::mcp::handle_json_rpc(
@@ -4821,7 +4792,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "params": {
                 "name": "crabdb.begin_turn",
                 "arguments": {
-                    "agent": "mcp-agent",
+                    "lane": "mcp-lane",
                     "branch": "main",
                     "session_title": "MCP smoke"
                 }
@@ -4929,7 +4900,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         "src/mcp_smoke.rs"
     );
 
-    let workdir = db.agent_workdir("mcp-agent").unwrap().workdir.unwrap();
+    let workdir = db.lane_workdir("mcp-lane").unwrap().workdir.unwrap();
     fs::write(
         std::path::Path::new(&workdir).join("README.md"),
         "hello\nmcp dirty\n",
@@ -4944,7 +4915,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "params": {
                 "name": "crabdb.sync_workdir",
                 "arguments": {
-                    "agent": "mcp-agent",
+                    "lane": "mcp-lane",
                     "force": true
                 }
             }
@@ -4963,7 +4934,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "params": {
                 "name": "crabdb.run_test",
                 "arguments": {
-                    "agent": "mcp-agent",
+                    "lane": "mcp-lane",
                     "turn_id": turn_id.clone(),
                     "command": ["sh", "-c", "printf mcp-test"],
                     "timeout_secs": 5
@@ -5013,7 +4984,7 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
         .iter()
         .any(|event| event["event_type"] == "test_finished"));
     assert_eq!(
-        db.agent_status("mcp-agent")
+        db.lane_status("mcp-lane")
             .unwrap()
             .latest_test
             .unwrap()
@@ -5028,9 +4999,9 @@ fn mcp_stdio_tools_drive_agent_turn_workflow() {
             "id": 33,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_handoff",
+                "name": "crabdb.lane_handoff",
                 "arguments": {
-                    "agent": "mcp-agent",
+                    "lane": "mcp-lane",
                     "limit": 5
                 }
             }
@@ -5100,27 +5071,27 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["key"] == "agent.default_materialize"));
+        .any(|entry| entry["key"] == "lane.default_materialize"));
     assert!(http_entries
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["key"] == "agent.require_test_gate"));
+        .any(|entry| entry["key"] == "lane.require_test_gate"));
     assert!(http_entries
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["key"] == "agent.require_eval_gate"));
+        .any(|entry| entry["key"] == "lane.require_eval_gate"));
     assert!(http_entries
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["key"] == "agent.required_test_suites"));
+        .any(|entry| entry["key"] == "lane.required_test_suites"));
     assert!(http_entries
         .as_array()
         .unwrap()
         .iter()
-        .any(|entry| entry["key"] == "agent.required_eval_suites"));
+        .any(|entry| entry["key"] == "lane.required_eval_suites"));
     assert!(http_entries
         .as_array()
         .unwrap()
@@ -5218,19 +5189,19 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         .config_set("guardrails.policy", guardrail_policy)
         .unwrap();
     assert_eq!(policy_set.new_value, guardrail_policy);
-    let test_gate_set = db.config_set("agent.require_test_gate", "yes").unwrap();
+    let test_gate_set = db.config_set("lane.require_test_gate", "yes").unwrap();
     assert_eq!(test_gate_set.old_value, "false");
     assert_eq!(test_gate_set.new_value, "true");
-    let eval_gate_set = db.config_set("agent.require_eval_gate", "on").unwrap();
+    let eval_gate_set = db.config_set("lane.require_eval_gate", "on").unwrap();
     assert_eq!(eval_gate_set.old_value, "false");
     assert_eq!(eval_gate_set.new_value, "true");
     let test_suites_set = db
-        .config_set("agent.required_test_suites", "unit,policy-smoke")
+        .config_set("lane.required_test_suites", "unit,policy-smoke")
         .unwrap();
     assert_eq!(test_suites_set.old_value, "");
     assert_eq!(test_suites_set.new_value, "unit,policy-smoke");
     let eval_suites_set = db
-        .config_set("agent.required_eval_suites", "regression; safety")
+        .config_set("lane.required_eval_suites", "regression; safety")
         .unwrap();
     assert_eq!(eval_suites_set.old_value, "");
     assert_eq!(eval_suites_set.new_value, "regression,safety");
@@ -5278,14 +5249,14 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         reopened.config_get("guardrails.policy").unwrap().value,
         guardrail_policy
     );
-    assert!(reopened.config().agent.require_test_gate);
-    assert!(reopened.config().agent.require_eval_gate);
+    assert!(reopened.config().lane.require_test_gate);
+    assert!(reopened.config().lane.require_eval_gate);
     assert_eq!(
-        reopened.config().agent.required_test_suites,
+        reopened.config().lane.required_test_suites,
         vec!["unit".to_string(), "policy-smoke".to_string()]
     );
     assert_eq!(
-        reopened.config().agent.required_eval_suites,
+        reopened.config().lane.required_eval_suites,
         vec!["regression".to_string(), "safety".to_string()]
     );
 
@@ -5526,7 +5497,7 @@ fn same_position_rewrite_preserves_line_identity() {
     let before = db.why("README.md:2", Some("main")).unwrap();
     fs::write(
         temp.path().join("README.md"),
-        "one\nagent rewrote this line\nthree\n",
+        "one\nlane rewrote this line\nthree\n",
     )
     .unwrap();
     let record = db
@@ -5538,7 +5509,7 @@ fn same_position_rewrite_preserves_line_identity() {
         )
         .unwrap();
     let after = db.why("README.md:2", Some("main")).unwrap();
-    assert_eq!(after.current_text, "agent rewrote this line");
+    assert_eq!(after.current_text, "lane rewrote this line");
     assert_eq!(after.line_id, before.line_id);
     assert!(after
         .history
@@ -5550,7 +5521,7 @@ fn same_position_rewrite_preserves_line_identity() {
         before.line_id.origin_change.0, before.line_id.local_seq
     );
     let cli_by_line = run_crabdb_json(temp.path(), &["why", "--line-id", &line_id, "--at", "main"]);
-    assert_eq!(cli_by_line["current_text"], "agent rewrote this line");
+    assert_eq!(cli_by_line["current_text"], "lane rewrote this line");
     let cli_at_root = run_crabdb_json(
         temp.path(),
         &[
@@ -5599,7 +5570,7 @@ fn same_position_rewrite_preserves_line_identity() {
     assert_eq!(mcp["result"]["isError"], false);
     assert_eq!(
         mcp["result"]["structuredContent"]["current_text"],
-        "agent rewrote this line"
+        "lane rewrote this line"
     );
 }
 
@@ -5912,31 +5883,31 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
           "session_id": "session-review",
-          "message": "agent adds review line",
+          "message": "lane adds review line",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\nworld\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\nworld\n"}
           ]
         }"#,
     )
     .unwrap();
-    let applied = db.apply_agent_patch("doc-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("doc-bot", patch).unwrap();
 
     let why = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "GET",
-            "/v1/why?path_line=README.md:2&branch=refs/agents/doc-bot",
+            "/v1/why?path_line=README.md:2&branch=refs/lanes/doc-bot",
             serde_json::Value::Null,
         ),
     );
     assert_eq!(why.status, 200);
     let why: serde_json::Value = why.body_json().unwrap();
-    assert_eq!(why["current_text"], "agent");
+    assert_eq!(why["current_text"], "lane");
     let line_id = format!(
         "{}:{}",
         why["line_id"]["origin_change"].as_str().unwrap(),
@@ -5988,7 +5959,7 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
                 "name": "crabdb.why",
                 "arguments": {
                     "path_line": "README.md:2",
-                    "branch": "refs/agents/doc-bot"
+                    "branch": "refs/lanes/doc-bot"
                 }
             }
         }),
@@ -5997,7 +5968,7 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
     assert_eq!(mcp_why["result"]["isError"], false);
     assert_eq!(
         mcp_why["result"]["structuredContent"]["current_text"],
-        "agent"
+        "lane"
     );
 
     let mcp_code_from = crabdb::mcp::handle_json_rpc(
@@ -6030,7 +6001,7 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
             serde_json::json!({
                 "path_line": "README.md:2",
                 "label": "review marker",
-                "branch": "refs/agents/doc-bot"
+                "branch": "refs/lanes/doc-bot"
             }),
         ),
     );
@@ -6063,18 +6034,18 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
           "session_id": "session-review",
           "message": "move anchored line",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nintro\nagent\nworld\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nintro\nlane\nworld\n"}
           ]
         }"#,
     )
     .unwrap();
-    db.apply_agent_patch("doc-bot", move_patch).unwrap();
+    db.apply_lane_patch("doc-bot", move_patch).unwrap();
 
     let resolved = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/anchors/{anchor_id}?branch=refs/agents/doc-bot"),
+            &format!("/v1/anchors/{anchor_id}?branch=refs/lanes/doc-bot"),
             serde_json::Value::Null,
         ),
     );
@@ -6082,7 +6053,7 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
     let resolved: serde_json::Value = resolved.body_json().unwrap();
     assert_eq!(resolved["status"], "found");
     assert_eq!(resolved["line_number"], 3);
-    assert_eq!(resolved["text"], "agent");
+    assert_eq!(resolved["text"], "lane");
 
     let mcp_resolved = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -6094,7 +6065,7 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
                 "name": "crabdb.anchor_resolve",
                 "arguments": {
                     "anchor_id": anchor_id.clone(),
-                    "branch": "refs/agents/doc-bot"
+                    "branch": "refs/lanes/doc-bot"
                 }
             }
         }),
@@ -6153,7 +6124,7 @@ fn checkout_restores_branch_root() {
 }
 
 #[test]
-fn refish_aliases_accept_branch_agent_and_root_selectors() {
+fn refish_aliases_accept_branch_lane_and_root_selectors() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("note.txt"), "one\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -6181,10 +6152,10 @@ fn refish_aliases_accept_branch_agent_and_root_selectors() {
         "one\n"
     );
 
-    db.spawn_agent_with_workdir("doc-bot", Some("branch:main"), false, None, None, None)
+    db.spawn_lane_with_workdir("doc-bot", Some("branch:main"), false, None, None, None)
         .unwrap();
-    let agent_checkout = db.checkout("agent:doc-bot", true).unwrap();
-    assert_eq!(agent_checkout.change_id, recorded_change);
+    let lane_checkout = db.checkout("lane:doc-bot", true).unwrap();
+    assert_eq!(lane_checkout.change_id, recorded_change);
     assert_eq!(
         fs::read_to_string(temp.path().join("note.txt")).unwrap(),
         "two\n"
@@ -6440,28 +6411,28 @@ fn timeline_branch_scope_accepts_command_flag_and_ref_aliases() {
 }
 
 #[test]
-fn agent_patch_can_merge_into_main() {
+fn lane_patch_can_merge_into_main() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), true, None, None)
+    db.spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
-          "message": "agent edits",
+          "message": "lane edits",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"},
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"},
             {"op": "write", "path": "src/lib.rs", "content": "pub fn answer() -> u32 { 42 }\n"}
           ]
         }"#,
     )
     .unwrap();
-    let applied = db.apply_agent_patch("doc-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("doc-bot", patch).unwrap();
     assert_eq!(applied.changed_paths.len(), 2);
 
-    let merged = db.merge_agent("doc-bot", "main").unwrap();
+    let merged = db.merge_lane("doc-bot", "main").unwrap();
     assert_eq!(merged.changed_paths.len(), 2);
     db.checkout("main", true).unwrap();
 
@@ -6473,7 +6444,7 @@ fn agent_patch_can_merge_into_main() {
 }
 
 #[test]
-fn agent_patch_refreshes_clean_materialized_workdir_incrementally() {
+fn lane_patch_refreshes_clean_materialized_workdir_incrementally() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     fs::write(temp.path().join("old.txt"), "remove me\n").unwrap();
@@ -6482,7 +6453,7 @@ fn agent_patch_refreshes_clean_materialized_workdir_incrementally() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("workdir-bot", Some("main"), true, None, None)
+        .spawn_lane("workdir-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = PathBuf::from(spawned.workdir.unwrap());
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
@@ -6495,7 +6466,7 @@ fn agent_patch_refreshes_clean_materialized_workdir_incrementally() {
     }))
     .unwrap();
 
-    let applied = db.apply_agent_patch("workdir-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("workdir-bot", patch).unwrap();
     assert_eq!(applied.changed_paths.len(), 3);
     assert_eq!(
         fs::read_to_string(workdir.join("README.md")).unwrap(),
@@ -6521,7 +6492,7 @@ fn agent_patch_refreshes_clean_materialized_workdir_incrementally() {
     assert!(manifest["files"].get("untouched.txt").is_some());
     assert!(manifest["files"].get("old.txt").is_none());
     assert_eq!(
-        db.agent_status("workdir-bot").unwrap().workdir_state,
+        db.lane_status("workdir-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
 }
@@ -6534,21 +6505,21 @@ fn merge_dry_run_reports_without_mutating_refs() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let before_head = db.status(Some("main")).unwrap().head.change_id;
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
-        "message": "agent edits",
+        "message": "lane edits",
         "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"}
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
 
     let cli = run_crabdb_json(
         temp.path(),
         &[
-            "merge-agent",
+            "merge-lane",
             "doc-bot",
             "--strategy",
             "line-id-aware",
@@ -6562,9 +6533,9 @@ fn merge_dry_run_reports_without_mutating_refs() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-agent",
+            "/v1/branches/main/merge-lane",
             serde_json::json!({
-                "agent": "doc-bot",
+                "lane": "doc-bot",
                 "dry_run": true
             }),
         ),
@@ -6573,22 +6544,20 @@ fn merge_dry_run_reports_without_mutating_refs() {
     let api: serde_json::Value = api_response.body_json().unwrap();
     assert_eq!(api["dry_run"], true);
 
-    let dry_run = db
-        .merge_agent_with_options("doc-bot", "main", true)
-        .unwrap();
+    let dry_run = db.merge_lane_with_options("doc-bot", "main", true).unwrap();
     assert!(dry_run.dry_run);
     assert_eq!(dry_run.changed_paths.len(), 1);
     assert_eq!(db.status(Some("main")).unwrap().head.change_id, before_head);
-    assert_eq!(db.agent_details("doc-bot").unwrap().branch.status, "active");
+    assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "active");
 
-    let merged = db.merge_agent("doc-bot", "main").unwrap();
+    let merged = db.merge_lane("doc-bot", "main").unwrap();
     assert!(!merged.dry_run);
     assert_eq!(merged.changed_paths.len(), 1);
     assert_ne!(db.status(Some("main")).unwrap().head.change_id, before_head);
 
     let before_branch_head = db.status(Some("main")).unwrap().head.change_id;
     db.create_branch("feature", Some("main")).unwrap();
-    fs::write(temp.path().join("README.md"), "hello\nagent\nbranch\n").unwrap();
+    fs::write(temp.path().join("README.md"), "hello\nlane\nbranch\n").unwrap();
     db.record(Some("feature"), None, Actor::human(), false)
         .unwrap();
     let branch_dry_run = db
@@ -6609,15 +6578,15 @@ fn merge_dry_run_reports_conflicts_without_opening_conflict_state() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
         "edits": [
-            {"op": "write", "path": "README.md", "content": "one\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "one\nlane\n"}
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
 
     fs::write(temp.path().join("README.md"), "one\nhuman\n").unwrap();
     db.record(
@@ -6628,33 +6597,31 @@ fn merge_dry_run_reports_conflicts_without_opening_conflict_state() {
     )
     .unwrap();
 
-    let dry_run = db
-        .merge_agent_with_options("doc-bot", "main", true)
-        .unwrap();
+    let dry_run = db.merge_lane_with_options("doc-bot", "main", true).unwrap();
     assert!(dry_run.dry_run);
     assert!(dry_run.changed_paths.is_empty());
     assert_eq!(
         dry_run.conflicts,
         vec!["both changed `README.md` differently"]
     );
-    assert_eq!(db.agent_details("doc-bot").unwrap().branch.status, "active");
+    assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "active");
 
-    let cli = run_crabdb_json(temp.path(), &["merge-agent", "doc-bot", "--dry-run"]);
+    let cli = run_crabdb_json(temp.path(), &["merge-lane", "doc-bot", "--dry-run"]);
     assert_eq!(cli["dry_run"], true);
     assert_eq!(cli["conflicts"][0], "both changed `README.md` differently");
     assert!(db.list_conflicts().unwrap().is_empty());
 
-    let err = db.merge_agent("doc-bot", "main").unwrap_err();
+    let err = db.merge_lane("doc-bot", "main").unwrap_err();
     assert!(matches!(&err, Error::Conflict(_)));
     assert_eq!(
-        db.agent_details("doc-bot").unwrap().branch.status,
+        db.lane_details("doc-bot").unwrap().branch.status,
         "conflicted"
     );
     let conflicts = db.list_conflicts().unwrap();
     assert_eq!(conflicts.len(), 1);
     assert_eq!(
         conflicts[0].source_ref.as_deref(),
-        Some("refs/agents/doc-bot")
+        Some("refs/lanes/doc-bot")
     );
     assert_eq!(
         conflicts[0].target_ref.as_deref(),
@@ -6666,7 +6633,7 @@ fn merge_dry_run_reports_conflicts_without_opening_conflict_state() {
         .any(|detail| detail == "both changed `README.md` differently"));
     assert!(err.to_string().contains(&conflicts[0].conflict_set_id));
 
-    let repeated = db.merge_agent("doc-bot", "main").unwrap_err();
+    let repeated = db.merge_lane("doc-bot", "main").unwrap_err();
     assert!(matches!(&repeated, Error::Conflict(_)));
     assert!(repeated.to_string().contains(&conflicts[0].conflict_set_id));
     assert_eq!(db.list_conflicts().unwrap().len(), 1);
@@ -6675,30 +6642,30 @@ fn merge_dry_run_reports_conflicts_without_opening_conflict_state() {
         .resolve_conflict(&conflicts[0].conflict_set_id, "source")
         .unwrap();
     assert_eq!(resolved.resolution, "source");
-    assert_eq!(db.agent_details("doc-bot").unwrap().branch.status, "merged");
+    assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "merged");
     db.checkout("main", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
-        "one\nagent\n"
+        "one\nlane\n"
     );
 }
 
 #[test]
-fn local_api_direct_merge_agent_conflict_records_conflict_set() {
+fn local_api_direct_merge_lane_conflict_records_conflict_set() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("api-bot", Some("main"), false, None, None)
+    db.spawn_lane("api-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
         "edits": [
-            {"op": "write", "path": "README.md", "content": "one\nagent-api\n"}
+            {"op": "write", "path": "README.md", "content": "one\nlane-api\n"}
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("api-bot", patch).unwrap();
+    db.apply_lane_patch("api-bot", patch).unwrap();
 
     fs::write(temp.path().join("README.md"), "one\nhuman-api\n").unwrap();
     db.record(
@@ -6713,8 +6680,8 @@ fn local_api_direct_merge_agent_conflict_records_conflict_set() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-agent",
-            serde_json::json!({ "agent_id": "api-bot" }),
+            "/v1/branches/main/merge-lane",
+            serde_json::json!({ "lane_id": "api-bot" }),
         ),
     );
     assert_eq!(response.status, 409);
@@ -6732,20 +6699,20 @@ fn local_api_direct_merge_agent_conflict_records_conflict_set() {
     assert_eq!(conflicts.status, 200);
     let conflicts: serde_json::Value = conflicts.body_json().unwrap();
     assert_eq!(conflicts.as_array().unwrap().len(), 1);
-    assert_eq!(conflicts[0]["source_ref"], "refs/agents/api-bot");
+    assert_eq!(conflicts[0]["source_ref"], "refs/lanes/api-bot");
     assert_eq!(conflicts[0]["target_ref"], "refs/branches/main");
 }
 
 #[test]
-fn agent_patch_can_replace_stable_line_with_expected_text() {
+fn lane_patch_can_replace_stable_line_with_expected_text() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "one\ntwo\nthree\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
-    let why = db.why("README.md:2", Some("refs/agents/doc-bot")).unwrap();
+    let why = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
     let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
     let patch_json = serde_json::json!({
         "message": "line-id patch",
@@ -6754,15 +6721,15 @@ fn agent_patch_can_replace_stable_line_with_expected_text() {
             "path": "README.md",
             "line_id": line_id,
             "expected_text": "two",
-            "new_text": "agent two"
+            "new_text": "lane two"
         }]
     });
     let patch: PatchDocument = serde_json::from_value(patch_json).unwrap();
-    let applied = db.apply_agent_patch("doc-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("doc-bot", patch).unwrap();
     assert_eq!(applied.changed_paths.len(), 1);
 
-    let changed = db.why("README.md:2", Some("refs/agents/doc-bot")).unwrap();
-    assert_eq!(changed.current_text, "agent two");
+    let changed = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
+    assert_eq!(changed.current_text, "lane two");
     assert_eq!(changed.line_id, why.line_id);
     let shown = db.show(&applied.operation.0).unwrap();
     match shown {
@@ -6787,13 +6754,13 @@ fn agent_patch_can_replace_stable_line_with_expected_text() {
         }]
     }))
     .unwrap();
-    let err = db.apply_agent_patch("doc-bot", stale_patch).unwrap_err();
+    let err = db.apply_lane_patch("doc-bot", stale_patch).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(_)));
     assert!(err.to_string().contains("expected text mismatch"));
 }
 
 #[test]
-fn agent_patch_incrementally_handles_rename_delete_and_write() {
+fn lane_patch_incrementally_handles_rename_delete_and_write() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     fs::write(temp.path().join("old.txt"), "remove me\n").unwrap();
@@ -6808,7 +6775,7 @@ fn agent_patch_incrementally_handles_rename_delete_and_write() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("patch-bot", Some("main"), false, None, None)
+    db.spawn_lane("patch-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "rename delete write",
@@ -6819,7 +6786,7 @@ fn agent_patch_incrementally_handles_rename_delete_and_write() {
         ]
     }))
     .unwrap();
-    let applied = db.apply_agent_patch("patch-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("patch-bot", patch).unwrap();
     assert_eq!(applied.changed_paths.len(), 3);
     assert!(applied.changed_paths.iter().any(|path| {
         path.kind == crabdb::FileChangeKind::Renamed
@@ -6835,18 +6802,18 @@ fn agent_patch_incrementally_handles_rename_delete_and_write() {
         .iter()
         .any(|path| { path.kind == crabdb::FileChangeKind::Added && path.path == "src/new.rs" }));
 
-    let status = db.agent_status("patch-bot").unwrap();
+    let status = db.lane_status("patch-bot").unwrap();
     assert_eq!(status.changed_paths.len(), 3);
     assert!(status
         .changed_paths
         .iter()
         .any(|path| path.path == "docs/README.md"));
     let untouched = db
-        .why("pkg/module_017.rs:1", Some("refs/agents/patch-bot"))
+        .why("pkg/module_017.rs:1", Some("refs/lanes/patch-bot"))
         .unwrap();
     assert_eq!(untouched.current_text, "pub fn value_17() -> usize { 17 }");
 
-    db.merge_agent("patch-bot", "main").unwrap();
+    db.merge_lane("patch-bot", "main").unwrap();
     let renamed = db.why("docs/README.md:1", Some("main")).unwrap();
     assert_eq!(renamed.current_text, "hello");
     let written = db.why("src/new.rs:1", Some("main")).unwrap();
@@ -6862,14 +6829,14 @@ fn agent_patch_incrementally_handles_rename_delete_and_write() {
 }
 
 #[test]
-fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
+fn lane_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "base\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("rewind-bot", Some("main"), true, None, None)
+        .spawn_lane("rewind-bot", Some("main"), true, None, None)
         .unwrap();
     let base_change = spawned.base_change;
     let workdir = PathBuf::from(spawned.workdir.unwrap());
@@ -6879,7 +6846,7 @@ fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
     let cli = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "rewind",
             "rewind-bot",
             "--to",
@@ -6895,7 +6862,7 @@ fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
     assert!(preserved_branch.starts_with("rewind/rewind-bot/"));
 
     let db = CrabDb::open(temp.path()).unwrap();
-    let details = db.agent_details("rewind-bot").unwrap();
+    let details = db.lane_details("rewind-bot").unwrap();
     assert_eq!(details.branch.head_change.0, cli["operation"]);
     assert_eq!(details.branch.head_root.0, cli["target_root"]);
     assert_eq!(
@@ -6908,7 +6875,7 @@ fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
         ShowResult::Operation { value } => {
             assert!(matches!(
                 value.operation.kind,
-                crabdb::OperationKind::AgentRewind
+                crabdb::OperationKind::LaneRewind
             ));
             assert_eq!(value.operation.parents[0].0, cli["previous_change"]);
             assert_eq!(value.operation.after_root.0, cli["target_root"]);
@@ -6920,12 +6887,12 @@ fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
     let preserved_line = db.why("README.md:1", Some(&preserved_ref)).unwrap();
     assert_eq!(preserved_line.current_text, "bad workdir");
     let rewound_line = db
-        .why("README.md:1", Some("refs/agents/rewind-bot"))
+        .why("README.md:1", Some("refs/lanes/rewind-bot"))
         .unwrap();
     assert_eq!(rewound_line.current_text, "base");
 
     let events = db
-        .list_agent_events(Some("rewind-bot"), None, None, Some("agent_rewound"), 10)
+        .list_lane_events(Some("rewind-bot"), None, None, Some("lane_rewound"), 10)
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].change_id.as_ref().unwrap().0, cli["operation"]);
@@ -6936,15 +6903,15 @@ fn agent_rewind_preserves_current_head_records_operation_and_syncs_workdir() {
 }
 
 #[test]
-fn agent_rewind_is_available_through_http_and_mcp() {
+fn lane_rewind_is_available_through_http_and_mcp() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "base\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("api-rewind", Some("main"), false, None, None)
+    db.spawn_lane("api-rewind", Some("main"), false, None, None)
         .unwrap();
-    let base_change = db.agent_details("api-rewind").unwrap().branch.base_change;
+    let base_change = db.lane_details("api-rewind").unwrap().branch.base_change;
     let bad_patch: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "bad api edit",
         "edits": [
@@ -6952,13 +6919,13 @@ fn agent_rewind_is_available_through_http_and_mcp() {
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("api-rewind", bad_patch).unwrap();
+    db.apply_lane_patch("api-rewind", bad_patch).unwrap();
 
     let response = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
-            "/v1/agents/api-rewind/rewind",
+            "/v1/lanes/api-rewind/rewind",
             serde_json::json!({
                 "to": base_change.0.clone(),
                 "record_current": true
@@ -6966,11 +6933,11 @@ fn agent_rewind_is_available_through_http_and_mcp() {
         ),
     );
     assert_eq!(response.status, 200);
-    let http_report: AgentRewindReport = response.body_json().unwrap();
+    let http_report: LaneRewindReport = response.body_json().unwrap();
     assert_eq!(http_report.target_change, base_change);
     assert!(http_report.preserved_branch.is_some());
     assert_eq!(
-        db.why("README.md:1", Some("refs/agents/api-rewind"))
+        db.why("README.md:1", Some("refs/lanes/api-rewind"))
             .unwrap()
             .current_text,
         "base"
@@ -6983,8 +6950,7 @@ fn agent_rewind_is_available_through_http_and_mcp() {
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("api-rewind", second_bad_patch)
-        .unwrap();
+    db.apply_lane_patch("api-rewind", second_bad_patch).unwrap();
     let mcp = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -6992,9 +6958,9 @@ fn agent_rewind_is_available_through_http_and_mcp() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_rewind",
+                "name": "crabdb.lane_rewind",
                 "arguments": {
-                    "agent": "api-rewind",
+                    "lane": "api-rewind",
                     "to": base_change.0.clone(),
                     "record_current": true
                 }
@@ -7012,7 +6978,7 @@ fn agent_rewind_is_available_through_http_and_mcp() {
         .unwrap()
         .starts_with("rewind/api-rewind/"));
     assert_eq!(
-        db.why("README.md:1", Some("refs/agents/api-rewind"))
+        db.why("README.md:1", Some("refs/lanes/api-rewind"))
             .unwrap()
             .current_text,
         "base"
@@ -7020,24 +6986,24 @@ fn agent_rewind_is_available_through_http_and_mcp() {
 }
 
 #[test]
-fn agent_merge_combines_non_overlapping_text_line_edits() {
+fn lane_merge_combines_non_overlapping_text_line_edits() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "one\ntwo\nthree\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
-          "message": "agent edits line two",
+          "message": "lane edits line two",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "one\nagent two\nthree\n"}
+            {"op": "write", "path": "README.md", "content": "one\nlane two\nthree\n"}
           ]
         }"#,
     )
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
 
     fs::write(temp.path().join("README.md"), "one\ntwo\nhuman three\n").unwrap();
     db.record(
@@ -7048,29 +7014,29 @@ fn agent_merge_combines_non_overlapping_text_line_edits() {
     )
     .unwrap();
 
-    let merged = db.merge_agent("doc-bot", "main").unwrap();
+    let merged = db.merge_lane("doc-bot", "main").unwrap();
     assert_eq!(merged.changed_paths.len(), 1);
     db.checkout("main", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
-        "one\nagent two\nhuman three\n"
+        "one\nlane two\nhuman three\n"
     );
 
     let line_two = db.why("README.md:2", Some("main")).unwrap();
-    assert_eq!(line_two.current_text, "agent two");
+    assert_eq!(line_two.current_text, "lane two");
     let line_three = db.why("README.md:3", Some("main")).unwrap();
     assert_eq!(line_three.current_text, "human three");
 }
 
 #[test]
-fn agent_management_commands_have_backing_apis() {
+fn lane_management_commands_have_backing_apis() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent(
+        .spawn_lane(
             "doc-bot",
             Some("main"),
             true,
@@ -7078,47 +7044,47 @@ fn agent_management_commands_have_backing_apis() {
             Some("gpt-5".to_string()),
         )
         .unwrap();
-    assert_eq!(db.list_agents().unwrap().len(), 1);
-    let details = db.agent_details("doc-bot").unwrap();
+    assert_eq!(db.list_lanes().unwrap().len(), 1);
+    let details = db.lane_details("doc-bot").unwrap();
     assert_eq!(details.record.provider.as_deref(), Some("openai"));
     assert_eq!(details.branch.ref_name, spawned.ref_name);
 
     let message = db
-        .add_agent_message(
+        .add_lane_message(
             "doc-bot",
             "user",
             "Please improve the docs",
-            Some("session-agent-management".to_string()),
+            Some("session-lane-management".to_string()),
         )
         .unwrap();
     assert_eq!(
         message.session_id.as_deref(),
-        Some("session-agent-management")
+        Some("session-lane-management")
     );
 
     let patch: PatchDocument = serde_json::from_str(
         r#"{
-          "session_id": "session-agent-management",
-          "message": "agent edits readme",
+          "session_id": "session-lane-management",
+          "message": "lane edits readme",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"}
           ]
         }"#,
     )
     .unwrap();
-    let applied = db.apply_agent_patch("doc-bot", patch).unwrap();
-    let status = db.agent_status("doc-bot").unwrap();
+    let applied = db.apply_lane_patch("doc-bot", patch).unwrap();
+    let status = db.lane_status("doc-bot").unwrap();
     assert_eq!(status.changed_paths.len(), 1);
     assert_eq!(
-        status.agent.branch.session_id.as_deref(),
-        Some("session-agent-management")
+        status.lane.branch.session_id.as_deref(),
+        Some("session-lane-management")
     );
-    let timeline = db.agent_timeline("doc-bot", 10).unwrap();
+    let timeline = db.lane_timeline("doc-bot", 10).unwrap();
     assert!(timeline
         .iter()
         .any(|entry| entry.change_id == applied.operation));
-    let contribution = db.agent_contribution("doc-bot", 10).unwrap();
-    assert_eq!(contribution.status.agent.record.name, "doc-bot");
+    let contribution = db.lane_contribution("doc-bot", 10).unwrap();
+    assert_eq!(contribution.status.lane.record.name, "doc-bot");
     assert!(contribution
         .status
         .changed_paths
@@ -7130,32 +7096,32 @@ fn agent_management_commands_have_backing_apis() {
         .any(|entry| entry.change_id == applied.operation));
     assert_eq!(contribution.sessions.len(), 1);
 
-    db.run_agent_test(
+    db.run_lane_test(
         "doc-bot",
         vec!["sh".to_string(), "-c".to_string(), "printf ok".to_string()],
         None,
         5,
     )
     .unwrap();
-    db.run_agent_eval(
+    db.run_lane_eval(
         "doc-bot",
         vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()],
         None,
         5,
     )
     .unwrap();
-    db.request_agent_approval(
+    db.request_lane_approval(
         "doc-bot",
         "shell.exec",
         "Run release smoke tests",
         None,
-        Some("session-agent-management"),
+        Some("session-lane-management"),
         None,
     )
     .unwrap();
 
-    let review = db.agent_review_packet("doc-bot", 1).unwrap();
-    assert_eq!(review.agent.record.name, "doc-bot");
+    let review = db.lane_review_packet("doc-bot", 1).unwrap();
+    assert_eq!(review.lane.record.name, "doc-bot");
     assert!(!review.readiness.ready);
     assert!(review
         .readiness
@@ -7191,50 +7157,47 @@ fn agent_management_commands_have_backing_apis() {
         .iter()
         .any(|step| step.contains("Resolve pending human approvals")));
 
-    db.checkout_agent("doc-bot", true).unwrap();
+    db.checkout_lane("doc-bot", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
-        "hello\nagent\n"
+        "hello\nlane\n"
     );
-    let err = db.remove_agent("doc-bot", false).unwrap_err();
+    let err = db.remove_lane("doc-bot", false).unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)));
-    let removed = db.remove_agent("doc-bot", true).unwrap();
-    assert_eq!(removed.agent_id, details.record.agent_id);
-    assert!(!temp.path().join(".crabdb/refs/agents/doc-bot").exists());
+    let removed = db.remove_lane("doc-bot", true).unwrap();
+    assert_eq!(removed.lane_id, details.record.lane_id);
+    assert!(!temp.path().join(".crabdb/refs/lanes/doc-bot").exists());
     if let Some(workdir) = removed.removed_workdir {
         assert!(!std::path::Path::new(&workdir).exists());
     }
-    assert_eq!(
-        db.agent_details("doc-bot").unwrap().branch.status,
-        "removed"
-    );
+    assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "removed");
 
     let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
     let messages: i64 = conn
         .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
         .unwrap();
     let events: i64 = conn
-        .query_row("SELECT COUNT(*) FROM agent_events", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM lane_events", [], |row| row.get(0))
         .unwrap();
     assert_eq!(messages, 2);
     assert!(events >= 4);
 }
 
 #[test]
-fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
+fn lane_test_runs_in_workdir_and_records_events_and_output_blobs() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), true, None, None)
+    db.spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     drop(db);
 
     let tested = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "test",
             "doc-bot",
             "--timeout-secs",
@@ -7256,7 +7219,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     let stderr_object = tested["stderr_object"].as_str().unwrap().to_string();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    let turn = db.show_agent_turn(turn_id).unwrap();
+    let turn = db.show_lane_turn(turn_id).unwrap();
     assert_eq!(turn.turn.status, "test_passed");
     assert!(turn
         .events
@@ -7275,7 +7238,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     assert_eq!(stderr.summary["byte_count"], 3);
 
     let failed = db
-        .run_agent_test(
+        .run_lane_test(
             "doc-bot",
             vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
             None,
@@ -7286,10 +7249,10 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     assert_eq!(failed.status, "test_failed");
     assert_eq!(failed.exit_code, Some(7));
     assert_eq!(
-        db.show_agent_turn(&failed.turn_id).unwrap().turn.status,
+        db.show_lane_turn(&failed.turn_id).unwrap().turn.status,
         "test_failed"
     );
-    let latest_test = db.agent_status("doc-bot").unwrap().latest_test.unwrap();
+    let latest_test = db.lane_status("doc-bot").unwrap().latest_test.unwrap();
     assert_eq!(latest_test.status, "test_failed");
     assert_eq!(latest_test.exit_code, Some(7));
     assert_eq!(latest_test.command, vec!["sh", "-c", "exit 7"]);
@@ -7298,7 +7261,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     let evaled = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "eval",
             "doc-bot",
             "--timeout-secs",
@@ -7325,7 +7288,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let eval_turn = db
-        .show_agent_turn(evaled["turn_id"].as_str().unwrap())
+        .show_lane_turn(evaled["turn_id"].as_str().unwrap())
         .unwrap();
     assert_eq!(eval_turn.turn.status, "eval_passed");
     assert!(eval_turn
@@ -7341,7 +7304,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agents/doc-bot/evals",
+            "/v1/lanes/doc-bot/evals",
             serde_json::json!({
                 "command": ["sh", "-c", "printf api-score"],
                 "timeout_secs": 5,
@@ -7361,7 +7324,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     assert_eq!(api_eval["score"], 0.72);
     assert_eq!(api_eval["threshold"], 0.8);
     let failed_eval_turn = db
-        .show_agent_turn(api_eval["turn_id"].as_str().unwrap())
+        .show_lane_turn(api_eval["turn_id"].as_str().unwrap())
         .unwrap();
     let failed_eval_event = failed_eval_turn
         .events
@@ -7381,7 +7344,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
             "params": {
                 "name": "crabdb.run_eval",
                 "arguments": {
-                    "agent": "doc-bot",
+                    "lane": "doc-bot",
                     "command": ["sh", "-c", "printf eval-ok"],
                     "timeout_secs": 5,
                     "suite": "nightly",
@@ -7398,7 +7361,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
         "eval_passed"
     );
 
-    let latest_eval = db.agent_status("doc-bot").unwrap().latest_eval.unwrap();
+    let latest_eval = db.lane_status("doc-bot").unwrap().latest_eval.unwrap();
     assert_eq!(latest_eval.kind, "eval");
     assert_eq!(latest_eval.status, "eval_passed");
     assert_eq!(latest_eval.suite.as_deref(), Some("nightly"));
@@ -7406,7 +7369,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     assert_eq!(latest_eval.threshold, Some(0.9));
     assert_eq!(latest_eval.command, vec!["sh", "-c", "printf eval-ok"]);
 
-    let gate_history = db.agent_gate_history("doc-bot", None, 10).unwrap();
+    let gate_history = db.lane_gate_history("doc-bot", None, 10).unwrap();
     assert_eq!(gate_history.kind, "all");
     assert!(gate_history.gates.len() >= 5);
     assert_eq!(gate_history.gates[0].kind, "eval");
@@ -7415,7 +7378,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
         .gates
         .iter()
         .any(|gate| gate.kind == "test" && gate.status == "test_failed"));
-    let eval_history = db.agent_gate_history("doc-bot", Some("eval"), 2).unwrap();
+    let eval_history = db.lane_gate_history("doc-bot", Some("eval"), 2).unwrap();
     assert_eq!(eval_history.kind, "eval");
     assert_eq!(eval_history.gates.len(), 2);
     assert_eq!(eval_history.gates[0].suite.as_deref(), Some("nightly"));
@@ -7429,7 +7392,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
         &mut db,
         &api_request(
             "GET",
-            "/v1/agents/doc-bot/gates?kind=eval&limit=2",
+            "/v1/lanes/doc-bot/gates?kind=eval&limit=2",
             serde_json::Value::Null,
         ),
     );
@@ -7448,7 +7411,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
             "params": {
                 "name": "crabdb.gate_history",
                 "arguments": {
-                    "agent": "doc-bot",
+                    "lane": "doc-bot",
                     "kind": "eval",
                     "limit": 2
                 }
@@ -7469,7 +7432,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
             "id": 3,
             "method": "resources/read",
             "params": {
-                "uri": "crabdb://workspace/agents/doc-bot/gates"
+                "uri": "crabdb://workspace/lanes/doc-bot/gates"
             }
         }),
     )
@@ -7483,9 +7446,7 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
     drop(db);
     let cli_gates = run_crabdb_json(
         temp.path(),
-        &[
-            "agent", "gates", "doc-bot", "--kind", "eval", "--limit", "2",
-        ],
+        &["lane", "gates", "doc-bot", "--kind", "eval", "--limit", "2"],
     );
     assert_eq!(cli_gates["kind"], "eval");
     assert_eq!(cli_gates["gates"].as_array().unwrap().len(), 2);
@@ -7499,16 +7460,16 @@ fn agent_test_runs_in_workdir_and_records_events_and_output_blobs() {
 }
 
 #[test]
-fn agent_sessions_track_messages_patches_and_turns() {
+fn lane_sessions_track_messages_patches_and_turns() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let started = db
-        .start_agent_session(
+        .start_lane_session(
             "doc-bot",
             Some("Improve docs".to_string()),
             Some("session-docs".to_string()),
@@ -7517,7 +7478,7 @@ fn agent_sessions_track_messages_patches_and_turns() {
     assert_eq!(started.session.session_id, "session-docs");
     assert_eq!(started.session.status, "active");
     assert_eq!(
-        db.agent_details("doc-bot")
+        db.lane_details("doc-bot")
             .unwrap()
             .branch
             .session_id
@@ -7526,20 +7487,20 @@ fn agent_sessions_track_messages_patches_and_turns() {
     );
 
     let message = db
-        .add_agent_message("doc-bot", "user", "Please improve README", None)
+        .add_lane_message("doc-bot", "user", "Please improve README", None)
         .unwrap();
     assert_eq!(message.session_id.as_deref(), Some("session-docs"));
 
     let patch: PatchDocument = serde_json::from_str(
         r#"{
-          "message": "agent edits readme",
+          "message": "lane edits readme",
           "edits": [
             {"op": "write", "path": "README.md", "content": "hello\nsession\n"}
           ]
         }"#,
     )
     .unwrap();
-    let applied = db.apply_agent_patch("doc-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("doc-bot", patch).unwrap();
     let by_session = db.code_from("session-docs").unwrap();
     assert_eq!(by_session.operations.len(), 1);
     assert_eq!(by_session.operations[0].change_id, applied.operation);
@@ -7550,8 +7511,8 @@ fn agent_sessions_track_messages_patches_and_turns() {
     let session_timeline = db.session_timeline("session-docs", 10).unwrap();
     assert_eq!(session_timeline.len(), 1);
     assert_eq!(session_timeline[0].change_id, applied.operation);
-    let agent_timeline = db.timeline_query(None, None, Some("doc-bot"), 10).unwrap();
-    assert!(agent_timeline
+    let lane_timeline = db.timeline_query(None, None, Some("doc-bot"), 10).unwrap();
+    assert!(lane_timeline
         .iter()
         .any(|entry| entry.change_id == applied.operation));
 
@@ -7613,17 +7574,17 @@ fn agent_sessions_track_messages_patches_and_turns() {
     assert_eq!(cli_session_timeline.as_array().unwrap().len(), 1);
     assert_eq!(cli_session_timeline[0]["change_id"], applied.operation.0);
 
-    let cli_agent_timeline = run_crabdb_json(
+    let cli_lane_timeline = run_crabdb_json(
         temp.path(),
-        &["timeline", "--agent", "doc-bot", "--limit", "5"],
+        &["timeline", "--lane", "doc-bot", "--limit", "5"],
     );
-    assert!(cli_agent_timeline
+    assert!(cli_lane_timeline
         .as_array()
         .unwrap()
         .iter()
         .any(|entry| entry["change_id"] == applied.operation.0));
 
-    let details = db.show_agent_session("session-docs").unwrap();
+    let details = db.show_lane_session("session-docs").unwrap();
     assert_eq!(details.messages.len(), 2);
     assert_eq!(details.operations.len(), 1);
     assert_eq!(details.turns.len(), 2);
@@ -7643,11 +7604,11 @@ fn agent_sessions_track_messages_patches_and_turns() {
             && event.turn_id.is_some()
             && event.session_id.as_deref() == Some("session-docs")));
 
-    let ended = db.end_agent_session("session-docs", "completed").unwrap();
+    let ended = db.end_lane_session("session-docs", "completed").unwrap();
     assert_eq!(ended.session.status, "completed");
     assert!(ended.session.ended_at.is_some());
     assert_eq!(
-        db.agent_details("doc-bot")
+        db.lane_details("doc-bot")
             .unwrap()
             .branch
             .session_id
@@ -7657,14 +7618,14 @@ fn agent_sessions_track_messages_patches_and_turns() {
 }
 
 #[test]
-fn agent_workdir_record_advances_agent_branch() {
+fn lane_workdir_record_advances_lane_branch() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = spawned.workdir.unwrap();
     fs::write(
@@ -7675,24 +7636,24 @@ fn agent_workdir_record_advances_agent_branch() {
     fs::create_dir_all(std::path::Path::new(&workdir).join("docs")).unwrap();
     fs::write(
         std::path::Path::new(&workdir).join("docs/notes.md"),
-        "agent notes\n",
+        "lane notes\n",
     )
     .unwrap();
 
     let recorded = db
-        .record_agent_workdir("doc-bot", Some("record workdir".to_string()))
+        .record_lane_workdir("doc-bot", Some("record workdir".to_string()))
         .unwrap();
     assert!(recorded.operation.is_some());
     assert_eq!(recorded.changed_paths.len(), 2);
 
-    let clean = db.record_agent_workdir("doc-bot", None).unwrap();
+    let clean = db.record_lane_workdir("doc-bot", None).unwrap();
     assert!(clean.operation.is_none());
-    let timeline = db.agent_timeline("doc-bot", 10).unwrap();
+    let timeline = db.lane_timeline("doc-bot", 10).unwrap();
     assert!(timeline
         .iter()
-        .any(|entry| entry.kind == crabdb::OperationKind::AgentRecord));
+        .any(|entry| entry.kind == crabdb::OperationKind::LaneRecord));
 
-    db.merge_agent("doc-bot", "main").unwrap();
+    db.merge_lane("doc-bot", "main").unwrap();
     db.checkout("main", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
@@ -7700,12 +7661,12 @@ fn agent_workdir_record_advances_agent_branch() {
     );
     assert_eq!(
         fs::read_to_string(temp.path().join("docs/notes.md")).unwrap(),
-        "agent notes\n"
+        "lane notes\n"
     );
 }
 
 #[test]
-fn agent_spawn_supports_custom_and_configured_workdirs() {
+fn lane_spawn_supports_custom_and_configured_workdirs() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     fs::create_dir_all(temp.path().join("src")).unwrap();
@@ -7735,7 +7696,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let workdir_parent = tempfile::tempdir().unwrap();
     let default_spawn = run_crabdb_json(
         temp.path(),
-        &["agent", "spawn", "default-bot", "--from", "main"],
+        &["lane", "spawn", "default-bot", "--from", "main"],
     );
     assert!(default_spawn["workdir"].is_null());
 
@@ -7743,7 +7704,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let cli_spawn = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "spawn",
             "cli-bot",
             "--from",
@@ -7766,7 +7727,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let headless_spawn = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "spawn",
             "headless-bot",
             "--from",
@@ -7779,7 +7740,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let no_materialize_spawn = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "spawn",
             "no-workdir-bot",
             "--from",
@@ -7791,14 +7752,14 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     assert_eq!(
-        db.agent_status("cli-bot").unwrap().workdir_state,
+        db.lane_status("cli-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
 
     let sparse_spawn = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "spawn",
             "sparse-bot",
             "--from",
@@ -7811,13 +7772,13 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     assert!(sparse_workdir.join("README.md").is_file());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
     assert!(!sparse_workdir.join("src/claimed.rs").exists());
-    let sparse_clean = db.agent_status("sparse-bot").unwrap();
+    let sparse_clean = db.lane_status("sparse-bot").unwrap();
     assert_eq!(sparse_clean.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_clean.workdir_changed_paths.is_empty());
     let claimed_hydration = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "claim",
             "sparse-bot",
             "src/claimed.rs",
@@ -7842,7 +7803,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     assert!(!sparse_workdir.join("src/lib.rs").exists());
     let sparse_read = run_crabdb_json(
         temp.path(),
-        &["agent", "read", "sparse-bot", "src/lib.rs", "--no-hydrate"],
+        &["lane", "read", "sparse-bot", "src/lib.rs", "--no-hydrate"],
     );
     assert_eq!(sparse_read["content_encoding"], "utf-8");
     assert_eq!(
@@ -7854,7 +7815,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let sparse_read_hydrate = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "read",
             "sparse-bot",
             "src/lib.rs",
@@ -7882,7 +7843,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let sparse_dir_spawn = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "spawn",
             "sparse-dir-bot",
             "--from",
@@ -7894,11 +7855,11 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let sparse_dir_workdir = PathBuf::from(sparse_dir_spawn["workdir"].as_str().unwrap());
     assert!(sparse_dir_workdir.join("src/lib.rs").is_file());
     assert!(!sparse_dir_workdir.join("README.md").exists());
-    let sparse_dir_clean = db.agent_status("sparse-dir-bot").unwrap();
+    let sparse_dir_clean = db.lane_status("sparse-dir-bot").unwrap();
     assert_eq!(sparse_dir_clean.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_dir_clean.workdir_changed_paths.is_empty());
     fs::remove_file(sparse_dir_workdir.join("src/lib.rs")).unwrap();
-    let sparse_dir_dirty = db.agent_status("sparse-dir-bot").unwrap();
+    let sparse_dir_dirty = db.lane_status("sparse-dir-bot").unwrap();
     assert_eq!(
         sparse_dir_dirty.workdir_state,
         Some(WorktreeState::DirtyTracked)
@@ -7910,7 +7871,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         crabdb::FileChangeKind::Deleted
     );
     let sparse_dir_record = db
-        .record_agent_workdir(
+        .record_lane_workdir(
             "sparse-dir-bot",
             Some("record sparse directory delete".to_string()),
         )
@@ -7923,13 +7884,13 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         crabdb::FileChangeKind::Deleted
     );
     assert_eq!(
-        db.agent_status("sparse-dir-bot").unwrap().workdir_state,
+        db.lane_status("sparse-dir-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
     let sparse_neighbor_spawn = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "spawn",
             "sparse-neighbor-bot",
             "--from",
@@ -7951,11 +7912,11 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     )
     .unwrap();
     let dirty_neighbor = db
-        .read_agent_file("sparse-neighbor-bot", "src/lib.rs", true, false, true)
+        .read_lane_file("sparse-neighbor-bot", "src/lib.rs", true, false, true)
         .unwrap_err();
     assert!(matches!(dirty_neighbor, Error::DirtyWorktreeWithMessage(_)));
     let forced_neighbor = db
-        .read_agent_file("sparse-neighbor-bot", "src/lib.rs", true, true, true)
+        .read_lane_file("sparse-neighbor-bot", "src/lib.rs", true, true, true)
         .unwrap();
     assert_eq!(
         forced_neighbor.hydrated_paths,
@@ -7972,7 +7933,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let hydrated = run_crabdb_json(
         temp.path(),
         &[
-            "agent",
+            "lane",
             "sync-workdir",
             "sparse-bot",
             "--paths",
@@ -7985,7 +7946,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         fs::read_to_string(sparse_workdir.join("src/lib.rs")).unwrap(),
         "#[path = \"../shared/helper.rs\"]\nmod helper;\npub fn answer() -> u8 { helper::answer() }\n"
     );
-    let sparse_hydrated = db.agent_status("sparse-bot").unwrap();
+    let sparse_hydrated = db.lane_status("sparse-bot").unwrap();
     assert_eq!(sparse_hydrated.workdir_state, Some(WorktreeState::Clean));
     assert!(sparse_hydrated.workdir_changed_paths.is_empty());
     #[cfg(unix)]
@@ -7993,7 +7954,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         .unwrap()
         .ino();
     let repeat_hydrate = db
-        .sync_agent_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
+        .sync_lane_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
         .unwrap();
     assert!(repeat_hydrate.changed_paths.is_empty());
     #[cfg(unix)]
@@ -8005,11 +7966,11 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     );
     fs::write(sparse_workdir.join("src/lib.rs"), "pub fn dirty() {}\n").unwrap();
     let err = db
-        .sync_agent_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
+        .sync_lane_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
         .unwrap_err();
     assert!(matches!(err, Error::DirtyWorktreeWithMessage(_)));
     let forced_hydrate = db
-        .sync_agent_workdir_with_paths("sparse-bot", true, &["src/lib.rs".to_string()])
+        .sync_lane_workdir_with_paths("sparse-bot", true, &["src/lib.rs".to_string()])
         .unwrap();
     assert!(forced_hydrate.forced);
     assert_eq!(
@@ -8018,11 +7979,11 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     );
     fs::write(sparse_workdir.join("README.md"), "hello\nsparse\n").unwrap();
     let unrelated_sync = db
-        .sync_agent_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
+        .sync_lane_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
         .unwrap();
     assert!(!unrelated_sync.forced);
     assert!(unrelated_sync.changed_paths.is_empty());
-    let sparse_dirty = db.agent_status("sparse-bot").unwrap();
+    let sparse_dirty = db.lane_status("sparse-bot").unwrap();
     assert_eq!(
         sparse_dirty.workdir_state,
         Some(WorktreeState::DirtyTracked)
@@ -8030,27 +7991,27 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(sparse_dirty.workdir_changed_paths.len(), 1);
     assert_eq!(sparse_dirty.workdir_changed_paths[0].path, "README.md");
     let sparse_record = db
-        .record_agent_workdir("sparse-bot", Some("record sparse workdir".to_string()))
+        .record_lane_workdir("sparse-bot", Some("record sparse workdir".to_string()))
         .unwrap();
     assert_eq!(sparse_record.changed_paths.len(), 1);
     assert_eq!(
-        db.agent_status("sparse-bot").unwrap().workdir_state,
+        db.lane_status("sparse-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
     fs::remove_file(sparse_workdir.join(".crabdb/workdir-manifest.json")).unwrap();
     fs::write(sparse_workdir.join("README.md"), "hello\nstale-manifest\n").unwrap();
     let missing_manifest_sync = db
-        .sync_agent_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
+        .sync_lane_workdir_with_paths("sparse-bot", false, &["src/lib.rs".to_string()])
         .unwrap();
     assert!(missing_manifest_sync.changed_paths.is_empty());
-    let still_dirty = db.agent_status("sparse-bot").unwrap();
+    let still_dirty = db.lane_status("sparse-bot").unwrap();
     assert_eq!(still_dirty.workdir_state, Some(WorktreeState::DirtyTracked));
     assert!(still_dirty
         .workdir_changed_paths
         .iter()
         .any(|path| path.path == "README.md"));
     let cleanup = db
-        .record_agent_workdir(
+        .record_lane_workdir(
             "sparse-bot",
             Some("record missing manifest dirty".to_string()),
         )
@@ -8063,7 +8024,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agents",
+            "/v1/lanes",
             serde_json::json!({
                 "name": "api-bot",
                 "from_ref": "main",
@@ -8087,7 +8048,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agents",
+            "/v1/lanes",
             serde_json::json!({
                 "name": "api-sparse-bot",
                 "from_ref": "main",
@@ -8101,12 +8062,12 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     let api_sparse_spawn: serde_json::Value = api_sparse_response.body_json().unwrap();
     assert!(api_sparse_workdir.join("README.md").is_file());
     assert!(!api_sparse_workdir.join("src/lib.rs").exists());
-    let api_sparse_agent = api_sparse_spawn["agent_id"].as_str().unwrap();
+    let api_sparse_lane = api_sparse_spawn["lane_id"].as_str().unwrap();
     let api_sparse_read = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{api_sparse_agent}/read-file"),
+            &format!("/v1/lanes/{api_sparse_lane}/read-file"),
             serde_json::json!({ "path": "src/lib.rs", "hydrate": false }),
         ),
     );
@@ -8121,7 +8082,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{api_sparse_agent}/read-file"),
+            &format!("/v1/lanes/{api_sparse_lane}/read-file"),
             serde_json::json!({
                 "path": "src/lib.rs",
                 "include_neighbors": true
@@ -8153,7 +8114,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         &mut db,
         &api_request(
             "POST",
-            &format!("/v1/agents/{api_sparse_agent}/sync-workdir"),
+            &format!("/v1/lanes/{api_sparse_lane}/sync-workdir"),
             serde_json::json!({ "paths": ["src/lib.rs"], "include_neighbors": true }),
         ),
     );
@@ -8180,7 +8141,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_spawn",
+                "name": "crabdb.lane_spawn",
                 "arguments": {
                     "name": "mcp-bot",
                     "from_ref": "main",
@@ -8212,7 +8173,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
             "params": {
                 "name": "crabdb.read_file",
                 "arguments": {
-                    "agent": "mcp-bot",
+                    "lane": "mcp-bot",
                     "path": "README.md"
                 }
             }
@@ -8225,10 +8186,10 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         "hello\n"
     );
 
-    db.config_set("agent.worktrees_dir", ".crabdb/custom-worktrees")
+    db.config_set("lane.worktrees_dir", ".crabdb/custom-worktrees")
         .unwrap();
     let configured = db
-        .spawn_agent("configured-bot", Some("main"), true, None, None)
+        .spawn_lane("configured-bot", Some("main"), true, None, None)
         .unwrap();
     let configured_workdir = PathBuf::from(configured.workdir.unwrap());
     assert!(configured_workdir.ends_with(".crabdb/custom-worktrees/configured-bot"));
@@ -8238,7 +8199,7 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
     fs::create_dir_all(&nonempty).unwrap();
     fs::write(nonempty.join("keep.txt"), "do not delete\n").unwrap();
     let err = db
-        .spawn_agent_with_workdir(
+        .spawn_lane_with_workdir(
             "nonempty-bot",
             Some("main"),
             true,
@@ -8248,15 +8209,15 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("must be empty or absent"));
-    assert!(db.agent_details("nonempty-bot").is_err());
+    assert!(db.lane_details("nonempty-bot").is_err());
     assert_eq!(
         fs::read_to_string(nonempty.join("keep.txt")).unwrap(),
         "do not delete\n"
     );
 
-    let unsafe_inside_workspace = temp.path().join("unsafe-agent-workdir");
+    let unsafe_inside_workspace = temp.path().join("unsafe-lane-workdir");
     let err = db
-        .spawn_agent_with_workdir(
+        .spawn_lane_with_workdir(
             "unsafe-bot",
             Some("main"),
             true,
@@ -8267,10 +8228,10 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         .unwrap_err();
     assert!(err
         .to_string()
-        .contains("agent workdirs inside the workspace must live under"));
+        .contains("lane workdirs inside the workspace must live under"));
 
     let err = db
-        .spawn_agent_with_workdir(
+        .spawn_lane_with_workdir(
             "disabled-bot",
             Some("main"),
             false,
@@ -8281,11 +8242,11 @@ fn agent_spawn_supports_custom_and_configured_workdirs() {
         .unwrap_err();
     assert!(err
         .to_string()
-        .contains("custom agent workdir requires materialization"));
+        .contains("custom lane workdir requires materialization"));
 }
 
 #[test]
-fn large_roots_default_agents_to_no_materialize() {
+fn large_roots_default_lanes_to_no_materialize() {
     let temp = tempfile::tempdir().unwrap();
     let files_dir = temp.path().join("files");
     fs::create_dir_all(&files_dir).unwrap();
@@ -8321,17 +8282,17 @@ fn large_roots_default_agents_to_no_materialize() {
     assert_eq!(file_history[0].kind, crabdb::FileChangeKind::Added);
     assert_eq!(file_history[0].change_id, init.operation);
 
-    db.config_set("agent.default_materialize", "true").unwrap();
-    assert!(db.default_agent_materialize());
-    assert!(!db.default_agent_materialize_for_ref(Some("main")).unwrap());
+    db.config_set("lane.default_materialize", "true").unwrap();
+    assert!(db.default_lane_materialize());
+    assert!(!db.default_lane_materialize_for_ref(Some("main")).unwrap());
 
-    let materialize = db.default_agent_materialize_for_ref(Some("main")).unwrap();
+    let materialize = db.default_lane_materialize_for_ref(Some("main")).unwrap();
     let report = db
-        .spawn_agent("large-default-bot", Some("main"), materialize, None, None)
+        .spawn_lane("large-default-bot", Some("main"), materialize, None, None)
         .unwrap();
     assert!(report.workdir.is_none());
 
-    db.begin_agent_turn(
+    db.begin_lane_turn(
         "large-turn-bot",
         Some("main"),
         Some("large turn".to_string()),
@@ -8339,7 +8300,7 @@ fn large_roots_default_agents_to_no_materialize() {
     )
     .unwrap();
     assert!(db
-        .agent_details("large-turn-bot")
+        .lane_details("large-turn-bot")
         .unwrap()
         .branch
         .workdir
@@ -8347,7 +8308,7 @@ fn large_roots_default_agents_to_no_materialize() {
 }
 
 #[test]
-fn agent_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
+fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -8355,7 +8316,7 @@ fn agent_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = PathBuf::from(spawned.workdir.unwrap());
 
@@ -8370,27 +8331,24 @@ fn agent_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
 }
 
 #[test]
-fn agent_workdir_sync_refuses_dirty_and_force_refreshes() {
+fn lane_workdir_sync_refuses_dirty_and_force_refreshes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = spawned.workdir.unwrap();
     let readme = std::path::Path::new(&workdir).join("README.md");
     fs::write(&readme, "hello\ndirty\n").unwrap();
 
-    let err = db.sync_agent_workdir("doc-bot", false).unwrap_err();
+    let err = db.sync_lane_workdir("doc-bot", false).unwrap_err();
     assert!(matches!(err, Error::DirtyWorktreeWithMessage(_)));
     drop(db);
 
-    let synced = run_crabdb_json(
-        temp.path(),
-        &["agent", "sync-workdir", "doc-bot", "--force"],
-    );
+    let synced = run_crabdb_json(temp.path(), &["lane", "sync-workdir", "doc-bot", "--force"]);
     assert_eq!(synced["forced"], true);
     assert!(synced["changed_paths"]
         .as_array()
@@ -8400,37 +8358,37 @@ fn agent_workdir_sync_refuses_dirty_and_force_refreshes() {
     assert_eq!(fs::read_to_string(&readme).unwrap(), "hello\n");
 
     let db = CrabDb::open(temp.path()).unwrap();
-    let status = db.agent_status("doc-bot").unwrap();
+    let status = db.lane_status("doc-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
     drop(db);
 
     #[cfg(unix)]
     {
         let inode_before = fs::metadata(&readme).unwrap().ino();
-        let clean_sync = run_crabdb_json(temp.path(), &["agent", "sync-workdir", "doc-bot"]);
+        let clean_sync = run_crabdb_json(temp.path(), &["lane", "sync-workdir", "doc-bot"]);
         assert_eq!(clean_sync["forced"], false);
         assert!(clean_sync["changed_paths"].as_array().unwrap().is_empty());
         assert_eq!(fs::metadata(&readme).unwrap().ino(), inode_before);
     }
 
     fs::remove_dir_all(&workdir).unwrap();
-    let recreated = run_crabdb_json(temp.path(), &["agent", "sync-workdir", "doc-bot"]);
+    let recreated = run_crabdb_json(temp.path(), &["lane", "sync-workdir", "doc-bot"]);
     assert_eq!(recreated["forced"], false);
     assert_eq!(fs::read_to_string(&readme).unwrap(), "hello\n");
 }
 
 #[test]
-fn agent_workdir_watch_records_only_agent_branch() {
+fn lane_workdir_watch_records_only_lane_branch() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = spawned.workdir.unwrap();
-    let workdir_report = db.agent_workdir("doc-bot").unwrap();
+    let workdir_report = db.lane_workdir("doc-bot").unwrap();
     assert_eq!(workdir_report.workdir.as_deref(), Some(workdir.as_str()));
 
     fs::write(
@@ -8439,7 +8397,7 @@ fn agent_workdir_watch_records_only_agent_branch() {
     )
     .unwrap();
     let watched = db
-        .watch_agent_workdir(
+        .watch_lane_workdir(
             "doc-bot",
             Some("watch workdir".to_string()),
             std::time::Duration::from_millis(0),
@@ -8450,8 +8408,8 @@ fn agent_workdir_watch_records_only_agent_branch() {
     assert_eq!(watched.recorded_operations.len(), 1);
     assert_eq!(watched.changed_paths.len(), 1);
 
-    let agent_status = db.agent_status("doc-bot").unwrap();
-    assert_eq!(agent_status.workdir_state, Some(WorktreeState::Clean));
+    let lane_status = db.lane_status("doc-bot").unwrap();
+    assert_eq!(lane_status.workdir_state, Some(WorktreeState::Clean));
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
         "hello\n"
@@ -8461,14 +8419,14 @@ fn agent_workdir_watch_records_only_agent_branch() {
 }
 
 #[test]
-fn dirty_agent_workdir_must_be_recorded_before_merge() {
+fn dirty_lane_workdir_must_be_recorded_before_merge() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = spawned.workdir.unwrap();
     fs::write(
@@ -8476,13 +8434,13 @@ fn dirty_agent_workdir_must_be_recorded_before_merge() {
         "hello\nunrecorded\n",
     )
     .unwrap();
-    let status = db.agent_status("doc-bot").unwrap();
+    let status = db.lane_status("doc-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::DirtyTracked));
     assert_eq!(status.workdir_changed_paths.len(), 1);
 
-    let err = db.merge_agent("doc-bot", "main").unwrap_err();
+    let err = db.merge_lane("doc-bot", "main").unwrap_err();
     assert!(matches!(err, Error::DirtyWorktreeWithMessage(_)));
-    assert!(err.to_string().contains("agent record doc-bot"));
+    assert!(err.to_string().contains("lane record doc-bot"));
 
     db.enqueue_merge("doc-bot", "main", 0).unwrap();
     let run = db.run_merge_queue(None).unwrap();
@@ -8496,13 +8454,13 @@ fn dirty_agent_workdir_must_be_recorded_before_merge() {
         .contains("unrecorded changes"));
 
     let recorded = db
-        .record_agent_workdir("doc-bot", Some("record before merge".to_string()))
+        .record_lane_workdir("doc-bot", Some("record before merge".to_string()))
         .unwrap();
     assert!(recorded.operation.is_some());
-    let clean_status = db.agent_status("doc-bot").unwrap();
+    let clean_status = db.lane_status("doc-bot").unwrap();
     assert_eq!(clean_status.workdir_state, Some(WorktreeState::Clean));
     assert!(clean_status.workdir_changed_paths.is_empty());
-    let merged = db.merge_agent("doc-bot", "main").unwrap();
+    let merged = db.merge_lane("doc-bot", "main").unwrap();
     assert_eq!(merged.changed_paths.len(), 1);
     db.checkout("main", true).unwrap();
     assert_eq!(
@@ -8512,7 +8470,7 @@ fn dirty_agent_workdir_must_be_recorded_before_merge() {
 }
 
 #[test]
-fn materialized_agent_status_detects_manifest_candidate_paths() {
+fn materialized_lane_status_detects_manifest_candidate_paths() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("src")).unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -8521,7 +8479,7 @@ fn materialized_agent_status_detects_manifest_candidate_paths() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = PathBuf::from(spawned.workdir.unwrap());
     let readme_metadata = fs::symlink_metadata(workdir.join("README.md")).unwrap();
@@ -8540,7 +8498,7 @@ fn materialized_agent_status_detects_manifest_candidate_paths() {
     fs::write(workdir.join("README.md"), "hello\nchanged\n").unwrap();
     fs::remove_file(workdir.join("src/lib.rs")).unwrap();
 
-    let status = db.agent_status("doc-bot").unwrap();
+    let status = db.lane_status("doc-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::DirtyTracked));
     let changed = status
         .workdir_changed_paths
@@ -8557,7 +8515,7 @@ fn materialized_agent_status_detects_manifest_candidate_paths() {
     );
 
     let recorded = db
-        .record_agent_workdir("doc-bot", Some("record candidate paths".to_string()))
+        .record_lane_workdir("doc-bot", Some("record candidate paths".to_string()))
         .unwrap();
     assert!(recorded.operation.is_some());
     let recorded_paths = recorded
@@ -8574,13 +8532,13 @@ fn materialized_agent_status_detects_manifest_candidate_paths() {
         Some(&crabdb::FileChangeKind::Deleted)
     );
     assert_eq!(
-        db.agent_status("doc-bot").unwrap().workdir_state,
+        db.lane_status("doc-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
 }
 
 #[test]
-fn materialized_agent_status_and_record_without_clean_manifest() {
+fn materialized_lane_status_and_record_without_clean_manifest() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("src")).unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -8589,7 +8547,7 @@ fn materialized_agent_status_and_record_without_clean_manifest() {
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     let spawned = db
-        .spawn_agent("doc-bot", Some("main"), true, None, None)
+        .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
     let workdir = PathBuf::from(spawned.workdir.unwrap());
     let manifest = workdir.join(".crabdb/workdir-manifest.json");
@@ -8598,7 +8556,7 @@ fn materialized_agent_status_and_record_without_clean_manifest() {
     fs::remove_file(workdir.join("src/lib.rs")).unwrap();
     fs::write(workdir.join("src/new.rs"), "pub fn new() {}\n").unwrap();
 
-    let status = db.agent_status("doc-bot").unwrap();
+    let status = db.lane_status("doc-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::DirtyUntracked));
     let changed = status
         .workdir_changed_paths
@@ -8619,7 +8577,7 @@ fn materialized_agent_status_and_record_without_clean_manifest() {
     );
 
     let recorded = db
-        .record_agent_workdir("doc-bot", Some("record missing manifest".to_string()))
+        .record_lane_workdir("doc-bot", Some("record missing manifest".to_string()))
         .unwrap();
     assert!(recorded.operation.is_some());
     let recorded_paths = recorded
@@ -8641,24 +8599,24 @@ fn materialized_agent_status_and_record_without_clean_manifest() {
     );
     assert!(manifest.exists());
     assert_eq!(
-        db.agent_status("doc-bot").unwrap().workdir_state,
+        db.lane_status("doc-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
 }
 
 #[test]
-fn advisory_leases_coordinate_agent_paths() {
+fn advisory_leases_coordinate_lane_paths() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
-    db.spawn_agent("test-bot", Some("main"), false, None, None)
+    db.spawn_lane("test-bot", Some("main"), false, None, None)
         .unwrap();
 
-    let claim = db.claim_agent_path("doc-bot", "README.md", 600).unwrap();
+    let claim = db.claim_lane_path("doc-bot", "README.md", 600).unwrap();
     assert!(claim.claimed);
     assert_eq!(claim.path, "README.md");
     assert_eq!(claim.mode, "write");
@@ -8667,7 +8625,7 @@ fn advisory_leases_coordinate_agent_paths() {
     assert_eq!(lease.path.as_deref(), Some("README.md"));
     assert!(lease.file_id.is_some());
 
-    let conflicting_claim = db.claim_agent_path("test-bot", "README.md", 600).unwrap();
+    let conflicting_claim = db.claim_lane_path("test-bot", "README.md", 600).unwrap();
     assert!(!conflicting_claim.claimed);
     assert_eq!(conflicting_claim.conflicts.len(), 1);
     assert!(conflicting_claim
@@ -8705,28 +8663,21 @@ fn advisory_leases_coordinate_agent_paths() {
 }
 
 #[test]
-fn agent_claims_are_soft_leases_across_cli_api_and_mcp() {
+fn lane_claims_are_soft_leases_across_cli_api_and_mcp() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
-    db.spawn_agent("test-bot", Some("main"), false, None, None)
+    db.spawn_lane("test-bot", Some("main"), false, None, None)
         .unwrap();
     drop(db);
 
     let cli_claim = run_crabdb_json(
         temp.path(),
-        &[
-            "agent",
-            "claim",
-            "doc-bot",
-            "README.md",
-            "--ttl-secs",
-            "120",
-        ],
+        &["lane", "claim", "doc-bot", "README.md", "--ttl-secs", "120"],
     );
     assert_eq!(cli_claim["claimed"], true);
     assert_eq!(cli_claim["path"], "README.md");
@@ -8738,7 +8689,7 @@ fn agent_claims_are_soft_leases_across_cli_api_and_mcp() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/agents/test-bot/claims",
+            "/v1/lanes/test-bot/claims",
             serde_json::json!({
                 "path": "README.md",
                 "ttl_secs": 120
@@ -8767,7 +8718,7 @@ fn agent_claims_are_soft_leases_across_cli_api_and_mcp() {
     let tool_list = tools["result"]["tools"].as_array().unwrap();
     assert!(tool_list
         .iter()
-        .any(|tool| tool["name"] == "crabdb.agent_claim"));
+        .any(|tool| tool["name"] == "crabdb.lane_claim"));
 
     let mcp_conflict = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -8776,9 +8727,9 @@ fn agent_claims_are_soft_leases_across_cli_api_and_mcp() {
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_claim",
+                "name": "crabdb.lane_claim",
                 "arguments": {
-                    "agent": "test-bot",
+                    "lane": "test-bot",
                     "path": "README.md"
                 }
             }
@@ -8798,9 +8749,9 @@ fn agent_claims_are_soft_leases_across_cli_api_and_mcp() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "crabdb.agent_claim",
+                "name": "crabdb.lane_claim",
                 "arguments": {
-                    "agent": "doc-bot",
+                    "lane": "doc-bot",
                     "path": "README.md"
                 }
             }
@@ -8822,9 +8773,9 @@ fn local_api_and_mcp_expose_advisory_leases() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
-    db.spawn_agent("test-bot", Some("main"), false, None, None)
+    db.spawn_lane("test-bot", Some("main"), false, None, None)
         .unwrap();
 
     let acquired = crabdb::server::handle_http_request(
@@ -8833,7 +8784,7 @@ fn local_api_and_mcp_expose_advisory_leases() {
             "POST",
             "/v1/leases",
             serde_json::json!({
-                "agent": "doc-bot",
+                "lane": "doc-bot",
                 "path": "README.md",
                 "mode": "write",
                 "ttl_secs": 120
@@ -8842,7 +8793,7 @@ fn local_api_and_mcp_expose_advisory_leases() {
     );
     assert_eq!(acquired.status, 201);
     let acquired: serde_json::Value = acquired.body_json().unwrap();
-    assert_eq!(acquired["lease"]["ref_name"], "refs/agents/doc-bot");
+    assert_eq!(acquired["lease"]["ref_name"], "refs/lanes/doc-bot");
     assert_eq!(acquired["lease"]["path"], "README.md");
     assert_eq!(acquired["lease"]["mode"], "write");
     let lease_id = acquired["lease"]["lease_id"].as_str().unwrap().to_string();
@@ -8887,7 +8838,7 @@ fn local_api_and_mcp_expose_advisory_leases() {
             "params": {
                 "name": "crabdb.lease_acquire",
                 "arguments": {
-                    "agent": "test-bot",
+                    "lane": "test-bot",
                     "path": "README.md",
                     "mode": "read",
                     "ttl_secs": 120
@@ -8923,7 +8874,7 @@ fn local_api_and_mcp_expose_advisory_leases() {
             "params": {
                 "name": "crabdb.lease_acquire",
                 "arguments": {
-                    "agent": "test-bot",
+                    "lane": "test-bot",
                     "path": "README.md",
                     "mode": "read"
                 }
@@ -8990,13 +8941,13 @@ fn local_api_and_mcp_expose_advisory_leases() {
 }
 
 #[test]
-fn merge_agent_and_queue_enforce_readiness_blockers() {
+fn merge_lane_and_queue_enforce_readiness_blockers() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("approval-bot", Some("main"), false, None, None)
+    db.spawn_lane("approval-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "approval gated edit",
@@ -9005,8 +8956,8 @@ fn merge_agent_and_queue_enforce_readiness_blockers() {
         ]
     }))
     .unwrap();
-    db.apply_agent_patch("approval-bot", patch).unwrap();
-    db.request_agent_approval(
+    db.apply_lane_patch("approval-bot", patch).unwrap();
+    db.request_lane_approval(
         "approval-bot",
         "deploy.preview",
         "Publish preview before merge",
@@ -9017,10 +8968,10 @@ fn merge_agent_and_queue_enforce_readiness_blockers() {
     .unwrap();
 
     let dry_run = db
-        .merge_agent_with_options("approval-bot", "main", true)
+        .merge_lane_with_options("approval-bot", "main", true)
         .unwrap();
     assert_eq!(dry_run.changed_paths.len(), 1);
-    let direct_err = db.merge_agent("approval-bot", "main").unwrap_err();
+    let direct_err = db.merge_lane("approval-bot", "main").unwrap_err();
     assert!(matches!(direct_err, Error::InvalidInput(_)));
     assert!(direct_err.to_string().contains("not merge-ready"));
     assert!(direct_err.to_string().contains("pending_approvals"));
@@ -9037,19 +8988,19 @@ fn merge_agent_and_queue_enforce_readiness_blockers() {
         .contains("pending_approvals"));
     assert!(!temp.path().join("docs/approval.md").exists());
 
-    db.spawn_agent("test-bot", Some("main"), true, None, None)
+    db.spawn_lane("test-bot", Some("main"), true, None, None)
         .unwrap();
-    let workdir = db.agent_workdir("test-bot").unwrap().workdir.unwrap();
+    let workdir = db.lane_workdir("test-bot").unwrap().workdir.unwrap();
     fs::create_dir_all(std::path::Path::new(&workdir).join("docs")).unwrap();
     fs::write(
         std::path::Path::new(&workdir).join("docs/test.md"),
         "needs tests\n",
     )
     .unwrap();
-    db.record_agent_workdir("test-bot", Some("test gated edit".to_string()))
+    db.record_lane_workdir("test-bot", Some("test gated edit".to_string()))
         .unwrap();
     let failed = db
-        .run_agent_test(
+        .run_lane_test(
             "test-bot",
             vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
             None,
@@ -9057,12 +9008,12 @@ fn merge_agent_and_queue_enforce_readiness_blockers() {
         )
         .unwrap();
     assert!(!failed.success);
-    let readiness = db.agent_readiness("test-bot").unwrap();
+    let readiness = db.lane_readiness("test-bot").unwrap();
     assert!(readiness
         .blockers
         .iter()
         .any(|issue| issue.code == "latest_test_failed"));
-    let test_err = db.merge_agent("test-bot", "main").unwrap_err();
+    let test_err = db.merge_lane("test-bot", "main").unwrap_err();
     assert!(matches!(test_err, Error::InvalidInput(_)));
     assert!(test_err.to_string().contains("latest_test_failed"));
 }
@@ -9074,17 +9025,17 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("strict-bot", Some("main"), true, None, None)
+    db.spawn_lane("strict-bot", Some("main"), true, None, None)
         .unwrap();
-    let workdir = db.agent_workdir("strict-bot").unwrap().workdir.unwrap();
+    let workdir = db.lane_workdir("strict-bot").unwrap().workdir.unwrap();
     fs::create_dir_all(Path::new(&workdir).join("docs")).unwrap();
     fs::write(Path::new(&workdir).join("docs/strict.md"), "strict gates\n").unwrap();
-    db.record_agent_workdir("strict-bot", Some("strict gated edit".to_string()))
+    db.record_lane_workdir("strict-bot", Some("strict gated edit".to_string()))
         .unwrap();
 
-    db.config_set("agent.require_test_gate", "true").unwrap();
-    db.config_set("agent.required_test_suites", "unit").unwrap();
-    let readiness = db.agent_readiness("strict-bot").unwrap();
+    db.config_set("lane.require_test_gate", "true").unwrap();
+    db.config_set("lane.required_test_suites", "unit").unwrap();
+    let readiness = db.lane_readiness("strict-bot").unwrap();
     assert_eq!(readiness.status, "blocked");
     assert!(readiness
         .blockers
@@ -9100,21 +9051,21 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
         .any(|issue| issue.code == "missing_latest_eval"));
 
     let dry_run = db
-        .merge_agent_with_options("strict-bot", "main", true)
+        .merge_lane_with_options("strict-bot", "main", true)
         .unwrap();
     assert_eq!(dry_run.changed_paths.len(), 1);
-    let missing_test = db.merge_agent("strict-bot", "main").unwrap_err();
+    let missing_test = db.merge_lane("strict-bot", "main").unwrap_err();
     assert!(matches!(missing_test, Error::InvalidInput(_)));
     assert!(missing_test.to_string().contains("missing_latest_test"));
     assert!(!temp.path().join("docs/strict.md").exists());
 
     let passed_test = db
-        .run_agent_test_with_options(
+        .run_lane_test_with_options(
             "strict-bot",
             vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
             None,
             30,
-            AgentGateOptions {
+            LaneGateOptions {
                 suite: Some("unit".to_string()),
                 score: None,
                 threshold: None,
@@ -9123,17 +9074,17 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
         .unwrap();
     assert!(passed_test.success);
     assert_eq!(passed_test.suite.as_deref(), Some("unit"));
-    let readiness = db.agent_readiness("strict-bot").unwrap();
+    let readiness = db.lane_readiness("strict-bot").unwrap();
     assert!(readiness.ready);
     assert!(readiness
         .warnings
         .iter()
         .any(|issue| issue.code == "missing_latest_eval"));
 
-    db.config_set("agent.require_eval_gate", "true").unwrap();
-    db.config_set("agent.required_eval_suites", "policy-smoke")
+    db.config_set("lane.require_eval_gate", "true").unwrap();
+    db.config_set("lane.required_eval_suites", "policy-smoke")
         .unwrap();
-    let readiness = db.agent_readiness("strict-bot").unwrap();
+    let readiness = db.lane_readiness("strict-bot").unwrap();
     assert_eq!(readiness.status, "blocked");
     assert!(readiness
         .blockers
@@ -9143,17 +9094,17 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
         .blockers
         .iter()
         .any(|issue| issue.code == "missing_required_eval_suite"));
-    let missing_eval = db.merge_agent("strict-bot", "main").unwrap_err();
+    let missing_eval = db.merge_lane("strict-bot", "main").unwrap_err();
     assert!(matches!(missing_eval, Error::InvalidInput(_)));
     assert!(missing_eval.to_string().contains("missing_latest_eval"));
 
     let failed_eval = db
-        .run_agent_eval_with_options(
+        .run_lane_eval_with_options(
             "strict-bot",
             vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
             None,
             30,
-            AgentGateOptions {
+            LaneGateOptions {
                 suite: Some("policy-smoke".to_string()),
                 score: Some(0.4),
                 threshold: Some(0.9),
@@ -9162,24 +9113,24 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
         .unwrap();
     assert!(!failed_eval.success);
     assert_eq!(failed_eval.suite.as_deref(), Some("policy-smoke"));
-    let readiness = db.agent_readiness("strict-bot").unwrap();
+    let readiness = db.lane_readiness("strict-bot").unwrap();
     assert!(readiness
         .blockers
         .iter()
         .any(|issue| issue.code == "required_eval_suite_failed"));
-    let failed_suite = db.merge_agent("strict-bot", "main").unwrap_err();
+    let failed_suite = db.merge_lane("strict-bot", "main").unwrap_err();
     assert!(matches!(failed_suite, Error::InvalidInput(_)));
     assert!(failed_suite
         .to_string()
         .contains("required_eval_suite_failed"));
 
     let passed_eval = db
-        .run_agent_eval_with_options(
+        .run_lane_eval_with_options(
             "strict-bot",
             vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
             None,
             30,
-            AgentGateOptions {
+            LaneGateOptions {
                 suite: Some("policy-smoke".to_string()),
                 score: Some(0.95),
                 threshold: Some(0.9),
@@ -9188,11 +9139,11 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
         .unwrap();
     assert!(passed_eval.success);
     assert_eq!(passed_eval.suite.as_deref(), Some("policy-smoke"));
-    let readiness = db.agent_readiness("strict-bot").unwrap();
+    let readiness = db.lane_readiness("strict-bot").unwrap();
     assert!(readiness.ready);
     assert!(readiness.blockers.is_empty());
 
-    db.merge_agent("strict-bot", "main").unwrap();
+    db.merge_lane("strict-bot", "main").unwrap();
     db.checkout("main", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("docs/strict.md")).unwrap(),
@@ -9201,24 +9152,24 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
 }
 
 #[test]
-fn merge_queue_runs_agent_branch_into_main() {
+fn merge_queue_runs_lane_branch_into_main() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r##"{
-          "message": "agent adds docs",
+          "message": "lane adds docs",
           "edits": [
             {"op": "write", "path": "docs/guide.md", "content": "# Guide\n"}
           ]
         }"##,
     )
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
 
     let queued = db.enqueue_merge("doc-bot", "main", 10).unwrap();
     assert_eq!(queued.entry.status, "queued");
@@ -9258,18 +9209,18 @@ fn merge_queue_pauses_on_conflict() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
-          "message": "agent edits readme",
+          "message": "lane edits readme",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"}
           ]
         }"#,
     )
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
 
     fs::write(temp.path().join("README.md"), "hello\nhuman\n").unwrap();
     db.record(
@@ -9310,7 +9261,7 @@ fn merge_queue_pauses_on_conflict() {
     let shown = db.show_conflict(&conflicts[0].conflict_set_id).unwrap();
     assert_eq!(shown.conflict_set_id, conflicts[0].conflict_set_id);
     let explanation = shown.explanation.as_ref().unwrap();
-    assert_eq!(explanation.merge.source_ref, "refs/agents/doc-bot");
+    assert_eq!(explanation.merge.source_ref, "refs/lanes/doc-bot");
     assert_eq!(explanation.merge.target_ref, "refs/branches/main");
     assert_eq!(explanation.paths.len(), 1);
     assert_eq!(explanation.paths[0].path, "README.md");
@@ -9323,7 +9274,7 @@ fn merge_queue_pauses_on_conflict() {
     );
     assert_eq!(
         explanation.paths[0].lines[0].source.as_deref(),
-        Some("agent\n")
+        Some("lane\n")
     );
     assert_eq!(
         explanation.paths[0].lines[0]
@@ -9343,7 +9294,7 @@ fn merge_queue_pauses_on_conflict() {
     db.checkout("main", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
-        "hello\nagent\n"
+        "hello\nlane\n"
     );
 
     let queue_status: String = conn
@@ -9375,7 +9326,7 @@ fn merge_queue_pauses_on_conflict() {
 #[test]
 fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
     let (temp, mut db, conflict_id) =
-        conflicted_readme_workspace("hello\nagent-db\n", "hello\nhuman-db\n");
+        conflicted_readme_workspace("hello\nlane-db\n", "hello\nhuman-db\n");
     let report = db
         .resolve_conflict_manual(
             &conflict_id,
@@ -9395,7 +9346,7 @@ fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
     );
 
     let (temp, db, conflict_id) =
-        conflicted_readme_workspace("hello\nagent-cli\n", "hello\nhuman-cli\n");
+        conflicted_readme_workspace("hello\nlane-cli\n", "hello\nhuman-cli\n");
     drop(db);
     let shown = run_crabdb_json(
         temp.path(),
@@ -9442,7 +9393,7 @@ fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
     );
 
     let (temp, mut db, conflict_id) =
-        conflicted_readme_workspace("hello\nagent-api\n", "hello\nhuman-api\n");
+        conflicted_readme_workspace("hello\nlane-api\n", "hello\nhuman-api\n");
     let resolved = crabdb::server::handle_http_request(
         &mut db,
         &api_request(
@@ -9469,7 +9420,7 @@ fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
     );
 
     let (temp, mut db, conflict_id) =
-        conflicted_readme_workspace("hello\nagent-mcp\n", "hello\nhuman-mcp\n");
+        conflicted_readme_workspace("hello\nlane-mcp\n", "hello\nhuman-mcp\n");
     let resolved = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -9509,18 +9460,18 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("api-queue-bot", Some("main"), false, None, None)
+    db.spawn_lane("api-queue-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
-          "message": "agent edits readme",
+          "message": "lane edits readme",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent-api\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane-api\n"}
           ]
         }"#,
     )
     .unwrap();
-    db.apply_agent_patch("api-queue-bot", patch).unwrap();
+    db.apply_lane_patch("api-queue-bot", patch).unwrap();
 
     fs::write(temp.path().join("README.md"), "hello\nhuman-api\n").unwrap();
     db.record(
@@ -9629,7 +9580,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     );
     assert_eq!(
         shown["explanation"]["paths"][0]["lines"][0]["source"],
-        "agent-api\n"
+        "lane-api\n"
     );
 
     let mcp_show = crabdb::mcp::handle_json_rpc(
@@ -9700,7 +9651,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
         .iter()
         .any(|entry| entry["queue_id"] == queue_id && entry["status"] == "merged"));
 
-    db.spawn_agent("cancel-queue-bot", Some("main"), false, None, None)
+    db.spawn_lane("cancel-queue-bot", Some("main"), false, None, None)
         .unwrap();
     let mcp_add = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -9740,7 +9691,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     db.checkout("main", true).unwrap();
     assert_eq!(
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
-        "hello\nagent-api\n"
+        "hello\nlane-api\n"
     );
 }
 
@@ -10149,32 +10100,32 @@ fn workspace_lock_blocks_mutating_operations() {
 }
 
 #[test]
-fn agent_patch_records_message_and_event_indexes() {
+fn lane_patch_records_message_and_event_indexes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
           "session_id": "session-test",
-          "message": "agent edits readme",
+          "message": "lane edits readme",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"}
           ]
         }"#,
     )
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
 
     let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
     let messages: i64 = conn
         .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
         .unwrap();
     let events: i64 = conn
-        .query_row("SELECT COUNT(*) FROM agent_events", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM lane_events", [], |row| row.get(0))
         .unwrap();
     assert_eq!(messages, 1);
     assert_eq!(events, 2);
@@ -10187,19 +10138,19 @@ fn show_history_and_code_from_use_recorded_indexes() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
           "session_id": "session-show",
-          "message": "agent adds line",
+          "message": "lane adds line",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"}
           ]
         }"#,
     )
     .unwrap();
-    let applied = db.apply_agent_patch("doc-bot", patch).unwrap();
+    let applied = db.apply_lane_patch("doc-bot", patch).unwrap();
 
     match db.show(&applied.operation.0).unwrap() {
         ShowResult::Operation { value } => {
@@ -10217,20 +10168,20 @@ fn show_history_and_code_from_use_recorded_indexes() {
         })
         .unwrap();
     match db.show(&message_id).unwrap() {
-        ShowResult::Message { value } => assert_eq!(value.body, "agent adds line"),
+        ShowResult::Message { value } => assert_eq!(value.body, "lane adds line"),
         other => panic!("expected message show result, got {other:?}"),
     }
 
     let file_history = db.history_for_path("README.md").unwrap();
     assert!(file_history.file_history.len() >= 2);
 
-    let why = db.why("README.md:2", Some("refs/agents/doc-bot")).unwrap();
+    let why = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
     let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
     let line_history = db.history_for_line_id(&line_id).unwrap();
     assert!(!line_history.line_history.is_empty());
 
-    let by_agent = db.code_from("agent:doc-bot").unwrap();
-    assert!(by_agent
+    let by_lane = db.code_from("lane:doc-bot").unwrap();
+    assert!(by_lane
         .operations
         .iter()
         .any(|operation| operation.change_id == applied.operation));
@@ -10246,21 +10197,21 @@ fn index_rebuild_restores_derived_history_from_objects() {
     CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let mut db = CrabDb::open(temp.path()).unwrap();
-    db.spawn_agent("doc-bot", Some("main"), false, None, None)
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_str(
         r#"{
           "session_id": "session-rebuild",
-          "message": "agent edits readme",
+          "message": "lane edits readme",
           "edits": [
-            {"op": "write", "path": "README.md", "content": "hello\nagent\n"}
+            {"op": "write", "path": "README.md", "content": "hello\nlane\n"}
           ]
         }"#,
     )
     .unwrap();
-    db.apply_agent_patch("doc-bot", patch).unwrap();
+    db.apply_lane_patch("doc-bot", patch).unwrap();
     let turn = db
-        .begin_agent_turn(
+        .begin_lane_turn(
             "doc-bot",
             Some("main"),
             Some("rebuild trace span index".to_string()),
@@ -10268,7 +10219,7 @@ fn index_rebuild_restores_derived_history_from_objects() {
         )
         .unwrap();
     let span = db
-        .start_agent_trace_span(
+        .start_lane_trace_span(
             &turn.turn.turn_id,
             "tool_call",
             "cargo test",
@@ -10278,8 +10229,7 @@ fn index_rebuild_restores_derived_history_from_objects() {
         )
         .unwrap();
     let span_id = span.span.span_id.clone();
-    db.end_agent_trace_span(&span_id, "completed", None)
-        .unwrap();
+    db.end_lane_trace_span(&span_id, "completed", None).unwrap();
 
     let conn = Connection::open(temp.path().join(".crabdb/index/crabdb.sqlite")).unwrap();
     conn.execute_batch(
@@ -10289,7 +10239,7 @@ fn index_rebuild_restores_derived_history_from_objects() {
         DELETE FROM file_history;
         DELETE FROM line_history;
         DELETE FROM messages;
-        DELETE FROM agent_trace_span_events;
+        DELETE FROM lane_trace_span_events;
         ",
     )
     .unwrap();
@@ -10306,7 +10256,7 @@ fn index_rebuild_restores_derived_history_from_objects() {
     assert_eq!(messages, 1);
     let span_events: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM agent_trace_span_events WHERE span_id = ?1",
+            "SELECT COUNT(*) FROM lane_trace_span_events WHERE span_id = ?1",
             [&span_id],
             |row| row.get(0),
         )

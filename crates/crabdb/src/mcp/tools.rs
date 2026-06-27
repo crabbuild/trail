@@ -1,15 +1,15 @@
 use serde_json::Value;
 
-mod agent;
 mod annotations;
 mod collaboration;
 mod core;
+mod lane;
 mod merge;
 mod turns;
 
 pub(crate) fn tools() -> Value {
     let mut tools = core::tools();
-    append_tools(&mut tools, agent::tools());
+    append_tools(&mut tools, lane::tools());
     append_tools(&mut tools, collaboration::tools());
     append_tools(&mut tools, merge::tools());
     append_tools(&mut tools, turns::tools());

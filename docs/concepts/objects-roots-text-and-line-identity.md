@@ -46,7 +46,7 @@ Use line IDs when an agent needs precise edits:
 
 ```sh
 crabdb diff --dirty --show-line-ids
-crabdb agent diff doc-bot --patch --show-line-ids
+crabdb lane diff doc-bot --patch --show-line-ids
 ```
 
 Structured patches can replace a specific line by `line_id` and optional `expected_text`.
@@ -55,6 +55,6 @@ Structured patches can replace a specific line by `line_id` and optional `expect
 
 - Object model: `crates/crabdb/src/model/domain/objects.rs`
 - IDs: `crates/crabdb/src/ids.rs`
-- Line changes: `crates/crabdb/src/model/agent/changes.rs`
+- Line changes: `crates/crabdb/src/model/lane/changes.rs`
 - Tests: `same_position_rewrite_preserves_line_identity`, `copying_a_file_allocates_a_new_file_identity`, `small_text_policy_avoids_prolly_text_maps_for_tiny_files`
 

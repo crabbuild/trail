@@ -2,9 +2,9 @@ use super::*;
 
 impl CrabDb {
     pub fn show(&self, selector: &str) -> Result<ShowResult> {
-        if let Some(agent) = selector.strip_prefix("agent:") {
-            return Ok(ShowResult::Agent {
-                value: self.agent_branch(agent)?,
+        if let Some(lane) = selector.strip_prefix("lane:") {
+            return Ok(ShowResult::Lane {
+                value: self.lane_branch(lane)?,
             });
         }
         if selector.starts_with("ch_") {
@@ -27,8 +27,8 @@ impl CrabDb {
                 value: self.object_info(selector)?,
             });
         }
-        if let Ok(agent) = self.agent_branch(selector) {
-            return Ok(ShowResult::Agent { value: agent });
+        if let Ok(lane) = self.lane_branch(selector) {
+            return Ok(ShowResult::Lane { value: lane });
         }
         if let Ok(ref_record) = self.resolve_refish(selector) {
             return Ok(ShowResult::Ref { value: ref_record });
@@ -89,7 +89,7 @@ impl CrabDb {
                 serde_json::json!({
                     "message_id": message.id,
                     "role": message.role,
-                    "agent_id": message.agent_id,
+                    "lane_id": message.lane_id,
                     "session_id": message.session_id,
                     "change_id": message.change_id,
                     "body_bytes": message.body.len(),

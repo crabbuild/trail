@@ -27,11 +27,11 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/crabdb.sqlite";
-const CRABDB_SCHEMA_VERSION: i64 = 1;
+const CRABDB_SCHEMA_VERSION: i64 = 2;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";
-const AGENT_REF_PREFIX: &str = "refs/agents/";
+const LANE_REF_PREFIX: &str = "refs/lanes/";
 const ROOT_OBJECT_VERSION: u16 = 1;
 const TEXT_OBJECT_VERSION: u16 = 1;
 const OP_OBJECT_VERSION: u16 = 1;
@@ -41,7 +41,7 @@ const ANCHOR_OBJECT_VERSION: u16 = 1;
 const OBJECT_CACHE_MAX_ENTRIES: usize = 4096;
 const OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ORDER_KEY_STEP: u64 = 1024;
-const AGENT_TEST_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
+const LANE_TEST_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
 const DEFAULT_CRABIGNORE_PATTERNS: &[&str] = &[
     ".crabdb/",
     ".git/",
@@ -209,10 +209,10 @@ pub(crate) struct CommandRunResult {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AgentTraceSpanBuilder {
+pub(crate) struct LaneTraceSpanBuilder {
     span_id: String,
     trace_id: String,
-    agent_id: String,
+    lane_id: String,
     session_id: Option<String>,
     turn_id: Option<String>,
     parent_span_id: Option<String>,
@@ -383,8 +383,8 @@ impl Drop for WorkspaceLock {
     }
 }
 
-mod agent;
 mod core;
+mod lane;
 mod merge;
 mod record;
 mod storage;

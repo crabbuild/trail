@@ -79,7 +79,7 @@ pub(crate) fn render_backup_restore(
         println!("Workspace: {}", report.workspace);
         println!("Branch: {}", report.branch);
         println!("Replaced existing DB: {}", report.replaced_existing);
-        println!("Rewritten agent workdirs: {}", report.rewritten_workdirs);
+        println!("Rewritten lane workdirs: {}", report.rewritten_workdirs);
         println!(
             "Checked {} refs, {} roots, {} text objects",
             report.checked_refs, report.checked_roots, report.checked_texts

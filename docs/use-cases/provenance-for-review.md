@@ -11,12 +11,12 @@ crabdb code-from session-docs
 crabdb show <change-id>
 ```
 
-For an agent branch:
+For a lane branch:
 
 ```sh
-crabdb agent review doc-bot
-crabdb agent contribution doc-bot
-crabdb agent diff doc-bot --patch --show-line-ids
+crabdb lane review doc-bot
+crabdb lane contribution doc-bot
+crabdb lane diff doc-bot --patch --show-line-ids
 ```
 
 ## Review Signals
@@ -33,5 +33,5 @@ Look for:
 ## Code Facts Used
 
 - Provenance commands: `crates/crabdb/src/cli/command/inspect_args.rs`
-- Agent review reports: `crates/crabdb/src/model/agent/core.rs`
-- Tests: `show_history_and_code_from_use_recorded_indexes`, `agent_management_commands_have_backing_apis`
+- Lane review reports: `crates/crabdb/src/model/lane/core.rs`
+- Tests: `show_history_and_code_from_use_recorded_indexes`, `lane_management_commands_have_backing_apis`

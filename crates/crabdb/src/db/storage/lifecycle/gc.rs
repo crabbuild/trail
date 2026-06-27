@@ -79,7 +79,7 @@ impl CrabDb {
             reachable.insert(object_id.0);
         }
 
-        self.collect_agent_event_object_refs(&mut reachable, &mut errors)?;
+        self.collect_lane_event_object_refs(&mut reachable, &mut errors)?;
 
         let mut stmt = self.conn.prepare("SELECT object_id FROM anchors")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -95,13 +95,13 @@ impl CrabDb {
         Ok(reachable)
     }
 
-    pub(crate) fn collect_agent_event_object_refs(
+    pub(crate) fn collect_lane_event_object_refs(
         &self,
         reachable: &mut HashSet<String>,
         errors: &mut Vec<String>,
     ) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, payload_json FROM agent_events ORDER BY created_at, event_id",
+            "SELECT event_id, payload_json FROM lane_events ORDER BY created_at, event_id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -111,7 +111,7 @@ impl CrabDb {
             let payload = match serde_json::from_str::<serde_json::Value>(&payload_json) {
                 Ok(payload) => payload,
                 Err(err) => {
-                    errors.push(format!("failed to decode agent event {event_id}: {err}"));
+                    errors.push(format!("failed to decode lane event {event_id}: {err}"));
                     continue;
                 }
             };

@@ -28,7 +28,7 @@ pub(crate) struct TimelineArgs {
     #[serde(default)]
     pub(crate) session: Option<String>,
     #[serde(default)]
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
@@ -85,7 +85,7 @@ pub(crate) struct IgnoreCheckArgs {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GuardrailCheckArgs {
-    pub(crate) agent: Option<String>,
+    pub(crate) lane: Option<String>,
     pub(crate) action: String,
     pub(crate) summary: Option<String>,
     pub(crate) payload: Option<Value>,

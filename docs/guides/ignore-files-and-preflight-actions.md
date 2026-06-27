@@ -1,6 +1,6 @@
 # Ignore Files and Preflight Actions
 
-Use ignore rules for files that should not be recorded, and guardrails for proposed agent actions that need review.
+Use ignore rules for files that should not be recorded, and guardrails for proposed lane actions that need review.
 
 ## Manage Ignore Rules
 
@@ -15,11 +15,11 @@ CrabDB reads `.crabignore` and `.gitignore`, plus hardcoded protections for inte
 
 ## What Happens to Ignored Paths
 
-Status and normal recording skip ignored paths. Selected records and agent patches reject ignored paths unless you explicitly opt in:
+Status and normal recording skip ignored paths. Selected records and lane patches reject ignored paths unless you explicitly opt in:
 
 ```sh
 crabdb record --paths fixture.local --allow-ignored -m "capture fixture"
-crabdb agent apply-patch doc-bot --patch patch.json --allow-ignored
+crabdb lane apply-patch doc-bot --patch patch.json --allow-ignored
 ```
 
 Structured patch JSON can also set `"allow_ignored": true`.
@@ -28,7 +28,7 @@ Structured patch JSON can also set `"allow_ignored": true`.
 
 ```sh
 crabdb guardrails check \
-  --agent doc-bot \
+  --lane doc-bot \
   --action shell.exec \
   --summary "run cargo test" \
   --path README.md
@@ -50,7 +50,7 @@ crabdb approvals request doc-bot \
   --action shell.exec \
   --summary "run release smoke tests"
 
-crabdb approvals list --agent doc-bot --status pending
+crabdb approvals list --lane doc-bot --status pending
 crabdb approvals decide <approval-id> --decision approved --reviewer alice
 ```
 
@@ -62,4 +62,3 @@ After approval, matching approval-required reasons can become allowed for that a
 - Approval args: `crates/crabdb/src/cli/command/collaboration_args/approvals.rs`
 - Guardrail implementation: `crates/crabdb/src/db/core/workspace/guardrails.rs`
 - Tests: `local_api_and_mcp_manage_human_approval_gates`, `hardcoded_private_key_denylist_is_not_recorded`
-

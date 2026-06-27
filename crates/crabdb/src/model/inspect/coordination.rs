@@ -1,7 +1,7 @@
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LeaseRecord {
     pub lease_id: String,
-    pub agent_id: String,
+    pub lane_id: String,
     pub ref_name: String,
     pub path: Option<String>,
     pub file_id: Option<String>,
@@ -11,8 +11,8 @@ pub struct LeaseRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentClaimReport {
-    pub agent_id: String,
+pub struct LaneClaimReport {
+    pub lane_id: String,
     pub ref_name: String,
     pub path: String,
     pub mode: String,
@@ -31,8 +31,8 @@ pub struct AgentClaimReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentFileReadReport {
-    pub agent_id: String,
+pub struct LaneFileReadReport {
+    pub lane_id: String,
     pub ref_name: String,
     pub root_id: String,
     pub path: String,

@@ -53,7 +53,7 @@ pub(in crate::cli::command) struct LeaseCommand {
 
 #[derive(Args)]
 pub(in crate::cli::command) struct LeaseAcquireArgs {
-    pub(in crate::cli::command) agent: String,
+    pub(in crate::cli::command) lane: String,
     #[arg(long)]
     pub(in crate::cli::command) path: String,
     #[arg(long, value_enum, default_value = "write")]

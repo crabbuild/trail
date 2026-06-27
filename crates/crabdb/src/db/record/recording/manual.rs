@@ -49,7 +49,7 @@ impl CrabDb {
             .session_id
             .map(|session_id| {
                 validate_session_id(&session_id)?;
-                self.agent_session(&session_id)?;
+                self.lane_session(&session_id)?;
                 Ok::<String, Error>(session_id)
             })
             .transpose()?;

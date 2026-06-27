@@ -1,16 +1,16 @@
 use super::*;
 use crate::db::util::*;
 
-mod agent_gates;
-mod agent_lookup;
-mod agent_runs;
-mod agents;
 mod content;
 mod diff;
 mod file_build;
 mod files;
 mod git;
 mod ids;
+mod lane_gates;
+mod lane_lookup;
+mod lane_runs;
+mod lanes;
 mod lifecycle;
 mod line_changes;
 mod manifest;

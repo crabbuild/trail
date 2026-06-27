@@ -8,10 +8,10 @@ CrabDB records operations, messages, file changes, and line changes so reviewers
 crabdb timeline --limit 30
 crabdb timeline --branch main
 crabdb timeline --session session-docs
-crabdb timeline --agent doc-bot
+crabdb timeline --lane doc-bot
 ```
 
-Timeline returns recent operations scoped by branch, session, or agent.
+Timeline returns recent operations scoped by branch, session, or lane.
 
 ## Show
 
@@ -43,10 +43,10 @@ History uses derived indexes. If the indexes are missing or stale after manual d
 ## Code From
 
 ```sh
-crabdb code-from <message-or-session-or-agent>
+crabdb code-from <message-or-session-or-lane>
 ```
 
-This finds source operations and changed paths from a message, session, or agent branch.
+This finds source operations and changed paths from a message, session, or lane branch.
 
 ## Low-Level Inspection
 
@@ -66,4 +66,3 @@ Use these when debugging storage or implementing integrations. Most users should
 - Inspect args: `crates/crabdb/src/cli/command/inspect_args.rs`
 - Inspection models: `crates/crabdb/src/model/inspect`
 - Tests: `show_history_and_code_from_use_recorded_indexes`, `inspection_apis_decode_objects_roots_and_texts`, `map_debug_commands_decode_known_prolly_maps`
-

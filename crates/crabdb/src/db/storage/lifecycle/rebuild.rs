@@ -113,7 +113,7 @@ impl CrabDb {
             report.messages += 1;
         }
 
-        self.rebuild_agent_trace_span_event_index()?;
+        self.rebuild_lane_trace_span_event_index()?;
 
         Ok(report)
     }

@@ -1,6 +1,6 @@
 # CrabDB CLI Reference
 
-The CrabDB CLI supports workspace initialization, recording, inspection, branching, agents, sessions, approvals, leases, daemon operation, Git interop, and maintenance commands.
+The CrabDB CLI supports workspace initialization, recording, inspection, branching, lanes, sessions, approvals, leases, daemon operation, Git interop, and maintenance commands.
 
 Reference sections:
 
@@ -9,7 +9,7 @@ Reference sections:
 - [Recording and history](reference/cli/recording-and-history.md)
 - [Inspection](reference/cli/inspection.md)
 - [Branching, merging, and conflicts](reference/cli/branching-merging-and-conflicts.md)
-- [Agents](reference/cli/agents.md)
+- [Lanes](reference/cli/lanes.md)
 - [Sessions, approvals, anchors, and leases](reference/cli/sessions-approvals-anchors-and-leases.md)
 - [Integrations and maintenance](reference/cli/integrations-and-maintenance.md)
 - [Errors and output formats](reference/cli/errors-and-output-formats.md)

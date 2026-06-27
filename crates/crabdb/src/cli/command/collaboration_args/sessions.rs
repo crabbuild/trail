@@ -2,11 +2,11 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub(in crate::cli::command) enum SessionSubcommand {
-    /// Start a new session for a given agent.
+    /// Start a new session for a given lane.
     Start(SessionStartArgs),
-    /// Show current session attachment for all agents or one agent.
+    /// Show current session attachment for all lanes or one lane.
     Current(SessionCurrentArgs),
-    /// List recent sessions, optionally filtered by agent.
+    /// List recent sessions, optionally filtered by lane.
     List(SessionListArgs),
     /// Show one session with context and linked records.
     Show(SessionShowArgs),
@@ -24,7 +24,7 @@ pub(in crate::cli::command) struct SessionCommand {
 
 #[derive(Args)]
 pub(in crate::cli::command) struct SessionStartArgs {
-    pub(in crate::cli::command) agent: String,
+    pub(in crate::cli::command) lane: String,
     #[arg(long)]
     pub(in crate::cli::command) title: Option<String>,
     #[arg(long)]
@@ -34,12 +34,12 @@ pub(in crate::cli::command) struct SessionStartArgs {
 #[derive(Args)]
 pub(in crate::cli::command) struct SessionListArgs {
     #[arg(long)]
-    pub(in crate::cli::command) agent: Option<String>,
+    pub(in crate::cli::command) lane: Option<String>,
 }
 
 #[derive(Args)]
 pub(in crate::cli::command) struct SessionCurrentArgs {
-    pub(in crate::cli::command) agent: Option<String>,
+    pub(in crate::cli::command) lane: Option<String>,
 }
 
 #[derive(Args)]

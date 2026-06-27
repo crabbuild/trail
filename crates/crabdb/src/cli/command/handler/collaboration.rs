@@ -1,9 +1,9 @@
 use super::*;
 
-pub(super) fn handle_merge_agent_command(ctx: &RuntimeContext, args: MergeAgentArgs) -> Result<()> {
+pub(super) fn handle_merge_lane_command(ctx: &RuntimeContext, args: MergeLaneArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     validate_merge_strategy(args.strategy.as_deref())?;
-    let report = db.merge_agent_with_options(&args.name, &args.into, args.dry_run)?;
+    let report = db.merge_lane_with_options(&args.name, &args.into, args.dry_run)?;
     render_merge(&report, ctx.json, ctx.quiet)
 }
 
@@ -97,7 +97,7 @@ pub(super) fn handle_lease_command(ctx: &RuntimeContext, lease: LeaseCommand) ->
         LeaseSubcommand::Acquire(args) => {
             let mut db = open_db(ctx)?;
             let report = db.acquire_lease(
-                &args.agent,
+                &args.lane,
                 Some(&args.path),
                 args.mode.as_str(),
                 args.ttl_secs,
@@ -121,32 +121,32 @@ pub(super) fn handle_session_command(ctx: &RuntimeContext, session: SessionComma
     match session.command {
         SessionSubcommand::Start(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.start_agent_session(&args.agent, args.title, args.id)?;
+            let report = db.start_lane_session(&args.lane, args.title, args.id)?;
             render_session_start(&report, ctx.json, ctx.quiet)
         }
         SessionSubcommand::Current(args) => {
             let db = open_db(ctx)?;
-            let reports = db.current_agent_sessions(args.agent.as_deref())?;
+            let reports = db.current_lane_sessions(args.lane.as_deref())?;
             render_session_current(&reports, ctx.json, ctx.quiet)
         }
         SessionSubcommand::List(args) => {
             let db = open_db(ctx)?;
-            let sessions = db.list_agent_sessions(args.agent.as_deref())?;
+            let sessions = db.list_lane_sessions(args.lane.as_deref())?;
             render_session_list(&sessions, ctx.json, ctx.quiet)
         }
         SessionSubcommand::Show(args) => {
             let db = open_db(ctx)?;
-            let details = db.show_agent_session(&args.session_id)?;
+            let details = db.show_lane_session(&args.session_id)?;
             render_session_details(&details, ctx.json, ctx.quiet)
         }
         SessionSubcommand::Context(args) => {
             let db = open_db(ctx)?;
-            let report = db.agent_session_context(&args.session_id, args.limit)?;
+            let report = db.lane_session_context(&args.session_id, args.limit)?;
             render_session_context(&report, ctx.json, ctx.quiet)
         }
         SessionSubcommand::End(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.end_agent_session(&args.session_id, &args.status)?;
+            let report = db.end_lane_session(&args.session_id, &args.status)?;
             render_session_end(&report, ctx.json, ctx.quiet)
         }
     }
@@ -163,8 +163,8 @@ pub(super) fn handle_approvals_command(
                 .payload_json
                 .map(|payload| serde_json::from_str::<serde_json::Value>(&payload))
                 .transpose()?;
-            let report = db.request_agent_approval(
-                &args.agent,
+            let report = db.request_lane_approval(
+                &args.lane,
                 &args.action,
                 &args.summary,
                 payload,
@@ -175,18 +175,17 @@ pub(super) fn handle_approvals_command(
         }
         ApprovalsSubcommand::List(args) => {
             let db = open_db(ctx)?;
-            let approvals =
-                db.list_agent_approvals(args.agent.as_deref(), args.status.as_deref())?;
+            let approvals = db.list_lane_approvals(args.lane.as_deref(), args.status.as_deref())?;
             render_approval_list(&approvals, ctx.json, ctx.quiet)
         }
         ApprovalsSubcommand::Show(args) => {
             let db = open_db(ctx)?;
-            let approval = db.show_agent_approval(&args.approval_id)?;
+            let approval = db.show_lane_approval(&args.approval_id)?;
             render_approval(&approval, ctx.json, ctx.quiet)
         }
         ApprovalsSubcommand::Decide(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.decide_agent_approval(
+            let report = db.decide_lane_approval(
                 &args.approval_id,
                 args.decision.as_str(),
                 args.reviewer,

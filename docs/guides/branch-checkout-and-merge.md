@@ -40,14 +40,14 @@ Allowed strategies are `conservative`, `line-id-aware`, and `line_id_aware`.
 
 When conflicts occur, CrabDB records structured conflict sets for inspection and resolution.
 
-## Agent Merges
+## Lane Merges
 
 ```sh
-crabdb merge-agent doc-bot --into main --dry-run
-crabdb merge-agent doc-bot --into main
+crabdb merge-lane doc-bot --into main --dry-run
+crabdb merge-lane doc-bot --into main
 ```
 
-Agent merges run readiness checks before mutating the target branch.
+Lane merges run readiness checks before mutating the target branch.
 
 ## Merge Queue
 

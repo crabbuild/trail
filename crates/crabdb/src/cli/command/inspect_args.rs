@@ -9,7 +9,7 @@ pub(super) struct TimelineArgs {
     #[arg(long)]
     pub(super) session: Option<String>,
     #[arg(long)]
-    pub(super) agent: Option<String>,
+    pub(super) lane: Option<String>,
 }
 
 #[derive(Args)]

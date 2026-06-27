@@ -37,7 +37,7 @@ Some commands also have command-specific branch flags, such as `status --branch`
 The storage layer uses:
 
 - `refs/branches/<name>` for normal branches.
-- `refs/agents/<name>` for agent branches.
+- `refs/lanes/<name>` for lane branches.
 
 Branches store the current `change_id`, `root_id`, generation, and update timestamp.
 

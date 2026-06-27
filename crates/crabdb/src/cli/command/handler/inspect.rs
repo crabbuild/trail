@@ -6,7 +6,7 @@ pub(super) fn handle_timeline_command(ctx: &RuntimeContext, args: TimelineArgs) 
     let entries = db.timeline_query(
         branch,
         args.session.as_deref(),
-        args.agent.as_deref(),
+        args.lane.as_deref(),
         args.limit,
     )?;
     render_timeline(&entries, ctx.json, ctx.quiet)

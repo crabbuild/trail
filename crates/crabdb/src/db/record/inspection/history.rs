@@ -32,8 +32,8 @@ impl CrabDb {
 
     pub fn code_from(&self, selector: &str) -> Result<CodeFromResult> {
         let mut changes = Vec::new();
-        if let Some(agent) = selector.strip_prefix("agent:") {
-            changes.extend(self.agent_change_ids(agent)?);
+        if let Some(lane) = selector.strip_prefix("lane:") {
+            changes.extend(self.lane_change_ids(lane)?);
         } else if selector.starts_with("msg_") {
             let change_id: Option<String> = self
                 .conn
@@ -53,8 +53,8 @@ impl CrabDb {
             changes.push(ChangeId(selector.to_string()));
         } else if selector.starts_with("session_") {
             changes.extend(self.session_change_ids(selector)?);
-        } else if let Ok(agent) = self.agent_branch(selector) {
-            changes.extend(self.agent_change_ids(&agent.agent_id)?);
+        } else if let Ok(lane) = self.lane_branch(selector) {
+            changes.extend(self.lane_change_ids(&lane.lane_id)?);
         } else {
             changes.extend(self.session_change_ids(selector)?);
         }

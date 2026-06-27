@@ -8,7 +8,7 @@ Use the CLI scale benchmark to verify large-repo and agent orchestration behavio
 make bench-cli-scale-smoke
 ```
 
-The smoke target defaults to 1,000 synthetic files and is intended for pull-request CI. It exercises init, clean and dirty status, dirty diff, record, no-materialize agent patching, sparse and materialized workdirs, merge queue, daemon hot-path calls, Git import/update, index rebuild, GC dry-run, and backup create/verify. CI also checks selected wall-time and storage ceilings with:
+The smoke target defaults to 1,000 synthetic files and is intended for pull-request CI. It exercises init, clean and dirty status, dirty diff, record, no-materialize lane patching, sparse and materialized workdirs, merge queue, daemon hot-path calls, Git import/update, index rebuild, GC dry-run, and backup create/verify. CI also checks selected wall-time and storage ceilings with:
 
 ```sh
 python3 scripts/check-cli-scale-thresholds.py <results.tsv> name=max_seconds ... --metrics <metrics.tsv> key=max_value ...
@@ -76,15 +76,15 @@ Important hot-path rows:
 - `daemon_persisted_snapshot_status`
 - `daemon_persisted_snapshot_record_clean`
 - `daemon_persisted_snapshot_diff_dirty`
-- `agent_apply_patch`
-- `agent_readiness`
+- `lane_apply_patch`
+- `lane_readiness`
 - `merge_queue_run`
 - `daemon_cli_status`
 - `daemon_cli_session_start`
 - `daemon_cli_approval_request`
 - `daemon_cli_lease_acquire`
-- `daemon_cli_agent_readiness`
-- `daemon_cli_agent_trace_summary`
+- `daemon_cli_lane_readiness`
+- `daemon_cli_lane_trace_summary`
 - `daemon_cli_timeline`
 - `daemon_cli_why`
 - `daemon_cli_history`
@@ -96,7 +96,7 @@ Important hot-path rows:
 
 The latest local `/Volumes/Workspace` runs were measured on June 25, 2026 with the release binary:
 
-| Scale | Init | Direct clean status | Direct dirty diff | Direct dirty record | Daemon status | Daemon CLI record | Agent patch | Agent readiness | Merge apply |
+| Scale | Init | Direct clean status | Direct dirty diff | Direct dirty record | Daemon status | Daemon CLI record | Lane patch | Lane readiness | Merge apply |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10k files | 1.29s | 0.06s | 0.71s | 0.60s | 0.05s | 0.21s | 0.33s | 0.02s | 0.14s |
 | 100k files | 29.59s | 0.43s | 1.86s | 1.65s | 0.07s | 0.67s | 0.63s | 0.03s | 0.30s |
@@ -113,12 +113,12 @@ python3 scripts/check-cli-scale-thresholds.py \
   daemon_status=5 daemon_persisted_snapshot_status=5 \
   daemon_persisted_snapshot_record_clean=5 daemon_persisted_snapshot_diff_dirty=10 \
   daemon_cli_status=5 daemon_cli_record_dirty=10 \
-  daemon_cli_agent_readiness=5 daemon_cli_agent_trace_summary=5 \
+  daemon_cli_lane_readiness=5 daemon_cli_lane_trace_summary=5 \
   daemon_cli_merge_dry_run=10 daemon_cli_session_start=10 \
   daemon_cli_approval_request=10 daemon_cli_lease_acquire=10 \
   daemon_cli_timeline=10 daemon_cli_why=10 daemon_cli_history=10 \
-  daemon_cli_code_from=10 agent_apply_patch=10 agent_readiness=10 \
-  merge_agent_dry_run=10 merge_agent_apply=10 merge_queue_run=10 \
+  daemon_cli_code_from=10 lane_apply_patch=10 lane_readiness=10 \
+  merge_lane_dry_run=10 merge_lane_apply=10 merge_queue_run=10 \
   git_dirty_status=120 git_dirty_diff=120 git_dirty_record=120 \
   git_status_after_dirty_record=90 \
   --metrics /Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000/metrics.tsv \
@@ -137,7 +137,7 @@ The compact prolly-node slice was measured on June 25, 2026 after switching newl
 
 The end-to-end CLI smoke was also run at 1k and 100k files with no backup or materialized-workdir cases:
 
-| Scale | Source bytes | SQLite bytes | `repo_prolly_nodes` | `TextContent` bytes | Init | Direct clean status | Direct dirty diff | Direct dirty record | Daemon status | Daemon CLI record | Agent patch | Agent readiness | Merge apply |
+| Scale | Source bytes | SQLite bytes | `repo_prolly_nodes` | `TextContent` bytes | Init | Direct clean status | Direct dirty diff | Direct dirty record | Daemon status | Daemon CLI record | Lane patch | Lane readiness | Merge apply |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1k files | 73,759 | 10,895,360 | 8,916,992 | 460,369 | 0.31s | 0.02s | 0.05s | 0.05s | 0.05s | 0.01s | 0.02s | 0.00s | 0.01s |
 | 100k files | 7,496,402 | 279,113,728 | 191,139,840 | 45,043,050 | 11.23s | 0.49s | 1.42s | 1.36s | 0.05s | 0.20s | 0.41s | 0.03s | 0.24s |
@@ -148,7 +148,7 @@ Large agent orchestration should use the daemon and no-materialize/sparse workdi
 
 - Spawn agents without full materialization unless a task explicitly needs filesystem access.
 - Prefer structured patches, MCP/API file reads, readiness, merge preflight, and merge queue operations over full worktree scans.
-- If filesystem access is needed, materialize selected paths with `--paths` and hydrate more paths lazily through `agent read`.
+- If filesystem access is needed, materialize selected paths with `--paths` and hydrate more paths lazily through `lane read`.
 - Keep the daemon running for repeated CLI calls so status, record, trace, gate, handoff, and merge queue commands use a hot SQLite connection and watcher-backed dirty path cache.
 - Separate CrabDB handles can reuse the daemon's watcher-backed dirty snapshot only while the persisted snapshot is initialized, belongs to the same workspace, and the daemon PID is still alive. If the snapshot is missing, stale, overflowed, or too large, commands fall back to Git dirty paths when a committed Git baseline is available, then to the full persisted-index scan.
 

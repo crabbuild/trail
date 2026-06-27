@@ -5,15 +5,15 @@ use clap::Parser;
 use super::{render::*, *};
 
 use crabdb::{
-    Actor, AgentGateOptions, CrabDb, Error, InitImportMode, OperationKind, PatchDocument,
+    Actor, CrabDb, Error, InitImportMode, LaneGateOptions, OperationKind, PatchDocument,
     RecordOptions, Result,
 };
 
-mod agent;
 mod collaboration;
 mod daemon_rpc;
 mod errors;
 mod inspect;
+mod lane;
 mod maintenance;
 mod parsing;
 mod runtime;
@@ -127,14 +127,14 @@ fn run(cli: Cli) -> Result<()> {
         Command::Why(args) => inspect::handle_why_command(&ctx, args),
         Command::History(args) => inspect::handle_history_command(&ctx, args),
         Command::CodeFrom(args) => inspect::handle_code_from_command(&ctx, args),
-        Command::Agent(agent_command) => agent::handle_agent_command(&ctx, agent_command),
+        Command::Lane(lane_command) => lane::handle_lane_command(&ctx, lane_command),
         Command::Session(session_command) => {
             collaboration::handle_session_command(&ctx, session_command)
         }
         Command::Approvals(approvals_command) => {
             collaboration::handle_approvals_command(&ctx, approvals_command)
         }
-        Command::MergeAgent(args) => collaboration::handle_merge_agent_command(&ctx, args),
+        Command::MergeLane(args) => collaboration::handle_merge_lane_command(&ctx, args),
         Command::MergeQueue(queue) => collaboration::handle_merge_queue_command(&ctx, queue),
         Command::Conflicts(conflicts) => collaboration::handle_conflicts_command(&ctx, conflicts),
         Command::Anchor(anchor) => collaboration::handle_anchor_command(&ctx, anchor),

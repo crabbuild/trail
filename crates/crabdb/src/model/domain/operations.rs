@@ -27,11 +27,11 @@ pub enum OperationKind {
     Checkout,
     Branch,
     Merge,
-    AgentSpawn,
-    AgentPatch,
-    AgentRecord,
-    AgentRewind,
-    AgentMerge,
+    LaneSpawn,
+    LanePatch,
+    LaneRecord,
+    LaneRewind,
+    LaneMerge,
     GitExport,
 }
 
@@ -44,7 +44,7 @@ pub struct Actor {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ActorKind {
     Human,
-    Agent,
+    Lane,
     System,
 }
 
@@ -63,9 +63,9 @@ impl Actor {
         }
     }
 
-    pub fn agent(id: impl Into<String>) -> Self {
+    pub fn lane(id: impl Into<String>) -> Self {
         Self {
-            kind: ActorKind::Agent,
+            kind: ActorKind::Lane,
             id: id.into(),
         }
     }

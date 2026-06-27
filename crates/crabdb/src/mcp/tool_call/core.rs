@@ -39,7 +39,7 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             tool_result(db.timeline_query(
                 args.branch.as_deref(),
                 args.session.as_deref(),
-                args.agent.as_deref(),
+                args.lane.as_deref(),
                 args.limit.unwrap_or(30),
             )?)
         }
@@ -107,7 +107,7 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
         "crabdb.guardrail_check" => {
             let args: GuardrailCheckArgs = parse_args(arguments)?;
             tool_result(db.guardrail_check(
-                args.agent.as_deref(),
+                args.lane.as_deref(),
                 &args.action,
                 args.summary.as_deref(),
                 args.payload,

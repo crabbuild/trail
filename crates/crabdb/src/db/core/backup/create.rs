@@ -34,7 +34,7 @@ impl CrabDb {
     pub(crate) fn create_backup_inner(&self, output: &Path) -> Result<BackupCreateReport> {
         fs::create_dir_all(output.join("index"))?;
         fs::create_dir_all(output.join("refs/branches"))?;
-        fs::create_dir_all(output.join("refs/agents"))?;
+        fs::create_dir_all(output.join("refs/lanes"))?;
 
         fs::copy(self.db_dir.join(CONFIG_FILE), output.join(CONFIG_FILE))?;
         fs::copy(self.db_dir.join(HEAD_FILE), output.join(HEAD_FILE))?;

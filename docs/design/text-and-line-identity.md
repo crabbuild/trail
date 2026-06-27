@@ -1,6 +1,6 @@
 # Text and Line Identity
 
-This design section is advanced/internal. It explains how CrabDB classifies file content, stores text, and preserves line identity for provenance and agent patching.
+This design section is advanced/internal. It explains how CrabDB classifies file content, stores text, and preserves line identity for provenance and lane patching.
 
 ## Why Line Identity Exists
 
@@ -132,7 +132,7 @@ sequenceDiagram
     participant Patch as patch JSON
     participant DB as CrabDb
     participant Text as TextContent
-    participant Branch as Agent branch
+    participant Branch as Lane branch
 
     Host->>Patch: replace_line(path, line_id, expected_text, new_text)
     Patch->>DB: apply structured patch
@@ -163,7 +163,7 @@ This supports `why`, `history --line-id`, and line-focused review workflows.
 
 ## Merges and Line Identity
 
-Line-aware merge paths can combine non-overlapping line edits more safely than path-only merging. Conflict detection can use file changes, line changes, and root diffs. Agent merge readiness checks conflict sets before allowing merge.
+Line-aware merge paths can combine non-overlapping line edits more safely than path-only merging. Conflict detection can use file changes, line changes, and root diffs. Lane merge readiness checks conflict sets before allowing merge.
 
 The current merge strategy validator accepts `conservative`, `line-id-aware`, and `line_id_aware`, while agent config currently accepts `conservative`.
 
@@ -182,4 +182,4 @@ The current merge strategy validator accepts `conservative`, `line-id-aware`, an
 - Content loading/materialization: `crates/crabdb/src/db/storage/content.rs`
 - Line utilities: `crates/crabdb/src/db/util/line_ops.rs`
 - Patch schema: `crates/crabdb/src/model/inspect/patch.rs`
-- Tests: `same_position_rewrite_preserves_line_identity`, `minimal_text_policy_uses_lazy_line_trackable_text`, `agent_patch_can_replace_stable_line_with_expected_text`
+- Tests: `same_position_rewrite_preserves_line_identity`, `minimal_text_policy_uses_lazy_line_trackable_text`, `lane_patch_can_replace_stable_line_with_expected_text`

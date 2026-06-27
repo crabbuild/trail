@@ -6,9 +6,9 @@ impl CrabDb {
             self.get_ref(source)?;
             return Ok(source.to_string());
         }
-        let agent_ref_name = agent_ref(source);
-        if self.try_get_ref(&agent_ref_name)?.is_some() {
-            return Ok(agent_ref_name);
+        let lane_ref_name = lane_ref(source);
+        if self.try_get_ref(&lane_ref_name)?.is_some() {
+            return Ok(lane_ref_name);
         }
         let branch_ref_name = branch_ref(source);
         self.get_ref(&branch_ref_name)?;
@@ -63,14 +63,14 @@ impl CrabDb {
             .target_ref
             .strip_prefix(MAIN_REF_PREFIX)
             .unwrap_or(&entry.target_ref);
-        if let Some(agent) = entry.source_ref.strip_prefix(AGENT_REF_PREFIX) {
-            return self.merge_agent_unlocked(agent, target, false, false);
+        if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
+            return self.merge_lane_unlocked(lane, target, false, false);
         }
         if let Some(source) = entry.source_ref.strip_prefix(MAIN_REF_PREFIX) {
             return self.merge_branches_unlocked(source, target, false);
         }
         Err(Error::InvalidInput(format!(
-            "merge queue source `{}` must be an agent or branch ref",
+            "merge queue source `{}` must be a lane or branch ref",
             entry.source_ref
         )))
     }
@@ -82,8 +82,8 @@ impl CrabDb {
     ) -> Result<MergeContext> {
         let source_ref = self.get_ref(source_ref_name)?;
         let target_ref = self.get_ref(target_ref_name)?;
-        let base_change = if let Some(agent) = source_ref_name.strip_prefix(AGENT_REF_PREFIX) {
-            self.agent_branch(agent)?.base_change
+        let base_change = if let Some(lane) = source_ref_name.strip_prefix(LANE_REF_PREFIX) {
+            self.lane_branch(lane)?.base_change
         } else {
             self.common_parent_hint(&source_ref.change_id, &target_ref.change_id)?
         };

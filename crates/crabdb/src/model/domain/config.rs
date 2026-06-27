@@ -11,7 +11,7 @@ pub struct CrabConfig {
     pub workspace: WorkspaceConfig,
     pub recording: RecordingConfig,
     pub text: TextConfig,
-    pub agent: AgentConfig,
+    pub lane: LaneConfig,
     pub git: GitConfig,
     #[serde(default = "default_guardrails_config")]
     pub guardrails: GuardrailsConfig,
@@ -40,7 +40,7 @@ pub struct TextConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentConfig {
+pub struct LaneConfig {
     pub default_materialize: bool,
     #[serde(default)]
     pub require_test_gate: bool,
@@ -120,15 +120,15 @@ pub struct IgnoreCheckReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GuardrailCheckReport {
-    pub agent: Option<AgentDetails>,
+    pub lane: Option<LaneDetails>,
     pub action: String,
     pub summary: Option<String>,
     pub decision: String,
     pub reasons: Vec<GuardrailReason>,
     pub path_checks: Vec<IgnoreCheckReport>,
-    pub pending_approvals: Vec<AgentApproval>,
+    pub pending_approvals: Vec<LaneApproval>,
     #[serde(default)]
-    pub satisfied_approvals: Vec<AgentApproval>,
+    pub satisfied_approvals: Vec<LaneApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_request: Option<GuardrailApprovalRequest>,
 }
@@ -144,7 +144,7 @@ pub struct GuardrailReason {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GuardrailApprovalRequest {
-    pub agent: Option<String>,
+    pub lane: Option<String>,
     pub action: String,
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,7 +170,7 @@ impl CrabConfig {
                 max_line_bytes: 1024 * 1024,
                 preserve_similarity: 0.45,
             },
-            agent: AgentConfig {
+            lane: LaneConfig {
                 default_materialize: false,
                 require_test_gate: false,
                 require_eval_gate: false,

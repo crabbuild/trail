@@ -106,7 +106,7 @@ pub(super) fn handle_system_route(
         let entries = db.timeline_query(
             utils::query_value(query, "branch"),
             utils::query_value(query, "session"),
-            utils::query_value(query, "agent"),
+            utils::query_value(query, "lane"),
             limit,
         )?;
         return Ok(Some(utils::json_response(200, "OK", &entries)?));
@@ -188,7 +188,7 @@ pub(super) fn handle_system_route(
         use crate::server::request_types::GuardrailCheckRequest;
         let body: GuardrailCheckRequest = serde_json::from_slice(&request.body)?;
         let report = db.guardrail_check(
-            body.agent.as_deref(),
+            body.lane.as_deref(),
             &body.action,
             body.summary.as_deref(),
             body.payload,

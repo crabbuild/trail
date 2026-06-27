@@ -116,7 +116,7 @@ pub enum ShowResult {
     Operation { value: OperationShow },
     Message { value: Message },
     Ref { value: RefRecord },
-    Agent { value: AgentBranch },
+    Lane { value: LaneBranch },
     Object { value: ObjectInfo },
 }
 

@@ -2,10 +2,10 @@
 
 Structured patches are used by:
 
-- `crabdb agent apply-patch`
-- `crabdb agent turn apply-patch`
-- HTTP `POST /v1/agents/{agent_or_id}/patches`
-- HTTP `POST /v1/agent/turns/{turn_id}/patches`
+- `crabdb lane apply-patch`
+- `crabdb lane turn apply-patch`
+- HTTP `POST /v1/lanes/{lane_or_id}/patches`
+- HTTP `POST /v1/lane/turns/{turn_id}/patches`
 - MCP `crabdb.apply_patch`
 
 ## Patch Document
@@ -123,5 +123,5 @@ Patch paths are normalized and checked. Internal paths and hardcoded private pat
 - Public patch schema: `crates/crabdb/src/model/inspect/patch.rs`
 - HTTP patch schema: `crates/crabdb/src/server/request_types/patches.rs`
 - HTTP parser: `crates/crabdb/src/server/route/utils.rs`
-- Patch policy: `crates/crabdb/src/db/agent/patch_policy.rs`
+- Patch policy: `crates/crabdb/src/db/lane/patch_policy.rs`
 

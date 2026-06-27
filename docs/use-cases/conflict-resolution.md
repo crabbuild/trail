@@ -57,7 +57,7 @@ Run status, diff, and relevant test/eval gates:
 ```sh
 crabdb status
 crabdb diff --dirty --patch
-crabdb agent readiness doc-bot
+crabdb lane readiness doc-bot
 ```
 
 ## Code Facts Used

@@ -61,7 +61,7 @@ crabdb backup verify /tmp/crabdb-backup
 crabdb backup restore /tmp/crabdb-backup
 ```
 
-Restore rewrites materialized agent workdir paths so they point inside the restored workspace.
+Restore rewrites materialized lane workdir paths so they point inside the restored workspace.
 
 ## Garbage Collection
 

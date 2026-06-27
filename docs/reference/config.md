@@ -16,13 +16,13 @@ Use `crabdb config list`, `get`, and `set` to inspect and edit workspace config.
 | `text.opaque_text_max_bytes` | u64 | no | Greater than zero. |
 | `text.max_line_bytes` | u64 | no | Greater than zero. |
 | `text.preserve_similarity` | f32 | no | Finite value from `0.0` to `1.0`. |
-| `agent.default_materialize` | bool | no | Boolean parser values. |
-| `agent.require_test_gate` | bool | no | Boolean parser values. |
-| `agent.require_eval_gate` | bool | no | Boolean parser values. |
-| `agent.required_test_suites` | list | no | Comma, semicolon, or newline separated suite names. |
-| `agent.required_eval_suites` | list | no | Comma, semicolon, or newline separated suite names. |
-| `agent.worktrees_dir` | path | no | Relative path normalized inside workspace. |
-| `agent.merge_strategy` | string | no | `conservative`. |
+| `lane.default_materialize` | bool | no | Boolean parser values. |
+| `lane.require_test_gate` | bool | no | Boolean parser values. |
+| `lane.require_eval_gate` | bool | no | Boolean parser values. |
+| `lane.required_test_suites` | list | no | Comma, semicolon, or newline separated suite names. |
+| `lane.required_eval_suites` | list | no | Comma, semicolon, or newline separated suite names. |
+| `lane.worktrees_dir` | path | no | Relative path normalized inside workspace. |
+| `lane.merge_strategy` | string | no | `conservative`. |
 | `git.export_trailers` | bool | no | Boolean parser values. |
 | `guardrails.policy` | policy | no | `decision:scope:pattern` rules. |
 

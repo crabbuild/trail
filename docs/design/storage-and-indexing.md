@@ -37,7 +37,7 @@ Initialization creates:
   HEAD
   index/crabdb.sqlite
   refs/branches/
-  refs/agents/
+  refs/lanes/
   worktrees/
 ```
 
@@ -45,7 +45,7 @@ Additional files may appear later:
 
 - `.crabdb/daemon.json`: daemon endpoint registration.
 - `.crabdb/daemon.token`: generated token file when daemon auth creates one.
-- Agent workdir manifests inside materialized workdirs.
+- Lane workdir manifests inside materialized workdirs.
 - Sparse workdir manifests inside sparse materializations.
 
 The `.crabignore` file lives at the workspace root, not inside `.crabdb`.
@@ -60,9 +60,9 @@ The schema contains these major table groups:
 - Operation indexes: `operations`, `operation_parents`
 - History indexes: `file_history`, `line_history`
 - Messages and anchors: `messages`, `anchors`
-- Agent identity and branch state: `agents`, `agent_branches`
-- Agent activity: `agent_sessions`, `agent_turns`, `agent_events`, `agent_trace_span_events`
-- Human gates and resumable state: `agent_approvals`, `agent_run_states`
+- Lane identity and branch state: `lanes`, `lane_branches`
+- Agent activity: `lane_sessions`, `lane_turns`, `lane_events`, `lane_trace_span_events`
+- Human gates and resumable state: `lane_approvals`, `lane_run_states`
 - Coordination: `leases`
 - Merge state: `merge_queue`, `merge_results`, `conflict_sets`
 - Git interop: `git_mappings`
@@ -162,7 +162,7 @@ Rebuild flow:
 4. Delete derived operation/history/message rows.
 5. Re-index reachable operations.
 6. Re-index messages.
-7. Rebuild the agent trace span event index.
+7. Rebuild the lane trace span event index.
 
 `rebuild_indexes_with_rich_text` first hydrates lazy text on the current branch into rich text indexes, records a system checkpoint operation, then rebuilds indexes.
 
@@ -188,13 +188,13 @@ Garbage collection works from reachability:
 - Ref roots and operation objects are roots of reachability.
 - Operations reference roots, parents, messages, conflict sets, and event payload objects.
 - Roots reference file entries and text/blob content.
-- Agent events and coordination records can reference object IDs.
+- Lane events and coordination records can reference object IDs.
 
 `gc --dry-run` reports without pruning. Normal GC deletes unreachable known objects while preserving reachable roots and references.
 
 ## Backup and Restore
 
-Backups include SQLite data and worktree-related state. Restore can rewrite materialized agent workdir paths so restored agent workdirs point inside the restored workspace. Backup creation rejects output inside `.crabdb` to avoid recursive or unsafe backups.
+Backups include SQLite data and worktree-related state. Restore can rewrite materialized lane workdir paths so restored lane workdirs point inside the restored workspace. Backup creation rejects output inside `.crabdb` to avoid recursive or unsafe backups.
 
 ## Failure Modes
 
@@ -202,7 +202,7 @@ Backups include SQLite data and worktree-related state. Restore can rewrite mate
 - Missing operation object referenced by a ref: index rebuild reports an error.
 - Corrupt operation/message object bytes: index rebuild reports decode errors.
 - Missing worktree index baseline: status may fall back to a fuller scan.
-- Dirty or missing workdir manifest: agent workdir status becomes conservative.
+- Dirty or missing workdir manifest: lane workdir status becomes conservative.
 
 ## When to Change This Area
 

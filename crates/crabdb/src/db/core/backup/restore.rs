@@ -38,7 +38,7 @@ impl CrabDb {
         let restore_result = (|| -> Result<()> {
             fs::create_dir_all(temp_dir.join("index"))?;
             fs::create_dir_all(temp_dir.join("refs/branches"))?;
-            fs::create_dir_all(temp_dir.join("refs/agents"))?;
+            fs::create_dir_all(temp_dir.join("refs/lanes"))?;
             fs::copy(backup_path.join(CONFIG_FILE), temp_dir.join(CONFIG_FILE))?;
             fs::copy(backup_path.join(HEAD_FILE), temp_dir.join(HEAD_FILE))?;
             fs::copy(
@@ -75,7 +75,7 @@ impl CrabDb {
             };
 
         let mut db = CrabDb::open(&workspace_root)?;
-        let rewritten_workdirs = db.rewrite_restored_agent_workdir_paths()?;
+        let rewritten_workdirs = db.rewrite_restored_lane_workdir_paths()?;
         let fsck = db.fsck()?;
         if !fsck.errors.is_empty() {
             return Err(Error::Corrupt(format!(

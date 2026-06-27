@@ -104,12 +104,12 @@ Routing flow:
 3. Return health without auth.
 4. Enforce auth.
 5. Dispatch system routes.
-6. Dispatch agent/collaboration routes.
+6. Dispatch lane/collaboration routes.
 7. Return invalid input for unknown endpoints.
 
 System routes cover core workspace operations: OpenAPI, doctor, status, record, diff, config, timeline, why, history, code-from, ignore, and guardrails.
 
-Agent routes cover agent lifecycle, sessions, approvals, runs, traces, turns, leases, anchors, merge queue, conflicts, and agent merge.
+Lane routes cover lane lifecycle, sessions, approvals, runs, traces, turns, leases, anchors, merge queue, conflicts, and lane merge.
 
 ```mermaid
 flowchart TB
@@ -118,7 +118,7 @@ flowchart TB
     Health{"GET /v1/health?"}
     Auth{"Authorized?<br/>Bearer or x-crabdb-token"}
     System{"System route?"}
-    Agent{"Agent/collaboration route?"}
+    Lane{"Lane/collaboration route?"}
     Core["Call CrabDb method"]
     Json["Serialize report JSON"]
     Error["Error JSON<br/>with CrabDB code"]
@@ -129,9 +129,9 @@ flowchart TB
     Auth -- "no" --> Error
     Auth -- "yes" --> System
     System -- "yes" --> Core
-    System -- "no" --> Agent
-    Agent -- "yes" --> Core
-    Agent -- "no" --> Error
+    System -- "no" --> Lane
+    Lane -- "yes" --> Core
+    Lane -- "no" --> Error
     Core --> Json
 ```
 
@@ -184,7 +184,7 @@ Auto-discovery:
 - Try daemon command.
 - Fall back to local execution for daemon-unavailable errors when discovery was automatic.
 
-Supported daemon-routed commands include `status`, `record`, `diff`, selected `agent` commands, `merge-agent`, and `merge-queue`.
+Supported daemon-routed commands include `status`, `record`, `diff`, selected `lane` commands, `merge-lane`, and `merge-queue`.
 
 ```mermaid
 sequenceDiagram
@@ -216,7 +216,7 @@ The OpenAPI document is generated in code from grouped path builders and schema 
 Path groups:
 
 - Core workspace routes.
-- Agent lifecycle and branch routes.
+- Lane lifecycle and branch routes.
 - Collaboration routes.
 - Turn, event, span, and run routes.
 
@@ -247,10 +247,10 @@ MCP tool calls dispatch into `CrabDb` methods through `mcp/tool_call` modules. T
 Tool groups mirror product workflows:
 
 - Core: doctor, status, diff, timeline, why, history, code-from, config, ignore, guardrails.
-- Agent: spawn, claim, list, show, status, contribution, gates, readiness, handoff, remove.
+- Lane: spawn, claim, list, show, status, contribution, gates, readiness, handoff, remove.
 - Collaboration: sessions, approvals, runs, leases, anchors.
 - Merge: merge queue and conflicts.
-- Turns: begin/end turn, messages, events, spans, patch application, agent diff, tests/evals, workdir sync/read.
+- Turns: begin/end turn, messages, events, spans, patch application, lane diff, tests/evals, workdir sync/read.
 
 Risk annotations mark tools as read-only, workspace write, destructive write, or open-world write. This helps MCP hosts make safer decisions before calling tools.
 
@@ -260,18 +260,18 @@ Static resources expose:
 
 - status
 - doctor
-- agents
+- lanes
 - merge queue
 - conflicts
 - OpenAPI
 - documentation resources
 
-Resource templates expose specific agent, session, turn, conflict, approval, run, and span reports.
+Resource templates expose specific lane, session, turn, conflict, approval, run, and span reports.
 
 Prompts guide hosts through:
 
-- agent task execution
-- agent review
+- lane task execution
+- lane review
 - conflict resolution
 
 The prompts are procedural guidance for hosts; the tools are the executable interface.
@@ -281,8 +281,8 @@ flowchart LR
     Host["MCP host"]
     Server["crabdb mcp<br/>stdio JSON-RPC"]
     Tools["Tools<br/>call CrabDb methods"]
-    Resources["Resources<br/>status, doctor, agents, OpenAPI, docs"]
-    Templates["Resource templates<br/>agent/session/turn/conflict/etc."]
+    Resources["Resources<br/>status, doctor, lanes, OpenAPI, docs"]
+    Templates["Resource templates<br/>lane/session/turn/conflict/etc."]
     Prompts["Prompts<br/>execution, review, conflict resolution"]
     DB["CrabDb"]
 
@@ -320,4 +320,4 @@ When adding a new core behavior:
 - HTTP routes: `crates/crabdb/src/server/route`
 - OpenAPI: `crates/crabdb/src/server/openapi`
 - MCP protocol/capabilities/tools: `crates/crabdb/src/mcp`
-- Tests: `cli_daemon_url_routes_hot_agent_commands`, `local_api_and_cli_export_openapi_contract`, `mcp_stdio_tools_drive_agent_turn_workflow`
+- Tests: `cli_daemon_url_routes_hot_lane_commands`, `local_api_and_cli_export_openapi_contract`, `mcp_stdio_tools_drive_lane_turn_workflow`

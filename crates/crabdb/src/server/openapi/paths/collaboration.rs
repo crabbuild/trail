@@ -7,14 +7,14 @@ use super::{
 pub(super) fn collaboration_paths() -> Value {
     json!({
         "/v1/sessions": {
-            "get": openapi_operation("sessionList", "List sessions", "List durable agent sessions.", vec![
-                openapi_query("agent", "string")
+            "get": openapi_operation("sessionList", "List sessions", "List durable lane sessions.", vec![
+                openapi_query("lane", "string")
             ], None, true),
-            "post": openapi_operation("sessionStart", "Start session", "Start an explicit durable agent session.", vec![], Some("SessionStartRequest"), true)
+            "post": openapi_operation("sessionStart", "Start session", "Start an explicit durable lane session.", vec![], Some("SessionStartRequest"), true)
         },
         "/v1/sessions/current": {
-            "get": openapi_operation("sessionCurrent", "Current sessions", "Read current agent branch session attachments.", vec![
-                openapi_query("agent", "string")
+            "get": openapi_operation("sessionCurrent", "Current sessions", "Read current lane branch session attachments.", vec![
+                openapi_query("lane", "string")
             ], None, true)
         },
         "/v1/sessions/{session_id}": {
@@ -29,13 +29,13 @@ pub(super) fn collaboration_paths() -> Value {
             ], None, true)
         },
         "/v1/sessions/{session_id}/end": {
-            "post": openapi_operation("sessionEnd", "End session", "End a durable agent session.", vec![
+            "post": openapi_operation("sessionEnd", "End session", "End a durable lane session.", vec![
                 openapi_path_param("session_id", "string")
             ], Some("SessionEndRequest"), true)
         },
         "/v1/approvals": {
             "get": openapi_operation("approvalList", "List approvals", "List durable human approval gates.", vec![
-                openapi_query("agent", "string"),
+                openapi_query("lane", "string"),
                 openapi_query("status", "string")
             ], None, true),
             "post": openapi_operation("approvalRequest", "Request approval", "Create a durable pending approval for a sensitive action.", vec![], Some("ApprovalRequest"), true)
@@ -61,10 +61,10 @@ pub(super) fn collaboration_paths() -> Value {
                 openapi_path_param("lease_id", "string")
             ], None, true)
         },
-        "/v1/agents/{agent_or_id}/claims": {
-            "post": openapi_operation("agentClaim", "Claim agent path", "Create an advisory path claim for an agent, or return active claim conflicts as a warning.", vec![
-                openapi_path_param("agent_or_id", "string")
-            ], Some("AgentClaimRequest"), true)
+        "/v1/lanes/{lane_or_id}/claims": {
+            "post": openapi_operation("laneClaim", "Claim lane path", "Create an advisory path claim for a lane, or return active claim conflicts as a warning.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneClaimRequest"), true)
         },
         "/v1/anchors": {
             "get": openapi_operation("anchorList", "List anchors", "List durable line anchors.", vec![], None, true),
@@ -81,7 +81,7 @@ pub(super) fn collaboration_paths() -> Value {
         },
         "/v1/merge-queue": {
             "get": openapi_operation("mergeQueueList", "List merge queue", "List merge queue entries.", vec![], None, true),
-            "post": openapi_operation("mergeQueueAdd", "Queue merge", "Queue an agent or branch for serialized merge.", vec![], Some("MergeQueueAddRequest"), true)
+            "post": openapi_operation("mergeQueueAdd", "Queue merge", "Queue a lane or branch for serialized merge.", vec![], Some("MergeQueueAddRequest"), true)
         },
         "/v1/merge-queue/run": {
             "post": openapi_operation("mergeQueueRun", "Run merge queue", "Run queued merges serially.", vec![], Some("MergeQueueRunRequest"), true)
@@ -105,10 +105,10 @@ pub(super) fn collaboration_paths() -> Value {
                 openapi_path_param("conflict_set_id", "string")
             ], Some("ConflictResolveRequest"), true)
         },
-        "/v1/branches/{branch}/merge-agent": {
-            "post": openapi_operation("branchMergeAgent", "Merge agent", "Merge an agent branch into a target branch.", vec![
+        "/v1/branches/{branch}/merge-lane": {
+            "post": openapi_operation("branchMergeLane", "Merge lane", "Merge a lane branch into a target branch.", vec![
                 openapi_path_param("branch", "string")
-            ], Some("MergeAgentRequest"), true)
+            ], Some("MergeLaneRequest"), true)
         }
     })
 }

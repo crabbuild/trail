@@ -4,7 +4,7 @@
 //!
 //! CrabDB is a local-first operation database for code and text worktrees. It
 //! records meaningful operations, preserves stable file and line identity, and
-//! gives humans and coding agents a safe branch/provenance layer above Git.
+//! gives humans and coding lanes a safe branch/provenance layer above Git.
 
 pub mod db;
 pub mod error;

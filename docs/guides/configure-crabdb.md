@@ -11,13 +11,13 @@ crabdb config list
 ## Read One Value
 
 ```sh
-crabdb config get agent.default_materialize
+crabdb config get lane.default_materialize
 ```
 
 ## Set One Value
 
 ```sh
-crabdb config set agent.require_test_gate true
+crabdb config set lane.require_test_gate true
 ```
 
 ## Important Groups
@@ -41,15 +41,15 @@ Text:
 - `text.max_line_bytes`
 - `text.preserve_similarity`: float from `0.0` to `1.0`.
 
-Agent:
+Lane:
 
-- `agent.default_materialize`
-- `agent.require_test_gate`
-- `agent.require_eval_gate`
-- `agent.required_test_suites`
-- `agent.required_eval_suites`
-- `agent.worktrees_dir`
-- `agent.merge_strategy`: currently `conservative`.
+- `lane.default_materialize`
+- `lane.require_test_gate`
+- `lane.require_eval_gate`
+- `lane.required_test_suites`
+- `lane.required_eval_suites`
+- `lane.worktrees_dir`
+- `lane.merge_strategy`: currently `conservative`.
 
 Git:
 
@@ -66,7 +66,7 @@ Booleans accept `true`, `1`, `yes`, `on`, `false`, `0`, `no`, and `off`.
 Suite lists can be comma, semicolon, or newline separated:
 
 ```sh
-crabdb config set agent.required_test_suites "unit,integration"
+crabdb config set lane.required_test_suites "unit,integration"
 ```
 
 ## Guardrail Policy Values
@@ -88,4 +88,3 @@ crabdb config set guardrails.policy "block:path:production;approval:keyword:depl
 - Config command args: `crates/crabdb/src/cli/command/workspace_args.rs`
 - Config entries and validation: `crates/crabdb/src/db/util/config`
 - Tests: `config_api_lists_sets_persists_and_validates_keys`, `required_gate_config_blocks_merge_until_test_and_eval_pass`
-

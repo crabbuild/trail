@@ -166,7 +166,7 @@ pub(super) fn push_ignore_policy_check(db: &CrabDb, checks: &mut Vec<DoctorCheck
         Ok(_) => checks.push(doctor_check(
             "ignore_policy",
             "warning",
-            ".crabignore is missing; agent patches still block CrabDB's hardcoded denylist",
+            ".crabignore is missing; lane patches still block CrabDB's hardcoded denylist",
             Some(serde_json::json!({ "path": crabignore_path.to_string_lossy() })),
         )),
         Err(err) => checks.push(doctor_check(

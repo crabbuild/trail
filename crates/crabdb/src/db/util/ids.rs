@@ -8,11 +8,11 @@ pub(crate) fn branch_ref(branch: &str) -> String {
     }
 }
 
-pub(crate) fn agent_ref(agent: &str) -> String {
-    if agent.starts_with("refs/") {
-        agent.to_string()
+pub(crate) fn lane_ref(lane: &str) -> String {
+    if lane.starts_with("refs/") {
+        lane.to_string()
     } else {
-        format!("{AGENT_REF_PREFIX}{agent}")
+        format!("{LANE_REF_PREFIX}{lane}")
     }
 }
 

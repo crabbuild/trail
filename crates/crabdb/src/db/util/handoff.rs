@@ -1,14 +1,14 @@
 use super::*;
 
 pub(crate) fn handoff_next_steps(
-    readiness: &AgentReadinessReport,
-    current_session: Option<&AgentSessionDetails>,
+    readiness: &LaneReadinessReport,
+    current_session: Option<&LaneSessionDetails>,
 ) -> Vec<String> {
     let mut steps = Vec::new();
     for blocker in &readiness.blockers {
         match blocker.code.as_str() {
-            "agent_removed" => steps
-                .push("Restore or respawn the agent branch before continuing the handoff.".into()),
+            "lane_removed" => steps
+                .push("Restore or respawn the lane branch before continuing the handoff.".into()),
             "dirty_workdir" => steps.push(
                 "Record or force-sync the materialized workdir before reviewing or merging.".into(),
             ),
@@ -57,7 +57,7 @@ pub(crate) fn handoff_next_steps(
 
     match current_session {
         Some(details) if details.session.status == "active" => steps.push(format!(
-            "Continue or close active session `{}` after the receiving agent catches up.",
+            "Continue or close active session `{}` after the receiving lane catches up.",
             details.session.session_id
         )),
         Some(details) => steps.push(format!(
@@ -65,7 +65,7 @@ pub(crate) fn handoff_next_steps(
             details.session.session_id
         )),
         None => steps
-            .push("Start a new session or turn if the receiving agent will continue work.".into()),
+            .push("Start a new session or turn if the receiving lane will continue work.".into()),
     }
 
     steps.dedup();

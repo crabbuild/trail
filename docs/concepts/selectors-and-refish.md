@@ -1,6 +1,6 @@
 # Selectors and Ref-Like Inputs
 
-Several commands accept selectors: path selectors, line selectors, object IDs, operation IDs, root IDs, branch names, and agent names.
+Several commands accept selectors: path selectors, line selectors, object IDs, operation IDs, root IDs, branch names, and lane names.
 
 ## Path and Line Selectors
 
@@ -30,7 +30,7 @@ Commands such as `checkout`, `diff`, `merge`, `timeline`, and `show` resolve val
 
 - A branch name.
 - A full ref such as `refs/branches/main`.
-- An agent name or agent ref.
+- A lane name or lane ref.
 - A change ID.
 - A root ID.
 - A message ID or object ID for `show`.
@@ -56,5 +56,4 @@ Daemon-backed `diff` enforces exactly one of positional range, `--root`, or `--d
 - Inspect args: `crates/crabdb/src/cli/command/inspect_args.rs`
 - Diff args and daemon validation: `crates/crabdb/src/cli/command/worktree_args.rs`, `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
 - Ref resolution: `crates/crabdb/src/db/storage/refs.rs`
-- Tests: `refish_aliases_accept_branch_agent_and_root_selectors`, `timeline_branch_scope_accepts_command_flag_and_ref_aliases`
-
+- Tests: `refish_aliases_accept_branch_lane_and_root_selectors`, `timeline_branch_scope_accepts_command_flag_and_ref_aliases`

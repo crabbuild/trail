@@ -57,7 +57,7 @@ pub(super) struct IgnoreCheckArgs {
 
 #[derive(Subcommand)]
 pub(super) enum GuardrailsSubcommand {
-    /// Preflight an agent action against policy and ignore checks.
+    /// Preflight a lane action against policy and ignore checks.
     Check(GuardrailCheckArgs),
 }
 
@@ -70,7 +70,7 @@ pub(super) struct GuardrailsCommand {
 #[derive(Args)]
 pub(super) struct GuardrailCheckArgs {
     #[arg(long)]
-    pub(super) agent: Option<String>,
+    pub(super) lane: Option<String>,
     #[arg(long)]
     pub(super) action: String,
     #[arg(long)]
