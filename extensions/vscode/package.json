@@ -1,0 +1,394 @@
+{
+  "name": "crabdb-vscode",
+  "displayName": "CrabDB Agents",
+  "description": "Unified ACP agent chat, review, checkpoint, and apply workflow backed by CrabDB.",
+  "version": "0.1.0",
+  "publisher": "crabdb",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/crabbuild/crabdb.git",
+    "directory": "extensions/vscode"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "agent",
+    "ACP",
+    "CrabDB",
+    "AI",
+    "review"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:crabdb.tasks",
+    "onView:crabdb.reviews",
+    "onView:crabdb.queue",
+    "onCommand:crabdb.initWorkspace",
+    "onCommand:crabdb.newAgentTask",
+    "onCommand:crabdb.openAgentChat",
+    "onCommand:crabdb.openLatestReview",
+    "onCommand:crabdb.applyLatestDryRun",
+    "onCommand:crabdb.queueMerge",
+    "onCommand:crabdb.explainQueueEntry",
+    "onCommand:crabdb.runMergeQueue",
+    "onCommand:crabdb.removeQueueEntry",
+    "onCommand:crabdb.rewindTask",
+    "onCommand:crabdb.preserveFailedAttempt",
+    "onCommand:crabdb.removeAgentTask",
+    "onCommand:crabdb.runLaneTest",
+    "onCommand:crabdb.runLaneEval",
+    "onCommand:crabdb.openLaneWorkdir",
+    "onCommand:crabdb.compareTasks",
+    "onCommand:crabdb.refreshTasks",
+    "onCommand:crabdb.startDaemon",
+    "onCommand:crabdb.doctor",
+    "onCommand:crabdb.addAcpProvider",
+    "onCommand:crabdb.askSelection",
+    "onCommand:crabdb.attachSelection",
+    "onCommand:crabdb.showLineHistory",
+    "onCommand:crabdb.showFileChanges"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "crabdbAgents",
+          "title": "CrabDB Agents",
+          "icon": "resources/crabdb.svg"
+        }
+      ]
+    },
+    "views": {
+      "crabdbAgents": [
+        {
+          "id": "crabdb.tasks",
+          "name": "Tasks",
+          "type": "tree"
+        },
+        {
+          "id": "crabdb.reviews",
+          "name": "Reviews",
+          "type": "tree"
+        },
+        {
+          "id": "crabdb.queue",
+          "name": "Queue",
+          "type": "tree"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "crabdb.initWorkspace",
+        "title": "CrabDB: Initialize Workspace",
+        "icon": "$(repo-create)"
+      },
+      {
+        "command": "crabdb.newAgentTask",
+        "title": "CrabDB: New Agent Task",
+        "icon": "$(comment-add)"
+      },
+      {
+        "command": "crabdb.openAgentChat",
+        "title": "CrabDB: Open Agent Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "crabdb.openLatestReview",
+        "title": "CrabDB: Open Latest Agent Review",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "crabdb.applyLatestDryRun",
+        "title": "CrabDB: Apply Latest Agent Task Dry Run",
+        "icon": "$(git-pull-request-draft)"
+      },
+      {
+        "command": "crabdb.queueMerge",
+        "title": "CrabDB: Queue Agent Task Merge",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "crabdb.explainQueueEntry",
+        "title": "CrabDB: Explain Merge Queue Entry",
+        "icon": "$(question)"
+      },
+      {
+        "command": "crabdb.runMergeQueue",
+        "title": "CrabDB: Run Merge Queue",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "crabdb.removeQueueEntry",
+        "title": "CrabDB: Remove Merge Queue Entry",
+        "icon": "$(close)"
+      },
+      {
+        "command": "crabdb.rewindTask",
+        "title": "CrabDB: Rewind Agent Task",
+        "icon": "$(debug-reverse-continue)"
+      },
+      {
+        "command": "crabdb.preserveFailedAttempt",
+        "title": "CrabDB: Preserve Failed Attempt and Rewind",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "crabdb.removeAgentTask",
+        "title": "CrabDB: Remove Agent Task",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "crabdb.runLaneTest",
+        "title": "CrabDB: Run Lane Test",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "crabdb.runLaneEval",
+        "title": "CrabDB: Run Lane Eval",
+        "icon": "$(symbol-method)"
+      },
+      {
+        "command": "crabdb.openLaneWorkdir",
+        "title": "CrabDB: Open Lane Workdir",
+        "icon": "$(root-folder-opened)"
+      },
+      {
+        "command": "crabdb.compareTasks",
+        "title": "CrabDB: Compare Agent Tasks",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "crabdb.refreshTasks",
+        "title": "CrabDB: Refresh Agent Tasks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "crabdb.startDaemon",
+        "title": "CrabDB: Start Daemon",
+        "icon": "$(server-process)"
+      },
+      {
+        "command": "crabdb.doctor",
+        "title": "CrabDB: Doctor",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "crabdb.addAcpProvider",
+        "title": "CrabDB: Add ACP Provider",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "crabdb.askSelection",
+        "title": "CrabDB: Ask Agent About Selection",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "crabdb.attachSelection",
+        "title": "CrabDB: Attach Selection to Agent Task",
+        "icon": "$(link)"
+      },
+      {
+        "command": "crabdb.showLineHistory",
+        "title": "CrabDB: Show History for Line",
+        "icon": "$(history)"
+      },
+      {
+        "command": "crabdb.showFileChanges",
+        "title": "CrabDB: Show Agent Changes for File",
+        "icon": "$(file-code)"
+      }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "crabdb.tasks",
+        "contents": "Open a folder to use CrabDB agents.",
+        "when": "!crabdb.workspaceOpen"
+      },
+      {
+        "view": "crabdb.tasks",
+        "contents": "Initialize CrabDB to record agent tasks, checkpoints, and review state.\n[Initialize workspace](command:crabdb.initWorkspace)",
+        "when": "crabdb.workspaceOpen && !crabdb.initialized"
+      },
+      {
+        "view": "crabdb.tasks",
+        "contents": "No agent tasks yet.\n[New agent task](command:crabdb.newAgentTask)\n[Start daemon](command:crabdb.startDaemon)",
+        "when": "crabdb.workspaceOpen && crabdb.initialized"
+      },
+      {
+        "view": "crabdb.reviews",
+        "contents": "No reviewable CrabDB agent tasks yet.\n[New agent task](command:crabdb.newAgentTask)",
+        "when": "crabdb.workspaceOpen && crabdb.initialized"
+      },
+      {
+        "view": "crabdb.queue",
+        "contents": "No queued CrabDB merges yet.\n[Run merge queue](command:crabdb.runMergeQueue)",
+        "when": "crabdb.workspaceOpen && crabdb.initialized"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "crabdb.initWorkspace",
+          "when": "view == crabdb.tasks && crabdb.workspaceOpen && !crabdb.initialized",
+          "group": "navigation"
+        },
+        {
+          "command": "crabdb.refreshTasks",
+          "when": "view == crabdb.tasks || view == crabdb.reviews || view == crabdb.queue",
+          "group": "navigation"
+        },
+        {
+          "command": "crabdb.newAgentTask",
+          "when": "view == crabdb.tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "crabdb.runMergeQueue",
+          "when": "view == crabdb.queue",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "crabdb.openAgentChat",
+          "when": "viewItem == crabdbTask",
+          "group": "inline"
+        },
+        {
+          "command": "crabdb.openLatestReview",
+          "when": "viewItem == crabdbTask",
+          "group": "inline"
+        },
+        {
+          "command": "crabdb.rewindTask",
+          "when": "viewItem == crabdbTask",
+          "group": "mutation"
+        },
+        {
+          "command": "crabdb.preserveFailedAttempt",
+          "when": "viewItem == crabdbTask",
+          "group": "mutation"
+        },
+        {
+          "command": "crabdb.removeAgentTask",
+          "when": "viewItem == crabdbTask",
+          "group": "destructive"
+        },
+        {
+          "command": "crabdb.runLaneTest",
+          "when": "viewItem == crabdbTask",
+          "group": "gate"
+        },
+        {
+          "command": "crabdb.runLaneEval",
+          "when": "viewItem == crabdbTask",
+          "group": "gate"
+        },
+        {
+          "command": "crabdb.openLaneWorkdir",
+          "when": "viewItem == crabdbTask",
+          "group": "navigation"
+        },
+        {
+          "command": "crabdb.explainQueueEntry",
+          "when": "viewItem == crabdbQueueEntry",
+          "group": "inline"
+        },
+        {
+          "command": "crabdb.removeQueueEntry",
+          "when": "viewItem == crabdbQueueEntry",
+          "group": "destructive"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "crabdb.askSelection",
+          "when": "editorHasSelection",
+          "group": "crabdb"
+        },
+        {
+          "command": "crabdb.showFileChanges",
+          "when": "resourceScheme == file",
+          "group": "crabdb"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CrabDB Agents",
+      "properties": {
+        "crabdb.path": {
+          "type": "string",
+          "default": "crabdb",
+          "description": "Path to the CrabDB CLI executable."
+        },
+        "crabdb.defaultProvider": {
+          "type": "string",
+          "default": "claude-code",
+          "description": "Default ACP provider passed to `crabdb agent acp`."
+        },
+        "crabdb.autoStartDaemon": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start `crabdb daemon` when no daemon endpoint is discovered."
+        },
+        "crabdb.customProviders": {
+          "type": "array",
+          "default": [],
+          "description": "Custom ACP provider launch definitions.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "label",
+              "command"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "compile": "npm run clean && node scripts/esbuild.mjs",
+    "check": "tsc --noEmit",
+    "test": "npm run check && npm run compile && node scripts/test.mjs",
+    "test:extension": "npm run compile && node scripts/extension-test.mjs",
+    "package:vsix": "npm run compile && vsce package --no-dependencies",
+    "watch": "node scripts/esbuild.mjs --watch",
+    "vscode:prepublish": "npm run compile && npm run check"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.93.0",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
+    "typescript": "^6.0.3"
+  }
+}

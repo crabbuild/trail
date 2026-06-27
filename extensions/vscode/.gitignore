@@ -1,0 +1,6 @@
+dist/
+dist-test/
+.vscode-test/
+node_modules/
+*.vsix
+*.tgz

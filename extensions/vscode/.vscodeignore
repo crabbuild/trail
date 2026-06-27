@@ -1,0 +1,13 @@
+.gitignore
+.npmignore
+.vscodeignore
+.vscode/**
+.vscode-test/**
+dist-test/**
+node_modules/**
+scripts/**
+src/**
+*.tgz
+*.vsix
+tsconfig.json
+package-lock.json

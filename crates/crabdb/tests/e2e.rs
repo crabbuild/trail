@@ -1151,8 +1151,8 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .any(|action| action["id"] == "validation_next"
             && action["safety"] == "open_world"
             && action["requires_confirmation"] == true
-            && action["mcp_tool"] == "crabdb.agent_test"
-            && action["mcp_arguments"]["command"][0] == "cargo"));
+            && (action["mcp_tool"] == "crabdb.agent_test"
+                || action["mcp_tool"] == "crabdb.agent_eval")));
     assert!(review_actions
         .iter()
         .any(|action| action["id"] == "apply_dry_run"
