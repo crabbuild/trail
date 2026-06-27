@@ -35,12 +35,22 @@ Then inspect or apply as needed:
 
 ```sh
 crabdb agent
+crabdb agent board
+crabdb agent stack
 crabdb agent summary latest
+crabdb agent review-data latest
 crabdb agent story latest
+crabdb agent tools latest
+crabdb agent impact latest
+crabdb agent review-map latest
+crabdb agent mark-file-reviewed latest README.md
 crabdb agent risk latest
+crabdb agent confidence latest
+crabdb agent test-plan latest
 crabdb agent ready latest
 crabdb agent diagnose latest
 crabdb agent compare <TASK_A> <TASK_B>
+crabdb agent handoff latest
 crabdb agent receipt latest
 crabdb agent pr latest
 crabdb agent report latest --markdown
@@ -51,6 +61,8 @@ crabdb agent workdir latest
 crabdb agent delta latest
 crabdb agent new latest
 crabdb agent changes latest
+crabdb agent review-flow latest
+crabdb agent ask walk me through review
 crabdb agent turn
 crabdb agent turn-diff latest --patch
 crabdb agent files latest
@@ -81,9 +93,17 @@ For day-to-day use, prefer the task-oriented commands:
 ```sh
 crabdb agent
 crabdb agent next
+crabdb agent stack
 crabdb agent summary latest
+crabdb agent review-data latest
 crabdb agent story latest
+crabdb agent tools latest
+crabdb agent impact latest
+crabdb agent review-map latest
+crabdb agent mark-file-reviewed latest README.md
 crabdb agent risk latest
+crabdb agent confidence latest
+crabdb agent test-plan latest
 crabdb agent ready latest
 crabdb agent diagnose latest
 crabdb agent compare <TASK_A> <TASK_B>
@@ -97,6 +117,8 @@ crabdb agent workdir latest
 crabdb agent delta latest
 crabdb agent new latest
 crabdb agent changes latest
+crabdb agent review-flow latest
+crabdb agent ask walk me through review
 crabdb agent turn
 crabdb agent turn-diff latest --patch
 crabdb agent files latest

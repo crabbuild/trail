@@ -115,6 +115,23 @@ pub struct StatusSuggestion {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewAction {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub command: String,
+    pub reason: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub safety: String,
+    pub requires_confirmation: bool,
+    pub path: Option<String>,
+    pub open_path: Option<String>,
+    pub mcp_tool: Option<String>,
+    pub mcp_arguments: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentTaskReport {
     pub task_id: String,
     pub name: String,
@@ -126,6 +143,7 @@ pub struct AgentTaskReport {
     pub session_id: Option<String>,
     pub acp_session_id: Option<String>,
     pub status: AgentTaskStatus,
+    pub archived: bool,
     pub changed_paths: Vec<FileDiffSummary>,
     pub latest_checkpoint: Option<ChangeId>,
     pub turns: usize,
@@ -147,18 +165,133 @@ pub enum AgentTaskStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentTaskListReport {
+    pub include_archived: bool,
     pub tasks: Vec<AgentTaskReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentInboxReport {
+    pub include_archived: bool,
     pub total: usize,
     pub attention_count: usize,
+    pub archived_count: usize,
     pub groups: Vec<AgentInboxGroup>,
     pub items: Vec<AgentInboxItem>,
     pub tasks: Vec<AgentTaskReport>,
     pub next: StatusSuggestion,
     pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBoardReport {
+    pub include_archived: bool,
+    pub total: usize,
+    pub attention_count: usize,
+    pub ready_count: usize,
+    pub active_count: usize,
+    pub blocked_count: usize,
+    pub conflicted_count: usize,
+    pub applied_count: usize,
+    pub archived_count: usize,
+    pub columns: Vec<AgentBoardColumn>,
+    pub items: Vec<AgentBoardItem>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBoardColumn {
+    pub key: String,
+    pub label: String,
+    pub summary: String,
+    pub attention: bool,
+    pub items: Vec<AgentBoardItem>,
+    pub next: Option<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBoardItem {
+    pub task: AgentTaskReport,
+    pub status_label: String,
+    pub attention: String,
+    pub detail: String,
+    pub changed_paths: usize,
+    pub turns: usize,
+    pub tool_events: usize,
+    pub review_first: Option<AgentInboxReviewTarget>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentStackReport {
+    pub include_archived: bool,
+    pub total: usize,
+    pub ready_count: usize,
+    pub blocked_count: usize,
+    pub overlap_count: usize,
+    pub summary: String,
+    pub shared_paths: Vec<AgentStackSharedPath>,
+    pub items: Vec<AgentStackItem>,
+    pub apply_order: Vec<String>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentStackItem {
+    pub rank: usize,
+    pub task: AgentTaskReport,
+    pub risk: AgentRiskReport,
+    pub status: String,
+    pub shared_paths: Vec<String>,
+    pub applyable: bool,
+    pub next: StatusSuggestion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentStackSharedPath {
+    pub path: String,
+    pub lanes: Vec<String>,
+    pub task_titles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentArchiveReport {
+    pub task: AgentTaskReport,
+    pub archived: bool,
+    pub previous_archived: bool,
+    pub event_id: String,
+    pub note: Option<String>,
+    pub summary: String,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentGuideReport {
+    pub status: AgentTaskStatus,
+    pub selector: String,
+    pub task: Option<AgentTaskReport>,
+    pub headline: String,
+    pub current_state: String,
+    pub primary: StatusSuggestion,
+    pub steps: Vec<AgentGuideStep>,
+    pub concepts: Vec<AgentGuideConcept>,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentGuideStep {
+    pub label: String,
+    pub command: String,
+    pub reason: String,
+    pub when: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentGuideConcept {
+    pub name: String,
+    pub meaning: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,6 +351,46 @@ pub struct AgentStoryReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentToolsReport {
+    pub task: AgentTaskReport,
+    pub lane: String,
+    pub summary: String,
+    pub total_tool_events: usize,
+    pub unique_tools: usize,
+    pub turns_with_tools: usize,
+    pub available_commands: Vec<String>,
+    pub tools: Vec<AgentToolEntry>,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentToolEntry {
+    pub rank: usize,
+    pub name: String,
+    pub kind: Option<String>,
+    pub event_count: usize,
+    pub turn_count: usize,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub event_types: Vec<String>,
+    pub statuses: std::collections::BTreeMap<String, usize>,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    pub turns: Vec<AgentToolTurnRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentToolTurnRef {
+    pub index: usize,
+    pub turn_id: String,
+    pub status: String,
+    pub prompt_preview: Option<String>,
+    pub checkpoint: Option<ChangeId>,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub turn_command: String,
+    pub diff_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentStoryTurn {
     pub index: usize,
     pub id: String,
@@ -265,10 +438,36 @@ pub struct AgentReadyReport {
     pub risk: AgentRiskReport,
     pub blockers: Vec<LaneReadinessIssue>,
     pub warnings: Vec<LaneReadinessIssue>,
+    pub default_apply_message: String,
     pub apply_preview: Option<AgentApplyReport>,
     pub apply_error: Option<String>,
     pub next: StatusSuggestion,
     pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfidenceReport {
+    pub task: AgentTaskReport,
+    pub verdict: String,
+    pub score: u8,
+    pub summary: String,
+    pub review_status: String,
+    pub reviewed: Option<AgentReviewMarker>,
+    pub ready: AgentReadyReport,
+    pub validation: AgentValidationReport,
+    pub risk: AgentRiskReport,
+    pub factors: Vec<AgentConfidenceFactor>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfidenceFactor {
+    pub name: String,
+    pub state: String,
+    pub score_delta: i16,
+    pub message: String,
+    pub command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -300,6 +499,25 @@ pub struct AgentReceiptReport {
     pub tool_summaries: Vec<String>,
     pub validation: Vec<LaneTestSummary>,
     pub latest_checkpoint: Option<ChangeId>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+    pub markdown: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentHandoffReport {
+    pub task: AgentTaskReport,
+    pub summary: String,
+    pub ready_to_apply: bool,
+    pub readiness_status: String,
+    pub risk: AgentRiskReport,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub turns: Vec<AgentStoryTurn>,
+    pub tool_summaries: Vec<String>,
+    pub validation: Vec<LaneTestSummary>,
+    pub latest_checkpoint: Option<ChangeId>,
+    pub transcript_turns: usize,
+    pub tool_events: usize,
     pub next: StatusSuggestion,
     pub suggestions: Vec<StatusSuggestion>,
     pub markdown: String,
@@ -357,6 +575,127 @@ pub struct AgentValidationReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentTestPlanReport {
+    pub task: AgentTaskReport,
+    pub status: String,
+    pub summary: String,
+    pub validation: AgentValidationReport,
+    pub impact_areas: Vec<AgentImpactArea>,
+    pub risk: AgentRiskReport,
+    pub steps: Vec<AgentTestPlanStep>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentTestPlanStep {
+    pub rank: usize,
+    pub kind: String,
+    pub label: String,
+    pub state: String,
+    pub required: bool,
+    pub command: String,
+    pub reason: String,
+    pub area_key: Option<String>,
+    pub area_label: Option<String>,
+    pub paths: Vec<FileDiffSummary>,
+    pub latest_gate: Option<LaneTestSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentImpactReport {
+    pub task: AgentTaskReport,
+    pub summary: String,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub changed_lines: u64,
+    pub highest_impact: String,
+    pub areas: Vec<AgentImpactArea>,
+    pub risk: AgentRiskReport,
+    pub validation: AgentValidationReport,
+    pub recommendations: Vec<StatusSuggestion>,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentImpactArea {
+    pub key: String,
+    pub label: String,
+    pub severity: String,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub changed_lines: u64,
+    pub reasons: Vec<String>,
+    pub review_command: String,
+    pub diff_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewMapReport {
+    pub task: AgentTaskReport,
+    pub summary: String,
+    pub review_status: String,
+    pub reviewed: Option<AgentReviewMarker>,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub changed_lines: u64,
+    pub highest_impact: String,
+    pub areas: Vec<AgentReviewMapArea>,
+    pub risk: AgentRiskReport,
+    pub validation: AgentValidationReport,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewMapArea {
+    pub key: String,
+    pub label: String,
+    pub severity: String,
+    pub state: String,
+    pub changed_paths: Vec<FileDiffSummary>,
+    pub changed_lines: u64,
+    pub reasons: Vec<String>,
+    pub files: Vec<AgentReviewMapFile>,
+    pub review_command: String,
+    pub patch_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewMapFile {
+    pub rank: usize,
+    pub path: String,
+    pub state: String,
+    pub reviewed: Option<AgentFileReviewMarker>,
+    pub change: FileDiffSummary,
+    pub score: u8,
+    pub reasons: Vec<String>,
+    pub touched_by: Vec<AgentFileTouch>,
+    pub review_command: String,
+    pub why_command: String,
+    pub diff_command: Option<String>,
+    pub open_path: Option<String>,
+    pub open_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentFileReviewMarker {
+    pub event_id: String,
+    pub path: String,
+    pub checkpoint: ChangeId,
+    pub reviewed_at: i64,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentMarkFileReviewedReport {
+    pub task: AgentTaskReport,
+    pub lane: String,
+    pub path: String,
+    pub marker: AgentFileReviewMarker,
+    pub previous: Option<AgentFileReviewMarker>,
+    pub summary: String,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentDiagnosisReport {
     pub task: AgentTaskReport,
     pub status: String,
@@ -408,6 +747,8 @@ pub struct AgentReviewPriority {
 pub struct AgentFocusReport {
     pub task: AgentTaskReport,
     pub path: String,
+    pub open_path: Option<String>,
+    pub open_command: Option<String>,
     pub source: String,
     pub summary: String,
     pub priority: Option<AgentReviewPriority>,
@@ -510,6 +851,33 @@ pub struct AgentNewReport {
     pub diff: Option<AgentDiffReport>,
     pub next: StatusSuggestion,
     pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewFlowReport {
+    pub task: AgentTaskReport,
+    pub status: AgentTaskStatus,
+    pub summary: String,
+    pub review_status: String,
+    pub reviewed: Option<AgentReviewMarker>,
+    pub new_changed_paths: usize,
+    pub new_changed_lines: u64,
+    pub review: AgentReviewReport,
+    pub focus: Option<AgentFocusReport>,
+    pub new: AgentNewReport,
+    pub validation: AgentValidationReport,
+    pub ready: AgentReadyReport,
+    pub steps: Vec<AgentReviewFlowStep>,
+    pub next: StatusSuggestion,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewFlowStep {
+    pub label: String,
+    pub state: String,
+    pub command: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -728,6 +1096,43 @@ pub struct AgentNextReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentDashboardReport {
+    pub status: AgentTaskStatus,
+    pub task: Option<AgentTaskReport>,
+    pub summary: String,
+    pub next: StatusSuggestion,
+    pub ready: Option<AgentReadyReport>,
+    pub validation: Option<AgentValidationReport>,
+    pub focus: Option<AgentFocusReport>,
+    pub changes: Option<AgentChangesReport>,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReviewDataReport {
+    pub task: AgentTaskReport,
+    pub summary: String,
+    pub next: StatusSuggestion,
+    pub review_status: String,
+    pub ready_to_apply: bool,
+    pub readiness_status: String,
+    pub confidence_verdict: String,
+    pub confidence_score: u8,
+    pub risk_level: AgentRiskLevel,
+    pub validation_status: String,
+    pub total_files: usize,
+    pub reviewed_files: usize,
+    pub needs_review_files: usize,
+    pub focus: Option<AgentFocusReport>,
+    pub review_map: AgentReviewMapReport,
+    pub changes_by_file: AgentChangesReport,
+    pub files: AgentFilesReport,
+    pub confidence: AgentConfidenceReport,
+    pub actions: Vec<AgentReviewAction>,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentAskReport {
     pub selector: String,
     pub question: String,
@@ -782,6 +1187,17 @@ pub struct AgentApplyReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentFinishReport {
+    pub task: AgentTaskReport,
+    pub status: String,
+    pub dry_run: bool,
+    pub apply: AgentApplyReport,
+    pub archive: Option<AgentArchiveReport>,
+    pub would_archive: bool,
+    pub suggestions: Vec<StatusSuggestion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentSetupReport {
     pub provider: String,
     pub editor: String,
@@ -800,6 +1216,14 @@ pub struct AgentRunReport {
     pub exit_code: Option<i32>,
     pub recorded: Option<LaneRecordReport>,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentContinueReport {
+    pub source_task: AgentTaskReport,
+    pub from_change: ChangeId,
+    pub run: AgentRunReport,
+    pub suggestions: Vec<StatusSuggestion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

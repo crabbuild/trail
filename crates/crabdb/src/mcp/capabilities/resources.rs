@@ -31,10 +31,38 @@ pub(crate) fn resource_templates() -> Value {
             "mimeType": "application/json"
         },
         {
+            "uriTemplate": RESOURCE_AGENT_TEST_PLAN_TEMPLATE,
+            "name": "agent-task-test-plan",
+            "title": "Agent Task Test Plan",
+            "description": "Read the prioritized test/eval checklist for an agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_CONFIDENCE_TEMPLATE,
+            "name": "agent-task-confidence",
+            "title": "Agent Task Confidence",
+            "description": "Read one go/no-go verdict from review freshness, validation, risk, and apply preflight.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_REVIEW_MAP_TEMPLATE,
+            "name": "agent-task-review-map",
+            "title": "Agent Task Review Map",
+            "description": "Read the file-by-file review checklist grouped by changed area.",
+            "mimeType": "application/json"
+        },
+        {
             "uriTemplate": RESOURCE_AGENT_REVIEW_TEMPLATE,
             "name": "agent-task-review",
             "title": "Agent Task Review",
             "description": "Read the agent task review dashboard with readiness, risk, prioritized files, blockers, warnings, and next commands.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_REVIEW_DATA_TEMPLATE,
+            "name": "agent-task-review-data",
+            "title": "Agent Review Data",
+            "description": "Read one editor-friendly review packet with file review progress, focus file, changes by file, confidence, validation, risk, and readiness.",
             "mimeType": "application/json"
         },
         {
@@ -70,6 +98,13 @@ pub(crate) fn resource_templates() -> Value {
             "name": "agent-task-receipt",
             "title": "Agent Task Receipt",
             "description": "Read the copyable post-run receipt with summary, validation, changed files, turns, risk, checkpoint, and next command.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": RESOURCE_AGENT_HANDOFF_TEMPLATE,
+            "name": "agent-task-handoff",
+            "title": "Agent Task Handoff",
+            "description": "Read the copyable handoff packet for another human or agent.",
             "mimeType": "application/json"
         },
         {
@@ -253,10 +288,38 @@ pub(crate) fn resources() -> Value {
             "mimeType": "application/json"
         },
         {
+            "uri": RESOURCE_AGENT_LATEST_TEST_PLAN,
+            "name": "latest-agent-test-plan",
+            "title": "Latest Agent Test Plan",
+            "description": "Prioritized test/eval checklist for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_CONFIDENCE,
+            "name": "latest-agent-confidence",
+            "title": "Latest Agent Confidence",
+            "description": "Go/no-go verdict for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_REVIEW_MAP,
+            "name": "latest-agent-review-map",
+            "title": "Latest Agent Review Map",
+            "description": "File-by-file review checklist grouped by changed area for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
             "uri": RESOURCE_AGENT_LATEST_REVIEW,
             "name": "latest-agent-review",
             "title": "Latest Agent Review",
             "description": "Review dashboard for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_REVIEW_DATA,
+            "name": "latest-agent-review-data",
+            "title": "Latest Agent Review Data",
+            "description": "Editor-friendly review packet for the latest agent task.",
             "mimeType": "application/json"
         },
         {
@@ -292,6 +355,13 @@ pub(crate) fn resources() -> Value {
             "name": "latest-agent-receipt",
             "title": "Latest Agent Receipt",
             "description": "Copyable receipt for the latest agent task.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_LATEST_HANDOFF,
+            "name": "latest-agent-handoff",
+            "title": "Latest Agent Handoff",
+            "description": "Copyable handoff packet for another human or agent.",
             "mimeType": "application/json"
         },
         {

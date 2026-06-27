@@ -85,9 +85,57 @@ pub(super) fn tools() -> Value {
             "inputSchema": object_schema(json!({}), vec![])
         },
         {
+            "name": "crabdb.agent_board",
+            "title": "Agent Task Board",
+            "description": "Show a low-noise multi-agent board with task columns, attention counts, and one primary next command.",
+            "inputSchema": object_schema(json!({
+                "all": { "type": "boolean", "description": "Include archived tasks." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_stack",
+            "title": "Agent Apply Stack",
+            "description": "Show overlap and a safe apply order across multiple agent tasks, with one next command.",
+            "inputSchema": object_schema(json!({
+                "all": { "type": "boolean", "description": "Include archived tasks." }
+            }), vec![])
+        },
+        {
             "name": "crabdb.agent_next",
             "title": "Next Agent Action",
             "description": "Return one primary next command for an agent task, plus a few alternatives, so users do not need to choose between lane, transcript, diff, and apply commands manually.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_guide",
+            "title": "Agent Task Guide",
+            "description": "Return a compact state-aware guide for using CrabDB with agent tasks: current state, one next command, workflow steps, and the small mental model.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_dashboard",
+            "title": "Agent Task Dashboard",
+            "description": "Return one compact dashboard with next action, focus file, validation status, changed files, risk, and apply readiness.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_review_data",
+            "title": "Agent Review Data",
+            "description": "Return one editor-friendly review packet with next action, file review progress, focus file, changes by file, confidence, validation, risk, and apply readiness.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_review_flow",
+            "title": "Agent Review Flow",
+            "description": "Return a guided checklist that walks one task through inspect, mark reviewed, validate, and finish without requiring users to connect separate CrabDB commands manually.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
             }), vec![])
@@ -134,9 +182,25 @@ pub(super) fn tools() -> Value {
             }), vec![])
         },
         {
+            "name": "crabdb.agent_test_plan",
+            "title": "Agent Test Plan",
+            "description": "Return a prioritized test/eval checklist with exact commands based on changed areas, impact, and existing validation gates.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
             "name": "crabdb.agent_report",
             "title": "Agent Task Report",
             "description": "Return a shareable review bundle for an agent task, including story, risk, changes, transcript, readiness, suggestions, and Markdown.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_handoff",
+            "title": "Agent Task Handoff",
+            "description": "Return a copyable handoff packet for another human or agent, with state, risks, validation, changed files, turns, tools, and exact receiver commands.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
             }), vec![])
@@ -166,9 +230,41 @@ pub(super) fn tools() -> Value {
             }), vec![])
         },
         {
+            "name": "crabdb.agent_tools",
+            "title": "Agent Tool Activity",
+            "description": "Return captured tool calls, available ACP commands, and the turns/checkpoints/changed files around each tool.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
             "name": "crabdb.agent_risk",
             "title": "Agent Task Risk",
             "description": "Return a deterministic risk level, reasons, and recommendations before applying an agent task.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_impact",
+            "title": "Agent Impact",
+            "description": "Return changed impact areas, blast radius, validation state, risk, and recommended review/test checks for an agent task.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_review_map",
+            "title": "Agent Review Map",
+            "description": "Return a file-by-file review checklist grouped by changed area, with review, why, diff, and open commands.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_confidence",
+            "title": "Agent Confidence",
+            "description": "Return one go/no-go confidence verdict across review freshness, validation, risk, and Git apply preflight.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." }
             }), vec![])
@@ -204,7 +300,8 @@ pub(super) fn tools() -> Value {
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
                 "by_operation": { "type": "boolean" },
-                "by-turn": { "type": "boolean" }
+                "by-turn": { "type": "boolean" },
+                "by-file": { "type": "boolean", "description": "Show one review card per changed file." }
             }), vec![])
         },
         {
@@ -236,6 +333,34 @@ pub(super) fn tools() -> Value {
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
                 "note": { "type": "string", "description": "Optional review note." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_mark_file_reviewed",
+            "title": "Mark Agent File Reviewed",
+            "description": "Mark one changed file as reviewed at the current agent task checkpoint so review-map can track file-level progress.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
+                "path": { "type": "string", "description": "Changed file path to mark reviewed." },
+                "note": { "type": "string", "description": "Optional review note." }
+            }), vec!["path"])
+        },
+        {
+            "name": "crabdb.agent_archive",
+            "title": "Archive Agent Task",
+            "description": "Hide an agent task from default agent inbox/list/latest views without deleting its lane, transcript, checkpoints, or provenance.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
+                "note": { "type": "string", "description": "Optional archive note." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_unarchive",
+            "title": "Unarchive Agent Task",
+            "description": "Restore an archived agent task to default agent inbox/list/latest views.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
+                "note": { "type": "string", "description": "Optional unarchive note." }
             }), vec![])
         },
         {
@@ -382,6 +507,17 @@ pub(super) fn tools() -> Value {
                 "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
                 "dry_run": { "type": "boolean", "description": "Preview the apply plan without mutating Git." },
                 "message": { "type": "string", "description": "Optional Git commit message for non-dry-run apply." }
+            }), vec![])
+        },
+        {
+            "name": "crabdb.agent_finish",
+            "title": "Finish Agent Task",
+            "description": "Preview or apply an agent task back to Git, then archive it after success. Hosts should call with dry_run first and require explicit confirmation before non-dry-run finish.",
+            "inputSchema": object_schema(json!({
+                "selector": { "type": "string", "description": "Agent task, lane, session, ACP session, or latest." },
+                "dry_run": { "type": "boolean", "description": "Preview the finish plan without mutating Git or archiving the task." },
+                "message": { "type": "string", "description": "Optional Git commit message for non-dry-run finish." },
+                "note": { "type": "string", "description": "Optional note to store with the archive marker after successful finish." }
             }), vec![])
         },
         {

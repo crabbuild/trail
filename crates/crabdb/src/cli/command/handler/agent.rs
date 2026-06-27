@@ -1,38 +1,54 @@
 use super::*;
 use crate::cli::command::render::render_agent_timeline;
-use crabdb::AgentRunReport;
+use crabdb::{AgentContinueReport, AgentRunReport, StatusSuggestion};
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) -> Result<()> {
     match agent.command {
-        None => handle_agent_inbox(ctx),
+        None => handle_agent_home(ctx),
         Some(AgentSubcommand::Setup(args)) => handle_agent_setup(ctx, args),
         Some(AgentSubcommand::Acp(args)) => handle_agent_acp(ctx, args),
         Some(AgentSubcommand::Start(args)) => handle_agent_start(ctx, args),
+        Some(AgentSubcommand::Continue(args)) => handle_agent_continue(ctx, args),
+        Some(AgentSubcommand::Guide(args)) => handle_agent_guide(ctx, args),
         Some(AgentSubcommand::Ask(args)) => handle_agent_ask(ctx, args),
         Some(AgentSubcommand::Next(args)) => handle_agent_next(ctx, args),
         Some(AgentSubcommand::Status) => handle_agent_status(ctx),
-        Some(AgentSubcommand::Inbox) => handle_agent_inbox(ctx),
+        Some(AgentSubcommand::Dashboard(args)) => handle_agent_dashboard(ctx, args),
+        Some(AgentSubcommand::ReviewData(args)) => handle_agent_review_data(ctx, args),
+        Some(AgentSubcommand::ReviewFlow(args)) => handle_agent_review_flow(ctx, args),
+        Some(AgentSubcommand::Inbox(args)) => handle_agent_inbox(ctx, args),
+        Some(AgentSubcommand::Board(args)) => handle_agent_board(ctx, args),
+        Some(AgentSubcommand::Stack(args)) => handle_agent_stack(ctx, args),
         Some(AgentSubcommand::Brief(args)) => handle_agent_brief(ctx, args),
         Some(AgentSubcommand::Summary(args)) => handle_agent_summary(ctx, args),
         Some(AgentSubcommand::Validate(args)) => handle_agent_validate(ctx, args),
+        Some(AgentSubcommand::TestPlan(args)) => handle_agent_test_plan(ctx, args),
         Some(AgentSubcommand::Report(args)) => handle_agent_report(ctx, args),
+        Some(AgentSubcommand::Handoff(args)) => handle_agent_handoff(ctx, args),
         Some(AgentSubcommand::Receipt(args)) => handle_agent_receipt(ctx, args),
         Some(AgentSubcommand::Pr(args)) => handle_agent_pr(ctx, args),
         Some(AgentSubcommand::Story(args)) => handle_agent_story(ctx, args),
+        Some(AgentSubcommand::Tools(args)) => handle_agent_tools(ctx, args),
+        Some(AgentSubcommand::Impact(args)) => handle_agent_impact(ctx, args),
+        Some(AgentSubcommand::ReviewMap(args)) => handle_agent_review_map(ctx, args),
         Some(AgentSubcommand::Risk(args)) => handle_agent_risk(ctx, args),
+        Some(AgentSubcommand::Confidence(args)) => handle_agent_confidence(ctx, args),
         Some(AgentSubcommand::Ready(args)) => handle_agent_ready(ctx, args),
         Some(AgentSubcommand::Diagnose(args)) => handle_agent_diagnose(ctx, args),
         Some(AgentSubcommand::Compare(args)) => handle_agent_compare(ctx, args),
         Some(AgentSubcommand::Test(args)) => handle_agent_gate(ctx, args, AgentGateKind::Test),
         Some(AgentSubcommand::Eval(args)) => handle_agent_gate(ctx, args, AgentGateKind::Eval),
         Some(AgentSubcommand::Workdir(args)) => handle_agent_workdir(ctx, args),
-        Some(AgentSubcommand::List) => handle_agent_list(ctx),
+        Some(AgentSubcommand::List(args)) => handle_agent_list(ctx, args),
         Some(AgentSubcommand::View(args)) => handle_agent_view(ctx, args),
         Some(AgentSubcommand::Changes(args)) => handle_agent_changes(ctx, args),
         Some(AgentSubcommand::Delta(args)) => handle_agent_delta(ctx, args),
         Some(AgentSubcommand::New(args)) => handle_agent_new(ctx, args),
         Some(AgentSubcommand::MarkReviewed(args)) => handle_agent_mark_reviewed(ctx, args),
+        Some(AgentSubcommand::MarkFileReviewed(args)) => handle_agent_mark_file_reviewed(ctx, args),
+        Some(AgentSubcommand::Archive(args)) => handle_agent_archive(ctx, args, true),
+        Some(AgentSubcommand::Unarchive(args)) => handle_agent_archive(ctx, args, false),
         Some(AgentSubcommand::Change(args)) => handle_agent_change(ctx, args),
         Some(AgentSubcommand::Files(args)) => handle_agent_files(ctx, args),
         Some(AgentSubcommand::File(args)) => handle_agent_file(ctx, args),
@@ -44,10 +60,24 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
         Some(AgentSubcommand::Diff(args)) => handle_agent_diff(ctx, args),
         Some(AgentSubcommand::Review(args)) => handle_agent_review(ctx, args),
         Some(AgentSubcommand::Focus(args)) => handle_agent_focus(ctx, args),
+        Some(AgentSubcommand::Open(args)) => handle_agent_open(ctx, args),
         Some(AgentSubcommand::Apply(args)) => handle_agent_apply(ctx, args),
+        Some(AgentSubcommand::Finish(args)) => handle_agent_finish(ctx, args),
         Some(AgentSubcommand::Undo(args)) => handle_agent_undo(ctx, args),
         Some(AgentSubcommand::Rewind(args)) => handle_agent_rewind(ctx, args),
         Some(AgentSubcommand::Doctor(args)) => handle_agent_doctor(ctx, args),
+    }
+}
+
+fn handle_agent_home(ctx: &RuntimeContext) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let tasks = db.list_agent_tasks()?.tasks;
+    if tasks.len() == 1 {
+        let report = db.agent_dashboard(&tasks[0].lane)?;
+        render_agent_dashboard(&report, ctx.json, ctx.quiet)
+    } else {
+        let report = db.agent_inbox()?;
+        render_agent_inbox(&report, ctx.json, ctx.quiet)
     }
 }
 
@@ -80,35 +110,92 @@ fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
 }
 
 fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> {
-    let mut db = open_db(ctx)?;
+    let db = open_db(ctx)?;
     let lane = db.fresh_agent_lane_name(&args.provider, args.name.as_deref());
-    let spawn = db.spawn_lane(&lane, None, true, Some(args.provider.clone()), None)?;
+    let report = run_terminal_agent_task(ctx, db, lane, args.provider, args.from, args.command)?;
+    render_agent_run(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let source = db.agent_task_view(&args.selector)?;
+    let from_change = source
+        .task
+        .latest_checkpoint
+        .clone()
+        .unwrap_or_else(|| source.review.lane.branch.head_change.clone());
+    let provider = args
+        .provider
+        .or_else(|| source.task.provider.clone())
+        .unwrap_or_else(|| "claude-code".to_string());
+    let name = args
+        .name
+        .unwrap_or_else(|| format!("{} follow-up", source.task.title));
+    let lane = db.fresh_agent_lane_name(&provider, Some(&name));
+    let source_task = source.task.clone();
+    let run = run_terminal_agent_task(
+        ctx,
+        db,
+        lane,
+        provider,
+        Some(from_change.0.clone()),
+        args.command,
+    )?;
+    let mut suggestions = vec![StatusSuggestion {
+        command: format!("crabdb agent view {}", run.task.lane),
+        reason: "inspect the new follow-up task transcript and checkpoint".to_string(),
+    }];
+    push_agent_cli_suggestion(
+        &mut suggestions,
+        format!("crabdb agent changes {}", run.task.lane),
+        "review changes made in the follow-up task",
+    );
+    push_agent_cli_suggestion(
+        &mut suggestions,
+        format!("crabdb agent land {} --dry-run", run.task.lane),
+        "preview applying the follow-up task safely",
+    );
+    let report = AgentContinueReport {
+        source_task,
+        from_change,
+        run,
+        suggestions,
+    };
+    render_agent_continue(&report, ctx.json, ctx.quiet)
+}
+
+fn run_terminal_agent_task(
+    ctx: &RuntimeContext,
+    mut db: crabdb::CrabDb,
+    lane: String,
+    provider: String,
+    from: Option<String>,
+    command: Vec<String>,
+) -> Result<AgentRunReport> {
+    let spawn = db.spawn_lane(&lane, from.as_deref(), true, Some(provider.clone()), None)?;
     let workdir = spawn.workdir.clone().ok_or_else(|| {
         Error::InvalidInput("agent start requires a materialized lane workdir".to_string())
     })?;
     let session = db
-        .start_lane_session(
-            &lane,
-            Some(format!("Agent terminal {}", args.provider)),
-            None,
-        )?
+        .start_lane_session(&lane, Some(format!("Agent terminal {}", provider)), None)?
         .session;
     db.add_lane_session_event(
         &lane,
         &session.session_id,
         "agent_task_started",
         Some(serde_json::json!({
-            "provider": args.provider,
+            "provider": provider,
             "workdir": workdir,
-            "mode": "terminal"
+            "mode": "terminal",
+            "from": from
         })),
     )?;
     drop(db);
 
-    let command = if args.command.is_empty() {
-        default_terminal_agent_command(&args.provider)?
+    let command = if command.is_empty() {
+        default_terminal_agent_command(&provider)?
     } else {
-        args.command
+        command
     };
     if !ctx.quiet && !ctx.json {
         println!("Agent task: {lane}");
@@ -156,7 +243,7 @@ fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> 
         &session.session_id,
         "agent_task_finished",
         Some(serde_json::json!({
-            "provider": args.provider,
+            "provider": provider,
             "exit_code": exit_code,
             "status": status
         })),
@@ -165,30 +252,65 @@ fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> 
     let view = db.agent_task_view(&lane)?;
     let report = AgentRunReport {
         task: view.task,
-        provider: args.provider,
+        provider,
         command,
         workdir: Some(workdir),
         exit_code,
         recorded: Some(recorded),
         status: status.to_string(),
     };
-    render_agent_run(&report, ctx.json, ctx.quiet)
+    Ok(report)
+}
+
+fn push_agent_cli_suggestion(
+    suggestions: &mut Vec<StatusSuggestion>,
+    command: String,
+    reason: &str,
+) {
+    if !suggestions
+        .iter()
+        .any(|suggestion| suggestion.command == command)
+    {
+        suggestions.push(StatusSuggestion {
+            command,
+            reason: reason.to_string(),
+        });
+    }
+}
+
+fn handle_agent_guide(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_guide(&args.selector)?;
+    render_agent_guide(&report, ctx.json, ctx.quiet)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentAskIntent {
     Inbox,
+    Board,
+    Stack,
     Next,
+    Guide,
+    Dashboard,
+    ReviewData,
     Summary,
     Validate,
+    TestPlan,
     Brief,
     Story,
     Risk,
+    Impact,
+    ReviewMap,
+    Confidence,
     Ready,
     Diagnose,
     Receipt,
+    Handoff,
     Pr,
     Changes,
+    ChangesByFile,
+    Tools,
+    TaskDiff { file: Option<String>, patch: bool },
     TurnDiff { file: Option<String>, patch: bool },
     Delta { file: Option<String>, patch: bool },
     New { file: Option<String>, patch: bool },
@@ -199,6 +321,7 @@ enum AgentAskIntent {
     Timeline,
     Turn,
     Why(String),
+    ReviewFlow,
     Review,
     Focus,
     View,
@@ -208,16 +331,26 @@ fn handle_agent_ask(ctx: &RuntimeContext, args: AgentAskArgs) -> Result<()> {
     let selector = args.selector;
     let question = args.question.join(" ");
     match resolve_agent_ask_intent(&question)? {
-        AgentAskIntent::Inbox => handle_agent_inbox(ctx),
+        AgentAskIntent::Inbox => handle_agent_inbox(ctx, AgentInboxArgs { all: false }),
+        AgentAskIntent::Board => handle_agent_board(ctx, AgentInboxArgs { all: false }),
+        AgentAskIntent::Stack => handle_agent_stack(ctx, AgentInboxArgs { all: false }),
         AgentAskIntent::Next => handle_agent_next(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::Guide => handle_agent_guide(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::Dashboard => handle_agent_dashboard(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::ReviewData => handle_agent_review_data(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Summary => handle_agent_summary(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Validate => handle_agent_validate(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::TestPlan => handle_agent_test_plan(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Brief => handle_agent_brief(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Story => handle_agent_story(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Risk => handle_agent_risk(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::Impact => handle_agent_impact(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::ReviewMap => handle_agent_review_map(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::Confidence => handle_agent_confidence(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Ready => handle_agent_ready(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Diagnose => handle_agent_diagnose(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Receipt => handle_agent_receipt(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::Handoff => handle_agent_handoff(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Pr => handle_agent_pr(
             ctx,
             AgentPrArgs {
@@ -232,6 +365,30 @@ fn handle_agent_ask(ctx: &RuntimeContext, args: AgentAskArgs) -> Result<()> {
                 selector,
                 by_turn: false,
                 by_operation: false,
+                by_file: false,
+            },
+        ),
+        AgentAskIntent::ChangesByFile => handle_agent_changes(
+            ctx,
+            AgentChangesArgs {
+                selector,
+                by_turn: false,
+                by_operation: false,
+                by_file: true,
+            },
+        ),
+        AgentAskIntent::Tools => handle_agent_tools(ctx, AgentSelectorArgs { selector }),
+        AgentAskIntent::TaskDiff { file, patch } => handle_agent_diff(
+            ctx,
+            AgentDiffArgs {
+                selector,
+                turn: None,
+                operation: None,
+                checkpoint: None,
+                last_turn: false,
+                file,
+                stat: false,
+                patch,
             },
         ),
         AgentAskIntent::TurnDiff { file, patch } => handle_agent_turn_diff(
@@ -277,7 +434,7 @@ fn handle_agent_ask(ctx: &RuntimeContext, args: AgentAskArgs) -> Result<()> {
         }
         AgentAskIntent::Timeline => handle_agent_timeline(
             ctx,
-            AgentChangesArgs {
+            AgentTimelineArgs {
                 selector,
                 by_turn: false,
                 by_operation: false,
@@ -299,6 +456,7 @@ fn handle_agent_ask(ctx: &RuntimeContext, args: AgentAskArgs) -> Result<()> {
                 path: Some(path),
             },
         ),
+        AgentAskIntent::ReviewFlow => handle_agent_review_flow(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Review => handle_agent_review(ctx, AgentSelectorArgs { selector }),
         AgentAskIntent::Focus => handle_agent_focus(
             ctx,
@@ -341,7 +499,162 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
             || lowered.contains("changes from")
             || lowered.contains("code changed")
             || agent_ask_has_any(&lowered_tokens, &["changed", "changes", "delta"]));
+    let mentions_apply_flow = lowered.contains("pull request")
+        || lowered.contains("apply")
+        || lowered.contains("merge")
+        || lowered.contains("ready")
+        || agent_ask_has_any(&lowered_tokens, &["land", "ship", "pr"]);
+    if lowered.contains("review data")
+        || lowered.contains("review json")
+        || lowered.contains("review packet json")
+        || lowered.contains("editor panel")
+        || lowered.contains("side panel")
+        || lowered.contains("panel data")
+        || lowered.contains("ui data")
+        || lowered.contains("one json")
+        || lowered.contains("single json")
+        || lowered.contains("single packet")
+    {
+        return Ok(AgentAskIntent::ReviewData);
+    }
+    let asks_blocker = lowered.contains("what blocks")
+        || lowered.contains("what is blocking")
+        || lowered.contains("what's blocking")
+        || lowered.contains("what is blocked")
+        || lowered.contains("why blocked")
+        || lowered.contains("why is this blocked")
+        || lowered.contains("why is it blocked")
+        || lowered.contains("blocking this")
+        || lowered.contains("blocking the")
+        || agent_ask_has_any(&lowered_tokens, &["blockers", "blocking"]);
+    let asks_problem = lowered.contains("what went wrong")
+        || lowered.contains("what's wrong")
+        || lowered.contains("what is wrong")
+        || lowered.contains("anything wrong")
+        || lowered.contains("any problems")
+        || lowered.contains("any issues")
+        || lowered.contains("did it fail")
+        || lowered.contains("did this fail")
+        || lowered.contains("why did it fail")
+        || lowered.contains("why did this fail")
+        || lowered.contains("why failed")
+        || lowered.contains("why is it failing")
+        || lowered.contains("why is this failing")
+        || agent_ask_has_any(
+            &lowered_tokens,
+            &["failed", "failing", "failure", "problem", "problems"],
+        );
+    let asks_file_risk = (lowered.contains("risk")
+        || lowered.contains("risky")
+        || lowered.contains("red flag")
+        || lowered.contains("worry")
+        || lowered.contains("danger"))
+        && (lowered.contains("file")
+            || lowered.contains("files")
+            || lowered.contains("path")
+            || lowered.contains("paths"));
+    let asks_file_to_open = lowered.contains("what file should i open")
+        || lowered.contains("which file should i open")
+        || lowered.contains("what file do i open")
+        || lowered.contains("which file do i open")
+        || lowered.contains("file should i open")
+        || lowered.contains("open first file")
+        || lowered.contains("open the first file")
+        || lowered.contains("open next file")
+        || lowered.contains("open the next file")
+        || lowered.contains("open in editor")
+        || lowered.contains("open in my editor");
+    let asks_impact = lowered.contains("impact")
+        || lowered.contains("blast radius")
+        || lowered.contains("surface area")
+        || lowered.contains("scope of change")
+        || lowered.contains("change scope")
+        || lowered.contains("what areas")
+        || lowered.contains("which areas")
+        || lowered.contains("areas did")
+        || lowered.contains("areas changed")
+        || lowered.contains("what parts")
+        || lowered.contains("which parts")
+        || lowered.contains("what surfaces")
+        || lowered.contains("which surfaces")
+        || lowered.contains("what should i test because")
+        || lowered.contains("what should we test because");
+    let asks_review_map = lowered.contains("review map")
+        || lowered.contains("review-map")
+        || lowered.contains("file checklist")
+        || lowered.contains("files checklist")
+        || lowered.contains("review files")
+        || lowered.contains("review all files")
+        || lowered.contains("review by file")
+        || lowered.contains("review by area")
+        || lowered.contains("map of changes")
+        || lowered.contains("map the changes")
+        || lowered.contains("change map")
+        || lowered.contains("changes map")
+        || lowered.contains("review every file");
+    let asks_confidence = lowered.contains("confidence")
+        || lowered.contains("go/no-go")
+        || lowered.contains("go no go")
+        || lowered.contains("go-no-go")
+        || lowered.contains("final check")
+        || lowered.contains("ship check")
+        || lowered.contains("apply check")
+        || lowered.contains("green light")
+        || lowered.contains("am i good")
+        || lowered.contains("are we good")
+        || lowered.contains("good to go")
+        || lowered.contains("should i ship")
+        || lowered.contains("should we ship")
+        || lowered.contains("should i land")
+        || lowered.contains("should we land")
+        || lowered.contains("should i apply")
+        || lowered.contains("should we apply");
+    let asks_test_plan = lowered.contains("test plan")
+        || lowered.contains("validation plan")
+        || lowered.contains("what tests")
+        || lowered.contains("which tests")
+        || lowered.contains("what should i test")
+        || lowered.contains("what should we test")
+        || lowered.contains("how do i test")
+        || lowered.contains("how should i test")
+        || lowered.contains("how should we test")
+        || lowered.contains("how to test")
+        || lowered.contains("test this")
+        || lowered.contains("test it")
+        || lowered.contains("run tests")
+        || lowered.contains("run the tests")
+        || lowered.contains("what validation should i run")
+        || lowered.contains("which validation should i run");
 
+    if path.is_none() && asks_confidence {
+        return Ok(AgentAskIntent::Confidence);
+    }
+    if path.is_none() && asks_impact {
+        return Ok(AgentAskIntent::Impact);
+    }
+    if path.is_none() && asks_review_map {
+        return Ok(AgentAskIntent::ReviewMap);
+    }
+    if path.is_none() && asks_test_plan {
+        return Ok(AgentAskIntent::TestPlan);
+    }
+
+    if path.is_none()
+        && mentions_apply_flow
+        && (agent_ask_has_any(&lowered_tokens, &["why", "reason"])
+            || lowered.contains("why can't")
+            || lowered.contains("why cant")
+            || lowered.contains("why cannot")
+            || asks_blocker)
+    {
+        return Ok(AgentAskIntent::Ready);
+    }
+    if path.is_none() && asks_blocker {
+        return Ok(AgentAskIntent::Diagnose);
+    }
+    if path.is_none() && asks_problem {
+        return Ok(AgentAskIntent::Diagnose);
+    }
     if agent_ask_has_any(&lowered_tokens, &["why", "explain", "reason"]) {
         return path.map(AgentAskIntent::Why).ok_or_else(|| {
             Error::InvalidInput(
@@ -395,6 +708,9 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
             });
         }
     }
+    if asks_file_risk {
+        return Ok(AgentAskIntent::ChangesByFile);
+    }
     if lowered.contains("changed files")
         || lowered.contains("which files")
         || lowered.contains("what files")
@@ -405,6 +721,18 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
         || lowered.contains("where did the agent edit")
         || lowered.contains("what did it edit")
         || lowered.contains("what did the agent edit")
+        || lowered.contains("what did it change")
+        || lowered.contains("what did the agent change")
+        || lowered.contains("what did it touch")
+        || lowered.contains("what did the agent touch")
+        || lowered.contains("what files did it change")
+        || lowered.contains("what files did the agent change")
+        || lowered.contains("which files did it change")
+        || lowered.contains("which files did the agent change")
+        || lowered.contains("what files did it touch")
+        || lowered.contains("what files did the agent touch")
+        || lowered.contains("which files did it touch")
+        || lowered.contains("which files did the agent touch")
         || agent_ask_has_any(&lowered_tokens, &["files"])
     {
         return Ok(AgentAskIntent::Files);
@@ -420,6 +748,29 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
                 patch: wants_patch,
             });
         }
+    }
+    if lowered.contains("apply order")
+        || lowered.contains("apply first")
+        || lowered.contains("which agent first")
+        || lowered.contains("which task first")
+        || lowered.contains("what should i apply first")
+        || lowered.contains("what should i land first")
+        || lowered.contains("what should i finish first")
+        || lowered.contains("show stack")
+        || lowered.contains("agent stack")
+        || lowered.contains("task stack")
+        || matches!(lowered.trim(), "stack" | "order" | "apply order")
+    {
+        return Ok(AgentAskIntent::Stack);
+    }
+    if lowered.contains("agent board")
+        || lowered.contains("task board")
+        || lowered.contains("multi agent")
+        || lowered.contains("multi-agent")
+        || lowered.contains("show board")
+        || matches!(lowered.trim(), "board" | "tasks")
+    {
+        return Ok(AgentAskIntent::Board);
     }
     if lowered.contains("what needs attention")
         || lowered.contains("needs my attention")
@@ -467,9 +818,35 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
     if lowered.contains("turn") || lowered.contains("prompt") {
         return Ok(AgentAskIntent::Turn);
     }
+    if lowered.contains("walk me through")
+        || lowered.contains("walk through")
+        || lowered.contains("walkthrough")
+        || lowered.contains("step by step")
+        || lowered.contains("step-by-step")
+        || lowered.contains("review flow")
+        || lowered.contains("review loop")
+        || lowered.contains("review checklist")
+        || lowered.contains("finish checklist")
+        || lowered.contains("ship checklist")
+        || lowered.contains("guide me through review")
+        || lowered.contains("guide me through the review")
+        || lowered.contains("how do i review")
+        || lowered.contains("how should i review")
+        || lowered.contains("review steps")
+        || lowered.contains("review workflow")
+    {
+        return Ok(AgentAskIntent::ReviewFlow);
+    }
     if lowered.contains("review first")
         || lowered.contains("inspect first")
+        || asks_file_to_open
+        || lowered.contains("what file should i review first")
+        || lowered.contains("which file should i review first")
+        || lowered.contains("first file to review")
+        || lowered.contains("first file should i review")
         || lowered.contains("look at first")
+        || lowered.contains("look first")
+        || lowered.contains("where should i look first")
         || lowered.contains("where should i start")
     {
         return Ok(AgentAskIntent::Focus);
@@ -490,10 +867,99 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
     {
         return Ok(AgentAskIntent::Review);
     }
+    if lowered.contains("commit message")
+        || lowered.contains("git message")
+        || lowered.contains("message for commit")
+        || lowered.contains("message should i use")
+        || lowered.contains("what message should i use")
+        || lowered.contains("commit title")
+    {
+        return Ok(AgentAskIntent::Ready);
+    }
+    if lowered.contains("pr title")
+        || lowered.contains("pr body")
+        || lowered.contains("pr description")
+        || lowered.contains("pull request title")
+        || lowered.contains("pull request body")
+        || lowered.contains("pull request description")
+        || lowered.contains("draft pr")
+        || lowered.contains("draft a pr")
+        || lowered.contains("draft the pr")
+        || lowered.contains("draft pull request")
+        || lowered.contains("draft a pull request")
+        || lowered.contains("draft the pull request")
+        || lowered.contains("put in the pr")
+        || lowered.contains("put in pr")
+        || lowered.contains("put in the pull request")
+        || lowered.contains("put in pull request")
+        || lowered.contains("write the pr")
+        || lowered.contains("write a pr")
+        || lowered.contains("write the pull request")
+        || lowered.contains("write a pull request")
+    {
+        return Ok(AgentAskIntent::Pr);
+    }
+    if lowered.contains("handoff")
+        || lowered.contains("hand off")
+        || lowered.contains("share with another agent")
+        || lowered.contains("share with an agent")
+        || lowered.contains("give to another agent")
+        || lowered.contains("give this to another agent")
+        || lowered.contains("send to another agent")
+        || lowered.contains("handoff packet")
+    {
+        return Ok(AgentAskIntent::Handoff);
+    }
+    if lowered.contains("receipt")
+        || lowered.contains("copyable")
+        || lowered.contains("share summary")
+        || lowered.contains("summary to share")
+        || lowered.contains("what should i share")
+        || lowered.contains("note to share")
+        || lowered.contains("review note")
+        || lowered.contains("after action")
+        || lowered.contains("after-action")
+        || lowered.contains("post run")
+        || lowered.contains("post-run")
+    {
+        return Ok(AgentAskIntent::Receipt);
+    }
+    if lowered.contains("red flag")
+        || lowered.contains("what should i worry")
+        || lowered.contains("what should we worry")
+        || lowered.contains("worry about")
+        || lowered.contains("worried about")
+        || lowered.contains("anything risky")
+        || lowered.contains("what is risky")
+        || lowered.contains("what's risky")
+        || lowered.contains("risky")
+        || lowered.contains("dangerous")
+        || lowered.contains("danger")
+        || lowered.contains("unsafe")
+        || lowered.contains("blast radius")
+        || lowered.contains("high risk")
+        || lowered.contains("risk review")
+    {
+        return Ok(AgentAskIntent::Risk);
+    }
+    if lowered.contains("help me")
+        || lowered.contains("show guide")
+        || lowered.contains("agent guide")
+        || lowered.contains("getting started")
+        || lowered.contains("how do i use crabdb")
+        || lowered.contains("how should i use crabdb")
+        || lowered.contains("how to use crabdb")
+        || lowered.contains("how do i use this")
+        || lowered.contains("how should i use this")
+        || lowered.contains("what commands should i use")
+        || matches!(lowered.trim(), "help" | "guide")
+    {
+        return Ok(AgentAskIntent::Guide);
+    }
     if lowered.contains("what should")
         || lowered.contains("what now")
         || lowered.contains("next")
-        || agent_ask_has_any(&lowered_tokens, &["todo", "help"])
+        || agent_ask_has_any(&lowered_tokens, &["todo"])
     {
         return Ok(AgentAskIntent::Next);
     }
@@ -550,10 +1016,18 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
         || lowered.contains("change cards")
         || agent_ask_has_any(&lowered_tokens, &["changes"])
     {
+        if lowered.contains("by file")
+            || lowered.contains("by changed file")
+            || lowered.contains("per file")
+            || lowered.contains("file by file")
+            || lowered.contains("file-by-file")
+        {
+            return Ok(AgentAskIntent::ChangesByFile);
+        }
         return Ok(AgentAskIntent::Changes);
     }
     if wants_patch {
-        return Ok(AgentAskIntent::Delta {
+        return Ok(AgentAskIntent::TaskDiff {
             file: path,
             patch: true,
         });
@@ -572,19 +1046,54 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
     {
         return Ok(AgentAskIntent::Story);
     }
-    if agent_ask_has_any(&lowered_tokens, &["tools", "tool", "commands", "command"]) {
-        return Ok(AgentAskIntent::View);
+    if lowered.contains("tool call")
+        || lowered.contains("tool use")
+        || lowered.contains("tools used")
+        || lowered.contains("used tools")
+        || lowered.contains("available command")
+        || lowered.contains("available commands")
+        || agent_ask_has_any(&lowered_tokens, &["tools", "tool"])
+    {
+        return Ok(AgentAskIntent::Tools);
+    }
+    if agent_ask_has_any(&lowered_tokens, &["commands", "command"]) {
+        return Ok(AgentAskIntent::Tools);
     }
     if lowered.contains("test status")
         || lowered.contains("validation")
-        || lowered.contains("what tests")
-        || lowered.contains("which tests")
+        || lowered.contains("tests passing")
+        || lowered.contains("tests pass")
+        || lowered.contains("test pass")
+        || lowered.contains("did tests pass")
+        || lowered.contains("did the tests pass")
+        || lowered.contains("did it pass tests")
+        || lowered.contains("is it tested")
+        || lowered.contains("is this tested")
+        || lowered.contains("has it been tested")
+        || lowered.contains("was it tested")
+        || lowered.contains("test results")
+        || lowered.contains("validation status")
+        || lowered.contains("validation guidance")
+        || lowered.contains("missing validation")
+        || lowered.contains("validation missing")
+        || lowered.contains("what validation")
+        || lowered.contains("which validation")
+        || lowered.contains("need validation")
+        || lowered.contains("needs validation")
         || lowered.contains("do i need tests")
         || lowered.contains("need tests")
     {
         return Ok(AgentAskIntent::Validate);
     }
-    if lowered.contains("summary") || lowered.contains("overview") || lowered.contains("cockpit") {
+    if lowered.contains("dashboard")
+        || lowered.contains("overview")
+        || lowered.contains("cockpit")
+        || lowered.contains("status board")
+        || lowered.contains("one screen")
+    {
+        return Ok(AgentAskIntent::Dashboard);
+    }
+    if lowered.contains("summary") {
         return Ok(AgentAskIntent::Summary);
     }
     if lowered.contains("brief") {
@@ -598,6 +1107,9 @@ fn resolve_agent_ask_intent(question: &str) -> Result<AgentAskIntent> {
     }
     if lowered.contains("receipt") {
         return Ok(AgentAskIntent::Receipt);
+    }
+    if lowered.contains("handoff") || lowered.contains("hand off") {
+        return Ok(AgentAskIntent::Handoff);
     }
     if lowered.contains("pr") || lowered.contains("pull request") {
         return Ok(AgentAskIntent::Pr);
@@ -711,10 +1223,40 @@ fn handle_agent_status(ctx: &RuntimeContext) -> Result<()> {
     render_agent_status(&report, ctx.json, ctx.quiet)
 }
 
-fn handle_agent_inbox(ctx: &RuntimeContext) -> Result<()> {
+fn handle_agent_dashboard(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let report = db.agent_dashboard(&args.selector)?;
+    render_agent_dashboard(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_review_data(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let report = db.agent_review_data(&args.selector)?;
+    render_agent_review_data(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_review_flow(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let report = db.agent_review_flow(&args.selector)?;
+    render_agent_review_flow(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_inbox(ctx: &RuntimeContext, args: AgentInboxArgs) -> Result<()> {
     let db = open_db(ctx)?;
-    let report = db.agent_inbox()?;
+    let report = db.agent_inbox_with_options(args.all)?;
     render_agent_inbox(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_board(ctx: &RuntimeContext, args: AgentInboxArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_board_with_options(args.all)?;
+    render_agent_board(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_stack(ctx: &RuntimeContext, args: AgentInboxArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_stack_with_options(args.all)?;
+    render_agent_stack(&report, ctx.json, ctx.quiet)
 }
 
 fn handle_agent_next(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
@@ -723,9 +1265,9 @@ fn handle_agent_next(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()
     render_agent_next(&report, ctx.json, ctx.quiet)
 }
 
-fn handle_agent_list(ctx: &RuntimeContext) -> Result<()> {
+fn handle_agent_list(ctx: &RuntimeContext, args: AgentListArgs) -> Result<()> {
     let db = open_db(ctx)?;
-    let report = db.list_agent_tasks()?;
+    let report = db.list_agent_tasks_with_options(args.all)?;
     render_agent_list(&report, ctx.json, ctx.quiet)
 }
 
@@ -747,10 +1289,22 @@ fn handle_agent_validate(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Resul
     render_agent_validate(&report, ctx.json, ctx.quiet)
 }
 
+fn handle_agent_test_plan(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_test_plan(&args.selector)?;
+    render_agent_test_plan(&report, ctx.json, ctx.quiet)
+}
+
 fn handle_agent_report(ctx: &RuntimeContext, args: AgentReportArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_report(&args.selector)?;
     render_agent_report(&report, ctx.json, ctx.quiet, args.markdown)
+}
+
+fn handle_agent_handoff(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_handoff(&args.selector)?;
+    render_agent_handoff(&report, ctx.json, ctx.quiet)
 }
 
 fn handle_agent_receipt(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
@@ -777,10 +1331,34 @@ fn handle_agent_story(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<(
     render_agent_story(&report, ctx.json, ctx.quiet)
 }
 
+fn handle_agent_tools(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_tools(&args.selector)?;
+    render_agent_tools(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_impact(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_impact(&args.selector)?;
+    render_agent_impact(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_review_map(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_review_map(&args.selector)?;
+    render_agent_review_map(&report, ctx.json, ctx.quiet)
+}
+
 fn handle_agent_risk(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_risk(&args.selector)?;
     render_agent_risk(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_confidence(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let report = db.agent_confidence(&args.selector)?;
+    render_agent_confidence(&report, ctx.json, ctx.quiet)
 }
 
 fn handle_agent_ready(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
@@ -850,7 +1428,8 @@ fn handle_agent_view(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()
 
 fn handle_agent_changes(ctx: &RuntimeContext, args: AgentChangesArgs) -> Result<()> {
     let db = open_db(ctx)?;
-    let report = db.agent_changes(&args.selector, args.by_operation)?;
+    let _ = args.by_turn;
+    let report = db.agent_changes_with_options(&args.selector, args.by_operation, args.by_file)?;
     render_agent_changes(&report, ctx.json, ctx.quiet)
 }
 
@@ -878,6 +1457,26 @@ fn handle_agent_mark_reviewed(ctx: &RuntimeContext, args: AgentMarkReviewedArgs)
     render_agent_mark_reviewed(&report, ctx.json, ctx.quiet)
 }
 
+fn handle_agent_mark_file_reviewed(
+    ctx: &RuntimeContext,
+    args: AgentMarkFileReviewedArgs,
+) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let (selector, path) = agent_mark_file_reviewed_selector_args(&args);
+    let report = db.agent_mark_file_reviewed(&selector, &path, args.note)?;
+    render_agent_mark_file_reviewed(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_archive(
+    ctx: &RuntimeContext,
+    args: AgentArchiveArgs,
+    archived: bool,
+) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    let report = db.agent_archive(&args.selector, archived, args.note)?;
+    render_agent_archive(&report, ctx.json, ctx.quiet)
+}
+
 fn handle_agent_change(ctx: &RuntimeContext, args: AgentChangeArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let (selector, change_selector) = agent_change_selector_args(&args);
@@ -885,8 +1484,9 @@ fn handle_agent_change(ctx: &RuntimeContext, args: AgentChangeArgs) -> Result<()
     render_agent_change_set(&report, ctx.json, ctx.quiet)
 }
 
-fn handle_agent_timeline(ctx: &RuntimeContext, args: AgentChangesArgs) -> Result<()> {
+fn handle_agent_timeline(ctx: &RuntimeContext, args: AgentTimelineArgs) -> Result<()> {
     let db = open_db(ctx)?;
+    let _ = args.by_turn;
     let report = db.agent_timeline(&args.selector, args.by_operation)?;
     render_agent_timeline(&report, ctx.json, ctx.quiet)
 }
@@ -930,6 +1530,13 @@ fn agent_change_selector_args(args: &AgentChangeArgs) -> (String, String) {
 }
 
 fn agent_file_selector_args(args: &AgentFileArgs) -> (String, String) {
+    match &args.path {
+        Some(path) => (args.selector_or_path.clone(), path.clone()),
+        None => ("latest".to_string(), args.selector_or_path.clone()),
+    }
+}
+
+fn agent_mark_file_reviewed_selector_args(args: &AgentMarkFileReviewedArgs) -> (String, String) {
     match &args.path {
         Some(path) => (args.selector_or_path.clone(), path.clone()),
         None => ("latest".to_string(), args.selector_or_path.clone()),
@@ -998,11 +1605,68 @@ fn handle_agent_focus(ctx: &RuntimeContext, args: AgentFocusArgs) -> Result<()> 
     render_agent_focus(&report, ctx.json, ctx.quiet)
 }
 
+fn handle_agent_open(ctx: &RuntimeContext, args: AgentOpenArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let report = db.agent_focus(&args.selector, args.file.as_deref(), false)?;
+    let open_path = report.open_path.clone().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "agent task `{}` has no materialized workdir to open; run `crabdb agent focus {}` to inspect it without opening an editor",
+            report.task.name, report.task.name
+        ))
+    })?;
+    let open_command = report.open_command.clone().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "agent task `{}` did not produce an editor command",
+            report.task.name
+        ))
+    })?;
+    if ctx.json {
+        return render_agent_focus(&report, true, ctx.quiet);
+    }
+    if args.print {
+        if !ctx.quiet {
+            println!("{open_command}");
+        }
+        return Ok(());
+    }
+    let shell = std::env::var_os("SHELL")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "sh".into());
+    let status = ProcessCommand::new(shell)
+        .arg("-c")
+        .arg(&open_command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(Error::from)?;
+    if !status.success() {
+        return Err(Error::InvalidInput(format!(
+            "editor command failed with status {}: {open_command}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated by signal".to_string())
+        )));
+    }
+    if !ctx.quiet {
+        println!("Opened: {open_path}");
+    }
+    Ok(())
+}
+
 fn handle_agent_apply(ctx: &RuntimeContext, args: AgentApplyArgs) -> Result<()> {
     let _ = args.into_current_git_branch;
     let mut db = open_db(ctx)?;
     let report = db.agent_apply(&args.selector, args.dry_run, args.message)?;
     render_agent_apply(&report, ctx.json, ctx.quiet)
+}
+
+fn handle_agent_finish(ctx: &RuntimeContext, args: AgentFinishArgs) -> Result<()> {
+    let _ = args.into_current_git_branch;
+    let mut db = open_db(ctx)?;
+    let report = db.agent_finish(&args.selector, args.dry_run, args.message, args.note)?;
+    render_agent_finish(&report, ctx.json, ctx.quiet)
 }
 
 fn handle_agent_rewind(ctx: &RuntimeContext, args: AgentRewindArgs) -> Result<()> {

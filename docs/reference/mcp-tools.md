@@ -27,17 +27,29 @@ and the server continues reading subsequent requests.
 
 - `crabdb.agent_status`
 - `crabdb.agent_inbox`
+- `crabdb.agent_board`
+- `crabdb.agent_stack`
 - `crabdb.agent_next`
+- `crabdb.agent_guide`
+- `crabdb.agent_dashboard`
+- `crabdb.agent_review_data`
+- `crabdb.agent_review_flow`
 - `crabdb.agent_ask`
 - `crabdb.agent_view`
 - `crabdb.agent_brief`
 - `crabdb.agent_summary`
 - `crabdb.agent_validate`
+- `crabdb.agent_test_plan`
 - `crabdb.agent_report`
+- `crabdb.agent_handoff`
 - `crabdb.agent_receipt`
 - `crabdb.agent_pr`
 - `crabdb.agent_story`
+- `crabdb.agent_tools`
+- `crabdb.agent_impact`
+- `crabdb.agent_review_map`
 - `crabdb.agent_risk`
+- `crabdb.agent_confidence`
 - `crabdb.agent_ready`
 - `crabdb.agent_diagnose`
 - `crabdb.agent_test`
@@ -47,6 +59,9 @@ and the server continues reading subsequent requests.
 - `crabdb.agent_delta`
 - `crabdb.agent_new`
 - `crabdb.agent_mark_reviewed`
+- `crabdb.agent_mark_file_reviewed`
+- `crabdb.agent_archive`
+- `crabdb.agent_unarchive`
 - `crabdb.agent_change`
 - `crabdb.agent_timeline`
 - `crabdb.agent_files`
@@ -59,38 +74,82 @@ and the server continues reading subsequent requests.
 - `crabdb.agent_review`
 - `crabdb.agent_focus`
 - `crabdb.agent_apply`
+- `crabdb.agent_finish`
 - `crabdb.agent_rewind`
 - `crabdb.agent_undo`
 
 These are the high-level tools an editor agent should prefer when the user asks
-questions like "what should I do next?", "what did the agent do?", "what should
-I review first?", "what tools were used?", "what changed?", "show the last turn
-diff", "what needs attention?", "where is the workdir?", "where did the agent edit?", "which prompt changed README.md?", "last prompt?", "what changed in the last prompt?", "what changed in README.md in the last prompt?", "show transcript?", "open review?", "review this task?", "what tests should I run?", "can I merge?", or "is this ready to apply?". `crabdb.agent_ask` is the
+questions like "help me use CrabDB?", "show agent board?", "which task first?", "show dashboard?", "walk me through review?", "go/no-go?", "am I good?", "what should I do next?", "what did the agent do?", "what did
+the agent change?", "what files did it touch?", "what should I review first?",
+"what should I put in the PR?", "handoff this to another agent?", "give me a summary to share?", "what commit
+message should I use?", "is it tested?", "how should I test this?", "what tools were used?", "what is the blast radius?", "review map?", "review files?", "what changed?", "show the diff?", "show the last turn
+diff", "what needs attention?", "where is the workdir?", "where did the agent edit?", "which prompt changed README.md?", "last prompt?", "what changed in the last prompt?", "what changed in README.md in the last prompt?", "show transcript?", "what file should I review first?", "what file should I open?", "where should I look first?", "open review?", "review this task?", "what tests should I run?", "validation plan?", "can I merge?", "why can't I apply?", "what is blocking this task?", "why did it fail?", "what went wrong?", "any red flags?", "what should I worry about?", "which files are risky?", or "is this ready to apply?". `crabdb.agent_ask` is the
 lowest-burden front door: pass a plain-language question and it deterministically
 routes to the right read-only report, returning the routed tool name and payload.
 It will route apply/merge/land questions to readiness and rewind/undo questions
 to checkpoint or diagnosis views rather than mutating state. Patch and diff
-questions such as "show last patch", "show turn diff", or "show patch for
-README.md" route to focused patch reports.
+questions such as "show the diff", "show last patch", "show turn diff", or
+"show changes by file", or "show patch for README.md" route to whole-task or
+focused patch reports.
 `crabdb.agent_inbox` groups all
 tasks by the action they need and returns one primary next command. Its
 structured `items` include each task's attention state, new files/lines since
 the last review, and an optional `review_first` target for editor dashboards.
+`crabdb.agent_board` presents the same multi-task evidence as low-noise columns
+for needs-record, conflicted, blocked, needs-review, ready, running, applied,
+and archived tasks. Use it for editor sidebars or "show all agents" requests
+where the user wants orientation before details.
+`crabdb.agent_stack` is the apply-order view: it finds files changed by more
+than one task, ranks non-overlapping apply candidates by risk and change size,
+and returns one next command. Use it for "which task first?" or "what can I
+apply safely?" requests.
 `crabdb.agent_next` returns one primary next command plus a few alternatives.
-`crabdb.agent_status` and
+`crabdb.agent_guide` returns the compact "how do I use CrabDB from here?"
+workflow: current state, one next command, setup/review/apply or recovery steps,
+and the small mental model to show in editor panels.
+`crabdb.agent_dashboard` returns one compact task board with next action, focus
+file, optional open command, validation status, changed files, risk, and apply
+readiness. `crabdb.agent_review_data` returns one editor-friendly structured
+packet with file review progress, focus file, review map, changes by file,
+confidence, validation, risk, readiness, and typed `actions` so hosts do not
+need to stitch multiple reports together or parse suggestions into buttons.
+Each action includes stable ids, enabled state, disabled reason, safety class,
+exact command, optional `mcp_tool`, and optional `mcp_arguments` for direct MCP
+execution.
+`crabdb.agent_review_flow` returns the procedural checklist for one
+task: inspect new changes, mark the checkpoint reviewed, validate, and preview
+finish/apply. Use it for editor "review checklist" or "walk me through review"
+requests. `crabdb.agent_status` and
 `crabdb.agent_brief` include embedded risk reports so an editor can show the
 safety signal without making a second tool call. `crabdb.agent_summary` returns
 the one-page post-run cockpit with readiness, risk, validation, receipt
 Markdown, PR draft, Git preflight, and next commands. `crabdb.agent_validate`
 returns a read-only validation guide with latest test/eval gates and suggested
 `agent_test`/`agent_eval` commands; use it before running open-world commands.
+`crabdb.agent_test_plan` returns the actionable validation checklist: ranked
+test/eval steps, exact commands, affected paths, and reasons derived from
+changed areas, impact, risk, and existing gates. Use it for "what tests should I
+run?" and keep `crabdb.agent_validate` for gate status questions.
 `crabdb.agent_story` returns one
 plain-language account of what happened, with turn summaries, changed files,
-tools, notes, and next action. `crabdb.agent_risk` returns a deterministic
+tools, notes, and next action. `crabdb.agent_tools` returns a focused tool
+activity report with available ACP commands, grouped tool calls, statuses,
+turns, checkpoints, and changed files around tool-heavy turns.
+`crabdb.agent_impact` returns the blast-radius view for a task: changed impact
+areas, highest impact, validation state, risk, and recommended review/test
+checks. Use it for "what areas did this touch?" or "what should I test because
+of these changes?" requests.
+`crabdb.agent_review_map` returns the file-by-file review checklist grouped by
+changed area, with per-file focus, why, patch, and optional editor-open commands.
+Use it for "review map", "review files", or "file checklist" requests.
+`crabdb.agent_risk` returns a deterministic
 low/medium/high/blocking risk level with reasons and mitigation commands before
-apply. `crabdb.agent_ready` returns a read-only apply preflight that combines
-task readiness, risk, Git dry-run status, blockers, warnings, and one next
-command. `crabdb.agent_diagnose` explains a likely issue, supporting evidence,
+apply. `crabdb.agent_confidence` returns a go/no-go verdict and score from
+review freshness, validation, risk, and Git apply preflight; use it for "am I
+good?", "final check", or "should I ship?" requests. `crabdb.agent_ready`
+returns a read-only apply preflight that combines task readiness, risk, Git
+dry-run status, blockers, warnings, and one next command.
+`crabdb.agent_diagnose` explains a likely issue, supporting evidence,
 friendly recovery targets, and safe inspection/recovery commands before an
 editor suggests destructive undo or rewind. `crabdb.agent_test` and
 `crabdb.agent_eval` run commands in the task
@@ -98,7 +157,10 @@ workdir and record durable gates without requiring the caller to know the lane
 name. `crabdb.agent_brief` returns a compact task review packet with next
 action, readiness, changed files, turn summaries, latest diff stats, and tools.
 `crabdb.agent_report` returns a shareable review bundle with story, risk,
-changes, transcript, readiness, suggestions, and a Markdown handoff string.
+changes, transcript, readiness, suggestions, and Markdown.
+`crabdb.agent_handoff` returns the receiver-friendly packet for another human or
+agent: current state, next step, review commands, validation, risks, changed
+files, turns, tools, related packet commands, and Markdown.
 `crabdb.agent_receipt` returns the easier post-run artifact: summary,
 validation gates, changed files, turns, tools, risk, checkpoint, next command,
 and a Markdown receipt string.
@@ -108,20 +170,28 @@ from the same recorded task state. It does not create a remote PR.
 cards, then raw turn/operation groups, so editor panels can show intent-level
 review chunks without asking the user to connect checkpoints manually. Each card
 includes `review_command`, `focus_command`, `why_command`, and `diff_command`
-fields when available.
+fields when available. Pass `by-file` when the editor wants one review card per
+changed file.
 `crabdb.agent_review` returns the review dashboard for an agent task: readiness,
 risk, blockers, warnings, prioritized files to inspect first, and exact next
 commands.
 `crabdb.agent_focus` bundles the next file to inspect with its review priority,
-prompt/tool explanation, and focused diff summary.
+prompt/tool explanation, optional materialized-task `open_path`/`open_command`,
+and focused diff summary.
 `crabdb.agent_workdir` returns the exact materialized task directory plus a
 shell-safe `cd` command. `crabdb.agent_change` expands one change card by rank,
 key, or title into files, provenance, tools, commands, and optional focused
 patches. `crabdb.agent_delta` returns the newest completed turn or operation as
 one card, with changed files, provenance, next commands, and optional focused
 patches. `crabdb.agent_new` returns the changes since the latest reviewed marker
-or the whole task when no marker exists. `crabdb.agent_mark_reviewed` writes that
-marker at the current task checkpoint. `crabdb.agent_timeline` returns the chronological
+or the whole task when no marker exists. `crabdb.agent_mark_reviewed` writes the
+whole-task marker at the current task checkpoint, while
+`crabdb.agent_mark_file_reviewed` records that one changed file has been
+reviewed for the current checkpoint and leaves the rest of the review map open.
+`crabdb.agent_archive` hides a task from default inbox/list/latest views without
+deleting its lane, transcript, checkpoints, or provenance;
+`crabdb.agent_unarchive` restores it.
+`crabdb.agent_timeline` returns the chronological
 prompt/operation timeline with checkpoints, tools, changed files, and per-item
 follow-up commands. `crabdb.agent_files` returns a file-centric review
 view with the turns, prompts, checkpoints, and commands behind each changed
@@ -150,10 +220,12 @@ checkpoints and friendly targets such as `before-last-turn`, `turn:2`,
 `before-last-operation`. Both undo and rewind are marked destructive so agent
 hosts can ask for explicit confirmation before moving task state or refreshing
 materialized workdirs.
-`crabdb.agent_apply` is also marked destructive because non-dry-run apply can
-record a task workdir, create a Git commit, and fast-forward the current Git
-branch. Hosts should call `crabdb.agent_ready` first and require explicit
-confirmation before non-dry-run apply.
+`crabdb.agent_apply` and `crabdb.agent_finish` are also marked destructive
+because non-dry-run apply can record a task workdir, create a Git commit, and
+fast-forward the current Git branch. `agent_finish` also archives the task after
+success. Hosts should call `crabdb.agent_ready` first, then call apply/finish in
+dry-run mode, and require explicit confirmation before non-dry-run apply or
+finish.
 
 ## Agent Prompts
 
@@ -261,7 +333,7 @@ workdir path. That directory contains copied recoverable regular files and
 
 ## Tool Risk Annotations
 
-The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only tool calls also run under CrabDB's read-only guard, so they must not persist SQLite database changes or mutate CrabDB sidecars such as `config.toml`, `HEAD`, ref files, daemon endpoint/token/cache files, or lane workdir metadata manifests while serving the request. The `crabdb://workspace/status` resource uses the same non-mutating status path. Read-only examples include status, diff, timeline, why, history, agent status/next/ask/view/brief/validate/report/story/risk/ready/workdir/changes/files/checkpoints/why/turn/compare/diff/review/focus, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Destructive-write examples include `crabdb.agent_apply`, `crabdb.agent_undo`, `crabdb.agent_rewind`, `crabdb.lane_rewind`, and `crabdb.merge_queue_run` because they intentionally move lane or shared branch refs and may refresh materialized workdirs.
+The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only tool calls also run under CrabDB's read-only guard, so they must not persist SQLite database changes or mutate CrabDB sidecars such as `config.toml`, `HEAD`, ref files, daemon endpoint/token/cache files, or lane workdir metadata manifests while serving the request. The `crabdb://workspace/status` resource uses the same non-mutating status path. Read-only examples include status, diff, timeline, why, history, agent status/inbox/board/stack/next/guide/dashboard/review-data/review-flow/ask/view/brief/validate/test-plan/report/handoff/story/tools/impact/review-map/risk/confidence/ready/workdir/changes/files/checkpoints/why/turn/compare/diff/review/focus, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Workspace-write examples include `crabdb.agent_mark_reviewed`, `crabdb.agent_mark_file_reviewed`, `crabdb.agent_archive`, and `crabdb.agent_unarchive` because they write task metadata markers without deleting provenance. Destructive-write examples include `crabdb.agent_apply`, `crabdb.agent_finish`, `crabdb.agent_undo`, `crabdb.agent_rewind`, `crabdb.lane_rewind`, and `crabdb.merge_queue_run` because they intentionally move lane or shared branch refs and may refresh materialized workdirs.
 
 Open-world write examples are `crabdb.agent_test`, `crabdb.agent_eval`,
 `crabdb.run_test`, and `crabdb.run_eval` because they execute commands in lane
@@ -291,10 +363,11 @@ Static resources include workspace status, doctor, lanes, merge queue,
 conflicts, OpenAPI, documentation, and agent task dashboard resources:
 `crabdb://workspace/agent-tasks`,
 `crabdb://workspace/agent-tasks/latest/review`,
+`crabdb://workspace/agent-tasks/latest/review-data`,
 `crabdb://workspace/agent-tasks/latest/changes`,
 `crabdb://workspace/agent-tasks/latest/files`, and
 `crabdb://workspace/agent-tasks/latest/focus`. Resource templates cover
-individual agent task review/changes/file/report/focus dashboards, lanes, lane
+individual agent task review-data/review/changes/file/report/focus dashboards, lanes, lane
 review packets, sessions, turns, conflicts, approvals, run states, and trace
 spans.
 

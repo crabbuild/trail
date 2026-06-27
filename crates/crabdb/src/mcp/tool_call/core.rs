@@ -84,9 +84,33 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
         }
         "crabdb.agent_status" => tool_result(db.agent_status()?),
         "crabdb.agent_inbox" => tool_result(db.agent_inbox()?),
+        "crabdb.agent_board" => {
+            let args: AgentBoardArgs = parse_args(arguments)?;
+            tool_result(db.agent_board_with_options(args.all)?)
+        }
+        "crabdb.agent_stack" => {
+            let args: AgentBoardArgs = parse_args(arguments)?;
+            tool_result(db.agent_stack_with_options(args.all)?)
+        }
         "crabdb.agent_next" => {
             let args: AgentSelectorArgs = parse_args(arguments)?;
             tool_result(db.agent_next(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_guide" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_guide(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_dashboard" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_dashboard(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_review_data" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_review_data(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_review_flow" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_review_flow(args.selector.as_deref().unwrap_or("latest"))?)
         }
         "crabdb.agent_ask" => {
             let args: AgentAskArgs = parse_args(arguments)?;
@@ -108,9 +132,17 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             let args: AgentSelectorArgs = parse_args(arguments)?;
             tool_result(db.agent_validate(args.selector.as_deref().unwrap_or("latest"))?)
         }
+        "crabdb.agent_test_plan" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_test_plan(args.selector.as_deref().unwrap_or("latest"))?)
+        }
         "crabdb.agent_report" => {
             let args: AgentSelectorArgs = parse_args(arguments)?;
             tool_result(db.agent_report(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_handoff" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_handoff(args.selector.as_deref().unwrap_or("latest"))?)
         }
         "crabdb.agent_receipt" => {
             let args: AgentSelectorArgs = parse_args(arguments)?;
@@ -124,9 +156,25 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             let args: AgentSelectorArgs = parse_args(arguments)?;
             tool_result(db.agent_story(args.selector.as_deref().unwrap_or("latest"))?)
         }
+        "crabdb.agent_tools" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_tools(args.selector.as_deref().unwrap_or("latest"))?)
+        }
         "crabdb.agent_risk" => {
             let args: AgentSelectorArgs = parse_args(arguments)?;
             tool_result(db.agent_risk(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_impact" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_impact(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_review_map" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_review_map(args.selector.as_deref().unwrap_or("latest"))?)
+        }
+        "crabdb.agent_confidence" => {
+            let args: AgentSelectorArgs = parse_args(arguments)?;
+            tool_result(db.agent_confidence(args.selector.as_deref().unwrap_or("latest"))?)
         }
         "crabdb.agent_ready" => {
             let args: AgentSelectorArgs = parse_args(arguments)?;
@@ -143,9 +191,10 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
         "crabdb.agent_changes" => {
             let args: AgentChangesArgs = parse_args(arguments)?;
             let _ = args.by_turn;
-            tool_result(db.agent_changes(
+            tool_result(db.agent_changes_with_options(
                 args.selector.as_deref().unwrap_or("latest"),
                 args.by_operation,
+                args.by_file,
             )?)
         }
         "crabdb.agent_delta" => {
@@ -171,6 +220,30 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
             tool_result(
                 db.agent_mark_reviewed(args.selector.as_deref().unwrap_or("latest"), args.note)?,
             )
+        }
+        "crabdb.agent_mark_file_reviewed" => {
+            let args: AgentMarkFileReviewedArgs = parse_args(arguments)?;
+            tool_result(db.agent_mark_file_reviewed(
+                args.selector.as_deref().unwrap_or("latest"),
+                &args.path,
+                args.note,
+            )?)
+        }
+        "crabdb.agent_archive" => {
+            let args: AgentArchiveArgs = parse_args(arguments)?;
+            tool_result(db.agent_archive(
+                args.selector.as_deref().unwrap_or("latest"),
+                true,
+                args.note,
+            )?)
+        }
+        "crabdb.agent_unarchive" => {
+            let args: AgentArchiveArgs = parse_args(arguments)?;
+            tool_result(db.agent_archive(
+                args.selector.as_deref().unwrap_or("latest"),
+                false,
+                args.note,
+            )?)
         }
         "crabdb.agent_change" => {
             let args: AgentChangeArgs = parse_args(arguments)?;
@@ -281,6 +354,15 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
                 args.selector.as_deref().unwrap_or("latest"),
                 args.dry_run,
                 args.message,
+            )?)
+        }
+        "crabdb.agent_finish" => {
+            let args: AgentFinishArgs = parse_args(arguments)?;
+            tool_result(db.agent_finish(
+                args.selector.as_deref().unwrap_or("latest"),
+                args.dry_run,
+                args.message,
+                args.note,
             )?)
         }
         "crabdb.agent_rewind" => {

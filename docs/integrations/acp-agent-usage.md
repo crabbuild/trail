@@ -143,6 +143,8 @@ run:
 
 ```sh
 crabdb agent
+crabdb agent board
+crabdb agent stack
 crabdb agent ask what needs attention
 crabdb agent ask what should I do next
 crabdb agent ask what did the agent do
@@ -153,28 +155,63 @@ crabdb agent ask last prompt
 crabdb agent ask what changed in the last prompt
 crabdb agent ask what changed in README.md in the last prompt
 crabdb agent ask show transcript
+crabdb agent ask show dashboard
 crabdb agent ask what should I review
 crabdb agent ask what should I review first
+crabdb agent ask what file should I review first
+crabdb agent ask what file should I open
+crabdb agent ask where should I look first
 crabdb agent ask open review
 crabdb agent ask review this task
 crabdb agent ask what tools were used
+crabdb agent tools latest
+crabdb agent ask what is the blast radius
+crabdb agent impact latest
+crabdb agent ask review map
+crabdb agent review-map latest
+crabdb agent ask what did the agent change
+crabdb agent ask what files did it touch
 crabdb agent ask can I merge
+crabdb agent ask why can't I apply
+crabdb agent ask what is blocking this task
+crabdb agent ask why did it fail
+crabdb agent ask what went wrong
+crabdb agent ask any red flags
+crabdb agent ask what should I worry about
+crabdb agent ask which files are risky
 crabdb agent todo
 crabdb agent ask what changed since I looked
+crabdb agent ask what should I put in the PR
+crabdb agent ask give me a summary to share
+crabdb agent ask handoff this to another agent
+crabdb agent ask what commit message should I use
 crabdb agent ask explain README.md
+crabdb agent ask show the diff
+crabdb agent ask show changes by file
 crabdb agent ask show patch for README.md
 crabdb agent ask show turn diff
 crabdb agent story latest
+crabdb agent dashboard latest
+crabdb agent review-data latest
+crabdb agent review-flow latest
+crabdb agent ask walk me through review
 crabdb agent risk latest
+crabdb agent confidence latest
+crabdb agent ask final check, am I good?
 crabdb agent can-land latest
 crabdb agent ask what tests should I run
+crabdb agent ask is it tested
+crabdb agent ask how should I test this
+crabdb agent test-plan latest
 crabdb agent validate latest
 crabdb agent test latest -- cargo test
 crabdb agent brief latest
 crabdb agent workdir latest
 crabdb agent changes latest
+crabdb agent changes latest --by-file
 crabdb agent last latest
 crabdb agent what-changed latest
+crabdb agent mark-file-reviewed latest README.md
 crabdb agent turn
 crabdb agent turn-diff latest --patch
 crabdb agent changed-files latest
@@ -182,9 +219,11 @@ crabdb agent explain README.md
 crabdb agent turn-diff latest --file README.md --patch
 crabdb agent review-plan latest
 crabdb agent focus latest
+crabdb agent open latest
 crabdb agent view latest
 crabdb agent can-land latest
 crabdb agent land latest
+crabdb agent finish latest
 ```
 
 ### VS Code
@@ -273,6 +312,8 @@ Then drive the relay over JSON-RPC stdio from your editor or test client.
 After the prompt completes:
 
 ```sh
+crabdb --workspace "$PLAYGROUND" agent board
+crabdb --workspace "$PLAYGROUND" agent stack
 crabdb --workspace "$PLAYGROUND" agent ask what needs attention
 crabdb --workspace "$PLAYGROUND" agent ask what should I do next
 crabdb --workspace "$PLAYGROUND" agent summary latest
@@ -286,12 +327,23 @@ crabdb --workspace "$PLAYGROUND" agent ask what changed in README.md in the last
 crabdb --workspace "$PLAYGROUND" agent ask show transcript
 crabdb --workspace "$PLAYGROUND" agent ask what should I review
 crabdb --workspace "$PLAYGROUND" agent ask what should I review first
+crabdb --workspace "$PLAYGROUND" agent ask what file should I review first
+crabdb --workspace "$PLAYGROUND" agent ask what file should I open
+crabdb --workspace "$PLAYGROUND" agent ask where should I look first
 crabdb --workspace "$PLAYGROUND" agent ask open review
 crabdb --workspace "$PLAYGROUND" agent ask review this task
 crabdb --workspace "$PLAYGROUND" agent ask what tools were used
 crabdb --workspace "$PLAYGROUND" agent ask can I merge
+crabdb --workspace "$PLAYGROUND" agent ask why can't I apply
+crabdb --workspace "$PLAYGROUND" agent ask what is blocking this task
+crabdb --workspace "$PLAYGROUND" agent ask why did it fail
+crabdb --workspace "$PLAYGROUND" agent ask what went wrong
+crabdb --workspace "$PLAYGROUND" agent ask any red flags
+crabdb --workspace "$PLAYGROUND" agent ask what should I worry about
+crabdb --workspace "$PLAYGROUND" agent ask which files are risky
 crabdb --workspace "$PLAYGROUND" agent ask what changed since I looked
 crabdb --workspace "$PLAYGROUND" agent ask explain README.md
+crabdb --workspace "$PLAYGROUND" agent ask show changes by file
 crabdb --workspace "$PLAYGROUND" agent ask show patch for README.md
 crabdb --workspace "$PLAYGROUND" agent ask show turn diff
 crabdb --workspace "$PLAYGROUND" agent changes latest
@@ -299,12 +351,14 @@ crabdb --workspace "$PLAYGROUND" agent last latest
 crabdb --workspace "$PLAYGROUND" agent what-changed latest
 crabdb --workspace "$PLAYGROUND" agent can-land latest
 crabdb --workspace "$PLAYGROUND" agent recover latest
+crabdb --workspace "$PLAYGROUND" agent handoff latest
 crabdb --workspace "$PLAYGROUND" agent receipt latest
 crabdb --workspace "$PLAYGROUND" agent pr latest
 crabdb --workspace "$PLAYGROUND" agent turn-diff latest --file README.md --patch
 crabdb --workspace "$PLAYGROUND" agent review-plan latest
 crabdb --workspace "$PLAYGROUND" agent view latest
 crabdb --workspace "$PLAYGROUND" agent land latest --dry-run
+crabdb --workspace "$PLAYGROUND" agent finish latest --dry-run
 ```
 
 Expected signals:
@@ -313,6 +367,21 @@ Expected signals:
   attention, shows new files/lines since the last review, names the first file
   to inspect, and prints one primary next command.
 - `agent inbox` is the explicit form of the same grouped home view.
+- `agent board` is the low-noise multi-agent view: it presents tasks as
+  needs-record, conflicted, blocked, needs-review, ready, running, applied, and
+  archived columns, with one next command.
+- `agent stack` is the apply-order view: it finds shared changed files across
+  tasks and tells you whether to compare overlap or preview finishing the safest
+  task first.
+- `agent handoff latest` prints a receiver-friendly Markdown packet for another
+  human or agent, while `agent receipt latest` stays the shorter after-action
+  note.
+- `agent finish latest` applies a ready task and archives it after success.
+  `agent close latest` only archives a task that has already been dealt with.
+  Archived tasks disappear from default `agent`, `agent inbox`, `agent board`,
+  `agent list`, and `latest` views without deleting transcripts, checkpoints,
+  or provenance. Use `agent inbox --all`, `agent board --all`, and
+  `agent unarchive <TASK>` when you need one back.
 - `agent status` shows the latest task status, risk, and next useful action.
 - `agent ask ...` routes plain-language questions to the right existing view.
   Try `what needs attention`, `what should I do next`, `what just changed`,
@@ -323,27 +392,69 @@ Expected signals:
   `what changed in README.md in the last prompt`, `show transcript`,
   `what should I review`,
   `what should I review first`, `open review`, `review this task`,
-  `what tools were used`, `changed files`,
+  `what file should I review first`, `what file should I open`,
+  `where should I look first`,
+  `what tools were used`, `changed files`, `what did the agent change`,
+  `what files did it touch`, `what should I put in the PR`,
+  `give me a summary to share`, `handoff this to another agent`,
+  `what commit message should I use`,
+  `is it tested`, `how should I test this`, `validation plan`,
   `can I merge`,
-  `is it safe to land`, `recover`, or
-  `explain README.md`. Patch and diff phrasing such as `show turn diff` and
-  `show patch for README.md` routes to focused patch views.
+  `is it safe to land`, `why can't I apply`,
+  `what is blocking this task`, `why did it fail`, `what went wrong`,
+  `any red flags`, `what should I worry about`, `which files are risky`,
+  `recover`, or
+  `explain README.md`. Patch and diff phrasing such as `show the diff`,
+  `show changes by file`, `show turn diff`, and `show patch for README.md`
+  routes to whole-task or focused patch views.
+- Bare `agent` shows the current task dashboard when there is one task, the
+  grouped inbox when there are multiple tasks, and setup guidance when there
+  are none.
 - `agent todo` shows one primary command for the latest task. It is an alias for
   `agent next`.
-- `agent summary latest` shows the one-page post-run cockpit with readiness,
+- `agent dashboard latest` shows the compact daily-use task board with next
+  action, focus file, open command, validation, changed files, risk, and apply
+  readiness.
+- `agent review-data latest` is the editor side-panel packet: file review
+  progress, focus file, review map, changes by file, confidence, validation,
+  risk, readiness, typed actions, and next commands in one structured report.
+  Each action has a stable id, label, safety class, enabled state, exact command,
+  disabled reason, optional MCP tool, and optional MCP arguments so an editor can
+  render and execute buttons without guessing or parsing shell text.
+- `agent review-flow latest` walks the task through inspect, mark reviewed,
+  validate, and finish as one checklist. Use this after an editor agent finishes
+  when you do not want to remember which CrabDB command comes next.
+- `agent summary latest` shows the fuller one-page post-run cockpit with readiness,
   risk, validation, Git preflight, receipt Markdown, PR draft, and next command.
 - `agent story latest` explains what happened in one plain-language task
   summary with turns, changed files, tools, notes, and next action.
+- `agent tools latest` shows tool calls, available ACP commands, statuses,
+  turns, checkpoints, and changed files around tool activity without reading the
+  whole transcript.
+- `agent impact latest` shows the blast radius: touched areas, highest impact,
+  risk, validation state, and recommended review/test checks.
+- `agent review-map latest` shows the code-review checklist grouped by changed
+  area, with per-file focus, why, patch, and editor-open commands. Use
+  `agent mark-file-reviewed latest <PATH>` as each file is inspected; the file
+  stays reviewed until a later checkpoint changes that path again.
 - `agent risk latest` shows a deterministic apply risk level, reasons, and
   mitigation commands before you touch Git.
+- `agent confidence latest` gives one go/no-go verdict from review freshness,
+  validation, risk, and Git apply preflight. Use this when the question is
+  "am I good?" rather than a specific risk or readiness check.
 - `agent validate latest` shows latest test/eval gates and suggested validation
   commands without running anything. It is also available as `agent tests`.
+- `agent test-plan latest` turns changed areas, impact, risk, and existing gates
+  into ranked test/eval steps with exact commands, affected paths, and reasons.
+  Use this for "what tests should I run?" and `agent validate` for gate status.
 - `agent test latest -- cargo test` records a durable test gate in the task
   workdir without requiring the lane name.
 - `agent brief latest` shows one compact review packet with next action,
   changes, tools, and risks.
 - `agent receipt latest` prints a copyable post-run receipt with validation,
   changed files, turns, tools, risk, checkpoint, and next command.
+- `agent handoff latest` prints a copyable handoff packet with receiver next
+  step, review commands, validation, risks, changed files, turns, and tools.
 - `agent pr latest` prints a read-only pull request draft title and body from
   the recorded task state without creating a remote PR.
 - `agent report latest --markdown` prints a copyable review/handoff report with
@@ -359,6 +470,9 @@ Expected signals:
 - `agent changes latest` shows one primary next command, high-level change
   cards, and the prompt/turn and checkpoint details behind each card. Each card
   includes ready review/focus/why/diff commands.
+- `agent changes latest --by-file` switches the same review map to one card per
+  changed file, which is useful when you are already looking at a file list in
+  the editor.
 - `agent last latest` shows the newest completed turn or operation. It is an
   alias for `agent delta latest`. Use `--patch` or `--file <PATH> --patch` when
   you want the fresh patch without reading the whole task.
@@ -381,18 +495,28 @@ Expected signals:
   `agent why README.md`.
 - `agent compare <A> <B>` compares two agent tasks, shared changed files,
   one-sided changes, risk, and a recommended next command.
+- `agent stack` generalizes compare across all active tasks when you need apply
+  order or overlap checks.
 - `agent turn-diff latest --file README.md --patch` shows the focused file
   patch for the most recent prompt.
 - `agent review-plan latest` shows readiness, risk, blockers, warnings, and the
   highest-priority files to inspect first.
 - `agent focus latest` picks the next file to inspect and bundles why, review
-  priority, and a focused diff summary.
+  priority, a materialized-task open command, and a focused diff summary.
+- `agent open latest` opens that focused file in `$EDITOR` for a materialized
+  task. Add `--print` when you only want the command.
 - `agent view latest` shows the user prompt, assistant response, tool summaries, and
   checkpoint id.
 - `agent can-land latest` shows the safe Git apply preflight.
 - `agent land latest` applies using a generated Git commit message from the task
   title. It is an alias for `agent apply latest`; pass `-m` only when you want
-  to override it.
+  to override it. If the task has already been applied, CrabDB reports
+  `already_applied` and points you to `agent continue` for follow-up work.
+- `agent finish latest` applies with the same safety checks as `agent land`,
+  then hides the finished task from the default inbox. Use it when you do not
+  need the applied task to stay visible.
+- `agent continue latest` creates a fresh task from the latest checkpoint, so
+  another round of edits does not reuse already-applied lane history.
 - `Changed paths` contains only the file you intended the agent to edit.
 
 When in doubt, start with:
@@ -417,10 +541,18 @@ Ask CrabDB what changed in the last prompt.
 Ask CrabDB what changed in README.md in the last prompt.
 Ask CrabDB to show the transcript.
 Ask CrabDB what I should review first.
+Ask CrabDB what file I should review first.
+Ask CrabDB what file I should open.
+Ask CrabDB where I should look first.
 Ask CrabDB to open review.
 Ask CrabDB to review this task.
 Ask CrabDB what tools were used.
+Ask CrabDB to show tool activity.
 Ask CrabDB if I can merge.
+Ask CrabDB why I can't apply.
+Ask CrabDB what is blocking this task.
+Ask CrabDB why it failed.
+Ask CrabDB what went wrong.
 Ask CrabDB if the latest task is safe to land.
 Ask CrabDB to explain README.md.
 Ask CrabDB to show the patch for README.md.
@@ -455,14 +587,15 @@ Use the crabdb.apply_agent prompt for latest.
 Plain-language "Ask CrabDB..." requests should use `crabdb.agent_ask`, which
 routes to read-only task reports such as next actions, task story, review focus,
 tools used, changes, readiness, recovery, file explanations, checkpoint targets,
-and focused patch/diff views.
-For validation, editors should ask `crabdb.agent_validate` first and present its
-suggested command before calling `crabdb.agent_test` or `crabdb.agent_eval`.
+focused patch/diff views, test plans, pull request drafts, and copyable
+receipts. For validation guidance, editors should call `crabdb.agent_test_plan`
+and present its checklist before calling `crabdb.agent_test` or
+`crabdb.agent_eval`. For gate status, use `crabdb.agent_validate`.
 
 Those map to `crabdb.agent_ask`, `crabdb.agent_next`, `crabdb.agent_status`,
 `crabdb.agent_inbox`, `crabdb.agent_story`, `crabdb.agent_brief`, `crabdb.agent_report`, `crabdb.agent_workdir`,
-`crabdb.agent_risk`, `crabdb.agent_ready`, `crabdb.agent_validate`, `crabdb.agent_test`, `crabdb.agent_changes`, `crabdb.agent_delta`, `crabdb.agent_new`, `crabdb.agent_mark_reviewed`, `crabdb.agent_files`, `crabdb.agent_checkpoints`, `crabdb.agent_why`,
-`crabdb.agent_turn`, `crabdb.agent_compare`, `crabdb.agent_diff`, `crabdb.agent_review`,
+`crabdb.agent_risk`, `crabdb.agent_confidence`, `crabdb.agent_ready`, `crabdb.agent_validate`, `crabdb.agent_test_plan`, `crabdb.agent_test`, `crabdb.agent_review_data`, `crabdb.agent_changes`, `crabdb.agent_delta`, `crabdb.agent_new`, `crabdb.agent_mark_reviewed`, `crabdb.agent_mark_file_reviewed`, `crabdb.agent_files`, `crabdb.agent_checkpoints`, `crabdb.agent_why`,
+`crabdb.agent_turn`, `crabdb.agent_compare`, `crabdb.agent_stack`, `crabdb.agent_diff`, `crabdb.agent_review_flow`, `crabdb.agent_review`,
 `crabdb.agent_focus`, and
 `crabdb.agent_apply`.
 
@@ -471,6 +604,7 @@ Editors can also render dashboards directly from MCP resources:
 ```text
 crabdb://workspace/agent-tasks
 crabdb://workspace/agent-tasks/latest/review
+crabdb://workspace/agent-tasks/latest/review-data
 crabdb://workspace/agent-tasks/latest/changes
 crabdb://workspace/agent-tasks/latest/files
 crabdb://workspace/agent-tasks/latest/focus

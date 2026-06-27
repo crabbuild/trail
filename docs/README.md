@@ -54,6 +54,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [MCP](integrations/mcp.md)
 - [ACP relay design](design/acp-relay.md)
 - [VS Code ACP chat view design](design/vscode-acp-chat-view.md)
+- [VS Code extension implementation](../extensions/vscode/README.md)
 - [Rust library](integrations/rust-library.md)
 - [Git](integrations/git.md)
 

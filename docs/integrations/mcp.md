@@ -26,9 +26,9 @@ See [MCP tools reference](../reference/mcp-tools.md) for the complete list.
 
 ## Resources
 
-Static resources include status, doctor, agents, merge queue, conflicts, OpenAPI, and the three compatibility docs.
+Static resources include status, doctor, agents, latest agent review-data, merge queue, conflicts, OpenAPI, and the three compatibility docs.
 
-Resource templates expose agent details, status, review packets, contribution, gates, readiness, handoff, diff, sessions, turns, conflicts, approvals, run states, and trace spans.
+Resource templates expose agent details, review-data packets, status, review packets, contribution, gates, readiness, handoff, diff, sessions, turns, conflicts, approvals, run states, and trace spans.
 
 ## Prompts
 

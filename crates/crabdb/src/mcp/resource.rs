@@ -33,9 +33,25 @@ fn resource_read_response(db: &mut CrabDb, args: ResourceReadArgs) -> Result<Val
             "application/json",
             pretty_json(&db.agent_diagnose("latest")?)?,
         ),
+        RESOURCE_AGENT_LATEST_TEST_PLAN => (
+            "application/json",
+            pretty_json(&db.agent_test_plan("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_CONFIDENCE => (
+            "application/json",
+            pretty_json(&db.agent_confidence("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_REVIEW_MAP => (
+            "application/json",
+            pretty_json(&db.agent_review_map("latest")?)?,
+        ),
         RESOURCE_AGENT_LATEST_REVIEW => (
             "application/json",
             pretty_json(&db.agent_review("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_REVIEW_DATA => (
+            "application/json",
+            pretty_json(&db.agent_review_data("latest")?)?,
         ),
         RESOURCE_AGENT_LATEST_CHANGES => (
             "application/json",
@@ -55,6 +71,10 @@ fn resource_read_response(db: &mut CrabDb, args: ResourceReadArgs) -> Result<Val
         RESOURCE_AGENT_LATEST_RECEIPT => (
             "application/json",
             pretty_json(&db.agent_receipt("latest")?)?,
+        ),
+        RESOURCE_AGENT_LATEST_HANDOFF => (
+            "application/json",
+            pretty_json(&db.agent_handoff("latest")?)?,
         ),
         RESOURCE_AGENT_LATEST_PR => (
             "application/json",
@@ -102,12 +122,56 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
     if let Some(selector) = template_uri_argument(
         uri,
         "crabdb://workspace/agent-tasks/",
+        "/test-plan",
+        RESOURCE_AGENT_TEST_PLAN_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_test_plan(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/confidence",
+        RESOURCE_AGENT_CONFIDENCE_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_confidence(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/review-map",
+        RESOURCE_AGENT_REVIEW_MAP_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_review_map(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
         "/review",
         RESOURCE_AGENT_REVIEW_TEMPLATE,
     )? {
         return Ok((
             "application/json",
             pretty_json(&db.agent_review(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/review-data",
+        RESOURCE_AGENT_REVIEW_DATA_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_review_data(&selector)?)?,
         ));
     }
     if let Some(selector) = template_uri_argument(
@@ -163,6 +227,17 @@ fn templated_resource(db: &mut CrabDb, uri: &str) -> Result<(&'static str, Strin
         return Ok((
             "application/json",
             pretty_json(&db.agent_receipt(&selector)?)?,
+        ));
+    }
+    if let Some(selector) = template_uri_argument(
+        uri,
+        "crabdb://workspace/agent-tasks/",
+        "/handoff",
+        RESOURCE_AGENT_HANDOFF_TEMPLATE,
+    )? {
+        return Ok((
+            "application/json",
+            pretty_json(&db.agent_handoff(&selector)?)?,
         ));
     }
     if let Some(selector) = template_uri_argument(

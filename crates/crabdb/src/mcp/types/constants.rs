@@ -12,8 +12,16 @@ pub(crate) const RESOURCE_AGENT_LATEST_SUMMARY: &str =
     "crabdb://workspace/agent-tasks/latest/summary";
 pub(crate) const RESOURCE_AGENT_LATEST_DIAGNOSE: &str =
     "crabdb://workspace/agent-tasks/latest/diagnose";
+pub(crate) const RESOURCE_AGENT_LATEST_TEST_PLAN: &str =
+    "crabdb://workspace/agent-tasks/latest/test-plan";
+pub(crate) const RESOURCE_AGENT_LATEST_CONFIDENCE: &str =
+    "crabdb://workspace/agent-tasks/latest/confidence";
+pub(crate) const RESOURCE_AGENT_LATEST_REVIEW_MAP: &str =
+    "crabdb://workspace/agent-tasks/latest/review-map";
 pub(crate) const RESOURCE_AGENT_LATEST_REVIEW: &str =
     "crabdb://workspace/agent-tasks/latest/review";
+pub(crate) const RESOURCE_AGENT_LATEST_REVIEW_DATA: &str =
+    "crabdb://workspace/agent-tasks/latest/review-data";
 pub(crate) const RESOURCE_AGENT_LATEST_CHANGES: &str =
     "crabdb://workspace/agent-tasks/latest/changes";
 pub(crate) const RESOURCE_AGENT_LATEST_TIMELINE: &str =
@@ -22,16 +30,26 @@ pub(crate) const RESOURCE_AGENT_LATEST_FILES: &str = "crabdb://workspace/agent-t
 pub(crate) const RESOURCE_AGENT_LATEST_FOCUS: &str = "crabdb://workspace/agent-tasks/latest/focus";
 pub(crate) const RESOURCE_AGENT_LATEST_RECEIPT: &str =
     "crabdb://workspace/agent-tasks/latest/receipt";
+pub(crate) const RESOURCE_AGENT_LATEST_HANDOFF: &str =
+    "crabdb://workspace/agent-tasks/latest/handoff";
 pub(crate) const RESOURCE_AGENT_LATEST_PR: &str = "crabdb://workspace/agent-tasks/latest/pr";
 pub(crate) const RESOURCE_USER_GUIDE: &str = "crabdb://docs/user-guide";
 pub(crate) const RESOURCE_LANE_WORKFLOWS: &str = "crabdb://docs/lane-workflows";
 pub(crate) const RESOURCE_CLI_REFERENCE: &str = "crabdb://docs/cli-reference";
 pub(crate) const RESOURCE_AGENT_REVIEW_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/review";
+pub(crate) const RESOURCE_AGENT_REVIEW_DATA_TEMPLATE: &str =
+    "crabdb://workspace/agent-tasks/{selector}/review-data";
 pub(crate) const RESOURCE_AGENT_SUMMARY_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/summary";
 pub(crate) const RESOURCE_AGENT_DIAGNOSE_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/diagnose";
+pub(crate) const RESOURCE_AGENT_TEST_PLAN_TEMPLATE: &str =
+    "crabdb://workspace/agent-tasks/{selector}/test-plan";
+pub(crate) const RESOURCE_AGENT_CONFIDENCE_TEMPLATE: &str =
+    "crabdb://workspace/agent-tasks/{selector}/confidence";
+pub(crate) const RESOURCE_AGENT_REVIEW_MAP_TEMPLATE: &str =
+    "crabdb://workspace/agent-tasks/{selector}/review-map";
 pub(crate) const RESOURCE_AGENT_CHANGES_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/changes";
 pub(crate) const RESOURCE_AGENT_TIMELINE_TEMPLATE: &str =
@@ -42,6 +60,8 @@ pub(crate) const RESOURCE_AGENT_REPORT_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/report";
 pub(crate) const RESOURCE_AGENT_RECEIPT_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/receipt";
+pub(crate) const RESOURCE_AGENT_HANDOFF_TEMPLATE: &str =
+    "crabdb://workspace/agent-tasks/{selector}/handoff";
 pub(crate) const RESOURCE_AGENT_PR_TEMPLATE: &str = "crabdb://workspace/agent-tasks/{selector}/pr";
 pub(crate) const RESOURCE_AGENT_FOCUS_TEMPLATE: &str =
     "crabdb://workspace/agent-tasks/{selector}/focus";

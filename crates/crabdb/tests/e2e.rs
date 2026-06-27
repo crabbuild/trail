@@ -835,6 +835,13 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_str()
         .unwrap()
         .contains("agent setup"));
+    let empty_dashboard = run_crabdb_json(temp.path(), &["agent", "dashboard"]);
+    assert_eq!(empty_dashboard["status"], "empty");
+    assert!(empty_dashboard["task"].is_null());
+    assert!(empty_dashboard["next"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent setup"));
     let empty_inbox = run_crabdb_json(temp.path(), &["agent", "inbox"]);
     assert_eq!(empty_inbox["total"], 0);
     assert_eq!(empty_inbox["attention_count"], 0);
@@ -876,6 +883,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         StubAcpAgentOptions::new("sess_agent_stub_b"),
     );
     run_agent_acp_stub_session(temp.path(), &first_agent);
+    let one_task_home = run_crabdb_json(temp.path(), &["agent"]);
+    assert!(one_task_home["task"]["name"]
+        .as_str()
+        .unwrap()
+        .starts_with("agent-claude-code-"));
+    assert_eq!(one_task_home["focus"]["path"], "README.md");
     run_agent_acp_stub_session(temp.path(), &second_agent);
 
     let list = run_crabdb_json(temp.path(), &["agent", "list"]);
@@ -920,6 +933,54 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         inbox["next"]["command"],
         format!("crabdb agent new {first}")
     );
+    let board = run_crabdb_json(temp.path(), &["agent", "board"]);
+    assert_eq!(board["total"], 2);
+    assert_eq!(board["attention_count"], 2);
+    assert_eq!(board["ready_count"], 2);
+    assert_eq!(board["columns"].as_array().unwrap().len(), 1);
+    assert_eq!(board["columns"][0]["key"], "needs_review");
+    assert_eq!(board["columns"][0]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(board["columns"][0]["items"][0]["task"]["name"], first);
+    assert_eq!(
+        board["columns"][0]["next"]["command"],
+        format!("crabdb agent new {first}")
+    );
+    assert_eq!(
+        board["next"]["command"],
+        format!("crabdb agent new {first}")
+    );
+    let stack = run_crabdb_json(temp.path(), &["agent", "stack"]);
+    assert_eq!(stack["total"], 2);
+    assert_eq!(stack["ready_count"], 2);
+    assert_eq!(stack["overlap_count"], 1);
+    assert_eq!(stack["shared_paths"][0]["path"], "README.md");
+    assert!(stack["shared_paths"][0]["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|lane| lane == first));
+    assert!(stack["shared_paths"][0]["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|lane| lane == second));
+    assert_eq!(stack["apply_order"].as_array().unwrap().len(), 0);
+    assert_eq!(stack["items"][0]["status"], "overlap_review");
+    assert!(stack["next"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent compare"));
+    let order_alias = run_crabdb_json(temp.path(), &["agent", "order"]);
+    assert_eq!(order_alias["next"], stack["next"]);
+    let multi_task_home = run_crabdb_json(temp.path(), &["agent"]);
+    assert_eq!(multi_task_home["total"], 2);
+    assert_eq!(multi_task_home["next"]["command"], inbox["next"]["command"]);
+    let ask_board = run_crabdb_json(temp.path(), &["agent", "ask", "show", "agent", "board"]);
+    assert_eq!(ask_board["total"], board["total"]);
+    assert_eq!(ask_board["columns"][0]["key"], "needs_review");
+    let ask_stack = run_crabdb_json(temp.path(), &["agent", "ask", "which", "task", "first"]);
+    assert_eq!(ask_stack["total"], stack["total"]);
+    assert_eq!(ask_stack["next"], stack["next"]);
     let ask_inbox = run_crabdb_json(temp.path(), &["agent", "ask", "what", "needs", "attention"]);
     assert_eq!(ask_inbox["total"], inbox["total"]);
     assert_eq!(ask_inbox["attention_count"], inbox["attention_count"]);
@@ -959,12 +1020,181 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_str()
         .unwrap()
         .contains("edit README"));
+    let agent_tools = run_crabdb_json(temp.path(), &["agent", "tools", "latest"]);
+    assert_eq!(agent_tools["task"]["lane"], view["task"]["lane"]);
+    assert!(agent_tools["total_tool_events"].as_u64().unwrap() > 0);
+    assert!(agent_tools["unique_tools"].as_u64().unwrap() > 0);
+    assert!(agent_tools["available_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command == "write_file"));
+    assert!(agent_tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "write README"
+            && tool["turns"][0]["changed_paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path["path"] == "README.md")));
+    let impact = run_crabdb_json(temp.path(), &["agent", "impact", "latest"]);
+    assert_eq!(impact["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(impact["highest_impact"], "low");
+    assert_eq!(impact["areas"][0]["key"], "docs");
+    assert_eq!(impact["areas"][0]["changed_paths"][0]["path"], "README.md");
+    assert_eq!(impact["validation"]["status"], "missing_test");
+    assert!(impact["recommendations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent validate")
+            || suggestion["command"]
+                .as_str()
+                .unwrap()
+                .contains("agent test")));
+    let ask_impact = run_crabdb_json(temp.path(), &["agent", "ask", "blast", "radius"]);
+    assert_eq!(ask_impact["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(ask_impact["areas"], impact["areas"]);
+    let ask_areas = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "areas", "did", "it", "touch"],
+    );
+    assert_eq!(ask_areas["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(ask_areas["highest_impact"], impact["highest_impact"]);
+    let review_map = run_crabdb_json(temp.path(), &["agent", "review-map", "latest"]);
+    assert_eq!(review_map["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(review_map["review_status"], "unreviewed");
+    assert_eq!(review_map["areas"][0]["key"], "docs");
+    assert_eq!(review_map["areas"][0]["state"], "needs_review");
+    assert_eq!(review_map["areas"][0]["files"][0]["path"], "README.md");
+    assert!(review_map["areas"][0]["files"][0]["review_command"]
+        .as_str()
+        .unwrap()
+        .contains("agent focus"));
+    assert!(review_map["areas"][0]["files"][0]["why_command"]
+        .as_str()
+        .unwrap()
+        .contains("agent why"));
+    assert!(review_map["areas"][0]["files"][0]["reviewed"].is_null());
+    let mark_file_reviewed = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "mark-file-reviewed",
+            "latest",
+            "README.md",
+            "--note",
+            "file looks good",
+        ],
+    );
+    assert_eq!(mark_file_reviewed["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(mark_file_reviewed["path"], "README.md");
+    assert_eq!(mark_file_reviewed["marker"]["path"], "README.md");
+    assert_eq!(mark_file_reviewed["marker"]["note"], "file looks good");
+    let review_map_after_file = run_crabdb_json(temp.path(), &["agent", "review-map", "latest"]);
+    assert_eq!(
+        review_map_after_file["areas"][0]["files"][0]["state"],
+        "reviewed"
+    );
+    assert_eq!(review_map_after_file["areas"][0]["state"], "reviewed");
+    assert_eq!(
+        review_map_after_file["areas"][0]["files"][0]["reviewed"]["note"],
+        "file looks good"
+    );
+    let done_file_alias = run_crabdb_json(temp.path(), &["agent", "done-file", "README.md"]);
+    assert_eq!(done_file_alias["path"], "README.md");
+    assert_eq!(
+        done_file_alias["previous"]["note"],
+        serde_json::Value::String("file looks good".to_string())
+    );
+    let review_map_after_alias = run_crabdb_json(temp.path(), &["agent", "review-map", "latest"]);
+    assert_eq!(
+        review_map_after_alias["areas"][0]["files"][0]["state"],
+        "reviewed"
+    );
+    let review_data = run_crabdb_json(temp.path(), &["agent", "review-data", "latest"]);
+    assert_eq!(review_data["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(review_data["total_files"], 1);
+    assert_eq!(review_data["reviewed_files"], 1);
+    assert_eq!(review_data["needs_review_files"], 0);
+    assert_eq!(review_data["focus"]["path"], "README.md");
+    assert_eq!(
+        review_data["review_map"]["areas"],
+        review_map_after_alias["areas"]
+    );
+    assert_eq!(review_data["changes_by_file"]["grouping"], "file");
+    assert_eq!(
+        review_data["files"]["files"][0]["change"]["path"],
+        "README.md"
+    );
+    let review_actions = review_data["actions"].as_array().unwrap();
+    assert!(review_actions
+        .iter()
+        .any(|action| action["id"] == "open_focus_file"
+            && action["kind"] == "open_file"
+            && action["enabled"] == true
+            && action["path"] == "README.md"));
+    assert!(review_actions
+        .iter()
+        .any(|action| action["id"] == "mark_focus_file_reviewed"
+            && action["safety"] == "workspace_write"
+            && action["enabled"] == false
+            && action["disabled_reason"] == "all changed files are already reviewed"
+            && action["mcp_arguments"]["path"] == "README.md"));
+    assert!(review_actions
+        .iter()
+        .any(|action| action["id"] == "validation_next"
+            && action["safety"] == "open_world"
+            && action["requires_confirmation"] == true
+            && action["mcp_tool"] == "crabdb.agent_test"
+            && action["mcp_arguments"]["command"][0] == "cargo"));
+    assert!(review_actions
+        .iter()
+        .any(|action| action["id"] == "apply_dry_run"
+            && action["safety"] == "read_only"
+            && action["enabled"] == true
+            && action["mcp_tool"] == "crabdb.agent_apply"
+            && action["mcp_arguments"]["dry-run"] == true));
+    assert!(review_actions
+        .iter()
+        .any(|action| action["id"] == "apply_task"
+            && action["safety"] == "destructive"
+            && action["requires_confirmation"] == true
+            && action["disabled_reason"].is_string()));
+    let cockpit_alias = run_crabdb_json(temp.path(), &["agent", "cockpit", "latest"]);
+    assert_eq!(cockpit_alias["summary"], review_data["summary"]);
+    let ask_review_data = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "show", "editor", "panel", "data"],
+    );
+    assert_eq!(ask_review_data["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(ask_review_data["needs_review_files"], 0);
+    assert_eq!(ask_review_data["changes_by_file"]["grouping"], "file");
+    assert!(ask_review_data["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "apply_dry_run" && action["safety"] == "read_only"));
+    let ask_review_map = run_crabdb_json(temp.path(), &["agent", "ask", "review", "map"]);
+    assert_eq!(ask_review_map["task"]["lane"], view["task"]["lane"]);
+    assert_eq!(ask_review_map["areas"], review_map_after_alias["areas"]);
+    let review_files_alias = run_crabdb_json(temp.path(), &["agent", "review-files", "latest"]);
+    assert_eq!(review_files_alias["areas"], review_map_after_alias["areas"]);
     let ask_tools = run_crabdb_json(
         temp.path(),
         &["agent", "ask", "what", "tools", "were", "used"],
     );
     assert_eq!(ask_tools["task"]["lane"], view["task"]["lane"]);
-    assert_eq!(ask_tools["transcript"], view["transcript"]);
+    assert_eq!(
+        ask_tools["available_commands"],
+        agent_tools["available_commands"]
+    );
+    assert_eq!(ask_tools["tools"], agent_tools["tools"]);
     let ask_transcript = run_crabdb_json(temp.path(), &["agent", "ask", "show", "transcript"]);
     assert_eq!(ask_transcript["task"]["lane"], view["task"]["lane"]);
     assert_eq!(ask_transcript["transcript"], view["transcript"]);
@@ -1019,6 +1249,59 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(ask_next["task"]["lane"], lane);
     assert_eq!(ask_next["focus"], next["focus"]);
     assert_eq!(ask_next["primary"], next["primary"]);
+    let review_flow = run_crabdb_json(temp.path(), &["agent", "review-flow", "latest"]);
+    assert_eq!(review_flow["task"]["lane"], lane);
+    assert_eq!(review_flow["review_status"], "unreviewed");
+    assert_eq!(review_flow["new_changed_paths"], 1);
+    assert_eq!(review_flow["focus"]["path"], "README.md");
+    assert!(review_flow["summary"]
+        .as_str()
+        .unwrap()
+        .contains("review `unreviewed`"));
+    let review_flow_steps = review_flow["steps"].as_array().unwrap();
+    assert_eq!(review_flow_steps[0]["label"], "Inspect changes");
+    assert_eq!(review_flow_steps[0]["state"], "current");
+    assert!(review_flow_steps[0]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent new"));
+    assert_eq!(review_flow_steps[1]["label"], "Mark reviewed");
+    assert_eq!(review_flow_steps[1]["state"], "pending");
+    assert!(review_flow["next"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent new"));
+    let walkthrough_alias = run_crabdb_json(temp.path(), &["agent", "walkthrough", "latest"]);
+    assert_eq!(walkthrough_alias["task"]["lane"], lane);
+    assert_eq!(walkthrough_alias["steps"], review_flow["steps"]);
+    let ask_review_flow = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "walk", "me", "through", "review"],
+    );
+    assert_eq!(ask_review_flow["task"]["lane"], lane);
+    assert_eq!(ask_review_flow["review_status"], "unreviewed");
+    assert_eq!(ask_review_flow["steps"], review_flow["steps"]);
+    let confidence = run_crabdb_json(temp.path(), &["agent", "confidence", "latest"]);
+    assert_eq!(confidence["task"]["lane"], lane);
+    assert_eq!(confidence["verdict"], "review");
+    assert!(confidence["score"].as_u64().unwrap() < 100);
+    assert_eq!(confidence["review_status"], "unreviewed");
+    assert_eq!(confidence["validation"]["status"], "missing_test");
+    assert!(confidence["factors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|factor| factor["name"] == "review" && factor["state"] == "warn"));
+    assert!(confidence["next"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent review-flow"));
+    let go_alias = run_crabdb_json(temp.path(), &["agent", "go-no-go", "latest"]);
+    assert_eq!(go_alias["task"]["lane"], lane);
+    assert_eq!(go_alias["verdict"], confidence["verdict"]);
+    let ask_confidence = run_crabdb_json(temp.path(), &["agent", "ask", "am", "I", "good"]);
+    assert_eq!(ask_confidence["task"]["lane"], lane);
+    assert_eq!(ask_confidence["verdict"], confidence["verdict"]);
     let brief = run_crabdb_json(temp.path(), &["agent", "brief", "latest"]);
     assert_eq!(brief["task"]["lane"], lane);
     assert_eq!(brief["task"]["workdir"], task_workdir);
@@ -1111,13 +1394,27 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     let tests_alias = run_crabdb_json(temp.path(), &["agent", "tests", "latest"]);
     assert_eq!(tests_alias["task"]["lane"], lane);
     assert_eq!(tests_alias["next"], validate["next"]);
+    let test_plan = run_crabdb_json(temp.path(), &["agent", "test-plan", "latest"]);
+    assert_eq!(test_plan["task"]["lane"], lane);
+    assert_eq!(test_plan["status"], "needs_test");
+    assert_eq!(test_plan["validation"]["status"], validate["status"]);
+    assert!(test_plan["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["kind"] == "test"
+            && step["required"] == true
+            && step["command"].as_str().unwrap().contains("agent test")));
     let ask_tests = run_crabdb_json(
         temp.path(),
         &["agent", "ask", "what", "tests", "should", "I", "run"],
     );
     assert_eq!(ask_tests["task"]["lane"], lane);
-    assert_eq!(ask_tests["status"], validate["status"]);
-    assert_eq!(ask_tests["next"], validate["next"]);
+    assert_eq!(ask_tests["status"], test_plan["status"]);
+    assert_eq!(ask_tests["steps"], test_plan["steps"]);
+    let validation_plan_alias =
+        run_crabdb_json(temp.path(), &["agent", "validation-plan", "latest"]);
+    assert_eq!(validation_plan_alias["steps"], test_plan["steps"]);
     let diagnose = run_crabdb_json(temp.path(), &["agent", "diagnose", "latest"]);
     assert_eq!(diagnose["task"]["lane"], lane);
     assert_eq!(diagnose["status"], "git_blocked");
@@ -1168,6 +1465,14 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(ask_recover["task"]["lane"], lane);
     assert_eq!(ask_recover["status"], diagnose["status"]);
     assert_eq!(ask_recover["likely_issue"], diagnose["likely_issue"]);
+    let ask_failed = run_crabdb_json(temp.path(), &["agent", "ask", "why", "did", "it", "fail"]);
+    assert_eq!(ask_failed["task"]["lane"], lane);
+    assert_eq!(ask_failed["status"], diagnose["status"]);
+    assert_eq!(ask_failed["likely_issue"], diagnose["likely_issue"]);
+    let ask_wrong = run_crabdb_json(temp.path(), &["agent", "ask", "what", "went", "wrong"]);
+    assert_eq!(ask_wrong["task"]["lane"], lane);
+    assert_eq!(ask_wrong["status"], diagnose["status"]);
+    assert_eq!(ask_wrong["likely_issue"], diagnose["likely_issue"]);
     let diagnose_text = Command::new(crabdb_bin())
         .arg("--workspace")
         .arg(temp.path())
@@ -1217,12 +1522,37 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_str()
         .unwrap()
         .contains("No test or eval gate has been recorded"));
+    let ask_receipt = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "give", "me", "a", "summary", "to", "share"],
+    );
+    assert_eq!(ask_receipt["task"]["lane"], lane);
+    assert!(ask_receipt["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("# Agent Task Receipt"));
     let pr = run_crabdb_json(temp.path(), &["agent", "pr", "latest"]);
     assert_eq!(pr["task"]["lane"], lane);
     assert!(pr["title"].as_str().unwrap().starts_with("Apply "));
     assert!(pr["body"].as_str().unwrap().contains("## Summary"));
     assert!(pr["body"].as_str().unwrap().contains("## Validation"));
     assert!(pr["body"].as_str().unwrap().contains("README.md"));
+    let ask_pr = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent", "ask", "what", "should", "I", "put", "in", "the", "PR",
+        ],
+    );
+    assert_eq!(ask_pr["task"]["lane"], lane);
+    assert!(ask_pr["title"].as_str().unwrap().starts_with("Apply "));
+    assert!(ask_pr["body"].as_str().unwrap().contains("## Summary"));
+    let ask_merge_pr = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "can", "I", "merge", "the", "PR"],
+    );
+    assert_eq!(ask_merge_pr["task"]["lane"], lane);
+    assert_eq!(ask_merge_pr["status"], "git_blocked");
+    assert!(ask_merge_pr["title"].is_null());
     let summary = run_crabdb_json(temp.path(), &["agent", "summary", "latest"]);
     assert_eq!(summary["task"]["lane"], lane);
     assert_eq!(summary["risk"]["level"], "medium");
@@ -1239,6 +1569,16 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_str()
         .unwrap()
         .contains("## CrabDB Review"));
+    let risk = run_crabdb_json(temp.path(), &["agent", "risk", "latest"]);
+    assert_eq!(risk["task"]["lane"], lane);
+    assert_eq!(risk["level"], "medium");
+    let ask_red_flags = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "should", "I", "worry", "about"],
+    );
+    assert_eq!(ask_red_flags["task"]["lane"], lane);
+    assert_eq!(ask_red_flags["level"], risk["level"]);
+    assert_eq!(ask_red_flags["reasons"], risk["reasons"]);
     let review = run_crabdb_json(temp.path(), &["agent", "review", "latest"]);
     assert_eq!(review["task"]["lane"], lane);
     assert_eq!(review["risk"]["level"], "medium");
@@ -1293,10 +1633,91 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(focus["why"]["path"], "README.md");
     assert_eq!(focus["diff"]["file_filter"], "README.md");
     assert_eq!(focus["diff"]["diff"]["files"].as_array().unwrap().len(), 1);
+    let focus_open_path = focus["open_path"].as_str().unwrap();
+    assert!(focus_open_path.ends_with("README.md"));
+    assert!(Path::new(focus_open_path).is_file());
+    assert!(focus["open_command"]
+        .as_str()
+        .unwrap()
+        .contains("${EDITOR:-vi}"));
     assert!(focus["next"]["command"]
         .as_str()
         .unwrap()
         .contains("--patch"));
+    let dashboard = run_crabdb_json(temp.path(), &["agent", "dashboard", "latest"]);
+    assert_eq!(dashboard["task"]["lane"], lane);
+    assert_eq!(dashboard["status"], "ready");
+    assert_eq!(dashboard["focus"]["path"], "README.md");
+    assert_eq!(dashboard["focus"]["open_path"], focus["open_path"]);
+    assert_eq!(dashboard["validation"]["status"], "missing_test");
+    assert_eq!(dashboard["ready"]["task"]["lane"], lane);
+    assert_eq!(
+        dashboard["changes"]["total_changed_paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(dashboard["summary"].as_str().unwrap().contains("README.md"));
+    let open_print = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("agent")
+        .arg("open")
+        .arg("latest")
+        .arg("--print")
+        .output()
+        .unwrap();
+    assert!(
+        open_print.status.success(),
+        "agent open --print failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&open_print.stdout),
+        String::from_utf8_lossy(&open_print.stderr)
+    );
+    let open_print_stdout = String::from_utf8_lossy(&open_print.stdout);
+    assert!(open_print_stdout.contains("${EDITOR:-vi}"));
+    assert!(open_print_stdout.contains("README.md"));
+    let open_json_output = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .arg("agent")
+        .arg("open")
+        .arg("latest")
+        .env("EDITOR", "false")
+        .output()
+        .unwrap();
+    assert!(
+        open_json_output.status.success(),
+        "agent open --json failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&open_json_output.stdout),
+        String::from_utf8_lossy(&open_json_output.stderr)
+    );
+    let open_json: serde_json::Value = serde_json::from_slice(&open_json_output.stdout).unwrap();
+    assert_eq!(open_json["open_path"], focus["open_path"]);
+    assert_eq!(open_json["open_command"], focus["open_command"]);
+    let open_launch = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("agent")
+        .arg("open")
+        .arg("latest")
+        .env("EDITOR", "true")
+        .output()
+        .unwrap();
+    assert!(
+        open_launch.status.success(),
+        "agent open failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&open_launch.stdout),
+        String::from_utf8_lossy(&open_launch.stderr)
+    );
+    assert!(String::from_utf8_lossy(&open_launch.stdout).contains("Opened:"));
+    let ask_dashboard = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "show", "me", "the", "dashboard"],
+    );
+    assert_eq!(ask_dashboard["task"]["lane"], lane);
+    assert_eq!(ask_dashboard["focus"]["path"], dashboard["focus"]["path"]);
     let ask_focus = run_crabdb_json(
         temp.path(),
         &["agent", "ask", "what", "should", "I", "review", "first"],
@@ -1304,6 +1725,31 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(ask_focus["task"]["lane"], lane);
     assert_eq!(ask_focus["path"], focus["path"]);
     assert_eq!(ask_focus["source"], focus["source"]);
+    let ask_focus_file = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent", "ask", "what", "file", "should", "I", "review", "first",
+        ],
+    );
+    assert_eq!(ask_focus_file["task"]["lane"], lane);
+    assert_eq!(ask_focus_file["path"], focus["path"]);
+    assert_eq!(ask_focus_file["source"], focus["source"]);
+    let ask_open_file = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "file", "should", "I", "open"],
+    );
+    assert_eq!(ask_open_file["task"]["lane"], lane);
+    assert_eq!(ask_open_file["path"], focus["path"]);
+    assert_eq!(ask_open_file["source"], focus["source"]);
+    assert_eq!(ask_open_file["open_path"], focus["open_path"]);
+    assert_eq!(ask_open_file["open_command"], focus["open_command"]);
+    let ask_look_first = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "where", "should", "I", "look", "first"],
+    );
+    assert_eq!(ask_look_first["task"]["lane"], lane);
+    assert_eq!(ask_look_first["path"], focus["path"]);
+    assert_eq!(ask_look_first["source"], focus["source"]);
     let focus_patch = run_crabdb_json(
         temp.path(),
         &["agent", "focus", "latest", "--file", "README.md", "--patch"],
@@ -1348,6 +1794,32 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     let receipt_stdout = String::from_utf8_lossy(&receipt_markdown.stdout);
     assert!(receipt_stdout.contains("# Agent Task Receipt"));
     assert!(receipt_stdout.contains("## Useful Commands"));
+    let handoff_markdown = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("agent")
+        .arg("handoff")
+        .arg("latest")
+        .output()
+        .unwrap();
+    assert!(
+        handoff_markdown.status.success(),
+        "agent handoff failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&handoff_markdown.stdout),
+        String::from_utf8_lossy(&handoff_markdown.stderr)
+    );
+    let handoff_stdout = String::from_utf8_lossy(&handoff_markdown.stdout);
+    assert!(handoff_stdout.contains("# Agent Task Handoff"));
+    assert!(handoff_stdout.contains("## Receiver Next Step"));
+    assert!(handoff_stdout.contains("crabdb agent focus"));
+    let ask_handoff = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "handoff", "this", "to", "another", "agent"],
+    );
+    assert!(ask_handoff["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("# Agent Task Handoff"));
     let pr_title = Command::new(crabdb_bin())
         .arg("--workspace")
         .arg(temp.path())
@@ -1760,6 +2232,25 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         next_after_reviewed["primary"]["command"],
         format!("crabdb agent land {lane} --dry-run")
     );
+    let review_flow_after_done = run_crabdb_json(temp.path(), &["agent", "review-loop", "latest"]);
+    assert_eq!(review_flow_after_done["task"]["lane"], lane);
+    assert_eq!(review_flow_after_done["review_status"], "up_to_date");
+    assert_eq!(review_flow_after_done["new_changed_paths"], 0);
+    assert_eq!(review_flow_after_done["steps"][0]["state"], "done");
+    assert_eq!(review_flow_after_done["steps"][1]["state"], "done");
+    assert!(review_flow_after_done["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["state"] == "current" || step["state"] == "blocked"));
+    let confidence_after_done = run_crabdb_json(temp.path(), &["agent", "go", "latest"]);
+    assert_eq!(confidence_after_done["task"]["lane"], lane);
+    assert_eq!(confidence_after_done["review_status"], "up_to_date");
+    assert_eq!(confidence_after_done["verdict"], "validate");
+    assert!(confidence_after_done["next"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("agent test"));
 
     let files = run_crabdb_json(temp.path(), &["agent", "files", "latest"]);
     assert_eq!(files["task"]["lane"], lane);
@@ -1791,6 +2282,20 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(ask_files["task"]["lane"], lane);
     assert_eq!(ask_files["grouping"], files["grouping"]);
     assert_eq!(ask_files["files"], files["files"]);
+    let ask_agent_change = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "did", "the", "agent", "change"],
+    );
+    assert_eq!(ask_agent_change["task"]["lane"], lane);
+    assert_eq!(ask_agent_change["grouping"], files["grouping"]);
+    assert_eq!(ask_agent_change["files"], files["files"]);
+    let ask_files_touched = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "files", "did", "it", "touch"],
+    );
+    assert_eq!(ask_files_touched["task"]["lane"], lane);
+    assert_eq!(ask_files_touched["grouping"], files["grouping"]);
+    assert_eq!(ask_files_touched["files"], files["files"]);
 
     let file = run_crabdb_json(temp.path(), &["agent", "file", "latest", "README.md"]);
     assert_eq!(file["task"]["lane"], lane);
@@ -2147,6 +2652,20 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     run_git(temp.path(), &["add", "README.md"]);
     run_git(temp.path(), &["commit", "-m", "initial"]);
     CrabDb::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let empty_guide = run_crabdb_json(temp.path(), &["agent", "guide"]);
+    assert_eq!(empty_guide["status"], "empty");
+    assert!(empty_guide["headline"]
+        .as_str()
+        .unwrap()
+        .contains("Set up one editor"));
+    assert!(empty_guide["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent setup --provider claude-code")));
     let edit_script = temp.path().join("edit-readme.sh");
     fs::write(
         &edit_script,
@@ -2178,6 +2697,34 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     assert!(std::path::Path::new(task_workdir).is_dir());
     assert_eq!(started["workdir"].as_str().unwrap(), task_workdir);
     assert!(started["recorded"]["operation"].as_str().is_some());
+
+    let task_guide = run_crabdb_json(temp.path(), &["agent", "guide", "latest"]);
+    assert_eq!(task_guide["task"]["lane"], task_name);
+    assert_eq!(task_guide["status"], "ready");
+    assert!(task_guide["current_state"]
+        .as_str()
+        .unwrap()
+        .contains("changed file"));
+    assert!(task_guide["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["command"]
+            .as_str()
+            .unwrap()
+            .contains("crabdb agent ask --selector")));
+    assert!(task_guide["concepts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|concept| concept["name"] == "Apply"));
+    let ask_help = run_crabdb_json(temp.path(), &["agent", "ask", "help", "me"]);
+    assert_eq!(ask_help["task"]["lane"], task_name);
+    assert_eq!(ask_help["status"], "ready");
+    assert!(ask_help["headline"]
+        .as_str()
+        .unwrap()
+        .contains("Use `doc edit` as one agent task"));
 
     let agent_test = run_crabdb_json(
         temp.path(),
@@ -2231,6 +2778,29 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .unwrap()
         .iter()
         .any(|path| path["path"] == "README.md"));
+    let file_changes = run_crabdb_json(temp.path(), &["agent", "changes", "latest", "--by-file"]);
+    assert_eq!(file_changes["grouping"], "file");
+    assert_eq!(file_changes["cards"][0]["key"], "README.md");
+    assert!(file_changes["cards"][0]["review_command"]
+        .as_str()
+        .unwrap()
+        .contains("agent file"));
+    assert!(file_changes["cards"][0]["why_command"]
+        .as_str()
+        .unwrap()
+        .contains("agent why"));
+    let ask_changes_by_file = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "show", "changes", "by", "file"],
+    );
+    assert_eq!(ask_changes_by_file["grouping"], "file");
+    assert_eq!(ask_changes_by_file["cards"][0]["key"], "README.md");
+    let ask_risky_files = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "which", "files", "are", "risky"],
+    );
+    assert_eq!(ask_risky_files["grouping"], "file");
+    assert_eq!(ask_risky_files["cards"][0]["key"], "README.md");
     let operation_timeline = run_crabdb_json(
         temp.path(),
         &["agent", "timeline", "latest", "--by-operation"],
@@ -2248,6 +2818,22 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .unwrap()
         .iter()
         .any(|path| path["path"] == "README.md"));
+    let ask_task_diff = run_crabdb_json(temp.path(), &["agent", "ask", "show", "the", "diff"]);
+    assert_eq!(ask_task_diff["task"]["lane"], task_name);
+    assert_eq!(ask_task_diff["target_kind"], "task");
+    assert!(ask_task_diff["diff"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "README.md"));
+    assert!(ask_task_diff["diff"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "README.md"
+            && path["patch"]
+                .as_str()
+                .is_some_and(|patch| !patch.is_empty())));
 
     let dry_run = run_crabdb_json(temp.path(), &["agent", "land", "latest", "--dry-run"]);
     assert_eq!(dry_run["status"], "ready");
@@ -2270,6 +2856,7 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     assert_eq!(ready["status"], "ready");
     assert_eq!(ready["risk"]["level"], "low");
     assert_eq!(ready["apply_preview"]["status"], "ready");
+    assert_eq!(ready["default_apply_message"], "Apply agent task: doc edit");
     assert_eq!(
         ready["next"]["command"],
         format!("crabdb agent land {task_name}")
@@ -2287,12 +2874,33 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         &["agent", "ask", "is", "it", "safe", "to", "land"],
     );
     assert_eq!(ask_ready["task"]["lane"], task_name);
+    let ask_commit_message = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent", "ask", "what", "commit", "message", "should", "I", "use",
+        ],
+    );
+    assert_eq!(ask_commit_message["task"]["lane"], task_name);
+    assert_eq!(
+        ask_commit_message["default_apply_message"],
+        "Apply agent task: doc edit"
+    );
     assert_eq!(ask_ready["ready"], ready["ready"]);
     assert_eq!(ask_ready["next"], ready["next"]);
     let ask_merge = run_crabdb_json(temp.path(), &["agent", "ask", "can", "I", "merge"]);
     assert_eq!(ask_merge["task"]["lane"], task_name);
     assert_eq!(ask_merge["ready"], ready["ready"]);
     assert_eq!(ask_merge["next"], ready["next"]);
+    let validate = run_crabdb_json(temp.path(), &["agent", "validate", "latest"]);
+    let ask_tested = run_crabdb_json(temp.path(), &["agent", "ask", "is", "it", "tested"]);
+    assert_eq!(ask_tested["task"]["lane"], task_name);
+    assert_eq!(ask_tested["status"], validate["status"]);
+    assert_eq!(ask_tested["next"], validate["next"]);
+    let ask_why_apply =
+        run_crabdb_json(temp.path(), &["agent", "ask", "why", "can't", "I", "apply"]);
+    assert_eq!(ask_why_apply["task"]["lane"], task_name);
+    assert_eq!(ask_why_apply["ready"], ready["ready"]);
+    assert_eq!(ask_why_apply["next"], ready["next"]);
 
     let diagnosis = run_crabdb_json(temp.path(), &["agent", "diagnose", "latest"]);
     assert_eq!(diagnosis["task"]["name"], task_name);
@@ -2300,6 +2908,13 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     assert_eq!(diagnosis["severity"], "low");
     assert_eq!(diagnosis["ready"], true);
     assert_eq!(diagnosis["likely_issue"], "no blocking issue detected");
+    let ask_blocking = run_crabdb_json(
+        temp.path(),
+        &["agent", "ask", "what", "is", "blocking", "this", "task"],
+    );
+    assert_eq!(ask_blocking["task"]["name"], task_name);
+    assert_eq!(ask_blocking["status"], diagnosis["status"]);
+    assert_eq!(ask_blocking["likely_issue"], diagnosis["likely_issue"]);
     assert!(diagnosis["evidence"]
         .as_array()
         .unwrap()
@@ -2330,6 +2945,193 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
 
     let view = run_crabdb_json(temp.path(), &["agent", "view", "latest"]);
     assert_eq!(view["task"]["status"], "applied");
+    let repeated_dry_run = run_crabdb_json(temp.path(), &["agent", "apply", "latest", "--dry-run"]);
+    assert_eq!(repeated_dry_run["status"], "already_applied");
+    assert_eq!(repeated_dry_run["dry_run"], true);
+    assert_eq!(
+        repeated_dry_run["git_apply_plan"]["would_create_git_commit"],
+        false
+    );
+    assert_eq!(repeated_dry_run["git_export"], serde_json::Value::Null);
+    assert!(repeated_dry_run["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("agent continue")));
+    assert!(repeated_dry_run["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent continue")));
+    let repeated_apply = run_crabdb_json(temp.path(), &["agent", "apply", "latest"]);
+    assert_eq!(repeated_apply["status"], "already_applied");
+    assert_eq!(repeated_apply["fast_forwarded"], false);
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), commit);
+    let ready_after_apply = run_crabdb_json(temp.path(), &["agent", "ready", "latest"]);
+    assert_eq!(ready_after_apply["status"], "applied");
+    assert!(ready_after_apply["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent continue")));
+
+    let archived = run_crabdb_json(
+        temp.path(),
+        &["agent", "archive", "latest", "--note", "landed"],
+    );
+    assert_eq!(archived["archived"], true);
+    assert_eq!(archived["previous_archived"], false);
+    assert_eq!(archived["task"]["archived"], true);
+    assert!(archived["summary"]
+        .as_str()
+        .unwrap()
+        .contains("hidden from the default agent inbox"));
+    let list_after_archive = run_crabdb_json(temp.path(), &["agent", "list"]);
+    assert!(list_after_archive["tasks"].as_array().unwrap().is_empty());
+    let list_all_after_archive = run_crabdb_json(temp.path(), &["agent", "list", "--all"]);
+    assert_eq!(list_all_after_archive["tasks"][0]["name"], task_name);
+    assert_eq!(list_all_after_archive["tasks"][0]["archived"], true);
+    let inbox_after_archive = run_crabdb_json(temp.path(), &["agent", "inbox"]);
+    assert_eq!(inbox_after_archive["total"], 0);
+    let inbox_all_after_archive = run_crabdb_json(temp.path(), &["agent", "inbox", "--all"]);
+    assert_eq!(inbox_all_after_archive["total"], 1);
+    assert_eq!(inbox_all_after_archive["archived_count"], 1);
+    assert_eq!(inbox_all_after_archive["items"][0]["attention"], "archived");
+    let board_after_archive = run_crabdb_json(temp.path(), &["agent", "board"]);
+    assert_eq!(board_after_archive["total"], 0);
+    let board_all_after_archive = run_crabdb_json(temp.path(), &["agent", "board", "--all"]);
+    assert_eq!(board_all_after_archive["total"], 1);
+    assert_eq!(board_all_after_archive["archived_count"], 1);
+    assert_eq!(board_all_after_archive["columns"][0]["key"], "archived");
+    let status_after_archive = run_crabdb_json(temp.path(), &["agent", "status"]);
+    assert_eq!(status_after_archive["status"], "empty");
+
+    let unarchived = run_crabdb_json(temp.path(), &["agent", "unarchive", &task_name]);
+    assert_eq!(unarchived["archived"], false);
+    assert_eq!(unarchived["previous_archived"], true);
+    assert_eq!(unarchived["task"]["archived"], false);
+    let list_after_unarchive = run_crabdb_json(temp.path(), &["agent", "list"]);
+    assert_eq!(list_after_unarchive["tasks"][0]["name"], task_name);
+    assert_eq!(list_after_unarchive["tasks"][0]["archived"], false);
+
+    let followup_script = temp.path().join("followup.sh");
+    fs::write(
+        &followup_script,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' 'follow-up task' > FOLLOWUP.md\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&followup_script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&followup_script, permissions).unwrap();
+
+    let followup = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "continue",
+            &task_name,
+            "--provider",
+            "claude-code",
+            "--name",
+            "doc-followup",
+            "--",
+            followup_script.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(followup["source_task"]["name"], task_name);
+    assert_eq!(followup["run"]["status"], "completed");
+    let followup_task = followup["run"]["task"]["name"].as_str().unwrap();
+    assert_ne!(followup_task, task_name);
+    assert!(followup_task.starts_with("agent-doc-followup-"));
+    assert!(followup["run"]["task"]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "FOLLOWUP.md"));
+    assert!(followup["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent land")));
+
+    let followup_dry_run =
+        run_crabdb_json(temp.path(), &["agent", "land", followup_task, "--dry-run"]);
+    assert_eq!(followup_dry_run["status"], "ready");
+    assert_eq!(
+        followup_dry_run["git_apply_plan"]["would_fast_forward"],
+        true
+    );
+
+    let finish_dry_run =
+        run_crabdb_json(temp.path(), &["agent", "ship", followup_task, "--dry-run"]);
+    assert_eq!(finish_dry_run["status"], "ready");
+    assert_eq!(finish_dry_run["dry_run"], true);
+    assert_eq!(finish_dry_run["apply"]["status"], "ready");
+    assert_eq!(finish_dry_run["would_archive"], true);
+    assert_eq!(finish_dry_run["archive"], serde_json::Value::Null);
+    assert!(finish_dry_run["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|suggestion| suggestion["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent finish")));
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), commit);
+
+    let finished = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "finish",
+            followup_task,
+            "-m",
+            "Apply follow-up task",
+            "--note",
+            "done",
+        ],
+    );
+    assert_eq!(finished["status"], "finished");
+    assert_eq!(finished["dry_run"], false);
+    assert_eq!(finished["apply"]["status"], "applied");
+    assert_eq!(finished["archive"]["archived"], true);
+    assert_eq!(finished["archive"]["previous_archived"], false);
+    assert_eq!(finished["archive"]["note"], "done");
+    assert_eq!(finished["task"]["archived"], true);
+    let followup_commit = finished["apply"]["git_export"]["commit"].as_str().unwrap();
+    assert_eq!(
+        git_output(temp.path(), &["rev-parse", "HEAD"]),
+        followup_commit
+    );
+    assert_eq!(
+        git_output(temp.path(), &["log", "-1", "--pretty=%s"]),
+        "Apply follow-up task"
+    );
+    assert_eq!(
+        git_output(temp.path(), &["show", "HEAD:FOLLOWUP.md"]),
+        "follow-up task"
+    );
+    let list_after_finish = run_crabdb_json(temp.path(), &["agent", "list"]);
+    assert!(list_after_finish["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|task| task["name"] != followup_task));
+    let list_all_after_finish = run_crabdb_json(temp.path(), &["agent", "list", "--all"]);
+    assert!(list_all_after_finish["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|task| task["name"] == followup_task && task["archived"] == true));
 }
 
 #[cfg(unix)]
@@ -8799,9 +9601,21 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(resources_list
         .iter()
         .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/review" }));
+    assert!(resources_list.iter().any(|resource| {
+        resource["uri"] == "crabdb://workspace/agent-tasks/latest/review-data"
+    }));
     assert!(resources_list
         .iter()
         .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/diagnose" }));
+    assert!(resources_list
+        .iter()
+        .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/confidence" }));
+    assert!(resources_list
+        .iter()
+        .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/test-plan" }));
+    assert!(resources_list
+        .iter()
+        .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/review-map" }));
     assert!(resources_list
         .iter()
         .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/changes" }));
@@ -8811,6 +9625,9 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(resources_list
         .iter()
         .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/focus" }));
+    assert!(resources_list
+        .iter()
+        .any(|resource| { resource["uri"] == "crabdb://workspace/agent-tasks/latest/handoff" }));
     assert!(resources_list
         .iter()
         .any(|resource| resource["uri"] == "crabdb://docs/lane-workflows"));
@@ -8835,7 +9652,19 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/review"
     }));
     assert!(template_list.iter().any(|template| {
+        template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/review-data"
+    }));
+    assert!(template_list.iter().any(|template| {
         template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/diagnose"
+    }));
+    assert!(template_list.iter().any(|template| {
+        template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/confidence"
+    }));
+    assert!(template_list.iter().any(|template| {
+        template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/test-plan"
+    }));
+    assert!(template_list.iter().any(|template| {
+        template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/review-map"
     }));
     assert!(template_list.iter().any(|template| {
         template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/changes"
@@ -8848,6 +9677,9 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     }));
     assert!(template_list.iter().any(|template| {
         template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/report"
+    }));
+    assert!(template_list.iter().any(|template| {
+        template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/handoff"
     }));
     assert!(template_list.iter().any(|template| {
         template["uriTemplate"] == "crabdb://workspace/agent-tasks/{selector}/focus"
@@ -9044,15 +9876,26 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .unwrap();
     assert!(agent_review_text.contains("crabdb.agent_summary"));
     assert!(agent_review_text.contains("crabdb.agent_report"));
+    assert!(agent_review_text.contains("crabdb.agent_handoff"));
     assert!(agent_review_text.contains("crabdb.agent_receipt"));
     assert!(agent_review_text.contains("crabdb.agent_pr"));
+    assert!(agent_review_text.contains("crabdb.agent_guide"));
+    assert!(agent_review_text.contains("crabdb.agent_board"));
+    assert!(agent_review_text.contains("crabdb.agent_review_flow"));
+    assert!(agent_review_text.contains("crabdb.agent_confidence"));
+    assert!(agent_review_text.contains("crabdb.agent_test_plan"));
     assert!(agent_review_text.contains("crabdb.agent_focus"));
     assert!(agent_review_text.contains("crabdb.agent_diagnose"));
     assert!(agent_review_text.contains("crabdb.agent_changes"));
     assert!(agent_review_text.contains("crabdb.agent_delta"));
     assert!(agent_review_text.contains("crabdb.agent_new"));
     assert!(agent_review_text.contains("crabdb.agent_mark_reviewed"));
+    assert!(agent_review_text.contains("crabdb.agent_archive"));
+    assert!(agent_review_text.contains("crabdb.agent_unarchive"));
     assert!(agent_review_text.contains("crabdb.agent_change"));
+    assert!(agent_review_text.contains("crabdb.agent_impact"));
+    assert!(agent_review_text.contains("crabdb.agent_review_map"));
+    assert!(agent_review_text.contains("crabdb.agent_tools"));
     assert!(agent_review_text.contains("crabdb.agent_timeline"));
     assert!(agent_review_text.contains("change cards"));
     assert!(agent_review_text.contains("crabdb.agent_files"));
@@ -9231,7 +10074,19 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_inbox"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_board"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_review_flow"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_review_data"));
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.agent_next"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_guide"));
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.agent_ask"));
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.agent_view"));
     assert!(tools
@@ -9245,10 +10100,16 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .any(|tool| tool["name"] == "crabdb.agent_validate"));
     assert!(tools
         .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_test_plan"));
+    assert!(tools
+        .iter()
         .any(|tool| tool["name"] == "crabdb.agent_diagnose"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_report"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_handoff"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_receipt"));
@@ -9256,7 +10117,19 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_story"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_tools"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_impact"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_review_map"));
     assert!(tools.iter().any(|tool| tool["name"] == "crabdb.agent_risk"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_confidence"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_ready"));
@@ -9273,6 +10146,15 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_mark_reviewed"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_mark_file_reviewed"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_archive"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "crabdb.agent_unarchive"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "crabdb.agent_change"));
@@ -9358,16 +10240,26 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         "readOnlyHint"
     ));
     assert!(tool_annotation("crabdb.agent_next", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_guide", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_inbox", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_board", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_review_flow", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_review_data", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_brief", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_summary", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_validate", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_test_plan", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_diagnose", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_report", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_handoff", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_receipt", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_pr", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_story", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_tools", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_impact", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_review_map", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_risk", "readOnlyHint"));
+    assert!(tool_annotation("crabdb.agent_confidence", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_ready", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_workdir", "readOnlyHint"));
     assert!(tool_annotation("crabdb.agent_changes", "readOnlyHint"));
@@ -9379,6 +10271,21 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     ));
     assert!(!tool_annotation(
         "crabdb.agent_mark_reviewed",
+        "destructiveHint"
+    ));
+    assert!(!tool_annotation(
+        "crabdb.agent_mark_file_reviewed",
+        "readOnlyHint"
+    ));
+    assert!(!tool_annotation(
+        "crabdb.agent_mark_file_reviewed",
+        "destructiveHint"
+    ));
+    assert!(!tool_annotation("crabdb.agent_archive", "readOnlyHint"));
+    assert!(!tool_annotation("crabdb.agent_archive", "destructiveHint"));
+    assert!(!tool_annotation("crabdb.agent_unarchive", "readOnlyHint"));
+    assert!(!tool_annotation(
+        "crabdb.agent_unarchive",
         "destructiveHint"
     ));
     assert!(tool_annotation("crabdb.agent_change", "readOnlyHint"));
@@ -9563,6 +10470,38 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         agent_next["result"]["structuredContent"]["primary"]["command"],
         "crabdb agent new agent-mcp"
     );
+    let agent_guide = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 278,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_guide",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_guide["result"]["structuredContent"]["primary"]["command"],
+        "crabdb agent new agent-mcp"
+    );
+    assert!(agent_guide["result"]["structuredContent"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["command"]
+            .as_str()
+            .unwrap()
+            .contains("crabdb agent ask --selector agent-mcp")));
+    assert!(agent_guide["result"]["structuredContent"]["concepts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|concept| concept["name"] == "Agent task"));
     let agent_ask_next = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -9595,6 +10534,37 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         agent_ask_next["result"]["structuredContent"]["read_only"],
         true
     );
+    let agent_ask_guide = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 279,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "help me use CrabDB"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_guide["result"]["structuredContent"]["intent"],
+        "guide"
+    );
+    assert_eq!(
+        agent_ask_guide["result"]["structuredContent"]["tool"],
+        "crabdb.agent_guide"
+    );
+    assert!(
+        agent_ask_guide["result"]["structuredContent"]["report"]["concepts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|concept| concept["name"] == "Changes")
+    );
     let agent_ask_tools = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -9613,15 +10583,19 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     .unwrap();
     assert_eq!(
         agent_ask_tools["result"]["structuredContent"]["intent"],
-        "view"
+        "tools"
     );
     assert_eq!(
         agent_ask_tools["result"]["structuredContent"]["tool"],
-        "crabdb.agent_view"
+        "crabdb.agent_tools"
     );
     assert_eq!(
         agent_ask_tools["result"]["structuredContent"]["report"]["task"]["lane"],
         "agent-mcp"
+    );
+    assert_eq!(
+        agent_ask_tools["result"]["structuredContent"]["report"]["total_tool_events"],
+        0
     );
     let agent_ask_transcript = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -9684,6 +10658,58 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .as_str()
             .unwrap()
             .contains("agent new")
+    );
+    let agent_board = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2471,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_board",
+                "arguments": {}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(agent_board["result"]["structuredContent"]["total"], 2);
+    assert_eq!(
+        agent_board["result"]["structuredContent"]["columns"][0]["key"],
+        "needs_review"
+    );
+    assert!(
+        agent_board["result"]["structuredContent"]["columns"][0]["items"][0]["next"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("agent new")
+    );
+    let agent_ask_board = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2472,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show agent board"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_board["result"]["structuredContent"]["intent"],
+        "board"
+    );
+    assert_eq!(
+        agent_ask_board["result"]["structuredContent"]["tool"],
+        "crabdb.agent_board"
+    );
+    assert_eq!(
+        agent_ask_board["result"]["structuredContent"]["routed_command"],
+        "crabdb agent board"
     );
     let agent_ask_inbox = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -9775,6 +10801,33 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .iter()
             .any(|reason| reason["code"] == "missing_latest_test")
     );
+    let agent_handoff = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2511,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_handoff",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert!(agent_handoff["result"]["structuredContent"]["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("# Agent Task Handoff"));
+    assert!(agent_handoff["result"]["structuredContent"]["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("## Receiver Next Step"));
+    assert_eq!(
+        agent_handoff["result"]["structuredContent"]["transcript_turns"],
+        1
+    );
     let agent_receipt = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -9824,6 +10877,147 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .as_str()
         .unwrap()
         .contains("## CrabDB Review"));
+    let agent_ask_receipt = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 310,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "give me a summary to share"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_receipt["result"]["structuredContent"]["intent"],
+        "receipt"
+    );
+    assert_eq!(
+        agent_ask_receipt["result"]["structuredContent"]["tool"],
+        "crabdb.agent_receipt"
+    );
+    assert!(
+        agent_ask_receipt["result"]["structuredContent"]["report"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("# Agent Task Receipt")
+    );
+    let agent_ask_handoff = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3101,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "handoff this to another agent"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_handoff["result"]["structuredContent"]["intent"],
+        "handoff"
+    );
+    assert_eq!(
+        agent_ask_handoff["result"]["structuredContent"]["tool"],
+        "crabdb.agent_handoff"
+    );
+    assert!(
+        agent_ask_handoff["result"]["structuredContent"]["report"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("# Agent Task Handoff")
+    );
+    let agent_ask_pr = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 311,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what should I put in the PR"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(agent_ask_pr["result"]["structuredContent"]["intent"], "pr");
+    assert_eq!(
+        agent_ask_pr["result"]["structuredContent"]["tool"],
+        "crabdb.agent_pr"
+    );
+    assert!(
+        agent_ask_pr["result"]["structuredContent"]["report"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("Apply ")
+    );
+    let agent_ask_merge_pr = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 312,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "can I merge the PR"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_merge_pr["result"]["structuredContent"]["intent"],
+        "ready"
+    );
+    assert_eq!(
+        agent_ask_merge_pr["result"]["structuredContent"]["tool"],
+        "crabdb.agent_ready"
+    );
+    let agent_ask_commit_message = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 313,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what commit message should I use"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_commit_message["result"]["structuredContent"]["intent"],
+        "ready"
+    );
+    assert_eq!(
+        agent_ask_commit_message["result"]["structuredContent"]["tool"],
+        "crabdb.agent_ready"
+    );
+    assert!(
+        agent_ask_commit_message["result"]["structuredContent"]["report"]["default_apply_message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Apply agent task")
+    );
     let agent_summary = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -9923,6 +11117,120 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .unwrap()
             .contains("agent validate")
     );
+    let agent_dashboard = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 358,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_dashboard",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_dashboard["result"]["structuredContent"]["task"]["lane"],
+        "agent-mcp"
+    );
+    assert_eq!(
+        agent_dashboard["result"]["structuredContent"]["focus"]["path"],
+        "README.md"
+    );
+    assert_eq!(
+        agent_dashboard["result"]["structuredContent"]["validation"]["status"],
+        "missing_test"
+    );
+    let agent_review_flow = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 360,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_review_flow",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_review_flow["result"]["structuredContent"]["task"]["lane"],
+        "agent-mcp"
+    );
+    assert_eq!(
+        agent_review_flow["result"]["structuredContent"]["review_status"],
+        "unreviewed"
+    );
+    assert_eq!(
+        agent_review_flow["result"]["structuredContent"]["steps"][0]["label"],
+        "Inspect changes"
+    );
+    assert_eq!(
+        agent_review_flow["result"]["structuredContent"]["steps"][0]["state"],
+        "current"
+    );
+    let agent_ask_review_flow = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 361,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "walk me through review"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_review_flow["result"]["structuredContent"]["intent"],
+        "review_flow"
+    );
+    assert_eq!(
+        agent_ask_review_flow["result"]["structuredContent"]["tool"],
+        "crabdb.agent_review_flow"
+    );
+    assert_eq!(
+        agent_ask_review_flow["result"]["structuredContent"]["report"]["steps"][0]["label"],
+        "Inspect changes"
+    );
+    let agent_ask_dashboard = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 359,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show dashboard"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_dashboard["result"]["structuredContent"]["intent"],
+        "dashboard"
+    );
+    assert_eq!(
+        agent_ask_dashboard["result"]["structuredContent"]["tool"],
+        "crabdb.agent_dashboard"
+    );
+    assert_eq!(
+        agent_ask_dashboard["result"]["structuredContent"]["report"]["focus"]["path"],
+        "README.md"
+    );
     let agent_focus = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -9944,6 +11252,100 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     );
     assert_eq!(
         agent_focus["result"]["structuredContent"]["diff"]["file_filter"],
+        "README.md"
+    );
+    assert!(agent_focus["result"]["structuredContent"]["open_path"].is_null());
+    assert!(agent_focus["result"]["structuredContent"]["open_command"].is_null());
+    let agent_ask_focus_file = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 292,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what file should I review first"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_focus_file["result"]["structuredContent"]["intent"],
+        "focus"
+    );
+    assert_eq!(
+        agent_ask_focus_file["result"]["structuredContent"]["tool"],
+        "crabdb.agent_focus"
+    );
+    assert_eq!(
+        agent_ask_focus_file["result"]["structuredContent"]["report"]["path"],
+        "README.md"
+    );
+    let agent_ask_open_file = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 322,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what file should I open"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_open_file["result"]["structuredContent"]["intent"],
+        "focus"
+    );
+    assert_eq!(
+        agent_ask_open_file["result"]["structuredContent"]["tool"],
+        "crabdb.agent_focus"
+    );
+    assert_eq!(
+        agent_ask_open_file["result"]["structuredContent"]["report"]["path"],
+        "README.md"
+    );
+    assert_eq!(
+        agent_ask_open_file["result"]["structuredContent"]["report"]["open_path"],
+        agent_focus["result"]["structuredContent"]["open_path"]
+    );
+    assert_eq!(
+        agent_ask_open_file["result"]["structuredContent"]["report"]["open_command"],
+        agent_focus["result"]["structuredContent"]["open_command"]
+    );
+    let agent_ask_look_first = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 293,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "where should I look first"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_look_first["result"]["structuredContent"]["intent"],
+        "focus"
+    );
+    assert_eq!(
+        agent_ask_look_first["result"]["structuredContent"]["tool"],
+        "crabdb.agent_focus"
+    );
+    assert_eq!(
+        agent_ask_look_first["result"]["structuredContent"]["report"]["path"],
         "README.md"
     );
     let agent_review_resource = crabdb::mcp::handle_json_rpc(
@@ -9989,6 +11391,73 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     let agent_focus_resource_json: serde_json::Value =
         serde_json::from_str(agent_focus_resource_text).unwrap();
     assert_eq!(agent_focus_resource_json["path"], "README.md");
+    assert!(agent_focus_resource_json["open_path"].is_null());
+    let agent_confidence_resource = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2591,
+            "method": "resources/read",
+            "params": {
+                "uri": "crabdb://workspace/agent-tasks/agent-mcp/confidence"
+            }
+        }),
+    )
+    .unwrap();
+    let agent_confidence_resource_text = agent_confidence_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    let agent_confidence_resource_json: serde_json::Value =
+        serde_json::from_str(agent_confidence_resource_text).unwrap();
+    assert_eq!(agent_confidence_resource_json["verdict"], "review");
+    assert_eq!(
+        agent_confidence_resource_json["ready"]["status"],
+        "git_blocked"
+    );
+    let agent_test_plan_resource = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 25911,
+            "method": "resources/read",
+            "params": {
+                "uri": "crabdb://workspace/agent-tasks/agent-mcp/test-plan"
+            }
+        }),
+    )
+    .unwrap();
+    let agent_test_plan_resource_text = agent_test_plan_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    let agent_test_plan_resource_json: serde_json::Value =
+        serde_json::from_str(agent_test_plan_resource_text).unwrap();
+    assert_eq!(agent_test_plan_resource_json["status"], "needs_test");
+    assert_eq!(
+        agent_test_plan_resource_json["validation"]["status"],
+        "missing_test"
+    );
+    let agent_review_map_resource = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2592,
+            "method": "resources/read",
+            "params": {
+                "uri": "crabdb://workspace/agent-tasks/agent-mcp/review-map"
+            }
+        }),
+    )
+    .unwrap();
+    let agent_review_map_resource_text = agent_review_map_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    let agent_review_map_resource_json: serde_json::Value =
+        serde_json::from_str(agent_review_map_resource_text).unwrap();
+    assert_eq!(agent_review_map_resource_json["areas"][0]["key"], "docs");
+    assert_eq!(
+        agent_review_map_resource_json["areas"][0]["files"][0]["path"],
+        "README.md"
+    );
     let agent_files_resource = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10031,6 +11500,27 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .as_str()
         .unwrap()
         .contains("# Agent Task Report"));
+    let agent_handoff_resource = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2571,
+            "method": "resources/read",
+            "params": {
+                "uri": "crabdb://workspace/agent-tasks/agent-mcp/handoff"
+            }
+        }),
+    )
+    .unwrap();
+    let agent_handoff_resource_text = agent_handoff_resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    let agent_handoff_resource_json: serde_json::Value =
+        serde_json::from_str(agent_handoff_resource_text).unwrap();
+    assert!(agent_handoff_resource_json["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("# Agent Task Handoff"));
     let agent_receipt_resource = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10161,6 +11651,232 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .unwrap()
         .iter()
         .any(|reason| reason["code"] == "missing_latest_test"));
+    let agent_impact = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2447,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_impact",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_impact["result"]["structuredContent"]["task"]["lane"],
+        "agent-mcp"
+    );
+    assert_eq!(
+        agent_impact["result"]["structuredContent"]["areas"][0]["key"],
+        "docs"
+    );
+    assert_eq!(
+        agent_impact["result"]["structuredContent"]["areas"][0]["changed_paths"][0]["path"],
+        "README.md"
+    );
+    let agent_ask_impact = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24471,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what is the blast radius"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_impact["result"]["structuredContent"]["intent"],
+        "impact"
+    );
+    assert_eq!(
+        agent_ask_impact["result"]["structuredContent"]["tool"],
+        "crabdb.agent_impact"
+    );
+    assert_eq!(
+        agent_ask_impact["result"]["structuredContent"]["report"]["areas"][0]["key"],
+        "docs"
+    );
+    let agent_review_map = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24472,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_review_map",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_review_map["result"]["structuredContent"]["task"]["lane"],
+        "agent-mcp"
+    );
+    assert_eq!(
+        agent_review_map["result"]["structuredContent"]["areas"][0]["key"],
+        "docs"
+    );
+    assert_eq!(
+        agent_review_map["result"]["structuredContent"]["areas"][0]["files"][0]["path"],
+        "README.md"
+    );
+    let agent_ask_review_map = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24473,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show review map"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_review_map["result"]["structuredContent"]["intent"],
+        "review_map"
+    );
+    assert_eq!(
+        agent_ask_review_map["result"]["structuredContent"]["tool"],
+        "crabdb.agent_review_map"
+    );
+    assert_eq!(
+        agent_ask_review_map["result"]["structuredContent"]["report"]["areas"][0]["files"][0]
+            ["path"],
+        "README.md"
+    );
+    let agent_tools = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2448,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_tools",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_tools["result"]["structuredContent"]["task"]["lane"],
+        "agent-mcp"
+    );
+    assert_eq!(
+        agent_tools["result"]["structuredContent"]["total_tool_events"],
+        0
+    );
+    assert!(agent_tools["result"]["structuredContent"]["tools"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let agent_confidence = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2451,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_confidence",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_confidence["result"]["structuredContent"]["task"]["lane"],
+        "agent-mcp"
+    );
+    assert_eq!(
+        agent_confidence["result"]["structuredContent"]["verdict"],
+        "review"
+    );
+    assert_eq!(
+        agent_confidence["result"]["structuredContent"]["ready"]["status"],
+        "git_blocked"
+    );
+    assert!(agent_confidence["result"]["structuredContent"]["factors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|factor| factor["name"] == "apply_preflight" && factor["state"] == "block"));
+    let agent_ask_confidence = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2452,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "final check, am I good?"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_confidence["result"]["structuredContent"]["intent"],
+        "confidence"
+    );
+    assert_eq!(
+        agent_ask_confidence["result"]["structuredContent"]["tool"],
+        "crabdb.agent_confidence"
+    );
+    assert_eq!(
+        agent_ask_confidence["result"]["structuredContent"]["report"]["verdict"],
+        "review"
+    );
+    let agent_ask_red_flags = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 317,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "any red flags"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_red_flags["result"]["structuredContent"]["intent"],
+        "risk"
+    );
+    assert_eq!(
+        agent_ask_red_flags["result"]["structuredContent"]["tool"],
+        "crabdb.agent_risk"
+    );
+    assert_eq!(
+        agent_ask_red_flags["result"]["structuredContent"]["report"]["level"],
+        agent_risk["result"]["structuredContent"]["level"]
+    );
     let agent_ready = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10213,6 +11929,114 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         agent_ask_ready["result"]["structuredContent"]["report"]["status"],
         agent_ready["result"]["structuredContent"]["status"]
     );
+    let agent_ask_why_apply = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 294,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "why can't I apply"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_why_apply["result"]["structuredContent"]["intent"],
+        "ready"
+    );
+    assert_eq!(
+        agent_ask_why_apply["result"]["structuredContent"]["tool"],
+        "crabdb.agent_ready"
+    );
+    assert_eq!(
+        agent_ask_why_apply["result"]["structuredContent"]["report"]["status"],
+        agent_ready["result"]["structuredContent"]["status"]
+    );
+    let agent_ask_blocking = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 295,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what is blocking this task"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_blocking["result"]["structuredContent"]["intent"],
+        "diagnose"
+    );
+    assert_eq!(
+        agent_ask_blocking["result"]["structuredContent"]["tool"],
+        "crabdb.agent_diagnose"
+    );
+    assert_eq!(
+        agent_ask_blocking["result"]["structuredContent"]["report"]["status"],
+        agent_diagnose["result"]["structuredContent"]["status"]
+    );
+    let agent_ask_failed = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 296,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "why did it fail"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_failed["result"]["structuredContent"]["intent"],
+        "diagnose"
+    );
+    assert_eq!(
+        agent_ask_failed["result"]["structuredContent"]["tool"],
+        "crabdb.agent_diagnose"
+    );
+    assert_eq!(
+        agent_ask_failed["result"]["structuredContent"]["report"]["status"],
+        agent_diagnose["result"]["structuredContent"]["status"]
+    );
+    let agent_ask_wrong = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 297,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what went wrong"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_wrong["result"]["structuredContent"]["intent"],
+        "diagnose"
+    );
+    assert_eq!(
+        agent_ask_wrong["result"]["structuredContent"]["tool"],
+        "crabdb.agent_diagnose"
+    );
     let agent_validate = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10238,6 +12062,32 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .unwrap()
             .contains("agent test")
     );
+    let agent_test_plan = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2791,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_test_plan",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_test_plan["result"]["structuredContent"]["status"],
+        "needs_test"
+    );
+    assert!(agent_test_plan["result"]["structuredContent"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|step| step["kind"] == "test"
+            && step["required"] == true
+            && step["command"].as_str().unwrap().contains("agent test")));
     let agent_ask_validate = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10256,15 +12106,71 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     .unwrap();
     assert_eq!(
         agent_ask_validate["result"]["structuredContent"]["intent"],
-        "validate"
+        "test_plan"
     );
     assert_eq!(
         agent_ask_validate["result"]["structuredContent"]["tool"],
+        "crabdb.agent_test_plan"
+    );
+    assert_eq!(
+        agent_ask_validate["result"]["structuredContent"]["report"]["steps"],
+        agent_test_plan["result"]["structuredContent"]["steps"]
+    );
+    let agent_ask_test_this = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 314,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "how should I test this"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_test_this["result"]["structuredContent"]["intent"],
+        "test_plan"
+    );
+    assert_eq!(
+        agent_ask_test_this["result"]["structuredContent"]["tool"],
+        "crabdb.agent_test_plan"
+    );
+    assert_eq!(
+        agent_ask_test_this["result"]["structuredContent"]["report"]["steps"],
+        agent_test_plan["result"]["structuredContent"]["steps"]
+    );
+    let agent_ask_tests_pass = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 315,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "did tests pass"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_tests_pass["result"]["structuredContent"]["intent"],
+        "validate"
+    );
+    assert_eq!(
+        agent_ask_tests_pass["result"]["structuredContent"]["tool"],
         "crabdb.agent_validate"
     );
     assert_eq!(
-        agent_ask_validate["result"]["structuredContent"]["report"]["next"],
-        agent_validate["result"]["structuredContent"]["next"]
+        agent_ask_tests_pass["result"]["structuredContent"]["report"]["status"],
+        agent_validate["result"]["structuredContent"]["status"]
     );
     let agent_changes = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -10310,6 +12216,175 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .as_str()
             .unwrap()
             .contains("agent focus")
+    );
+    let agent_file_changes = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 319,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_changes",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "by-file": true
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_file_changes["result"]["structuredContent"]["grouping"],
+        "file"
+    );
+    assert_eq!(
+        agent_file_changes["result"]["structuredContent"]["cards"][0]["key"],
+        "README.md"
+    );
+    assert!(
+        agent_file_changes["result"]["structuredContent"]["cards"][0]["review_command"]
+            .as_str()
+            .unwrap()
+            .contains("agent file")
+    );
+    let agent_review_data = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 322,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_review_data",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_review_data["result"]["structuredContent"]["total_files"],
+        1
+    );
+    assert_eq!(
+        agent_review_data["result"]["structuredContent"]["needs_review_files"],
+        1
+    );
+    assert_eq!(
+        agent_review_data["result"]["structuredContent"]["changes_by_file"]["grouping"],
+        "file"
+    );
+    assert_eq!(
+        agent_review_data["result"]["structuredContent"]["focus"]["path"],
+        "README.md"
+    );
+    let mcp_review_actions = agent_review_data["result"]["structuredContent"]["actions"]
+        .as_array()
+        .unwrap();
+    assert!(mcp_review_actions.iter().any(|action| {
+        action["id"] == "mark_focus_file_reviewed"
+            && action["enabled"] == true
+            && action["mcp_tool"] == "crabdb.agent_mark_file_reviewed"
+            && action["mcp_arguments"]["selector"] == "agent-mcp"
+            && action["mcp_arguments"]["path"] == "README.md"
+    }));
+    assert!(mcp_review_actions.iter().any(|action| {
+        action["id"] == "apply_task"
+            && action["safety"] == "destructive"
+            && action["requires_confirmation"] == true
+            && action["mcp_arguments"]["selector"] == "agent-mcp"
+            && action["mcp_arguments"]["dry-run"] == false
+    }));
+    let agent_ask_changes_by_file = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 320,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show changes by file"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_changes_by_file["result"]["structuredContent"]["intent"],
+        "changes"
+    );
+    assert_eq!(
+        agent_ask_changes_by_file["result"]["structuredContent"]["tool"],
+        "crabdb.agent_changes"
+    );
+    assert_eq!(
+        agent_ask_changes_by_file["result"]["structuredContent"]["report"]["grouping"],
+        "file"
+    );
+    let agent_ask_review_data = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 323,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show editor panel data"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_review_data["result"]["structuredContent"]["intent"],
+        "review_data"
+    );
+    assert_eq!(
+        agent_ask_review_data["result"]["structuredContent"]["tool"],
+        "crabdb.agent_review_data"
+    );
+    assert_eq!(
+        agent_ask_review_data["result"]["structuredContent"]["report"]["total_files"],
+        1
+    );
+    assert!(
+        agent_ask_review_data["result"]["structuredContent"]["report"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["id"] == "apply_dry_run")
+    );
+    let agent_ask_risky_files = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 321,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "which files are risky"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_risky_files["result"]["structuredContent"]["intent"],
+        "changes"
+    );
+    assert_eq!(
+        agent_ask_risky_files["result"]["structuredContent"]["tool"],
+        "crabdb.agent_changes"
+    );
+    assert_eq!(
+        agent_ask_risky_files["result"]["structuredContent"]["report"]["grouping"],
+        "file"
     );
     let agent_delta = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -10509,6 +12584,46 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .unwrap()
             .contains("from agent mcp")
     );
+    let agent_ask_task_diff = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 316,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "show me the diff"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_task_diff["result"]["structuredContent"]["intent"],
+        "diff"
+    );
+    assert_eq!(
+        agent_ask_task_diff["result"]["structuredContent"]["tool"],
+        "crabdb.agent_diff"
+    );
+    assert!(
+        agent_ask_task_diff["result"]["structuredContent"]["routed_command"]
+            .as_str()
+            .unwrap()
+            .contains("agent diff")
+    );
+    assert_eq!(
+        agent_ask_task_diff["result"]["structuredContent"]["report"]["target_kind"],
+        "task"
+    );
+    assert!(
+        agent_ask_task_diff["result"]["structuredContent"]["report"]["diff"]["files"][0]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("from agent mcp")
+    );
     let agent_ask_review_plan = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10628,6 +12743,55 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .as_str()
             .unwrap()
             .contains("from agent mcp")
+    );
+    let agent_mark_file_reviewed = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2741,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_mark_file_reviewed",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "path": "README.md",
+                    "note": "mcp file reviewed"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_mark_file_reviewed["result"]["structuredContent"]["marker"]["path"],
+        "README.md"
+    );
+    assert_eq!(
+        agent_mark_file_reviewed["result"]["structuredContent"]["marker"]["note"],
+        "mcp file reviewed"
+    );
+    let agent_review_map_after_file = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2742,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_review_map",
+                "arguments": {
+                    "selector": "agent-mcp"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_review_map_after_file["result"]["structuredContent"]["areas"][0]["files"][0]["state"],
+        "reviewed"
+    );
+    assert_eq!(
+        agent_review_map_after_file["result"]["structuredContent"]["areas"][0]["files"][0]
+            ["reviewed"]["note"],
+        "mcp file reviewed"
     );
     let agent_mark_reviewed = crabdb::mcp::handle_json_rpc(
         &mut db,
@@ -10790,6 +12954,36 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     let agent_changes_resource_json: serde_json::Value =
         serde_json::from_str(agent_changes_resource_text).unwrap();
     assert_eq!(agent_changes_resource_json["cards"][0]["key"], "docs");
+    let agent_review_data_resource = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 261,
+            "method": "resources/read",
+            "params": {
+                "uri": "crabdb://workspace/agent-tasks/agent-mcp/review-data"
+            }
+        }),
+    )
+    .unwrap();
+    let agent_review_data_resource_text = agent_review_data_resource["result"]["contents"][0]
+        ["text"]
+        .as_str()
+        .unwrap();
+    let agent_review_data_resource_json: serde_json::Value =
+        serde_json::from_str(agent_review_data_resource_text).unwrap();
+    assert_eq!(agent_review_data_resource_json["total_files"], 1);
+    assert_eq!(
+        agent_review_data_resource_json["changes_by_file"]["grouping"],
+        "file"
+    );
+    assert!(agent_review_data_resource_json["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "show_review_map"
+            && action["mcp_tool"] == "crabdb.agent_review_map"
+            && action["mcp_arguments"]["selector"] == "agent-mcp"));
     let agent_timeline_resource = crabdb::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
@@ -10898,6 +13092,64 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
             .as_str()
             .unwrap()
             .contains("agent why")
+    );
+    let agent_ask_agent_change = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 300,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what did the agent change"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_agent_change["result"]["structuredContent"]["intent"],
+        "files"
+    );
+    assert_eq!(
+        agent_ask_agent_change["result"]["structuredContent"]["tool"],
+        "crabdb.agent_files"
+    );
+    assert_eq!(
+        agent_ask_agent_change["result"]["structuredContent"]["report"]["files"][0]["change"]
+            ["path"],
+        "README.md"
+    );
+    let agent_ask_files_touched = crabdb::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 301,
+            "method": "tools/call",
+            "params": {
+                "name": "crabdb.agent_ask",
+                "arguments": {
+                    "selector": "agent-mcp",
+                    "question": "what files did it touch"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ask_files_touched["result"]["structuredContent"]["intent"],
+        "files"
+    );
+    assert_eq!(
+        agent_ask_files_touched["result"]["structuredContent"]["tool"],
+        "crabdb.agent_files"
+    );
+    assert_eq!(
+        agent_ask_files_touched["result"]["structuredContent"]["report"]["files"][0]["change"]
+            ["path"],
+        "README.md"
     );
     let agent_checkpoints = crabdb::mcp::handle_json_rpc(
         &mut db,

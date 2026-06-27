@@ -81,25 +81,34 @@ Workflow:\n\
                 format!(
                     "Review CrabDB agent task `{selector}` using the high-level agent tools.\n\n\
 Workflow:\n\
-1. If the user asks a plain-language question such as what needs attention, what changed, what should I do next, what did the agent do, where is the workdir, where did the agent edit, which prompt changed a file, last prompt, what changed in the last prompt, what changed in README.md in the last prompt, show transcript, what should I review, what should I review first, open review, review this task, what tools were used, what tests should I run, can I merge, is it safe to land, recover, explain a file, or show a patch/diff, call `crabdb.agent_ask` for `{selector}` and present the routed report.\n\
-2. Start with `crabdb.agent_summary` for `{selector}` when you need the full review cockpit: readiness, risk, validation, receipt Markdown, PR draft, and the one recommended next action.\n\
-3. Call `crabdb.agent_next` for `{selector}` only when you need a smaller next-action payload.\n\
-4. Call `crabdb.agent_receipt` for `{selector}` when the user asks for a copyable after-action note; call `crabdb.agent_report` only when a deeper review bundle is needed.\n\
-5. Call `crabdb.agent_focus` for `{selector}` when the user asks what to inspect first; it bundles review priority, why, and a focused diff summary.\n\
-6. Call `crabdb.agent_new` for `{selector}` when the user asks what changed since they last reviewed the task; call `crabdb.agent_mark_reviewed` only when the user explicitly says the current checkpoint has been reviewed.\n\
-7. Call `crabdb.agent_delta` for `{selector}` when the user asks what just changed in the latest prompt or wants the newest turn/operation patch.\n\
-8. Call `crabdb.agent_changes` for `{selector}` when the user asks what changed across the whole task; present its `next` command and high-level change cards before exposing raw turns or operation ids.\n\
-9. Call `crabdb.agent_change` for `{selector}` when the user wants one change card expanded into files, provenance, tools, commands, and optional focused patches.\n\
-10. Call `crabdb.agent_timeline` for `{selector}` when the user asks what happened when, which prompt caused a checkpoint, or how turns and operations connect.\n\
-11. Call `crabdb.agent_files` for `{selector}` when the user wants the full file-by-file review. Call `crabdb.agent_file` when the user points at one open file or asks why one path changed.\n\
-12. Call `crabdb.agent_turn` when the user asks what happened in one prompt; use `file` and `patch` only when patch detail is needed.\n\
-13. Call `crabdb.agent_diff` with `last_turn`, a turn selector, or an operation selector only when raw patch detail is needed; include `file` when reviewing one specific path.\n\
-14. Call `crabdb.agent_ready` or `crabdb.agent_risk` and explain blockers or warnings before suggesting apply.\n\
-15. If tests or evals are missing, call `crabdb.agent_validate` first and present its suggested command; only call `crabdb.agent_test` or `crabdb.agent_eval` after the user explicitly asks to run validation.\n\
-16. Call `crabdb.agent_pr` when the user asks for a pull request title/body; it is read-only and does not create a remote PR.\n\
-17. Call `crabdb.agent_diagnose` before suggesting undo or rewind when the task appears stuck, blocked, or sideways.\n\
-18. Do not call `crabdb.agent_apply`, `crabdb.agent_rewind`, or `crabdb.agent_undo` unless the user explicitly asks for apply or recovery.\n\
-19. End with one concrete next command from the receipt, report, diagnosis, new-changes, delta, timeline, change-set, file, or next-action output."
+1. If the user asks a plain-language question such as show the agent board, show all agents, which task first, apply order, what needs attention, what changed, what should I do next, what did the agent do, what did the agent change, what files did it touch, where is the workdir, where did the agent edit, which prompt changed a file, last prompt, what changed in the last prompt, what changed in README.md in the last prompt, show transcript, walk me through review, review checklist, review map, review files, file checklist, test plan, validation plan, go/no-go, am I good, final check, should I ship, what should I review, what should I review first, what file should I review first, what file should I open, where should I look first, open review, review this task, what tools were used, handoff this to another agent, what should I put in the PR, give me a summary to share, what commit message should I use, what tests should I run, is it tested, how should I test this, can I merge, why can't I apply, what is blocking this task, why did it fail, what went wrong, any red flags, what should I worry about, which files are risky, is it safe to land, recover, explain a file, show the diff, or show a patch/diff, call `crabdb.agent_ask` for `{selector}` and present the routed report.\n\
+2. Call `crabdb.agent_guide` for `{selector}` when the user asks how to use CrabDB from here, wants the shortest setup/review/apply/recovery workflow, or seems lost in command choices.\n\
+3. Start with `crabdb.agent_board` when the user wants all agent tasks, multiple agents, or a low-noise board of what needs attention across tasks. Use `crabdb.agent_stack` when the user asks which task to apply first, asks for apply order, or wants overlap checks across tasks.\n\
+4. Start with `crabdb.agent_dashboard` for `{selector}` when the user wants the compact cockpit for one task: next action, focus file, validation, changed files, risk, and apply readiness.\n\
+5. Call `crabdb.agent_review_data` for `{selector}` when an editor, side panel, or UI needs one structured review packet with file review progress, focus file, changes by file, confidence, validation, risk, and readiness.\n\
+6. Call `crabdb.agent_review_flow` for `{selector}` when the user asks to walk through review, wants a review checklist, or wants the review/validate/finish sequence in one place.\n\
+7. Call `crabdb.agent_summary` for `{selector}` when you need the fuller shareable review cockpit: readiness, risk, validation, receipt Markdown, PR draft, and the one recommended next action.\n\
+8. Call `crabdb.agent_next` for `{selector}` only when you need a smaller next-action payload.\n\
+9. Call `crabdb.agent_handoff` for `{selector}` when the user asks to hand work to another human or agent. Call `crabdb.agent_receipt` for a shorter copyable after-action note; call `crabdb.agent_report` only when a deeper review bundle is needed.\n\
+10. Call `crabdb.agent_focus` for `{selector}` when the user asks what to inspect first; it bundles review priority, why, and a focused diff summary.\n\
+11. Call `crabdb.agent_new` for `{selector}` when the user asks what changed since they last reviewed the task; call `crabdb.agent_mark_file_reviewed` only when the user explicitly says one changed file has been reviewed, and call `crabdb.agent_mark_reviewed` only when the user explicitly says the current checkpoint has been reviewed.\n\
+12. Call `crabdb.agent_finish` when the user asks to apply and clean up a task in one step; call `crabdb.agent_archive` when the user asks only to close, hide, dismiss, or clean up an already-finished task; call `crabdb.agent_unarchive` only when the user asks to restore it. Do not call low-level lane removal for inbox cleanup.\n\
+13. Call `crabdb.agent_delta` for `{selector}` when the user asks what just changed in the latest prompt or wants the newest turn/operation patch.\n\
+14. Call `crabdb.agent_changes` for `{selector}` when the user asks what changed across the whole task; present its `next` command and high-level change cards before exposing raw turns or operation ids. Pass `by-file` when the user wants a file-first review map.\n\
+15. Call `crabdb.agent_change` for `{selector}` when the user wants one change card expanded into files, provenance, tools, commands, and optional focused patches.\n\
+16. Call `crabdb.agent_impact` for `{selector}` when the user asks about impact, blast radius, touched areas, scope, surface area, or what areas need review/testing.\n\
+17. Call `crabdb.agent_review_map` for `{selector}` when the user asks for a review map, file checklist, review by area, review all files, or a low-burden file-by-file checklist.\n\
+18. Call `crabdb.agent_tools` for `{selector}` when the user asks which tools ran, what commands were available, or how tool calls relate to turns/checkpoints/files.\n\
+19. Call `crabdb.agent_timeline` for `{selector}` when the user asks what happened when, which prompt caused a checkpoint, or how turns and operations connect.\n\
+20. Call `crabdb.agent_files` for `{selector}` when the user wants the full file-by-file review. Call `crabdb.agent_file` when the user points at one open file or asks why one path changed.\n\
+21. Call `crabdb.agent_turn` when the user asks what happened in one prompt; use `file` and `patch` only when patch detail is needed.\n\
+22. Call `crabdb.agent_diff` with `last_turn`, a turn selector, or an operation selector only when raw patch detail is needed; include `file` when reviewing one specific path.\n\
+23. Call `crabdb.agent_confidence` when the user asks for go/no-go, final check, or whether they should ship; call `crabdb.agent_ready` or `crabdb.agent_risk` when they specifically ask about apply readiness or risk.\n\
+23. Call `crabdb.agent_test_plan` for `{selector}` when the user asks what tests to run, how to test, or wants a validation plan. Call `crabdb.agent_validate` when the user asks for validation status, whether tests passed, or latest gate results. Only call `crabdb.agent_test` or `crabdb.agent_eval` after the user explicitly asks to run validation.\n\
+24. Call `crabdb.agent_pr` when the user asks for a pull request title/body; it is read-only and does not create a remote PR.\n\
+25. Call `crabdb.agent_diagnose` before suggesting undo or rewind when the task appears stuck, blocked, or sideways.\n\
+26. Do not call `crabdb.agent_apply`, `crabdb.agent_finish`, `crabdb.agent_rewind`, or `crabdb.agent_undo` unless the user explicitly asks for apply, finish, or recovery.\n\
+27. End with one concrete next command from the board, handoff, receipt, report, diagnosis, impact, review-map, test-plan, new-changes, delta, tools, timeline, change-set, file, dashboard, review-flow, guide, or next-action output."
                 ),
                 Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),
             )
@@ -135,10 +144,10 @@ Workflow:\n\
 1. Call `crabdb.agent_summary` and `crabdb.agent_ready` for `{selector}` before applying.\n\
 2. If `crabdb.agent_ready` returns `ready = false`, stop and explain the exact blocker, Git preflight error, or recommended test/eval command.\n\
 3. Use `crabdb.agent_files` and `crabdb.agent_diff` for patch review when the changed files or risk reasons need detail; pass `file` to keep the patch focused on one path.\n\
-4. When the user asks to apply, call `crabdb.agent_apply` in dry-run mode first and summarize the plan, Git branch, changed files, generated commit message, and any safety failure.\n\
-5. Only call non-dry-run `crabdb.agent_apply` after the dry run is clean and the user confirms they want the Git fast-forward/apply action.\n\
-6. If apply fails or reports conflicts, stop. Do not retry with force. Show `crabdb.agent_report`, `crabdb.agent_files`, or conflict/readiness details as the next step.\n\
-7. After successful apply, show the created Git commit/checkpoint and offer `crabdb.agent_pr` for a read-only PR title/body draft or the `markdown` field from `crabdb.agent_receipt` for archival review."
+4. When the user asks to apply, call `crabdb.agent_apply` in dry-run mode first and summarize the plan, Git branch, changed files, generated commit message, and any safety failure. When the user asks to finish, call `crabdb.agent_finish` in dry-run mode first and summarize both the apply plan and whether it would archive the task.\n\
+5. Only call non-dry-run `crabdb.agent_apply` or `crabdb.agent_finish` after the dry run is clean and the user confirms they want the Git fast-forward/apply action. Use finish only when the user also wants the task hidden from the default inbox after success.\n\
+6. If apply or finish fails or reports conflicts, stop. Do not retry with force. Show `crabdb.agent_report`, `crabdb.agent_files`, or conflict/readiness details as the next step.\n\
+7. After successful apply or finish, show the created Git commit/checkpoint and offer `crabdb.agent_pr` for a read-only PR title/body draft or the `markdown` field from `crabdb.agent_receipt` for archival review."
                 ),
                 Some((RESOURCE_CLI_REFERENCE, "text/markdown", CLI_REFERENCE_MD)),
             )

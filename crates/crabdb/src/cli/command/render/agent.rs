@@ -48,6 +48,252 @@ pub(crate) fn render_agent_status(
     Ok(())
 }
 
+pub(crate) fn render_agent_guide(report: &AgentGuideReport, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent guide: {:?}", report.status);
+        println!("{}", report.headline);
+        println!("{}", report.current_state);
+        if let Some(task) = &report.task {
+            println!("Task: {}", agent_task_display_title(task));
+            print_agent_task_id_if_needed(task);
+            print_agent_task_workdir(task);
+        }
+        println!("Do this next:");
+        println!("  {}", report.primary.command);
+        println!("  {}", report.primary.reason);
+        if !report.steps.is_empty() {
+            println!("Workflow:");
+            for (idx, step) in report.steps.iter().enumerate() {
+                println!("  {}. {}", idx + 1, step.label);
+                println!("     {}", step.command);
+                println!("     {}", step.reason);
+                println!("     When: {}", step.when);
+            }
+        }
+        if !report.concepts.is_empty() {
+            println!("Mental model:");
+            for concept in &report.concepts {
+                println!("  {}: {}", concept.name, concept.meaning);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_dashboard(
+    report: &AgentDashboardReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent dashboard: {:?}", report.status);
+        println!("{}", report.summary);
+        if let Some(task) = &report.task {
+            println!("Task: {}", agent_task_display_title(task));
+            print_agent_task_id_if_needed(task);
+            print_agent_task_workdir(task);
+            println!(
+                "Changed files: {}  Turns: {}  Tool events: {}",
+                task.changed_paths.len(),
+                task.turns,
+                task.tool_events
+            );
+            if let Some(checkpoint) = &task.latest_checkpoint {
+                println!("Last checkpoint: {}", checkpoint.0);
+            }
+        }
+        if let Some(ready) = &report.ready {
+            print_agent_risk_line(&ready.risk);
+            println!(
+                "Readiness: {}  Apply: {}  Ready: {}",
+                ready.readiness_status, ready.status, ready.ready
+            );
+        }
+        if let Some(validation) = &report.validation {
+            println!("Validation: {}", validation.status);
+            if validation.needs_test || validation.needs_eval {
+                println!("  {}", validation.next.command);
+                println!("  {}", validation.next.reason);
+            }
+        }
+        if let Some(focus) = &report.focus {
+            println!("Focus:");
+            println!("  {}", focus.path);
+            println!("  {}", focus.summary);
+            if let Some(command) = &focus.open_command {
+                println!("  Open: {command}");
+            } else {
+                println!("  Inspect: crabdb agent focus {}", focus.task.lane);
+            }
+        }
+        if let Some(changes) = &report.changes {
+            if changes.total_changed_paths.is_empty() {
+                println!("Changed files: none");
+            } else {
+                println!("Changed files:");
+                for change in changes.total_changed_paths.iter().take(5) {
+                    println!(
+                        "  {:?} {} (+{} -{})",
+                        change.kind, change.path, change.additions, change.deletions
+                    );
+                }
+                if changes.total_changed_paths.len() > 5 {
+                    println!(
+                        "  ... {} more; run `crabdb agent changes {} --by-file`",
+                        changes.total_changed_paths.len() - 5,
+                        changes.lane
+                    );
+                }
+            }
+        }
+        println!("Next:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        if report.suggestions.len() > 1 {
+            println!("Useful commands:");
+            for suggestion in report.suggestions.iter().skip(1) {
+                println!("  {}", suggestion.command);
+                println!("  {}", suggestion.reason);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_review_data(
+    report: &AgentReviewDataReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent review data: {}",
+            agent_task_display_title(&report.task)
+        );
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("{}", report.summary);
+        println!(
+            "Files: {}/{} reviewed  Needs review: {}",
+            report.reviewed_files, report.total_files, report.needs_review_files
+        );
+        println!(
+            "Verdict: {}  Confidence: {}/100  Validation: {}  Apply: {}",
+            report.confidence_verdict,
+            report.confidence_score,
+            report.validation_status,
+            report.readiness_status
+        );
+        println!("Risk: {:?}", report.risk_level);
+        if let Some(focus) = &report.focus {
+            println!("Focus:");
+            println!("  {}", focus.path);
+            println!("  {}", focus.summary);
+            if let Some(command) = &focus.open_command {
+                println!("  Open: {command}");
+            }
+        }
+        if !report.review_map.areas.is_empty() {
+            println!("Review areas:");
+            for area in &report.review_map.areas {
+                println!(
+                    "  {}: {} file(s), {}",
+                    area.label,
+                    area.files.len(),
+                    area.state
+                );
+            }
+        }
+        println!("Next:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        if !report.actions.is_empty() {
+            println!("Actions:");
+            for action in &report.actions {
+                let state = if action.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let confirmation = if action.requires_confirmation {
+                    ", confirmation"
+                } else {
+                    ""
+                };
+                println!(
+                    "  {} [{}: {}{}]",
+                    action.label, state, action.safety, confirmation
+                );
+                println!("    {}", action.command);
+                println!("    {}", action.reason);
+                if let Some(reason) = &action.disabled_reason {
+                    println!("    Disabled: {reason}");
+                }
+            }
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_review_flow(
+    report: &AgentReviewFlowReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent review flow: {}",
+            agent_task_display_title(&report.task)
+        );
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("{}", report.summary);
+        println!(
+            "Review: {}  New files: {}  New lines: {}",
+            report.review_status, report.new_changed_paths, report.new_changed_lines
+        );
+        println!(
+            "Validation: {}  Apply: {}  Ready: {}",
+            report.validation.status, report.ready.status, report.ready.ready
+        );
+        if let Some(checkpoint) = &report.task.latest_checkpoint {
+            println!("Last checkpoint: {}", checkpoint.0);
+        }
+        if let Some(marker) = &report.reviewed {
+            println!("Reviewed checkpoint: {}", marker.checkpoint.0);
+        } else {
+            println!("Reviewed checkpoint: none");
+        }
+        if let Some(focus) = &report.focus {
+            println!("Focus: {}", focus.path);
+        }
+        println!("Checklist:");
+        for (idx, step) in report.steps.iter().enumerate() {
+            println!("  {}. [{}] {}", idx + 1, step.state, step.label);
+            println!("     {}", step.command);
+            println!("     {}", step.reason);
+        }
+        println!("Next:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_inbox(report: &AgentInboxReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);
@@ -55,14 +301,127 @@ pub(crate) fn render_agent_inbox(report: &AgentInboxReport, json: bool, quiet: b
     if !quiet {
         println!("Agent inbox");
         println!(
-            "Tasks: {}  Need attention: {}",
-            report.total, report.attention_count
+            "Tasks: {}  Need attention: {}  Archived: {}",
+            report.total, report.attention_count, report.archived_count
         );
+        if report.include_archived {
+            println!("Showing: active and archived tasks");
+        }
         if report.groups.is_empty() {
             println!("No agent tasks recorded");
         }
         for group in &report.groups {
             print_agent_inbox_group(group);
+        }
+        println!("Next command:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        if report.suggestions.len() > 1 {
+            println!("Other useful commands:");
+            for suggestion in report.suggestions.iter().skip(1) {
+                println!("  {}", suggestion.command);
+                println!("  {}", suggestion.reason);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_board(report: &AgentBoardReport, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent board");
+        println!(
+            "Tasks: {}  Need attention: {}  Ready: {}  Running: {}  Blocked: {}  Conflicted: {}  Applied: {}  Archived: {}",
+            report.total,
+            report.attention_count,
+            report.ready_count,
+            report.active_count,
+            report.blocked_count,
+            report.conflicted_count,
+            report.applied_count,
+            report.archived_count
+        );
+        if report.include_archived {
+            println!("Showing: active and archived tasks");
+        }
+        if report.columns.is_empty() {
+            println!("No agent tasks recorded");
+        }
+        for column in &report.columns {
+            print_agent_board_column(column);
+        }
+        println!("Next command:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        if report.suggestions.len() > 1 {
+            println!("Other useful commands:");
+            for suggestion in report.suggestions.iter().skip(1) {
+                println!("  {}", suggestion.command);
+                println!("  {}", suggestion.reason);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_stack(report: &AgentStackReport, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent stack");
+        println!("{}", report.summary);
+        println!(
+            "Tasks: {}  Ready: {}  Blocked: {}  Shared paths: {}",
+            report.total, report.ready_count, report.blocked_count, report.overlap_count
+        );
+        if report.include_archived {
+            println!("Showing: active and archived tasks");
+        }
+        if !report.shared_paths.is_empty() {
+            println!("Shared files:");
+            for shared in &report.shared_paths {
+                println!("  {} ({})", shared.path, shared.task_titles.join(", "));
+            }
+        }
+        if !report.apply_order.is_empty() {
+            println!("Apply order:");
+            for (idx, lane) in report.apply_order.iter().enumerate() {
+                if let Some(item) = report.items.iter().find(|item| &item.task.lane == lane) {
+                    println!(
+                        "  {}. {}  risk {:?} ({}/100), {} file(s)",
+                        idx + 1,
+                        agent_task_display_title(&item.task),
+                        item.risk.level,
+                        item.risk.score,
+                        item.task.changed_paths.len()
+                    );
+                }
+            }
+        }
+        if !report.items.is_empty() {
+            println!("Tasks:");
+            for item in &report.items {
+                let shared = if item.shared_paths.is_empty() {
+                    "no shared files".to_string()
+                } else {
+                    format!("shared: {}", item.shared_paths.join(", "))
+                };
+                println!(
+                    "  {}. {}  {}  risk {:?} ({}/100), {}",
+                    item.rank,
+                    agent_task_display_title(&item.task),
+                    item.status,
+                    item.risk.level,
+                    item.risk.score,
+                    shared
+                );
+                println!("     {}", item.next.command);
+                println!("     {}", item.next.reason);
+            }
         }
         println!("Next command:");
         println!("  {}", report.next.command);
@@ -120,9 +479,10 @@ pub(crate) fn render_agent_list(
         }
         for task in &report.tasks {
             println!(
-                "{} {:?} {} changed path(s)",
+                "{} {:?}{} {} changed path(s)",
                 agent_task_display_title(task),
                 task.status,
+                if task.archived { " archived" } else { "" },
                 task.changed_paths.len()
             );
             print_agent_task_id_if_needed(task);
@@ -309,6 +669,61 @@ pub(crate) fn render_agent_validate(
     Ok(())
 }
 
+pub(crate) fn render_agent_test_plan(
+    report: &AgentTestPlanReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent test plan: {}",
+            agent_task_display_title(&report.task)
+        );
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("Status: {}", report.status);
+        println!("{}", report.summary);
+        print_agent_risk_line(&report.risk);
+        println!("Validation: {}", report.validation.status);
+        println!("Next:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        if report.steps.is_empty() {
+            println!("Steps: none");
+        } else {
+            println!("Steps:");
+            for step in &report.steps {
+                let required = if step.required {
+                    "required"
+                } else {
+                    "optional"
+                };
+                println!(
+                    "  {}. {} [{}; {}]",
+                    step.rank, step.label, step.state, required
+                );
+                println!("     {}", step.command);
+                println!("     {}", step.reason);
+                if let Some(area) = &step.area_label {
+                    println!("     Area: {area}");
+                }
+                if !step.paths.is_empty() {
+                    print_changed_paths(&step.paths, "     ");
+                }
+                if let Some(gate) = &step.latest_gate {
+                    println!("     Latest gate:");
+                    print_agent_gate_summary(gate, "       ");
+                }
+            }
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_report(
     report: &AgentReviewBundleReport,
     json: bool,
@@ -372,6 +787,20 @@ pub(crate) fn render_agent_report(
 
 pub(crate) fn render_agent_receipt(
     report: &AgentReceiptReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        print!("{}", report.markdown);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_handoff(
+    report: &AgentHandoffReport,
     json: bool,
     quiet: bool,
 ) -> Result<()> {
@@ -453,6 +882,224 @@ pub(crate) fn render_agent_story(report: &AgentStoryReport, json: bool, quiet: b
     Ok(())
 }
 
+pub(crate) fn render_agent_tools(report: &AgentToolsReport, json: bool, quiet: bool) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent tools: {}", agent_task_display_title(&report.task));
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("{}", report.summary);
+        println!(
+            "Tool events: {}  Tools: {}  Turns with tools: {}",
+            report.total_tool_events, report.unique_tools, report.turns_with_tools
+        );
+        if report.available_commands.is_empty() {
+            println!("Available commands: none captured");
+        } else {
+            println!("Available commands:");
+            for command in report.available_commands.iter().take(20) {
+                println!("  {command}");
+            }
+            if report.available_commands.len() > 20 {
+                println!("  ... {} more", report.available_commands.len() - 20);
+            }
+        }
+        if report.tools.is_empty() {
+            println!("Tool usage: none captured");
+        } else {
+            println!("Tool usage:");
+            for tool in &report.tools {
+                println!();
+                println!(
+                    "  {}. {}{}  {} event(s) across {} turn(s)",
+                    tool.rank,
+                    tool.name,
+                    tool.kind
+                        .as_ref()
+                        .map(|kind| format!(" ({kind})"))
+                        .unwrap_or_default(),
+                    tool.event_count,
+                    tool.turn_count
+                );
+                if !tool.statuses.is_empty() {
+                    let statuses = tool
+                        .statuses
+                        .iter()
+                        .map(|(status, count)| format!("{status}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("     Statuses: {statuses}");
+                }
+                if !tool.event_types.is_empty() {
+                    println!("     Events: {}", tool.event_types.join(", "));
+                }
+                println!(
+                    "     Changed files around this tool: {}",
+                    tool.changed_paths.len()
+                );
+                print_changed_paths(&tool.changed_paths, "       ");
+                println!("     Turns:");
+                for turn in &tool.turns {
+                    let prompt = turn
+                        .prompt_preview
+                        .as_deref()
+                        .map(|value| single_line_preview(value, 120))
+                        .unwrap_or_else(|| "no prompt preview".to_string());
+                    println!("       turn {} {} - {}", turn.index, turn.status, prompt);
+                    if let Some(checkpoint) = &turn.checkpoint {
+                        println!("         checkpoint: {}", checkpoint.0);
+                    }
+                    println!("         inspect: {}", turn.turn_command);
+                    if let Some(command) = &turn.diff_command {
+                        println!("         diff: {command}");
+                    }
+                }
+            }
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_impact(
+    report: &AgentImpactReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent impact: {}", agent_task_display_title(&report.task));
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("{}", report.summary);
+        println!(
+            "Changed files: {}  Changed lines: {}  Highest impact: {}",
+            report.changed_paths.len(),
+            report.changed_lines,
+            report.highest_impact
+        );
+        print_agent_risk_line(&report.risk);
+        println!("Validation: {}", report.validation.status);
+        if report.areas.is_empty() {
+            println!("Impact areas: none");
+        } else {
+            println!("Impact areas:");
+            for area in &report.areas {
+                println!();
+                println!(
+                    "  {} ({})  {} file(s), {} changed line(s)",
+                    area.label,
+                    area.severity,
+                    area.changed_paths.len(),
+                    area.changed_lines
+                );
+                if !area.reasons.is_empty() {
+                    println!("     Why: {}", area.reasons.join(", "));
+                }
+                print_changed_paths(&area.changed_paths, "     ");
+                println!("     Review: {}", area.review_command);
+                if let Some(command) = &area.diff_command {
+                    println!("     Patch: {command}");
+                }
+            }
+        }
+        if !report.recommendations.is_empty() {
+            println!("Recommended checks:");
+            for recommendation in &report.recommendations {
+                println!("  {}", recommendation.command);
+                println!("  {}", recommendation.reason);
+            }
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_review_map(
+    report: &AgentReviewMapReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent review map: {}",
+            agent_task_display_title(&report.task)
+        );
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("{}", report.summary);
+        println!(
+            "Review: {}  Changed files: {}  Changed lines: {}  Highest impact: {}",
+            report.review_status,
+            report.changed_paths.len(),
+            report.changed_lines,
+            report.highest_impact
+        );
+        print_agent_risk_line(&report.risk);
+        println!("Validation: {}", report.validation.status);
+        println!("Next:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        if report.areas.is_empty() {
+            println!("Review areas: none");
+        } else {
+            println!("Review areas:");
+            for area in &report.areas {
+                println!();
+                println!(
+                    "  {} ({}, {})  {} file(s), {} changed line(s)",
+                    area.label,
+                    area.severity,
+                    area.state,
+                    area.files.len(),
+                    area.changed_lines
+                );
+                if !area.reasons.is_empty() {
+                    println!("     Why: {}", area.reasons.join(", "));
+                }
+                println!("     Start: {}", area.review_command);
+                if let Some(command) = &area.patch_command {
+                    println!("     Patch: {command}");
+                }
+                for file in &area.files {
+                    println!(
+                        "     {}. {} [{}] +{} -{} score {}",
+                        file.rank,
+                        file.path,
+                        file.state,
+                        file.change.additions,
+                        file.change.deletions,
+                        file.score
+                    );
+                    if let Some(marker) = &file.reviewed {
+                        println!("        Reviewed at: {}", marker.checkpoint.0);
+                    }
+                    if !file.reasons.is_empty() {
+                        println!("        Reasons: {}", file.reasons.join(", "));
+                    }
+                    println!("        Review: {}", file.review_command);
+                    if let Some(command) = &file.open_command {
+                        println!("        Open: {command}");
+                    }
+                    println!("        Why: {}", file.why_command);
+                    if let Some(command) = &file.diff_command {
+                        println!("        Patch: {command}");
+                    }
+                }
+            }
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_risk(report: &AgentRiskReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);
@@ -485,6 +1132,54 @@ pub(crate) fn render_agent_risk(report: &AgentRiskReport, json: bool, quiet: boo
     Ok(())
 }
 
+pub(crate) fn render_agent_confidence(
+    report: &AgentConfidenceReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent confidence: {}",
+            agent_task_display_title(&report.task)
+        );
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("Verdict: {}  Score: {}/100", report.verdict, report.score);
+        println!("{}", report.summary);
+        println!(
+            "Review: {}  Validation: {}  Apply: {}",
+            report.review_status, report.validation.status, report.ready.status
+        );
+        print_agent_risk_line(&report.risk);
+        if let Some(marker) = &report.reviewed {
+            println!("Reviewed checkpoint: {}", marker.checkpoint.0);
+        }
+        if report.factors.is_empty() {
+            println!("Factors: none");
+        } else {
+            println!("Factors:");
+            for factor in &report.factors {
+                println!(
+                    "  [{}] {} ({})",
+                    factor.state, factor.name, factor.score_delta
+                );
+                println!("      {}", factor.message);
+                if let Some(command) = &factor.command {
+                    println!("      {command}");
+                }
+            }
+        }
+        println!("Next:");
+        println!("  {}", report.next.command);
+        println!("  {}", report.next.reason);
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_ready(report: &AgentReadyReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);
@@ -497,6 +1192,7 @@ pub(crate) fn render_agent_ready(report: &AgentReadyReport, json: bool, quiet: b
         println!("Status: {}", report.status);
         println!("Readiness: {}", report.readiness_status);
         print_agent_risk_line(&report.risk);
+        println!("Default commit message: {}", report.default_apply_message);
         println!("{}", report.summary);
         if !report.blockers.is_empty() {
             println!("Blockers:");
@@ -850,6 +1546,57 @@ pub(crate) fn render_agent_mark_reviewed(
             println!("Previous reviewed: {}", previous.checkpoint.0);
         }
         if let Some(note) = &report.marker.note {
+            println!("Note: {note}");
+        }
+        println!("{}", report.summary);
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_mark_file_reviewed(
+    report: &AgentMarkFileReviewedReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent file reviewed: {}", report.path);
+        println!("Task: {}", agent_task_display_title(&report.task));
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("Checkpoint: {}", report.marker.checkpoint.0);
+        if let Some(note) = &report.marker.note {
+            println!("Note: {note}");
+        }
+        if let Some(previous) = &report.previous {
+            println!("Previous file marker: {}", previous.checkpoint.0);
+        }
+        println!("{}", report.summary);
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_agent_archive(
+    report: &AgentArchiveReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Agent archive: {}", agent_task_display_title(&report.task));
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!(
+            "Archived: {}  Previous: {}",
+            report.archived, report.previous_archived
+        );
+        if let Some(note) = &report.note {
             println!("Note: {note}");
         }
         println!("{}", report.summary);
@@ -1231,6 +1978,13 @@ pub(crate) fn render_agent_focus(report: &AgentFocusReport, json: bool, quiet: b
         println!("Task: {}", agent_task_display_title(&report.task));
         print_agent_task_id_if_needed(&report.task);
         print_agent_task_workdir(&report.task);
+        if let Some(open_path) = &report.open_path {
+            println!("Open path: {open_path}");
+        }
+        if let Some(open_command) = &report.open_command {
+            println!("Open command:");
+            println!("  {open_command}");
+        }
         println!("Source: {}", report.source);
         println!("{}", report.summary);
         if let Some(priority) = &report.priority {
@@ -1307,6 +2061,53 @@ pub(crate) fn render_agent_apply(report: &AgentApplyReport, json: bool, quiet: b
     Ok(())
 }
 
+pub(crate) fn render_agent_finish(
+    report: &AgentFinishReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        if report.dry_run {
+            println!(
+                "Would finish agent task: {}",
+                agent_task_display_title(&report.task)
+            );
+        } else {
+            println!(
+                "Finished agent task: {}",
+                agent_task_display_title(&report.task)
+            );
+        }
+        print_agent_task_id_if_needed(&report.task);
+        print_agent_task_workdir(&report.task);
+        println!("Apply: {}", report.apply.status);
+        if let Some(export) = &report.apply.git_export {
+            println!("Git commit: {}", export.commit);
+        }
+        if report.apply.fast_forwarded {
+            println!("Fast-forwarded current Git branch");
+        }
+        if report.dry_run {
+            println!("Archive after apply: {}", report.would_archive);
+        } else if let Some(archive) = &report.archive {
+            println!("Archived: {}", archive.archived);
+        } else if report.task.archived {
+            println!("Archived: already");
+        } else {
+            println!("Archived: no");
+        }
+        println!("Result: {}", report.status);
+        for warning in &report.apply.warnings {
+            println!("warning: {warning}");
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
 pub(crate) fn render_agent_run(report: &AgentRunReport, json: bool, quiet: bool) -> Result<()> {
     if json {
         return render_json(report);
@@ -1329,11 +2130,48 @@ pub(crate) fn render_agent_run(report: &AgentRunReport, json: bool, quiet: bool)
     Ok(())
 }
 
+pub(crate) fn render_agent_continue(
+    report: &AgentContinueReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Agent follow-up: {}",
+            agent_task_display_title(&report.run.task)
+        );
+        println!(
+            "From: {} ({})",
+            agent_task_display_title(&report.source_task),
+            report.from_change.0
+        );
+        print_agent_task_id_if_needed(&report.run.task);
+        print_agent_task_workdir(&report.run.task);
+        println!("Status: {}", report.run.status);
+        if let Some(code) = report.run.exit_code {
+            println!("Exit code: {code}");
+        }
+        if let Some(recorded) = &report.run.recorded {
+            if let Some(operation) = &recorded.operation {
+                println!("Checkpoint: {}", operation.0);
+            }
+        }
+        print_suggestions(&report.suggestions);
+    }
+    Ok(())
+}
+
 fn print_agent_task_summary(task: &AgentTaskReport) {
     println!("Agent task: {}", agent_task_display_title(task));
     print_agent_task_id_if_needed(task);
     print_agent_task_workdir(task);
     println!("Status: {:?}", task.status);
+    if task.archived {
+        println!("Archived: yes");
+    }
     if let Some(provider) = &task.provider {
         println!("Provider: {provider}");
     }
@@ -1355,8 +2193,9 @@ fn print_agent_inbox_group(group: &AgentInboxGroup) {
             .map(|change| change.0.as_str())
             .unwrap_or("-");
         println!(
-            "  {}  {} file(s)  {} turn(s)  checkpoint {}",
+            "  {}{}  {} file(s)  {} turn(s)  checkpoint {}",
             agent_task_display_title(task),
+            if task.archived { " [archived]" } else { "" },
             task.changed_paths.len(),
             task.turns,
             checkpoint
@@ -1382,6 +2221,41 @@ fn print_agent_inbox_group(group: &AgentInboxGroup) {
     }
     if let Some(next) = &group.next {
         println!("  Group next: {}", next.command);
+        println!("  {}", next.reason);
+    }
+}
+
+fn print_agent_board_column(column: &AgentBoardColumn) {
+    println!();
+    println!("{}: {}", column.label, column.items.len());
+    println!("  {}", column.summary);
+    for item in &column.items {
+        let task = &item.task;
+        let checkpoint = task
+            .latest_checkpoint
+            .as_ref()
+            .map(|change| change.0.as_str())
+            .unwrap_or("-");
+        println!(
+            "  {}{}  [{}]  {} file(s)  {} turn(s)  checkpoint {}",
+            agent_task_display_title(task),
+            if task.archived { " [archived]" } else { "" },
+            item.status_label,
+            item.changed_paths,
+            item.turns,
+            checkpoint
+        );
+        if agent_task_display_title(task) != task.name {
+            println!("    Task id: {}", task.name);
+        }
+        println!("    {}", item.detail);
+        if let Some(target) = &item.review_first {
+            println!("    Review first: {} ({})", target.path, target.reason);
+        }
+        println!("    Next: {}", item.next.command);
+    }
+    if let Some(next) = &column.next {
+        println!("  Column next: {}", next.command);
         println!("  {}", next.reason);
     }
 }

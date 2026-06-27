@@ -98,6 +98,13 @@ pub(crate) struct AgentAskArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct AgentBoardArgs {
+    #[serde(default, alias = "include_archived")]
+    pub(crate) all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AgentChangesArgs {
     #[serde(default)]
     pub(crate) selector: Option<String>,
@@ -105,6 +112,8 @@ pub(crate) struct AgentChangesArgs {
     pub(crate) by_operation: bool,
     #[serde(default, alias = "by-turn")]
     pub(crate) by_turn: bool,
+    #[serde(default, alias = "by-file")]
+    pub(crate) by_file: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +147,38 @@ pub(crate) struct AgentNewArgs {
 pub(crate) struct AgentMarkReviewedArgs {
     #[serde(default)]
     pub(crate) selector: Option<String>,
+    #[serde(default)]
+    pub(crate) note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentMarkFileReviewedArgs {
+    #[serde(default)]
+    pub(crate) selector: Option<String>,
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentArchiveArgs {
+    #[serde(default)]
+    pub(crate) selector: Option<String>,
+    #[serde(default)]
+    pub(crate) note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentFinishArgs {
+    #[serde(default)]
+    pub(crate) selector: Option<String>,
+    #[serde(default)]
+    pub(crate) dry_run: bool,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
     #[serde(default)]
     pub(crate) note: Option<String>,
 }

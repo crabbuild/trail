@@ -140,17 +140,19 @@ current state and next safe action always visible.
 ### Visual System
 
 Use VS Code theme variables as the base so the extension respects light, dark,
-high contrast, and custom themes.
+high contrast, and custom themes. Color should be restrained: neutral editor
+surfaces do most of the work, semantic accents appear mainly as thin borders,
+rail markers, and compact status text.
 
 Semantic accents:
 
 | Token | Hex fallback | Use |
 | --- | --- | --- |
-| `--crabdb-lane` | `#3FA7B3` | Active task, lane identity, current turn rail. |
-| `--crabdb-checkpoint` | `#5B9E5A` | Recorded checkpoint, ready state, successful tool. |
-| `--crabdb-review` | `#C58B32` | Needs review, stale base, waiting state. |
-| `--crabdb-risk` | `#C75664` | Permission risk, blocked gate, destructive action. |
-| `--crabdb-provider` | `#7A78D6` | Provider badge, model identity. |
+| `--crabdb-lane` | `var(--vscode-textLink-foreground, #4F8EA3)` | Active task, lane identity, current turn rail. |
+| `--crabdb-checkpoint` | `var(--vscode-testing-iconPassed, #4D8D55)` | Recorded checkpoint, ready state, successful tool. |
+| `--crabdb-review` | `var(--vscode-editorWarning-foreground, #9A6A23)` | Needs review, stale base, waiting state. |
+| `--crabdb-risk` | `var(--vscode-errorForeground, #B0525C)` | Permission risk, blocked gate, destructive action. |
+| `--crabdb-provider` | `var(--vscode-badge-background, #62628F)` | Provider badge, model identity. |
 | `--crabdb-muted` | `var(--vscode-descriptionForeground)` | Metadata and secondary labels. |
 
 Typography:
@@ -179,7 +181,17 @@ turn and whether the turn produced a durable CrabDB checkpoint.
 ```
 
 This is the one distinctive visual move. Everything else should be restrained:
-thin dividers, compact rows, stable icon buttons, and native theme colors.
+thin dividers, compact rows, bordered labels instead of bright pills, stable
+icon buttons, and native theme colors.
+
+Interaction chrome should follow VS Code workbench conventions:
+
+- Icon-only controls are transparent by default and use toolbar hover tokens.
+- Primary actions use VS Code button tokens; destructive actions are outlined.
+- Status, capability, provider, and attachment labels are bordered labels, not
+  saturated pills.
+- Touch-capable environments should retain at least 44px interactive targets
+  without increasing desktop density.
 
 ## Primary Layout
 
@@ -230,6 +242,8 @@ Header responsibilities:
   checkpoint status.
 - Offer only the next useful commands.
 - Display stale-base, dirty-workdir, and blocked-gate warnings inline.
+- Use user-facing "session" language in the primary UI. ACP IDs remain
+  available in review details, logs, and troubleshooting surfaces.
 
 ### Transcript Timeline
 
@@ -741,6 +755,10 @@ Review actions:
 - show shared changed paths
 - queue one task behind another
 - open conflict set when CrabDB reports one
+- render task-local buttons from `crabdb agent review-data --json`
+  `actions[]`; use each action's stable id, label, safety class, enabled state,
+  disabled reason, exact command, optional path/open path, MCP tool, and MCP
+  arguments instead of parsing free-form suggestions or shell strings.
 
 ## Accessibility
 
@@ -958,7 +976,8 @@ Deliver:
 - Review drawer.
 - Diff renderer and native diff editor integration.
 - Readiness and gate display.
-- Dry-run apply and merge queue actions.
+- `review-data` driven actions for open focus file, mark file reviewed, test
+  plan, dry-run apply, apply, merge queue, and rewind.
 - Rewind actions.
 
 Acceptance:

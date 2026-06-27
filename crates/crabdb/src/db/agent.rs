@@ -4,6 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const AGENT_REVIEWED_EVENT: &str = "agent_reviewed";
+const AGENT_FILE_REVIEWED_EVENT: &str = "agent_file_reviewed";
+const AGENT_TASK_ARCHIVED_EVENT: &str = "agent_task_archived";
+const AGENT_TASK_UNARCHIVED_EVENT: &str = "agent_task_unarchived";
 
 struct AgentReviewProgress {
     status: String,
@@ -15,17 +18,30 @@ struct AgentReviewProgress {
 #[derive(Clone, Debug)]
 enum AgentAskRoute {
     Inbox,
+    Board,
+    Stack,
     Next,
+    Guide,
+    Dashboard,
+    ReviewData,
     Summary,
     Validate,
+    TestPlan,
     Brief,
     Story,
     Risk,
+    Impact,
+    ReviewMap,
+    Confidence,
     Ready,
     Diagnose,
     Receipt,
+    Handoff,
     Pr,
     Changes,
+    ChangesByFile,
+    Tools,
+    TaskDiff { file: Option<String>, patch: bool },
     TurnDiff { file: Option<String>, patch: bool },
     Delta { file: Option<String>, patch: bool },
     New { file: Option<String>, patch: bool },
@@ -36,6 +52,7 @@ enum AgentAskRoute {
     Timeline,
     Turn,
     Why(String),
+    ReviewFlow,
     Review,
     Focus,
     View,
@@ -45,17 +62,30 @@ impl AgentAskRoute {
     fn intent(&self) -> &'static str {
         match self {
             AgentAskRoute::Inbox => "inbox",
+            AgentAskRoute::Board => "board",
+            AgentAskRoute::Stack => "stack",
             AgentAskRoute::Next => "next",
+            AgentAskRoute::Guide => "guide",
+            AgentAskRoute::Dashboard => "dashboard",
+            AgentAskRoute::ReviewData => "review_data",
             AgentAskRoute::Summary => "summary",
             AgentAskRoute::Validate => "validate",
+            AgentAskRoute::TestPlan => "test_plan",
             AgentAskRoute::Brief => "brief",
             AgentAskRoute::Story => "story",
             AgentAskRoute::Risk => "risk",
+            AgentAskRoute::Impact => "impact",
+            AgentAskRoute::ReviewMap => "review_map",
+            AgentAskRoute::Confidence => "confidence",
             AgentAskRoute::Ready => "ready",
             AgentAskRoute::Diagnose => "diagnose",
             AgentAskRoute::Receipt => "receipt",
+            AgentAskRoute::Handoff => "handoff",
             AgentAskRoute::Pr => "pr",
             AgentAskRoute::Changes => "changes",
+            AgentAskRoute::ChangesByFile => "changes",
+            AgentAskRoute::Tools => "tools",
+            AgentAskRoute::TaskDiff { .. } => "diff",
             AgentAskRoute::TurnDiff { .. } => "turn_diff",
             AgentAskRoute::Delta { .. } => "delta",
             AgentAskRoute::New { .. } => "new",
@@ -66,6 +96,7 @@ impl AgentAskRoute {
             AgentAskRoute::Timeline => "timeline",
             AgentAskRoute::Turn => "turn",
             AgentAskRoute::Why(_) => "why",
+            AgentAskRoute::ReviewFlow => "review_flow",
             AgentAskRoute::Review => "review",
             AgentAskRoute::Focus => "focus",
             AgentAskRoute::View => "view",
@@ -75,17 +106,30 @@ impl AgentAskRoute {
     fn tool(&self) -> &'static str {
         match self {
             AgentAskRoute::Inbox => "crabdb.agent_inbox",
+            AgentAskRoute::Board => "crabdb.agent_board",
+            AgentAskRoute::Stack => "crabdb.agent_stack",
             AgentAskRoute::Next => "crabdb.agent_next",
+            AgentAskRoute::Guide => "crabdb.agent_guide",
+            AgentAskRoute::Dashboard => "crabdb.agent_dashboard",
+            AgentAskRoute::ReviewData => "crabdb.agent_review_data",
             AgentAskRoute::Summary => "crabdb.agent_summary",
             AgentAskRoute::Validate => "crabdb.agent_validate",
+            AgentAskRoute::TestPlan => "crabdb.agent_test_plan",
             AgentAskRoute::Brief => "crabdb.agent_brief",
             AgentAskRoute::Story => "crabdb.agent_story",
             AgentAskRoute::Risk => "crabdb.agent_risk",
+            AgentAskRoute::Impact => "crabdb.agent_impact",
+            AgentAskRoute::ReviewMap => "crabdb.agent_review_map",
+            AgentAskRoute::Confidence => "crabdb.agent_confidence",
             AgentAskRoute::Ready => "crabdb.agent_ready",
             AgentAskRoute::Diagnose => "crabdb.agent_diagnose",
             AgentAskRoute::Receipt => "crabdb.agent_receipt",
+            AgentAskRoute::Handoff => "crabdb.agent_handoff",
             AgentAskRoute::Pr => "crabdb.agent_pr",
             AgentAskRoute::Changes => "crabdb.agent_changes",
+            AgentAskRoute::ChangesByFile => "crabdb.agent_changes",
+            AgentAskRoute::Tools => "crabdb.agent_tools",
+            AgentAskRoute::TaskDiff { .. } => "crabdb.agent_diff",
             AgentAskRoute::TurnDiff { .. } => "crabdb.agent_diff",
             AgentAskRoute::Delta { .. } => "crabdb.agent_delta",
             AgentAskRoute::New { .. } => "crabdb.agent_new",
@@ -96,6 +140,7 @@ impl AgentAskRoute {
             AgentAskRoute::Timeline => "crabdb.agent_timeline",
             AgentAskRoute::Turn => "crabdb.agent_turn",
             AgentAskRoute::Why(_) => "crabdb.agent_why",
+            AgentAskRoute::ReviewFlow => "crabdb.agent_review_flow",
             AgentAskRoute::Review => "crabdb.agent_review",
             AgentAskRoute::Focus => "crabdb.agent_focus",
             AgentAskRoute::View => "crabdb.agent_view",
@@ -106,17 +151,39 @@ impl AgentAskRoute {
         let selector = agent_shell_arg(selector);
         match self {
             AgentAskRoute::Inbox => "crabdb agent inbox".to_string(),
+            AgentAskRoute::Board => "crabdb agent board".to_string(),
+            AgentAskRoute::Stack => "crabdb agent stack".to_string(),
             AgentAskRoute::Next => format!("crabdb agent next {selector}"),
+            AgentAskRoute::Guide => format!("crabdb agent guide {selector}"),
+            AgentAskRoute::Dashboard => format!("crabdb agent dashboard {selector}"),
+            AgentAskRoute::ReviewData => format!("crabdb agent review-data {selector}"),
             AgentAskRoute::Summary => format!("crabdb agent summary {selector}"),
             AgentAskRoute::Validate => format!("crabdb agent validate {selector}"),
+            AgentAskRoute::TestPlan => format!("crabdb agent test-plan {selector}"),
             AgentAskRoute::Brief => format!("crabdb agent brief {selector}"),
             AgentAskRoute::Story => format!("crabdb agent story {selector}"),
             AgentAskRoute::Risk => format!("crabdb agent risk {selector}"),
+            AgentAskRoute::Impact => format!("crabdb agent impact {selector}"),
+            AgentAskRoute::ReviewMap => format!("crabdb agent review-map {selector}"),
+            AgentAskRoute::Confidence => format!("crabdb agent confidence {selector}"),
             AgentAskRoute::Ready => format!("crabdb agent can-land {selector}"),
             AgentAskRoute::Diagnose => format!("crabdb agent recover {selector}"),
             AgentAskRoute::Receipt => format!("crabdb agent receipt {selector}"),
+            AgentAskRoute::Handoff => format!("crabdb agent handoff {selector}"),
             AgentAskRoute::Pr => format!("crabdb agent pr {selector}"),
             AgentAskRoute::Changes => format!("crabdb agent changes {selector}"),
+            AgentAskRoute::ChangesByFile => format!("crabdb agent changes {selector} --by-file"),
+            AgentAskRoute::Tools => format!("crabdb agent tools {selector}"),
+            AgentAskRoute::TaskDiff { file, patch } => {
+                let mut command = format!("crabdb agent diff {selector}");
+                if let Some(path) = file {
+                    command.push_str(&format!(" --file {}", agent_shell_arg(path)));
+                }
+                if *patch {
+                    command.push_str(" --patch");
+                }
+                command
+            }
             AgentAskRoute::TurnDiff { file, patch } => {
                 let mut command = format!("crabdb agent turn-diff {selector}");
                 if let Some(path) = file {
@@ -163,6 +230,7 @@ impl AgentAskRoute {
             AgentAskRoute::Why(path) => {
                 format!("crabdb agent explain {selector} {}", agent_shell_arg(path))
             }
+            AgentAskRoute::ReviewFlow => format!("crabdb agent review-flow {selector}"),
             AgentAskRoute::Review => format!("crabdb agent review-plan {selector}"),
             AgentAskRoute::Focus => format!("crabdb agent focus {selector}"),
             AgentAskRoute::View => format!("crabdb agent view {selector}"),
@@ -230,6 +298,13 @@ impl CrabDb {
     }
 
     pub fn list_agent_tasks(&self) -> Result<AgentTaskListReport> {
+        self.list_agent_tasks_with_options(false)
+    }
+
+    pub fn list_agent_tasks_with_options(
+        &self,
+        include_archived: bool,
+    ) -> Result<AgentTaskListReport> {
         let mut lanes = self.list_lanes()?;
         lanes.sort_by(|left, right| {
             right
@@ -243,21 +318,237 @@ impl CrabDb {
             if !self.lane_looks_like_agent_task(&lane)? {
                 continue;
             }
-            tasks.push(self.agent_task_for_lane_details(lane, 10)?);
+            let task = self.agent_task_for_lane_details(lane, 10)?;
+            if !include_archived && task.archived {
+                continue;
+            }
+            tasks.push(task);
         }
-        Ok(AgentTaskListReport { tasks })
+        Ok(AgentTaskListReport {
+            include_archived,
+            tasks,
+        })
     }
 
     pub fn agent_inbox(&self) -> Result<AgentInboxReport> {
-        let tasks = self.list_agent_tasks()?.tasks;
+        self.agent_inbox_with_options(false)
+    }
+
+    pub fn agent_board(&self) -> Result<AgentBoardReport> {
+        self.agent_board_with_options(false)
+    }
+
+    pub fn agent_stack(&self) -> Result<AgentStackReport> {
+        self.agent_stack_with_options(false)
+    }
+
+    pub fn agent_board_with_options(&self, include_archived: bool) -> Result<AgentBoardReport> {
+        let inbox = self.agent_inbox_with_options(include_archived)?;
+        let items = inbox
+            .items
+            .iter()
+            .map(agent_board_item_from_inbox)
+            .collect::<Vec<_>>();
+        let ready_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived && matches!(item.task.status, AgentTaskStatus::Ready)
+            })
+            .count();
+        let active_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived && matches!(item.task.status, AgentTaskStatus::Active)
+            })
+            .count();
+        let blocked_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived && matches!(item.task.status, AgentTaskStatus::Blocked)
+            })
+            .count();
+        let conflicted_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived && matches!(item.task.status, AgentTaskStatus::Conflicted)
+            })
+            .count();
+        let applied_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived && matches!(item.task.status, AgentTaskStatus::Applied)
+            })
+            .count();
+        let mut suggestions = vec![inbox.next.clone()];
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent inbox".to_string(),
+            "open the detailed task queue with review-first metadata",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent guide".to_string(),
+            "show the shortest state-aware workflow for the current task",
+        );
+        if inbox.archived_count > 0 && !include_archived {
+            agent_push_suggestion(
+                &mut suggestions,
+                "crabdb agent board --all".to_string(),
+                "include archived tasks on the board",
+            );
+        }
+        if inbox.total == 0 {
+            agent_push_suggestion(
+                &mut suggestions,
+                "crabdb agent start --provider claude-code".to_string(),
+                "start a terminal agent task without configuring an editor",
+            );
+        }
+
+        Ok(AgentBoardReport {
+            include_archived,
+            total: inbox.total,
+            attention_count: inbox.attention_count,
+            ready_count,
+            active_count,
+            blocked_count,
+            conflicted_count,
+            applied_count,
+            archived_count: inbox.archived_count,
+            columns: agent_board_columns(&items),
+            items,
+            next: inbox.next,
+            suggestions,
+        })
+    }
+
+    pub fn agent_stack_with_options(&self, include_archived: bool) -> Result<AgentStackReport> {
+        let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
+        if tasks.is_empty() {
+            let next = StatusSuggestion {
+                command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
+                reason: "configure an editor once, then start an agent task".to_string(),
+            };
+            return Ok(AgentStackReport {
+                include_archived,
+                total: 0,
+                ready_count: 0,
+                blocked_count: 0,
+                overlap_count: 0,
+                summary: "No agent tasks are recorded yet.".to_string(),
+                shared_paths: Vec::new(),
+                items: Vec::new(),
+                apply_order: Vec::new(),
+                suggestions: vec![
+                    next.clone(),
+                    StatusSuggestion {
+                        command: "crabdb agent start --provider claude-code".to_string(),
+                        reason: "start a terminal agent task without configuring an editor"
+                            .to_string(),
+                    },
+                ],
+                next,
+            });
+        }
+
+        let shared_paths = agent_stack_shared_paths(&tasks);
+        let shared_by_lane = agent_stack_shared_paths_by_lane(&shared_paths);
+        let mut items = Vec::new();
+        for task in &tasks {
+            let view = self.agent_task_view(&task.lane)?;
+            let risk = agent_risk_report_from_view(&view);
+            let task_shared_paths = shared_by_lane.get(&task.lane).cloned().unwrap_or_default();
+            let status = agent_stack_item_status(&view.task, &risk, !task_shared_paths.is_empty());
+            let applyable = agent_stack_item_applyable(&view.task, &risk, &task_shared_paths);
+            let next = agent_stack_item_next(&view.task, &status);
+            items.push(AgentStackItem {
+                rank: 0,
+                task: view.task,
+                risk,
+                status,
+                shared_paths: task_shared_paths,
+                applyable,
+                next,
+            });
+        }
+        items.sort_by_key(agent_stack_item_sort_key);
+        for (idx, item) in items.iter_mut().enumerate() {
+            item.rank = idx + 1;
+        }
+
+        let apply_order = items
+            .iter()
+            .filter(|item| item.applyable)
+            .map(|item| item.task.lane.clone())
+            .collect::<Vec<_>>();
+        let ready_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived
+                    && matches!(
+                        item.task.status,
+                        AgentTaskStatus::Ready | AgentTaskStatus::Dirty
+                    )
+            })
+            .count();
+        let blocked_count = items
+            .iter()
+            .filter(|item| {
+                !item.task.archived
+                    && matches!(
+                        item.task.status,
+                        AgentTaskStatus::Blocked | AgentTaskStatus::Conflicted
+                    )
+            })
+            .count();
+        let overlap_count = shared_paths.len();
+        let next = agent_stack_next(&items, &shared_paths);
+        let mut suggestions = vec![next.clone()];
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent board".to_string(),
+            "return to the grouped task board",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent inbox".to_string(),
+            "open the detailed task inbox with review-first metadata",
+        );
+        if !include_archived {
+            agent_push_suggestion(
+                &mut suggestions,
+                "crabdb agent stack --all".to_string(),
+                "include archived tasks in the apply-order view",
+            );
+        }
+        let summary = agent_stack_summary(tasks.len(), ready_count, blocked_count, overlap_count);
+        Ok(AgentStackReport {
+            include_archived,
+            total: tasks.len(),
+            ready_count,
+            blocked_count,
+            overlap_count,
+            summary,
+            shared_paths,
+            items,
+            apply_order,
+            next,
+            suggestions,
+        })
+    }
+
+    pub fn agent_inbox_with_options(&self, include_archived: bool) -> Result<AgentInboxReport> {
+        let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
                 command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentInboxReport {
+                include_archived,
                 total: 0,
                 attention_count: 0,
+                archived_count: 0,
                 groups: Vec::new(),
                 items: Vec::new(),
                 tasks,
@@ -288,16 +579,26 @@ impl CrabDb {
                 group.next = Some(item.next.clone());
             }
         }
-        let attention_count = groups
+        let attention_count = items
             .iter()
-            .filter(|group| !matches!(group.status, AgentTaskStatus::Applied))
-            .map(|group| group.items.len())
-            .sum();
-        let next = groups
+            .filter(|item| {
+                !item.task.archived && !matches!(item.task.status, AgentTaskStatus::Applied)
+            })
+            .count();
+        let archived_count = items.iter().filter(|item| item.task.archived).count();
+        let next = items
             .iter()
-            .find(|group| !matches!(group.status, AgentTaskStatus::Applied))
-            .and_then(|group| group.next.clone())
-            .or_else(|| groups.iter().find_map(|group| group.next.clone()))
+            .find(|item| {
+                !item.task.archived && !matches!(item.task.status, AgentTaskStatus::Applied)
+            })
+            .map(|item| item.next.clone())
+            .or_else(|| {
+                items
+                    .iter()
+                    .find(|item| !item.task.archived)
+                    .map(|item| item.next.clone())
+            })
+            .or_else(|| items.first().map(|item| item.next.clone()))
             .unwrap_or_else(|| StatusSuggestion {
                 command: "crabdb agent setup --provider claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
@@ -310,6 +611,13 @@ impl CrabDb {
                 "return to the grouped task overview",
             );
         }
+        if archived_count == 0 {
+            agent_push_suggestion(
+                &mut suggestions,
+                "crabdb agent inbox --all".to_string(),
+                "show archived tasks as well as active tasks",
+            );
+        }
         if let Some(latest) = tasks.first() {
             agent_push_suggestion(
                 &mut suggestions,
@@ -318,8 +626,10 @@ impl CrabDb {
             );
         }
         Ok(AgentInboxReport {
+            include_archived,
             total: tasks.len(),
             attention_count,
+            archived_count,
             groups,
             items,
             tasks,
@@ -386,21 +696,212 @@ impl CrabDb {
         self.agent_next_report_for_view(&view)
     }
 
+    pub fn agent_guide(&self, selector: &str) -> Result<AgentGuideReport> {
+        let next = self.agent_next(selector)?;
+        let task = next.task.clone();
+        let headline = agent_guide_headline(task.as_ref(), &next.status);
+        let current_state = agent_guide_current_state(task.as_ref(), &next);
+        let steps = agent_guide_steps(task.as_ref(), &next.primary);
+        let concepts = agent_guide_concepts();
+        let mut suggestions = vec![next.primary.clone()];
+        for step in &steps {
+            agent_push_suggestion(&mut suggestions, step.command.clone(), &step.reason);
+        }
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent ask what should I do next".to_string(),
+            "use plain language when you do not remember a specific command",
+        );
+        Ok(AgentGuideReport {
+            status: next.status,
+            selector: selector.to_string(),
+            task,
+            headline,
+            current_state,
+            primary: next.primary,
+            steps,
+            concepts,
+            suggestions,
+        })
+    }
+
+    pub fn agent_dashboard(&mut self, selector: &str) -> Result<AgentDashboardReport> {
+        let next = self.agent_next(selector)?;
+        let Some(task) = next.task.clone() else {
+            let mut suggestions = vec![next.primary.clone()];
+            suggestions.extend(next.suggestions.clone());
+            return Ok(AgentDashboardReport {
+                status: next.status,
+                task: None,
+                summary: next.summary,
+                next: next.primary,
+                ready: None,
+                validation: None,
+                focus: None,
+                changes: None,
+                suggestions,
+            });
+        };
+        let lane = task.lane.clone();
+        let ready = self.agent_ready(&lane)?;
+        let validation = self.agent_validate(&lane)?;
+        let changes = self.agent_changes_with_options(&lane, false, true)?;
+        let focus = if task.changed_paths.is_empty() {
+            None
+        } else {
+            Some(self.agent_focus(&lane, None, false)?)
+        };
+        let summary = agent_dashboard_summary(&task, &ready, &validation, focus.as_ref());
+        let mut suggestions = vec![next.primary.clone()];
+        if let Some(focus) = &focus {
+            if let Some(command) = &focus.open_command {
+                agent_push_suggestion(
+                    &mut suggestions,
+                    command.clone(),
+                    "open the highest-priority file in your configured editor",
+                );
+            }
+            agent_push_suggestion(
+                &mut suggestions,
+                format!("crabdb agent focus {lane}"),
+                "inspect why this file is the next review target",
+            );
+        }
+        agent_push_suggestion(
+            &mut suggestions,
+            validation.next.command.clone(),
+            &validation.next.reason,
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            ready.next.command.clone(),
+            &ready.next.reason,
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent confidence {lane}"),
+            "show one go/no-go verdict across review, validation, risk, and apply preflight",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent changes {lane} --by-file"),
+            "review every changed file as its own card",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent view {lane}"),
+            "open the full transcript, tools, changed paths, and checkpoint",
+        );
+        Ok(AgentDashboardReport {
+            status: task.status.clone(),
+            task: Some(task),
+            summary,
+            next: next.primary,
+            ready: Some(ready),
+            validation: Some(validation),
+            focus,
+            changes: Some(changes),
+            suggestions,
+        })
+    }
+
+    pub fn agent_review_data(&mut self, selector: &str) -> Result<AgentReviewDataReport> {
+        let review_map = self.agent_review_map(selector)?;
+        let lane = review_map.task.lane.clone();
+        let confidence = self.agent_confidence(&lane)?;
+        let changes_by_file = self.agent_changes_with_options(&lane, false, true)?;
+        let files = self.agent_files(&lane)?;
+        let focus = if review_map.changed_paths.is_empty() {
+            None
+        } else {
+            Some(self.agent_focus(&lane, None, false)?)
+        };
+        let total_files = review_map
+            .areas
+            .iter()
+            .map(|area| area.files.len())
+            .sum::<usize>();
+        let reviewed_files = review_map
+            .areas
+            .iter()
+            .flat_map(|area| area.files.iter())
+            .filter(|file| file.state == "reviewed")
+            .count();
+        let needs_review_files = total_files.saturating_sub(reviewed_files);
+        let next = confidence.next.clone();
+        let summary = agent_review_data_summary(
+            &review_map.task,
+            &confidence,
+            total_files,
+            reviewed_files,
+            needs_review_files,
+        );
+        let actions =
+            agent_review_data_actions(&lane, focus.as_ref(), &confidence, needs_review_files);
+        let suggestions =
+            agent_review_data_suggestions(&lane, &next, focus.as_ref(), needs_review_files);
+        Ok(AgentReviewDataReport {
+            task: review_map.task.clone(),
+            summary,
+            next,
+            review_status: review_map.review_status.clone(),
+            ready_to_apply: confidence.ready.ready,
+            readiness_status: confidence.ready.readiness_status.clone(),
+            confidence_verdict: confidence.verdict.clone(),
+            confidence_score: confidence.score,
+            risk_level: confidence.risk.level.clone(),
+            validation_status: confidence.validation.status.clone(),
+            total_files,
+            reviewed_files,
+            needs_review_files,
+            focus,
+            review_map,
+            changes_by_file,
+            files,
+            confidence,
+            actions,
+            suggestions,
+        })
+    }
+
     pub fn agent_ask(&mut self, selector: &str, question: &str) -> Result<AgentAskReport> {
         let route = agent_ask_route(question)?;
         let report = match &route {
             AgentAskRoute::Inbox => serde_json::to_value(self.agent_inbox()?)?,
+            AgentAskRoute::Board => serde_json::to_value(self.agent_board()?)?,
+            AgentAskRoute::Stack => serde_json::to_value(self.agent_stack()?)?,
             AgentAskRoute::Next => serde_json::to_value(self.agent_next(selector)?)?,
+            AgentAskRoute::Guide => serde_json::to_value(self.agent_guide(selector)?)?,
+            AgentAskRoute::Dashboard => serde_json::to_value(self.agent_dashboard(selector)?)?,
+            AgentAskRoute::ReviewData => serde_json::to_value(self.agent_review_data(selector)?)?,
             AgentAskRoute::Summary => serde_json::to_value(self.agent_summary(selector)?)?,
             AgentAskRoute::Validate => serde_json::to_value(self.agent_validate(selector)?)?,
+            AgentAskRoute::TestPlan => serde_json::to_value(self.agent_test_plan(selector)?)?,
             AgentAskRoute::Brief => serde_json::to_value(self.agent_brief(selector)?)?,
             AgentAskRoute::Story => serde_json::to_value(self.agent_story(selector)?)?,
             AgentAskRoute::Risk => serde_json::to_value(self.agent_risk(selector)?)?,
+            AgentAskRoute::Impact => serde_json::to_value(self.agent_impact(selector)?)?,
+            AgentAskRoute::ReviewMap => serde_json::to_value(self.agent_review_map(selector)?)?,
+            AgentAskRoute::Confidence => serde_json::to_value(self.agent_confidence(selector)?)?,
             AgentAskRoute::Ready => serde_json::to_value(self.agent_ready(selector)?)?,
             AgentAskRoute::Diagnose => serde_json::to_value(self.agent_diagnose(selector)?)?,
             AgentAskRoute::Receipt => serde_json::to_value(self.agent_receipt(selector)?)?,
+            AgentAskRoute::Handoff => serde_json::to_value(self.agent_handoff(selector)?)?,
             AgentAskRoute::Pr => serde_json::to_value(self.agent_pr_draft(selector)?)?,
             AgentAskRoute::Changes => serde_json::to_value(self.agent_changes(selector, false)?)?,
+            AgentAskRoute::ChangesByFile => {
+                serde_json::to_value(self.agent_changes_with_options(selector, false, true)?)?
+            }
+            AgentAskRoute::Tools => serde_json::to_value(self.agent_tools(selector)?)?,
+            AgentAskRoute::TaskDiff { file, patch } => serde_json::to_value(self.agent_diff(
+                selector,
+                None,
+                None,
+                None,
+                false,
+                file.as_deref(),
+                *patch,
+            )?)?,
             AgentAskRoute::TurnDiff { file, patch } => serde_json::to_value(self.agent_diff(
                 selector,
                 None,
@@ -427,6 +928,7 @@ impl CrabDb {
                 serde_json::to_value(self.agent_turn(selector, "last", None, false)?)?
             }
             AgentAskRoute::Why(path) => serde_json::to_value(self.agent_why(selector, path)?)?,
+            AgentAskRoute::ReviewFlow => serde_json::to_value(self.agent_review_flow(selector)?)?,
             AgentAskRoute::Review => serde_json::to_value(self.agent_review(selector)?)?,
             AgentAskRoute::Focus => serde_json::to_value(self.agent_focus(selector, None, false)?)?,
             AgentAskRoute::View => serde_json::to_value(self.agent_task_view(selector)?)?,
@@ -579,9 +1081,164 @@ impl CrabDb {
         })
     }
 
+    pub fn agent_tools(&self, selector: &str) -> Result<AgentToolsReport> {
+        let view = self.agent_task_view(selector)?;
+        let lane = view.task.lane.clone();
+        let mut groups = self.agent_turn_change_groups(&view)?;
+        if groups.is_empty() {
+            groups = self.agent_operation_change_groups(&view)?;
+        }
+        let group_by_turn = groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .turn_id
+                    .as_ref()
+                    .map(|turn_id| (turn_id.clone(), group.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let available_commands = self.agent_available_commands(&view)?;
+        let tools = agent_tool_entries(&lane, &view, &group_by_turn);
+        let total_tool_events = tools.iter().map(|tool| tool.event_count).sum();
+        let turns_with_tools = tools
+            .iter()
+            .flat_map(|tool| tool.turns.iter().map(|turn| turn.turn_id.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let summary = agent_tools_summary(
+            &view.task,
+            total_tool_events,
+            tools.len(),
+            turns_with_tools,
+            available_commands.len(),
+        );
+        let suggestions = agent_tools_suggestions(&lane, &tools);
+        Ok(AgentToolsReport {
+            task: view.task,
+            lane,
+            summary,
+            total_tool_events,
+            unique_tools: tools.len(),
+            turns_with_tools,
+            available_commands,
+            tools,
+            suggestions,
+        })
+    }
+
     pub fn agent_risk(&self, selector: &str) -> Result<AgentRiskReport> {
         let view = self.agent_task_view(selector)?;
         Ok(agent_risk_report_from_view(&view))
+    }
+
+    pub fn agent_impact(&self, selector: &str) -> Result<AgentImpactReport> {
+        let view = self.agent_task_view(selector)?;
+        let lane = view.task.lane.clone();
+        let changed_paths = view.task.changed_paths.clone();
+        let changed_lines = changed_paths
+            .iter()
+            .map(|path| path.additions + path.deletions)
+            .sum();
+        let mut areas = agent_impact_areas(&lane, &changed_paths);
+        let highest_impact = areas
+            .iter()
+            .map(|area| area.severity.as_str())
+            .max_by_key(|severity| agent_impact_severity_rank(severity))
+            .unwrap_or("none")
+            .to_string();
+        areas.sort_by(|left, right| {
+            agent_impact_severity_rank(&right.severity)
+                .cmp(&agent_impact_severity_rank(&left.severity))
+                .then_with(|| right.changed_lines.cmp(&left.changed_lines))
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        let risk = agent_risk_report_from_view(&view);
+        let validation = self.agent_validate(&lane)?;
+        let recommendations =
+            agent_impact_recommendations(&lane, &areas, &risk, &validation, &changed_paths);
+        let suggestions = agent_impact_suggestions(&lane, &recommendations);
+        let summary = agent_impact_summary(
+            &view.task,
+            &areas,
+            changed_lines,
+            &highest_impact,
+            &validation,
+        );
+        Ok(AgentImpactReport {
+            task: view.task,
+            summary,
+            changed_paths,
+            changed_lines,
+            highest_impact,
+            areas,
+            risk,
+            validation,
+            recommendations,
+            suggestions,
+        })
+    }
+
+    pub fn agent_review_map(&self, selector: &str) -> Result<AgentReviewMapReport> {
+        let view = self.agent_task_view(selector)?;
+        let lane = view.task.lane.clone();
+        let changed_paths = view.task.changed_paths.clone();
+        let progress = self.agent_review_progress_for_view(&view)?;
+        let mut groups = self.agent_turn_change_groups(&view)?;
+        if groups.is_empty() {
+            groups = self.agent_operation_change_groups(&view)?;
+        }
+        let priorities = agent_review_priorities(&lane, &changed_paths, &groups);
+        let reviewed_files =
+            self.valid_agent_file_review_markers(&lane, &view.task.latest_checkpoint)?;
+        let mut areas = agent_review_map_areas(
+            &lane,
+            view.task.workdir.as_deref(),
+            &changed_paths,
+            &priorities,
+            &progress.status,
+            &reviewed_files,
+        );
+        let changed_lines = changed_paths
+            .iter()
+            .map(|path| path.additions + path.deletions)
+            .sum();
+        let highest_impact = areas
+            .iter()
+            .map(|area| area.severity.as_str())
+            .max_by_key(|severity| agent_impact_severity_rank(severity))
+            .unwrap_or("none")
+            .to_string();
+        areas.sort_by(|left, right| {
+            agent_impact_severity_rank(&right.severity)
+                .cmp(&agent_impact_severity_rank(&left.severity))
+                .then_with(|| {
+                    let right_score = right.files.first().map(|file| file.score).unwrap_or(0);
+                    let left_score = left.files.first().map(|file| file.score).unwrap_or(0);
+                    right_score.cmp(&left_score)
+                })
+                .then_with(|| right.changed_lines.cmp(&left.changed_lines))
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        let risk = agent_risk_report_from_view(&view);
+        let validation = self.agent_validate(&lane)?;
+        let next = agent_review_map_next(&lane, &areas, &progress, &validation);
+        let suggestions = agent_review_map_suggestions(&lane, &next, &areas, &validation);
+        let summary =
+            agent_review_map_summary(&view.task, &areas, changed_lines, &progress, &validation);
+        Ok(AgentReviewMapReport {
+            task: view.task,
+            summary,
+            review_status: progress.status,
+            reviewed: progress.reviewed,
+            changed_paths,
+            changed_lines,
+            highest_impact,
+            areas,
+            risk,
+            validation,
+            next,
+            suggestions,
+        })
     }
 
     pub fn agent_ready(&mut self, selector: &str) -> Result<AgentReadyReport> {
@@ -617,8 +1274,40 @@ impl CrabDb {
             risk,
             blockers: view.review.readiness.blockers.clone(),
             warnings: view.review.readiness.warnings.clone(),
+            default_apply_message: default_agent_apply_message_for_task(&view.task),
             apply_preview,
             apply_error,
+            next,
+            suggestions,
+        })
+    }
+
+    pub fn agent_confidence(&mut self, selector: &str) -> Result<AgentConfidenceReport> {
+        let view = self.agent_task_view(selector)?;
+        let lane = view.task.lane.clone();
+        let progress = self.agent_review_progress_for_view(&view)?;
+        let validation = self.agent_validate(&lane)?;
+        let ready = self.agent_ready(&lane)?;
+        let risk = ready.risk.clone();
+        let factors = agent_confidence_factors(&lane, &progress, &validation, &ready, &risk);
+        let score = agent_confidence_score(&factors, &risk);
+        let verdict =
+            agent_confidence_verdict(&view.task, &progress, &validation, &ready, &risk, score);
+        let next = agent_confidence_next(&lane, &verdict, &progress, &validation, &ready);
+        let suggestions = agent_confidence_suggestions(&lane, &next, &verdict, &validation, &ready);
+        let summary =
+            agent_confidence_summary(&view.task, &verdict, score, &progress, &validation, &ready);
+        Ok(AgentConfidenceReport {
+            task: view.task,
+            verdict,
+            score,
+            summary,
+            review_status: progress.status,
+            reviewed: progress.reviewed,
+            ready,
+            validation,
+            risk,
+            factors,
             next,
             suggestions,
         })
@@ -687,6 +1376,60 @@ impl CrabDb {
             tool_summaries: report.story.tool_summaries.clone(),
             validation,
             latest_checkpoint: report.task.latest_checkpoint.clone(),
+            next: report.next.clone(),
+            suggestions,
+            markdown,
+        })
+    }
+
+    pub fn agent_handoff(&self, selector: &str) -> Result<AgentHandoffReport> {
+        let report = self.agent_report(selector)?;
+        let validation = agent_receipt_validation(&report.review);
+        let lane = report.task.lane.clone();
+        let markdown = agent_handoff_markdown(&report, &validation);
+        let mut suggestions = vec![report.next.clone()];
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent focus {lane}"),
+            "start the receiving reviewer at the highest-priority file",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent ready {lane}"),
+            "check whether this task can be safely applied",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent receipt {lane}"),
+            "print the shorter after-action receipt",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent report {lane} --markdown"),
+            "print the deeper review report backing this handoff",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent close {lane}"),
+            "archive the task after the receiving human or agent no longer needs it",
+        );
+        Ok(AgentHandoffReport {
+            task: report.task.clone(),
+            summary: agent_handoff_summary(&report),
+            ready_to_apply: report.ready_to_apply,
+            readiness_status: report.readiness_status.clone(),
+            risk: report.risk.clone(),
+            changed_paths: report.task.changed_paths.clone(),
+            turns: report.story.turn_summaries.clone(),
+            tool_summaries: report.story.tool_summaries.clone(),
+            validation,
+            latest_checkpoint: report.task.latest_checkpoint.clone(),
+            transcript_turns: report
+                .transcript
+                .as_ref()
+                .map(|transcript| transcript.turns.len())
+                .unwrap_or(report.task.turns),
+            tool_events: report.task.tool_events,
             next: report.next.clone(),
             suggestions,
             markdown,
@@ -795,6 +1538,28 @@ impl CrabDb {
             latest_eval: review.latest_eval.clone(),
             recent_gates: review.recent_gates.clone(),
             changed_paths: view.task.changed_paths,
+            next,
+            suggestions,
+        })
+    }
+
+    pub fn agent_test_plan(&self, selector: &str) -> Result<AgentTestPlanReport> {
+        let validation = self.agent_validate(selector)?;
+        let impact = self.agent_impact(selector)?;
+        let lane = validation.task.lane.clone();
+        let steps = agent_test_plan_steps(&lane, self.workspace_root(), &validation, &impact);
+        let status = agent_test_plan_status(&steps);
+        let next = agent_test_plan_next(&lane, &steps);
+        let suggestions = agent_test_plan_suggestions(&lane, &next, &validation, &impact);
+        let summary = agent_test_plan_summary(&validation.task, &status, &steps, &impact);
+        Ok(AgentTestPlanReport {
+            task: validation.task.clone(),
+            status,
+            summary,
+            validation,
+            impact_areas: impact.areas,
+            risk: impact.risk,
+            steps,
             next,
             suggestions,
         })
@@ -929,16 +1694,85 @@ impl CrabDb {
                 reason: "show the focused patch for this file".to_string(),
             }
         };
-        let suggestions = agent_focus_suggestions(&lane, &path, &next, &review);
         let summary = agent_focus_summary(&review, &path, &source, priority.as_ref(), &why);
+        let open_path = review
+            .task
+            .workdir
+            .as_ref()
+            .map(|workdir| Path::new(workdir).join(&path).to_string_lossy().to_string());
+        let open_command = open_path
+            .as_ref()
+            .map(|path| format!("${{EDITOR:-vi}} {}", shell_quote(path)));
+        let mut suggestions = agent_focus_suggestions(&lane, &path, &next, &review);
+        if let Some(command) = &open_command {
+            agent_push_suggestion(
+                &mut suggestions,
+                command.clone(),
+                "open the focused file in your configured editor",
+            );
+        }
         Ok(AgentFocusReport {
             task: review.task,
             path,
+            open_path,
+            open_command,
             source,
             summary,
             priority,
             why,
             diff,
+            next,
+            suggestions,
+        })
+    }
+
+    pub fn agent_review_flow(&mut self, selector: &str) -> Result<AgentReviewFlowReport> {
+        let view = self.agent_task_view(selector)?;
+        let lane = view.task.lane.clone();
+        let progress = self.agent_review_progress_for_view(&view)?;
+        let review = self.agent_review(&lane)?;
+        let focus = if review.priorities.is_empty() {
+            None
+        } else {
+            Some(self.agent_focus(&lane, None, false)?)
+        };
+        let new = self.agent_new(&lane, None, false)?;
+        let validation = self.agent_validate(&lane)?;
+        let ready = self.agent_ready(&lane)?;
+        let steps = agent_review_flow_steps(&lane, &new, &validation, &ready, focus.as_ref());
+        let next = steps
+            .iter()
+            .find(|step| step.state == "current")
+            .map(|step| StatusSuggestion {
+                command: step.command.clone(),
+                reason: step.reason.clone(),
+            })
+            .unwrap_or_else(|| ready.next.clone());
+        let suggestions = agent_review_flow_suggestions(
+            &lane,
+            &next,
+            &review,
+            &new,
+            &validation,
+            &ready,
+            focus.as_ref(),
+        );
+        let summary =
+            agent_review_flow_summary(&view.task, &progress, &validation, &ready, focus.as_ref());
+        Ok(AgentReviewFlowReport {
+            task: view.task.clone(),
+            status: view.task.status.clone(),
+            summary,
+            review_status: progress.status,
+            reviewed: progress.reviewed,
+            new_changed_paths: progress.changed_paths,
+            new_changed_lines: progress.changed_lines,
+            review,
+            focus,
+            new,
+            validation,
+            ready,
+            steps,
             next,
             suggestions,
         })
@@ -1223,6 +2057,21 @@ impl CrabDb {
     }
 
     pub fn agent_changes(&self, selector: &str, by_operation: bool) -> Result<AgentChangesReport> {
+        self.agent_changes_with_options(selector, by_operation, false)
+    }
+
+    pub fn agent_changes_with_options(
+        &self,
+        selector: &str,
+        by_operation: bool,
+        by_file: bool,
+    ) -> Result<AgentChangesReport> {
+        if by_operation && by_file {
+            return Err(Error::InvalidInput(
+                "agent changes accepts only one grouping lens: --by-operation or --by-file"
+                    .to_string(),
+            ));
+        }
         let view = self.agent_task_view(selector)?;
         let lane = view.task.lane.clone();
         let branch = self.lane_branch(&lane)?;
@@ -1231,7 +2080,7 @@ impl CrabDb {
         } else {
             self.agent_turn_change_groups(&view)?
         };
-        let grouping = if by_operation {
+        let detail_grouping = if by_operation {
             "operation"
         } else if groups.is_empty() {
             groups = self.agent_operation_change_groups(&view)?;
@@ -1239,7 +2088,12 @@ impl CrabDb {
         } else {
             "turn"
         };
-        let cards = agent_change_cards(&lane, &view.task.changed_paths, &groups);
+        let grouping = if by_file { "file" } else { detail_grouping };
+        let cards = if by_file {
+            agent_file_change_cards(&lane, &view.task.changed_paths, &groups)
+        } else {
+            agent_change_cards(&lane, &view.task.changed_paths, &groups)
+        };
         let summary = agent_changes_summary(&view, grouping, &cards, &groups);
         let next = agent_changes_next(&lane, &cards);
         let suggestions = agent_changes_suggestions(&lane, &cards, &next);
@@ -1494,6 +2348,115 @@ impl CrabDb {
             lane,
             marker,
             previous,
+            summary,
+            suggestions,
+        })
+    }
+
+    pub fn agent_mark_file_reviewed(
+        &mut self,
+        selector: &str,
+        path: &str,
+        note: Option<String>,
+    ) -> Result<AgentMarkFileReviewedReport> {
+        let _lock = self.acquire_write_lock()?;
+        let view = self.agent_task_view(selector)?;
+        let lane = view.task.lane.clone();
+        let branch = self.lane_branch(&lane)?;
+        let change = view
+            .task
+            .changed_paths
+            .iter()
+            .find(|change| agent_file_matches_path(change, path))
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "`{path}` is not recorded as changed in agent task `{}`",
+                    agent_task_label(&view.task)
+                ))
+            })?;
+        let previous = self.latest_agent_file_review_marker(&lane, &change.path)?;
+        let note = note.filter(|value| !value.trim().is_empty());
+        let payload = serde_json::json!({
+            "checkpoint": branch.head_change.0,
+            "path": change.path,
+            "note": note
+        });
+        let event_id = self.insert_lane_event_with_context(
+            &branch.lane_id,
+            view.task.session_id.as_deref(),
+            None,
+            AGENT_FILE_REVIEWED_EVENT,
+            Some(&branch.head_change),
+            None,
+            &payload,
+        )?;
+        let marker = self
+            .agent_file_review_marker_from_event(self.lane_event(&event_id)?)?
+            .ok_or_else(|| {
+                Error::InvalidInput("failed to read stored agent file review marker".to_string())
+            })?;
+        let summary =
+            agent_mark_file_reviewed_summary(&view.task, &marker.path, previous.as_ref(), &marker);
+        let suggestions = agent_mark_file_reviewed_suggestions(&lane, &marker.path);
+        Ok(AgentMarkFileReviewedReport {
+            task: view.task,
+            lane,
+            path: marker.path.clone(),
+            marker,
+            previous,
+            summary,
+            suggestions,
+        })
+    }
+
+    pub fn agent_archive(
+        &mut self,
+        selector: &str,
+        archived: bool,
+        note: Option<String>,
+    ) -> Result<AgentArchiveReport> {
+        let _lock = self.acquire_write_lock()?;
+        let lane = if selector == "latest" {
+            self.latest_agent_lane()?.ok_or_else(|| {
+                Error::InvalidInput("no unarchived agent tasks have been recorded".to_string())
+            })?
+        } else {
+            self.resolve_agent_selector(selector)?.ok_or_else(|| {
+                Error::InvalidInput(format!("agent task `{selector}` was not found"))
+            })?
+        };
+        let previous_archived = self.lane_agent_archived(&lane)?;
+        let branch = self.lane_branch(&lane)?;
+        let note = note.filter(|value| !value.trim().is_empty());
+        let event_type = if archived {
+            AGENT_TASK_ARCHIVED_EVENT
+        } else {
+            AGENT_TASK_UNARCHIVED_EVENT
+        };
+        let payload = serde_json::json!({
+            "archived": archived,
+            "previous_archived": previous_archived,
+            "note": note
+        });
+        let event_id = self.insert_lane_event_with_context(
+            &branch.lane_id,
+            None,
+            None,
+            event_type,
+            Some(&branch.head_change),
+            None,
+            &payload,
+        )?;
+        let task = self.agent_task_for_lane_details(self.lane_details(&lane)?, 10)?;
+        let summary = agent_archive_summary(&task, archived, previous_archived);
+        let suggestions = agent_archive_suggestions(&task, archived);
+        Ok(AgentArchiveReport {
+            task,
+            archived,
+            previous_archived,
+            event_id,
+            note,
             summary,
             suggestions,
         })
@@ -1879,6 +2842,33 @@ impl CrabDb {
         let crab_branch = self.config.workspace.default_branch.clone();
         let target_ref_name = branch_ref(&crab_branch);
         let target_ref = self.get_ref(&target_ref_name)?;
+        let view = self.agent_task_view(&lane)?;
+        if view.task.status == AgentTaskStatus::Applied {
+            return Ok(AgentApplyReport {
+                task: view.task.clone(),
+                status: "already_applied".to_string(),
+                dry_run,
+                git_apply_plan: AgentGitApplyPlan {
+                    crab_branch,
+                    git_branch: None,
+                    base_change: target_ref.change_id,
+                    result_change: None,
+                    range: None,
+                    would_record: false,
+                    would_create_git_commit: false,
+                    would_fast_forward: false,
+                },
+                recorded: None,
+                merge: None,
+                git_export: None,
+                fast_forwarded: false,
+                warnings: vec![
+                    "agent task has already been applied; use `crabdb agent continue` for follow-up work to avoid reusing old lane history"
+                        .to_string(),
+                ],
+                suggestions: agent_already_applied_suggestions(&view.task),
+            });
+        }
         let git_branch = self.current_git_branch()?;
         let git_state = self.current_git_state()?.ok_or_else(|| {
             Error::Git(format!(
@@ -1955,16 +2945,19 @@ impl CrabDb {
         if dry_run {
             let view = self.agent_task_view(&lane)?;
             let (status, suggestions) = if merge.conflicts.is_empty() {
-                (
-                    "ready".to_string(),
-                    vec![StatusSuggestion {
+                let mut suggestions = vec![StatusSuggestion {
                         command: format!("crabdb agent land {lane}"),
                         reason: format!(
                             "create a Git commit using default message `{}` and fast-forward the current branch",
                             default_agent_apply_message_for_task(&view.task)
                         ),
-                    }],
-                )
+                    }];
+                agent_push_suggestion(
+                    &mut suggestions,
+                    format!("crabdb agent finish {lane}"),
+                    "apply the task and hide it from the default inbox after success",
+                );
+                ("ready".to_string(), suggestions)
             } else {
                 (
                     "conflicted".to_string(),
@@ -2019,6 +3012,53 @@ impl CrabDb {
                 command: format!("crabdb agent view {lane}"),
                 reason: "inspect the applied task transcript and checkpoint".to_string(),
             }],
+        })
+    }
+
+    pub fn agent_finish(
+        &mut self,
+        selector: &str,
+        dry_run: bool,
+        message: Option<String>,
+        note: Option<String>,
+    ) -> Result<AgentFinishReport> {
+        let apply = self.agent_apply(selector, dry_run, message)?;
+        let apply_can_finish = matches!(
+            apply.status.as_str(),
+            "ready" | "would_record" | "applied" | "already_applied"
+        );
+        let apply_succeeded = matches!(apply.status.as_str(), "applied" | "already_applied");
+        let would_archive = dry_run && apply_can_finish && !apply.task.archived;
+        let archive = if !dry_run && apply_succeeded && !apply.task.archived {
+            let note = note.or_else(|| Some("finished after apply".to_string()));
+            Some(self.agent_archive(&apply.task.lane, true, note)?)
+        } else {
+            None
+        };
+        let task = archive
+            .as_ref()
+            .map(|report| report.task.clone())
+            .unwrap_or_else(|| apply.task.clone());
+        let status = if dry_run {
+            if apply_can_finish {
+                "ready".to_string()
+            } else {
+                apply.status.clone()
+            }
+        } else if apply_succeeded && (archive.is_some() || task.archived) {
+            "finished".to_string()
+        } else {
+            apply.status.clone()
+        };
+        let suggestions = agent_finish_suggestions(&task, &apply, &status, dry_run);
+        Ok(AgentFinishReport {
+            task,
+            status,
+            dry_run,
+            apply,
+            archive,
+            would_archive,
+            suggestions,
         })
     }
 
@@ -2155,6 +3195,7 @@ impl CrabDb {
             review.lane.record.provider.as_deref(),
             transcript,
         );
+        let archived = self.lane_agent_archived(&lane_name)?;
         Ok(AgentTaskReport {
             task_id: lane_name.clone(),
             name: lane_name.clone(),
@@ -2166,6 +3207,7 @@ impl CrabDb {
             session_id,
             acp_session_id: acp_session.map(|session| session.acp_session_id),
             status,
+            archived,
             changed_paths: review.changed_paths.clone(),
             latest_checkpoint,
             turns,
@@ -2191,13 +3233,11 @@ impl CrabDb {
     }
 
     fn latest_agent_lane(&self) -> Result<Option<String>> {
-        if let Some(acp) = self
-            .list_lane_acp_sessions(None)?
-            .sessions
-            .into_iter()
-            .next()
-        {
-            return self.resolve_lane_handle(&acp.lane_id).map(Some);
+        for acp in self.list_lane_acp_sessions(None)?.sessions {
+            let lane = self.resolve_lane_handle(&acp.lane_id)?;
+            if !self.lane_agent_archived(&lane)? {
+                return Ok(Some(lane));
+            }
         }
         let mut lanes = self.list_lanes()?;
         lanes.sort_by(|left, right| {
@@ -2209,6 +3249,9 @@ impl CrabDb {
         });
         for lane in lanes {
             if self.lane_looks_like_agent_task(&lane)? {
+                if self.lane_agent_archived(&lane.record.name)? {
+                    continue;
+                }
                 return Ok(Some(lane.record.name));
             }
         }
@@ -2316,6 +3359,39 @@ impl CrabDb {
         Ok(operations)
     }
 
+    fn agent_available_commands(&self, view: &AgentTaskViewReport) -> Result<Vec<String>> {
+        let mut events = self.list_lane_events(
+            Some(&view.task.lane),
+            view.task.session_id.as_deref(),
+            None,
+            Some("acp_available_commands_update"),
+            1000,
+        )?;
+        events.reverse();
+        let mut commands = Vec::new();
+        let mut seen = BTreeSet::new();
+        for event in events {
+            let Some(payload) = event.payload.as_ref() else {
+                continue;
+            };
+            let Some(names) = payload
+                .get("command_names")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for name in names {
+                let Some(name) = name.as_str() else {
+                    continue;
+                };
+                if seen.insert(name.to_string()) {
+                    commands.push(name.to_string());
+                }
+            }
+        }
+        Ok(commands)
+    }
+
     fn agent_next_report_for_view(&self, view: &AgentTaskViewReport) -> Result<AgentNextReport> {
         let progress = if view.task.status == AgentTaskStatus::Ready {
             Some(self.agent_review_progress_for_view(view)?)
@@ -2326,6 +3402,12 @@ impl CrabDb {
     }
 
     fn agent_inbox_next_for_task(&self, task: &AgentTaskReport) -> Result<StatusSuggestion> {
+        if task.archived {
+            return Ok(StatusSuggestion {
+                command: format!("crabdb agent unarchive {}", task.lane),
+                reason: "restore this archived task to the default inbox".to_string(),
+            });
+        }
         if task.status == AgentTaskStatus::Ready {
             let view = self.agent_task_view(&task.lane)?;
             return Ok(self.agent_next_report_for_view(&view)?.primary);
@@ -2339,80 +3421,91 @@ impl CrabDb {
         let mut new_changed_paths = 0;
         let mut new_changed_lines = 0;
         let mut review_first = None;
-        let (attention, detail) = match &task.status {
-            AgentTaskStatus::Empty => (
-                "setup".to_string(),
-                "No agent task is available yet.".to_string(),
-            ),
-            AgentTaskStatus::Active => (
-                "active".to_string(),
-                "Agent task is active or has no recorded checkpoint yet.".to_string(),
-            ),
-            AgentTaskStatus::Dirty => (
-                "record_needed".to_string(),
-                "Materialized agent workdir has unrecorded changes.".to_string(),
-            ),
-            AgentTaskStatus::Blocked => (
-                "blocked".to_string(),
-                "Readiness blockers require review before apply.".to_string(),
-            ),
-            AgentTaskStatus::Conflicted => (
-                "conflicted".to_string(),
-                "Task has conflicts and cannot be applied safely yet.".to_string(),
-            ),
-            AgentTaskStatus::Applied => (
-                "applied".to_string(),
-                "Task has already been applied.".to_string(),
-            ),
-            AgentTaskStatus::Ready => {
-                let view = self.agent_task_view(&task.lane)?;
-                let progress = self.agent_review_progress_for_view(&view)?;
-                new_changed_paths = progress.changed_paths;
-                new_changed_lines = progress.changed_lines;
-                let review = self.agent_review(&task.lane)?;
-                if let Some(priority) = review.priorities.first() {
-                    review_first = Some(AgentInboxReviewTarget {
-                        path: priority.change.path.clone(),
-                        reason: priority
-                            .reasons
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "highest-ranked review priority".to_string()),
-                        command: format!(
-                            "crabdb agent focus {} --file {} --patch",
-                            task.lane,
-                            agent_shell_arg(&priority.change.path)
-                        ),
-                    });
-                }
-                let next_report = self.agent_next_report_for_view(&view)?;
-                next = next_report.primary;
-                suggestions = vec![next.clone()];
-                for suggestion in next_report.suggestions {
-                    agent_push_suggestion(&mut suggestions, suggestion.command, &suggestion.reason);
-                }
-                if let Some(target) = &review_first {
-                    agent_push_suggestion(
-                        &mut suggestions,
-                        target.command.clone(),
-                        "start with the highest-priority file and patch",
-                    );
-                }
-                let detail = match progress.status.as_str() {
-                    "up_to_date" if progress.reviewed.is_some() => {
-                        "Current checkpoint has already been marked reviewed.".to_string()
+        let (attention, detail) = if task.archived {
+            (
+                "archived".to_string(),
+                "Hidden from the default agent inbox; use `agent unarchive` to restore it."
+                    .to_string(),
+            )
+        } else {
+            match &task.status {
+                AgentTaskStatus::Empty => (
+                    "setup".to_string(),
+                    "No agent task is available yet.".to_string(),
+                ),
+                AgentTaskStatus::Active => (
+                    "active".to_string(),
+                    "Agent task is active or has no recorded checkpoint yet.".to_string(),
+                ),
+                AgentTaskStatus::Dirty => (
+                    "record_needed".to_string(),
+                    "Materialized agent workdir has unrecorded changes.".to_string(),
+                ),
+                AgentTaskStatus::Blocked => (
+                    "blocked".to_string(),
+                    "Readiness blockers require review before apply.".to_string(),
+                ),
+                AgentTaskStatus::Conflicted => (
+                    "conflicted".to_string(),
+                    "Task has conflicts and cannot be applied safely yet.".to_string(),
+                ),
+                AgentTaskStatus::Applied => (
+                    "applied".to_string(),
+                    "Task has already been applied.".to_string(),
+                ),
+                AgentTaskStatus::Ready => {
+                    let view = self.agent_task_view(&task.lane)?;
+                    let progress = self.agent_review_progress_for_view(&view)?;
+                    new_changed_paths = progress.changed_paths;
+                    new_changed_lines = progress.changed_lines;
+                    let review = self.agent_review(&task.lane)?;
+                    if let Some(priority) = review.priorities.first() {
+                        review_first =
+                            Some(AgentInboxReviewTarget {
+                                path: priority.change.path.clone(),
+                                reason: priority.reasons.first().cloned().unwrap_or_else(|| {
+                                    "highest-ranked review priority".to_string()
+                                }),
+                                command: format!(
+                                    "crabdb agent focus {} --file {} --patch",
+                                    task.lane,
+                                    agent_shell_arg(&priority.change.path)
+                                ),
+                            });
                     }
-                    "new_changes" => format!(
-                        "{} changed file(s), {} changed line(s) since the last review.",
-                        progress.changed_paths, progress.changed_lines
-                    ),
-                    "unreviewed" => format!(
-                        "{} changed file(s), {} changed line(s) have not been reviewed yet.",
-                        progress.changed_paths, progress.changed_lines
-                    ),
-                    _ => "Ready for human review before apply.".to_string(),
-                };
-                (progress.status, detail)
+                    let next_report = self.agent_next_report_for_view(&view)?;
+                    next = next_report.primary;
+                    suggestions = vec![next.clone()];
+                    for suggestion in next_report.suggestions {
+                        agent_push_suggestion(
+                            &mut suggestions,
+                            suggestion.command,
+                            &suggestion.reason,
+                        );
+                    }
+                    if let Some(target) = &review_first {
+                        agent_push_suggestion(
+                            &mut suggestions,
+                            target.command.clone(),
+                            "start with the highest-priority file and patch",
+                        );
+                    }
+                    let detail = match progress.status.as_str() {
+                        "up_to_date" if progress.reviewed.is_some() => {
+                            "Current checkpoint has already been marked reviewed.".to_string()
+                        }
+                        "new_changes" => format!(
+                            "{} changed file(s), {} changed line(s) since the last review.",
+                            progress.changed_paths, progress.changed_lines
+                        ),
+                        "unreviewed" => format!(
+                            "{} changed file(s), {} changed line(s) have not been reviewed yet.",
+                            progress.changed_paths, progress.changed_lines
+                        ),
+                        _ => "Ready for human review before apply.".to_string(),
+                    };
+                    (progress.status, detail)
+                }
             }
         };
         Ok(AgentInboxItem {
@@ -2473,6 +3566,106 @@ impl CrabDb {
             .map(Option::flatten)
     }
 
+    fn latest_agent_file_review_marker(
+        &self,
+        lane: &str,
+        path: &str,
+    ) -> Result<Option<AgentFileReviewMarker>> {
+        let markers = self.latest_agent_file_review_markers(lane)?;
+        Ok(markers
+            .into_iter()
+            .find(|(_, marker)| marker.path == path)
+            .map(|(_, marker)| marker))
+    }
+
+    fn latest_agent_file_review_markers(
+        &self,
+        lane: &str,
+    ) -> Result<BTreeMap<String, AgentFileReviewMarker>> {
+        let branch = self.lane_branch(lane)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, lane_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
+             FROM lane_events \
+             WHERE lane_id = ?1 AND event_type = ?2 \
+             ORDER BY created_at DESC, rowid DESC",
+        )?;
+        let events = stmt
+            .query_map(
+                params![branch.lane_id, AGENT_FILE_REVIEWED_EVENT],
+                lane_event_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut markers = BTreeMap::new();
+        for event in events {
+            if let Some(marker) = self.agent_file_review_marker_from_event(event)? {
+                markers.entry(marker.path.clone()).or_insert(marker);
+            }
+        }
+        Ok(markers)
+    }
+
+    fn valid_agent_file_review_markers(
+        &self,
+        lane: &str,
+        head_change: &Option<ChangeId>,
+    ) -> Result<BTreeMap<String, AgentFileReviewMarker>> {
+        let Some(head_change) = head_change else {
+            return Ok(BTreeMap::new());
+        };
+        let markers = self.latest_agent_file_review_markers(lane)?;
+        let mut changed_since_by_checkpoint: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut valid = BTreeMap::new();
+        for (path, marker) in markers {
+            if marker.checkpoint == *head_change {
+                valid.insert(path, marker);
+                continue;
+            }
+            let changed_since = if let Some(paths) =
+                changed_since_by_checkpoint.get(marker.checkpoint.0.as_str())
+            {
+                paths.clone()
+            } else {
+                let diff =
+                    self.diff_refs_with_options(&marker.checkpoint.0, &head_change.0, false, true)?;
+                let paths = diff
+                    .files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<BTreeSet<_>>();
+                changed_since_by_checkpoint.insert(marker.checkpoint.0.clone(), paths.clone());
+                paths
+            };
+            if !changed_since.iter().any(|changed| changed == &marker.path) {
+                valid.insert(path, marker);
+            }
+        }
+        Ok(valid)
+    }
+
+    fn lane_agent_archived(&self, lane: &str) -> Result<bool> {
+        let branch = self.lane_branch(lane)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, lane_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
+             FROM lane_events \
+             WHERE lane_id = ?1 AND event_type IN (?2, ?3) \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let event = stmt
+            .query_row(
+                params![
+                    branch.lane_id,
+                    AGENT_TASK_ARCHIVED_EVENT,
+                    AGENT_TASK_UNARCHIVED_EVENT
+                ],
+                lane_event_row,
+            )
+            .optional()?;
+        Ok(matches!(
+            event.as_ref().map(|event| event.event_type.as_str()),
+            Some(AGENT_TASK_ARCHIVED_EVENT)
+        ))
+    }
+
     fn agent_review_marker_from_event(
         &self,
         event: LaneEventRecord,
@@ -2509,6 +3702,53 @@ impl CrabDb {
             checkpoint,
             reviewed_at: event.created_at,
             changed_paths,
+            note,
+        }))
+    }
+
+    fn agent_file_review_marker_from_event(
+        &self,
+        event: LaneEventRecord,
+    ) -> Result<Option<AgentFileReviewMarker>> {
+        if event.event_type != AGENT_FILE_REVIEWED_EVENT {
+            return Ok(None);
+        }
+        let payload = event.payload.as_ref();
+        let path = payload
+            .and_then(|payload| payload.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "agent file reviewed marker `{}` is missing path",
+                    event.event_id
+                ))
+            })?
+            .to_string();
+        let checkpoint = event
+            .change_id
+            .clone()
+            .or_else(|| {
+                payload
+                    .and_then(|payload| payload.get("checkpoint"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| ChangeId(value.to_string()))
+            })
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "agent file reviewed marker `{}` is missing checkpoint",
+                    event.event_id
+                ))
+            })?;
+        let note = payload
+            .and_then(|payload| payload.get("note"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        Ok(Some(AgentFileReviewMarker {
+            event_id: event.event_id,
+            path,
+            checkpoint,
+            reviewed_at: event.created_at,
             note,
         }))
     }
@@ -3206,7 +4446,161 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
             || lowered.contains("changes from")
             || lowered.contains("code changed")
             || agent_ask_has_any(&lowered_tokens, &["changed", "changes", "delta"]));
+    let mentions_apply_flow = lowered.contains("pull request")
+        || lowered.contains("apply")
+        || lowered.contains("merge")
+        || lowered.contains("ready")
+        || agent_ask_has_any(&lowered_tokens, &["land", "ship", "pr"]);
+    if lowered.contains("review data")
+        || lowered.contains("review json")
+        || lowered.contains("review packet json")
+        || lowered.contains("editor panel")
+        || lowered.contains("side panel")
+        || lowered.contains("panel data")
+        || lowered.contains("ui data")
+        || lowered.contains("one json")
+        || lowered.contains("single json")
+        || lowered.contains("single packet")
+    {
+        return Ok(AgentAskRoute::ReviewData);
+    }
+    let asks_blocker = lowered.contains("what blocks")
+        || lowered.contains("what is blocking")
+        || lowered.contains("what's blocking")
+        || lowered.contains("what is blocked")
+        || lowered.contains("why blocked")
+        || lowered.contains("why is this blocked")
+        || lowered.contains("why is it blocked")
+        || lowered.contains("blocking this")
+        || lowered.contains("blocking the")
+        || agent_ask_has_any(&lowered_tokens, &["blockers", "blocking"]);
+    let asks_problem = lowered.contains("what went wrong")
+        || lowered.contains("what's wrong")
+        || lowered.contains("what is wrong")
+        || lowered.contains("anything wrong")
+        || lowered.contains("any problems")
+        || lowered.contains("any issues")
+        || lowered.contains("did it fail")
+        || lowered.contains("did this fail")
+        || lowered.contains("why did it fail")
+        || lowered.contains("why did this fail")
+        || lowered.contains("why failed")
+        || lowered.contains("why is it failing")
+        || lowered.contains("why is this failing")
+        || agent_ask_has_any(
+            &lowered_tokens,
+            &["failed", "failing", "failure", "problem", "problems"],
+        );
+    let asks_file_risk = (lowered.contains("risk")
+        || lowered.contains("risky")
+        || lowered.contains("red flag")
+        || lowered.contains("worry")
+        || lowered.contains("danger"))
+        && (lowered.contains("file")
+            || lowered.contains("files")
+            || lowered.contains("path")
+            || lowered.contains("paths"));
+    let asks_file_to_open = lowered.contains("what file should i open")
+        || lowered.contains("which file should i open")
+        || lowered.contains("what file do i open")
+        || lowered.contains("which file do i open")
+        || lowered.contains("file should i open")
+        || lowered.contains("open first file")
+        || lowered.contains("open the first file")
+        || lowered.contains("open next file")
+        || lowered.contains("open the next file")
+        || lowered.contains("open in editor")
+        || lowered.contains("open in my editor");
+    let asks_impact = lowered.contains("impact")
+        || lowered.contains("blast radius")
+        || lowered.contains("surface area")
+        || lowered.contains("scope of change")
+        || lowered.contains("change scope")
+        || lowered.contains("what areas")
+        || lowered.contains("which areas")
+        || lowered.contains("areas did")
+        || lowered.contains("areas changed")
+        || lowered.contains("what parts")
+        || lowered.contains("which parts")
+        || lowered.contains("what surfaces")
+        || lowered.contains("which surfaces")
+        || lowered.contains("what should i test because")
+        || lowered.contains("what should we test because");
+    let asks_review_map = lowered.contains("review map")
+        || lowered.contains("review-map")
+        || lowered.contains("file checklist")
+        || lowered.contains("files checklist")
+        || lowered.contains("review files")
+        || lowered.contains("review all files")
+        || lowered.contains("review by file")
+        || lowered.contains("review by area")
+        || lowered.contains("map of changes")
+        || lowered.contains("map the changes")
+        || lowered.contains("change map")
+        || lowered.contains("changes map")
+        || lowered.contains("review every file");
+    let asks_confidence = lowered.contains("confidence")
+        || lowered.contains("go/no-go")
+        || lowered.contains("go no go")
+        || lowered.contains("go-no-go")
+        || lowered.contains("final check")
+        || lowered.contains("ship check")
+        || lowered.contains("apply check")
+        || lowered.contains("green light")
+        || lowered.contains("am i good")
+        || lowered.contains("are we good")
+        || lowered.contains("good to go")
+        || lowered.contains("should i ship")
+        || lowered.contains("should we ship")
+        || lowered.contains("should i land")
+        || lowered.contains("should we land")
+        || lowered.contains("should i apply")
+        || lowered.contains("should we apply");
+    let asks_test_plan = lowered.contains("test plan")
+        || lowered.contains("validation plan")
+        || lowered.contains("what tests")
+        || lowered.contains("which tests")
+        || lowered.contains("what should i test")
+        || lowered.contains("what should we test")
+        || lowered.contains("how do i test")
+        || lowered.contains("how should i test")
+        || lowered.contains("how should we test")
+        || lowered.contains("how to test")
+        || lowered.contains("test this")
+        || lowered.contains("test it")
+        || lowered.contains("run tests")
+        || lowered.contains("run the tests")
+        || lowered.contains("what validation should i run")
+        || lowered.contains("which validation should i run");
 
+    if path.is_none() && asks_confidence {
+        return Ok(AgentAskRoute::Confidence);
+    }
+    if path.is_none() && asks_impact {
+        return Ok(AgentAskRoute::Impact);
+    }
+    if path.is_none() && asks_review_map {
+        return Ok(AgentAskRoute::ReviewMap);
+    }
+    if path.is_none() && asks_test_plan {
+        return Ok(AgentAskRoute::TestPlan);
+    }
+    if path.is_none()
+        && mentions_apply_flow
+        && (agent_ask_has_any(&lowered_tokens, &["why", "reason"])
+            || lowered.contains("why can't")
+            || lowered.contains("why cant")
+            || lowered.contains("why cannot")
+            || asks_blocker)
+    {
+        return Ok(AgentAskRoute::Ready);
+    }
+    if path.is_none() && asks_blocker {
+        return Ok(AgentAskRoute::Diagnose);
+    }
+    if path.is_none() && asks_problem {
+        return Ok(AgentAskRoute::Diagnose);
+    }
     if agent_ask_has_any(&lowered_tokens, &["why", "explain", "reason"]) {
         return path.map(AgentAskRoute::Why).ok_or_else(|| {
             Error::InvalidInput(
@@ -3260,6 +4654,9 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
             });
         }
     }
+    if asks_file_risk {
+        return Ok(AgentAskRoute::ChangesByFile);
+    }
     if lowered.contains("changed files")
         || lowered.contains("which files")
         || lowered.contains("what files")
@@ -3270,6 +4667,18 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
         || lowered.contains("where did the agent edit")
         || lowered.contains("what did it edit")
         || lowered.contains("what did the agent edit")
+        || lowered.contains("what did it change")
+        || lowered.contains("what did the agent change")
+        || lowered.contains("what did it touch")
+        || lowered.contains("what did the agent touch")
+        || lowered.contains("what files did it change")
+        || lowered.contains("what files did the agent change")
+        || lowered.contains("which files did it change")
+        || lowered.contains("which files did the agent change")
+        || lowered.contains("what files did it touch")
+        || lowered.contains("what files did the agent touch")
+        || lowered.contains("which files did it touch")
+        || lowered.contains("which files did the agent touch")
         || agent_ask_has_any(&lowered_tokens, &["files"])
     {
         return Ok(AgentAskRoute::Files);
@@ -3285,6 +4694,29 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
                 patch: wants_patch,
             });
         }
+    }
+    if lowered.contains("apply order")
+        || lowered.contains("apply first")
+        || lowered.contains("which agent first")
+        || lowered.contains("which task first")
+        || lowered.contains("what should i apply first")
+        || lowered.contains("what should i land first")
+        || lowered.contains("what should i finish first")
+        || lowered.contains("show stack")
+        || lowered.contains("agent stack")
+        || lowered.contains("task stack")
+        || matches!(lowered.trim(), "stack" | "order" | "apply order")
+    {
+        return Ok(AgentAskRoute::Stack);
+    }
+    if lowered.contains("agent board")
+        || lowered.contains("task board")
+        || lowered.contains("multi agent")
+        || lowered.contains("multi-agent")
+        || lowered.contains("show board")
+        || matches!(lowered.trim(), "board" | "tasks")
+    {
+        return Ok(AgentAskRoute::Board);
     }
     if lowered.contains("what needs attention")
         || lowered.contains("needs my attention")
@@ -3332,9 +4764,35 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
     if lowered.contains("turn") || lowered.contains("prompt") {
         return Ok(AgentAskRoute::Turn);
     }
+    if lowered.contains("walk me through")
+        || lowered.contains("walk through")
+        || lowered.contains("walkthrough")
+        || lowered.contains("step by step")
+        || lowered.contains("step-by-step")
+        || lowered.contains("review flow")
+        || lowered.contains("review loop")
+        || lowered.contains("review checklist")
+        || lowered.contains("finish checklist")
+        || lowered.contains("ship checklist")
+        || lowered.contains("guide me through review")
+        || lowered.contains("guide me through the review")
+        || lowered.contains("how do i review")
+        || lowered.contains("how should i review")
+        || lowered.contains("review steps")
+        || lowered.contains("review workflow")
+    {
+        return Ok(AgentAskRoute::ReviewFlow);
+    }
     if lowered.contains("review first")
         || lowered.contains("inspect first")
+        || asks_file_to_open
+        || lowered.contains("what file should i review first")
+        || lowered.contains("which file should i review first")
+        || lowered.contains("first file to review")
+        || lowered.contains("first file should i review")
         || lowered.contains("look at first")
+        || lowered.contains("look first")
+        || lowered.contains("where should i look first")
         || lowered.contains("where should i start")
     {
         return Ok(AgentAskRoute::Focus);
@@ -3355,10 +4813,99 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
     {
         return Ok(AgentAskRoute::Review);
     }
+    if lowered.contains("commit message")
+        || lowered.contains("git message")
+        || lowered.contains("message for commit")
+        || lowered.contains("message should i use")
+        || lowered.contains("what message should i use")
+        || lowered.contains("commit title")
+    {
+        return Ok(AgentAskRoute::Ready);
+    }
+    if lowered.contains("pr title")
+        || lowered.contains("pr body")
+        || lowered.contains("pr description")
+        || lowered.contains("pull request title")
+        || lowered.contains("pull request body")
+        || lowered.contains("pull request description")
+        || lowered.contains("draft pr")
+        || lowered.contains("draft a pr")
+        || lowered.contains("draft the pr")
+        || lowered.contains("draft pull request")
+        || lowered.contains("draft a pull request")
+        || lowered.contains("draft the pull request")
+        || lowered.contains("put in the pr")
+        || lowered.contains("put in pr")
+        || lowered.contains("put in the pull request")
+        || lowered.contains("put in pull request")
+        || lowered.contains("write the pr")
+        || lowered.contains("write a pr")
+        || lowered.contains("write the pull request")
+        || lowered.contains("write a pull request")
+    {
+        return Ok(AgentAskRoute::Pr);
+    }
+    if lowered.contains("handoff")
+        || lowered.contains("hand off")
+        || lowered.contains("share with another agent")
+        || lowered.contains("share with an agent")
+        || lowered.contains("give to another agent")
+        || lowered.contains("give this to another agent")
+        || lowered.contains("send to another agent")
+        || lowered.contains("handoff packet")
+    {
+        return Ok(AgentAskRoute::Handoff);
+    }
+    if lowered.contains("receipt")
+        || lowered.contains("copyable")
+        || lowered.contains("share summary")
+        || lowered.contains("summary to share")
+        || lowered.contains("what should i share")
+        || lowered.contains("note to share")
+        || lowered.contains("review note")
+        || lowered.contains("after action")
+        || lowered.contains("after-action")
+        || lowered.contains("post run")
+        || lowered.contains("post-run")
+    {
+        return Ok(AgentAskRoute::Receipt);
+    }
+    if lowered.contains("red flag")
+        || lowered.contains("what should i worry")
+        || lowered.contains("what should we worry")
+        || lowered.contains("worry about")
+        || lowered.contains("worried about")
+        || lowered.contains("anything risky")
+        || lowered.contains("what is risky")
+        || lowered.contains("what's risky")
+        || lowered.contains("risky")
+        || lowered.contains("dangerous")
+        || lowered.contains("danger")
+        || lowered.contains("unsafe")
+        || lowered.contains("blast radius")
+        || lowered.contains("high risk")
+        || lowered.contains("risk review")
+    {
+        return Ok(AgentAskRoute::Risk);
+    }
+    if lowered.contains("help me")
+        || lowered.contains("show guide")
+        || lowered.contains("agent guide")
+        || lowered.contains("getting started")
+        || lowered.contains("how do i use crabdb")
+        || lowered.contains("how should i use crabdb")
+        || lowered.contains("how to use crabdb")
+        || lowered.contains("how do i use this")
+        || lowered.contains("how should i use this")
+        || lowered.contains("what commands should i use")
+        || matches!(lowered.trim(), "help" | "guide")
+    {
+        return Ok(AgentAskRoute::Guide);
+    }
     if lowered.contains("what should")
         || lowered.contains("what now")
         || lowered.contains("next")
-        || agent_ask_has_any(&lowered_tokens, &["todo", "help"])
+        || agent_ask_has_any(&lowered_tokens, &["todo"])
     {
         return Ok(AgentAskRoute::Next);
     }
@@ -3415,10 +4962,18 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
         || lowered.contains("change cards")
         || agent_ask_has_any(&lowered_tokens, &["changes"])
     {
+        if lowered.contains("by file")
+            || lowered.contains("by changed file")
+            || lowered.contains("per file")
+            || lowered.contains("file by file")
+            || lowered.contains("file-by-file")
+        {
+            return Ok(AgentAskRoute::ChangesByFile);
+        }
         return Ok(AgentAskRoute::Changes);
     }
     if wants_patch {
-        return Ok(AgentAskRoute::Delta {
+        return Ok(AgentAskRoute::TaskDiff {
             file: path,
             patch: true,
         });
@@ -3437,19 +4992,54 @@ fn agent_ask_route(question: &str) -> Result<AgentAskRoute> {
     {
         return Ok(AgentAskRoute::Story);
     }
-    if agent_ask_has_any(&lowered_tokens, &["tools", "tool", "commands", "command"]) {
-        return Ok(AgentAskRoute::View);
+    if lowered.contains("tool call")
+        || lowered.contains("tool use")
+        || lowered.contains("tools used")
+        || lowered.contains("used tools")
+        || lowered.contains("available command")
+        || lowered.contains("available commands")
+        || agent_ask_has_any(&lowered_tokens, &["tools", "tool"])
+    {
+        return Ok(AgentAskRoute::Tools);
+    }
+    if agent_ask_has_any(&lowered_tokens, &["commands", "command"]) {
+        return Ok(AgentAskRoute::Tools);
     }
     if lowered.contains("test status")
         || lowered.contains("validation")
-        || lowered.contains("what tests")
-        || lowered.contains("which tests")
+        || lowered.contains("tests passing")
+        || lowered.contains("tests pass")
+        || lowered.contains("test pass")
+        || lowered.contains("did tests pass")
+        || lowered.contains("did the tests pass")
+        || lowered.contains("did it pass tests")
+        || lowered.contains("is it tested")
+        || lowered.contains("is this tested")
+        || lowered.contains("has it been tested")
+        || lowered.contains("was it tested")
+        || lowered.contains("test results")
+        || lowered.contains("validation status")
+        || lowered.contains("validation guidance")
+        || lowered.contains("missing validation")
+        || lowered.contains("validation missing")
+        || lowered.contains("what validation")
+        || lowered.contains("which validation")
+        || lowered.contains("need validation")
+        || lowered.contains("needs validation")
         || lowered.contains("do i need tests")
         || lowered.contains("need tests")
     {
         return Ok(AgentAskRoute::Validate);
     }
-    if lowered.contains("summary") || lowered.contains("overview") || lowered.contains("cockpit") {
+    if lowered.contains("dashboard")
+        || lowered.contains("overview")
+        || lowered.contains("cockpit")
+        || lowered.contains("status board")
+        || lowered.contains("one screen")
+    {
+        return Ok(AgentAskRoute::Dashboard);
+    }
+    if lowered.contains("summary") {
         return Ok(AgentAskRoute::Summary);
     }
     if lowered.contains("brief") {
@@ -3607,6 +5197,143 @@ fn agent_inbox_groups(items: &[AgentInboxItem]) -> Vec<AgentInboxGroup> {
     .collect()
 }
 
+fn agent_board_item_from_inbox(item: &AgentInboxItem) -> AgentBoardItem {
+    AgentBoardItem {
+        task: item.task.clone(),
+        status_label: agent_task_status_label(&item.task.status).to_string(),
+        attention: item.attention.clone(),
+        detail: item.detail.clone(),
+        changed_paths: item.task.changed_paths.len(),
+        turns: item.task.turns,
+        tool_events: item.task.tool_events,
+        review_first: item.review_first.clone(),
+        next: item.next.clone(),
+        suggestions: item.suggestions.clone(),
+    }
+}
+
+fn agent_board_columns(items: &[AgentBoardItem]) -> Vec<AgentBoardColumn> {
+    agent_board_column_specs()
+        .into_iter()
+        .filter_map(|spec| {
+            let column_items = items
+                .iter()
+                .filter(|item| agent_board_item_matches_column(item, spec.key))
+                .cloned()
+                .collect::<Vec<_>>();
+            if column_items.is_empty() {
+                return None;
+            }
+            let next = column_items.first().map(|item| item.next.clone());
+            Some(AgentBoardColumn {
+                key: spec.key.to_string(),
+                label: spec.label.to_string(),
+                summary: spec.summary.to_string(),
+                attention: spec.attention,
+                items: column_items,
+                next,
+            })
+        })
+        .collect()
+}
+
+struct AgentBoardColumnSpec {
+    key: &'static str,
+    label: &'static str,
+    summary: &'static str,
+    attention: bool,
+}
+
+fn agent_board_column_specs() -> Vec<AgentBoardColumnSpec> {
+    vec![
+        AgentBoardColumnSpec {
+            key: "needs_record",
+            label: "Needs record",
+            summary: "Materialized workdirs have unrecorded changes.",
+            attention: true,
+        },
+        AgentBoardColumnSpec {
+            key: "conflicted",
+            label: "Conflicted",
+            summary: "Tasks cannot be applied cleanly yet.",
+            attention: true,
+        },
+        AgentBoardColumnSpec {
+            key: "blocked",
+            label: "Blocked",
+            summary: "Tasks have readiness blockers.",
+            attention: true,
+        },
+        AgentBoardColumnSpec {
+            key: "needs_review",
+            label: "Needs review",
+            summary: "Tasks are ready for a human review pass.",
+            attention: true,
+        },
+        AgentBoardColumnSpec {
+            key: "ready",
+            label: "Ready to apply",
+            summary: "Tasks have been reviewed and can move toward apply.",
+            attention: true,
+        },
+        AgentBoardColumnSpec {
+            key: "running",
+            label: "Running",
+            summary: "Tasks are active or have no checkpoint yet.",
+            attention: false,
+        },
+        AgentBoardColumnSpec {
+            key: "applied",
+            label: "Applied",
+            summary: "Tasks have already landed in Git or CrabDB main.",
+            attention: false,
+        },
+        AgentBoardColumnSpec {
+            key: "archived",
+            label: "Archived",
+            summary: "Tasks hidden from default views.",
+            attention: false,
+        },
+        AgentBoardColumnSpec {
+            key: "empty",
+            label: "Empty",
+            summary: "Setup placeholders with no agent work yet.",
+            attention: false,
+        },
+    ]
+}
+
+fn agent_board_item_matches_column(item: &AgentBoardItem, key: &str) -> bool {
+    if item.task.archived {
+        return key == "archived";
+    }
+    match key {
+        "needs_record" => item.task.status == AgentTaskStatus::Dirty,
+        "conflicted" => item.task.status == AgentTaskStatus::Conflicted,
+        "blocked" => item.task.status == AgentTaskStatus::Blocked,
+        "needs_review" => {
+            item.task.status == AgentTaskStatus::Ready && item.attention != "up_to_date"
+        }
+        "ready" => item.task.status == AgentTaskStatus::Ready && item.attention == "up_to_date",
+        "running" => item.task.status == AgentTaskStatus::Active,
+        "applied" => item.task.status == AgentTaskStatus::Applied,
+        "empty" => item.task.status == AgentTaskStatus::Empty,
+        _ => false,
+    }
+}
+
+fn agent_task_status_label(status: &AgentTaskStatus) -> &'static str {
+    match status {
+        AgentTaskStatus::Empty => "empty",
+        AgentTaskStatus::Active => "active",
+        AgentTaskStatus::Dirty => "dirty",
+        AgentTaskStatus::Ready => "ready",
+        AgentTaskStatus::Blocked => "blocked",
+        AgentTaskStatus::Conflicted => "conflicted",
+        AgentTaskStatus::Applied => "applied",
+    }
+}
+
 fn agent_inbox_next_for_task(task: &AgentTaskReport) -> StatusSuggestion {
     let lane = &task.lane;
     match &task.status {
@@ -3638,10 +5365,211 @@ fn agent_inbox_next_for_task(task: &AgentTaskReport) -> StatusSuggestion {
             reason: "inspect conflicts before any apply attempt".to_string(),
         },
         AgentTaskStatus::Applied => StatusSuggestion {
-            command: format!("crabdb agent view {lane}"),
-            reason: "inspect the applied transcript, tools, and checkpoint".to_string(),
+            command: format!("crabdb agent finish {lane}"),
+            reason: "hide the applied task from the default inbox when you are done".to_string(),
         },
     }
+}
+
+fn agent_stack_shared_paths(tasks: &[AgentTaskReport]) -> Vec<AgentStackSharedPath> {
+    let mut owners: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for task in tasks {
+        let mut seen = BTreeSet::new();
+        for path in &task.changed_paths {
+            if seen.insert(path.path.clone()) {
+                owners
+                    .entry(path.path.clone())
+                    .or_default()
+                    .push((task.lane.clone(), agent_task_label(task).to_string()));
+            }
+        }
+    }
+    owners
+        .into_iter()
+        .filter_map(|(path, owners)| {
+            if owners.len() < 2 {
+                return None;
+            }
+            let (lanes, task_titles): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
+            Some(AgentStackSharedPath {
+                path,
+                lanes,
+                task_titles,
+            })
+        })
+        .collect()
+}
+
+fn agent_stack_shared_paths_by_lane(
+    shared_paths: &[AgentStackSharedPath],
+) -> BTreeMap<String, Vec<String>> {
+    let mut by_lane: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for shared in shared_paths {
+        for lane in &shared.lanes {
+            by_lane
+                .entry(lane.clone())
+                .or_default()
+                .push(shared.path.clone());
+        }
+    }
+    by_lane
+}
+
+fn agent_stack_item_status(
+    task: &AgentTaskReport,
+    risk: &AgentRiskReport,
+    has_overlap: bool,
+) -> String {
+    if task.archived {
+        return "archived".to_string();
+    }
+    if matches!(risk.level, AgentRiskLevel::Blocking) {
+        return "blocked".to_string();
+    }
+    match task.status {
+        AgentTaskStatus::Ready | AgentTaskStatus::Dirty if has_overlap => {
+            "overlap_review".to_string()
+        }
+        AgentTaskStatus::Ready => "ready".to_string(),
+        AgentTaskStatus::Dirty => "needs_record".to_string(),
+        AgentTaskStatus::Blocked | AgentTaskStatus::Conflicted => "blocked".to_string(),
+        AgentTaskStatus::Applied => "applied".to_string(),
+        AgentTaskStatus::Active => "active".to_string(),
+        AgentTaskStatus::Empty => "empty".to_string(),
+    }
+}
+
+fn agent_stack_item_applyable(
+    task: &AgentTaskReport,
+    risk: &AgentRiskReport,
+    shared_paths: &[String],
+) -> bool {
+    !task.archived
+        && shared_paths.is_empty()
+        && matches!(task.status, AgentTaskStatus::Ready | AgentTaskStatus::Dirty)
+        && !matches!(risk.level, AgentRiskLevel::Blocking)
+}
+
+fn agent_stack_item_next(task: &AgentTaskReport, status: &str) -> StatusSuggestion {
+    let lane = &task.lane;
+    match status {
+        "ready" | "needs_record" => StatusSuggestion {
+            command: format!("crabdb agent finish {lane} --dry-run"),
+            reason: "preview applying and closing this task".to_string(),
+        },
+        "overlap_review" => StatusSuggestion {
+            command: format!("crabdb agent changes {lane} --by-file"),
+            reason: "review shared changed files before applying".to_string(),
+        },
+        "blocked" => StatusSuggestion {
+            command: format!("crabdb agent recover {lane}"),
+            reason: "inspect blockers before choosing an apply order".to_string(),
+        },
+        "applied" => StatusSuggestion {
+            command: format!("crabdb agent finish {lane}"),
+            reason: "hide the already-applied task from the default inbox".to_string(),
+        },
+        "active" => StatusSuggestion {
+            command: format!("crabdb agent view {lane}"),
+            reason: "inspect current task activity before applying".to_string(),
+        },
+        "archived" => StatusSuggestion {
+            command: format!("crabdb agent receipt {lane}"),
+            reason: "inspect the archived task receipt if needed".to_string(),
+        },
+        _ => StatusSuggestion {
+            command: "crabdb agent inbox".to_string(),
+            reason: "return to the agent task inbox".to_string(),
+        },
+    }
+}
+
+fn agent_stack_item_sort_key(item: &AgentStackItem) -> (u8, u8, u8, usize, String) {
+    let status_rank = match item.status.as_str() {
+        "overlap_review" => 0,
+        "blocked" => 1,
+        "ready" => 2,
+        "needs_record" => 3,
+        "applied" => 4,
+        "active" => 5,
+        "empty" => 6,
+        "archived" => 7,
+        _ => 8,
+    };
+    (
+        status_rank,
+        agent_risk_sort_rank(&item.risk.level),
+        item.risk.score,
+        item.task.changed_paths.len(),
+        item.task.lane.clone(),
+    )
+}
+
+fn agent_risk_sort_rank(level: &AgentRiskLevel) -> u8 {
+    match level {
+        AgentRiskLevel::Low => 0,
+        AgentRiskLevel::Medium => 1,
+        AgentRiskLevel::High => 2,
+        AgentRiskLevel::Blocking => 3,
+    }
+}
+
+fn agent_stack_next(
+    items: &[AgentStackItem],
+    shared_paths: &[AgentStackSharedPath],
+) -> StatusSuggestion {
+    if let Some(shared) = shared_paths.first() {
+        if shared.lanes.len() >= 2 {
+            return StatusSuggestion {
+                command: format!(
+                    "crabdb agent compare {} {}",
+                    shared.lanes[0], shared.lanes[1]
+                ),
+                reason: format!(
+                    "review overlap on `{}` before applying either task",
+                    shared.path
+                ),
+            };
+        }
+    }
+    if let Some(item) = items.iter().find(|item| item.status == "blocked") {
+        return item.next.clone();
+    }
+    if let Some(item) = items.iter().find(|item| item.applyable) {
+        return item.next.clone();
+    }
+    if let Some(item) = items.iter().find(|item| item.status == "applied") {
+        return item.next.clone();
+    }
+    if let Some(item) = items.iter().find(|item| item.status == "active") {
+        return item.next.clone();
+    }
+    StatusSuggestion {
+        command: "crabdb agent inbox".to_string(),
+        reason: "choose an agent task from the inbox".to_string(),
+    }
+}
+
+fn agent_stack_summary(
+    total: usize,
+    ready_count: usize,
+    blocked_count: usize,
+    overlap_count: usize,
+) -> String {
+    if total == 0 {
+        return "No agent tasks are recorded yet.".to_string();
+    }
+    if overlap_count > 0 {
+        return format!(
+            "{total} task(s), {ready_count} apply candidate(s), {blocked_count} blocked/conflicted, and {overlap_count} shared changed path(s). Resolve overlap before applying."
+        );
+    }
+    if ready_count > 0 {
+        return format!(
+            "{total} task(s), {ready_count} apply candidate(s), and {blocked_count} blocked/conflicted. Apply candidates are ordered by low risk and smaller change size."
+        );
+    }
+    format!("{total} task(s), no apply candidates, {blocked_count} blocked/conflicted.")
 }
 
 fn agent_inbox_status_key(status: &AgentTaskStatus) -> &'static str {
@@ -3666,6 +5594,245 @@ fn agent_inbox_status_label(status: &AgentTaskStatus) -> &'static str {
         AgentTaskStatus::Applied => "Applied",
         AgentTaskStatus::Empty => "Empty",
     }
+}
+
+fn agent_guide_headline(task: Option<&AgentTaskReport>, status: &AgentTaskStatus) -> String {
+    match task {
+        Some(task) => format!(
+            "Use `{}` as one agent task: inspect it, validate it, apply it, or recover it.",
+            task.title
+        ),
+        None => match status {
+            AgentTaskStatus::Empty => {
+                "Set up one editor or terminal entrypoint; CrabDB will create fresh tasks automatically."
+                    .to_string()
+            }
+            _ => "Use CrabDB agent commands to inspect, validate, apply, or recover agent work."
+                .to_string(),
+        },
+    }
+}
+
+fn agent_guide_current_state(task: Option<&AgentTaskReport>, next: &AgentNextReport) -> String {
+    match task {
+        Some(task) => format!(
+            "Task `{}` is {:?} with {} changed file(s), {} turn(s), and {} tool event(s). Next: {}.",
+            task.title,
+            task.status,
+            task.changed_paths.len(),
+            task.turns,
+            task.tool_events,
+            next.primary.reason
+        ),
+        None => format!("No agent task is recorded yet. Next: {}.", next.primary.reason),
+    }
+}
+
+fn agent_guide_steps(
+    task: Option<&AgentTaskReport>,
+    primary: &StatusSuggestion,
+) -> Vec<AgentGuideStep> {
+    let Some(task) = task else {
+        return vec![
+            agent_guide_step(
+                "Connect an editor",
+                "crabdb agent setup --provider claude-code --editor vscode",
+                "print a stable ACP editor config that creates fresh CrabDB tasks automatically",
+                "once per editor setup",
+            ),
+            agent_guide_step(
+                "Check the provider",
+                "crabdb agent doctor --provider claude-code",
+                "verify CrabDB and the provider before the first real session",
+                "before or after setup when something does not connect",
+            ),
+            agent_guide_step(
+                "Start in terminal",
+                "crabdb agent start --provider claude-code",
+                "launch a fresh materialized terminal task when you are not using an ACP editor",
+                "when you want to work from the shell",
+            ),
+        ];
+    };
+
+    let lane = &task.lane;
+    let provider = task.provider.as_deref().unwrap_or("claude-code");
+    let mut steps = vec![agent_guide_step(
+        "Do next",
+        primary.command.clone(),
+        primary.reason.clone(),
+        "right now",
+    )];
+
+    match task.status {
+        AgentTaskStatus::Active => {
+            steps.push(agent_guide_step(
+                "Watch the task",
+                format!("crabdb agent dashboard {lane}"),
+                "see the current task, focus file, validation, and next action in one screen",
+                "while the editor or terminal agent is still running",
+            ));
+            steps.push(agent_guide_step(
+                "Read the transcript",
+                format!("crabdb agent view {lane}"),
+                "inspect prompts, assistant messages, tools, changed files, and checkpoint data",
+                "when you want to understand what the agent is doing",
+            ));
+        }
+        AgentTaskStatus::Dirty => {
+            agent_push_guide_step(
+                &mut steps,
+                "Preview apply",
+                format!("crabdb agent land {lane} --dry-run"),
+                "record dirty workdir changes and preview the Git apply plan without mutating Git",
+                "after the agent changed files but before applying",
+            );
+            steps.push(agent_guide_step(
+                "Review changes",
+                format!("crabdb agent changes {lane} --by-file"),
+                "review changed files with the prompt, tools, and diff commands behind each file",
+                "before approving the task",
+            ));
+        }
+        AgentTaskStatus::Ready => {
+            steps.push(agent_guide_step(
+                "Review changes",
+                format!("crabdb agent changes {lane}"),
+                "see high-level change cards connected to turns, checkpoints, and files",
+                "before applying the task",
+            ));
+            steps.push(agent_guide_step(
+                "Validate",
+                format!("crabdb agent validate {lane}"),
+                "see missing test/eval gates and copy the recommended validation command",
+                "before applying when tests matter",
+            ));
+            steps.push(agent_guide_step(
+                "Apply safely",
+                format!("crabdb agent land {lane} --dry-run"),
+                "preview the Git commit and fast-forward plan before the real apply",
+                "when review looks good",
+            ));
+        }
+        AgentTaskStatus::Blocked | AgentTaskStatus::Conflicted => {
+            steps.push(agent_guide_step(
+                "Diagnose",
+                format!("crabdb agent recover {lane}"),
+                "identify the blocker and list safe recovery options before destructive commands",
+                "when the task is blocked, conflicted, or sideways",
+            ));
+            steps.push(agent_guide_step(
+                "Pick a recovery point",
+                format!("crabdb agent rewind-points {lane}"),
+                "list friendly checkpoint targets such as before-last-turn or before-prompt text",
+                "before running rewind or undo",
+            ));
+        }
+        AgentTaskStatus::Applied => {
+            steps.push(agent_guide_step(
+                "Inspect receipt",
+                format!("crabdb agent receipt {lane}"),
+                "copy the applied task summary, validation, changed files, turns, tools, and checkpoint",
+                "after a task has landed",
+            ));
+            steps.push(agent_guide_step(
+                "Close task",
+                format!("crabdb agent close {lane}"),
+                "hide the applied task from default inbox/list/latest views without deleting provenance",
+                "after you no longer need it in the daily inbox",
+            ));
+            steps.push(agent_guide_step(
+                "Start follow-up",
+                format!("crabdb agent continue {lane} --provider {provider}"),
+                "create a fresh task from this applied checkpoint instead of reusing already-applied lane history",
+                "when you want more edits",
+            ));
+        }
+        AgentTaskStatus::Empty => {}
+    }
+
+    agent_push_guide_step(
+        &mut steps,
+        "Ask naturally",
+        format!(
+            "crabdb agent ask --selector {lane} {}",
+            agent_shell_arg("what should I do next")
+        ),
+        "route a plain-language question to the right CrabDB view",
+        "whenever you forget the exact command",
+    );
+    agent_push_guide_step(
+        &mut steps,
+        "Open review focus",
+        format!("crabdb agent focus {lane}"),
+        "show the highest-priority file, why it changed, and the focused diff command",
+        "when you want one file to inspect first",
+    );
+    agent_push_guide_step(
+        &mut steps,
+        "See new work",
+        format!("crabdb agent what-changed {lane}"),
+        "show only changes since your last reviewed marker",
+        "after follow-up prompts",
+    );
+    steps
+}
+
+fn agent_guide_step(
+    label: impl Into<String>,
+    command: impl Into<String>,
+    reason: impl Into<String>,
+    when: impl Into<String>,
+) -> AgentGuideStep {
+    AgentGuideStep {
+        label: label.into(),
+        command: command.into(),
+        reason: reason.into(),
+        when: when.into(),
+    }
+}
+
+fn agent_push_guide_step(
+    steps: &mut Vec<AgentGuideStep>,
+    label: impl Into<String>,
+    command: impl Into<String>,
+    reason: impl Into<String>,
+    when: impl Into<String>,
+) {
+    let command = command.into();
+    if steps.iter().any(|step| step.command == command) {
+        return;
+    }
+    steps.push(agent_guide_step(label, command, reason, when));
+}
+
+fn agent_guide_concepts() -> Vec<AgentGuideConcept> {
+    vec![
+        AgentGuideConcept {
+            name: "Agent task".to_string(),
+            meaning:
+                "one agent job with its own isolated CrabDB lane, transcript, tools, and checkpoints"
+                    .to_string(),
+        },
+        AgentGuideConcept {
+            name: "Changes".to_string(),
+            meaning:
+                "the review map that connects prompts, files, tools, checkpoints, and apply readiness"
+                    .to_string(),
+        },
+        AgentGuideConcept {
+            name: "Apply".to_string(),
+            meaning:
+                "the safe path back to Git: preview, create a Git commit, then fast-forward only when clean"
+                    .to_string(),
+        },
+        AgentGuideConcept {
+            name: "Recover".to_string(),
+            meaning:
+                "diagnose, choose a friendly checkpoint, then undo or rewind when an agent goes sideways"
+                    .to_string(),
+        },
+    ]
 }
 
 fn filter_agent_groups_by_path(groups: Vec<AgentChangeGroup>, path: &str) -> Vec<AgentChangeGroup> {
@@ -3821,11 +5988,815 @@ fn agent_story_risk_notes(view: &AgentTaskViewReport) -> Vec<String> {
     notes
 }
 
+#[derive(Default)]
+struct AgentToolAccumulator {
+    name: String,
+    kind: Option<String>,
+    event_count: usize,
+    changed_paths: BTreeMap<String, FileDiffSummary>,
+    event_types: BTreeSet<String>,
+    statuses: BTreeMap<String, usize>,
+    first_seen_at: Option<i64>,
+    last_seen_at: Option<i64>,
+    turns: BTreeMap<usize, AgentToolTurnRef>,
+}
+
+fn agent_tool_entries(
+    lane: &str,
+    view: &AgentTaskViewReport,
+    group_by_turn: &BTreeMap<String, AgentChangeGroup>,
+) -> Vec<AgentToolEntry> {
+    let Some(transcript) = &view.transcript else {
+        return Vec::new();
+    };
+    let tool_names_by_id = agent_tool_names_by_id(transcript);
+    let mut tools: BTreeMap<String, AgentToolAccumulator> = BTreeMap::new();
+    for (turn_idx, turn) in transcript.turns.iter().enumerate() {
+        let index = turn_idx + 1;
+        let group = group_by_turn.get(&turn.turn.turn_id);
+        let changed_paths = group
+            .map(|group| group.changed_paths.clone())
+            .unwrap_or_default();
+        for event in &turn.events {
+            if !agent_is_tool_event(event) {
+                continue;
+            }
+            let name = agent_tool_event_name(event, &tool_names_by_id);
+            let entry = tools
+                .entry(name.clone())
+                .or_insert_with(|| AgentToolAccumulator {
+                    name: name.clone(),
+                    ..AgentToolAccumulator::default()
+                });
+            entry.event_count += 1;
+            entry.event_types.insert(event.event_type.clone());
+            if entry.kind.is_none() {
+                entry.kind = agent_tool_event_kind(event);
+            }
+            if let Some(status) = agent_tool_event_status(event) {
+                *entry.statuses.entry(status).or_insert(0) += 1;
+            }
+            entry.first_seen_at = Some(
+                entry
+                    .first_seen_at
+                    .map(|seen| seen.min(event.created_at))
+                    .unwrap_or(event.created_at),
+            );
+            entry.last_seen_at = Some(
+                entry
+                    .last_seen_at
+                    .map(|seen| seen.max(event.created_at))
+                    .unwrap_or(event.created_at),
+            );
+            for change in &changed_paths {
+                entry
+                    .changed_paths
+                    .entry(change.path.clone())
+                    .or_insert_with(|| change.clone());
+            }
+            entry
+                .turns
+                .entry(index)
+                .or_insert_with(|| AgentToolTurnRef {
+                    index,
+                    turn_id: turn.turn.turn_id.clone(),
+                    status: turn.turn.status.clone(),
+                    prompt_preview: turn_prompt_preview(turn),
+                    checkpoint: group
+                        .and_then(|group| group.checkpoint.clone())
+                        .or_else(|| turn.checkpoint.clone())
+                        .or_else(|| turn.turn.after_change.clone()),
+                    changed_paths: changed_paths.clone(),
+                    turn_command: format!("crabdb agent turn {lane} {index}"),
+                    diff_command: group
+                        .and_then(|group| group.after_change.as_ref())
+                        .map(|_| agent_turn_diff_command(lane, Some(index), None, true)),
+                });
+        }
+    }
+    let mut entries = tools
+        .into_values()
+        .map(|tool| AgentToolEntry {
+            rank: 0,
+            name: tool.name,
+            kind: tool.kind,
+            event_count: tool.event_count,
+            turn_count: tool.turns.len(),
+            changed_paths: tool.changed_paths.into_values().collect(),
+            event_types: tool.event_types.into_iter().collect(),
+            statuses: tool.statuses,
+            first_seen_at: tool.first_seen_at.unwrap_or(0),
+            last_seen_at: tool.last_seen_at.unwrap_or(0),
+            turns: tool.turns.into_values().collect(),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .event_count
+            .cmp(&left.event_count)
+            .then_with(|| right.turn_count.cmp(&left.turn_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        entry.rank = idx + 1;
+    }
+    entries
+}
+
+fn agent_tool_names_by_id(transcript: &TranscriptReport) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    for turn in &transcript.turns {
+        for event in &turn.events {
+            let Some(id) = agent_tool_event_identity(event) else {
+                continue;
+            };
+            let Some(name) = agent_tool_event_title(event) else {
+                continue;
+            };
+            names.entry(id).or_insert(name);
+        }
+    }
+    names
+}
+
+fn agent_is_tool_event(event: &LaneEventRecord) -> bool {
+    match event.event_type.as_str() {
+        "tool_call" | "tool_call_update" => true,
+        "span_started" => {
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("span_type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("tool")
+        }
+        "span_ended" => agent_tool_event_identity(event).is_some(),
+        _ => false,
+    }
+}
+
+fn agent_tool_event_name(
+    event: &LaneEventRecord,
+    tool_names_by_id: &BTreeMap<String, String>,
+) -> String {
+    if let Some(title) = agent_tool_event_title(event) {
+        return title;
+    }
+    if let Some(id) = agent_tool_event_identity(event) {
+        if let Some(title) = tool_names_by_id.get(&id) {
+            return title.clone();
+        }
+        return id;
+    }
+    event.event_type.clone()
+}
+
+fn agent_tool_event_identity(event: &LaneEventRecord) -> Option<String> {
+    let payload = event.payload.as_ref()?;
+    for key in ["toolCallId", "tool_call_id", "tool_id", "id", "span_id"] {
+        if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
+            return Some(value.to_string());
+        }
+    }
+    payload
+        .get("attributes")
+        .and_then(|attributes| {
+            ["toolCallId", "tool_call_id", "tool_id", "id"]
+                .iter()
+                .find_map(|key| attributes.get(key).and_then(serde_json::Value::as_str))
+        })
+        .map(str::to_string)
+}
+
+fn agent_tool_event_title(event: &LaneEventRecord) -> Option<String> {
+    let payload = event.payload.as_ref()?;
+    for key in ["title", "name", "tool", "command"] {
+        if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
+            return Some(value.to_string());
+        }
+    }
+    payload
+        .get("attributes")
+        .and_then(|attributes| {
+            ["title", "name", "tool", "command"]
+                .iter()
+                .find_map(|key| attributes.get(key).and_then(serde_json::Value::as_str))
+        })
+        .map(str::to_string)
+}
+
+fn agent_tool_event_kind(event: &LaneEventRecord) -> Option<String> {
+    let payload = event.payload.as_ref()?;
+    payload
+        .get("kind")
+        .or_else(|| payload.get("span_type"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("attributes")
+                .and_then(|attributes| attributes.get("kind").or_else(|| attributes.get("type")))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+fn agent_tool_event_status(event: &LaneEventRecord) -> Option<String> {
+    let payload = event.payload.as_ref()?;
+    payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn agent_tools_summary(
+    task: &AgentTaskReport,
+    total_tool_events: usize,
+    unique_tools: usize,
+    turns_with_tools: usize,
+    available_commands: usize,
+) -> String {
+    if total_tool_events == 0 && available_commands == 0 {
+        return format!(
+            "{} has no captured tool activity yet.",
+            agent_task_label(task)
+        );
+    }
+    let tool_word = if unique_tools == 1 { "tool" } else { "tools" };
+    let event_word = if total_tool_events == 1 {
+        "event"
+    } else {
+        "events"
+    };
+    let turn_word = if turns_with_tools == 1 {
+        "turn"
+    } else {
+        "turns"
+    };
+    format!(
+        "{} captured {total_tool_events} tool {event_word} across {unique_tools} {tool_word} and {turns_with_tools} {turn_word}; {available_commands} available command(s) were advertised.",
+        agent_task_label(task)
+    )
+}
+
+fn agent_tools_suggestions(lane: &str, tools: &[AgentToolEntry]) -> Vec<StatusSuggestion> {
+    let mut suggestions = vec![
+        StatusSuggestion {
+            command: format!("crabdb agent changes {lane}"),
+            reason: "connect tool activity to prompt-to-checkpoint changes".to_string(),
+        },
+        StatusSuggestion {
+            command: format!("crabdb agent timeline {lane}"),
+            reason: "see tools, prompts, checkpoints, and changed files in order".to_string(),
+        },
+    ];
+    if let Some(tool) = tools.first().and_then(|tool| tool.turns.first()) {
+        suggestions.push(StatusSuggestion {
+            command: tool.turn_command.clone(),
+            reason: "inspect the turn with the most captured tool activity".to_string(),
+        });
+        if let Some(command) = &tool.diff_command {
+            suggestions.push(StatusSuggestion {
+                command: command.clone(),
+                reason: "inspect the patch from that tool-heavy turn".to_string(),
+            });
+        }
+    }
+    suggestions
+}
+
+fn agent_impact_areas(lane: &str, changed_paths: &[FileDiffSummary]) -> Vec<AgentImpactArea> {
+    let mut areas: BTreeMap<String, AgentImpactArea> = BTreeMap::new();
+    for change in changed_paths {
+        let profile = agent_impact_profile(&change.path);
+        let area = areas
+            .entry(profile.key.to_string())
+            .or_insert_with(|| AgentImpactArea {
+                key: profile.key.to_string(),
+                label: profile.label.to_string(),
+                severity: profile.severity.to_string(),
+                changed_paths: Vec::new(),
+                changed_lines: 0,
+                reasons: Vec::new(),
+                review_command: format!("crabdb agent changes {lane} --by-file"),
+                diff_command: None,
+            });
+        if agent_impact_severity_rank(profile.severity) > agent_impact_severity_rank(&area.severity)
+        {
+            area.severity = profile.severity.to_string();
+        }
+        area.changed_lines += change.additions + change.deletions;
+        area.changed_paths.push(change.clone());
+        agent_push_unique_string(&mut area.reasons, profile.reason.to_string());
+    }
+    let mut areas = areas.into_values().collect::<Vec<_>>();
+    for area in &mut areas {
+        area.changed_paths
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        if area.changed_paths.len() == 1 {
+            let path = &area.changed_paths[0].path;
+            area.review_command = format!("crabdb agent file {lane} {}", agent_shell_arg(path));
+            area.diff_command = Some(format!(
+                "crabdb agent file {lane} {} --patch",
+                agent_shell_arg(path)
+            ));
+        } else if let Some(first) = area.changed_paths.first() {
+            area.diff_command = Some(format!(
+                "crabdb agent file {lane} {} --patch",
+                agent_shell_arg(&first.path)
+            ));
+        }
+    }
+    areas
+}
+
+struct AgentImpactProfile {
+    key: &'static str,
+    label: &'static str,
+    severity: &'static str,
+    reason: &'static str,
+}
+
+fn agent_impact_profile(path: &str) -> AgentImpactProfile {
+    let lower = path.to_ascii_lowercase();
+    let filename = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if matches!(
+        filename,
+        "cargo.lock"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "bun.lockb"
+            | "go.sum"
+            | "gemfile.lock"
+            | "poetry.lock"
+    ) {
+        return AgentImpactProfile {
+            key: "dependencies",
+            label: "Dependencies",
+            severity: "high",
+            reason: "lockfile or dependency resolution changed",
+        };
+    }
+    if matches!(
+        filename,
+        "cargo.toml"
+            | "package.json"
+            | "pyproject.toml"
+            | "go.mod"
+            | "makefile"
+            | "justfile"
+            | "dockerfile"
+    ) || lower.starts_with(".github/workflows/")
+        || lower.contains("docker-compose")
+    {
+        return AgentImpactProfile {
+            key: "build_config",
+            label: "Build and Project Config",
+            severity: "high",
+            reason: "build, package, CI, or project manifest changed",
+        };
+    }
+    if lower.ends_with("src/lib.rs")
+        || lower.contains("/api/")
+        || lower.contains("/schema")
+        || lower.contains("/schemas/")
+        || lower.contains("/proto/")
+        || lower.contains("openapi")
+        || lower.contains("/types/")
+    {
+        return AgentImpactProfile {
+            key: "public_api",
+            label: "Public API Surface",
+            severity: "high",
+            reason: "public API, schema, protocol, or exported type surface changed",
+        };
+    }
+    if lower.contains("/mcp/")
+        || lower.contains("/acp")
+        || lower.contains("/server/")
+        || lower.contains("/http")
+        || lower.contains("/integrations/")
+    {
+        return AgentImpactProfile {
+            key: "integrations",
+            label: "Integrations and Protocols",
+            severity: "high",
+            reason: "integration, protocol, or server-facing code changed",
+        };
+    }
+    if lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".spec.js")
+    {
+        return AgentImpactProfile {
+            key: "tests",
+            label: "Tests",
+            severity: "medium",
+            reason: "test coverage or fixtures changed",
+        };
+    }
+    if filename == "readme.md"
+        || lower.starts_with("docs/")
+        || lower.ends_with(".md")
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".rst")
+    {
+        return AgentImpactProfile {
+            key: "docs",
+            label: "Documentation",
+            severity: "low",
+            reason: "documentation or prose changed",
+        };
+    }
+    if lower.contains("/cli/")
+        || lower.contains("/command/")
+        || lower.contains("/render/")
+        || lower.ends_with(".css")
+        || lower.ends_with(".html")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".jsx")
+    {
+        return AgentImpactProfile {
+            key: "cli_ui",
+            label: "CLI or User Interface",
+            severity: "medium",
+            reason: "user-facing command or interface code changed",
+        };
+    }
+    if lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".json")
+        || lower.ends_with(".ini")
+        || filename.starts_with(".env")
+    {
+        return AgentImpactProfile {
+            key: "configuration",
+            label: "Configuration",
+            severity: "medium",
+            reason: "configuration data changed",
+        };
+    }
+    if lower.ends_with(".rs")
+        || lower.ends_with(".go")
+        || lower.ends_with(".py")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".js")
+        || lower.ends_with(".java")
+        || lower.ends_with(".kt")
+        || lower.ends_with(".swift")
+    {
+        return AgentImpactProfile {
+            key: "core_logic",
+            label: "Core Code",
+            severity: "medium",
+            reason: "runtime source code changed",
+        };
+    }
+    AgentImpactProfile {
+        key: "other",
+        label: "Other Files",
+        severity: "low",
+        reason: "changed file does not match a known high-signal area",
+    }
+}
+
+fn agent_impact_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+fn agent_impact_recommendations(
+    lane: &str,
+    areas: &[AgentImpactArea],
+    risk: &AgentRiskReport,
+    validation: &AgentValidationReport,
+    changed_paths: &[FileDiffSummary],
+) -> Vec<StatusSuggestion> {
+    let mut recommendations = Vec::new();
+    if let Some(area) = areas.first() {
+        agent_push_suggestion(
+            &mut recommendations,
+            area.review_command.clone(),
+            "start review in the highest-impact changed area",
+        );
+    }
+    if validation.needs_test || validation.needs_eval {
+        agent_push_suggestion(
+            &mut recommendations,
+            validation.next.command.clone(),
+            &validation.next.reason,
+        );
+    }
+    if agent_changed_manifest_or_api_surface(changed_paths) {
+        for suggestion in &validation.suggestions {
+            if suggestion.reason.contains("broader test gate") {
+                agent_push_suggestion(
+                    &mut recommendations,
+                    suggestion.command.clone(),
+                    &suggestion.reason,
+                );
+            }
+        }
+    }
+    if matches!(
+        risk.level,
+        AgentRiskLevel::Medium | AgentRiskLevel::High | AgentRiskLevel::Blocking
+    ) {
+        agent_push_suggestion(
+            &mut recommendations,
+            format!("crabdb agent risk {lane}"),
+            "inspect risk reasons and mitigation steps before applying",
+        );
+    }
+    agent_push_suggestion(
+        &mut recommendations,
+        format!("crabdb agent confidence {lane}"),
+        "finish with one go/no-go verdict after review and validation",
+    );
+    recommendations
+}
+
+fn agent_impact_suggestions(
+    lane: &str,
+    recommendations: &[StatusSuggestion],
+) -> Vec<StatusSuggestion> {
+    let mut suggestions = recommendations.to_vec();
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent changes {lane} --by-file"),
+        "inspect every changed file with prompt and checkpoint provenance",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent review-flow {lane}"),
+        "walk through inspect, mark reviewed, validate, and finish",
+    );
+    suggestions
+}
+
+fn agent_impact_summary(
+    task: &AgentTaskReport,
+    areas: &[AgentImpactArea],
+    changed_lines: u64,
+    highest_impact: &str,
+    validation: &AgentValidationReport,
+) -> String {
+    if areas.is_empty() {
+        return format!(
+            "{} has no recorded changed files yet.",
+            agent_task_label(task)
+        );
+    }
+    let top_areas = areas
+        .iter()
+        .take(3)
+        .map(|area| area.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{} touched {} file(s) and {changed_lines} changed line(s) across {top_areas}; highest impact `{highest_impact}`, validation `{}`.",
+        agent_task_label(task),
+        task.changed_paths.len(),
+        validation.status
+    )
+}
+
+fn agent_review_map_areas(
+    lane: &str,
+    workdir: Option<&str>,
+    changed_paths: &[FileDiffSummary],
+    priorities: &[AgentReviewPriority],
+    review_status: &str,
+    reviewed_files: &BTreeMap<String, AgentFileReviewMarker>,
+) -> Vec<AgentReviewMapArea> {
+    let priorities_by_path = priorities
+        .iter()
+        .map(|priority| (priority.change.path.as_str(), priority))
+        .collect::<BTreeMap<_, _>>();
+    let mut areas = agent_impact_areas(lane, changed_paths)
+        .into_iter()
+        .map(|area| {
+            let mut files = area
+                .changed_paths
+                .iter()
+                .filter_map(|change| {
+                    priorities_by_path
+                        .get(change.path.as_str())
+                        .map(|priority| {
+                            let file_arg = agent_shell_arg(&change.path);
+                            let reviewed = if review_status == "up_to_date" {
+                                None
+                            } else {
+                                reviewed_files.get(&change.path).cloned()
+                            };
+                            let state = if review_status == "up_to_date" || reviewed.is_some() {
+                                "reviewed"
+                            } else {
+                                "needs_review"
+                            };
+                            let open_path = workdir.map(|workdir| {
+                                Path::new(workdir)
+                                    .join(&change.path)
+                                    .to_string_lossy()
+                                    .to_string()
+                            });
+                            let open_command = open_path
+                                .as_ref()
+                                .map(|path| format!("${{EDITOR:-vi}} {}", shell_quote(path)));
+                            AgentReviewMapFile {
+                                rank: priority.rank,
+                                path: change.path.clone(),
+                                state: state.to_string(),
+                                reviewed,
+                                change: change.clone(),
+                                score: priority.score,
+                                reasons: priority.reasons.clone(),
+                                touched_by: priority.touched_by.clone(),
+                                review_command: format!(
+                                    "crabdb agent focus {lane} --file {file_arg}"
+                                ),
+                                why_command: priority.why_command.clone(),
+                                diff_command: priority.diff_command.clone(),
+                                open_path,
+                                open_command,
+                            }
+                        })
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|left, right| {
+                left.rank
+                    .cmp(&right.rank)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+            let state = if files.is_empty() {
+                "empty"
+            } else if files.iter().all(|file| file.state == "reviewed") {
+                "reviewed"
+            } else {
+                "needs_review"
+            }
+            .to_string();
+            let review_command = files
+                .first()
+                .map(|file| file.review_command.clone())
+                .unwrap_or(area.review_command.clone());
+            let patch_command = files
+                .first()
+                .and_then(|file| file.diff_command.clone())
+                .or(area.diff_command.clone());
+            AgentReviewMapArea {
+                key: area.key,
+                label: area.label,
+                severity: area.severity,
+                state,
+                changed_paths: area.changed_paths,
+                changed_lines: area.changed_lines,
+                reasons: area.reasons,
+                files,
+                review_command,
+                patch_command,
+            }
+        })
+        .collect::<Vec<_>>();
+    areas.retain(|area| !area.changed_paths.is_empty());
+    areas
+}
+
+fn agent_review_map_next(
+    lane: &str,
+    areas: &[AgentReviewMapArea],
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+) -> StatusSuggestion {
+    if let Some(file) = areas
+        .iter()
+        .flat_map(|area| area.files.iter())
+        .find(|file| file.state != "reviewed")
+    {
+        return StatusSuggestion {
+            command: file.review_command.clone(),
+            reason: "start with the highest-priority file that still needs review".to_string(),
+        };
+    }
+    if progress.status != "up_to_date" {
+        return StatusSuggestion {
+            command: format!("crabdb agent new {lane}"),
+            reason: "inspect changes since the latest reviewed checkpoint".to_string(),
+        };
+    }
+    if validation.needs_test || validation.needs_eval {
+        return validation.next.clone();
+    }
+    StatusSuggestion {
+        command: format!("crabdb agent confidence {lane}"),
+        reason: "finish with one go/no-go verdict before applying".to_string(),
+    }
+}
+
+fn agent_review_map_suggestions(
+    lane: &str,
+    next: &StatusSuggestion,
+    areas: &[AgentReviewMapArea],
+    validation: &AgentValidationReport,
+) -> Vec<StatusSuggestion> {
+    let mut suggestions = vec![next.clone()];
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent impact {lane}"),
+        "review the blast radius and impacted areas behind this map",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent changes {lane} --by-file"),
+        "inspect every changed file with prompt and checkpoint provenance",
+    );
+    if let Some(area) = areas.first() {
+        agent_push_suggestion(
+            &mut suggestions,
+            area.review_command.clone(),
+            "start in the highest-impact review area",
+        );
+        if let Some(command) = &area.patch_command {
+            agent_push_suggestion(
+                &mut suggestions,
+                command.clone(),
+                "inspect the first focused patch from the highest-impact area",
+            );
+        }
+    }
+    if validation.needs_test || validation.needs_eval {
+        agent_push_suggestion(
+            &mut suggestions,
+            validation.next.command.clone(),
+            &validation.next.reason,
+        );
+    }
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent review-flow {lane}"),
+        "walk through inspect, mark reviewed, validate, and finish",
+    );
+    suggestions
+}
+
+fn agent_review_map_summary(
+    task: &AgentTaskReport,
+    areas: &[AgentReviewMapArea],
+    changed_lines: u64,
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+) -> String {
+    if areas.is_empty() {
+        return format!("{} has no changed files to review.", agent_task_label(task));
+    }
+    let top_area = areas
+        .first()
+        .map(|area| area.label.as_str())
+        .unwrap_or("changed files");
+    let top_file = areas
+        .iter()
+        .flat_map(|area| area.files.iter())
+        .next()
+        .map(|file| file.path.as_str())
+        .unwrap_or("the first changed file");
+    format!(
+        "{} has {} changed file(s) and {changed_lines} changed line(s) across {} review area(s). Review status `{}`, validation `{}`. Start with {top_area}: `{top_file}`.",
+        agent_task_label(task),
+        task.changed_paths.len(),
+        areas.len(),
+        progress.status,
+        validation.status
+    )
+}
+
 fn agent_risk_report_from_view(view: &AgentTaskViewReport) -> AgentRiskReport {
     let mut score: u8 = 0;
     let mut reasons = Vec::new();
     let mut recommendations = Vec::new();
     let lane = &view.task.lane;
+
+    if view.task.status == AgentTaskStatus::Applied {
+        return AgentRiskReport {
+            task: view.task.clone(),
+            level: AgentRiskLevel::Low,
+            score: 0,
+            summary:
+                "Task has already been applied; use `crabdb agent continue` for follow-up work."
+                    .to_string(),
+            reasons,
+            recommendations: agent_already_applied_suggestions(&view.task),
+        };
+    }
 
     for blocker in &view.review.readiness.blockers {
         score = score.saturating_add(60);
@@ -4072,8 +7043,8 @@ fn agent_ready_next(
     }
     if status == "applied" {
         return StatusSuggestion {
-            command: format!("crabdb agent view {lane}"),
-            reason: "inspect the applied task transcript and checkpoint".to_string(),
+            command: format!("crabdb agent finish {lane}"),
+            reason: "hide the applied task from the default inbox when you are done".to_string(),
         };
     }
     if let Some(error) = apply_error {
@@ -4121,6 +7092,9 @@ fn agent_ready_suggestions(
             suggestion.command.clone(),
             &suggestion.reason,
         );
+    }
+    if view.task.status == AgentTaskStatus::Applied {
+        return suggestions;
     }
     agent_push_suggestion(
         &mut suggestions,
@@ -4194,6 +7168,303 @@ fn agent_report_suggestions(
     suggestions
 }
 
+fn agent_confidence_factors(
+    lane: &str,
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+    risk: &AgentRiskReport,
+) -> Vec<AgentConfidenceFactor> {
+    let mut factors = Vec::new();
+
+    let (review_state, review_delta, review_message, review_command) =
+        match progress.status.as_str() {
+            "up_to_date" => (
+                "pass",
+                0,
+                "current checkpoint has been marked reviewed".to_string(),
+                Some(format!("crabdb agent review-flow {lane}")),
+            ),
+            "new_changes" => (
+                "warn",
+                -18,
+                format!(
+                    "{} changed file(s) and {} changed line(s) have not been reviewed since the last marker",
+                    progress.changed_paths, progress.changed_lines
+                ),
+                Some(format!("crabdb agent review-flow {lane}")),
+            ),
+            _ => (
+                "warn",
+                -22,
+                format!(
+                    "{} changed file(s) and {} changed line(s) have not been marked reviewed yet",
+                    progress.changed_paths, progress.changed_lines
+                ),
+                Some(format!("crabdb agent review-flow {lane}")),
+            ),
+        };
+    factors.push(agent_confidence_factor(
+        "review",
+        review_state,
+        review_delta,
+        review_message,
+        review_command,
+    ));
+
+    let (validation_state, validation_delta, validation_message, validation_command) =
+        if validation.needs_test && validation.needs_eval {
+            (
+                "warn",
+                -18,
+                "latest test and eval gates are both missing".to_string(),
+                Some(validation.next.command.clone()),
+            )
+        } else if validation.needs_test {
+            (
+                "warn",
+                -14,
+                "latest test gate is missing".to_string(),
+                Some(validation.next.command.clone()),
+            )
+        } else if validation.needs_eval {
+            (
+                "warn",
+                -8,
+                "latest eval gate is missing".to_string(),
+                Some(validation.next.command.clone()),
+            )
+        } else {
+            (
+                "pass",
+                0,
+                "validation guidance has no required missing gate".to_string(),
+                Some(format!("crabdb agent validate {lane}")),
+            )
+        };
+    factors.push(agent_confidence_factor(
+        "validation",
+        validation_state,
+        validation_delta,
+        validation_message,
+        validation_command,
+    ));
+
+    let (risk_state, risk_delta, risk_message) = match risk.level {
+        AgentRiskLevel::Low => ("pass", 0, format!("risk is low ({}/100)", risk.score)),
+        AgentRiskLevel::Medium => ("warn", -12, format!("risk is medium ({}/100)", risk.score)),
+        AgentRiskLevel::High => ("warn", -25, format!("risk is high ({}/100)", risk.score)),
+        AgentRiskLevel::Blocking => (
+            "block",
+            -45,
+            format!("risk is blocking ({}/100)", risk.score),
+        ),
+    };
+    factors.push(agent_confidence_factor(
+        "risk",
+        risk_state,
+        risk_delta,
+        risk_message,
+        risk.recommendations
+            .first()
+            .map(|suggestion| suggestion.command.clone()),
+    ));
+
+    let (apply_state, apply_delta, apply_message, apply_command) = if ready.ready {
+        (
+            "pass",
+            0,
+            "Git dry-run preflight and CrabDB readiness passed".to_string(),
+            Some(format!("crabdb agent finish {lane} --dry-run")),
+        )
+    } else {
+        match ready.status.as_str() {
+            "applied" => (
+                "pass",
+                0,
+                "task has already been applied".to_string(),
+                Some(format!("crabdb agent finish {lane}")),
+            ),
+            "needs_record" => (
+                "warn",
+                -20,
+                "materialized task workdir has unrecorded changes".to_string(),
+                Some(ready.next.command.clone()),
+            ),
+            "conflicted" | "git_blocked" => (
+                "block",
+                -45,
+                ready.summary.clone(),
+                Some(ready.next.command.clone()),
+            ),
+            _ => (
+                if ready.blockers.is_empty() {
+                    "warn"
+                } else {
+                    "block"
+                },
+                if ready.blockers.is_empty() { -18 } else { -40 },
+                ready.summary.clone(),
+                Some(ready.next.command.clone()),
+            ),
+        }
+    };
+    factors.push(agent_confidence_factor(
+        "apply_preflight",
+        apply_state,
+        apply_delta,
+        apply_message,
+        apply_command,
+    ));
+
+    factors
+}
+
+fn agent_confidence_factor(
+    name: &str,
+    state: &str,
+    score_delta: i16,
+    message: String,
+    command: Option<String>,
+) -> AgentConfidenceFactor {
+    AgentConfidenceFactor {
+        name: name.to_string(),
+        state: state.to_string(),
+        score_delta,
+        message,
+        command,
+    }
+}
+
+fn agent_confidence_score(factors: &[AgentConfidenceFactor], risk: &AgentRiskReport) -> u8 {
+    let risk_penalty = match risk.level {
+        AgentRiskLevel::Low => 0,
+        AgentRiskLevel::Medium => 5,
+        AgentRiskLevel::High => 15,
+        AgentRiskLevel::Blocking => 30,
+    };
+    let factor_delta = factors.iter().map(|factor| factor.score_delta).sum::<i16>();
+    let score = 100i16 - risk_penalty + factor_delta;
+    score.clamp(0, 100) as u8
+}
+
+fn agent_confidence_verdict(
+    task: &AgentTaskReport,
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+    risk: &AgentRiskReport,
+    score: u8,
+) -> String {
+    if task.status == AgentTaskStatus::Applied || ready.status == "applied" {
+        return "applied".to_string();
+    }
+    if progress.status != "up_to_date" {
+        return "review".to_string();
+    }
+    if validation.needs_test || validation.needs_eval {
+        return "validate".to_string();
+    }
+    if ready.status == "conflicted" || ready.status == "git_blocked" || !ready.blockers.is_empty() {
+        return "blocked".to_string();
+    }
+    if !ready.ready {
+        return "wait".to_string();
+    }
+    if matches!(risk.level, AgentRiskLevel::Blocking | AgentRiskLevel::High) || score < 70 {
+        return "review".to_string();
+    }
+    "go".to_string()
+}
+
+fn agent_confidence_next(
+    lane: &str,
+    verdict: &str,
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+) -> StatusSuggestion {
+    match verdict {
+        "applied" => StatusSuggestion {
+            command: format!("crabdb agent finish {lane}"),
+            reason: "hide the already-applied task from the default inbox when done".to_string(),
+        },
+        "blocked" | "wait" => ready.next.clone(),
+        "review" if progress.status != "up_to_date" => StatusSuggestion {
+            command: format!("crabdb agent review-flow {lane}"),
+            reason: "walk through review before deciding whether to apply".to_string(),
+        },
+        "review" => StatusSuggestion {
+            command: format!("crabdb agent review-plan {lane}"),
+            reason: "inspect higher-risk files before applying".to_string(),
+        },
+        "validate" => validation.next.clone(),
+        "go" => StatusSuggestion {
+            command: format!("crabdb agent finish {lane} --dry-run"),
+            reason: "preview apply and archive before mutating Git".to_string(),
+        },
+        _ => ready.next.clone(),
+    }
+}
+
+fn agent_confidence_suggestions(
+    lane: &str,
+    primary: &StatusSuggestion,
+    verdict: &str,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+) -> Vec<StatusSuggestion> {
+    let mut suggestions = vec![primary.clone()];
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent review-flow {lane}"),
+        "walk through inspect, mark reviewed, validate, and finish",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent changes {lane} --by-file"),
+        "review changed files with prompt and checkpoint provenance",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        validation.next.command.clone(),
+        &validation.next.reason,
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        ready.next.command.clone(),
+        &ready.next.reason,
+    );
+    if verdict == "go" {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent finish {lane} --dry-run"),
+            "preview the final apply and cleanup plan",
+        );
+    }
+    suggestions
+}
+
+fn agent_confidence_summary(
+    task: &AgentTaskReport,
+    verdict: &str,
+    score: u8,
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+) -> String {
+    let label = agent_task_label(task);
+    let validation_state = if validation.needs_test || validation.needs_eval {
+        validation.status.as_str()
+    } else {
+        "current"
+    };
+    format!(
+        "{label}: verdict `{verdict}`, confidence {score}/100, review `{}`, validation `{validation_state}`, apply `{}`.",
+        progress.status, ready.status
+    )
+}
+
 fn agent_receipt_validation(review: &LaneReviewPacketReport) -> Vec<LaneTestSummary> {
     let mut validation = Vec::new();
     if let Some(test) = &review.latest_test {
@@ -4239,6 +7510,491 @@ fn agent_summary_text(receipt: &AgentReceiptReport, ready: &AgentReadyReport) ->
         ready.risk.level,
         ready.risk.score
     )
+}
+
+fn agent_dashboard_summary(
+    task: &AgentTaskReport,
+    ready: &AgentReadyReport,
+    validation: &AgentValidationReport,
+    focus: Option<&AgentFocusReport>,
+) -> String {
+    let title = agent_task_label(task);
+    let focus_text = focus
+        .map(|report| format!("next file `{}`", report.path))
+        .unwrap_or_else(|| "no changed file focus".to_string());
+    format!(
+        "{title}: {:?}, {} changed file(s), {focus_text}, validation `{}`, apply `{}`.",
+        task.status,
+        task.changed_paths.len(),
+        validation.status,
+        ready.status
+    )
+}
+
+fn agent_review_data_summary(
+    task: &AgentTaskReport,
+    confidence: &AgentConfidenceReport,
+    total_files: usize,
+    reviewed_files: usize,
+    needs_review_files: usize,
+) -> String {
+    let title = agent_task_label(task);
+    let progress = if total_files == 0 {
+        "no changed files".to_string()
+    } else if needs_review_files == 0 {
+        format!("all {total_files} changed file(s) reviewed")
+    } else {
+        format!("{reviewed_files}/{total_files} changed file(s) reviewed")
+    };
+    format!(
+        "{title}: {progress}, verdict `{}`, confidence {}/100, validation `{}`, apply `{}`.",
+        confidence.verdict, confidence.score, confidence.validation.status, confidence.ready.status
+    )
+}
+
+fn agent_review_data_actions(
+    lane: &str,
+    focus: Option<&AgentFocusReport>,
+    confidence: &AgentConfidenceReport,
+    needs_review_files: usize,
+) -> Vec<AgentReviewAction> {
+    let mut actions = Vec::new();
+    if let Some(focus) = focus {
+        let path_arg = agent_shell_arg(&focus.path);
+        let open_command = focus
+            .open_command
+            .clone()
+            .unwrap_or_else(|| format!("crabdb agent open {lane} --file {path_arg}"));
+        actions.push(agent_review_action(
+            "open_focus_file",
+            "Open focus file",
+            "open_file",
+            open_command,
+            "open the highest-priority changed file",
+            true,
+            None,
+            "read_only",
+            false,
+            Some(focus.path.clone()),
+            focus.open_path.clone(),
+            None,
+            None,
+        ));
+        actions.push(agent_review_action(
+            "inspect_focus_file",
+            "Inspect focus file",
+            "inspect_file",
+            format!("crabdb agent focus {lane} --file {path_arg}"),
+            "show why this file is the next review target",
+            true,
+            None,
+            "read_only",
+            false,
+            Some(focus.path.clone()),
+            focus.open_path.clone(),
+            Some("crabdb.agent_focus"),
+            Some(serde_json::json!({
+                "selector": lane,
+                "file": focus.path,
+                "patch": false
+            })),
+        ));
+        actions.push(agent_review_action(
+            "show_focus_patch",
+            "Show focus patch",
+            "show_patch",
+            format!("crabdb agent focus {lane} --file {path_arg} --patch"),
+            "show the focused diff for this file",
+            true,
+            None,
+            "read_only",
+            false,
+            Some(focus.path.clone()),
+            focus.open_path.clone(),
+            Some("crabdb.agent_focus"),
+            Some(serde_json::json!({
+                "selector": lane,
+                "file": focus.path,
+                "patch": true
+            })),
+        ));
+        actions.push(agent_review_action(
+            "mark_focus_file_reviewed",
+            "Mark file reviewed",
+            "mark_file_reviewed",
+            format!("crabdb agent done-file {lane} {path_arg}"),
+            "record that this changed file has been reviewed",
+            needs_review_files > 0,
+            if needs_review_files > 0 {
+                None
+            } else {
+                Some("all changed files are already reviewed".to_string())
+            },
+            "workspace_write",
+            false,
+            Some(focus.path.clone()),
+            focus.open_path.clone(),
+            Some("crabdb.agent_mark_file_reviewed"),
+            Some(serde_json::json!({
+                "selector": lane,
+                "path": focus.path,
+                "note": null
+            })),
+        ));
+    }
+
+    actions.push(agent_review_action(
+        "show_review_map",
+        "Show review map",
+        "show_review_map",
+        format!("crabdb agent review-map {lane}"),
+        "show file-level review progress grouped by area",
+        true,
+        None,
+        "read_only",
+        false,
+        None,
+        None,
+        Some("crabdb.agent_review_map"),
+        Some(serde_json::json!({ "selector": lane })),
+    ));
+    actions.push(agent_review_action(
+        "show_test_plan",
+        "Show test plan",
+        "show_test_plan",
+        format!("crabdb agent test-plan {lane}"),
+        "show exact validation commands before applying",
+        true,
+        None,
+        "read_only",
+        false,
+        None,
+        None,
+        Some("crabdb.agent_test_plan"),
+        Some(serde_json::json!({ "selector": lane })),
+    ));
+
+    let validation_safety = agent_review_action_safety(&confidence.validation.next.command);
+    actions.push(agent_review_action(
+        "validation_next",
+        "Run validation next step",
+        "validation_next",
+        confidence.validation.next.command.clone(),
+        confidence.validation.next.reason.clone(),
+        true,
+        None,
+        validation_safety,
+        validation_safety != "read_only",
+        None,
+        None,
+        agent_review_action_mcp_tool(&confidence.validation.next.command),
+        agent_review_action_mcp_arguments(
+            &confidence.validation.next.command,
+            agent_review_action_mcp_tool(&confidence.validation.next.command),
+            lane,
+        ),
+    ));
+    actions.push(agent_review_action(
+        "apply_dry_run",
+        "Preview apply",
+        "apply_dry_run",
+        format!("crabdb agent apply {lane} --dry-run"),
+        "preview applying this task without mutating Git",
+        true,
+        None,
+        "read_only",
+        false,
+        None,
+        None,
+        Some("crabdb.agent_apply"),
+        Some(serde_json::json!({
+            "selector": lane,
+            "dry-run": true,
+            "message": null
+        })),
+    ));
+    let apply_enabled = confidence.ready.ready;
+    actions.push(agent_review_action(
+        "apply_task",
+        "Apply task",
+        "apply",
+        format!("crabdb agent finish {lane}"),
+        if confidence.ready.ready {
+            "apply this task and hide it from the default inbox"
+        } else {
+            "disabled until review, validation, risk, and apply preflight are ready"
+        },
+        apply_enabled,
+        if apply_enabled {
+            None
+        } else {
+            Some("review, validation, risk, or apply preflight is not ready".to_string())
+        },
+        "destructive",
+        true,
+        None,
+        None,
+        Some("crabdb.agent_finish"),
+        Some(serde_json::json!({
+            "selector": lane,
+            "dry-run": false,
+            "message": null,
+            "note": null
+        })),
+    ));
+    if needs_review_files == 0 && confidence.review_status != "up_to_date" {
+        actions.push(agent_review_action(
+            "mark_task_reviewed",
+            "Mark task reviewed",
+            "mark_task_reviewed",
+            format!("crabdb agent done {lane}"),
+            "record the current checkpoint as reviewed after all files are inspected",
+            true,
+            None,
+            "workspace_write",
+            false,
+            None,
+            None,
+            Some("crabdb.agent_mark_reviewed"),
+            Some(serde_json::json!({
+                "selector": lane,
+                "note": null
+            })),
+        ));
+    }
+    actions
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_review_action(
+    id: &str,
+    label: &str,
+    kind: &str,
+    command: impl Into<String>,
+    reason: impl Into<String>,
+    enabled: bool,
+    disabled_reason: Option<String>,
+    safety: &str,
+    requires_confirmation: bool,
+    path: Option<String>,
+    open_path: Option<String>,
+    mcp_tool: Option<&str>,
+    mcp_arguments: Option<serde_json::Value>,
+) -> AgentReviewAction {
+    AgentReviewAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        kind: kind.to_string(),
+        command: command.into(),
+        reason: reason.into(),
+        enabled,
+        disabled_reason,
+        safety: safety.to_string(),
+        requires_confirmation,
+        path,
+        open_path,
+        mcp_tool: mcp_tool.map(ToString::to_string),
+        mcp_arguments,
+    }
+}
+
+fn agent_review_action_safety(command: &str) -> &'static str {
+    if command.contains(" agent test ") || command.contains(" agent eval ") {
+        "open_world"
+    } else if command.contains(" done")
+        || command.contains("mark-reviewed")
+        || command.contains("mark-file-reviewed")
+    {
+        "workspace_write"
+    } else if command.contains(" finish ")
+        || command.contains(" apply ")
+        || command.contains(" rewind")
+        || command.contains(" undo")
+    {
+        if command.contains("--dry-run") {
+            "read_only"
+        } else {
+            "destructive"
+        }
+    } else {
+        "read_only"
+    }
+}
+
+fn agent_review_action_mcp_tool(command: &str) -> Option<&'static str> {
+    if command.contains(" agent test ") {
+        Some("crabdb.agent_test")
+    } else if command.contains(" agent eval ") {
+        Some("crabdb.agent_eval")
+    } else if command.contains(" agent ready ") || command.contains(" agent can-land ") {
+        Some("crabdb.agent_ready")
+    } else if command.contains(" agent test-plan ") {
+        Some("crabdb.agent_test_plan")
+    } else {
+        None
+    }
+}
+
+fn agent_review_action_mcp_arguments(
+    command: &str,
+    tool: Option<&str>,
+    lane: &str,
+) -> Option<serde_json::Value> {
+    match tool {
+        Some("crabdb.agent_ready") => Some(serde_json::json!({ "selector": lane })),
+        Some("crabdb.agent_test_plan") => Some(serde_json::json!({ "selector": lane })),
+        Some("crabdb.agent_test") | Some("crabdb.agent_eval") => {
+            agent_review_action_gate_args(command, lane)
+        }
+        _ => None,
+    }
+}
+
+fn agent_review_action_gate_args(command: &str, lane: &str) -> Option<serde_json::Value> {
+    let marker = if command.contains(" agent test ") {
+        " -- "
+    } else if command.contains(" agent eval ") {
+        " -- "
+    } else {
+        return None;
+    };
+    let (_prefix, tail) = command.split_once(marker)?;
+    let command_args = tail
+        .split_whitespace()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+    if command_args.is_empty() || command_args.iter().any(|part| part.starts_with('<')) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "selector": lane,
+        "command": command_args
+    }))
+}
+
+fn agent_review_data_suggestions(
+    lane: &str,
+    next: &StatusSuggestion,
+    focus: Option<&AgentFocusReport>,
+    needs_review_files: usize,
+) -> Vec<StatusSuggestion> {
+    let mut suggestions = vec![next.clone()];
+    if let Some(focus) = focus {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!(
+                "crabdb agent focus {lane} --file {}",
+                agent_shell_arg(&focus.path)
+            ),
+            "inspect the current highest-priority file with provenance",
+        );
+        if needs_review_files > 0 {
+            agent_push_suggestion(
+                &mut suggestions,
+                format!(
+                    "crabdb agent done-file {lane} {}",
+                    agent_shell_arg(&focus.path)
+                ),
+                "mark this file reviewed after inspection",
+            );
+        }
+    }
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent review-map {lane}"),
+        "see file-level review progress grouped by area",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent test-plan {lane}"),
+        "see exact validation commands to run before applying",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent can-land {lane}"),
+        "check apply readiness without mutating Git",
+    );
+    suggestions
+}
+
+fn agent_already_applied_suggestions(task: &AgentTaskReport) -> Vec<StatusSuggestion> {
+    let provider = task.provider.as_deref().unwrap_or("claude-code");
+    let mut suggestions = Vec::new();
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent view {}", task.lane),
+        "inspect the applied task transcript, tools, and checkpoint",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent finish {}", task.lane),
+        "hide the applied task from the default inbox when you are done",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent continue {} --provider {provider}", task.lane),
+        "start a fresh follow-up task from this applied checkpoint instead of reusing the applied lane",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        "crabdb agent inbox".to_string(),
+        "choose another active agent task",
+    );
+    suggestions
+}
+
+fn agent_finish_suggestions(
+    task: &AgentTaskReport,
+    apply: &AgentApplyReport,
+    status: &str,
+    dry_run: bool,
+) -> Vec<StatusSuggestion> {
+    let lane = &task.lane;
+    let mut suggestions = Vec::new();
+    if dry_run && matches!(status, "ready") {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent finish {lane}"),
+            "apply the task and hide it from the default inbox after success",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent land {lane}"),
+            "apply the task but keep it visible in the default inbox",
+        );
+        return suggestions;
+    }
+    if status == "finished" {
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent inbox".to_string(),
+            "pick the next active agent task",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent receipt {lane}"),
+            "print the applied task receipt if you need to share it",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent continue {lane}"),
+            "start a fresh follow-up task from this applied checkpoint",
+        );
+        return suggestions;
+    }
+    for suggestion in &apply.suggestions {
+        agent_push_suggestion(
+            &mut suggestions,
+            suggestion.command.clone(),
+            &suggestion.reason,
+        );
+    }
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent view {lane}"),
+        "inspect the task transcript, tools, and checkpoint",
+    );
+    suggestions
 }
 
 fn agent_summary_suggestions(
@@ -4379,6 +8135,279 @@ fn agent_validation_suggestions(
         "preview apply after validation passes",
     );
     suggestions
+}
+
+fn agent_test_plan_steps(
+    lane: &str,
+    workspace_root: &Path,
+    validation: &AgentValidationReport,
+    impact: &AgentImpactReport,
+) -> Vec<AgentTestPlanStep> {
+    let mut steps = Vec::new();
+    let high_impact_paths = agent_test_plan_high_impact_paths(&impact.areas);
+    let broad_needed = !high_impact_paths.is_empty();
+    let test_failed = validation
+        .latest_test
+        .as_ref()
+        .is_some_and(|gate| !gate.success);
+    if validation.needs_test {
+        let broad = broad_needed;
+        let command_parts = agent_validation_default_test_command(workspace_root, broad);
+        let paths = if broad_needed {
+            high_impact_paths.clone()
+        } else {
+            validation.changed_paths.clone()
+        };
+        steps.push(AgentTestPlanStep {
+            rank: 0,
+            kind: "test".to_string(),
+            label: if broad {
+                "Run broad test gate".to_string()
+            } else {
+                "Run test gate".to_string()
+            },
+            state: if test_failed { "failed" } else { "needed" }.to_string(),
+            required: true,
+            command: format!(
+                "crabdb agent test {lane} -- {}",
+                agent_validation_command_text(&command_parts)
+            ),
+            reason: if test_failed {
+                "latest recorded test gate failed; rerun after reviewing the agent changes"
+                    .to_string()
+            } else if broad {
+                "high-impact files changed, so record a broader passing test gate".to_string()
+            } else {
+                "no passing test gate has been recorded for this task".to_string()
+            },
+            area_key: if broad {
+                Some("high_impact".to_string())
+            } else {
+                None
+            },
+            area_label: if broad {
+                Some("High-impact changed areas".to_string())
+            } else {
+                None
+            },
+            paths,
+            latest_gate: validation.latest_test.clone(),
+        });
+    } else if let Some(gate) = &validation.latest_test {
+        steps.push(AgentTestPlanStep {
+            rank: 0,
+            kind: "test".to_string(),
+            label: "Latest test gate passed".to_string(),
+            state: "done".to_string(),
+            required: false,
+            command: format!("crabdb agent validate {lane}"),
+            reason: "a passing test gate is already recorded for this task".to_string(),
+            area_key: None,
+            area_label: None,
+            paths: validation.changed_paths.clone(),
+            latest_gate: Some(gate.clone()),
+        });
+    }
+
+    let eval_failed = validation
+        .latest_eval
+        .as_ref()
+        .is_some_and(|gate| !gate.success);
+    if validation.needs_eval {
+        steps.push(AgentTestPlanStep {
+            rank: 0,
+            kind: "eval".to_string(),
+            label: if eval_failed {
+                "Rerun eval gate".to_string()
+            } else {
+                "Record eval gate when quality policy matters".to_string()
+            },
+            state: if eval_failed { "failed" } else { "optional" }.to_string(),
+            required: eval_failed,
+            command: format!("crabdb agent eval {lane} -- <eval-command>"),
+            reason: if eval_failed {
+                "latest recorded eval gate failed; rerun the relevant quality eval".to_string()
+            } else {
+                "record this only when model, policy, or product-quality behavior matters"
+                    .to_string()
+            },
+            area_key: None,
+            area_label: None,
+            paths: validation.changed_paths.clone(),
+            latest_gate: validation.latest_eval.clone(),
+        });
+    } else if let Some(gate) = &validation.latest_eval {
+        steps.push(AgentTestPlanStep {
+            rank: 0,
+            kind: "eval".to_string(),
+            label: "Latest eval gate passed".to_string(),
+            state: "done".to_string(),
+            required: false,
+            command: format!("crabdb agent validate {lane}"),
+            reason: "a passing eval gate is already recorded for this task".to_string(),
+            area_key: None,
+            area_label: None,
+            paths: validation.changed_paths.clone(),
+            latest_gate: Some(gate.clone()),
+        });
+    }
+
+    if broad_needed && !validation.needs_test {
+        let command_parts = agent_validation_default_test_command(workspace_root, true);
+        steps.push(AgentTestPlanStep {
+            rank: 0,
+            kind: "test".to_string(),
+            label: "Consider broad regression test".to_string(),
+            state: "optional".to_string(),
+            required: false,
+            command: format!(
+                "crabdb agent test {lane} -- {}",
+                agent_validation_command_text(&command_parts)
+            ),
+            reason: "high-impact files changed; run this if the existing gate was too narrow"
+                .to_string(),
+            area_key: Some("high_impact".to_string()),
+            area_label: Some("High-impact changed areas".to_string()),
+            paths: high_impact_paths,
+            latest_gate: validation.latest_test.clone(),
+        });
+    }
+
+    steps.push(AgentTestPlanStep {
+        rank: 0,
+        kind: "readiness".to_string(),
+        label: "Check confidence after validation".to_string(),
+        state: "pending".to_string(),
+        required: false,
+        command: format!("crabdb agent confidence {lane}"),
+        reason: "finish with one go/no-go verdict after review and validation".to_string(),
+        area_key: None,
+        area_label: None,
+        paths: Vec::new(),
+        latest_gate: None,
+    });
+
+    for (index, step) in steps.iter_mut().enumerate() {
+        step.rank = index + 1;
+    }
+    steps
+}
+
+fn agent_test_plan_high_impact_paths(areas: &[AgentImpactArea]) -> Vec<FileDiffSummary> {
+    areas
+        .iter()
+        .filter(|area| {
+            matches!(
+                area.key.as_str(),
+                "dependencies" | "build_config" | "public_api" | "integrations"
+            )
+        })
+        .flat_map(|area| area.changed_paths.iter().cloned())
+        .collect()
+}
+
+fn agent_test_plan_status(steps: &[AgentTestPlanStep]) -> String {
+    if steps
+        .iter()
+        .any(|step| step.required && step.state == "failed")
+    {
+        return "failed_gate".to_string();
+    }
+    if steps
+        .iter()
+        .any(|step| step.required && step.state == "needed")
+    {
+        return "needs_test".to_string();
+    }
+    if steps
+        .iter()
+        .any(|step| step.required && step.state != "done")
+    {
+        return "needs_validation".to_string();
+    }
+    if steps.iter().any(|step| step.state == "optional") {
+        return "optional_eval".to_string();
+    }
+    "current".to_string()
+}
+
+fn agent_test_plan_next(lane: &str, steps: &[AgentTestPlanStep]) -> StatusSuggestion {
+    if let Some(step) = steps
+        .iter()
+        .find(|step| step.required && step.state != "done")
+    {
+        return StatusSuggestion {
+            command: step.command.clone(),
+            reason: step.reason.clone(),
+        };
+    }
+    if let Some(step) = steps.iter().find(|step| step.state == "optional") {
+        return StatusSuggestion {
+            command: step.command.clone(),
+            reason: step.reason.clone(),
+        };
+    }
+    StatusSuggestion {
+        command: format!("crabdb agent confidence {lane}"),
+        reason: "validation is current; finish with one go/no-go verdict".to_string(),
+    }
+}
+
+fn agent_test_plan_suggestions(
+    lane: &str,
+    next: &StatusSuggestion,
+    validation: &AgentValidationReport,
+    impact: &AgentImpactReport,
+) -> Vec<StatusSuggestion> {
+    let mut suggestions = vec![next.clone()];
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent validate {lane}"),
+        "see latest recorded test and eval gates",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent impact {lane}"),
+        "see why the validation plan chose these checks",
+    );
+    if !impact.areas.is_empty() {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent review-map {lane}"),
+            "review changed files before running validation",
+        );
+    }
+    if !validation.recent_gates.is_empty() {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb lane gates {lane}"),
+            "inspect recorded validation gate history",
+        );
+    }
+    suggestions
+}
+
+fn agent_test_plan_summary(
+    task: &AgentTaskReport,
+    status: &str,
+    steps: &[AgentTestPlanStep],
+    impact: &AgentImpactReport,
+) -> String {
+    let required = steps
+        .iter()
+        .filter(|step| step.required && step.state != "done")
+        .count();
+    let optional = steps.iter().filter(|step| step.state == "optional").count();
+    let top_area = impact
+        .areas
+        .first()
+        .map(|area| area.label.as_str())
+        .unwrap_or("changed files");
+    format!(
+        "{} validation plan: status `{status}`, {required} required step(s), {optional} optional step(s), highest impact `{}` in {top_area}.",
+        agent_task_label(task),
+        impact.highest_impact
+    )
 }
 
 fn agent_validation_default_test_command(workspace_root: &Path, broad: bool) -> Vec<String> {
@@ -4742,6 +8771,209 @@ fn agent_focus_suggestions(
     suggestions
 }
 
+fn agent_review_flow_steps(
+    lane: &str,
+    new: &AgentNewReport,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+    focus: Option<&AgentFocusReport>,
+) -> Vec<AgentReviewFlowStep> {
+    let review_open = new.status != "up_to_date";
+    let validation_open = validation.needs_test || validation.needs_eval;
+    let applied = ready.status == "applied" || ready.task.status == AgentTaskStatus::Applied;
+
+    let inspect_command = if review_open {
+        new.next.command.clone()
+    } else {
+        format!("crabdb agent changes {lane}")
+    };
+    let inspect_reason = if review_open {
+        new.next.reason.clone()
+    } else if let Some(focus) = focus {
+        format!(
+            "current checkpoint is reviewed; highest-priority file was `{}`",
+            focus.path
+        )
+    } else {
+        "current checkpoint is reviewed and no changed file needs focus".to_string()
+    };
+
+    let mut steps = vec![agent_review_flow_step(
+        "Inspect changes",
+        if review_open { "current" } else { "done" },
+        inspect_command,
+        inspect_reason,
+    )];
+
+    steps.push(agent_review_flow_step(
+        "Mark reviewed",
+        if review_open { "pending" } else { "done" },
+        format!("crabdb agent done {lane}"),
+        if review_open {
+            "mark the current checkpoint reviewed after inspecting the new changes".to_string()
+        } else {
+            "current checkpoint is already marked reviewed".to_string()
+        },
+    ));
+
+    let validation_state = if review_open {
+        "pending"
+    } else if validation_open {
+        "current"
+    } else {
+        "done"
+    };
+    let validation_command = if validation_open {
+        validation.next.command.clone()
+    } else {
+        format!("crabdb agent validate {lane}")
+    };
+    steps.push(agent_review_flow_step(
+        "Validate",
+        validation_state,
+        validation_command,
+        if validation_open {
+            validation.next.reason.clone()
+        } else {
+            "latest test/eval guidance has no required gate missing".to_string()
+        },
+    ));
+
+    let finish_state = if applied {
+        "done"
+    } else if review_open || validation_open {
+        "pending"
+    } else if ready.ready || ready.status == "ready" {
+        "current"
+    } else {
+        "blocked"
+    };
+    let finish_command = if ready.ready || ready.status == "ready" {
+        format!("crabdb agent finish {lane} --dry-run")
+    } else {
+        ready.next.command.clone()
+    };
+    steps.push(agent_review_flow_step(
+        "Finish safely",
+        finish_state,
+        finish_command,
+        if applied {
+            "task has already been applied; finish only needs cleanup".to_string()
+        } else if review_open {
+            "finish waits until new changes are reviewed".to_string()
+        } else if validation_open {
+            "finish waits until recommended validation is addressed".to_string()
+        } else if ready.ready || ready.status == "ready" {
+            "preview apply and archive without mutating Git".to_string()
+        } else {
+            ready.next.reason.clone()
+        },
+    ));
+
+    steps
+}
+
+fn agent_review_flow_step(
+    label: &str,
+    state: &str,
+    command: String,
+    reason: String,
+) -> AgentReviewFlowStep {
+    AgentReviewFlowStep {
+        label: label.to_string(),
+        state: state.to_string(),
+        command,
+        reason,
+    }
+}
+
+fn agent_review_flow_summary(
+    task: &AgentTaskReport,
+    progress: &AgentReviewProgress,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+    focus: Option<&AgentFocusReport>,
+) -> String {
+    let label = agent_task_label(task);
+    let focus_text = focus
+        .map(|focus| format!("next focus `{}`", focus.path))
+        .unwrap_or_else(|| "no focus file".to_string());
+    let validation_text = if validation.needs_test && validation.needs_eval {
+        "test and eval missing"
+    } else if validation.needs_test {
+        "test missing"
+    } else if validation.needs_eval {
+        "eval missing"
+    } else {
+        "validation current"
+    };
+    format!(
+        "{label}: review `{}`, {} new file(s), {} new line(s), {focus_text}, {validation_text}, apply `{}`.",
+        progress.status, progress.changed_paths, progress.changed_lines, ready.status
+    )
+}
+
+fn agent_review_flow_suggestions(
+    lane: &str,
+    primary: &StatusSuggestion,
+    review: &AgentReviewReport,
+    new: &AgentNewReport,
+    validation: &AgentValidationReport,
+    ready: &AgentReadyReport,
+    focus: Option<&AgentFocusReport>,
+) -> Vec<StatusSuggestion> {
+    let mut suggestions = vec![primary.clone()];
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent review-flow {lane}"),
+        "refresh the guided review checklist after each step",
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent new {lane}"),
+        "show what changed since the latest reviewed marker",
+    );
+    if let Some(focus) = focus {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!(
+                "crabdb agent focus {lane} --file {}",
+                agent_shell_arg(&focus.path)
+            ),
+            "inspect the highest-priority file with provenance and diff context",
+        );
+    } else if let Some(priority) = review.priorities.first() {
+        agent_push_suggestion(
+            &mut suggestions,
+            priority.why_command.clone(),
+            "explain why the highest-priority file changed",
+        );
+    }
+    if new.status != "up_to_date" {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent done {lane}"),
+            "mark the checkpoint reviewed after inspection",
+        );
+    }
+    agent_push_suggestion(
+        &mut suggestions,
+        validation.next.command.clone(),
+        &validation.next.reason,
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        ready.next.command.clone(),
+        &ready.next.reason,
+    );
+    agent_push_suggestion(
+        &mut suggestions,
+        format!("crabdb agent finish {lane} --dry-run"),
+        "preview apply and cleanup once review and validation are done",
+    );
+    suggestions
+}
+
 fn agent_focus_diff_target(groups: &[AgentChangeGroup]) -> (Option<String>, Option<String>) {
     let Some(group) = groups.first() else {
         return (None, None);
@@ -4949,6 +9181,123 @@ fn agent_change_cards(
         .collect()
 }
 
+fn agent_file_change_cards(
+    lane: &str,
+    paths: &[FileDiffSummary],
+    groups: &[AgentChangeGroup],
+) -> Vec<AgentChangeCard> {
+    let mut ranked = Vec::new();
+    let mut changed_paths = paths.to_vec();
+    changed_paths.sort_by(|left, right| left.path.cmp(&right.path));
+
+    for change in changed_paths {
+        let touched_groups = groups
+            .iter()
+            .filter(|group| {
+                group
+                    .changed_paths
+                    .iter()
+                    .any(|file| agent_file_matches_path(file, &change.path))
+            })
+            .collect::<Vec<_>>();
+        let touched_by = touched_groups
+            .iter()
+            .map(|group| agent_file_touch_for_path(lane, group, &change.path))
+            .collect::<Vec<_>>();
+
+        let mut operations = Vec::new();
+        let mut seen_operations = BTreeSet::new();
+        for group in &touched_groups {
+            for operation in &group.operations {
+                if seen_operations.insert(operation.clone()) {
+                    operations.push(operation.clone());
+                }
+            }
+        }
+
+        let mut tool_summaries = Vec::new();
+        let mut seen_tools = BTreeSet::new();
+        for group in &touched_groups {
+            for tool in &group.tool_summaries {
+                if seen_tools.insert(tool.clone()) {
+                    tool_summaries.push(tool.clone());
+                }
+                if tool_summaries.len() >= 8 {
+                    break;
+                }
+            }
+            if tool_summaries.len() >= 8 {
+                break;
+            }
+        }
+
+        let (score, mut reasons) = agent_review_priority_score(&change, touched_by.len());
+        if reasons.is_empty() {
+            reasons.push("changed by the agent task".to_string());
+        }
+        let risk = agent_change_card_risk(score);
+        let churn = change.additions + change.deletions;
+        let path = change.path.clone();
+        let file_arg = agent_shell_arg(&path);
+        let title = path.clone();
+        let summary = format!(
+            "`{}`: {:?} (+{} -{}), touched by {} turn(s) or operation(s).",
+            path,
+            change.kind,
+            change.additions,
+            change.deletions,
+            touched_by.len()
+        );
+        let diff_command = touched_by
+            .first()
+            .map(|touch| agent_file_diff_command(lane, touch, &path))
+            .unwrap_or_else(|| format!("crabdb agent diff {lane} --file {file_arg} --patch"));
+
+        ranked.push((
+            agent_change_card_risk_rank(&risk),
+            score,
+            churn,
+            AgentChangeCard {
+                rank: 0,
+                key: path.clone(),
+                title,
+                summary,
+                risk,
+                reasons,
+                changed_paths: vec![change],
+                touched_by,
+                operations,
+                tool_summaries,
+                review_command: String::new(),
+                focus_command: Some(format!("crabdb agent focus {lane} --file {file_arg}")),
+                why_command: Some(format!("crabdb agent why {lane} {file_arg}")),
+                diff_command: Some(diff_command),
+            },
+        ));
+    }
+
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.3.title.cmp(&right.3.title))
+    });
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, _, _, mut card))| {
+            card.rank = index + 1;
+            card.review_command = format!(
+                "crabdb agent file {lane} {}",
+                agent_shell_arg(card.key.as_str())
+            );
+            card
+        })
+        .collect()
+}
+
 fn agent_changes_next(lane: &str, cards: &[AgentChangeCard]) -> StatusSuggestion {
     if let Some(card) = cards.first() {
         return StatusSuggestion {
@@ -5005,6 +9354,14 @@ fn agent_changes_summary(
 ) -> String {
     if view.task.changed_paths.is_empty() {
         return "No changed files recorded for this agent task.".to_string();
+    }
+    if grouping == "file" {
+        return format!(
+            "{} changed file(s) are shown as {} file review card(s), with {} turn/operation group(s) available for provenance.",
+            view.task.changed_paths.len(),
+            cards.len(),
+            groups.len()
+        );
     }
     format!(
         "{} changed file(s) are grouped into {} review card(s), with {} {} checkpoint group(s) available for detail.",
@@ -5680,6 +10037,97 @@ fn agent_mark_reviewed_suggestions(lane: &str) -> Vec<StatusSuggestion> {
             reason: "return to the latest task status and next action".to_string(),
         },
     ]
+}
+
+fn agent_mark_file_reviewed_summary(
+    task: &AgentTaskReport,
+    path: &str,
+    previous: Option<&AgentFileReviewMarker>,
+    marker: &AgentFileReviewMarker,
+) -> String {
+    match previous {
+        Some(previous) if previous.checkpoint == marker.checkpoint => format!(
+            "`{path}` in {} was already marked reviewed at checkpoint `{}`; refreshed the file marker.",
+            agent_task_label(task),
+            marker.checkpoint.0
+        ),
+        Some(previous) => format!(
+            "`{path}` in {} marked reviewed at checkpoint `{}`; previous file marker was `{}`.",
+            agent_task_label(task),
+            marker.checkpoint.0,
+            previous.checkpoint.0
+        ),
+        None => format!(
+            "`{path}` in {} marked reviewed at checkpoint `{}`.",
+            agent_task_label(task),
+            marker.checkpoint.0
+        ),
+    }
+}
+
+fn agent_mark_file_reviewed_suggestions(lane: &str, path: &str) -> Vec<StatusSuggestion> {
+    vec![
+        StatusSuggestion {
+            command: format!("crabdb agent review-map {lane}"),
+            reason: "continue the file-by-file review checklist".to_string(),
+        },
+        StatusSuggestion {
+            command: format!("crabdb agent file {lane} {}", agent_shell_arg(path)),
+            reason: "reopen the reviewed file context if needed".to_string(),
+        },
+        StatusSuggestion {
+            command: format!("crabdb agent confidence {lane}"),
+            reason: "finish with one go/no-go verdict after review and validation".to_string(),
+        },
+    ]
+}
+
+fn agent_archive_summary(
+    task: &AgentTaskReport,
+    archived: bool,
+    previous_archived: bool,
+) -> String {
+    let label = agent_task_label(task);
+    match (archived, previous_archived) {
+        (true, true) => format!("{label} was already archived; it remains hidden from the default agent inbox."),
+        (true, false) => format!("{label} archived; it is hidden from the default agent inbox and can be restored with `agent unarchive`."),
+        (false, true) => format!("{label} restored; it will appear in the default agent inbox again."),
+        (false, false) => format!("{label} was not archived; it remains visible in the default agent inbox."),
+    }
+}
+
+fn agent_archive_suggestions(task: &AgentTaskReport, archived: bool) -> Vec<StatusSuggestion> {
+    let lane = &task.lane;
+    let mut suggestions = Vec::new();
+    if archived {
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent inbox".to_string(),
+            "return to the active task inbox without archived tasks",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent inbox --all".to_string(),
+            "show active and archived tasks together",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent unarchive {lane}"),
+            "restore this task to the default inbox",
+        );
+    } else {
+        agent_push_suggestion(
+            &mut suggestions,
+            format!("crabdb agent view {lane}"),
+            "inspect the restored task transcript, tools, and checkpoint",
+        );
+        agent_push_suggestion(
+            &mut suggestions,
+            "crabdb agent inbox".to_string(),
+            "return to the active task inbox",
+        );
+    }
+    suggestions
 }
 
 fn agent_timeline_items(
@@ -6389,6 +10837,179 @@ fn agent_receipt_markdown(
     out
 }
 
+fn agent_handoff_summary(report: &AgentReviewBundleReport) -> String {
+    let title = agent_task_label(&report.task);
+    format!(
+        "{title}: handoff packet with {} changed file(s), {} turn(s), {:?} risk, and readiness `{}`.",
+        report.task.changed_paths.len(),
+        report.task.turns,
+        report.risk.level,
+        report.readiness_status
+    )
+}
+
+fn agent_handoff_markdown(
+    report: &AgentReviewBundleReport,
+    validation: &[LaneTestSummary],
+) -> String {
+    let mut out = String::new();
+    let title = agent_task_label(&report.task);
+    out.push_str(&format!("# Agent Task Handoff: {title}\n\n"));
+    out.push_str("Use this packet to continue, review, validate, or apply the recorded agent task without reading CrabDB internals.\n\n");
+
+    out.push_str("## Current State\n\n");
+    out.push_str(&format!("- Task: `{}`\n", report.task.name));
+    out.push_str(&format!("- Lane: `{}`\n", report.task.lane));
+    out.push_str(&format!("- Status: {:?}\n", report.task.status));
+    out.push_str(&format!(
+        "- Readiness: {}{}\n",
+        report.readiness_status,
+        if report.ready_to_apply {
+            " (ready)"
+        } else {
+            ""
+        }
+    ));
+    out.push_str(&format!(
+        "- Risk: {:?} ({}/100)\n",
+        report.risk.level, report.risk.score
+    ));
+    out.push_str(&format!(
+        "- Changed files: {}  Turns: {}  Tool events: {}\n",
+        report.task.changed_paths.len(),
+        report.task.turns,
+        report.task.tool_events
+    ));
+    if let Some(checkpoint) = &report.task.latest_checkpoint {
+        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+    }
+    if let Some(workdir) = &report.task.workdir {
+        out.push_str(&format!("- Workdir: `{workdir}`\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!("{}\n\n", report.story.summary));
+
+    out.push_str("## Receiver Next Step\n\n");
+    out.push_str(&format!("```sh\n{}\n```\n\n", report.next.command));
+    out.push_str(&format!("{}\n\n", report.next.reason));
+
+    out.push_str("## Review Commands\n\n");
+    out.push_str(&format!("```sh\ncrabdb agent focus {}\n", report.task.lane));
+    out.push_str(&format!("crabdb agent changes {}\n", report.task.lane));
+    out.push_str(&format!("crabdb agent review-plan {}\n", report.task.lane));
+    out.push_str(&format!("crabdb agent ready {}\n", report.task.lane));
+    out.push_str(&format!(
+        "crabdb agent land {} --dry-run\n",
+        report.task.lane
+    ));
+    out.push_str("```\n\n");
+
+    out.push_str("## Validation\n\n");
+    if validation.is_empty() {
+        out.push_str("No test or eval gate has been recorded for this task.\n\n");
+    } else {
+        for gate in validation {
+            let suite = gate.suite.as_deref().unwrap_or("default");
+            let result = if gate.success { "passed" } else { "failed" };
+            out.push_str(&format!(
+                "- {} `{}` {}: `{}`",
+                gate.kind,
+                suite,
+                result,
+                shell_join(&gate.command)
+            ));
+            if let Some(code) = gate.exit_code {
+                out.push_str(&format!(" (exit {code})"));
+            }
+            if let Some(score) = gate.score {
+                out.push_str(&format!(" score {score}"));
+            }
+            if let Some(threshold) = gate.threshold {
+                out.push_str(&format!(" threshold {threshold}"));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    if !report.review.readiness.blockers.is_empty() {
+        out.push_str("## Blockers\n\n");
+        for blocker in &report.review.readiness.blockers {
+            out.push_str(&format!("- {}: {}\n", blocker.code, blocker.message));
+        }
+        out.push('\n');
+    }
+    if !report.review.readiness.warnings.is_empty() {
+        out.push_str("## Warnings\n\n");
+        for warning in &report.review.readiness.warnings {
+            out.push_str(&format!("- {}: {}\n", warning.code, warning.message));
+        }
+        out.push('\n');
+    }
+    if !report.risk.reasons.is_empty() {
+        out.push_str("## Risk Notes\n\n");
+        for reason in &report.risk.reasons {
+            out.push_str(&format!(
+                "- [{}] {}: {}\n",
+                reason.severity, reason.code, reason.message
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Changed Files\n\n");
+    if report.task.changed_paths.is_empty() {
+        out.push_str("No changed files recorded.\n\n");
+    } else {
+        for path in &report.task.changed_paths {
+            out.push_str(&format!(
+                "- {:?} `{}` (+{} -{})\n",
+                path.kind, path.path, path.additions, path.deletions
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !report.story.turn_summaries.is_empty() {
+        out.push_str("## Turn Summary\n\n");
+        for turn in &report.story.turn_summaries {
+            let label = turn
+                .prompt_preview
+                .as_deref()
+                .or(turn.outcome_preview.as_deref())
+                .unwrap_or(&turn.id);
+            out.push_str(&format!(
+                "{}. {} ({} changed file(s))\n",
+                turn.index,
+                label,
+                turn.changed_paths.len()
+            ));
+            if let Some(checkpoint) = &turn.checkpoint {
+                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+            }
+            for tool in &turn.tool_summaries {
+                out.push_str(&format!("   - Tool: {tool}\n"));
+            }
+        }
+        out.push('\n');
+    }
+
+    if !report.story.tool_summaries.is_empty() {
+        out.push_str("## Tools\n\n");
+        for tool in &report.story.tool_summaries {
+            out.push_str(&format!("- {tool}\n"));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Related Packets\n\n");
+    out.push_str(&format!(
+        "```sh\ncrabdb agent receipt {}\ncrabdb agent report {} --markdown\ncrabdb agent pr {}\n```\n",
+        report.task.lane, report.task.lane, report.task.lane
+    ));
+    out
+}
+
 fn agent_pr_title(receipt: &AgentReceiptReport) -> String {
     let title = agent_task_label(&receipt.task).trim();
     if title.is_empty() {
@@ -6835,10 +11456,17 @@ fn agent_task_suggestions(lane: &str, status: &AgentTaskStatus) -> Vec<StatusSug
             command: format!("crabdb agent view {lane}"),
             reason: "inspect blockers before applying".to_string(),
         }],
-        AgentTaskStatus::Applied => vec![StatusSuggestion {
-            command: format!("crabdb agent view {lane}"),
-            reason: "inspect the applied transcript and checkpoint".to_string(),
-        }],
+        AgentTaskStatus::Applied => vec![
+            StatusSuggestion {
+                command: format!("crabdb agent finish {lane}"),
+                reason: "hide the applied task from the default inbox when you are done"
+                    .to_string(),
+            },
+            StatusSuggestion {
+                command: format!("crabdb agent receipt {lane}"),
+                reason: "print the applied task receipt if you need to share it".to_string(),
+            },
+        ],
         AgentTaskStatus::Active => vec![StatusSuggestion {
             command: format!("crabdb agent view {lane}"),
             reason: "inspect current task activity".to_string(),
@@ -6897,11 +11525,12 @@ fn agent_next_report_from_view(
             },
         ),
         AgentTaskStatus::Applied => (
-            "inspect_applied",
+            "finish_applied",
             "The agent task has already been applied.",
             StatusSuggestion {
-                command: format!("crabdb agent view {lane}"),
-                reason: "inspect the applied transcript, tools, and checkpoint".to_string(),
+                command: format!("crabdb agent finish {lane}"),
+                reason: "hide the applied task from the default inbox when you are done"
+                    .to_string(),
             },
         ),
     };
