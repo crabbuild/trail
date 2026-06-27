@@ -1,6 +1,28 @@
 # HTTP API Reference
 
 The daemon serves JSON HTTP routes under `/v1`.
+Accepted HTTP connections use 30-second read/write timeouts. Requests larger
+than 16 MiB are rejected before routing. Requests with an `Origin` header are
+accepted only for loopback origins such as `localhost`, `127.0.0.1`, and `::1`.
+Daemon listener connections are rate-limited per peer. The default limit is
+600 requests per 60 seconds; excess requests receive `429 Too Many Requests`.
+
+Mutation request bodies are strict JSON objects. Unknown fields are rejected
+with `400 Bad Request`; they are not silently ignored.
+
+For retry-safe mutation requests, send:
+
+```text
+Idempotency-Key: <stable unique key>
+```
+
+CrabDB replays the first stored response when the same key is reused with the
+same method, path, and body. Reusing the key for different request content
+returns `400 Bad Request`. Unauthorized and forbidden responses are not cached.
+
+Accepted non-GET mutation attempts are recorded in the local
+`external_mutation_audit` table with method/path, status, inferred lane/ref,
+and a small redacted result summary. Raw request bodies are not stored.
 
 ## Auth
 
@@ -59,6 +81,10 @@ x-crabdb-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
 | POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
 | POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
+
+`POST /v1/lanes/{lane_or_id}/sync-workdir` returns `rescue_workdir` when
+`force=true` overwrites dirty materialized workdir files. The rescue directory
+contains copied dirty regular files plus `manifest.json`.
 
 ## Collaboration Routes
 

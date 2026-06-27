@@ -63,10 +63,15 @@ Implemented:
 - Workdir recording at prompt completion linked to the active prompt turn.
 - Conservative structured ACP `diff` content capture as CrabDB `write` patch
   edits for non-materialized sessions.
+- Guided setup and inspection commands: `crabdb acp install`, `crabdb acp list`,
+  `crabdb acp doctor`, `crabdb acp sessions`, `crabdb transcript`, and top-level
+  `crabdb turn show`.
+- Bounded assistant/event capture with truncation events and relay EOF closeout
+  for open turns.
 
 Not yet implemented:
 
-- Editor config generation commands such as `crabdb acp init`.
+- Mutating editor config generation; `acp install` prints snippets only.
 - Broad structured edit conversion beyond ACP `diff` content with `newText`.
 - Remote ACP transports while the HTTP transport remains draft.
 - Long-running assistant message checkpointing before prompt completion.
@@ -197,16 +202,18 @@ Useful flags:
 - `--provider` and `--model` annotate the lane, turns, and session mapping.
 - `--no-mcp` disables dynamic CrabDB MCP injection.
 
-Supporting setup commands can come after the relay works:
+Supporting setup commands are exposed through `crabdb acp`:
 
 ```sh
-crabdb acp init claude
-crabdb acp init codex
 crabdb acp list
-crabdb acp doctor
+crabdb acp install --agent claude-code --print
+crabdb acp doctor --agent claude-code
+crabdb acp sessions
+crabdb transcript <lane-or-session>
 ```
 
-`acp init` should write editor-specific launch snippets only when requested.
+`acp install` prints editor-specific launch snippets only; it does not mutate
+editor configuration.
 The relay itself must be usable directly from any ACP editor that can launch a
 local agent command.
 

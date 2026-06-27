@@ -110,6 +110,8 @@ pub(super) struct LanePatchArgs {
     pub(super) patch: PathBuf,
     #[arg(long)]
     pub(super) allow_ignored: bool,
+    #[arg(long)]
+    pub(super) allow_stale: bool,
 }
 
 #[derive(Args)]

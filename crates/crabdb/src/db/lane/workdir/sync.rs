@@ -178,6 +178,11 @@ impl CrabDb {
                 "lane `{lane}` workdir has unrecorded changes; run `crabdb lane record {lane}` or pass `--force` to sync: {preview}{suffix}"
             )));
         }
+        let rescue_workdir = if force && workdir_exists && !changed_paths.is_empty() {
+            Some(self.rescue_dirty_lane_workdir(lane, &workdir, &workdir_path, &changed_paths)?)
+        } else {
+            None
+        };
         if force && !path_scoped && workdir_path.exists() {
             fs::remove_dir_all(&workdir_path)?;
         }
@@ -233,6 +238,7 @@ impl CrabDb {
             &serde_json::json!({
                 "workdir": workdir.clone(),
                 "forced": force,
+                "rescue_workdir": rescue_workdir.clone(),
                 "paths": selected_paths,
                 "include_neighbors": include_neighbors,
                 "changed_paths": changed_paths.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
@@ -244,8 +250,75 @@ impl CrabDb {
             head_change: head.change_id,
             root_id: head.root_id,
             forced: force,
+            rescue_workdir,
             changed_paths,
         })
+    }
+
+    fn rescue_dirty_lane_workdir(
+        &self,
+        lane: &str,
+        workdir: &str,
+        workdir_path: &Path,
+        changed_paths: &[FileDiffSummary],
+    ) -> Result<String> {
+        let rescue_root = self.db_dir.join("lane-workdir-rescue");
+        fs::create_dir_all(&rescue_root)?;
+        let rescue_dir = create_unique_lane_workdir_rescue_dir(&rescue_root, lane)?;
+        let files_dir = rescue_dir.join("files");
+        fs::create_dir_all(&files_dir)?;
+
+        let mut copied_paths = Vec::new();
+        let mut skipped_paths = Vec::new();
+        let mut candidate_paths = BTreeSet::new();
+        for changed_path in changed_paths {
+            candidate_paths.insert(changed_path.path.clone());
+            if let Some(old_path) = &changed_path.old_path {
+                candidate_paths.insert(old_path.clone());
+            }
+        }
+
+        for path in candidate_paths {
+            let source = match safe_join(workdir_path, &path) {
+                Ok(source) => source,
+                Err(err) => {
+                    skipped_paths.push(format!("{path}: {err}"));
+                    continue;
+                }
+            };
+            let metadata = match fs::symlink_metadata(&source) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    skipped_paths.push(format!("{path}: missing"));
+                    continue;
+                }
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                skipped_paths.push(format!("{path}: not a regular file"));
+                continue;
+            }
+            let destination = files_dir.join(path_from_rel(&path));
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &destination)?;
+            copied_paths.push(path);
+        }
+
+        let manifest = serde_json::json!({
+            "lane": lane,
+            "workdir": workdir,
+            "created_at": now_ts(),
+            "changed_paths": changed_paths,
+            "copied_paths": copied_paths,
+            "skipped_paths": skipped_paths,
+        });
+        fs::write(
+            rescue_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(rescue_dir.to_string_lossy().to_string())
     }
 
     pub(crate) fn hydrate_sparse_lane_workdir_paths_unlocked(
@@ -389,4 +462,18 @@ fn branch_has_sparse_workdir(db: &CrabDb, branch: &LaneBranch) -> Result<bool> {
     }
     db.sparse_workdir_paths(&workdir_path)
         .map(|paths| paths.is_some())
+}
+
+fn create_unique_lane_workdir_rescue_dir(rescue_root: &Path, lane: &str) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let candidate = rescue_root.join(format!("{lane}-{}", now_nanos()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+    Err(Error::InvalidInput(
+        "could not create unique lane workdir rescue directory".to_string(),
+    ))
 }

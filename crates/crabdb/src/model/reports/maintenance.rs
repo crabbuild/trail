@@ -39,6 +39,20 @@ pub struct WorktreeIndexReport {
     pub duration_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalMutationAuditRecord {
+    pub audit_id: String,
+    pub surface: String,
+    pub command: String,
+    pub target_ref: Option<String>,
+    pub lane_id: Option<String>,
+    pub status: String,
+    pub status_code: Option<i64>,
+    pub change_id: Option<ChangeId>,
+    pub summary: Option<serde_json::Value>,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GcReport {
     pub dry_run: bool,

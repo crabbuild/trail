@@ -75,6 +75,7 @@ pub(crate) fn parse_patch_request(body: &[u8]) -> Result<PatchDocument> {
         message: request.message,
         session_id: request.session_id,
         allow_ignored: request.allow_ignored,
+        allow_stale: request.allow_stale,
         edits,
     })
 }
@@ -137,6 +138,20 @@ pub(crate) fn json_response<T: Serialize>(
     })
 }
 
+pub(crate) fn reason_for_status(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        _ => "Internal Server Error",
+    }
+}
+
 pub(crate) fn authorized(request: &HttpRequest, auth: &ServerAuth) -> bool {
     let Some(expected) = auth.token.as_deref() else {
         return true;
@@ -154,6 +169,63 @@ pub(crate) fn authorized(request: &HttpRequest, auth: &ServerAuth) -> bool {
         .headers
         .get("x-crabdb-token")
         .is_some_and(|token| constant_time_eq(token.trim().as_bytes(), expected.as_bytes()))
+}
+
+pub(crate) fn origin_allowed(request: &HttpRequest) -> bool {
+    let Some(origin) = request.headers.get("origin") else {
+        return true;
+    };
+    local_loopback_origin(origin.trim())
+}
+
+fn local_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('/') || rest.contains('@') {
+        return false;
+    }
+    let Some((host, port)) = split_origin_host_port(rest) else {
+        return false;
+    };
+    if !valid_optional_port(port) {
+        return false;
+    }
+    let host = host.trim().trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|addr| addr.is_loopback())
+}
+
+fn split_origin_host_port(value: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']')?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?)
+        };
+        return Some((host, port));
+    }
+    if value.matches(':').count() > 1 {
+        return None;
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) => Some((host, Some(port))),
+        None => Some((value, None)),
+    }
+}
+
+fn valid_optional_port(port: Option<&str>) -> bool {
+    let Some(port) = port else {
+        return true;
+    };
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -176,15 +248,13 @@ pub(crate) fn error_response(err: &Error) -> HttpResponse {
         | Error::PatchRejected(_)
         | Error::StaleBranch(_)
         | Error::WorkspaceLocked(_) => 409,
-        Error::InvalidInput(_) | Error::InvalidPath { .. } | Error::IgnoredPath(_) => 400,
+        Error::InvalidInput(_)
+        | Error::InvalidPath { .. }
+        | Error::IgnoredPath(_)
+        | Error::Json(_) => 400,
         _ => 500,
     };
-    let reason = match status {
-        400 => "Bad Request",
-        404 => "Not Found",
-        409 => "Conflict",
-        _ => "Internal Server Error",
-    };
+    let reason = reason_for_status(status);
     let body = serde_json::to_vec(&ErrorBody {
         error: ErrorDetails {
             message: err.to_string(),
@@ -221,6 +291,21 @@ pub(crate) fn unauthorized_response() -> HttpResponse {
     HttpResponse {
         status: 401,
         reason: "Unauthorized",
+        body,
+    }
+}
+
+pub(crate) fn forbidden_origin_response() -> HttpResponse {
+    let body = serde_json::to_vec(&ErrorBody {
+        error: ErrorDetails {
+            message: "forbidden: request origin is not a local loopback origin".to_string(),
+            code: 11,
+        },
+    })
+    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"forbidden\",\"code\":11}}".to_vec());
+    HttpResponse {
+        status: 403,
+        reason: "Forbidden",
         body,
     }
 }

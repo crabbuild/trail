@@ -1,5 +1,8 @@
 # CrabDB
 
+CrabDB gives AI coding agents branch-like memory, transcripts, checkpoints, and
+rewind without polluting your active Git branch.
+
 CrabDB is a local-first operation database for code and text worktrees. It records
 the meaningful work that happens between Git commits: local edits, recorded
 operations, branch movement, lane patches, review handoffs, merges, and
@@ -354,6 +357,14 @@ make install
 crabdb --help
 ```
 
+For ACP coding-agent setup, keep installation simple and use the guided CrabDB
+commands after the binary is installed:
+
+```sh
+crabdb acp doctor --agent claude-code
+crabdb acp install --agent claude-code --print
+```
+
 For a project-local install directory, override `PREFIX`:
 
 ```sh
@@ -585,6 +596,10 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `crabdb daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `crabdb mcp` | Start the MCP stdio server for agent hosts |
+| `crabdb acp install --agent claude-code` | Print an ACP relay command and editor snippet |
+| `crabdb acp doctor --agent claude-code` | Check ACP provider and relay readiness |
+| `crabdb acp sessions` | List captured ACP sessions |
+| `crabdb transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
 | `crabdb doctor` | Run workspace and integration diagnostics |
 | `crabdb backup create <output>` | Create a CrabDB workspace backup |
 | `crabdb fsck` | Verify repository integrity |

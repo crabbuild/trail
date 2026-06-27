@@ -39,6 +39,7 @@ pub(crate) struct ConfigKeyArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConfigSetArgs {
     pub(crate) key: String,
     pub(crate) value: String,
@@ -74,6 +75,7 @@ pub(crate) struct CodeFromArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IgnorePatternArgs {
     pub(crate) pattern: String,
 }
@@ -84,6 +86,7 @@ pub(crate) struct IgnoreCheckArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GuardrailCheckArgs {
     pub(crate) lane: Option<String>,
     pub(crate) action: String,

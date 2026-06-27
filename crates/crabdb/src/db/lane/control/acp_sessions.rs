@@ -105,6 +105,26 @@ impl CrabDb {
             .ok_or_else(|| Error::InvalidInput(format!("ACP session `{acp_session_id}` not found")))
     }
 
+    pub fn list_lane_acp_sessions(&self, lane: Option<&str>) -> Result<AcpSessionListReport> {
+        let sessions = if let Some(lane) = lane {
+            let branch = self.lane_branch(lane)?;
+            let mut stmt = self.conn.prepare(
+                "SELECT acp_session_id, upstream_session_id, lane_id, crabdb_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+                 FROM lane_acp_sessions WHERE lane_id = ?1 ORDER BY updated_at DESC, acp_session_id DESC",
+            )?;
+            let rows = stmt.query_map(params![branch.lane_id], lane_acp_session_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT acp_session_id, upstream_session_id, lane_id, crabdb_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+                 FROM lane_acp_sessions ORDER BY updated_at DESC, acp_session_id DESC",
+            )?;
+            let rows = stmt.query_map([], lane_acp_session_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(AcpSessionListReport { sessions })
+    }
+
     pub fn try_lane_acp_session(&self, acp_session_id: &str) -> Result<Option<LaneAcpSession>> {
         let acp_session_id = validate_external_id("ACP session id", acp_session_id)?;
         self.conn
@@ -119,7 +139,7 @@ impl CrabDb {
     }
 }
 
-fn lane_acp_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneAcpSession> {
+pub(super) fn lane_acp_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneAcpSession> {
     Ok(LaneAcpSession {
         acp_session_id: row.get(0)?,
         upstream_session_id: row.get(1)?,

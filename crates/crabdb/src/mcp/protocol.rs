@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::{CrabDb, Result};
 
 use super::{
+    audit::McpMutationAudit,
     capabilities::{
         discover_result, initialize_result, prompts_list_result, resources_list_result,
         resources_templates_list_result, tools_list_result,
@@ -67,14 +68,23 @@ pub fn handle_json_rpc(db: &mut CrabDb, request: Value) -> Option<Value> {
             Ok(result) => json_rpc_result(id, result),
             Err(err) => resource_error_response(id, &err),
         }),
-        "tools/call" => Some(match handle_tool_call(db, params) {
-            Ok(result) => json_rpc_result(id, result),
-            Err(err) => json_rpc_result(id, tool_error_result(&err)),
-        }),
+        "tools/call" => Some(handle_tool_call_response(db, id, params)),
         _ => Some(json_rpc_error(
             id,
             -32601,
             &format!("method not found: {method}"),
         )),
     }
+}
+
+fn handle_tool_call_response(db: &mut CrabDb, id: Value, params: Value) -> Value {
+    let audit = McpMutationAudit::from_tool_call_params(&params);
+    let result = match handle_tool_call(db, params) {
+        Ok(result) => result,
+        Err(err) => tool_error_result(&err),
+    };
+    if let Some(audit) = audit {
+        audit.record(db, &result);
+    }
+    json_rpc_result(id, result)
 }

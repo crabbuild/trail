@@ -224,6 +224,31 @@ impl CrabDb {
         })
     }
 
+    pub(crate) fn selected_worktree_snapshot_read_only(
+        &self,
+        head_files: &BTreeMap<String, FileEntry>,
+        candidate_paths: &[String],
+    ) -> Result<SelectedWorktreeSnapshot> {
+        let disk_files = self.scan_visible_files_for_paths(candidate_paths)?;
+        let disk_manifest = self.disk_manifest(&disk_files);
+        let summaries =
+            self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths);
+        let paths = summaries
+            .iter()
+            .map(|summary| summary.path.clone())
+            .collect::<Vec<_>>();
+        let path_set = paths.iter().map(String::as_str).collect::<HashSet<_>>();
+        let files = disk_files
+            .into_iter()
+            .filter(|file| path_set.contains(file.path.as_str()))
+            .collect();
+        Ok(SelectedWorktreeSnapshot {
+            paths,
+            files,
+            summaries,
+        })
+    }
+
     pub(crate) fn selected_worktree_snapshot_for_root(
         &self,
         root_id: &ObjectId,
@@ -231,6 +256,15 @@ impl CrabDb {
     ) -> Result<SelectedWorktreeSnapshot> {
         let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
         self.selected_worktree_snapshot(&head_files, candidate_paths)
+    }
+
+    pub(crate) fn selected_worktree_snapshot_for_root_read_only(
+        &self,
+        root_id: &ObjectId,
+        candidate_paths: &[String],
+    ) -> Result<SelectedWorktreeSnapshot> {
+        let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
+        self.selected_worktree_snapshot_read_only(&head_files, candidate_paths)
     }
 
     pub(crate) fn diff_file_maps_to_manifest_for_paths(

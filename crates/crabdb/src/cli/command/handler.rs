@@ -130,6 +130,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::CodeFrom(args) => inspect::handle_code_from_command(&ctx, args),
         Command::Lane(lane_command) => lane::handle_lane_command(&ctx, lane_command),
         Command::Acp(acp_command) => acp::handle_acp_command(&ctx, acp_command),
+        Command::Transcript(args) => acp::handle_transcript_command(&ctx, args),
+        Command::Turn(turn) => acp::handle_top_turn_command(&ctx, turn),
+        Command::Demo(demo) => acp::handle_demo_command(&ctx, demo),
         Command::Session(session_command) => {
             collaboration::handle_session_command(&ctx, session_command)
         }

@@ -338,6 +338,9 @@ fn handle_lane_command(
             if args.allow_ignored {
                 patch.allow_ignored = true;
             }
+            if args.allow_stale {
+                patch.allow_stale = true;
+            }
             let body = serde_json::to_value(&patch)?;
             let report: LanePatchReport =
                 client.post_json(&format!("/v1/lanes/{}/patches", args.name), &body)?;
@@ -652,6 +655,9 @@ fn handle_lane_turn_command(
             if args.allow_ignored {
                 patch.allow_ignored = true;
             }
+            if args.allow_stale {
+                patch.allow_stale = true;
+            }
             let body = serde_json::to_value(&patch)?;
             let report: LanePatchReport =
                 client.post_json(&format!("/v1/lane/turns/{}/patches", args.turn_id), &body)?;
@@ -790,6 +796,7 @@ fn handle_merge_queue_command(
             render_merge_queue_list(&entries, ctx.json, ctx.quiet)?;
             Ok(true)
         }
+        MergeQueueSubcommand::Explain(_) => Ok(false),
         MergeQueueSubcommand::Run(args) => {
             let body = match args.limit {
                 Some(limit) => serde_json::json!({ "limit": limit }),

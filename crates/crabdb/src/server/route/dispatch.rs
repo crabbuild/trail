@@ -12,6 +12,10 @@ pub(crate) fn route_request_result(
     let raw_path = request.path.trim_end_matches('/');
     let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
 
+    if !utils::origin_allowed(&request) {
+        return Ok(utils::forbidden_origin_response());
+    }
+
     if request.method == "GET" && path == "/v1/health" {
         return Ok(utils::json_response(
             200,

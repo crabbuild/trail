@@ -83,6 +83,48 @@ pub(crate) fn config_entries_from(config: &CrabConfig) -> Vec<ConfigEntry> {
             false,
         ),
         config_entry(
+            "lane.claim_enforcement",
+            &config.lane.claim_enforcement,
+            "string",
+            false,
+        ),
+        config_entry(
+            "lane.enforce_sparse_paths",
+            config.lane.enforce_sparse_paths,
+            "bool",
+            false,
+        ),
+        config_entry(
+            "lane.max_patch_bytes",
+            config.lane.max_patch_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "lane.max_patch_file_bytes",
+            config.lane.max_patch_file_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "lane.max_changed_paths",
+            config.lane.max_changed_paths,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "lane.max_event_payload_bytes",
+            config.lane.max_event_payload_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "lane.max_trace_payload_bytes",
+            config.lane.max_trace_payload_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
             "lane.worktrees_dir",
             &config.lane.worktrees_dir,
             "path",

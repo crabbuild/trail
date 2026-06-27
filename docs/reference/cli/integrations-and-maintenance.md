@@ -32,6 +32,28 @@ crabdb mcp
 
 Starts the MCP stdio server.
 
+## `acp`
+
+```text
+crabdb acp relay [--lane <LANE>] [--from <REF>] [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] [--provider <NAME>] [--model <NAME>] [--no-mcp] -- <COMMAND>...
+crabdb acp install --agent claude-code [--editor generic|zed] [--dry-run] [--print]
+crabdb acp doctor --agent claude-code [--relay-command <COMMAND>...]
+crabdb acp list
+crabdb acp sessions [--lane <LANE>]
+```
+
+`acp install` prints setup snippets and does not mutate editor config. `acp
+relay` remains the low-level ACP stdio relay in front of the real coding agent.
+
+## `demo`
+
+```text
+crabdb demo acp [--agent fake|claude-code]
+```
+
+`demo acp --agent fake` creates a temporary sample workspace, runs a local fake
+ACP relay session, and prints follow-up transcript/review commands.
+
 ## `doctor`
 
 ```text
@@ -76,4 +98,3 @@ crabdb gc [--dry-run]
 - Args: `crates/crabdb/src/cli/command/maintenance_args.rs`
 - Handlers: `crates/crabdb/src/cli/command/handler/maintenance.rs`
 - Reports: `crates/crabdb/src/model/reports/maintenance.rs`
-

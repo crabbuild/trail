@@ -149,6 +149,7 @@ fn patch_document_from_args(args: ApplyPatchArgs) -> PatchDocument {
         message: args.message,
         session_id: args.session_id,
         allow_ignored: args.allow_ignored,
+        allow_stale: args.allow_stale,
         edits,
     }
 }

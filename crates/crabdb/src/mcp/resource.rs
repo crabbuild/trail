@@ -6,8 +6,16 @@ use super::{response::pretty_json, types::*, utils::from_arguments};
 
 pub(crate) fn handle_resource_read(db: &mut CrabDb, params: Value) -> Result<Value> {
     let args: ResourceReadArgs = from_arguments(params)?;
+    let label = format!("resources/read {}", args.uri);
+    db.enforce_read_only_mcp_call(&label, |db| resource_read_response(db, args))
+}
+
+fn resource_read_response(db: &mut CrabDb, args: ResourceReadArgs) -> Result<Value> {
     let (mime_type, text) = match args.uri.as_str() {
-        RESOURCE_STATUS => ("application/json", pretty_json(&db.status(None)?)?),
+        RESOURCE_STATUS => (
+            "application/json",
+            pretty_json(&db.status_read_only(None)?)?,
+        ),
         RESOURCE_DOCTOR => ("application/json", pretty_json(&db.doctor()?)?),
         RESOURCE_LANES => ("application/json", pretty_json(&db.list_lanes()?)?),
         RESOURCE_MERGE_QUEUE => ("application/json", pretty_json(&db.list_merge_queue()?)?),

@@ -90,6 +90,69 @@ impl CrabDb {
         })
     }
 
+    pub fn explain_merge_queue(&mut self, selector: &str) -> Result<MergeQueueExplainReport> {
+        let _lock = self.acquire_write_lock()?;
+        let entry = self.merge_queue_entry_by_selector(selector)?;
+        let mut readiness = None;
+        let mut blockers = Vec::new();
+        let mut warnings = Vec::new();
+        let mut next_steps = Vec::new();
+
+        if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
+            let report = self.lane_readiness(lane)?;
+            blockers.extend(report.blockers.clone());
+            warnings.extend(report.warnings.clone());
+            next_steps.extend(merge_queue_readiness_next_steps(lane, &report));
+            readiness = Some(report);
+        }
+
+        let (dry_run, error) = match self.merge_queue_entry_dry_run(&entry) {
+            Ok(report) => {
+                if !report.conflicts.is_empty() {
+                    blockers.push(readiness_issue(
+                        "merge_conflicts",
+                        format!(
+                            "dry-run merge reports {} conflict(s)",
+                            report.conflicts.len()
+                        ),
+                        Some(serde_json::json!({
+                            "conflicts": report.conflicts.clone()
+                        })),
+                    ));
+                    next_steps.push(merge_queue_dry_run_next_step(&entry));
+                }
+                (Some(report), None)
+            }
+            Err(err) => {
+                let message = err.to_string();
+                blockers.push(readiness_issue(
+                    "merge_preflight_failed",
+                    "dry-run merge preflight failed",
+                    Some(serde_json::json!({ "error": message })),
+                ));
+                next_steps.push(
+                    "Fix the preflight error, then run `crabdb merge-queue explain` again."
+                        .to_string(),
+                );
+                (None, Some(message))
+            }
+        };
+
+        if blockers.is_empty() {
+            next_steps.push("Run `crabdb merge-queue run` to merge this item.".to_string());
+        }
+
+        Ok(MergeQueueExplainReport {
+            entry,
+            readiness,
+            dry_run,
+            blockers,
+            warnings,
+            error,
+            next_steps,
+        })
+    }
+
     pub fn run_merge_queue(&mut self, limit: Option<usize>) -> Result<MergeQueueRunReport> {
         let _lock = self.acquire_write_lock()?;
         let entries = self.queued_merge_entries(limit)?;
@@ -174,4 +237,59 @@ impl CrabDb {
             stopped_on_failure,
         })
     }
+}
+
+fn merge_queue_dry_run_next_step(entry: &MergeQueueEntry) -> String {
+    let target = entry
+        .target_ref
+        .strip_prefix(MAIN_REF_PREFIX)
+        .unwrap_or(&entry.target_ref);
+    if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
+        return format!(
+            "Inspect conflicts with `crabdb merge-lane {lane} --into {target} --dry-run` or run the queue to record a conflict set."
+        );
+    }
+    let source = entry
+        .source_ref
+        .strip_prefix(MAIN_REF_PREFIX)
+        .unwrap_or(&entry.source_ref);
+    format!(
+        "Inspect conflicts with `crabdb merge {source} --into {target} --dry-run` or run the queue to record a conflict set."
+    )
+}
+
+fn merge_queue_readiness_next_steps(lane: &str, readiness: &LaneReadinessReport) -> Vec<String> {
+    let mut steps = Vec::new();
+    for issue in &readiness.blockers {
+        match issue.code.as_str() {
+            "dirty_workdir" => {
+                steps.push(format!(
+                    "Record or discard dirty workdir changes with `crabdb lane record {lane}`."
+                ));
+            }
+            "pending_approvals" => {
+                steps.push(format!(
+                    "Review pending approvals with `crabdb approvals list --lane {lane}`."
+                ));
+            }
+            "open_conflicts" => {
+                steps.push(
+                    "Inspect open conflicts with `crabdb conflicts list` and resolve them before retrying."
+                        .to_string(),
+                );
+            }
+            "missing_latest_test" | "latest_test_failed" => {
+                steps.push(format!(
+                    "Run or fix the required test gate with `crabdb lane test {lane} -- <command>`."
+                ));
+            }
+            "missing_latest_eval" | "latest_eval_failed" => {
+                steps.push(format!(
+                    "Run or fix the required eval gate with `crabdb lane eval {lane} -- <command>`."
+                ));
+            }
+            _ => steps.push(format!("Resolve readiness blocker `{}`.", issue.code)),
+        }
+    }
+    steps
 }

@@ -58,6 +58,8 @@ pub struct LaneWorkdirSyncReport {
     pub head_change: ChangeId,
     pub root_id: ObjectId,
     pub forced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescue_workdir: Option<String>,
     pub changed_paths: Vec<FileDiffSummary>,
 }
 

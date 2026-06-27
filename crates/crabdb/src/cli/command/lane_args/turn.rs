@@ -69,6 +69,8 @@ pub(in crate::cli::command) struct LaneTurnPatchArgs {
     pub(in crate::cli::command) patch: PathBuf,
     #[arg(long)]
     pub(in crate::cli::command) allow_ignored: bool,
+    #[arg(long)]
+    pub(in crate::cli::command) allow_stale: bool,
 }
 
 #[derive(Args)]

@@ -38,6 +38,83 @@ pub struct LaneAcpSession {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpProviderProfile {
+    pub agent: String,
+    pub display_name: String,
+    pub available: bool,
+    pub relay_command: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpInstallReport {
+    pub agent: String,
+    pub editor: String,
+    pub dry_run: bool,
+    pub relay_command: Vec<String>,
+    pub snippet: String,
+    pub detected: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpDoctorCheck {
+    pub name: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpDoctorReport {
+    pub status: String,
+    pub provider: String,
+    pub relay_command: Vec<String>,
+    pub lane: Option<String>,
+    pub session_id: Option<String>,
+    pub checks: Vec<AcpDoctorCheck>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpSessionListReport {
+    pub sessions: Vec<LaneAcpSession>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptReport {
+    pub selector: String,
+    pub resolved_kind: String,
+    pub lane_id: String,
+    pub lane_name: String,
+    pub session: LaneSession,
+    pub acp_session: Option<LaneAcpSession>,
+    pub turns: Vec<TranscriptTurn>,
+    pub operations: Vec<TimelineEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptTurn {
+    pub turn: LaneTurn,
+    pub messages: Vec<TranscriptMessage>,
+    pub events: Vec<LaneEventRecord>,
+    pub checkpoint: Option<ChangeId>,
+    pub tool_summaries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptMessage {
+    pub role: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StatusSuggestion {
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneTurn {
     pub turn_id: String,
     pub lane_id: String,

@@ -7,6 +7,12 @@ pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
             reason: "NUL bytes are not allowed".to_string(),
         });
     }
+    if path.contains(['\u{2215}', '\u{2044}', '\u{FF0F}']) {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path contains a slash lookalike; use `/` as the separator".to_string(),
+        });
+    }
     let path = path.replace('\\', "/");
     let mut parts = Vec::new();
     for component in Path::new(&path).components() {
@@ -16,6 +22,7 @@ pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
                 if part.is_empty() {
                     continue;
                 }
+                validate_relative_path_component(&path, &part)?;
                 parts.push(part.to_string());
             }
             Component::CurDir => {}
@@ -34,6 +41,59 @@ pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
         });
     }
     Ok(parts.join("/"))
+}
+
+fn validate_relative_path_component(path: &str, part: &str) -> Result<()> {
+    if part.chars().any(char::is_control) {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path components cannot contain control characters".to_string(),
+        });
+    }
+    if part.contains(':') {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path components cannot contain `:`".to_string(),
+        });
+    }
+    if part.ends_with([' ', '.']) {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: "path components cannot end with a space or dot".to_string(),
+        });
+    }
+    let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return Err(Error::InvalidPath {
+            path: path.to_string(),
+            reason: format!("path component `{part}` is reserved on Windows"),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_workdir_path(path: &Path) -> Result<PathBuf> {

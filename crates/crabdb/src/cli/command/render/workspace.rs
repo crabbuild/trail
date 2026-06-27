@@ -42,6 +42,13 @@ pub(crate) fn render_status(report: &StatusReport, json: bool, quiet: bool) -> R
         for path in &report.changed_paths {
             println!("  {:?} {}", path.kind, path.path);
         }
+        if !report.suggestions.is_empty() {
+            println!("Suggested next steps:");
+            for suggestion in &report.suggestions {
+                println!("  {}", suggestion.command);
+                println!("    {}", suggestion.reason);
+            }
+        }
     }
     Ok(())
 }

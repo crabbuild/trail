@@ -21,6 +21,19 @@ pub(crate) fn redact_sensitive_json(value: serde_json::Value) -> serde_json::Val
     }
 }
 
+#[cfg(test)]
+pub(crate) fn contains_sensitive_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            (is_sensitive_json_key(key) && json_value_has_payload(value))
+                || contains_sensitive_json(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(contains_sensitive_json),
+        serde_json::Value::String(value) => contains_sensitive_text(value),
+        _ => false,
+    }
+}
+
 pub(crate) fn redact_sensitive_text(input: &str) -> String {
     if !may_contain_sensitive_text(input) {
         return input.to_string();
@@ -45,6 +58,13 @@ pub(crate) fn redact_sensitive_text(input: &str) -> String {
     output
 }
 
+pub(crate) fn contains_sensitive_text(input: &str) -> bool {
+    if contains_private_key_pem(input) {
+        return true;
+    }
+    redact_sensitive_text(input) != input
+}
+
 pub(crate) fn may_contain_sensitive_text(input: &str) -> bool {
     let lower = input.to_ascii_lowercase();
     [
@@ -62,6 +82,22 @@ pub(crate) fn may_contain_sensitive_text(input: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn contains_private_key_pem(input: &str) -> bool {
+    let upper = input.to_ascii_uppercase();
+    upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY-----")
+}
+
+#[cfg(test)]
+fn json_value_has_payload(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(values) => !values.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
 }
 
 pub(crate) fn redact_sensitive_line(line: &str) -> String {
@@ -172,3 +208,32 @@ pub(crate) const SENSITIVE_TEXT_KEYS: &[&str] = &[
     "secret",
     "token",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_text_detector_avoids_benign_keyword_mentions() {
+        assert!(!contains_sensitive_text(
+            "token expiration logic stays visible"
+        ));
+        assert!(contains_sensitive_text("OPENAI_API_KEY=sk-live-secret"));
+        assert!(contains_sensitive_text("Authorization: Bearer abc123"));
+        assert!(contains_sensitive_text(
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+        ));
+    }
+
+    #[test]
+    fn sensitive_json_detector_flags_secret_keys_with_payloads() {
+        assert!(contains_sensitive_json(&serde_json::json!({
+            "safe": "token expiration logic",
+            "client_secret": "abc"
+        })));
+        assert!(!contains_sensitive_json(&serde_json::json!({
+            "safe": "token expiration logic",
+            "client_secret": ""
+        })));
+    }
+}

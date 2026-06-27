@@ -246,6 +246,7 @@ impl CrabDb {
                 changed_paths: Vec::new(),
             });
         }
+        self.ensure_lane_record_policy(&branch, &diff.summaries)?;
         if let Some(session_id) = &branch.session_id {
             self.ensure_lane_session(&branch.lane_id, session_id, None)?;
         }

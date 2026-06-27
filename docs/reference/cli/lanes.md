@@ -46,6 +46,11 @@ crabdb lane sync-workdir <NAME> [--force] [--paths <PATH>...] [--include-neighbo
 crabdb lane checkout <NAME> [--force] [--dry-run] [--workdir <PATH>]
 ```
 
+`lane sync-workdir --force` refuses no longer-dirty content as before, but when
+it overwrites dirty materialized workdir files it prints `Rescue workdir:` with
+the `.crabdb/lane-workdir-rescue/...` directory that contains copied dirty files
+and a manifest.
+
 ## Patches and Diffs
 
 ```text

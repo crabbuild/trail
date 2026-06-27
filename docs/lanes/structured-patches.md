@@ -15,15 +15,16 @@ Use `--allow-ignored` only for intentional ignored fixtures.
 
 ```json
 {
-  "base_change": "optional-change-id",
+  "base_change": "current-lane-head-change-id",
   "message": "describe the patch",
   "session_id": "optional-session-id",
   "allow_ignored": false,
+  "allow_stale": false,
   "edits": []
 }
 ```
 
-`base_change`, `message`, `session_id`, and `allow_ignored` are optional. `edits` is required by the public patch document type.
+Direct lane patches require `base_change` to match the current lane head. Turn-linked patches may omit it because the turn's `before_change` guards freshness. `message`, `session_id`, `allow_ignored`, and `allow_stale` are optional. Use `allow_stale: true` or `--allow-stale` only when intentionally applying without a fresh base. `edits` is required by the public patch document type.
 
 ## Write Text
 
@@ -75,10 +76,11 @@ Use `--allow-ignored` only for intentional ignored fixtures.
 
 The HTTP patch parser also accepts a `files` array with `add_text`, `modify_text`, `write_bytes`, `delete`, and `rename` entries. The parser converts these entries into the same patch edits.
 
+Structured patch messages and edit payloads are secret-scanned before storage. Assignment-style credentials, bearer tokens, and private-key PEM blocks reject the patch rather than writing those bytes into CrabDB objects.
+
 ## Code Facts Used
 
 - Patch schema: `crates/crabdb/src/model/inspect/patch.rs`
 - HTTP patch request schema: `crates/crabdb/src/server/request_types/patches.rs`
 - Patch policy: `crates/crabdb/src/db/lane/patch_policy.rs`
-- Tests: `lane_patch_incrementally_handles_rename_delete_and_write`, `lane_patch_can_replace_stable_line_with_expected_text`
-
+- Tests: `lane_patch_incrementally_handles_rename_delete_and_write`, `lane_patch_can_replace_stable_line_with_expected_text`, `lane_payload_secret_scan_rejects_patch_content_and_redacts_stored_payloads`

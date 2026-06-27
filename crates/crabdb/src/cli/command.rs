@@ -120,6 +120,12 @@ enum Command {
     Lane(LaneCommand),
     /// Run Agent Client Protocol relay integrations for coding agents.
     Acp(AcpCommand),
+    /// Show a readable transcript for a lane, session, or ACP session.
+    Transcript(TranscriptArgs),
+    /// Work with durable turns using a short top-level alias.
+    Turn(TopTurnCommand),
+    /// Run guided local demos.
+    Demo(DemoCommand),
     /// Create and manage lane sessions, context packets, and lifecycle.
     Session(SessionCommand),
     /// Handle sensitive action approvals and reviewer decisions.

@@ -2,6 +2,16 @@
 
 Inspection commands expose high-level diffs and low-level storage objects.
 
+## `transcript` and `turn`
+
+```text
+crabdb transcript <LANE_OR_SESSION_OR_ACP_SESSION>
+crabdb turn show <TURN_ID>
+```
+
+`transcript` resolves a lane, CrabDB session id, or ACP session id and prints
+captured prompts, assistant messages, tool summaries, and checkpoint change ids.
+
 ## `diff`
 
 ```text
@@ -58,4 +68,3 @@ These commands are advanced/internal debugging tools for prolly maps and object 
 - Args: `crates/crabdb/src/cli/command/inspect_args.rs`
 - Renderers: `crates/crabdb/src/cli/command/render/inspection.rs`
 - Tests: `inspection_apis_decode_objects_roots_and_texts`, `map_debug_commands_decode_known_prolly_maps`
-

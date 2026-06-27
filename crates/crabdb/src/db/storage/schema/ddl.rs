@@ -254,6 +254,9 @@ impl CrabDb {
                 base_change TEXT NOT NULL,
                 left_change TEXT NOT NULL,
                 right_change TEXT NOT NULL,
+                base_root TEXT,
+                left_root TEXT,
+                right_root TEXT,
                 result_change TEXT,
                 status TEXT NOT NULL,
                 conflict_set TEXT,
@@ -268,6 +271,32 @@ impl CrabDb {
                 details_json TEXT,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS external_mutation_audit (
+                audit_id TEXT PRIMARY KEY,
+                surface TEXT NOT NULL,
+                command TEXT NOT NULL,
+                target_ref TEXT,
+                lane_id TEXT,
+                status TEXT NOT NULL,
+                status_code INTEGER,
+                change_id TEXT,
+                summary_json TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS external_mutation_audit_created_idx ON external_mutation_audit(created_at);
+            CREATE INDEX IF NOT EXISTS external_mutation_audit_surface_created_idx ON external_mutation_audit(surface, created_at);
+            CREATE INDEX IF NOT EXISTS external_mutation_audit_lane_created_idx ON external_mutation_audit(lane_id, created_at);
+            CREATE TABLE IF NOT EXISTS http_idempotency_keys (
+                key TEXT PRIMARY KEY,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                status INTEGER NOT NULL,
+                body BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS http_idempotency_keys_updated_idx ON http_idempotency_keys(updated_at);
             CREATE TABLE IF NOT EXISTS git_mappings (
                 mapping_id TEXT PRIMARY KEY,
                 direction TEXT NOT NULL,
@@ -296,6 +325,9 @@ impl CrabDb {
             ",
         )?;
         ensure_column(&self.conn, "conflict_sets", "details_json", "TEXT")?;
+        ensure_column(&self.conn, "merge_results", "base_root", "TEXT")?;
+        ensure_column(&self.conn, "merge_results", "left_root", "TEXT")?;
+        ensure_column(&self.conn, "merge_results", "right_root", "TEXT")?;
         ensure_column(&self.conn, "lane_events", "session_id", "TEXT")?;
         ensure_column(
             &self.conn,

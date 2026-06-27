@@ -1,3 +1,4 @@
+use super::acp_sessions::lane_acp_session_row;
 use super::*;
 
 impl CrabDb {
@@ -121,6 +122,97 @@ impl CrabDb {
         })
     }
 
+    pub fn transcript(&self, selector: &str) -> Result<TranscriptReport> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(Error::InvalidInput(
+                "transcript selector cannot be empty".to_string(),
+            ));
+        }
+
+        let (resolved_kind, session, acp_session) =
+            if let Some(acp) = self.try_lane_acp_session(selector)? {
+                (
+                    "acp_session".to_string(),
+                    self.lane_session(&acp.crabdb_session_id)?,
+                    Some(acp),
+                )
+            } else if let Some(session) = self.try_lane_session(selector)? {
+                (
+                    "session".to_string(),
+                    session,
+                    self.acp_session_for_session(selector)?,
+                )
+            } else {
+                let lane_name = self.resolve_lane_handle(selector)?;
+                let lane = self.lane_details(&lane_name)?;
+                let session = if let Some(session_id) = lane.branch.session_id.as_deref() {
+                    self.lane_session(session_id)?
+                } else {
+                    self.list_lane_sessions(Some(&lane_name))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "lane `{selector}` has no sessions to transcript"
+                            ))
+                        })?
+                };
+                let acp = self.acp_session_for_session(&session.session_id)?;
+                ("lane".to_string(), session, acp)
+            };
+
+        let lane_name = self.resolve_lane_handle(&session.lane_id)?;
+        let details = self.show_lane_session(&session.session_id)?;
+        let mut turns = Vec::new();
+        for turn in details.turns {
+            let turn_details = self.show_lane_turn(&turn.turn_id)?;
+            let checkpoint = turn_details.turn.after_change.clone().or_else(|| {
+                turn_details
+                    .operations
+                    .last()
+                    .map(|operation| operation.change_id.clone())
+            });
+            let tool_summaries = turn_details
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "tool_call" | "tool_call_update" | "span_started" | "span_ended"
+                    )
+                })
+                .filter_map(tool_summary_for_event)
+                .collect();
+            turns.push(TranscriptTurn {
+                turn: turn_details.turn,
+                messages: turn_details
+                    .messages
+                    .into_iter()
+                    .map(|message| TranscriptMessage {
+                        role: message.role,
+                        body: message.body,
+                        created_at: message.created_at,
+                    })
+                    .collect(),
+                events: turn_details.events,
+                checkpoint,
+                tool_summaries,
+            });
+        }
+
+        Ok(TranscriptReport {
+            selector: selector.to_string(),
+            resolved_kind,
+            lane_id: session.lane_id.clone(),
+            lane_name,
+            session,
+            acp_session,
+            turns,
+            operations: details.operations,
+        })
+    }
+
     pub fn lane_session_context(
         &self,
         session_id: &str,
@@ -178,5 +270,39 @@ impl CrabDb {
         Ok(LaneSessionEndReport {
             session: self.lane_session(session_id)?,
         })
+    }
+
+    fn acp_session_for_session(&self, session_id: &str) -> Result<Option<LaneAcpSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT acp_session_id, upstream_session_id, lane_id, crabdb_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+             FROM lane_acp_sessions WHERE crabdb_session_id = ?1 ORDER BY updated_at DESC, acp_session_id DESC LIMIT 1",
+        )?;
+        stmt.query_row(params![session_id], lane_acp_session_row)
+            .optional()
+            .map_err(Error::from)
+    }
+}
+
+fn tool_summary_for_event(event: &LaneEventRecord) -> Option<String> {
+    let payload = event.payload.as_ref()?;
+    let title = payload
+        .get("title")
+        .or_else(|| payload.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("attributes")
+                .and_then(|attributes| attributes.get("title").or_else(|| attributes.get("name")))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or(event.event_type.as_str());
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if status.is_empty() {
+        Some(title.to_string())
+    } else {
+        Some(format!("{title} ({status})"))
     }
 }

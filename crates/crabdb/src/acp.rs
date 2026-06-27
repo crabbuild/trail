@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -8,9 +9,14 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
+use crate::model::*;
 use crate::{CrabDb, Error, PatchDocument, PatchEdit, Result};
 
 const ACP_CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(30);
+const CLAUDE_ACP_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@latest";
+const ACP_MAX_PENDING_EVENTS_PER_TURN: usize = 128;
+const ACP_MAX_ASSISTANT_MESSAGE_BYTES: usize = 256 * 1024;
+const ACP_MAX_ASSISTANT_TOTAL_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AcpRelayOptions {
@@ -24,6 +30,89 @@ pub struct AcpRelayOptions {
     pub workdir: Option<PathBuf>,
     pub inject_mcp: bool,
     pub upstream_command: Vec<String>,
+}
+
+pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
+    match agent {
+        "claude-code" | "claude" => {
+            let relay_command = vec![
+                "crabdb".to_string(),
+                "acp".to_string(),
+                "relay".to_string(),
+                "--provider".to_string(),
+                "claude-code".to_string(),
+                "--materialize".to_string(),
+                "--".to_string(),
+                "npx".to_string(),
+                "-y".to_string(),
+                CLAUDE_ACP_ADAPTER.to_string(),
+            ];
+            let npx_available = command_in_path("npx");
+            Ok(AcpProviderProfile {
+                agent: "claude-code".to_string(),
+                display_name: "Claude Code".to_string(),
+                available: npx_available,
+                relay_command,
+                notes: if npx_available {
+                    vec!["uses the official Claude ACP adapter through npx".to_string()]
+                } else {
+                    vec!["`npx` was not found on PATH".to_string()]
+                },
+            })
+        }
+        "fake" => Ok(AcpProviderProfile {
+            agent: "fake".to_string(),
+            display_name: "Fake local ACP test agent".to_string(),
+            available: true,
+            relay_command: vec![
+                "crabdb".to_string(),
+                "acp".to_string(),
+                "relay".to_string(),
+                "--provider".to_string(),
+                "fake".to_string(),
+                "--materialize".to_string(),
+                "--".to_string(),
+                "<fake-acp-agent>".to_string(),
+            ],
+            notes: vec!["for diagnostics and tests only".to_string()],
+        }),
+        other => Err(Error::InvalidInput(format!(
+            "unsupported ACP agent `{other}`; supported agents: claude-code, fake"
+        ))),
+    }
+}
+
+pub fn acp_provider_profiles() -> Vec<AcpProviderProfile> {
+    ["claude-code", "fake"]
+        .into_iter()
+        .filter_map(|agent| acp_provider_profile(agent).ok())
+        .collect()
+}
+
+pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<AcpInstallReport> {
+    let profile = acp_provider_profile(agent)?;
+    let editor = match editor {
+        "generic" | "zed" => editor,
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "unsupported ACP editor `{other}`; supported editors: generic, zed"
+            )))
+        }
+    };
+    let snippet = acp_editor_snippet(editor, &profile.relay_command);
+    Ok(AcpInstallReport {
+        agent: profile.agent,
+        editor: editor.to_string(),
+        dry_run,
+        relay_command: profile.relay_command,
+        snippet,
+        detected: profile.available,
+        warnings: if profile.available {
+            Vec::new()
+        } else {
+            profile.notes
+        },
+    })
 }
 
 pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
@@ -115,6 +204,48 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
     }
 }
 
+fn command_in_path(command: &str) -> bool {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return PathBuf::from(command).is_file();
+    }
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| dir.join(command).is_file())
+}
+
+fn acp_editor_snippet(editor: &str, relay_command: &[String]) -> String {
+    let command = shell_join(relay_command);
+    match editor {
+        "zed" => serde_json::json!({
+            "agent_servers": {
+                "crabdb-claude-code": {
+                    "command": relay_command.first().cloned().unwrap_or_default(),
+                    "args": relay_command.iter().skip(1).cloned().collect::<Vec<_>>()
+                }
+            }
+        })
+        .to_string(),
+        _ => format!("ACP command:\n{command}"),
+    }
+}
+
+fn shell_join(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| {
+            if part.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | '@' | ':')
+            }) {
+                part.clone()
+            } else {
+                format!("'{}'", part.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 enum PumpDone {
     Editor(io::Result<()>),
     Agent(io::Result<()>),
@@ -129,12 +260,25 @@ where
     R: BufRead,
     W: Write,
 {
-    while let Some(mut message) = read_json_line(&mut reader)? {
+    loop {
+        let mut message = match read_json_line(&mut reader) {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(err) => {
+                capture_step(&coordinator, |capture| {
+                    capture.finish_open_turns("failed", "editor sent malformed JSON")
+                });
+                return Err(err);
+            }
+        };
         capture_step(&coordinator, |capture| {
             capture.before_client_message(&mut message)
         });
         write_json_line(&mut writer, &message)?;
     }
+    capture_step(&coordinator, |capture| {
+        capture.finish_open_turns("cancelled", "editor input closed")
+    });
     writer.flush()
 }
 
@@ -147,12 +291,25 @@ where
     R: BufRead,
     W: Write,
 {
-    while let Some(mut message) = read_json_line(&mut reader)? {
+    loop {
+        let mut message = match read_json_line(&mut reader) {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(err) => {
+                capture_step(&coordinator, |capture| {
+                    capture.finish_open_turns("failed", "upstream sent malformed JSON")
+                });
+                return Err(err);
+            }
+        };
         capture_step(&coordinator, |capture| {
             capture.before_agent_message(&mut message)
         });
         write_json_line(&mut writer, &message)?;
     }
+    capture_step(&coordinator, |capture| {
+        capture.finish_open_turns("failed", "upstream output closed")
+    });
     writer.flush()
 }
 
@@ -248,6 +405,8 @@ struct ActiveTurn {
     tool_spans: HashMap<String, String>,
     structured_diff_keys: HashSet<String>,
     pending_events: Vec<BufferedTurnEvent>,
+    assistant_buffer_bytes: usize,
+    capture_truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +425,20 @@ impl ActiveTurn {
             change_id: None,
             message_id: None,
         });
+    }
+
+    fn push_truncation_event(&mut self, reason: &str) {
+        if self.capture_truncated {
+            return;
+        }
+        self.capture_truncated = true;
+        self.push_event(
+            "acp_capture_truncated",
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "reason": reason
+            }))),
+        );
     }
 
     fn push_span_started(&mut self, span_id: &str, name: &str, attributes: Option<Value>) {
@@ -720,6 +893,8 @@ impl CaptureCoordinator {
                 tool_spans: HashMap::new(),
                 structured_diff_keys: HashSet::new(),
                 pending_events: Vec::new(),
+                assistant_buffer_bytes: 0,
+                capture_truncated: false,
             },
         );
         Ok(())
@@ -810,11 +985,29 @@ impl CaptureCoordinator {
                     .to_string();
                 let text = content_text(update.get("content"));
                 if !text.is_empty() {
-                    active
+                    let redaction_truncated = text.contains("\n[truncated]");
+                    let current_message_len = active
                         .assistant_buffers
-                        .entry(key)
-                        .or_default()
-                        .push_str(&text);
+                        .get(&key)
+                        .map(String::len)
+                        .unwrap_or(0);
+                    let available_for_message =
+                        ACP_MAX_ASSISTANT_MESSAGE_BYTES.saturating_sub(current_message_len);
+                    let available_for_turn =
+                        ACP_MAX_ASSISTANT_TOTAL_BYTES.saturating_sub(active.assistant_buffer_bytes);
+                    let allowed =
+                        utf8_prefix_len(&text, available_for_message.min(available_for_turn));
+                    if allowed > 0 {
+                        active
+                            .assistant_buffers
+                            .entry(key)
+                            .or_default()
+                            .push_str(&text[..allowed]);
+                        active.assistant_buffer_bytes += allowed;
+                    }
+                    if redaction_truncated || allowed < text.len() {
+                        active.push_truncation_event("assistant message buffer limit exceeded");
+                    }
                 }
                 Ok(())
             }
@@ -843,6 +1036,9 @@ impl CaptureCoordinator {
                 Ok(())
             }
         };
+        if active.pending_events.len() >= ACP_MAX_PENDING_EVENTS_PER_TURN {
+            self.flush_turn_events(&mut active)?;
+        }
         self.active_turns.insert(acp_session_id.to_string(), active);
         result
     }
@@ -972,6 +1168,7 @@ impl CaptureCoordinator {
             message: Some("ACP structured diff update".to_string()),
             session_id: Some(active.crabdb_session_id.clone()),
             allow_ignored: false,
+            allow_stale: false,
             edits,
         };
         match self
@@ -1089,6 +1286,77 @@ impl CaptureCoordinator {
         if status == "closed" {
             let _ = db.end_lane_session(&session.crabdb_session_id, "completed");
             self.sessions_by_acp.remove(acp_session_id);
+        }
+        Ok(())
+    }
+
+    fn finish_open_turns(&mut self, status: &str, reason: &str) -> Result<()> {
+        if self.active_turns.is_empty() {
+            return Ok(());
+        }
+        let active_turns = std::mem::take(&mut self.active_turns);
+        let mut db = self.open_db()?;
+        for (acp_session_id, mut active) in active_turns {
+            let open_spans = active.tool_spans.drain().collect::<Vec<_>>();
+            for (_, span_id) in open_spans {
+                active.push_span_ended(&span_id, status, None);
+            }
+            active.push_event(
+                "acp_relay_turn_closed",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "acp_session_id": acp_session_id,
+                    "status": status,
+                    "reason": reason
+                }))),
+            );
+            self.flush_turn_events(&mut active)?;
+            for (message_id, text) in active.assistant_buffers.drain() {
+                if !text.trim().is_empty() {
+                    db.add_lane_turn_message(&active.turn_id, "assistant", &text)?;
+                    db.add_lane_turn_event(
+                        &active.turn_id,
+                        "acp_agent_message_flushed",
+                        Some(redact_json(serde_json::json!({
+                            "protocol": "acp",
+                            "acp_message_id": message_id,
+                            "reason": reason
+                        }))),
+                        None,
+                        None,
+                    )?;
+                }
+            }
+            if active.materialized {
+                let _ = db.record_lane_workdir_for_turn(
+                    &active.lane_name,
+                    &active.turn_id,
+                    Some(format!("ACP prompt workdir checkpoint ({reason})")),
+                );
+            }
+            db.add_lane_turn_event(
+                &active.turn_id,
+                "acp_prompt_finished",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "acp_session_id": acp_session_id,
+                    "status": status,
+                    "reason": reason
+                }))),
+                None,
+                None,
+            )?;
+            if let Some(span_id) = active.root_span_id {
+                let _ = db.end_lane_trace_span(
+                    &span_id,
+                    status,
+                    Some(redact_json(serde_json::json!({ "reason": reason }))),
+                );
+            }
+            let _ = db.end_lane_turn(&active.turn_id, status);
+            let _ = db.update_lane_acp_session_status(&acp_session_id, status);
+            self.pending_prompts
+                .retain(|_, pending| pending.acp_session_id != acp_session_id);
         }
         Ok(())
     }
@@ -1486,6 +1754,17 @@ fn summarize_text(text: &str) -> String {
     let mut summary = text.chars().take(LIMIT).collect::<String>();
     summary.push_str("...");
     summary
+}
+
+fn utf8_prefix_len(value: &str, max_bytes: usize) -> usize {
+    if value.len() <= max_bytes {
+        return value.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn acp_trace_id_for_turn(turn_id: &str) -> String {

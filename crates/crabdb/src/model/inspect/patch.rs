@@ -1,4 +1,5 @@
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchDocument {
     pub base_change: Option<String>,
     pub message: Option<String>,
@@ -6,11 +7,13 @@ pub struct PatchDocument {
     pub session_id: Option<String>,
     #[serde(default)]
     pub allow_ignored: bool,
+    #[serde(default)]
+    pub allow_stale: bool,
     pub edits: Vec<PatchEdit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PatchEdit {
     Write {
         path: String,

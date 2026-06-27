@@ -22,6 +22,11 @@ pub(super) fn handle_merge_queue_command(
             let entries = db.list_merge_queue()?;
             render_merge_queue_list(&entries, ctx.json, ctx.quiet)
         }
+        MergeQueueSubcommand::Explain(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.explain_merge_queue(&args.selector)?;
+            render_merge_queue_explain(&report, ctx.json, ctx.quiet)
+        }
         MergeQueueSubcommand::Run(args) => {
             let mut db = open_db(ctx)?;
             let report = db.run_merge_queue(args.limit)?;

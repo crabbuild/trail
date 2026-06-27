@@ -5,6 +5,7 @@ use crate::model::ConflictManualResolution;
 use super::default_completed_status;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeLaneRequest {
     #[serde(default, alias = "lane", alias = "name")]
     pub(crate) lane_id: Option<String>,
@@ -15,6 +16,7 @@ pub(crate) struct MergeLaneRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionStartRequest {
     pub(crate) lane: String,
     #[serde(default)]
@@ -24,12 +26,14 @@ pub(crate) struct SessionStartRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionEndRequest {
     #[serde(default = "default_completed_status")]
     pub(crate) status: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovalRequest {
     pub(crate) lane: String,
     pub(crate) action: String,
@@ -43,6 +47,7 @@ pub(crate) struct ApprovalRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovalDecisionRequest {
     pub(crate) decision: String,
     #[serde(default)]
@@ -52,6 +57,7 @@ pub(crate) struct ApprovalDecisionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRunPauseRequest {
     pub(crate) lane: String,
     pub(crate) reason: String,
@@ -67,6 +73,7 @@ pub(crate) struct LaneRunPauseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRunResumeRequest {
     #[serde(default)]
     pub(crate) reviewer: Option<String>,
@@ -75,6 +82,7 @@ pub(crate) struct LaneRunResumeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LeaseAcquireRequest {
     pub(crate) lane: String,
     #[serde(default)]
@@ -86,6 +94,7 @@ pub(crate) struct LeaseAcquireRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AnchorCreateRequest {
     pub(crate) path_line: String,
     pub(crate) label: String,
@@ -94,6 +103,7 @@ pub(crate) struct AnchorCreateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeQueueAddRequest {
     pub(crate) source: String,
     #[serde(alias = "into", alias = "target_branch")]
@@ -103,12 +113,14 @@ pub(crate) struct MergeQueueAddRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeQueueRunRequest {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConflictResolveRequest {
     #[serde(default)]
     pub(crate) take: Option<String>,

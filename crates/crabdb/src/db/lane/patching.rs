@@ -31,12 +31,22 @@ impl CrabDb {
                 return Err(Error::StaleBranch(ref_name));
             }
         }
-        if let Some(base_change) = &patch.base_change {
-            if base_change != &head.change_id.0 {
-                return Err(Error::PatchRejected(format!(
-                    "patch base {base_change} does not match lane head {}",
-                    head.change_id.0
-                )));
+        if !patch.allow_stale {
+            match &patch.base_change {
+                Some(base_change) if base_change == &head.change_id.0 => {}
+                Some(base_change) => {
+                    return Err(Error::PatchRejected(format!(
+                        "patch base {base_change} does not match lane head {}; set allow_stale=true to apply without a fresh base",
+                        head.change_id.0
+                    )));
+                }
+                None if api_turn.is_some() => {}
+                None => {
+                    return Err(Error::PatchRejected(format!(
+                        "patch requires base_change matching lane head {}; set allow_stale=true to apply without a fresh base",
+                        head.change_id.0
+                    )));
+                }
             }
         }
         for edit in &patch.edits {
@@ -44,6 +54,7 @@ impl CrabDb {
         }
 
         let touched_paths = self.patch_touched_paths(&patch.edits)?;
+        self.ensure_lane_patch_policy(&lane_row, &patch, &touched_paths)?;
         let previous_touched = self.load_root_files_for_paths(&head.root_id, &touched_paths)?;
         let actor = Actor::lane(lane);
         let change_id = self.allocate_change_id(&actor.id, "lane_patch")?;
@@ -161,6 +172,7 @@ impl CrabDb {
                     "root_id": built.root_id.0.clone(),
                     "session_id": patch_session_id.clone(),
                     "allow_ignored": patch.allow_ignored,
+                    "allow_stale": patch.allow_stale,
                     "changed_paths": changed_summaries.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
                 }),
             )?;

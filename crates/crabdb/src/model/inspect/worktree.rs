@@ -25,6 +25,8 @@ pub struct StatusReport {
     pub head: RefRecord,
     pub worktree_state: WorktreeState,
     pub changed_paths: Vec<FileDiffSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<StatusSuggestion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

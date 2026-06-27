@@ -88,6 +88,13 @@ At request time:
 The HTTP transport is intentionally small and local:
 
 - It reads a request line, headers, and `Content-Length` body.
+- It applies 30-second read and write timeouts to accepted TCP connections.
+- It applies a per-peer rate limit on accepted listener connections. The
+  default is 600 requests per 60-second window; callers embedding the listener
+  can provide a different `ServerRateLimit`.
+- It rejects raw requests or declared bodies larger than 16 MiB before routing.
+- It rejects requests with an `Origin` header unless the origin host is loopback
+  (`localhost`, `127.0.0.1`, or `::1`).
 - It stores lowercased header names.
 - It parses method and path.
 - It dispatches to route handlers.
@@ -138,6 +145,14 @@ flowchart TB
 ## Request and Response Shape
 
 HTTP route handlers parse request bodies into typed request structs from `server/request_types`. They call `CrabDb` methods and return report structs serialized as JSON.
+Mutation request bodies use strict typed deserialization: unknown fields are rejected instead of ignored. This catches misspelled keys and prevents clients from believing CrabDB accepted options that were never evaluated.
+
+Mutating HTTP requests may include `Idempotency-Key`. CrabDB stores the first
+response for a key in `http_idempotency_keys` with method, path, request hash,
+status, and body. A later request with the same key, method, path, and body
+hash replays the stored response without dispatching the mutation again. A
+later request with the same key but a different method, path, or body is
+rejected as invalid input. Unauthorized and forbidden responses are not cached.
 
 Errors return:
 
@@ -154,10 +169,29 @@ The numeric code is the same category used by CLI exit codes.
 
 HTTP status mapping:
 
-- 400: invalid input, invalid path, ignored path.
+- 400: invalid input, invalid path, ignored path, malformed JSON, unknown JSON fields.
 - 404: missing ref, operation, or root.
 - 409: conflict, dirty worktree, patch rejection, stale branch, workspace lock.
+- 429: daemon listener rate limit exceeded.
 - 500: other errors.
+
+## External Mutation Audit
+
+HTTP and MCP mutation surfaces emit compact durable audit rows in `external_mutation_audit`.
+
+For HTTP, non-GET mutation requests are audited after routing unless the request was rejected by auth or origin checks. For MCP, mutating `tools/call` requests are audited according to tool risk annotations; read-only tools are not written to the audit table.
+
+Audit rows store:
+
+- surface: `http` or `mcp`
+- command: HTTP method/path or MCP tool name
+- lane id and target ref when they can be inferred from structured output
+- success or error status
+- HTTP status code when applicable
+- change id when the mutation produced one
+- a small redacted summary
+
+Raw HTTP request bodies and MCP arguments are not stored in the audit table.
 
 ## CLI Daemon Routing
 
@@ -252,7 +286,7 @@ Tool groups mirror product workflows:
 - Merge: merge queue and conflicts.
 - Turns: begin/end turn, messages, events, spans, patch application, lane diff, tests/evals, workdir sync/read.
 
-Risk annotations mark tools as read-only, workspace write, destructive write, or open-world write. This helps MCP hosts make safer decisions before calling tools.
+Risk annotations mark tools as read-only, workspace write, destructive write, or open-world write. This helps MCP hosts make safer decisions before calling tools. The MCP dispatcher enforces read-only annotations with a read-only database guard and a storage fingerprint check, so annotated read-only tools fail if they attempt to persist CrabDB state. The workspace status resource also uses a non-mutating status path instead of refreshing persistent index caches. Mutating MCP tools are audited through `external_mutation_audit`.
 
 ## MCP Resources and Prompts
 

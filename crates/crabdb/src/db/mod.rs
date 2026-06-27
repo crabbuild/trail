@@ -214,6 +214,37 @@ pub(crate) struct CommandRunResult {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ExternalMutationAuditInput {
+    pub(crate) surface: String,
+    pub(crate) command: String,
+    pub(crate) target_ref: Option<String>,
+    pub(crate) lane_id: Option<String>,
+    pub(crate) status: String,
+    pub(crate) status_code: Option<i64>,
+    pub(crate) change_id: Option<ChangeId>,
+    pub(crate) summary: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HttpIdempotencyEntry {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) request_hash: String,
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HttpIdempotencyStoreInput {
+    pub(crate) key: String,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) request_hash: String,
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct LaneTraceSpanBuilder {
     span_id: String,
     trace_id: String,
@@ -472,6 +503,9 @@ pub(crate) struct MergeContext {
     base_change: ChangeId,
     left_change: ChangeId,
     right_change: ChangeId,
+    base_root: ObjectId,
+    left_root: ObjectId,
+    right_root: ObjectId,
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +517,9 @@ pub(crate) struct PendingConflictMerge {
     base_change: ChangeId,
     left_change: ChangeId,
     right_change: ChangeId,
+    base_root: Option<ObjectId>,
+    left_root: Option<ObjectId>,
+    right_root: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone)]
@@ -569,5 +606,140 @@ mod tests {
     fn case_fold_collision_validation_allows_distinct_paths() {
         let paths = ["src/foo.rs".to_string(), "src/bar.rs".to_string()];
         validate_no_case_fold_collisions(paths.iter()).unwrap();
+    }
+
+    #[test]
+    fn relative_path_normalization_fuzz_corpus_never_escapes_workspace() {
+        for seed in 0..512_u64 {
+            let path = generated_path(seed);
+            if let Ok(normalized) = normalize_relative_path(&path) {
+                assert!(!normalized.is_empty(), "seed {seed} normalized empty");
+                assert!(!normalized.starts_with('/'), "seed {seed}: {normalized}");
+                assert!(!normalized.contains('\\'), "seed {seed}: {normalized}");
+                assert!(!normalized.contains('\0'), "seed {seed}: {normalized}");
+                for part in normalized.split('/') {
+                    assert!(!part.is_empty(), "seed {seed}: {normalized}");
+                    assert_ne!(part, ".", "seed {seed}: {normalized}");
+                    assert_ne!(part, "..", "seed {seed}: {normalized}");
+                    assert!(!part.contains(':'), "seed {seed}: {normalized}");
+                    assert!(!part.ends_with([' ', '.']), "seed {seed}: {normalized}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn patch_document_parser_fuzz_corpus_accepts_only_known_shapes() {
+        for seed in 0..256_u64 {
+            let value = generated_patch_json(seed);
+            match serde_json::from_value::<PatchDocument>(value) {
+                Ok(document) => {
+                    let encoded = serde_json::to_value(&document).unwrap();
+                    assert!(encoded.get("edits").is_some());
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("unknown field")
+                            || message.contains("unknown variant")
+                            || message.contains("missing field")
+                            || message.contains("invalid type"),
+                        "unexpected parse error for seed {seed}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn generated_path(seed: u64) -> String {
+        let atoms = [
+            "src",
+            "lib.rs",
+            "..",
+            ".",
+            "",
+            "CON",
+            "aux.txt",
+            "has:colon",
+            "trail.",
+            "trail ",
+            "nested\\path",
+            "normal-name",
+            "\u{2215}",
+            "emoji",
+            ".git",
+            ".crabdb",
+        ];
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut parts = Vec::new();
+        for _ in 0..=((seed % 5) as usize) {
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            parts.push(atoms[(state as usize) % atoms.len()]);
+        }
+        let mut path = parts.join(if seed % 7 == 0 { "\\" } else { "/" });
+        if seed % 11 == 0 {
+            path.insert(0, '/');
+        }
+        if seed % 13 == 0 {
+            path.push('\0');
+        }
+        path
+    }
+
+    fn generated_patch_json(seed: u64) -> serde_json::Value {
+        let path = generated_path(seed);
+        let op = match seed % 7 {
+            0 => "write",
+            1 => "write_bytes",
+            2 => "replace_line",
+            3 => "delete",
+            4 => "rename",
+            5 => "unknown",
+            _ => "write",
+        };
+        let edit = match op {
+            "write" => serde_json::json!({
+                "op": op,
+                "path": path,
+                "content": format!("seed-{seed}\n"),
+                "extra": (seed % 3 == 0).then_some(true)
+            }),
+            "write_bytes" => serde_json::json!({
+                "op": op,
+                "path": path,
+                "bytes_hex": if seed % 2 == 0 { "00ff" } else { "not-hex" }
+            }),
+            "replace_line" => serde_json::json!({
+                "op": op,
+                "path": path,
+                "line_id": if seed % 2 == 0 {
+                    serde_json::json!("change_abc:1")
+                } else {
+                    serde_json::json!(1)
+                },
+                "expected_text": "old",
+                "new_text": "new"
+            }),
+            "delete" => serde_json::json!({
+                "op": op,
+                "path": path
+            }),
+            "rename" => serde_json::json!({
+                "op": op,
+                "from": path,
+                "to": generated_path(seed.wrapping_add(17))
+            }),
+            _ => serde_json::json!({
+                "op": op,
+                "path": path
+            }),
+        };
+        serde_json::json!({
+            "message": format!("generated patch {seed}"),
+            "allow_stale": seed % 2 == 0,
+            "edits": [edit]
+        })
     }
 }

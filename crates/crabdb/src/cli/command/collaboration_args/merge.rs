@@ -19,6 +19,8 @@ pub(in crate::cli::command) enum MergeQueueSubcommand {
     Add(MergeQueueAddArgs),
     /// List queued merge candidates and states.
     List,
+    /// Explain why a queued merge is ready or blocked.
+    Explain(MergeQueueExplainArgs),
     /// Run queued merges up to optional item limit.
     Run(MergeQueueRunArgs),
     /// Remove a queued item before execution.
@@ -44,6 +46,11 @@ pub(in crate::cli::command) struct MergeQueueAddArgs {
 pub(in crate::cli::command) struct MergeQueueRunArgs {
     #[arg(long)]
     pub(in crate::cli::command) limit: Option<usize>,
+}
+
+#[derive(Args)]
+pub(in crate::cli::command) struct MergeQueueExplainArgs {
+    pub(in crate::cli::command) selector: String,
 }
 
 #[derive(Args)]

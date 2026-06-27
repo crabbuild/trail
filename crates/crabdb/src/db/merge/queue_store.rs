@@ -75,6 +75,43 @@ impl CrabDb {
         )))
     }
 
+    pub(crate) fn merge_queue_entry_dry_run(
+        &mut self,
+        entry: &MergeQueueEntry,
+    ) -> Result<MergeReport> {
+        let target = entry
+            .target_ref
+            .strip_prefix(MAIN_REF_PREFIX)
+            .unwrap_or(&entry.target_ref);
+        if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
+            return self.merge_lane_unlocked(lane, target, true, false);
+        }
+        if let Some(source) = entry.source_ref.strip_prefix(MAIN_REF_PREFIX) {
+            return self.merge_branches_unlocked(source, target, true);
+        }
+        Err(Error::InvalidInput(format!(
+            "merge queue source `{}` must be a lane or branch ref",
+            entry.source_ref
+        )))
+    }
+
+    pub(crate) fn merge_queue_entry_by_selector(&self, selector: &str) -> Result<MergeQueueEntry> {
+        let lane_candidate = lane_ref(selector);
+        let branch_candidate = branch_ref(selector);
+        self.conn
+            .query_row(
+                "SELECT queue_id, source_ref, target_ref, status, priority, created_at, updated_at \
+                 FROM merge_queue \
+                 WHERE (queue_id = ?1 OR source_ref = ?1 OR source_ref = ?2 OR source_ref = ?3) \
+                   AND status NOT IN ('merged', 'cancelled') \
+                 ORDER BY status = 'queued' DESC, priority DESC, created_at ASC LIMIT 1",
+                params![selector, lane_candidate, branch_candidate],
+                merge_queue_row,
+            )
+            .optional()?
+            .ok_or_else(|| Error::InvalidInput(format!("merge queue item `{selector}` not found")))
+    }
+
     pub(crate) fn merge_queue_context(
         &self,
         source_ref_name: &str,
@@ -87,10 +124,14 @@ impl CrabDb {
         } else {
             self.common_parent_hint(&source_ref.change_id, &target_ref.change_id)?
         };
+        let base_ref = self.ref_from_change(&base_change)?;
         Ok(MergeContext {
             base_change,
             left_change: target_ref.change_id,
             right_change: source_ref.change_id,
+            base_root: base_ref.root_id,
+            left_root: target_ref.root_id,
+            right_root: source_ref.root_id,
         })
     }
 
@@ -100,7 +141,7 @@ impl CrabDb {
     ) -> Result<PendingConflictMerge> {
         self.conn
             .query_row(
-                "SELECT merge_id, queue_id, source_ref, target_ref, base_change, left_change, right_change \
+                "SELECT merge_id, queue_id, source_ref, target_ref, base_change, left_change, right_change, base_root, left_root, right_root \
                  FROM merge_results WHERE conflict_set = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![conflict_set_id],
                 |row| {
@@ -112,6 +153,9 @@ impl CrabDb {
                         base_change: ChangeId(row.get(4)?),
                         left_change: ChangeId(row.get(5)?),
                         right_change: ChangeId(row.get(6)?),
+                        base_root: row.get::<_, Option<String>>(7)?.map(ObjectId),
+                        left_root: row.get::<_, Option<String>>(8)?.map(ObjectId),
+                        right_root: row.get::<_, Option<String>>(9)?.map(ObjectId),
                     })
                 },
             )
@@ -181,8 +225,8 @@ impl CrabDb {
         let result_change = result_change.map(|change| change.0.clone());
         self.conn.execute(
             "INSERT INTO merge_results \
-             (merge_id, queue_id, source_ref, target_ref, base_change, left_change, right_change, result_change, status, conflict_set, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (merge_id, queue_id, source_ref, target_ref, base_change, left_change, right_change, base_root, left_root, right_root, result_change, status, conflict_set, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 merge_id,
                 queue_id,
@@ -191,6 +235,9 @@ impl CrabDb {
                 context.base_change.0,
                 context.left_change.0,
                 context.right_change.0,
+                context.base_root.0,
+                context.left_root.0,
+                context.right_root.0,
                 result_change,
                 status,
                 conflict_set,

@@ -49,6 +49,10 @@ fn tool_annotations(name: &str) -> Value {
     }
 }
 
+pub(crate) fn tool_is_read_only(name: &str) -> bool {
+    matches!(tool_risk_class(name), ToolRiskClass::ReadOnly)
+}
+
 #[derive(Clone, Copy)]
 enum ToolRiskClass {
     ReadOnly,

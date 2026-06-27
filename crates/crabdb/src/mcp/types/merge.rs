@@ -3,6 +3,7 @@ use serde::Deserialize;
 use crate::model::ConflictManualResolution;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeQueueAddArgs {
     pub(crate) source: String,
     #[serde(alias = "into", alias = "target_branch")]
@@ -12,12 +13,14 @@ pub(crate) struct MergeQueueAddArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeQueueRunArgs {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct MergeQueueRemoveArgs {
     pub(crate) selector: String,
 }
@@ -30,6 +33,7 @@ pub(crate) struct ConflictIdArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConflictResolveArgs {
     pub(crate) conflict_set_id: String,
     #[serde(default)]

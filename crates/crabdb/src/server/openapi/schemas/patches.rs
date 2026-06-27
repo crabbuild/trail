@@ -10,6 +10,7 @@ pub(super) fn patch_schemas() -> Value {
                 "message": { "type": "string" },
                 "session_id": { "type": "string" },
                 "allow_ignored": { "type": "boolean" },
+                "allow_stale": { "type": "boolean" },
                 "edits": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
                 "files": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
             }

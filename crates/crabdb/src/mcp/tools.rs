@@ -7,6 +7,8 @@ mod lane;
 mod merge;
 mod turns;
 
+pub(crate) use annotations::tool_is_read_only;
+
 pub(crate) fn tools() -> Value {
     let mut tools = core::tools();
     append_tools(&mut tools, lane::tools());

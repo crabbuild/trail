@@ -21,6 +21,13 @@ Use `crabdb config list`, `get`, and `set` to inspect and edit workspace config.
 | `lane.require_eval_gate` | bool | no | Boolean parser values. |
 | `lane.required_test_suites` | list | no | Comma, semicolon, or newline separated suite names. |
 | `lane.required_eval_suites` | list | no | Comma, semicolon, or newline separated suite names. |
+| `lane.claim_enforcement` | string | no | `off`, `warn`, or `reject`. |
+| `lane.enforce_sparse_paths` | bool | no | Boolean parser values. |
+| `lane.max_patch_bytes` | u64 | no | Unsigned integer, zero disables the limit. |
+| `lane.max_patch_file_bytes` | u64 | no | Unsigned integer, zero disables the limit. |
+| `lane.max_changed_paths` | u64 | no | Unsigned integer, zero disables the limit. |
+| `lane.max_event_payload_bytes` | u64 | no | Unsigned integer, zero disables the limit. |
+| `lane.max_trace_payload_bytes` | u64 | no | Unsigned integer, zero disables the limit. |
 | `lane.worktrees_dir` | path | no | Relative path normalized inside workspace. |
 | `lane.merge_strategy` | string | no | `conservative`. |
 | `git.export_trailers` | bool | no | Boolean parser values. |
@@ -73,4 +80,3 @@ Scopes:
 - Config validation: `crates/crabdb/src/db/util/config/set.rs`
 - Parsing helpers: `crates/crabdb/src/db/util/config_parse.rs`
 - Guardrail policy parser: `crates/crabdb/src/db/util/guardrails/policy.rs`
-

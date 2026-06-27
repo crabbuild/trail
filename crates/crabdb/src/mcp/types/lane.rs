@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneSpawnArgs {
     pub(crate) name: String,
     #[serde(default, alias = "from", alias = "branch")]
@@ -20,6 +21,7 @@ pub(crate) struct LaneSpawnArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneClaimArgs {
     pub(crate) lane: String,
     pub(crate) path: String,
@@ -42,6 +44,7 @@ pub(crate) struct LaneContributionArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRemoveArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,
@@ -50,6 +53,7 @@ pub(crate) struct LaneRemoveArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRewindArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,
@@ -62,6 +66,7 @@ pub(crate) struct LaneRewindArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LeaseAcquireArgs {
     pub(crate) lane: String,
     #[serde(default)]
@@ -79,6 +84,7 @@ pub(crate) struct LeaseListArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LeaseReleaseArgs {
     pub(crate) lease_id: String,
 }
@@ -102,6 +108,7 @@ pub(crate) struct GateHistoryArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunTestArgs {
     pub(crate) lane: String,
     pub(crate) command: Vec<String>,
@@ -118,6 +125,7 @@ pub(crate) struct RunTestArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadFileArgs {
     pub(crate) lane: String,
     pub(crate) path: String,
@@ -130,6 +138,7 @@ pub(crate) struct ReadFileArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SyncWorkdirArgs {
     pub(crate) lane: String,
     #[serde(default)]

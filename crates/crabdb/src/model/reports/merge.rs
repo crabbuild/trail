@@ -33,6 +33,17 @@ pub struct MergeQueueRemoveReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MergeQueueExplainReport {
+    pub entry: MergeQueueEntry,
+    pub readiness: Option<LaneReadinessReport>,
+    pub dry_run: Option<MergeReport>,
+    pub blockers: Vec<LaneReadinessIssue>,
+    pub warnings: Vec<LaneReadinessIssue>,
+    pub error: Option<String>,
+    pub next_steps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeQueueRunReport {
     pub processed: Vec<MergeQueueRunItem>,
     pub stopped_on_conflict: bool,
@@ -80,11 +91,18 @@ pub struct ConflictMergeContext {
     pub base_change: ChangeId,
     pub target_change: ChangeId,
     pub source_change: ChangeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_root: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_root: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConflictPathExplanation {
     pub path: String,
+    pub conflict_class: String,
     pub summary: String,
     pub reason: String,
     pub target: Option<ConflictSideProvenance>,

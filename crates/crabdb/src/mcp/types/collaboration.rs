@@ -4,6 +4,7 @@ use serde_json::Value;
 use super::turns::default_completed_status;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionStartArgs {
     pub(crate) lane: String,
     #[serde(default)]
@@ -25,6 +26,7 @@ pub(crate) struct SessionCurrentArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionIdArgs {
     pub(crate) session_id: String,
 }
@@ -37,6 +39,7 @@ pub(crate) struct SessionContextArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionEndArgs {
     pub(crate) session_id: String,
     #[serde(default = "default_completed_status")]
@@ -44,6 +47,7 @@ pub(crate) struct SessionEndArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovalRequestArgs {
     pub(crate) lane: String,
     pub(crate) action: String,
@@ -70,6 +74,7 @@ pub(crate) struct ApprovalShowArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApprovalDecideArgs {
     pub(crate) approval_id: String,
     pub(crate) decision: String,
@@ -80,6 +85,7 @@ pub(crate) struct ApprovalDecideArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRunPauseArgs {
     pub(crate) lane: String,
     pub(crate) reason: String,
@@ -108,6 +114,7 @@ pub(crate) struct LaneRunShowArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRunResumeArgs {
     pub(crate) run_id: String,
     #[serde(default)]
@@ -117,6 +124,7 @@ pub(crate) struct LaneRunResumeArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AnchorCreateArgs {
     pub(crate) path_line: String,
     pub(crate) label: String,

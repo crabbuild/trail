@@ -117,6 +117,7 @@ pub(super) fn tools() -> Value {
                 "base_change": { "type": "string" },
                 "session_id": { "type": "string" },
                 "allow_ignored": { "type": "boolean" },
+                "allow_stale": { "type": "boolean" },
                 "edits": { "type": "array", "items": { "type": "object" } },
                 "files": { "type": "array", "items": { "type": "object" } }
             }), vec!["turn_id"])

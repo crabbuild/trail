@@ -3,6 +3,7 @@ use serde::Deserialize;
 use super::default_completed_status;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpawnLaneRequest {
     pub(crate) name: String,
     #[serde(default, alias = "from_ref", alias = "branch")]
@@ -22,6 +23,7 @@ pub(crate) struct SpawnLaneRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BeginTurnRequest {
     pub(crate) lane: String,
     #[serde(default)]
@@ -33,6 +35,7 @@ pub(crate) struct BeginTurnRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddMessageRequest {
     pub(crate) role: String,
     #[serde(default)]
@@ -42,6 +45,7 @@ pub(crate) struct AddMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddEventRequest {
     #[serde(alias = "type")]
     pub(crate) event_type: String,
@@ -54,6 +58,7 @@ pub(crate) struct AddEventRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StartSpanRequest {
     #[serde(alias = "type")]
     pub(crate) span_type: String,
@@ -67,6 +72,7 @@ pub(crate) struct StartSpanRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EndSpanRequest {
     #[serde(default = "default_completed_status")]
     pub(crate) status: String,
@@ -75,12 +81,14 @@ pub(crate) struct EndSpanRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EndTurnRequest {
     #[serde(default = "default_completed_status")]
     pub(crate) status: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneTestRequest {
     pub(crate) command: Vec<String>,
     #[serde(default, alias = "turn")]
@@ -96,6 +104,7 @@ pub(crate) struct LaneTestRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneReadFileRequest {
     pub(crate) path: String,
     #[serde(default)]
@@ -107,6 +116,7 @@ pub(crate) struct LaneReadFileRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SyncWorkdirRequest {
     #[serde(default)]
     pub(crate) force: bool,
@@ -117,12 +127,14 @@ pub(crate) struct SyncWorkdirRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRecordRequest {
     #[serde(default)]
     pub(crate) message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRewindRequest {
     #[serde(alias = "target")]
     pub(crate) to: String,
@@ -133,6 +145,7 @@ pub(crate) struct LaneRewindRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneClaimRequest {
     pub(crate) path: String,
     #[serde(default, alias = "ttl")]

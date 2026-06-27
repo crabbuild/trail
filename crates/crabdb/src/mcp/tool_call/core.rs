@@ -9,7 +9,7 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
         "crabdb.doctor" => tool_result(db.doctor()?),
         "crabdb.status" => {
             let args: StatusArgs = parse_args(arguments)?;
-            tool_result(db.status(args.branch.as_deref())?)
+            tool_result(db.status_read_only(args.branch.as_deref())?)
         }
         "crabdb.diff" => {
             let args: DiffArgs = parse_args(arguments)?;

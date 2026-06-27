@@ -12,20 +12,22 @@ Structured patches are used by:
 
 ```json
 {
-  "base_change": "optional-change-id",
+  "base_change": "current-lane-head-change-id",
   "message": "optional message",
   "session_id": "optional-session-id",
   "allow_ignored": false,
+  "allow_stale": false,
   "edits": []
 }
 ```
 
 Fields:
 
-- `base_change`: optional expected base change.
+- `base_change`: expected lane head change for direct lane patches. Turn-linked patches may omit it because the turn's `before_change` is used as the freshness guard.
 - `message`: optional operation message.
 - `session_id`: optional session link.
 - `allow_ignored`: default `false`; opt-in for ignored paths.
+- `allow_stale`: default `false`; set `true` only to bypass the `base_change` freshness check intentionally.
 - `edits`: edit list.
 
 ## Edit: `write`
@@ -118,10 +120,13 @@ The HTTP parser also accepts:
 
 Patch paths are normalized and checked. Internal paths and hardcoded private paths are rejected. Workspace-ignored paths require `allow_ignored`.
 
+Direct lane patches are rejected unless `base_change` matches the current lane head. If a tool intentionally wants to apply against whatever the current head is, it must set `allow_stale: true` or use `--allow-stale`.
+
+Patch messages and edit payloads are secret-scanned before storage. Assignment-style credentials such as `API_KEY=...`, bearer tokens, and private-key PEM blocks reject the patch; benign prose such as “token expiration logic” is allowed.
+
 ## Code Facts Used
 
 - Public patch schema: `crates/crabdb/src/model/inspect/patch.rs`
 - HTTP patch schema: `crates/crabdb/src/server/request_types/patches.rs`
 - HTTP parser: `crates/crabdb/src/server/route/utils.rs`
 - Patch policy: `crates/crabdb/src/db/lane/patch_policy.rs`
-

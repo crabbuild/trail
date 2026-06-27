@@ -39,6 +39,13 @@ On Unix, newly created token files are restricted to mode `0600`.
 ## Auth
 
 `GET /v1/health` is unauthenticated. Other routes require auth unless `--no-auth` is used.
+Requests larger than 16 MiB are rejected before routing. Requests with an
+`Origin` header are accepted only when the origin host is loopback, such as
+`localhost`, `127.0.0.1`, or `::1`.
+The daemon applies a per-peer listener rate limit of 600 requests per 60
+seconds and returns `429 Too Many Requests` when the window is exhausted.
+Mutating requests can include `Idempotency-Key` to make retries replay the first
+stored response instead of dispatching the mutation again.
 
 Send either:
 
@@ -67,4 +74,3 @@ Or set `CRABDB_DAEMON_URL` and `CRABDB_DAEMON_TOKEN`. Supported hot commands can
 - Daemon args/auth: `crates/crabdb/src/cli/command/maintenance_args.rs`, `crates/crabdb/src/cli/command/handler/maintenance.rs`
 - HTTP transport/auth: `crates/crabdb/src/server/transport.rs`, `crates/crabdb/src/server/route/utils.rs`
 - CLI daemon routing: `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
-

@@ -36,6 +36,8 @@ impl CrabDb {
         );
         let event_id = format!("evt_{}", crate::ids::short_hash(event_seed.as_bytes(), 16));
         let payload = redact_sensitive_json(payload.clone());
+        let payload_json = serde_json::to_string(&payload)?;
+        self.ensure_lane_event_payload_limit(event_type, &payload_json)?;
         let created_at = now_ts();
         self.conn.execute(
             "INSERT INTO lane_events \
@@ -49,7 +51,7 @@ impl CrabDb {
                 event_type,
                 change_id.map(|id| id.0.clone()),
                 message_id.map(|id| id.0.clone()),
-                serde_json::to_string(&payload)?,
+                payload_json,
                 created_at
             ],
         )?;
@@ -57,6 +59,26 @@ impl CrabDb {
             &event_id, lane_id, session_id, turn_id, event_type, &payload, created_at,
         )?;
         Ok(event_id)
+    }
+
+    fn ensure_lane_event_payload_limit(&self, event_type: &str, payload_json: &str) -> Result<()> {
+        let payload_bytes = payload_json.as_bytes().len() as u64;
+        let max_event_payload_bytes = self.config.lane.max_event_payload_bytes;
+        if max_event_payload_bytes > 0 && payload_bytes > max_event_payload_bytes {
+            return Err(Error::InvalidInput(format!(
+                "lane event payload is {payload_bytes} bytes, exceeding lane.max_event_payload_bytes {max_event_payload_bytes}"
+            )));
+        }
+        let max_trace_payload_bytes = self.config.lane.max_trace_payload_bytes;
+        if matches!(event_type, "span_started" | "span_ended")
+            && max_trace_payload_bytes > 0
+            && payload_bytes > max_trace_payload_bytes
+        {
+            return Err(Error::InvalidInput(format!(
+                "lane trace payload is {payload_bytes} bytes, exceeding lane.max_trace_payload_bytes {max_trace_payload_bytes}"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn index_lane_trace_span_event(

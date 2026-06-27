@@ -170,6 +170,9 @@ pub(crate) fn render_lane_workdir_sync(
         if report.forced {
             println!("Forced: true");
         }
+        if let Some(rescue_workdir) = &report.rescue_workdir {
+            println!("Rescue workdir: {rescue_workdir}");
+        }
         for path in &report.changed_paths {
             println!("  {:?} {}", path.kind, path.path);
         }

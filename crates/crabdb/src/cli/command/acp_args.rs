@@ -4,14 +4,51 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub(super) enum AcpSubcommand {
+    /// Print guided setup for an ACP provider without mutating editor config.
+    Install(AcpInstallArgs),
+    /// Run ACP integration diagnostics.
+    Doctor(AcpDoctorArgs),
+    /// List supported ACP provider profiles.
+    List,
+    /// List captured ACP sessions.
+    Sessions(AcpSessionsArgs),
     /// Run a local ACP stdio relay in front of a real ACP coding agent.
     Relay(AcpRelayArgs),
+    /// Internal fake ACP agent used by diagnostics and tests.
+    #[command(hide = true)]
+    TestAgent(AcpTestAgentArgs),
 }
 
 #[derive(Args)]
 pub(super) struct AcpCommand {
     #[command(subcommand)]
     pub(super) command: AcpSubcommand,
+}
+
+#[derive(Args)]
+pub(super) struct AcpInstallArgs {
+    #[arg(long, default_value = "claude-code")]
+    pub(super) agent: String,
+    #[arg(long, default_value = "generic")]
+    pub(super) editor: String,
+    #[arg(long)]
+    pub(super) dry_run: bool,
+    #[arg(long = "print")]
+    pub(super) print_only: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AcpDoctorArgs {
+    #[arg(long, default_value = "claude-code")]
+    pub(super) agent: String,
+    #[arg(long = "relay-command", num_args = 1..)]
+    pub(super) relay_command: Vec<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AcpSessionsArgs {
+    #[arg(long)]
+    pub(super) lane: Option<String>,
 }
 
 #[derive(Args)]
@@ -40,4 +77,60 @@ pub(super) struct AcpRelayArgs {
     pub(super) no_mcp: bool,
     #[arg(last = true, num_args = 1.., required = true)]
     pub(super) command: Vec<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AcpTestAgentArgs {
+    #[arg(long = "session-id", default_value = "sess_fake_doctor")]
+    pub(super) session_id: String,
+    #[arg(long = "crash-after-update")]
+    pub(super) crash_after_update: bool,
+    #[arg(long = "malformed-after-update")]
+    pub(super) malformed_after_update: bool,
+    #[arg(long = "huge-message-bytes")]
+    pub(super) huge_message_bytes: Option<usize>,
+    #[arg(long = "request-permission")]
+    pub(super) request_permission: bool,
+    #[arg(long = "sleep-before-result-ms")]
+    pub(super) sleep_before_result_ms: Option<u64>,
+}
+
+#[derive(Args)]
+pub(super) struct TranscriptArgs {
+    pub(super) selector: String,
+}
+
+#[derive(Subcommand)]
+pub(super) enum TopTurnSubcommand {
+    /// Show one durable turn by id.
+    Show(TopTurnShowArgs),
+}
+
+#[derive(Args)]
+pub(super) struct TopTurnCommand {
+    #[command(subcommand)]
+    pub(super) command: TopTurnSubcommand,
+}
+
+#[derive(Args)]
+pub(super) struct TopTurnShowArgs {
+    pub(super) turn_id: String,
+}
+
+#[derive(Subcommand)]
+pub(super) enum DemoSubcommand {
+    /// Show or run an ACP demo workflow.
+    Acp(DemoAcpArgs),
+}
+
+#[derive(Args)]
+pub(super) struct DemoCommand {
+    #[command(subcommand)]
+    pub(super) command: DemoSubcommand,
+}
+
+#[derive(Args)]
+pub(super) struct DemoAcpArgs {
+    #[arg(long, default_value = "fake")]
+    pub(super) agent: String,
 }

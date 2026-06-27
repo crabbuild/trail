@@ -1,12 +1,19 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{CrabDb, Error, Result};
 
 use super::route;
+
+const MAX_HTTP_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RATE_LIMIT_REQUESTS: usize = 600;
+const DEFAULT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub(crate) struct HttpRequest {
@@ -41,6 +48,47 @@ impl ServerAuth {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ServerRateLimit {
+    max_requests: Option<usize>,
+    window: Duration,
+}
+
+impl ServerRateLimit {
+    pub fn per_window(max_requests: usize, window: Duration) -> Result<Self> {
+        if max_requests == 0 {
+            return Err(Error::InvalidInput(
+                "rate limit max_requests must be greater than zero".to_string(),
+            ));
+        }
+        if window.is_zero() {
+            return Err(Error::InvalidInput(
+                "rate limit window must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            max_requests: Some(max_requests),
+            window,
+        })
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            max_requests: None,
+            window: DEFAULT_RATE_LIMIT_WINDOW,
+        }
+    }
+}
+
+impl Default for ServerRateLimit {
+    fn default() -> Self {
+        Self {
+            max_requests: Some(DEFAULT_RATE_LIMIT_REQUESTS),
+            window: DEFAULT_RATE_LIMIT_WINDOW,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
@@ -62,13 +110,30 @@ pub fn serve_listener_with_auth(
     max_requests: Option<usize>,
     auth: ServerAuth,
 ) -> Result<()> {
+    serve_listener_with_auth_and_rate_limit(
+        db,
+        listener,
+        max_requests,
+        auth,
+        ServerRateLimit::default(),
+    )
+}
+
+pub fn serve_listener_with_auth_and_rate_limit(
+    db: &mut CrabDb,
+    listener: TcpListener,
+    max_requests: Option<usize>,
+    auth: ServerAuth,
+    rate_limit: ServerRateLimit,
+) -> Result<()> {
     let mut handled = 0usize;
+    let mut rate_limiter = HttpRateLimiter::new(rate_limit);
     loop {
         if max_requests.is_some_and(|max| handled >= max) {
             break;
         }
-        let (stream, _) = listener.accept()?;
-        handle_connection(db, stream, &auth)?;
+        let (stream, peer_addr) = listener.accept()?;
+        handle_connection(db, stream, peer_addr, &auth, &mut rate_limiter)?;
         handled += 1;
     }
     Ok(())
@@ -89,12 +154,81 @@ pub fn handle_http_request_with_auth(
     }
 }
 
-fn handle_connection(db: &mut CrabDb, mut stream: TcpStream, auth: &ServerAuth) -> Result<()> {
+fn handle_connection(
+    db: &mut CrabDb,
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    auth: &ServerAuth,
+    rate_limiter: &mut HttpRateLimiter,
+) -> Result<()> {
+    stream.set_read_timeout(Some(HTTP_CONNECTION_TIMEOUT))?;
+    stream.set_write_timeout(Some(HTTP_CONNECTION_TIMEOUT))?;
     let request = read_request(&mut stream)?;
+    if let Some(retry_after_secs) = rate_limiter.check(peer_addr.ip()) {
+        let response = rate_limited_response(retry_after_secs);
+        stream.write_all(&response.to_http_bytes())?;
+        stream.flush()?;
+        return Ok(());
+    }
     let response = route::route_request(db, request, auth);
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+struct HttpRateLimiter {
+    config: ServerRateLimit,
+    peers: BTreeMap<IpAddr, RateWindow>,
+}
+
+struct RateWindow {
+    started_at: Instant,
+    count: usize,
+}
+
+impl HttpRateLimiter {
+    fn new(config: ServerRateLimit) -> Self {
+        Self {
+            config,
+            peers: BTreeMap::new(),
+        }
+    }
+
+    fn check(&mut self, peer: IpAddr) -> Option<u64> {
+        let max_requests = self.config.max_requests?;
+        let now = Instant::now();
+        let window = self.config.window;
+        let entry = self.peers.entry(peer).or_insert(RateWindow {
+            started_at: now,
+            count: 0,
+        });
+        if now.duration_since(entry.started_at) >= window {
+            entry.started_at = now;
+            entry.count = 0;
+        }
+        if entry.count >= max_requests {
+            let elapsed = now.duration_since(entry.started_at);
+            return Some(window.saturating_sub(elapsed).as_secs().max(1));
+        }
+        entry.count += 1;
+        None
+    }
+}
+
+fn rate_limited_response(retry_after_secs: u64) -> HttpResponse {
+    let body = serde_json::to_vec(&json!({
+        "error": {
+            "message": format!("rate limit exceeded; retry after {retry_after_secs} seconds"),
+            "code": 2,
+            "retry_after_secs": retry_after_secs
+        }
+    }))
+    .unwrap_or_else(|_| b"{\"error\":{\"message\":\"rate limit exceeded\",\"code\":2}}".to_vec());
+    HttpResponse {
+        status: 429,
+        reason: "Too Many Requests",
+        body,
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
@@ -119,6 +253,11 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
                 content_length = value.trim().parse().map_err(|_| {
                     Error::InvalidInput("invalid Content-Length header".to_string())
                 })?;
+                if content_length > MAX_HTTP_REQUEST_BYTES {
+                    return Err(Error::InvalidInput(format!(
+                        "HTTP request body is {content_length} bytes, exceeding limit {MAX_HTTP_REQUEST_BYTES}"
+                    )));
+                }
             }
         }
     }
@@ -128,6 +267,12 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
 }
 
 fn parse_request(raw: &[u8]) -> Result<HttpRequest> {
+    if raw.len() > MAX_HTTP_REQUEST_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "HTTP request is {} bytes, exceeding limit {MAX_HTTP_REQUEST_BYTES}",
+            raw.len()
+        )));
+    }
     let raw = String::from_utf8_lossy(raw);
     let Some((head, body)) = raw.split_once("\r\n\r\n") else {
         return Err(Error::InvalidInput("malformed HTTP request".to_string()));

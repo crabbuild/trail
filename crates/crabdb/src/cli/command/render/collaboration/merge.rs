@@ -102,6 +102,56 @@ pub(crate) fn render_merge_queue_run(
     Ok(())
 }
 
+pub(crate) fn render_merge_queue_explain(
+    report: &MergeQueueExplainReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "{} {} priority={} {} -> {}",
+            report.entry.queue_id,
+            report.entry.status,
+            report.entry.priority,
+            report.entry.source_ref,
+            report.entry.target_ref
+        );
+        if report.blockers.is_empty() {
+            println!("Ready: true");
+        } else {
+            println!("Ready: false");
+            for blocker in &report.blockers {
+                println!("  blocker {}: {}", blocker.code, blocker.message);
+            }
+        }
+        for warning in &report.warnings {
+            println!("  warning {}: {}", warning.code, warning.message);
+        }
+        if let Some(dry_run) = &report.dry_run {
+            if !dry_run.conflicts.is_empty() {
+                for conflict in &dry_run.conflicts {
+                    println!("  conflict {conflict}");
+                }
+            } else {
+                println!("Dry-run changed paths: {}", dry_run.changed_paths.len());
+            }
+        }
+        if let Some(error) = &report.error {
+            println!("Preflight error: {error}");
+        }
+        if !report.next_steps.is_empty() {
+            println!("Next steps:");
+            for step in &report.next_steps {
+                println!("  - {step}");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn render_merge_queue_remove(
     report: &MergeQueueRemoveReport,
     json: bool,
@@ -175,6 +225,7 @@ pub(crate) fn render_conflict(entry: &ConflictSetSummary, json: bool, quiet: boo
             );
             for path in &explanation.paths {
                 println!("  Path: {}", path.path);
+                println!("    Class: {}", path.conflict_class);
                 println!("    {}", path.summary);
                 println!("    Reason: {}", path.reason);
                 if let Some(target) = &path.target {

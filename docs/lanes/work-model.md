@@ -202,7 +202,7 @@ patch.json
 crabdb lane apply-patch docs-lane --patch patch.json
    |
    v
-validate paths, ignored files, base/root, line guards
+validate base_change, paths, ignored files, root, line guards
    |
    v
 record LanePatch operation
@@ -218,6 +218,12 @@ crabdb lane spawn docs-lane --from main --no-materialize
 crabdb lane apply-patch docs-lane --patch patch.json
 crabdb lane diff docs-lane --patch
 ```
+
+For direct lane patches, `patch.json` must include a `base_change` matching the
+current lane head. A tool can intentionally bypass that freshness check with
+`allow_stale: true` in the patch document or `--allow-stale` on the CLI.
+Turn-linked patches may omit `base_change` because the turn's `before_change`
+acts as the freshness guard.
 
 Turn-linked patch flow:
 
@@ -392,6 +398,28 @@ Common blockers include:
 - Failed latest required test or eval gate.
 - Removed or invalid lane state.
 
+Readiness also warns when the lane's saved base is behind the workspace default
+branch, for example: `lane started 14 operations behind main`.
+
+## Optional Lane Hardening
+
+Lane isolation is permissive by default for compatibility. Workspaces can opt
+into stricter boundaries:
+
+```sh
+crabdb config set lane.claim_enforcement reject
+crabdb config set lane.enforce_sparse_paths true
+crabdb config set lane.max_changed_paths 25
+crabdb config set lane.max_patch_bytes 1048576
+crabdb config set lane.max_event_payload_bytes 65536
+crabdb config set lane.max_trace_payload_bytes 65536
+```
+
+`lane.claim_enforcement=warn` records a `lane_policy_warning` event when a lane
+touches paths outside its active write claims. `reject` blocks the mutation.
+`lane.enforce_sparse_paths=true` turns sparse lane `--paths` selections into a
+hard write boundary for lane patches and materialized workdir records.
+
 ## Review, Handoff, Rewind, and Merge
 
 Review summarizes the lane:
@@ -435,6 +463,11 @@ crabdb merge-queue run
 
 The merge updates CrabDB's target branch ref. Git history remains separate until
 you export, checkout, or commit through the Git workflow.
+
+If a merge pauses on conflict, CrabDB records the base, target, and source root
+snapshots for that merge. Conflict explanations and resolutions use those stored
+roots and label each path with a conservative conflict class, so later ref
+movement does not change what is being resolved.
 
 ```text
 refs/lanes/docs-lane              refs/branches/main

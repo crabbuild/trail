@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RecordRequest {
     #[serde(default, alias = "branch")]
     pub(crate) ref_name: Option<String>,
@@ -17,16 +18,19 @@ pub(crate) struct RecordRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IgnorePatternRequest {
     pub(crate) pattern: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IgnoreCheckRequest {
     pub(crate) path: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GuardrailCheckRequest {
     pub(crate) lane: Option<String>,
     pub(crate) action: String,
@@ -37,6 +41,7 @@ pub(crate) struct GuardrailCheckRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConfigSetRequest {
     pub(crate) key: String,
     pub(crate) value: String,

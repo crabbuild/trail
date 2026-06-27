@@ -1,5 +1,6 @@
 use crabdb::Result;
 
+mod acp;
 mod collaboration;
 mod config;
 mod diff;
@@ -11,6 +12,7 @@ mod lane;
 mod maintenance;
 mod workspace;
 
+pub(crate) use acp::*;
 pub(crate) use collaboration::*;
 pub(crate) use config::*;
 pub(crate) use diff::*;

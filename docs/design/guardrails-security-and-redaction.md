@@ -97,6 +97,7 @@ Lane patch paths are validated before mutation:
 - Internal paths are rejected.
 - Hardcoded private paths are rejected.
 - Workspace ignored paths require `allow_ignored`.
+- Patch messages and edit payloads are secret-scanned before storage. Assignment-style credentials, bearer tokens, and private-key PEM blocks reject the patch instead of creating objects or events.
 
 The CLI can set `--allow-ignored`, and patch JSON can set `"allow_ignored": true`. This opt-in is intentionally explicit so ignored fixtures are auditable.
 
@@ -183,7 +184,7 @@ This lets a human decision persist across related guardrail checks without losin
 
 ## Redaction
 
-Redaction is applied to guardrail summaries/payloads and trace/event metadata paths before storage. The redaction helpers look for secret-like field names and private-key-like content.
+Redaction is applied to guardrail summaries/payloads, lane messages, event payloads, and trace metadata before storage. The redaction helpers look for secret-like field names and private-key-like content. Structured patch file content is stricter: secret-like values are rejected before storage because patch content would otherwise become recorded worktree objects.
 
 Redaction reduces accidental leakage in:
 
@@ -214,6 +215,8 @@ The HTTP daemon requires auth by default:
 - Other routes require `Authorization: Bearer <token>` or `x-crabdb-token`.
 - `--no-auth` disables auth explicitly.
 - Generated daemon token files are restricted to `0600` on Unix.
+- Requests with an `Origin` header must come from a loopback origin. This
+  blocks browser pages on non-local origins from driving the local daemon.
 
 CLI daemon routing can read the token from `--daemon-token`, `CRABDB_DAEMON_TOKEN`, or `.crabdb/daemon.token`.
 

@@ -4,6 +4,7 @@ use serde_json::Value;
 use crate::PatchEdit;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BeginTurnArgs {
     pub(crate) lane: String,
     #[serde(default)]
@@ -15,11 +16,13 @@ pub(crate) struct BeginTurnArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TurnIdArgs {
     pub(crate) turn_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddMessageArgs {
     pub(crate) turn_id: String,
     pub(crate) role: String,
@@ -30,6 +33,7 @@ pub(crate) struct AddMessageArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AddEventArgs {
     pub(crate) turn_id: String,
     #[serde(alias = "type")]
@@ -57,6 +61,7 @@ pub(crate) struct EventListArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpanStartArgs {
     pub(crate) turn_id: String,
     #[serde(alias = "type")]
@@ -71,6 +76,7 @@ pub(crate) struct SpanStartArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SpanEndArgs {
     pub(crate) span_id: String,
     #[serde(default = "default_completed_status")]
@@ -113,6 +119,7 @@ pub(crate) struct SpanShowArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EndTurnArgs {
     pub(crate) turn_id: String,
     #[serde(default = "default_completed_status")]
@@ -120,6 +127,7 @@ pub(crate) struct EndTurnArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApplyPatchArgs {
     pub(crate) turn_id: String,
     #[serde(default)]
@@ -131,13 +139,15 @@ pub(crate) struct ApplyPatchArgs {
     #[serde(default)]
     pub(crate) allow_ignored: bool,
     #[serde(default)]
+    pub(crate) allow_stale: bool,
+    #[serde(default)]
     pub(crate) edits: Vec<PatchEdit>,
     #[serde(default)]
     pub(crate) files: Vec<ApiPatchFile>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ApiPatchFile {
     AddText {
         path: String,
@@ -165,7 +175,7 @@ pub(crate) enum ApiPatchFile {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ApiTextEdit {
     ModifyLine {
         line_id: String,

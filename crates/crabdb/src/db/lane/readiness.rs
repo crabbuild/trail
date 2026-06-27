@@ -148,6 +148,9 @@ impl CrabDb {
                 None,
             ));
         }
+        if let Some(issue) = self.stale_lane_base_warning(&status.lane.branch)? {
+            warnings.push(issue);
+        }
         if status.queued_merges > 0 {
             warnings.push(readiness_issue(
                 "queued_merge",
@@ -172,6 +175,41 @@ impl CrabDb {
             latest_test: status.latest_test,
             latest_eval: status.latest_eval,
         })
+    }
+
+    fn stale_lane_base_warning(&self, branch: &LaneBranch) -> Result<Option<LaneReadinessIssue>> {
+        let target_branch = self.config.workspace.default_branch.as_str();
+        let target_ref = match self.resolve_branch_ref(target_branch) {
+            Ok(target_ref) => target_ref,
+            Err(_) => return Ok(None),
+        };
+        if target_ref.change_id == branch.base_change {
+            return Ok(None);
+        }
+        let Some(operations_behind) =
+            self.first_parent_distance(&target_ref.change_id, &branch.base_change)?
+        else {
+            return Ok(None);
+        };
+        if operations_behind == 0 {
+            return Ok(None);
+        }
+        let plural = if operations_behind == 1 {
+            "operation"
+        } else {
+            "operations"
+        };
+        Ok(Some(readiness_issue(
+            "stale_lane_base",
+            format!("lane started {operations_behind} {plural} behind `{target_branch}`"),
+            Some(serde_json::json!({
+                "target_branch": target_branch,
+                "target_ref": target_ref.name,
+                "target_change": target_ref.change_id,
+                "lane_base_change": branch.base_change,
+                "operations_behind": operations_behind
+            })),
+        )))
     }
 
     pub fn lane_handoff(&self, lane: &str, limit: usize) -> Result<LaneHandoffReport> {

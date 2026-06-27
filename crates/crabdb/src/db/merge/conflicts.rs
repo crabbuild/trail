@@ -79,10 +79,12 @@ impl CrabDb {
         }
 
         let conflict_paths = conflict_paths_from_details(&summary.details)?;
-        let base_ref = self.ref_from_change(&pending.base_change)?;
-        let base_files = self.load_root_files(&base_ref.root_id)?;
-        let source_files = self.load_root_files(&source_ref.root_id)?;
-        let target_files = self.load_root_files(&target_ref.root_id)?;
+        let base_root = self.pending_base_root(&pending)?;
+        let target_root = self.pending_target_root(&pending)?;
+        let source_root = self.pending_source_root(&pending)?;
+        let base_files = self.load_root_files(&base_root)?;
+        let source_files = self.load_root_files(&source_root)?;
+        let target_files = self.load_root_files(&target_root)?;
         let manual_files = match &resolution {
             ConflictResolution::Take(_) => None,
             ConflictResolution::Manual(manual) => Some(normalize_manual_conflict_files(
@@ -197,13 +199,13 @@ impl CrabDb {
             Ok(paths) => paths,
             Err(_) => return Ok(None),
         };
-        let base_ref = self.ref_from_change(&pending.base_change)?;
-        let target_ref = self.ref_from_change(&pending.left_change)?;
-        let source_ref = self.ref_from_change(&pending.right_change)?;
+        let base_root = self.pending_base_root(&pending)?;
+        let target_root = self.pending_target_root(&pending)?;
+        let source_root = self.pending_source_root(&pending)?;
         let paths = conflict_paths.into_iter().collect::<Vec<_>>();
-        let base_files = self.load_root_files_for_paths(&base_ref.root_id, &paths)?;
-        let target_files = self.load_root_files_for_paths(&target_ref.root_id, &paths)?;
-        let source_files = self.load_root_files_for_paths(&source_ref.root_id, &paths)?;
+        let base_files = self.load_root_files_for_paths(&base_root, &paths)?;
+        let target_files = self.load_root_files_for_paths(&target_root, &paths)?;
+        let source_files = self.load_root_files_for_paths(&source_root, &paths)?;
         let mut explanations = Vec::new();
         let mut recommendations = Vec::new();
         for path in paths.into_iter().take(limit) {
@@ -212,6 +214,9 @@ impl CrabDb {
                 base_files.get(&path),
                 target_files.get(&path),
                 source_files.get(&path),
+                &base_files,
+                &target_files,
+                &source_files,
                 &pending,
                 limit,
             )?;
@@ -227,6 +232,9 @@ impl CrabDb {
                 base_change: pending.base_change,
                 target_change: pending.left_change,
                 source_change: pending.right_change,
+                base_root: Some(base_root),
+                target_root: Some(target_root),
+                source_root: Some(source_root),
             },
             paths: explanations,
             recommendations,
@@ -248,6 +256,9 @@ impl CrabDb {
         base_entry: Option<&FileEntry>,
         target_entry: Option<&FileEntry>,
         source_entry: Option<&FileEntry>,
+        base_files: &BTreeMap<String, FileEntry>,
+        target_files: &BTreeMap<String, FileEntry>,
+        source_files: &BTreeMap<String, FileEntry>,
         pending: &PendingConflictMerge,
         limit: usize,
     ) -> Result<ConflictPathExplanation> {
@@ -266,6 +277,19 @@ impl CrabDb {
                 .unwrap_or_else(|| pending.right_change.clone()),
         );
         let lines = self.explain_conflict_lines(base_entry, target_entry, source_entry, limit)?;
+        let same_insertion_gap =
+            self.same_insertion_gap_conflict(base_entry, target_entry, source_entry)?;
+        let conflict_class = conflict_class_for_path(
+            path,
+            base_entry,
+            target_entry,
+            source_entry,
+            base_files,
+            target_files,
+            source_files,
+            &lines,
+            same_insertion_gap,
+        );
         let reason = if !lines.is_empty() {
             "both sides changed the same logical line differently".to_string()
         } else if !matches!(
@@ -310,6 +334,7 @@ impl CrabDb {
         };
         Ok(ConflictPathExplanation {
             path: path.to_string(),
+            conflict_class,
             summary,
             reason,
             target,
@@ -317,6 +342,27 @@ impl CrabDb {
             lines,
             recommendation,
         })
+    }
+
+    fn pending_base_root(&self, pending: &PendingConflictMerge) -> Result<ObjectId> {
+        match &pending.base_root {
+            Some(root) => Ok(root.clone()),
+            None => Ok(self.ref_from_change(&pending.base_change)?.root_id),
+        }
+    }
+
+    fn pending_target_root(&self, pending: &PendingConflictMerge) -> Result<ObjectId> {
+        match &pending.left_root {
+            Some(root) => Ok(root.clone()),
+            None => Ok(self.ref_from_change(&pending.left_change)?.root_id),
+        }
+    }
+
+    fn pending_source_root(&self, pending: &PendingConflictMerge) -> Result<ObjectId> {
+        match &pending.right_root {
+            Some(root) => Ok(root.clone()),
+            None => Ok(self.ref_from_change(&pending.right_change)?.root_id),
+        }
     }
 
     fn explain_conflict_lines(
@@ -383,6 +429,52 @@ impl CrabDb {
             }
         }
         Ok(out)
+    }
+
+    fn same_insertion_gap_conflict(
+        &self,
+        base_entry: Option<&FileEntry>,
+        target_entry: Option<&FileEntry>,
+        source_entry: Option<&FileEntry>,
+    ) -> Result<bool> {
+        let (Some(base_entry), Some(target_entry), Some(source_entry)) =
+            (base_entry, target_entry, source_entry)
+        else {
+            return Ok(false);
+        };
+        if base_entry.kind != FileKind::Text
+            || target_entry.kind != FileKind::Text
+            || source_entry.kind != FileKind::Text
+            || base_entry.file_id != target_entry.file_id
+            || base_entry.file_id != source_entry.file_id
+        {
+            return Ok(false);
+        }
+        let (
+            FileContentRef::Text(base_text),
+            FileContentRef::Text(target_text),
+            FileContentRef::Text(source_text),
+        ) = (
+            &base_entry.content,
+            &target_entry.content,
+            &source_entry.content,
+        )
+        else {
+            return Ok(false);
+        };
+        let base_lines = self.load_text_lines(base_text)?;
+        let target_lines = self.load_text_lines(target_text)?;
+        let source_lines = self.load_text_lines(source_text)?;
+        let base_order = base_lines
+            .iter()
+            .map(LineEntryExt::line_id_key)
+            .collect::<Vec<_>>();
+        let base_keys = base_order.iter().cloned().collect::<HashSet<_>>();
+        let target_inserted_gaps = inserted_line_gaps(&target_lines, &base_keys);
+        let source_inserted_groups = inserted_line_groups(&source_lines, &base_keys);
+        Ok(source_inserted_groups
+            .iter()
+            .any(|(gap, _)| target_inserted_gaps.contains(gap)))
     }
 
     fn side_provenance(&self, side: &str, change_id: ChangeId) -> Option<ConflictSideProvenance> {
@@ -457,4 +549,62 @@ fn line_preview(line: &LineEntry) -> String {
         value.push_str("...");
     }
     value
+}
+
+fn conflict_class_for_path(
+    path: &str,
+    base_entry: Option<&FileEntry>,
+    target_entry: Option<&FileEntry>,
+    source_entry: Option<&FileEntry>,
+    _base_files: &BTreeMap<String, FileEntry>,
+    target_files: &BTreeMap<String, FileEntry>,
+    source_files: &BTreeMap<String, FileEntry>,
+    lines: &[ConflictLineExplanation],
+    same_insertion_gap: bool,
+) -> String {
+    if same_insertion_gap {
+        return "same_insertion_gap".to_string();
+    }
+    if has_binary_entry(base_entry)
+        || has_binary_entry(target_entry)
+        || has_binary_entry(source_entry)
+    {
+        return "binary".to_string();
+    }
+    if let (Some(base), None, Some(_)) = (base_entry, target_entry, source_entry) {
+        if file_id_at_different_path(target_files, &base.file_id, path) {
+            return "rename/modify".to_string();
+        }
+        return "delete/modify".to_string();
+    }
+    if let (Some(base), Some(_), None) = (base_entry, target_entry, source_entry) {
+        if file_id_at_different_path(source_files, &base.file_id, path) {
+            return "rename/modify".to_string();
+        }
+        return "delete/modify".to_string();
+    }
+    if let (Some(_), Some(target), Some(source)) = (base_entry, target_entry, source_entry) {
+        if target.executable != source.executable || target.mode != source.mode {
+            return "mode".to_string();
+        }
+        if !lines.is_empty() {
+            return "modify/modify".to_string();
+        }
+        return "modify/modify".to_string();
+    }
+    "modify/modify".to_string()
+}
+
+fn has_binary_entry(entry: Option<&FileEntry>) -> bool {
+    entry.is_some_and(|entry| matches!(entry.kind, FileKind::Binary | FileKind::OpaqueText))
+}
+
+fn file_id_at_different_path(
+    files: &BTreeMap<String, FileEntry>,
+    file_id: &FileId,
+    path: &str,
+) -> bool {
+    files
+        .iter()
+        .any(|(candidate_path, entry)| candidate_path != path && &entry.file_id == file_id)
 }

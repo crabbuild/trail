@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{CrabDb, Error, Result};
 
-use super::{types::*, utils::from_arguments};
+use super::{tools::tool_is_read_only, types::*, utils::from_arguments};
 
 mod collaboration;
 mod core;
@@ -13,6 +13,13 @@ mod turns;
 
 pub(crate) fn handle_tool_call(db: &mut CrabDb, params: Value) -> Result<Value> {
     let call: ToolCall = serde_json::from_value(params)?;
+    if tool_is_read_only(&call.name) {
+        return db.enforce_read_only_mcp_call(&call.name, |db| dispatch_tool_call(db, &call));
+    }
+    dispatch_tool_call(db, &call)
+}
+
+fn dispatch_tool_call(db: &mut CrabDb, call: &ToolCall) -> Result<Value> {
     if let Some(value) = core::handle(db, &call.name, &call.arguments)? {
         return Ok(value);
     }

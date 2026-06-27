@@ -59,6 +59,9 @@ impl CrabDb {
                     base_change: lane_branch.base_change.clone(),
                     left_change: target_ref.change_id.clone(),
                     right_change: source_ref.change_id.clone(),
+                    base_root: base_ref.root_id.clone(),
+                    left_root: target_ref.root_id.clone(),
+                    right_root: source_ref.root_id.clone(),
                 };
                 let conflict_set_id = match self.existing_open_conflict_set(
                     &lane_branch.ref_name,

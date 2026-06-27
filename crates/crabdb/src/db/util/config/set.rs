@@ -85,6 +85,39 @@ pub(crate) fn set_config_value(
             config.lane.required_eval_suites = parse_config_suite_list(key, value)?;
             Ok(())
         }
+        "lane.claim_enforcement" => match value {
+            "off" | "warn" | "reject" => {
+                config.lane.claim_enforcement = value.to_string();
+                Ok(())
+            }
+            other => Err(Error::InvalidInput(format!(
+                "lane.claim_enforcement must be off, warn, or reject, got `{other}`"
+            ))),
+        },
+        "lane.enforce_sparse_paths" => {
+            config.lane.enforce_sparse_paths = parse_config_bool(key, value)?;
+            Ok(())
+        }
+        "lane.max_patch_bytes" => {
+            config.lane.max_patch_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "lane.max_patch_file_bytes" => {
+            config.lane.max_patch_file_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "lane.max_changed_paths" => {
+            config.lane.max_changed_paths = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "lane.max_event_payload_bytes" => {
+            config.lane.max_event_payload_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "lane.max_trace_payload_bytes" => {
+            config.lane.max_trace_payload_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
         "lane.worktrees_dir" => {
             config.lane.worktrees_dir = normalize_relative_path(value)?;
             Ok(())

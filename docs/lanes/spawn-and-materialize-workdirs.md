@@ -59,6 +59,12 @@ crabdb lane sync-workdir doc-bot --force
 
 Dirty workdirs require recording or force refresh.
 
+When `--force` overwrites dirty materialized workdir content, CrabDB first saves
+the current dirty regular files under `.crabdb/lane-workdir-rescue/...` and
+returns that path as `rescue_workdir`. The rescue directory also contains a
+`manifest.json` with the dirty path summary and any paths that could not be
+copied, such as deleted files.
+
 ## Code Facts Used
 
 - Spawn/read/sync args: `crates/crabdb/src/cli/command/lane_args.rs`

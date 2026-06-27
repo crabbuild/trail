@@ -50,6 +50,20 @@ pub struct LaneConfig {
     pub required_test_suites: Vec<String>,
     #[serde(default)]
     pub required_eval_suites: Vec<String>,
+    #[serde(default = "default_lane_claim_enforcement")]
+    pub claim_enforcement: String,
+    #[serde(default)]
+    pub enforce_sparse_paths: bool,
+    #[serde(default)]
+    pub max_patch_bytes: u64,
+    #[serde(default)]
+    pub max_patch_file_bytes: u64,
+    #[serde(default)]
+    pub max_changed_paths: u64,
+    #[serde(default)]
+    pub max_event_payload_bytes: u64,
+    #[serde(default)]
+    pub max_trace_payload_bytes: u64,
     pub worktrees_dir: String,
     pub merge_strategy: String,
 }
@@ -68,6 +82,10 @@ fn default_guardrails_config() -> GuardrailsConfig {
     GuardrailsConfig {
         policy: String::new(),
     }
+}
+
+fn default_lane_claim_enforcement() -> String {
+    "off".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +194,13 @@ impl CrabConfig {
                 require_eval_gate: false,
                 required_test_suites: Vec::new(),
                 required_eval_suites: Vec::new(),
+                claim_enforcement: "off".to_string(),
+                enforce_sparse_paths: false,
+                max_patch_bytes: 0,
+                max_patch_file_bytes: 0,
+                max_changed_paths: 0,
+                max_event_payload_bytes: 0,
+                max_trace_payload_bytes: 0,
                 worktrees_dir: ".crabdb/worktrees".to_string(),
                 merge_strategy: "conservative".to_string(),
             },

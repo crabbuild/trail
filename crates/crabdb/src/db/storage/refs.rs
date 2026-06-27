@@ -225,6 +225,23 @@ impl CrabDb {
             .map_err(Error::from)
     }
 
+    pub(crate) fn first_parent_distance(
+        &self,
+        from: &ChangeId,
+        ancestor: &ChangeId,
+    ) -> Result<Option<u64>> {
+        let mut distance = 0u64;
+        let mut cursor = Some(from.clone());
+        while let Some(change) = cursor {
+            if &change == ancestor {
+                return Ok(Some(distance));
+            }
+            cursor = self.first_parent(&change)?;
+            distance = distance.saturating_add(1);
+        }
+        Ok(None)
+    }
+
     pub(crate) fn parents(&self, change_id: &ChangeId) -> Result<Vec<ChangeId>> {
         let mut stmt = self.conn.prepare(
             "SELECT parent_change_id FROM operation_parents WHERE change_id = ?1 ORDER BY position",

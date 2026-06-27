@@ -41,6 +41,9 @@ pub(super) fn handle_turn_command(ctx: &RuntimeContext, turn: LaneTurnCommand) -
             if args.allow_ignored {
                 patch.allow_ignored = true;
             }
+            if args.allow_stale {
+                patch.allow_stale = true;
+            }
             let report = db.apply_lane_turn_patch(&args.turn_id, patch)?;
             render_lane_patch(&report, ctx.json, ctx.quiet)
         }

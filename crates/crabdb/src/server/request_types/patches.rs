@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ApiPatchRequest {
     #[serde(default)]
     pub(crate) base_change: Option<String>,
@@ -11,13 +12,15 @@ pub(crate) struct ApiPatchRequest {
     #[serde(default)]
     pub(crate) allow_ignored: bool,
     #[serde(default)]
+    pub(crate) allow_stale: bool,
+    #[serde(default)]
     pub(crate) edits: Vec<crate::PatchEdit>,
     #[serde(default)]
     pub(crate) files: Vec<ApiPatchFile>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ApiPatchFile {
     AddText {
         path: String,
@@ -45,7 +48,7 @@ pub(crate) enum ApiPatchFile {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ApiTextEdit {
     ModifyLine {
         line_id: String,

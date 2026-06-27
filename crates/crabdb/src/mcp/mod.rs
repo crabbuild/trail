@@ -1,3 +1,4 @@
+mod audit;
 mod capabilities;
 mod completion;
 mod prompt;

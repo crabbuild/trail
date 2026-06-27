@@ -155,6 +155,9 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             if args.allow_ignored {
                 patch.allow_ignored = true;
             }
+            if args.allow_stale {
+                patch.allow_stale = true;
+            }
             let report = db.apply_lane_patch(&args.name, patch)?;
             render_lane_patch(&report, ctx.json, ctx.quiet)
         }
