@@ -275,6 +275,10 @@ impl Store for RocksDBStore {
         Ok(ordered)
     }
 
+    fn prefers_batch_reads(&self) -> bool {
+        true
+    }
+
     fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
         let mut batch = WriteBatch::default();
 

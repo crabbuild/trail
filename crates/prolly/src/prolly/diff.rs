@@ -48,9 +48,9 @@
 //!
 //! ## Three-Way Merge Algorithm
 //!
-//! 1. Compute diffs from `base` to `left` and from `base` to `right`
-//! 2. Build change maps for both branches
-//! 3. Start with the `left` tree as the result
+//! 1. Return immediately when one branch is unchanged or both branches match
+//! 2. Compute the diff from `base` to `right`
+//! 3. Batch-lookup the right-changed keys in `left`
 //! 4. Apply changes from `right` that don't conflict with `left`
 //! 5. Detect and handle conflicts
 //!
@@ -99,9 +99,9 @@
 //! - **Different roots**: O(changed subtrees) when chunk boundaries align, with
 //!   a local full-scan fallback when boundaries diverge
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
-use super::batch::get_max_key;
+use super::batch::{get_max_key, BatchWriteCollector};
 use super::cid::Cid;
 use super::error::{Conflict, Diff, Error, Mutation, Resolver};
 use super::node::Node;
@@ -110,8 +110,297 @@ use super::tree::Tree;
 
 use super::Prolly;
 
-const SPARSE_MERGE_POINT_CHECK_THRESHOLD: usize = 1024;
 type ChildSpanCid<'a> = (Option<&'a [u8]>, Cid);
+
+#[derive(Clone, Debug, PartialEq)]
+struct MergeChange {
+    base: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
+}
+
+enum DiffFrame {
+    Compare {
+        base_cid: Cid,
+        other_cid: Cid,
+        span_end: Option<Vec<u8>>,
+    },
+    Added {
+        cid: Cid,
+    },
+    Removed {
+        cid: Cid,
+    },
+}
+
+/// Iterator over tree differences that preserves the subtree-pruning behavior
+/// of eager diff without collecting the whole result upfront.
+pub(crate) struct StructuralDiffIter<'a, S: Store> {
+    prolly: &'a Prolly<S>,
+    stack: Vec<DiffFrame>,
+    pending: VecDeque<Diff>,
+    failed: bool,
+}
+
+impl<'a, S: Store> StructuralDiffIter<'a, S> {
+    fn new(prolly: &'a Prolly<S>, base: &Tree, other: &Tree) -> Self {
+        let stack = match (&base.root, &other.root) {
+            (Some(base_cid), Some(other_cid)) if base_cid != other_cid => {
+                vec![DiffFrame::Compare {
+                    base_cid: base_cid.clone(),
+                    other_cid: other_cid.clone(),
+                    span_end: None,
+                }]
+            }
+            (Some(base_cid), None) => vec![DiffFrame::Removed {
+                cid: base_cid.clone(),
+            }],
+            (None, Some(other_cid)) => vec![DiffFrame::Added {
+                cid: other_cid.clone(),
+            }],
+            _ => Vec::new(),
+        };
+
+        Self {
+            prolly,
+            stack,
+            pending: VecDeque::new(),
+            failed: false,
+        }
+    }
+
+    fn fill_pending(&mut self) -> Result<(), Error> {
+        while self.pending.is_empty() {
+            let Some(frame) = self.stack.pop() else {
+                return Ok(());
+            };
+
+            match frame {
+                DiffFrame::Compare {
+                    base_cid,
+                    other_cid,
+                    span_end,
+                } => self.process_compare(base_cid, other_cid, span_end.as_deref())?,
+                DiffFrame::Added { cid } => self.process_added(cid)?,
+                DiffFrame::Removed { cid } => self.process_removed(cid)?,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_compare(
+        &mut self,
+        base_cid: Cid,
+        other_cid: Cid,
+        span_end: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        if base_cid == other_cid {
+            return Ok(());
+        }
+
+        let nodes = self
+            .prolly
+            .load_many_ordered(&[base_cid.clone(), other_cid.clone()])?;
+        let base = nodes[0].clone();
+        let other = nodes[1].clone();
+
+        match (base.leaf, other.leaf) {
+            (true, true) => {
+                let mut diffs = Vec::new();
+                diff_leaf_nodes(&base, &other, &mut diffs)?;
+                self.pending.extend(diffs);
+            }
+            (false, false) if base.level == other.level => {
+                self.enqueue_internal_diff(&base, &other, span_end)?;
+            }
+            _ => {
+                let mut diffs = Vec::new();
+                diff_collected_nodes(self.prolly, &base, &other, &mut diffs)?;
+                self.pending.extend(diffs);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn enqueue_internal_diff(
+        &mut self,
+        base: &Node,
+        other: &Node,
+        span_end: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        let mut frames = Vec::new();
+        let mut base_idx = 0;
+        let mut other_idx = 0;
+
+        while base_idx < base.len() && other_idx < other.len() {
+            let base_start = base.keys[base_idx].as_slice();
+            let other_start = other.keys[other_idx].as_slice();
+            let base_end = child_span_end(base, base_idx, span_end);
+            let other_end = child_span_end(other, other_idx, span_end);
+
+            if base_start == other_start && base_end == other_end {
+                let base_cid = child_cid(base, base_idx)?;
+                let other_cid = child_cid(other, other_idx)?;
+                if base_cid != other_cid {
+                    frames.push(DiffFrame::Compare {
+                        base_cid,
+                        other_cid,
+                        span_end: base_end.map(<[u8]>::to_vec),
+                    });
+                }
+                base_idx += 1;
+                other_idx += 1;
+            } else if span_ends_before_or_at(base_end, other_start) {
+                frames.push(DiffFrame::Removed {
+                    cid: child_cid(base, base_idx)?,
+                });
+                base_idx += 1;
+            } else if span_ends_before_or_at(other_end, base_start) {
+                frames.push(DiffFrame::Added {
+                    cid: child_cid(other, other_idx)?,
+                });
+                other_idx += 1;
+            } else {
+                let mut diffs = Vec::new();
+                diff_collected_nodes(self.prolly, base, other, &mut diffs)?;
+                self.pending.extend(diffs);
+                return Ok(());
+            }
+        }
+
+        while base_idx < base.len() {
+            frames.push(DiffFrame::Removed {
+                cid: child_cid(base, base_idx)?,
+            });
+            base_idx += 1;
+        }
+
+        while other_idx < other.len() {
+            frames.push(DiffFrame::Added {
+                cid: child_cid(other, other_idx)?,
+            });
+            other_idx += 1;
+        }
+
+        self.prefetch_frame_roots(&frames)?;
+        self.stack.extend(frames.into_iter().rev());
+        Ok(())
+    }
+
+    fn process_added(&mut self, cid: Cid) -> Result<(), Error> {
+        let node = self.prolly.load_arc(&cid)?;
+        if node.leaf {
+            self.pending.extend(
+                node.keys
+                    .iter()
+                    .zip(&node.vals)
+                    .map(|(key, val)| Diff::Added {
+                        key: key.clone(),
+                        val: val.clone(),
+                    }),
+            );
+        } else {
+            let mut frames = child_cids(&node)?
+                .into_iter()
+                .map(|cid| DiffFrame::Added { cid })
+                .collect::<Vec<_>>();
+            self.prefetch_frame_roots(&frames)?;
+            frames.reverse();
+            self.stack.extend(frames);
+        }
+
+        Ok(())
+    }
+
+    fn process_removed(&mut self, cid: Cid) -> Result<(), Error> {
+        let node = self.prolly.load_arc(&cid)?;
+        if node.leaf {
+            self.pending.extend(
+                node.keys
+                    .iter()
+                    .zip(&node.vals)
+                    .map(|(key, val)| Diff::Removed {
+                        key: key.clone(),
+                        val: val.clone(),
+                    }),
+            );
+        } else {
+            let mut frames = child_cids(&node)?
+                .into_iter()
+                .map(|cid| DiffFrame::Removed { cid })
+                .collect::<Vec<_>>();
+            self.prefetch_frame_roots(&frames)?;
+            frames.reverse();
+            self.stack.extend(frames);
+        }
+
+        Ok(())
+    }
+
+    fn prefetch_frame_roots(&self, frames: &[DiffFrame]) -> Result<(), Error> {
+        if frames.len() <= 1 || !self.prolly.store().prefers_batch_reads() {
+            return Ok(());
+        }
+
+        let mut seen = HashSet::new();
+        let mut cids = Vec::new();
+        for frame in frames {
+            match frame {
+                DiffFrame::Compare {
+                    base_cid,
+                    other_cid,
+                    ..
+                } => {
+                    if seen.insert(base_cid.clone()) {
+                        cids.push(base_cid.clone());
+                    }
+                    if seen.insert(other_cid.clone()) {
+                        cids.push(other_cid.clone());
+                    }
+                }
+                DiffFrame::Added { cid } | DiffFrame::Removed { cid } => {
+                    if seen.insert(cid.clone()) {
+                        cids.push(cid.clone());
+                    }
+                }
+            }
+        }
+
+        if !cids.is_empty() {
+            let _ = self.prolly.load_many_ordered(&cids)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<S: Store> Iterator for StructuralDiffIter<'_, S> {
+    type Item = Result<Diff, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+
+        if let Err(err) = self.fill_pending() {
+            self.failed = true;
+            self.stack.clear();
+            self.pending.clear();
+            return Some(Err(err));
+        }
+
+        self.pending.pop_front().map(Ok)
+    }
+}
+
+pub(crate) fn stream_diff<'a, S: Store>(
+    prolly: &'a Prolly<S>,
+    base: &Tree,
+    other: &Tree,
+) -> StructuralDiffIter<'a, S> {
+    StructuralDiffIter::new(prolly, base, other)
+}
 
 /// Compute the difference between two trees.
 ///
@@ -141,18 +430,8 @@ pub fn compute_diff<S: Store>(
     }
 
     let mut diffs = Vec::new();
-
-    match (&base.root, &other.root) {
-        (Some(base_cid), Some(other_cid)) => {
-            diff_nodes(prolly, base_cid, other_cid, None, &mut diffs)?;
-        }
-        (Some(base_cid), None) => {
-            collect_removed_from_cid(prolly, base_cid, &mut diffs)?;
-        }
-        (None, Some(other_cid)) => {
-            collect_added_from_cid(prolly, other_cid, &mut diffs)?;
-        }
-        (None, None) => {}
+    for diff in stream_diff(prolly, base, other) {
+        diffs.push(diff?);
     }
 
     Ok(diffs)
@@ -191,81 +470,6 @@ pub fn compute_range_diff<S: Store>(
     }
 
     Ok(diffs)
-}
-
-fn diff_nodes<S: Store>(
-    prolly: &Prolly<S>,
-    base_cid: &Cid,
-    other_cid: &Cid,
-    span_end: Option<&[u8]>,
-    diffs: &mut Vec<Diff>,
-) -> Result<(), Error> {
-    if base_cid == other_cid {
-        return Ok(());
-    }
-
-    let base_node = prolly.load_arc(base_cid)?;
-    let other_node = prolly.load_arc(other_cid)?;
-
-    match (base_node.leaf, other_node.leaf) {
-        (true, true) => diff_leaf_nodes(&base_node, &other_node, diffs),
-        (false, false) if base_node.level == other_node.level => {
-            diff_internal_nodes(prolly, &base_node, &other_node, span_end, diffs)
-        }
-        _ => diff_collected_nodes(prolly, &base_node, &other_node, diffs),
-    }
-}
-
-fn diff_internal_nodes<S: Store>(
-    prolly: &Prolly<S>,
-    base: &Node,
-    other: &Node,
-    span_end: Option<&[u8]>,
-    diffs: &mut Vec<Diff>,
-) -> Result<(), Error> {
-    let mut base_idx = 0;
-    let mut other_idx = 0;
-
-    while base_idx < base.len() && other_idx < other.len() {
-        let base_start = base.keys[base_idx].as_slice();
-        let other_start = other.keys[other_idx].as_slice();
-        let base_end = child_span_end(base, base_idx, span_end);
-        let other_end = child_span_end(other, other_idx, span_end);
-
-        if base_start == other_start && base_end == other_end {
-            let base_cid = child_cid(base, base_idx)?;
-            let other_cid = child_cid(other, other_idx)?;
-            diff_nodes(prolly, &base_cid, &other_cid, base_end, diffs)?;
-            base_idx += 1;
-            other_idx += 1;
-        } else if span_ends_before_or_at(base_end, other_start) {
-            let base_cid = child_cid(base, base_idx)?;
-            collect_removed_from_cid(prolly, &base_cid, diffs)?;
-            base_idx += 1;
-        } else if span_ends_before_or_at(other_end, base_start) {
-            let other_cid = child_cid(other, other_idx)?;
-            collect_added_from_cid(prolly, &other_cid, diffs)?;
-            other_idx += 1;
-        } else {
-            // Chunk boundaries overlap but do not line up. Fall back to a local
-            // ordered merge for this subtree to preserve correctness.
-            return diff_collected_nodes(prolly, base, other, diffs);
-        }
-    }
-
-    while base_idx < base.len() {
-        let base_cid = child_cid(base, base_idx)?;
-        collect_removed_from_cid(prolly, &base_cid, diffs)?;
-        base_idx += 1;
-    }
-
-    while other_idx < other.len() {
-        let other_cid = child_cid(other, other_idx)?;
-        collect_added_from_cid(prolly, &other_cid, diffs)?;
-        other_idx += 1;
-    }
-
-    Ok(())
 }
 
 fn diff_range_nodes<S: Store>(
@@ -809,38 +1013,6 @@ fn collect_added_range_from_node<S: Store>(
     Ok(())
 }
 
-fn collect_removed_from_cid<S: Store>(
-    prolly: &Prolly<S>,
-    cid: &Cid,
-    diffs: &mut Vec<Diff>,
-) -> Result<(), Error> {
-    let node = prolly.load_arc(cid)?;
-    collect_removed_from_node(prolly, &node, diffs)
-}
-
-fn collect_removed_from_node<S: Store>(
-    prolly: &Prolly<S>,
-    node: &Node,
-    diffs: &mut Vec<Diff>,
-) -> Result<(), Error> {
-    if node.leaf {
-        for (key, val) in node.keys.iter().zip(&node.vals) {
-            diffs.push(Diff::Removed {
-                key: key.clone(),
-                val: val.clone(),
-            });
-        }
-        return Ok(());
-    }
-
-    let child_cids = child_cids(node)?;
-    for child_node in prolly.load_many_ordered(&child_cids)? {
-        collect_removed_from_node(prolly, &child_node, diffs)?;
-    }
-
-    Ok(())
-}
-
 fn collect_removed_range_from_cid<S: Store>(
     prolly: &Prolly<S>,
     cid: &Cid,
@@ -992,67 +1164,243 @@ pub fn merge_trees<S: Store>(
     right: &Tree,
     resolver: Option<Resolver>,
 ) -> Result<Tree, Error> {
-    let right_diff = compute_diff(prolly, base, right)?;
-    if right_diff.len() <= SPARSE_MERGE_POINT_CHECK_THRESHOLD {
-        return merge_trees_sparse_right_diff(prolly, base, left, right, &right_diff, resolver);
+    if left.root == right.root {
+        return Ok(left.clone());
+    }
+    if left.root == base.root {
+        return Ok(right.clone());
+    }
+    if right.root == base.root {
+        return Ok(left.clone());
     }
 
-    // For broad right-side changes, use subtree diffs for both branches.
-    let left_diff = compute_diff(prolly, base, left)?;
-    let left_changes = build_change_map(&left_diff);
-    let right_changes = build_change_map(&right_diff);
+    if let Some(merged) = try_structural_merge(prolly, base, left, right, resolver.as_deref())? {
+        return Ok(merged);
+    }
 
-    // Start with left tree and batch-apply right-side changes.
-    let mut mutations = Vec::new();
+    let right_diff = compute_diff(prolly, base, right)?;
+    merge_trees_with_right_diff(prolly, base, left, &right_diff, resolver)
+}
 
-    // Apply right changes
-    for (key, right_val) in &right_changes {
-        let left_val = left_changes.get(key);
+fn try_structural_merge<S: Store>(
+    prolly: &Prolly<S>,
+    base: &Tree,
+    left: &Tree,
+    right: &Tree,
+    resolver: Option<&dyn Fn(&Conflict) -> Option<Vec<u8>>>,
+) -> Result<Option<Tree>, Error> {
+    let (Some(base_cid), Some(left_cid), Some(right_cid)) = (&base.root, &left.root, &right.root)
+    else {
+        return Ok(None);
+    };
 
-        match (left_val, right_val) {
-            // Both made the same change - already in result
-            (Some(l), r) if l == r => {
-                // Same change on both sides, already in result (from left)
-                continue;
-            }
+    let mut collector = BatchWriteCollector::new();
+    let Some(root) = try_structural_merge_cids(
+        prolly,
+        base_cid,
+        left_cid,
+        right_cid,
+        resolver,
+        &mut collector,
+    )?
+    else {
+        return Ok(None);
+    };
+    collector.flush(prolly.store())?;
 
-            // Only right changed (left didn't touch this key)
-            (None, Some(val)) => {
-                mutations.push(Mutation::Upsert {
-                    key: key.clone(),
-                    val: val.clone(),
-                });
-            }
-            (None, None) => {
-                mutations.push(Mutation::Delete { key: key.clone() });
-            }
+    Ok(Some(Tree {
+        root: Some(root),
+        config: base.config.clone(),
+    }))
+}
 
-            // Both changed but differently - conflict!
-            (Some(_left_change), _right_change) => {
-                let conflict = build_conflict(prolly, base, left, right, key)?;
+fn try_structural_merge_cids<S: Store>(
+    prolly: &Prolly<S>,
+    base_cid: &Cid,
+    left_cid: &Cid,
+    right_cid: &Cid,
+    resolver: Option<&dyn Fn(&Conflict) -> Option<Vec<u8>>>,
+    collector: &mut BatchWriteCollector,
+) -> Result<Option<Cid>, Error> {
+    if left_cid == right_cid {
+        return Ok(Some(left_cid.clone()));
+    }
+    if left_cid == base_cid {
+        return Ok(Some(right_cid.clone()));
+    }
+    if right_cid == base_cid {
+        return Ok(Some(left_cid.clone()));
+    }
 
-                // Try to resolve the conflict
-                if let Some(ref resolve) = resolver {
-                    if let Some(resolved) = resolve(&conflict) {
-                        mutations.push(Mutation::Upsert {
-                            key: key.clone(),
-                            val: resolved,
-                        });
-                        continue;
-                    }
-                }
+    let nodes =
+        prolly.load_many_ordered(&[base_cid.clone(), left_cid.clone(), right_cid.clone()])?;
+    let base = nodes[0].clone();
+    let left = nodes[1].clone();
+    let right = nodes[2].clone();
 
-                // No resolver or resolver returned None
+    if base.leaf != left.leaf
+        || base.leaf != right.leaf
+        || base.level != left.level
+        || base.level != right.level
+        || base.keys != left.keys
+        || base.keys != right.keys
+    {
+        return Ok(None);
+    }
+
+    if base.leaf {
+        return try_structural_merge_leaf(
+            prolly, &base, &left, &right, base_cid, left_cid, right_cid, resolver, collector,
+        )
+        .map(Some);
+    }
+
+    try_structural_merge_internal(
+        prolly, &base, &left, &right, base_cid, left_cid, right_cid, resolver, collector,
+    )
+}
+
+fn try_structural_merge_internal<S: Store>(
+    prolly: &Prolly<S>,
+    base: &Node,
+    left: &Node,
+    right: &Node,
+    base_cid: &Cid,
+    left_cid: &Cid,
+    right_cid: &Cid,
+    resolver: Option<&dyn Fn(&Conflict) -> Option<Vec<u8>>>,
+    collector: &mut BatchWriteCollector,
+) -> Result<Option<Cid>, Error> {
+    if base.len() != left.len() || base.len() != right.len() {
+        return Ok(None);
+    }
+
+    let mut merged = prolly.new_node_like(base);
+    let mut differs_from_base = false;
+    prefetch_structural_merge_frontier(prolly, base, left, right);
+
+    for idx in 0..base.len() {
+        let base_child = child_cid(base, idx)?;
+        let left_child = child_cid(left, idx)?;
+        let right_child = child_cid(right, idx)?;
+        let Some(merged_child) = try_structural_merge_cids(
+            prolly,
+            &base_child,
+            &left_child,
+            &right_child,
+            resolver,
+            collector,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        if merged_child != base_child {
+            differs_from_base = true;
+        }
+        merged.keys.push(base.keys[idx].clone());
+        merged.vals.push(merged_child.0.to_vec());
+    }
+
+    if !differs_from_base {
+        return Ok(Some(base_cid.clone()));
+    }
+    if merged.vals == left.vals {
+        return Ok(Some(left_cid.clone()));
+    }
+    if merged.vals == right.vals {
+        return Ok(Some(right_cid.clone()));
+    }
+
+    Ok(Some(collector.add(&merged)))
+}
+
+fn prefetch_structural_merge_frontier<S: Store>(
+    prolly: &Prolly<S>,
+    base: &Node,
+    left: &Node,
+    right: &Node,
+) {
+    if !prolly.store().prefers_batch_reads() || base.len() <= 1 {
+        return;
+    }
+
+    let mut cids = Vec::new();
+    for idx in 0..base.len() {
+        let (Ok(base_child), Ok(left_child), Ok(right_child)) = (
+            child_cid(base, idx),
+            child_cid(left, idx),
+            child_cid(right, idx),
+        ) else {
+            continue;
+        };
+
+        if left_child == right_child || left_child == base_child || right_child == base_child {
+            continue;
+        }
+
+        cids.push(base_child);
+        cids.push(left_child);
+        cids.push(right_child);
+    }
+
+    if cids.len() > 3 {
+        let _ = prolly.load_many_ordered(&cids);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_structural_merge_leaf<S: Store>(
+    prolly: &Prolly<S>,
+    base: &Node,
+    left: &Node,
+    right: &Node,
+    base_cid: &Cid,
+    left_cid: &Cid,
+    right_cid: &Cid,
+    resolver: Option<&dyn Fn(&Conflict) -> Option<Vec<u8>>>,
+    collector: &mut BatchWriteCollector,
+) -> Result<Cid, Error> {
+    let mut merged = prolly.new_node_like(base);
+    merged.keys = base.keys.clone();
+
+    for idx in 0..base.len() {
+        let base_val = &base.vals[idx];
+        let left_val = &left.vals[idx];
+        let right_val = &right.vals[idx];
+        let merged_val = if left_val == right_val {
+            left_val.clone()
+        } else if left_val == base_val {
+            right_val.clone()
+        } else if right_val == base_val {
+            left_val.clone()
+        } else {
+            let conflict = Conflict {
+                key: base.keys[idx].clone(),
+                base: Some(base_val.clone()),
+                left: left_val.clone(),
+                right: right_val.clone(),
+            };
+            if let Some(resolve) = resolver {
+                resolve(&conflict).ok_or(Error::Conflict(conflict))?
+            } else {
                 return Err(Error::Conflict(conflict));
             }
-        }
+        };
+        merged.vals.push(merged_val);
     }
 
-    if mutations.is_empty() {
-        Ok(left.clone())
-    } else {
-        prolly.batch(left, mutations)
+    if merged.vals == base.vals {
+        return Ok(base_cid.clone());
     }
+    if merged.vals == left.vals {
+        return Ok(left_cid.clone());
+    }
+    if merged.vals == right.vals {
+        return Ok(right_cid.clone());
+    }
+
+    Ok(collector.add(&merged))
 }
 
 pub(crate) fn try_append_only_diff<S: Store>(
@@ -1072,8 +1420,9 @@ pub(crate) fn try_append_only_diff<S: Store>(
         }
         (Some(_), None) => Ok(None),
         (Some(base_cid), Some(other_cid)) => {
-            let base_node = prolly.load_arc(base_cid)?;
-            let other_node = prolly.load_arc(other_cid)?;
+            let nodes = prolly.load_many_ordered(&[base_cid.clone(), other_cid.clone()])?;
+            let base_node = nodes[0].clone();
+            let other_node = nodes[1].clone();
             if append_only_diff_nodes(prolly, &base_node, &other_node, &mut diffs)? {
                 Ok(Some(diffs))
             } else {
@@ -1152,8 +1501,9 @@ fn append_only_diff_nodes<S: Store>(
     let base_child = child_cid(base, right_edge_idx)?;
     let other_child = child_cid(other, right_edge_idx)?;
     if base_child != other_child {
-        let base_child_node = prolly.load_arc(&base_child)?;
-        let other_child_node = prolly.load_arc(&other_child)?;
+        let nodes = prolly.load_many_ordered(&[base_child, other_child])?;
+        let base_child_node = nodes[0].clone();
+        let other_child_node = nodes[1].clone();
         if !append_only_diff_nodes(prolly, &base_child_node, &other_child_node, diffs)? {
             return Ok(false);
         }
@@ -1169,20 +1519,19 @@ fn append_only_diff_nodes<S: Store>(
     Ok(true)
 }
 
-fn merge_trees_sparse_right_diff<S: Store>(
+fn merge_trees_with_right_diff<S: Store>(
     prolly: &Prolly<S>,
     base: &Tree,
     left: &Tree,
-    right: &Tree,
     right_diff: &[Diff],
     resolver: Option<Resolver>,
 ) -> Result<Tree, Error> {
-    let right_changes = build_change_map(right_diff);
+    let right_changes = build_merge_change_map(right_diff);
     if right_changes_are_append_only_after(prolly, base, left, &right_changes)? {
         let mutations = right_changes
             .iter()
-            .filter_map(|(key, value)| {
-                value.as_ref().map(|val| Mutation::Upsert {
+            .filter_map(|(key, change)| {
+                change.value.as_ref().map(|val| Mutation::Upsert {
                     key: key.clone(),
                     val: val.clone(),
                 })
@@ -1192,12 +1541,14 @@ fn merge_trees_sparse_right_diff<S: Store>(
     }
 
     let mut mutations = Vec::new();
+    let keys = right_changes.keys().cloned().collect::<Vec<_>>();
+    let left_values = get_many_from_tree(prolly, left, &keys)?;
 
-    for (key, right_val) in &right_changes {
-        let base_val = prolly.get(base, key)?;
-        let left_val = prolly.get(left, key)?;
+    for ((key, change), left_val) in right_changes.iter().zip(left_values) {
+        let base_val = &change.base;
+        let right_val = &change.value;
 
-        if left_val == base_val {
+        if &left_val == base_val {
             push_change_mutation(&mut mutations, key, right_val);
             continue;
         }
@@ -1206,7 +1557,8 @@ fn merge_trees_sparse_right_diff<S: Store>(
             continue;
         }
 
-        let conflict = build_conflict(prolly, base, left, right, key)?;
+        let conflict =
+            build_conflict_from_values(key, base_val.clone(), left_val, right_val.clone());
         if let Some(ref resolve) = resolver {
             if let Some(resolved) = resolve(&conflict) {
                 mutations.push(Mutation::Upsert {
@@ -1241,17 +1593,107 @@ fn option_bytes_eq(left: &Option<Vec<u8>>, right: &Option<Vec<u8>>) -> bool {
     left.as_deref() == right.as_deref()
 }
 
+struct KeyLookupFrame {
+    cid: Cid,
+    positions: Vec<usize>,
+}
+
+fn get_many_from_tree<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    keys: &[Vec<u8>],
+) -> Result<Vec<Option<Vec<u8>>>, Error> {
+    let mut values = vec![None; keys.len()];
+    let Some(root_cid) = &tree.root else {
+        return Ok(values);
+    };
+
+    if keys.is_empty() {
+        return Ok(values);
+    }
+
+    let mut frames = vec![KeyLookupFrame {
+        cid: root_cid.clone(),
+        positions: (0..keys.len()).collect(),
+    }];
+
+    while !frames.is_empty() {
+        let cids = frames
+            .iter()
+            .map(|frame| frame.cid.clone())
+            .collect::<Vec<_>>();
+        let nodes = prolly.load_many_ordered(&cids)?;
+        let mut next_frames = Vec::new();
+
+        for (frame, node) in frames.into_iter().zip(nodes) {
+            if node.leaf {
+                for position in frame.positions {
+                    if let Ok(idx) = node.search(&keys[position]) {
+                        values[position] = Some(node.vals[idx].clone());
+                    }
+                }
+                continue;
+            }
+
+            next_frames.extend(route_key_positions_to_children(
+                &node,
+                frame.positions,
+                keys,
+            )?);
+        }
+
+        frames = next_frames;
+    }
+
+    Ok(values)
+}
+
+fn route_key_positions_to_children(
+    node: &Node,
+    positions: Vec<usize>,
+    keys: &[Vec<u8>],
+) -> Result<Vec<KeyLookupFrame>, Error> {
+    if node.is_empty() {
+        return Err(Error::InvalidNode);
+    }
+
+    let mut routed: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut child_index = 0usize;
+
+    for position in positions {
+        let key = keys[position].as_slice();
+        while child_index + 1 < node.len() && key >= node.keys[child_index + 1].as_slice() {
+            child_index += 1;
+        }
+
+        match routed.last_mut() {
+            Some((idx, bucket)) if *idx == child_index => bucket.push(position),
+            _ => routed.push((child_index, vec![position])),
+        }
+    }
+
+    routed
+        .into_iter()
+        .map(|(idx, positions)| {
+            Ok(KeyLookupFrame {
+                cid: child_cid(node, idx)?,
+                positions,
+            })
+        })
+        .collect()
+}
+
 fn right_changes_are_append_only_after<S: Store>(
     prolly: &Prolly<S>,
     base: &Tree,
     left: &Tree,
-    right_changes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    right_changes: &BTreeMap<Vec<u8>, MergeChange>,
 ) -> Result<bool, Error> {
     let Some((first_key, _)) = right_changes.first_key_value() else {
         return Ok(false);
     };
 
-    if right_changes.values().any(Option::is_none) {
+    if right_changes.values().any(|change| change.value.is_none()) {
         return Ok(false);
     }
 
@@ -1283,27 +1725,47 @@ pub fn build_change_map(diffs: &[Diff]) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
         .collect()
 }
 
-/// Build conflict information for a key that has conflicting changes.
-///
-/// Retrieves the values from base, left, and right trees to provide
-/// complete conflict information for resolution.
-fn build_conflict<S: Store>(
-    prolly: &Prolly<S>,
-    base: &Tree,
-    left: &Tree,
-    right: &Tree,
-    key: &[u8],
-) -> Result<Conflict, Error> {
-    let base_val = prolly.get(base, key)?;
-    let left_val_actual = prolly.get(left, key)?.unwrap_or_default();
-    let right_val_actual = prolly.get(right, key)?.unwrap_or_default();
+fn build_merge_change_map(diffs: &[Diff]) -> BTreeMap<Vec<u8>, MergeChange> {
+    diffs
+        .iter()
+        .map(|d| match d {
+            Diff::Added { key, val } => (
+                key.clone(),
+                MergeChange {
+                    base: None,
+                    value: Some(val.clone()),
+                },
+            ),
+            Diff::Removed { key, val } => (
+                key.clone(),
+                MergeChange {
+                    base: Some(val.clone()),
+                    value: None,
+                },
+            ),
+            Diff::Changed { key, old, new } => (
+                key.clone(),
+                MergeChange {
+                    base: Some(old.clone()),
+                    value: Some(new.clone()),
+                },
+            ),
+        })
+        .collect()
+}
 
-    Ok(Conflict {
+fn build_conflict_from_values(
+    key: &[u8],
+    base: Option<Vec<u8>>,
+    left: Option<Vec<u8>>,
+    right: Option<Vec<u8>>,
+) -> Conflict {
+    Conflict {
         key: key.to_vec(),
-        base: base_val,
-        left: left_val_actual,
-        right: right_val_actual,
-    })
+        base,
+        left: left.unwrap_or_default(),
+        right: right.unwrap_or_default(),
+    }
 }
 
 #[cfg(test)]
@@ -1312,7 +1774,7 @@ mod tests {
     use super::super::config::Config;
     use super::super::store::{BatchOp, MemStore, Store};
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1330,14 +1792,33 @@ mod tests {
     #[derive(Default)]
     struct CountingStore {
         data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+        blocked_get_keys: Mutex<HashSet<Vec<u8>>>,
+        prefer_batch_reads: bool,
         get_calls: AtomicUsize,
         batch_get_ordered_calls: AtomicUsize,
+        max_batch_get_ordered_len: AtomicUsize,
     }
 
     impl CountingStore {
         fn reset_counts(&self) {
             self.get_calls.store(0, Ordering::Relaxed);
             self.batch_get_ordered_calls.store(0, Ordering::Relaxed);
+            self.max_batch_get_ordered_len.store(0, Ordering::Relaxed);
+        }
+
+        fn block_get_key(&self, key: &[u8]) {
+            self.blocked_get_keys.lock().unwrap().insert(key.to_vec());
+        }
+
+        fn clear_blocked_get_keys(&self) {
+            self.blocked_get_keys.lock().unwrap().clear();
+        }
+
+        fn ensure_get_allowed(&self, key: &[u8]) -> Result<(), CountingStoreError> {
+            if self.blocked_get_keys.lock().unwrap().contains(key) {
+                return Err(CountingStoreError);
+            }
+            Ok(())
         }
     }
 
@@ -1345,6 +1826,7 @@ mod tests {
         type Error = CountingStoreError;
 
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.ensure_get_allowed(key)?;
             self.get_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
@@ -1378,9 +1860,18 @@ mod tests {
         }
 
         fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+            for key in keys {
+                self.ensure_get_allowed(key)?;
+            }
             self.batch_get_ordered_calls.fetch_add(1, Ordering::Relaxed);
+            self.max_batch_get_ordered_len
+                .fetch_max(keys.len(), Ordering::Relaxed);
             let data = self.data.lock().unwrap();
             Ok(keys.iter().map(|key| data.get(*key).cloned()).collect())
+        }
+
+        fn prefers_batch_reads(&self) -> bool {
+            self.prefer_batch_reads
         }
     }
 
@@ -1418,6 +1909,147 @@ mod tests {
             store.get_calls.load(Ordering::Relaxed),
             1,
             "only the added root should require a single-key get"
+        );
+    }
+
+    #[test]
+    fn structural_stream_diff_skips_unchanged_subtrees() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..256 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let other = prolly
+            .put(&base, b"k173".to_vec(), b"changed-173".to_vec())
+            .unwrap();
+
+        prolly.clear_cache();
+        store.reset_counts();
+        let diffs = stream_diff(&prolly, &base, &other)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            diffs,
+            vec![Diff::Changed {
+                key: b"k173".to_vec(),
+                old: b"v173".to_vec(),
+                new: b"changed-173".to_vec(),
+            }]
+        );
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > 0,
+            "structural streaming should hydrate compared node pairs in ordered batches"
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            0,
+            "structural streaming should not cursor-scan entries with single-key gets"
+        );
+    }
+
+    #[test]
+    fn structural_stream_diff_prefetches_sibling_frames_for_batched_stores() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..512 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let other = prolly
+            .batch(
+                &base,
+                (0..512)
+                    .step_by(29)
+                    .map(|i| Mutation::Upsert {
+                        key: format!("k{i:03}").into_bytes(),
+                        val: format!("changed-{i:03}").into_bytes(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        prolly.clear_cache();
+        store.reset_counts();
+        let diffs = stream_diff(&prolly, &base, &other)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(diffs.len(), 18);
+        assert!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed) > 2,
+            "batched-read stores should prefetch sibling diff frames wider than one node pair"
+        );
+    }
+
+    #[test]
+    fn eager_diff_uses_structural_prefetch_for_batched_stores() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..512 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let other = prolly
+            .batch(
+                &base,
+                (0..512)
+                    .step_by(29)
+                    .map(|i| Mutation::Upsert {
+                        key: format!("k{i:03}").into_bytes(),
+                        val: format!("changed-{i:03}").into_bytes(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        prolly.clear_cache();
+        store.reset_counts();
+        let diffs = compute_diff(&prolly, &base, &other).unwrap();
+
+        assert_eq!(diffs.len(), 18);
+        assert!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed) > 2,
+            "eager diff should reuse structural sibling prefetch for batched-read stores"
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            0,
+            "eager structural diff should avoid point reads after append-only fallback"
         );
     }
 
@@ -1535,6 +2167,68 @@ mod tests {
     }
 
     #[test]
+    fn append_only_diff_batches_changed_right_edge_child_pair() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::default();
+        let prolly = Prolly::new(store.clone(), config.clone());
+
+        let mut leaf_a = prolly.new_leaf_node();
+        leaf_a.keys.push(b"a".to_vec());
+        leaf_a.vals.push(b"1".to_vec());
+        let leaf_a_cid = prolly.save(&leaf_a).unwrap();
+
+        let mut leaf_b = prolly.new_leaf_node();
+        leaf_b.keys.push(b"b".to_vec());
+        leaf_b.vals.push(b"2".to_vec());
+        let leaf_b_cid = prolly.save(&leaf_b).unwrap();
+
+        let mut leaf_bc = prolly.new_leaf_node();
+        leaf_bc.keys = vec![b"b".to_vec(), b"c".to_vec()];
+        leaf_bc.vals = vec![b"2".to_vec(), b"3".to_vec()];
+        let leaf_bc_cid = prolly.save(&leaf_bc).unwrap();
+
+        let mut base_root = prolly.new_internal_node(1);
+        base_root.keys = vec![b"a".to_vec(), b"b".to_vec()];
+        base_root.vals = vec![leaf_a_cid.0.to_vec(), leaf_b_cid.0.to_vec()];
+        let base_root_cid = prolly.save(&base_root).unwrap();
+
+        let mut other_root = prolly.new_internal_node(1);
+        other_root.keys = vec![b"a".to_vec(), b"b".to_vec()];
+        other_root.vals = vec![leaf_a_cid.0.to_vec(), leaf_bc_cid.0.to_vec()];
+        let other_root_cid = prolly.save(&other_root).unwrap();
+
+        let base = Tree {
+            root: Some(base_root_cid),
+            config: config.clone(),
+        };
+        let other = Tree {
+            root: Some(other_root_cid),
+            config,
+        };
+
+        prolly.clear_cache();
+        store.reset_counts();
+        let diffs = try_append_only_diff(&prolly, &base, &other)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            diffs,
+            vec![Diff::Added {
+                key: b"c".to_vec(),
+                val: b"3".to_vec()
+            }]
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            0,
+            "changed right-edge child nodes should be loaded through ordered batches"
+        );
+        assert_eq!(store.batch_get_ordered_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(store.max_batch_get_ordered_len.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn append_only_diff_rejects_existing_key_updates() {
         let config = Config::builder()
             .min_chunk_size(2)
@@ -1585,6 +2279,279 @@ mod tests {
         assert_eq!(prolly.get(&merged, b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(prolly.get(&merged, b"b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(prolly.get(&merged, b"c").unwrap(), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn merge_returns_changed_branch_without_reads_when_other_branch_unchanged() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let base = prolly
+            .put(&prolly.create(), b"a".to_vec(), b"1".to_vec())
+            .unwrap();
+        let right = prolly.put(&base, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        prolly.clear_cache();
+        store.reset_counts();
+        let merged = merge_trees(&prolly, &base, &base, &right, None).unwrap();
+
+        assert_eq!(merged.root, right.root);
+        assert_eq!(store.get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.batch_get_ordered_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn structural_merge_reuses_disjoint_changed_subtrees_without_reading_them() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let prolly = Prolly::new(store.clone(), Config::default());
+
+        let mut base_left_leaf = prolly.new_leaf_node();
+        base_left_leaf.keys.push(b"a".to_vec());
+        base_left_leaf.vals.push(b"1".to_vec());
+        let base_left_leaf_cid = prolly.save(&base_left_leaf).unwrap();
+
+        let mut base_right_leaf = prolly.new_leaf_node();
+        base_right_leaf.keys.push(b"m".to_vec());
+        base_right_leaf.vals.push(b"1".to_vec());
+        let base_right_leaf_cid = prolly.save(&base_right_leaf).unwrap();
+
+        let mut base_root = prolly.new_internal_node(1);
+        base_root.keys = vec![b"a".to_vec(), b"m".to_vec()];
+        base_root.vals = vec![
+            base_left_leaf_cid.0.to_vec(),
+            base_right_leaf_cid.0.to_vec(),
+        ];
+        let base_root_cid = prolly.save(&base_root).unwrap();
+
+        let mut left_leaf = prolly.new_leaf_node();
+        left_leaf.keys.push(b"a".to_vec());
+        left_leaf.vals.push(b"left".to_vec());
+        let left_leaf_cid = prolly.save(&left_leaf).unwrap();
+
+        let mut left_root = prolly.new_internal_node(1);
+        left_root.keys = base_root.keys.clone();
+        left_root.vals = vec![left_leaf_cid.0.to_vec(), base_right_leaf_cid.0.to_vec()];
+        let left_root_cid = prolly.save(&left_root).unwrap();
+
+        let mut right_leaf = prolly.new_leaf_node();
+        right_leaf.keys.push(b"m".to_vec());
+        right_leaf.vals.push(b"right".to_vec());
+        let right_leaf_cid = prolly.save(&right_leaf).unwrap();
+
+        let mut right_root = prolly.new_internal_node(1);
+        right_root.keys = base_root.keys.clone();
+        right_root.vals = vec![base_left_leaf_cid.0.to_vec(), right_leaf_cid.0.to_vec()];
+        let right_root_cid = prolly.save(&right_root).unwrap();
+
+        let base = Tree {
+            root: Some(base_root_cid),
+            config: Config::default(),
+        };
+        let left = Tree {
+            root: Some(left_root_cid),
+            config: Config::default(),
+        };
+        let right = Tree {
+            root: Some(right_root_cid),
+            config: Config::default(),
+        };
+
+        store.block_get_key(left_leaf_cid.as_bytes());
+        store.block_get_key(right_leaf_cid.as_bytes());
+        prolly.clear_cache();
+        store.reset_counts();
+
+        let merged = merge_trees(&prolly, &base, &left, &right, None).unwrap();
+
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > 0,
+            "structural merge should batch-read only the internal merge frontier"
+        );
+
+        store.clear_blocked_get_keys();
+        assert_eq!(prolly.get(&merged, b"a").unwrap(), Some(b"left".to_vec()));
+        assert_eq!(prolly.get(&merged, b"m").unwrap(), Some(b"right".to_vec()));
+    }
+
+    #[test]
+    fn structural_merge_prefetches_sibling_merge_frontier() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let prolly = Prolly::new(store.clone(), Config::default());
+
+        let save_leaf = |key: &[u8], val: &[u8]| {
+            let mut leaf = prolly.new_leaf_node();
+            leaf.keys.push(key.to_vec());
+            leaf.vals.push(val.to_vec());
+            prolly.save(&leaf).unwrap()
+        };
+        let save_internal = |level, keys: Vec<Vec<u8>>, child_cids: Vec<Cid>| {
+            let mut node = prolly.new_internal_node(level);
+            node.keys = keys;
+            node.vals = child_cids
+                .into_iter()
+                .map(|cid| cid.0.to_vec())
+                .collect::<Vec<_>>();
+            prolly.save(&node).unwrap()
+        };
+
+        let base_a = save_leaf(b"a", b"base-a");
+        let base_g = save_leaf(b"g", b"base-g");
+        let base_m = save_leaf(b"m", b"base-m");
+        let base_t = save_leaf(b"t", b"base-t");
+        let base_left_internal = save_internal(
+            1,
+            vec![b"a".to_vec(), b"g".to_vec()],
+            vec![base_a.clone(), base_g.clone()],
+        );
+        let base_right_internal = save_internal(
+            1,
+            vec![b"m".to_vec(), b"t".to_vec()],
+            vec![base_m.clone(), base_t.clone()],
+        );
+        let base_root = save_internal(
+            2,
+            vec![b"a".to_vec(), b"m".to_vec()],
+            vec![base_left_internal.clone(), base_right_internal.clone()],
+        );
+
+        let left_a = save_leaf(b"a", b"left-a");
+        let left_m = save_leaf(b"m", b"left-m");
+        let left_left_internal = save_internal(
+            1,
+            vec![b"a".to_vec(), b"g".to_vec()],
+            vec![left_a, base_g.clone()],
+        );
+        let left_right_internal = save_internal(
+            1,
+            vec![b"m".to_vec(), b"t".to_vec()],
+            vec![left_m, base_t.clone()],
+        );
+        let left_root = save_internal(
+            2,
+            vec![b"a".to_vec(), b"m".to_vec()],
+            vec![left_left_internal, left_right_internal],
+        );
+
+        let right_g = save_leaf(b"g", b"right-g");
+        let right_t = save_leaf(b"t", b"right-t");
+        let right_left_internal =
+            save_internal(1, vec![b"a".to_vec(), b"g".to_vec()], vec![base_a, right_g]);
+        let right_right_internal =
+            save_internal(1, vec![b"m".to_vec(), b"t".to_vec()], vec![base_m, right_t]);
+        let right_root = save_internal(
+            2,
+            vec![b"a".to_vec(), b"m".to_vec()],
+            vec![right_left_internal, right_right_internal],
+        );
+
+        let base = Tree {
+            root: Some(base_root),
+            config: Config::default(),
+        };
+        let left = Tree {
+            root: Some(left_root),
+            config: Config::default(),
+        };
+        let right = Tree {
+            root: Some(right_root),
+            config: Config::default(),
+        };
+
+        prolly.clear_cache();
+        store.reset_counts();
+        let merged = merge_trees(&prolly, &base, &left, &right, None).unwrap();
+
+        assert!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed) >= 6,
+            "structural merge should prefetch sibling child triples wider than one subtree"
+        );
+        assert_eq!(prolly.get(&merged, b"a").unwrap(), Some(b"left-a".to_vec()));
+        assert_eq!(
+            prolly.get(&merged, b"g").unwrap(),
+            Some(b"right-g".to_vec())
+        );
+        assert_eq!(prolly.get(&merged, b"m").unwrap(), Some(b"left-m".to_vec()));
+        assert_eq!(
+            prolly.get(&merged, b"t").unwrap(),
+            Some(b"right-t".to_vec())
+        );
+    }
+
+    #[test]
+    fn broad_merge_does_not_read_left_only_changed_subtrees() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let key_for = |idx: usize| format!("k{idx:04}").into_bytes();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..4096 {
+            builder.add(key_for(i), format!("v{i:04}").into_bytes());
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+
+        let left = prolly
+            .batch(
+                &base,
+                (0..32)
+                    .map(|i| Mutation::Upsert {
+                        key: key_for(i),
+                        val: format!("left-{i:04}").into_bytes(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let right = prolly
+            .batch(
+                &base,
+                (2000..3100)
+                    .map(|i| Mutation::Upsert {
+                        key: key_for(i),
+                        val: format!("right-{i:04}").into_bytes(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let left_only_leaf = prolly
+            .find_path(&left, &key_for(0))
+            .unwrap()
+            .last()
+            .map(|(node, _)| node.clone())
+            .unwrap();
+        let blocked_cid = Cid::from_bytes(&left_only_leaf.to_bytes());
+        store.block_get_key(blocked_cid.as_bytes());
+        prolly.clear_cache();
+        store.reset_counts();
+
+        let merged = merge_trees(&prolly, &base, &left, &right, None).unwrap();
+
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > 0,
+            "merge should check left values through batched tree reads"
+        );
+
+        store.clear_blocked_get_keys();
+        assert_eq!(
+            prolly.get(&merged, &key_for(0)).unwrap(),
+            Some(b"left-0000".to_vec())
+        );
+        assert_eq!(
+            prolly.get(&merged, &key_for(2500)).unwrap(),
+            Some(b"right-2500".to_vec())
+        );
     }
 
     #[test]

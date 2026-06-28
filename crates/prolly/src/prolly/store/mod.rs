@@ -1,13 +1,21 @@
 //! Storage backend trait and implementations for Prolly Trees
 
 mod memory;
+#[cfg(feature = "pglite")]
+mod pglite;
 #[cfg(feature = "rocksdb")]
 mod rocksdb;
+#[cfg(feature = "slatedb")]
+mod slatedb;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
+#[cfg(feature = "pglite")]
+pub use self::pglite::{PgliteStore, PgliteStoreConfig, PgliteStoreError};
 #[cfg(feature = "rocksdb")]
 pub use self::rocksdb::{CompressionType, RocksDBConfig, RocksDBStore, RocksDBStoreError};
+#[cfg(feature = "slatedb")]
+pub use self::slatedb::{SlateDbStore, SlateDbStoreConfig, SlateDbStoreError};
 #[cfg(feature = "sqlite")]
 pub use self::sqlite::{SqliteStore, SqliteStoreConfig, SqliteStoreError};
 pub use memory::{MemStore, MemStoreError};
@@ -96,6 +104,15 @@ pub trait Store: Send + Sync {
         Ok(results)
     }
 
+    /// Whether this store has an efficient batched-read implementation.
+    ///
+    /// The prolly engine uses this to decide whether to prefetch many tree
+    /// paths through `batch_get_ordered`. Stores that implement true multi-get,
+    /// request coalescing, or parallel remote reads should return `true`.
+    fn prefers_batch_reads(&self) -> bool {
+        false
+    }
+
     /// Store multiple key-value pairs in a single operation
     ///
     /// Writes all entries atomically when possible. The default implementation
@@ -173,6 +190,10 @@ impl<T: Store> Store for std::sync::Arc<T> {
 
     fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
         (**self).batch_get_ordered(keys)
+    }
+
+    fn prefers_batch_reads(&self) -> bool {
+        (**self).prefers_batch_reads()
     }
 
     fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {

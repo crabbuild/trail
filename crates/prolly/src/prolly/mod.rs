@@ -764,9 +764,9 @@ impl<S: Store> Prolly<S> {
     /// Create a streaming diff iterator between two trees.
     ///
     /// Returns an iterator that yields `Result<Diff, Error>` entries representing
-    /// the changes needed to transform `base` into `other`. This method uses the
-    /// Append-only suffix changes are routed through the tree-structural diff
-    /// shortcut; other changes use [`DiffCursor`].
+    /// the changes needed to transform `base` into `other`. This method walks
+    /// the same content-addressed structure as eager diff, so equal subtrees are
+    /// skipped by CID and only changed subtrees are visited.
     ///
     /// # Arguments
     /// * `base` - The base tree to compare from
@@ -809,12 +809,7 @@ impl<S: Store> Prolly<S> {
         base: &Tree,
         other: &Tree,
     ) -> Result<Box<dyn Iterator<Item = Result<Diff, Error>> + 'a>, Error> {
-        if let Some(diffs) = diff::try_append_only_diff(self, base, other)? {
-            return Ok(Box::new(diffs.into_iter().map(Ok)));
-        }
-
-        let diff_cursor = cursor::DiffCursor::new(&self.store, base, other)?;
-        Ok(Box::new(diff_cursor.map(Ok)))
+        Ok(Box::new(diff::stream_diff(self, base, other)))
     }
 
     /// Load a node by its CID from the store.
@@ -848,7 +843,7 @@ impl<S: Store> Prolly<S> {
     /// Load nodes by CID in input order, batching cache misses through the store.
     pub(crate) fn load_many_ordered(&self, cids: &[Cid]) -> Result<Vec<Arc<Node>>, Error> {
         let mut nodes = vec![None; cids.len()];
-        let mut missing_indices = Vec::new();
+        let mut missing_positions: HashMap<Cid, Vec<usize>> = HashMap::new();
         let mut missing_cids = Vec::new();
 
         if let Ok(cache) = self.node_cache.read() {
@@ -856,13 +851,27 @@ impl<S: Store> Prolly<S> {
                 if let Some(node) = cache.get(cid) {
                     nodes[idx] = Some(node.clone());
                 } else {
-                    missing_indices.push(idx);
-                    missing_cids.push(cid.clone());
+                    if !missing_positions.contains_key(cid) {
+                        missing_cids.push(cid.clone());
+                        missing_positions.insert(cid.clone(), Vec::new());
+                    }
+                    missing_positions
+                        .get_mut(cid)
+                        .ok_or(Error::InvalidNode)?
+                        .push(idx);
                 }
             }
         } else {
-            missing_indices.extend(0..cids.len());
-            missing_cids.extend(cids.iter().cloned());
+            for (idx, cid) in cids.iter().enumerate() {
+                if !missing_positions.contains_key(cid) {
+                    missing_cids.push(cid.clone());
+                    missing_positions.insert(cid.clone(), Vec::new());
+                }
+                missing_positions
+                    .get_mut(cid)
+                    .ok_or(Error::InvalidNode)?
+                    .push(idx);
+            }
         }
 
         if !missing_cids.is_empty() {
@@ -880,19 +889,21 @@ impl<S: Store> Prolly<S> {
             }
 
             let mut cache = self.node_cache.write().ok();
-            for ((idx, cid), bytes) in missing_indices
-                .into_iter()
-                .zip(missing_cids.into_iter())
-                .zip(loaded)
-            {
+            for (cid, bytes) in missing_cids.into_iter().zip(loaded) {
                 let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
                 let node = Arc::new(Node::from_bytes(&bytes)?);
                 let node = if let Some(cache) = cache.as_mut() {
-                    cache.entry(cid).or_insert_with(|| node.clone()).clone()
+                    cache
+                        .entry(cid.clone())
+                        .or_insert_with(|| node.clone())
+                        .clone()
                 } else {
                     node
                 };
-                nodes[idx] = Some(node);
+                let positions = missing_positions.remove(&cid).ok_or(Error::InvalidNode)?;
+                for idx in positions {
+                    nodes[idx] = Some(node.clone());
+                }
             }
         }
 
@@ -1210,6 +1221,8 @@ mod tests {
         put_calls: AtomicUsize,
         batch_calls: AtomicUsize,
         batch_put_calls: AtomicUsize,
+        batch_get_ordered_calls: AtomicUsize,
+        max_batch_get_ordered_len: AtomicUsize,
     }
 
     impl Store for CountingStore {
@@ -1257,6 +1270,14 @@ mod tests {
             }
             Ok(())
         }
+
+        fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+            self.batch_get_ordered_calls.fetch_add(1, Ordering::Relaxed);
+            self.max_batch_get_ordered_len
+                .fetch_max(keys.len(), Ordering::Relaxed);
+            let data = self.data.lock().unwrap();
+            Ok(keys.iter().map(|key| data.get(*key).cloned()).collect())
+        }
     }
 
     #[test]
@@ -1274,6 +1295,32 @@ mod tests {
 
         assert!(tree.is_empty());
         assert!(tree.root.is_none());
+    }
+
+    #[test]
+    fn load_many_ordered_deduplicates_missing_cids() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let tree = prolly
+            .put(&prolly.create(), b"key".to_vec(), b"value".to_vec())
+            .unwrap();
+        let root = tree.root.clone().unwrap();
+        prolly.clear_cache();
+
+        let nodes = prolly
+            .load_many_ordered(&[root.clone(), root.clone(), root.clone()])
+            .unwrap();
+
+        assert_eq!(nodes.len(), 3);
+        assert!(Arc::ptr_eq(&nodes[0], &nodes[1]));
+        assert!(Arc::ptr_eq(&nodes[1], &nodes[2]));
+        assert_eq!(prolly.cache_len(), 1);
+        assert_eq!(store.batch_get_ordered_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed),
+            1,
+            "duplicate CIDs should be fetched and decoded once"
+        );
     }
 
     #[test]

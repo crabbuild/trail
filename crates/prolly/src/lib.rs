@@ -295,6 +295,10 @@ pub use prolly::stats::TreeStats;
 pub use prolly::store::{BatchOp, MemStore, MemStoreError, Store};
 #[cfg(feature = "rocksdb")]
 pub use prolly::store::{CompressionType, RocksDBConfig, RocksDBStore, RocksDBStoreError};
+#[cfg(feature = "pglite")]
+pub use prolly::store::{PgliteStore, PgliteStoreConfig, PgliteStoreError};
+#[cfg(feature = "slatedb")]
+pub use prolly::store::{SlateDbStore, SlateDbStoreConfig, SlateDbStoreError};
 #[cfg(feature = "sqlite")]
 pub use prolly::store::{SqliteStore, SqliteStoreConfig, SqliteStoreError};
 pub use prolly::tree::Tree;

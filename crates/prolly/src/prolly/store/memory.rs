@@ -111,6 +111,10 @@ impl Store for MemStore {
         Ok(results)
     }
 
+    fn prefers_batch_reads(&self) -> bool {
+        true
+    }
+
     /// Optimized batch_put for MemStore - acquires lock once for all writes
     fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
         let mut data = self
