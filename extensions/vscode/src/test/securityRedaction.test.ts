@@ -40,6 +40,7 @@ test("redacts sensitive command flag values", () => {
 test("redacts common secret string forms", () => {
   assert.equal(redactString("Authorization: Bearer abc123"), "Authorization: Bearer [REDACTED]");
   assert.equal(redactString("password=hunter2 token=abc123"), "password=[REDACTED] token=[REDACTED]");
+  assert.equal(redactString("deploy --token abc123 --env prod"), "deploy --token [REDACTED] --env prod");
 });
 
 test("handles circular values in redacted json", () => {

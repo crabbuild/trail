@@ -10,6 +10,8 @@ pub(crate) struct SpawnLaneRequest {
     pub(crate) from: Option<String>,
     #[serde(default)]
     pub(crate) materialize: Option<bool>,
+    #[serde(default)]
+    pub(crate) workdir_mode: Option<String>,
     #[serde(default, alias = "workdir_path")]
     pub(crate) workdir: Option<String>,
     #[serde(default)]

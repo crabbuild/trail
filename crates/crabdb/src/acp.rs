@@ -387,6 +387,8 @@ struct ActiveTurn {
     effective_cwd: String,
     materialized: bool,
     assistant_buffers: HashMap<String, String>,
+    assistant_buffer_order: Vec<String>,
+    assistant_message_bytes: HashMap<String, usize>,
     tool_spans: HashMap<String, String>,
     structured_diff_keys: HashSet<String>,
     pending_events: Vec<BufferedTurnEvent>,
@@ -403,6 +405,39 @@ struct BufferedTurnEvent {
 }
 
 impl ActiveTurn {
+    fn append_assistant_text(&mut self, message_id: String, text: &str) {
+        if !self.assistant_buffers.contains_key(&message_id) {
+            self.assistant_buffer_order.push(message_id.clone());
+        }
+        self.assistant_buffers
+            .entry(message_id.clone())
+            .or_default()
+            .push_str(text);
+        *self.assistant_message_bytes.entry(message_id).or_default() += text.len();
+        self.assistant_buffer_bytes += text.len();
+    }
+
+    fn assistant_message_bytes(&self, message_id: &str) -> usize {
+        self.assistant_message_bytes
+            .get(message_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn drain_assistant_buffers(&mut self) -> Vec<(String, String)> {
+        let ordered = std::mem::take(&mut self.assistant_buffer_order);
+        let mut drained = Vec::new();
+        for message_id in ordered {
+            if let Some(text) = self.assistant_buffers.remove(&message_id) {
+                drained.push((message_id, text));
+            }
+        }
+        for (message_id, text) in std::mem::take(&mut self.assistant_buffers) {
+            drained.push((message_id, text));
+        }
+        drained
+    }
+
     fn push_event(&mut self, event_type: impl Into<String>, payload: Option<Value>) {
         self.pending_events.push(BufferedTurnEvent {
             event_type: event_type.into(),
@@ -875,6 +910,8 @@ impl CaptureCoordinator {
                 effective_cwd: session.effective_cwd,
                 materialized: pending.materialized,
                 assistant_buffers: HashMap::new(),
+                assistant_buffer_order: Vec::new(),
+                assistant_message_bytes: HashMap::new(),
                 tool_spans: HashMap::new(),
                 structured_diff_keys: HashSet::new(),
                 pending_events: Vec::new(),
@@ -895,21 +932,7 @@ impl CaptureCoordinator {
                 active_turn.push_span_ended(&span_id, status, None);
             }
             self.flush_turn_events(active_turn)?;
-            for (message_id, text) in active_turn.assistant_buffers.drain() {
-                if !text.trim().is_empty() {
-                    db.add_lane_turn_message(&pending.turn_id, "assistant", &text)?;
-                    db.add_lane_turn_event(
-                        &pending.turn_id,
-                        "acp_agent_message_flushed",
-                        Some(redact_json(serde_json::json!({
-                            "protocol": "acp",
-                            "acp_message_id": message_id
-                        }))),
-                        None,
-                        None,
-                    )?;
-                }
-            }
+            self.flush_assistant_messages(active_turn, "prompt_completed")?;
         }
         if pending.materialized {
             let _ = db.record_lane_workdir_for_turn(
@@ -971,11 +994,7 @@ impl CaptureCoordinator {
                 let text = content_text(update.get("content"));
                 if !text.is_empty() {
                     let redaction_truncated = text.contains("\n[truncated]");
-                    let current_message_len = active
-                        .assistant_buffers
-                        .get(&key)
-                        .map(String::len)
-                        .unwrap_or(0);
+                    let current_message_len = active.assistant_message_bytes(&key);
                     let available_for_message =
                         ACP_MAX_ASSISTANT_MESSAGE_BYTES.saturating_sub(current_message_len);
                     let available_for_turn =
@@ -983,12 +1002,7 @@ impl CaptureCoordinator {
                     let allowed =
                         utf8_prefix_len(&text, available_for_message.min(available_for_turn));
                     if allowed > 0 {
-                        active
-                            .assistant_buffers
-                            .entry(key)
-                            .or_default()
-                            .push_str(&text[..allowed]);
-                        active.assistant_buffer_bytes += allowed;
+                        active.append_assistant_text(key, &text[..allowed]);
                     }
                     if redaction_truncated || allowed < text.len() {
                         active.push_truncation_event("assistant message buffer limit exceeded");
@@ -999,6 +1013,8 @@ impl CaptureCoordinator {
             "tool_call" => self.capture_tool_call_start(&mut active, update),
             "tool_call_update" => self.capture_tool_call_update(&mut active, update),
             "plan" => {
+                self.flush_turn_events(&mut active)?;
+                self.flush_assistant_messages(&mut active, "before_plan_update")?;
                 active.push_event(
                     "plan_update",
                     Some(redact_json(Value::Object(update.clone()))),
@@ -1007,6 +1023,8 @@ impl CaptureCoordinator {
             }
             kind if ignore_session_update(kind) => Ok(()),
             "available_commands_update" => {
+                self.flush_turn_events(&mut active)?;
+                self.flush_assistant_messages(&mut active, "before_available_commands_update")?;
                 active.push_event(
                     "acp_available_commands_update",
                     Some(summarize_available_commands(update)),
@@ -1014,6 +1032,8 @@ impl CaptureCoordinator {
                 Ok(())
             }
             _ => {
+                self.flush_turn_events(&mut active)?;
+                self.flush_assistant_messages(&mut active, "before_session_update")?;
                 active.push_event(
                     &format!("acp_{update_kind}"),
                     Some(redact_json(Value::Object(update.clone()))),
@@ -1074,6 +1094,8 @@ impl CaptureCoordinator {
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or("ACP tool call");
+        self.flush_turn_events(active)?;
+        self.flush_assistant_messages(active, "before_tool_call")?;
         active.push_event(
             "tool_call",
             Some(redact_json(Value::Object(update.clone()))),
@@ -1098,6 +1120,8 @@ impl CaptureCoordinator {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("updated");
+        self.flush_turn_events(active)?;
+        self.flush_assistant_messages(active, "before_tool_call_update")?;
         active.push_event(
             "tool_call_update",
             Some(redact_json(Value::Object(update.clone()))),
@@ -1132,6 +1156,32 @@ impl CaptureCoordinator {
             .collect::<Vec<_>>();
         let mut db = self.open_db()?;
         db.add_lane_turn_events_batch(&active.turn_id, events)?;
+        Ok(())
+    }
+
+    fn flush_assistant_messages(&self, active: &mut ActiveTurn, reason: &str) -> Result<()> {
+        let messages = active.drain_assistant_buffers();
+        if messages.iter().all(|(_, text)| text.trim().is_empty()) {
+            return Ok(());
+        }
+        let mut db = self.open_db()?;
+        for (message_id, text) in messages {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let report = db.add_lane_turn_message(&active.turn_id, "assistant", &text)?;
+            db.add_lane_turn_event(
+                &active.turn_id,
+                "acp_agent_message_flushed",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "acp_message_id": message_id,
+                    "reason": reason
+                }))),
+                None,
+                Some(&report.message_id.0),
+            )?;
+        }
         Ok(())
     }
 
@@ -1185,6 +1235,7 @@ impl CaptureCoordinator {
             {
                 let turn_id = active.turn_id.clone();
                 self.flush_turn_events(&mut active)?;
+                self.flush_assistant_messages(&mut active, "before_permission_request")?;
                 self.active_turns.insert(acp_session_id.to_string(), active);
                 Some(turn_id)
             } else {
@@ -1223,6 +1274,8 @@ impl CaptureCoordinator {
         let Some(mut active) = self.active_turns.remove(acp_session_id) else {
             return Ok(());
         };
+        self.flush_turn_events(&mut active)?;
+        self.flush_assistant_messages(&mut active, "before_cancel")?;
         active.push_event(
             "acp_prompt_cancel_requested",
             Some(redact_json(serde_json::json!({
@@ -1280,12 +1333,13 @@ impl CaptureCoordinator {
             return Ok(());
         }
         let active_turns = std::mem::take(&mut self.active_turns);
-        let mut db = self.open_db()?;
         for (acp_session_id, mut active) in active_turns {
             let open_spans = active.tool_spans.drain().collect::<Vec<_>>();
             for (_, span_id) in open_spans {
                 active.push_span_ended(&span_id, status, None);
             }
+            self.flush_turn_events(&mut active)?;
+            self.flush_assistant_messages(&mut active, reason)?;
             active.push_event(
                 "acp_relay_turn_closed",
                 Some(redact_json(serde_json::json!({
@@ -1296,22 +1350,7 @@ impl CaptureCoordinator {
                 }))),
             );
             self.flush_turn_events(&mut active)?;
-            for (message_id, text) in active.assistant_buffers.drain() {
-                if !text.trim().is_empty() {
-                    db.add_lane_turn_message(&active.turn_id, "assistant", &text)?;
-                    db.add_lane_turn_event(
-                        &active.turn_id,
-                        "acp_agent_message_flushed",
-                        Some(redact_json(serde_json::json!({
-                            "protocol": "acp",
-                            "acp_message_id": message_id,
-                            "reason": reason
-                        }))),
-                        None,
-                        None,
-                    )?;
-                }
-            }
+            let mut db = self.open_db()?;
             if active.materialized {
                 let _ = db.record_lane_workdir_for_turn(
                     &active.lane_name,

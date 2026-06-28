@@ -83,6 +83,11 @@ pub(super) fn lane_paths() -> Value {
                 openapi_path_param("lane_or_id", "string")
             ], Some("SyncWorkdirRequest"), true)
         },
+        "/v1/lanes/{lane_or_id}/hydrate": {
+            "post": openapi_operation("laneHydrateWorkdir", "Hydrate lane workdir paths", "Hydrate selected paths into a sparse lane workdir before editing.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("SyncWorkdirRequest"), true)
+        },
         "/v1/lanes/{lane_or_id}/record": {
             "post": openapi_operation_with_response_schema("laneRecordWorkdir", "Record lane workdir", "Record materialized lane workdir changes into the lane branch, or return a non-mutating preview when preview=true.", vec![
                 openapi_path_param("lane_or_id", "string")

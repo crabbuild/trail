@@ -12,6 +12,7 @@ pub(super) fn tools() -> Value {
                 "name": { "type": "string" },
                 "from_ref": { "type": "string" },
                 "materialize": { "type": "boolean" },
+                "workdir_mode": { "type": "string", "enum": ["virtual", "sparse", "full-cow", "overlay-cow"] },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
                 "paths": { "type": "array", "items": { "type": "string" } },
@@ -20,6 +21,18 @@ pub(super) fn tools() -> Value {
                 "provider": { "type": "string" },
                 "model": { "type": "string" }
             }), vec!["name"])
+        },
+        {
+            "name": "crabdb.lane_hydrate",
+            "title": "Hydrate Lane Workdir Paths",
+            "description": "Hydrate selected paths into a sparse lane workdir before filesystem edits.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                "force": { "type": "boolean" },
+                "include_neighbors": { "type": "boolean" },
+                "include_neighborhood": { "type": "boolean" }
+            }), vec!["lane", "paths"])
         },
         {
             "name": "crabdb.lane_claim",

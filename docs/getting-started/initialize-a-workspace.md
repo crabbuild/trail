@@ -48,9 +48,17 @@ Supported policies are:
 
 The policy writes concrete config values such as `text.opaque_text_max_bytes`, `text.max_line_bytes`, and `text.preserve_similarity`.
 
+## Choose a Prolly Storage Backend
+
+```sh
+crabdb init --working-tree --prolly-backend slatedb
+```
+
+The default backend is `sqlite`. `slatedb` stores Prolly tree nodes in SlateDB backed by the configured S3-compatible object store. The default local development settings use `http://localhost:9000`, bucket `crab`, and credentials `crab`/`crab`; inspect them with `crabdb config get storage.slatedb_s3_endpoint` or `crabdb config list`.
+
 ## Files Created
 
-Initialization creates CrabDB state under `.crabdb`, including SQLite storage under `.crabdb/index/crabdb.sqlite`, ref files, config, and default ignore rules. It also creates `.crabignore` when needed.
+Initialization creates CrabDB state under `.crabdb`, including SQLite metadata storage under `.crabdb/index/crabdb.sqlite`, ref files, config, and default ignore rules. It also creates `.crabignore` when needed. With the SlateDB backend, Prolly tree nodes are stored outside SQLite under a workspace-scoped object-store path.
 
 Default `.crabignore` patterns include `.crabdb/`, `.git/`, `.env`, `.env.*`, private key file extensions, `node_modules/`, `target/`, `dist/`, `build/`, and `coverage/`.
 
@@ -61,4 +69,3 @@ Default `.crabignore` patterns include `.crabdb/`, `.git/`, `.env`, `.env.*`, pr
 - Text policy: `crates/crabdb/src/db/util/config/policy.rs`
 - Default ignore patterns: `crates/crabdb/src/db/mod.rs`
 - Tests: `init_record_why_and_fsck_work`, `init_text_policy_sets_text_tracking_thresholds`
-

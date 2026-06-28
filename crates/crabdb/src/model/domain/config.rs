@@ -13,6 +13,8 @@ pub struct CrabConfig {
     pub text: TextConfig,
     pub lane: LaneConfig,
     pub git: GitConfig,
+    #[serde(default = "default_storage_config")]
+    pub storage: StorageConfig,
     #[serde(default = "default_guardrails_config")]
     pub guardrails: GuardrailsConfig,
 }
@@ -74,8 +76,73 @@ pub struct GitConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_prolly_backend")]
+    pub prolly_backend: String,
+    #[serde(default = "default_slatedb_path")]
+    pub slatedb_path: String,
+    #[serde(default = "default_slatedb_s3_endpoint")]
+    pub slatedb_s3_endpoint: String,
+    #[serde(default = "default_slatedb_s3_bucket")]
+    pub slatedb_s3_bucket: String,
+    #[serde(default = "default_slatedb_s3_region")]
+    pub slatedb_s3_region: String,
+    #[serde(default = "default_slatedb_s3_access_key_id")]
+    pub slatedb_s3_access_key_id: String,
+    #[serde(default = "default_slatedb_s3_secret_access_key")]
+    pub slatedb_s3_secret_access_key: String,
+    #[serde(default = "default_slatedb_s3_allow_http")]
+    pub slatedb_s3_allow_http: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GuardrailsConfig {
     pub policy: String,
+}
+
+fn default_storage_config() -> StorageConfig {
+    StorageConfig {
+        prolly_backend: default_prolly_backend(),
+        slatedb_path: default_slatedb_path(),
+        slatedb_s3_endpoint: default_slatedb_s3_endpoint(),
+        slatedb_s3_bucket: default_slatedb_s3_bucket(),
+        slatedb_s3_region: default_slatedb_s3_region(),
+        slatedb_s3_access_key_id: default_slatedb_s3_access_key_id(),
+        slatedb_s3_secret_access_key: default_slatedb_s3_secret_access_key(),
+        slatedb_s3_allow_http: default_slatedb_s3_allow_http(),
+    }
+}
+
+fn default_prolly_backend() -> String {
+    "sqlite".to_string()
+}
+
+fn default_slatedb_path() -> String {
+    "crabdb/prolly".to_string()
+}
+
+fn default_slatedb_s3_endpoint() -> String {
+    "http://localhost:9000".to_string()
+}
+
+fn default_slatedb_s3_bucket() -> String {
+    "crab".to_string()
+}
+
+fn default_slatedb_s3_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_slatedb_s3_access_key_id() -> String {
+    "crab".to_string()
+}
+
+fn default_slatedb_s3_secret_access_key() -> String {
+    "crab".to_string()
+}
+
+fn default_slatedb_s3_allow_http() -> bool {
+    true
 }
 
 fn default_guardrails_config() -> GuardrailsConfig {
@@ -207,6 +274,7 @@ impl CrabConfig {
             git: GitConfig {
                 export_trailers: true,
             },
+            storage: default_storage_config(),
             guardrails: default_guardrails_config(),
         }
     }

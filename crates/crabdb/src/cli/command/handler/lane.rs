@@ -9,18 +9,18 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
     match lane.command {
         LaneSubcommand::Spawn(args) => {
             let mut db = open_db(ctx)?;
-            let materialize = if args.no_materialize {
-                false
-            } else if args.workdir.is_some() || !args.paths.is_empty() {
-                args.materialize.unwrap_or(true)
-            } else {
-                args.materialize
-                    .unwrap_or(db.default_lane_materialize_for_ref(args.from.as_deref())?)
-            };
-            let report = db.spawn_lane_with_workdir_paths_and_neighbors(
+            let workdir_mode = db.resolve_lane_spawn_workdir_mode(
+                args.from.as_deref(),
+                args.workdir_mode.as_deref(),
+                args.materialize,
+                args.no_materialize,
+                args.workdir.is_some(),
+                &args.paths,
+            )?;
+            let report = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 &args.name,
                 args.from.as_deref(),
-                materialize,
+                workdir_mode,
                 args.provider,
                 args.model,
                 args.workdir,
@@ -142,6 +142,16 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.include_neighbors,
             )?;
             render_lane_file_read(&report, ctx.json, ctx.quiet)
+        }
+        LaneSubcommand::Hydrate(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.sync_lane_workdir_with_paths_and_neighbors(
+                &args.name,
+                args.force,
+                &args.paths,
+                args.include_neighbors,
+            )?;
+            render_lane_workdir_sync(&report, ctx.json, ctx.quiet)
         }
         LaneSubcommand::Workdir(args) => {
             let db = open_db(ctx)?;

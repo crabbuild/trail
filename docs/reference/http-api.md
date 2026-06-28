@@ -101,6 +101,7 @@ x-crabdb-token: <token>
 | GET | `/v1/lanes/{lane_or_id}/workdir` | Workdir path. |
 | GET | `/v1/lanes/{lane_or_id}/diff` | Lane branch diff. |
 | POST | `/v1/lanes/{lane_or_id}/read-file` | Read lane file. |
+| POST | `/v1/lanes/{lane_or_id}/hydrate` | Hydrate sparse workdir paths. |
 | POST | `/v1/lanes/{lane_or_id}/sync-workdir` | Sync workdir. |
 | POST | `/v1/lanes/{lane_or_id}/record` | Record lane workdir. |
 | POST | `/v1/lanes/{lane_or_id}/rewind` | Rewind lane branch. |
@@ -115,6 +116,16 @@ one non-empty array, not both.
 resolve the workspace default branch. It reports the target branch/ref, target
 change, lane base change, `operations_behind`, and whether the lane base is
 stale.
+
+`POST /v1/lanes` accepts `workdir_mode` values `virtual`, `sparse`,
+`full-cow`, and `overlay-cow`. `virtual` creates no workdir, `sparse` requires
+`paths`, and `full-cow` creates a full materialized workdir using filesystem
+clone COW when available. `overlay-cow` is reserved and currently returns an
+unavailable-backend error. The response includes `workdir_mode`, `cow_backend`,
+`sparse_paths`, and `overlay_available`.
+
+`POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
+`sync-workdir`, but requires at least one `paths` entry.
 
 `POST /v1/lanes/{lane_or_id}/sync-workdir` returns `rescue_workdir` when
 `force=true` overwrites dirty materialized workdir files or replaces a

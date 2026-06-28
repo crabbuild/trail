@@ -26,16 +26,18 @@ pub(super) fn handle_lane_resources(
 
     if request.method == "POST" && path == "/v1/lanes" {
         let body: SpawnLaneRequest = serde_json::from_slice(&request.body)?;
-        let materialize = if body.workdir.is_some() || !body.paths.is_empty() {
-            body.materialize.unwrap_or(true)
-        } else {
-            body.materialize
-                .unwrap_or(db.default_lane_materialize_for_ref(body.from.as_deref())?)
-        };
-        let report = db.spawn_lane_with_workdir_paths_and_neighbors(
+        let workdir_mode = db.resolve_lane_spawn_workdir_mode(
+            body.from.as_deref(),
+            body.workdir_mode.as_deref(),
+            body.materialize,
+            false,
+            body.workdir.is_some(),
+            &body.paths,
+        )?;
+        let report = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             &body.name,
             body.from.as_deref(),
-            materialize,
+            workdir_mode,
             body.provider,
             body.model,
             body.workdir.map(PathBuf::from),
@@ -147,6 +149,28 @@ pub(super) fn handle_lane_resources(
             return Ok(Some(json_response(200, "OK", &report)?));
         }
         let report = db.record_lane_workdir(&lane, body.message)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "hydrate"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: SyncWorkdirRequest = serde_json::from_slice(&request.body)?;
+        if body.paths.is_empty() {
+            return Err(Error::InvalidInput(
+                "lane hydrate requires at least one path".to_string(),
+            ));
+        }
+        let report = db.sync_lane_workdir_with_paths_and_neighbors(
+            &lane,
+            body.force,
+            &body.paths,
+            body.include_neighbors,
+        )?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

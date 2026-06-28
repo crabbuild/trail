@@ -28,7 +28,8 @@ export function redactString(value: string): string {
   return value
     .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"'`]+/gi, `$1${REDACTED}`)
     .replace(/((?:api[_-]?key|auth|cookie|credential|password|private[_-]?key|secret|session[_-]?token|token)\s*[:=]\s*)[^\s"'`,}]+/gi, `$1${REDACTED}`)
-    .replace(/(--?(?:api[-_]?key|auth|authorization|cookie|credential|password|private[-_]?key|secret|session[-_]?token|token)=)[^\s"'`]+/gi, `$1${REDACTED}`);
+    .replace(/(--?(?:api[-_]?key|auth|authorization|cookie|credential|password|private[-_]?key|secret|session[-_]?token|token)=)[^\s"'`]+/gi, `$1${REDACTED}`)
+    .replace(/(--?(?:api[-_]?key|auth|authorization|cookie|credential|password|private[-_]?key|secret|session[-_]?token|token)\s+)[^\s"'`]+/gi, `$1${REDACTED}`);
 }
 
 export function redactCommandArgs(args: unknown[]): unknown[] {

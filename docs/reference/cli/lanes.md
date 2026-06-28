@@ -3,7 +3,7 @@
 ## Lifecycle and Review
 
 ```text
-crabdb lane spawn <NAME> [--from <REF>] [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] [--provider <PROVIDER>] [--model <MODEL>]
+crabdb lane spawn <NAME> [--from <REF>] [--workdir-mode virtual|sparse|full-cow|overlay-cow] [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] [--provider <PROVIDER>] [--model <MODEL>]
 crabdb lane list
 crabdb lane show <NAME>
 crabdb lane status <NAME>
@@ -24,6 +24,14 @@ workdir records become a hard write boundary: writes, deletes, and both sides
 of renames must stay inside the selected paths. The sparse boundary is also
 persisted with the lane, so enforcement survives a missing workdir sparse
 manifest and can restore that manifest on the next valid sparse update.
+
+Workdir modes are explicit in JSON as `workdir_mode`. `virtual` creates no
+workdir and is the high-scale default, `sparse` materializes selected paths,
+and `full-cow` materializes the full root while attempting filesystem clone COW
+on supported filesystems. `overlay-cow` is reserved for a future transparent
+write-time COW backend and currently returns an unavailable-backend error.
+The older `--materialize`, `--no-materialize`, and `--paths` flags remain
+compatibility aliases.
 
 `lane status` reports branch changes, dirty materialized workdir state, queued
 merges, and `base_status`. When the lane's saved base is behind the workspace
@@ -60,10 +68,15 @@ recording. Read leases do not grant write permission under this policy.
 crabdb lane record <NAME> [-m <MESSAGE>] [--preview]
 crabdb lane watch <NAME> [-m <MESSAGE>] [--interval-secs <SECONDS>] [--debounce-ms <MS>] [--include-untracked] [--once]
 crabdb lane read <NAME> <PATH> [--hydrate] [--no-hydrate] [--force] [--include-neighbors]
+crabdb lane hydrate <NAME> <PATH>... [--force] [--include-neighbors]
 crabdb lane workdir <NAME>
 crabdb lane sync-workdir <NAME> [--force] [--paths <PATH>...] [--include-neighbors]
 crabdb lane checkout <NAME> [--force] [--dry-run] [--workdir <PATH>]
 ```
+
+`lane hydrate` is a path-scoped convenience command for sparse workdirs before
+filesystem edits. It uses the same safety and dirty-workdir checks as
+`lane sync-workdir --paths`.
 
 `lane sync-workdir --force` refuses no longer-dirty content as before, but when
 it overwrites dirty materialized workdir files or replaces a non-directory file

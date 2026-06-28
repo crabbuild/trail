@@ -1,5 +1,16 @@
 import * as vscode from "vscode";
-import type { AgentTask, AgentTaskStatus, MergeQueueEntry, TaskRepository } from "../crabdb/TaskRepository";
+import type { AgentTask, MergeQueueEntry, TaskRepository } from "../crabdb/TaskRepository";
+import {
+  buildEmptyTreePresentation,
+  buildGroupTreePresentation,
+  buildQueueItemTreePresentation,
+  buildTaskTreePresentation,
+  normalizeTreeStatus,
+  taskTreeGroupStatus,
+  type TaskTreeMode,
+  type TreeIconPresentation,
+  type TreeItemPresentation
+} from "./taskTreeModel";
 
 type TreeEntry = GroupEntry | QueueGroupEntry | TaskEntry | QueueItemEntry | EmptyEntry;
 
@@ -29,10 +40,9 @@ interface QueueItemEntry {
 
 interface EmptyEntry {
   type: "empty";
-  label: string;
+  mode: TaskTreeMode;
+  error?: string | undefined;
 }
-
-export type TaskTreeMode = "tasks" | "reviews" | "queue";
 
 export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
   private readonly changed = new vscode.EventEmitter<TreeEntry | undefined | null | void>();
@@ -66,47 +76,30 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
 
   getTreeItem(element: TreeEntry): vscode.TreeItem {
     if (element.type === "empty") {
-      const item = new vscode.TreeItem(element.label, vscode.TreeItemCollapsibleState.None);
-      item.iconPath = new vscode.ThemeIcon("info");
-      return item;
+      return treeItemFromPresentation(buildEmptyTreePresentation(element.mode, element.error));
     }
 
     if (element.type === "group") {
-      const item = new vscode.TreeItem(
-        `${element.label} (${element.tasks.length})`,
+      const item = treeItemFromPresentation(
+        buildGroupTreePresentation({ id: element.id, label: element.label, count: element.tasks.length, kind: "task" }),
         vscode.TreeItemCollapsibleState.Expanded
       );
-      item.iconPath = new vscode.ThemeIcon(groupIcon(element.id));
       return item;
     }
 
     if (element.type === "queueGroup") {
-      const item = new vscode.TreeItem(
-        `${element.label} (${element.entries.length})`,
+      const item = treeItemFromPresentation(
+        buildGroupTreePresentation({ id: element.id, label: element.label, count: element.entries.length, kind: "queue" }),
         vscode.TreeItemCollapsibleState.Expanded
       );
-      item.iconPath = new vscode.ThemeIcon(queueGroupIcon(element.id));
       return item;
     }
 
     if (element.type === "queueItem") {
       const entry = element.entry;
-      const item = new vscode.TreeItem(entry.sourceRef, vscode.TreeItemCollapsibleState.None);
+      const item = treeItemFromPresentation(buildQueueItemTreePresentation(entry));
       item.id = entry.id;
-      item.description = `-> ${entry.targetRef} priority ${entry.priority}`;
-      item.tooltip = [
-        `Queue: ${entry.id}`,
-        `Source: ${entry.sourceRef}`,
-        `Target: ${entry.targetRef}`,
-        `Status: ${entry.status}`,
-        `Priority: ${entry.priority}`,
-        entry.createdAt !== undefined ? `Created: ${formatQueueTime(entry.createdAt)}` : undefined,
-        entry.updatedAt !== undefined ? `Updated: ${formatQueueTime(entry.updatedAt)}` : undefined
-      ]
-        .filter(Boolean)
-        .join("\n");
       item.contextValue = "crabdbQueueEntry";
-      item.iconPath = new vscode.ThemeIcon(queueStatusIcon(entry.status));
       item.command = {
         command: "crabdb.explainQueueEntry",
         title: "Explain Merge Queue Entry",
@@ -116,24 +109,9 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
     }
 
     const task = element.task;
-    const item = new vscode.TreeItem(task.title, vscode.TreeItemCollapsibleState.None);
-    const coordination = task.coordination;
-    const coordinationLabels = coordination?.labels.slice(0, 3) ?? [];
+    const item = treeItemFromPresentation(buildTaskTreePresentation(task, this.mode === "reviews" ? "reviews" : "tasks"));
     item.id = task.id;
-    item.description = [task.provider, task.lane, ...coordinationLabels].filter(Boolean).join(" ");
-    item.tooltip = [
-      task.title,
-      `Lane: ${task.lane}`,
-      `Status: ${task.status}`,
-      task.changedPaths.length ? `Changed paths: ${task.changedPaths.length}` : undefined,
-      coordination?.labels.length ? `Coordination: ${coordination.labels.join(", ")}` : undefined,
-      ...(coordination?.issues.slice(0, 5).map((issue) => `${issue.tone}: ${issue.message}`) ?? []),
-      task.nextAction
-    ]
-      .filter(Boolean)
-      .join("\n");
     item.contextValue = "crabdbTask";
-    item.iconPath = new vscode.ThemeIcon(statusIcon(task.status, coordination?.severity));
     item.command = {
       command: "crabdb.openAgentChat",
       title: "Open Agent Chat",
@@ -156,34 +134,36 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
     }
 
     if (this.error) {
-      return [{ type: "empty", label: this.error }];
+      return [{ type: "empty", mode: this.mode, error: this.error }];
     }
 
     const groups = this.mode === "queue" ? this.queueGroupsForMode() : this.groupsForMode();
     if (groups.length === 0) {
-      return [{ type: "empty", label: emptyLabel(this.mode) }];
+      return [{ type: "empty", mode: this.mode }];
     }
     return groups;
   }
 
   private groupsForMode(): GroupEntry[] {
     const filtered = this.tasks.filter((task) => {
+      const groupStatus = taskTreeGroupStatus(task);
       if (this.mode === "reviews") {
-        return ["ready", "dirty", "blocked", "conflicted"].includes(normalizeStatus(task.status));
+        return ["ready", "dirty", "blocked", "conflicted", "attention"].includes(groupStatus);
       }
       if (this.mode === "queue") {
-        return ["ready", "conflicted", "blocked"].includes(normalizeStatus(task.status));
+        return ["ready", "conflicted", "blocked"].includes(groupStatus);
       }
-      return normalizeStatus(task.status) !== "empty";
+      return groupStatus !== "empty";
     });
 
     const order: Array<[string, string, (task: AgentTask) => boolean]> = [
-      ["blocked", "Waiting for permission", (task) => normalizeStatus(task.status) === "blocked"],
-      ["conflicted", "Conflicted", (task) => normalizeStatus(task.status) === "conflicted"],
-      ["dirty", "Needs checkpoint", (task) => normalizeStatus(task.status) === "dirty"],
-      ["ready", "Ready to review", (task) => normalizeStatus(task.status) === "ready"],
-      ["active", "Running", (task) => normalizeStatus(task.status) === "active"],
-      ["applied", "Applied", (task) => normalizeStatus(task.status) === "applied"]
+      ["blocked", "Blocked", (task) => taskTreeGroupStatus(task) === "blocked"],
+      ["conflicted", "Conflicted", (task) => taskTreeGroupStatus(task) === "conflicted"],
+      ["attention", "Needs attention", (task) => taskTreeGroupStatus(task) === "attention"],
+      ["dirty", "Needs checkpoint", (task) => taskTreeGroupStatus(task) === "dirty"],
+      ["ready", "Ready to review", (task) => taskTreeGroupStatus(task) === "ready"],
+      ["active", "Running", (task) => taskTreeGroupStatus(task) === "active"],
+      ["applied", "Applied", (task) => taskTreeGroupStatus(task) === "applied"]
     ];
 
     return order
@@ -198,12 +178,12 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
 
   private queueGroupsForMode(): QueueGroupEntry[] {
     const order: Array<[string, string, (entry: MergeQueueEntry) => boolean]> = [
-      ["running", "Running", (entry) => normalizeStatus(entry.status) === "running"],
-      ["queued", "Queued", (entry) => normalizeStatus(entry.status) === "queued"],
-      ["conflicted", "Conflicted", (entry) => normalizeStatus(entry.status) === "conflicted"],
-      ["failed", "Failed", (entry) => normalizeStatus(entry.status) === "failed"],
-      ["merged", "Merged", (entry) => normalizeStatus(entry.status) === "merged"],
-      ["cancelled", "Cancelled", (entry) => normalizeStatus(entry.status) === "cancelled"]
+      ["running", "Running", (entry) => normalizeTreeStatus(entry.status) === "running"],
+      ["queued", "Queued", (entry) => normalizeTreeStatus(entry.status) === "queued"],
+      ["conflicted", "Conflicted", (entry) => normalizeTreeStatus(entry.status) === "conflicted"],
+      ["failed", "Failed", (entry) => normalizeTreeStatus(entry.status) === "failed"],
+      ["merged", "Merged", (entry) => normalizeTreeStatus(entry.status) === "merged"],
+      ["cancelled", "Cancelled", (entry) => normalizeTreeStatus(entry.status) === "cancelled"]
     ];
     const known = new Set(order.map(([id]) => id));
     const groups = order
@@ -214,7 +194,7 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
         entries: this.queueEntries.filter(predicate)
       }))
       .filter((group) => group.entries.length > 0);
-    const other = this.queueEntries.filter((entry) => !known.has(normalizeStatus(entry.status)));
+    const other = this.queueEntries.filter((entry) => !known.has(normalizeTreeStatus(entry.status)));
     if (other.length) {
       groups.push({
         type: "queueGroup",
@@ -227,101 +207,29 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
   }
 }
 
-function normalizeStatus(status: AgentTaskStatus): string {
-  return String(status).toLowerCase();
+function treeItemFromPresentation(
+  presentation: TreeItemPresentation,
+  collapsibleState = vscode.TreeItemCollapsibleState.None
+): vscode.TreeItem {
+  const item = new vscode.TreeItem(presentation.label, collapsibleState);
+  const description = presentation.description;
+  if (description !== undefined) {
+    item.description = description;
+  }
+  item.tooltip = presentation.tooltip;
+  item.iconPath = themeIcon(presentation.icon);
+  item.accessibilityInformation = {
+    label: presentation.accessibilityLabel
+  };
+  if (presentation.command) {
+    item.command = {
+      command: presentation.command.command,
+      title: presentation.command.title
+    };
+  }
+  return item;
 }
 
-function statusIcon(status: AgentTaskStatus, coordinationSeverity: string = "ok"): string {
-  if (coordinationSeverity === "blocked") {
-    return "warning";
-  }
-  if (coordinationSeverity === "warning") {
-    return "issues";
-  }
-  switch (normalizeStatus(status)) {
-    case "ready":
-      return "pass";
-    case "dirty":
-      return "circle-filled";
-    case "blocked":
-      return "warning";
-    case "conflicted":
-      return "error";
-    case "applied":
-      return "check";
-    case "active":
-      return "sync~spin";
-    default:
-      return "circle-outline";
-  }
-}
-
-function groupIcon(group: string): string {
-  switch (group) {
-    case "ready":
-      return "checklist";
-    case "blocked":
-      return "lock";
-    case "conflicted":
-      return "warning";
-    case "applied":
-      return "verified";
-    default:
-      return "list-tree";
-  }
-}
-
-function queueGroupIcon(group: string): string {
-  switch (group) {
-    case "running":
-      return "sync~spin";
-    case "queued":
-      return "git-merge";
-    case "conflicted":
-      return "warning";
-    case "failed":
-      return "error";
-    case "merged":
-      return "pass";
-    case "cancelled":
-      return "circle-slash";
-    default:
-      return "list-tree";
-  }
-}
-
-function queueStatusIcon(status: string): string {
-  switch (normalizeStatus(status)) {
-    case "running":
-      return "sync~spin";
-    case "queued":
-      return "git-merge";
-    case "conflicted":
-      return "warning";
-    case "failed":
-      return "error";
-    case "merged":
-      return "pass";
-    case "cancelled":
-      return "circle-slash";
-    default:
-      return "circle-outline";
-  }
-}
-
-function formatQueueTime(value: number | string): string {
-  if (typeof value === "number") {
-    return new Date(value * 1000).toLocaleString();
-  }
-  return value;
-}
-
-function emptyLabel(mode: TaskTreeMode): string {
-  if (mode === "reviews") {
-    return "No agent tasks need review.";
-  }
-  if (mode === "queue") {
-    return "No merge queue entries.";
-  }
-  return "No agent tasks yet.";
+function themeIcon(icon: TreeIconPresentation): vscode.ThemeIcon {
+  return icon.color ? new vscode.ThemeIcon(icon.id, new vscode.ThemeColor(icon.color)) : new vscode.ThemeIcon(icon.id);
 }

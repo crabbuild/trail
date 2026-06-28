@@ -362,7 +362,7 @@ commands after the binary is installed:
 
 ```sh
 crabdb agent doctor --provider claude-code
-crabdb agent setup --provider claude-code --editor vscode
+crabdb agent setup
 ```
 
 For a project-local install directory, override `PREFIX`:
@@ -587,13 +587,14 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
 | `crabdb ignore check <path>` | Check whether ignore policy records or skips a path |
 | `crabdb guardrails check --action <action>` | Preflight a risky action against workspace policy |
-| `crabdb agent setup --provider claude-code --editor vscode` | Print editor config for fresh CrabDB agent tasks |
+| `crabdb agent setup` | Print editor config for fresh CrabDB agent tasks |
 | `crabdb agent continue latest` | Start a fresh follow-up task from the latest task checkpoint |
 | `crabdb agent` | Open the agent inbox home view with grouped tasks, review-first hints, and one next action |
 | `crabdb agent board` | Show a multi-agent board with low-noise columns and one next action |
 | `crabdb agent ask show agent board` | Route a plain-language question to the multi-agent board |
 | `crabdb agent ask what needs attention` | Route a plain-language question to the inbox home view |
 | `crabdb agent ask what changed` | Route a plain-language question to the right task view |
+| `crabdb agent ask show actions` | Route a plain-language question to the action palette |
 | `crabdb agent ask last prompt` | Route a plain-language question to the latest prompt turn |
 | `crabdb agent ask what changed in the last prompt` | Route a plain-language question to the newest prompt delta |
 | `crabdb agent ask what changed in README.md in the last prompt` | Route a plain-language question to a file-scoped prompt delta |
@@ -616,6 +617,8 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb agent status` | Show the latest agent task, risk, and next useful action |
 | `crabdb agent dashboard latest` | Show one compact task board with next action, focus, validation, and apply readiness |
 | `crabdb agent review-data latest` | Show one structured review packet for editor panels and integrations |
+| `crabdb agent action` | Show runnable review actions for the latest task |
+| `crabdb agent action inspect_focus_file` | Run one published review action for the latest task |
 | `crabdb agent review-flow latest` | Walk review, validation, and finish as one guided checklist |
 | `crabdb agent walkthrough latest` | Friendly alias for the guided review checklist |
 | `crabdb agent brief latest` | Show a compact task brief with risk, next action, changes, and tools |
@@ -737,9 +740,12 @@ exact directory where the agent edited files.
 Configure an ACP editor once:
 
 ```sh
-crabdb agent setup --provider claude-code --editor vscode
+crabdb agent setup
 ```
 
+`agent setup` defaults to Claude Code plus VS Code, the lowest-friction tested
+path. Use `--editor zed` or `--editor generic` when you want another snippet.
+It prints the editor snippet plus the next verification and review commands.
 Paste the printed snippet into the editor's ACP custom-agent settings. After one
 prompt, ask CrabDB what needs attention:
 
@@ -761,6 +767,14 @@ the current task state, prints one next command, shows a short setup/review/appl
 or recovery workflow, and keeps the public mental model to agent task, changes,
 apply, and recover.
 
+`crabdb agent --help` intentionally shows the common path first. Specialist
+inspection commands still exist, but the first screen points you toward
+`agent guide`, `agent ask ...`, `agent action`, `agent changes`, and safe
+`agent apply --dry-run` instead of making you choose from every low-level view.
+If no task exists yet, daily-path commands such as `agent view latest`,
+`agent changes latest`, and `agent apply latest --dry-run` return setup guidance
+and first-run actions instead of a dead-end error.
+
 ```sh
 crabdb agent
 crabdb agent board
@@ -778,6 +792,7 @@ crabdb agent ask what changed in the last prompt
 crabdb agent ask what changed in README.md in the last prompt
 crabdb agent ask show transcript
 crabdb agent ask show dashboard
+crabdb agent ask show actions
 crabdb agent ask what should I review
 crabdb agent ask what should I review first
 crabdb agent ask what file should I review first
@@ -916,14 +931,22 @@ draft a PR.
 `agent dashboard latest` is the compact daily-use board. It shows the one next
 action, review focus, open command, validation status, changed files, risk, and
 apply readiness without exposing lane, turn, or checkpoint ids unless you ask
-for JSON.
+for JSON. Human output also points to `agent action <task>`, the small command
+palette for review, validation, apply, and recovery actions.
 
 `agent review-data latest` is the editor-panel packet. It returns file review
 progress, focus file, review map, changes by file, confidence, validation, risk,
 apply readiness, and typed actions for side-panel buttons in one structured
 report. Actions include stable ids, safety classes, disabled reasons, optional
 MCP tool names and MCP arguments, so UI buttons do not need to parse shell
-commands. `agent cockpit latest` and `agent side-panel latest` are aliases.
+commands. Run `agent action` to list the available actions, `agent action <id>`
+to execute one for the latest task, `agent action <task> <id>` for a specific
+task, or add `--print` to show the exact command without running it.
+Before the first task exists, `agent action` shows runnable setup, doctor, and
+terminal-start actions instead of failing; for example,
+`crabdb agent action setup_vscode` prints the VS Code setup report.
+Confirmation-required actions still need `--confirm`. `agent cockpit latest`
+and `agent side-panel latest` are aliases.
 
 `agent validate latest` is the read-only validation guide. It shows the latest
 test/eval gates, whether more validation is needed, and suggested

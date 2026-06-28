@@ -12,7 +12,7 @@ getrandom.workspace = true
 hex.workspace = true
 ignore.workspace = true
 notify.workspace = true
-prolly = { path = "../prolly", features = ["sqlite"] }
+prolly = { path = "../prolly", features = ["slatedb", "sqlite"] }
 rayon.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
@@ -20,6 +20,7 @@ serde.workspace = true
 serde_cbor.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+slatedb.workspace = true
 similar.workspace = true
 thiserror.workspace = true
 toml.workspace = true
@@ -27,7 +28,12 @@ unicode-normalization.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+sqlite-vec.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "sqlite_vector_memory_bench"
+harness = false

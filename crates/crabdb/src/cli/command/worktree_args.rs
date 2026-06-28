@@ -12,6 +12,8 @@ pub(super) struct InitArgs {
     pub(super) branch: String,
     #[arg(long = "text-policy", value_enum)]
     pub(super) text_policy: Option<TextPolicyArg>,
+    #[arg(long = "prolly-backend", value_enum)]
+    pub(super) prolly_backend: Option<ProllyBackendArg>,
     #[arg(long)]
     pub(super) force: bool,
 }
@@ -29,6 +31,21 @@ impl TextPolicyArg {
             Self::Minimal => "minimal",
             Self::Balanced => "balanced",
             Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub(super) enum ProllyBackendArg {
+    Sqlite,
+    Slatedb,
+}
+
+impl ProllyBackendArg {
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Slatedb => "slatedb",
         }
     }
 }

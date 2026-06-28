@@ -56,6 +56,8 @@ pub(super) enum LaneSubcommand {
     Eval(LaneTestArgs),
     /// Read one file from a lane branch, lazily hydrating sparse workdirs by default.
     Read(LaneReadArgs),
+    /// Hydrate paths into a sparse lane workdir before editing.
+    Hydrate(LaneHydrateArgs),
     /// Print the resolved lane workdir path.
     Workdir(LaneWorkdirArgs),
     /// Re-sync lane workdir from the lane branch head.
@@ -93,6 +95,11 @@ pub(super) struct LaneSpawnArgs {
     pub(super) materialize: Option<bool>,
     #[arg(long = "no-materialize")]
     pub(super) no_materialize: bool,
+    #[arg(
+        long,
+        value_parser = ["virtual", "sparse", "full-cow", "overlay-cow"]
+    )]
+    pub(super) workdir_mode: Option<String>,
     #[arg(long)]
     pub(super) workdir: Option<PathBuf>,
     #[arg(long, num_args = 1.., conflicts_with = "no_materialize")]
@@ -256,6 +263,17 @@ pub(super) struct LaneReadArgs {
 #[derive(Args)]
 pub(super) struct LaneWorkdirArgs {
     pub(super) name: String,
+}
+
+#[derive(Args)]
+pub(super) struct LaneHydrateArgs {
+    pub(super) name: String,
+    #[arg(required = true)]
+    pub(super) paths: Vec<String>,
+    #[arg(long)]
+    pub(super) force: bool,
+    #[arg(long)]
+    pub(super) include_neighbors: bool,
 }
 
 #[derive(Args)]

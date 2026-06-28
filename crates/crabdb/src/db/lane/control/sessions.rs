@@ -190,6 +190,7 @@ impl CrabDb {
                     .messages
                     .into_iter()
                     .map(|message| TranscriptMessage {
+                        message_id: message.id,
                         role: message.role,
                         body: message.body,
                         created_at: message.created_at,

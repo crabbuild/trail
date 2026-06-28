@@ -70,6 +70,7 @@ fn crabdb_bin() -> PathBuf {
 struct StubAcpAgentOptions<'a> {
     session_id: &'a str,
     lane_workdir: Option<&'a Path>,
+    assistant_text_before_tool: Option<String>,
     assistant_text: String,
     write_text: Option<&'a str>,
     crash_after_update: bool,
@@ -84,6 +85,7 @@ impl<'a> StubAcpAgentOptions<'a> {
         Self {
             session_id,
             lane_workdir: None,
+            assistant_text_before_tool: None,
             assistant_text: "diagnostic complete".to_string(),
             write_text: Some("diagnostic complete"),
             crash_after_update: false,
@@ -109,6 +111,28 @@ fn write_stub_acp_agent(
     let write_dir = options
         .lane_workdir
         .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let assistant_before_tool = options
+        .assistant_text_before_tool
+        .as_ref()
+        .map(|text| {
+            let update = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": options.session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "msg_before_tool",
+                        "content": {
+                            "type": "text",
+                            "text": text
+                        }
+                    }
+                }
+            });
+            format!("printf '%s\\n' {}\n", shell_quote(&update.to_string()))
+        })
         .unwrap_or_default();
     let permission_request = if options.request_permission {
         format!(
@@ -158,6 +182,7 @@ fi
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"{}"}}}}'
 IFS= read -r prompt
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{}","update":{{"sessionUpdate":"available_commands_update","commands":[{{"name":"write_file","description":"diagnostic command"}}]}}}}}}'
+{}
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{}","update":{{"sessionUpdate":"tool_call","toolCallId":"tool_stub","title":"write README","kind":"edit","status":"pending"}}}}}}'
 {}
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{}","update":{{"sessionUpdate":"tool_call_update","toolCallId":"tool_stub","status":"completed"}}}}}}'
@@ -169,6 +194,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
             shell_quote(&write_dir),
             options.session_id,
             options.session_id,
+            assistant_before_tool,
             options.session_id,
             permission_request,
             options.session_id,
@@ -3721,6 +3747,76 @@ fn acp_relay_mirrors_permission_requests_to_approvals() {
 
 #[cfg(unix)]
 #[test]
+fn acp_relay_persists_assistant_messages_around_tool_events_in_order() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let output = run_stub_acp_relay_scenario(
+        temp.path(),
+        "acp-interleaved",
+        &["--assistant-before-tool", "Before tool."],
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "relay should preserve assistant/tool interleaving\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let view = run_crabdb_json(temp.path(), &["agent", "view", "acp-interleaved"]);
+    let turn = &view["transcript"]["turns"][0];
+    let messages = turn["messages"].as_array().unwrap();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect::<Vec<_>>();
+    let assistant_bodies = assistant_messages
+        .iter()
+        .map(|message| message["body"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_bodies,
+        vec!["Before tool.", "diagnostic complete"]
+    );
+
+    let first_assistant_id = assistant_messages[0]["message_id"].as_str().unwrap();
+    let second_assistant_id = assistant_messages[1]["message_id"].as_str().unwrap();
+    let events = turn["events"].as_array().unwrap();
+    let first_message_idx = events
+        .iter()
+        .position(|event| {
+            event["event_type"] == "message_added" && event["message_id"] == first_assistant_id
+        })
+        .unwrap();
+    let tool_call_idx = events
+        .iter()
+        .position(|event| event["event_type"] == "tool_call")
+        .unwrap();
+    let tool_update_idx = events
+        .iter()
+        .position(|event| event["event_type"] == "tool_call_update")
+        .unwrap();
+    let second_message_idx = events
+        .iter()
+        .position(|event| {
+            event["event_type"] == "message_added" && event["message_id"] == second_assistant_id
+        })
+        .unwrap();
+
+    assert!(
+        first_message_idx < tool_call_idx,
+        "assistant text before a tool should be recorded before the tool call"
+    );
+    assert!(
+        tool_update_idx < second_message_idx,
+        "assistant text after a tool should be recorded after the tool update"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn acp_relay_records_cancel_requests() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -3848,6 +3944,10 @@ fn run_stub_acp_relay_scenario_with_session_id(
             "--crash-after-update" => options.crash_after_update = true,
             "--malformed-after-update" => options.malformed_after_update = true,
             "--request-permission" => options.request_permission = true,
+            "--assistant-before-tool" => {
+                index += 1;
+                options.assistant_text_before_tool = Some(test_agent_args[index].to_string());
+            }
             "--sleep-before-result-ms" => {
                 index += 1;
                 options.sleep_before_result_ms = Some(test_agent_args[index].parse().unwrap());
@@ -9720,6 +9820,20 @@ fn lane_turn_cli_tracks_events_and_closeout() {
     );
     assert_eq!(event["event"]["event_type"], "tool_call");
     assert_eq!(event["event"]["payload"]["tool"], "cli.apply_patch");
+    let event_update = run_crabdb_json(
+        temp.path(),
+        &[
+            "lane",
+            "turn",
+            "event",
+            &turn_id,
+            "--event-type",
+            "tool_call_update",
+            "--payload-json",
+            r#"{"tool":"cli.apply_patch","status":"completed"}"#,
+        ],
+    );
+    assert_eq!(event_update["event"]["event_type"], "tool_call_update");
 
     let patch_path = temp.path().join("turn-patch.json");
     fs::write(
@@ -9753,6 +9867,24 @@ fn lane_turn_cli_tracks_events_and_closeout() {
         .unwrap()
         .iter()
         .any(|event| event["event_type"] == "tool_call"));
+    let event_types = details["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["event_type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let tool_call_index = event_types
+        .iter()
+        .position(|event_type| *event_type == "tool_call")
+        .unwrap();
+    let tool_update_index = event_types
+        .iter()
+        .position(|event_type| *event_type == "tool_call_update")
+        .unwrap();
+    assert!(
+        tool_call_index < tool_update_index,
+        "same-second turn events should retain insertion order"
+    );
     assert!(details["operations"]
         .as_array()
         .unwrap()
@@ -14441,6 +14573,16 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         .unwrap()
         .iter()
         .any(|entry| entry["key"] == "guardrails.policy"));
+    assert!(http_entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["key"] == "storage.prolly_backend"));
+    assert!(http_entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["key"] == "storage.slatedb_s3_endpoint"));
 
     let http_get = crabdb::server::handle_http_request(
         &mut db,
@@ -14549,6 +14691,22 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         .unwrap();
     assert_eq!(eval_suites_set.old_value, "");
     assert_eq!(eval_suites_set.new_value, "regression,safety");
+    let path_set = db
+        .config_set("storage.slatedb_path", "/custom/prolly/")
+        .unwrap();
+    assert_eq!(path_set.new_value, "custom/prolly");
+    let endpoint_set = db
+        .config_set("storage.slatedb_s3_endpoint", "http://localhost:9001/")
+        .unwrap();
+    assert_eq!(endpoint_set.new_value, "http://localhost:9001");
+    let bucket_set = db
+        .config_set("storage.slatedb_s3_bucket", "test-bucket")
+        .unwrap();
+    assert_eq!(bucket_set.new_value, "test-bucket");
+    let allow_http_set = db
+        .config_set("storage.slatedb_s3_allow_http", "no")
+        .unwrap();
+    assert_eq!(allow_http_set.new_value, "false");
     let allowed_shell = db
         .guardrail_check(
             None,
@@ -14603,9 +14761,27 @@ fn config_api_lists_sets_persists_and_validates_keys() {
         reopened.config().lane.required_eval_suites,
         vec!["regression".to_string(), "safety".to_string()]
     );
+    assert_eq!(reopened.config().storage.prolly_backend, "sqlite");
+    assert_eq!(reopened.config().storage.slatedb_path, "custom/prolly");
+    assert_eq!(
+        reopened.config().storage.slatedb_s3_endpoint,
+        "http://localhost:9001"
+    );
+    assert_eq!(reopened.config().storage.slatedb_s3_bucket, "test-bucket");
+    assert!(!reopened.config().storage.slatedb_s3_allow_http);
 
     let err = reopened
         .config_set("recording.ignore_gitignored", "sometimes")
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)));
+
+    let err = reopened
+        .config_set("storage.prolly_backend", "slatedb")
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)));
+
+    let err = reopened
+        .config_set("storage.slatedb_path", "///")
         .unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)));
 
@@ -17944,6 +18120,10 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         &["lane", "spawn", "default-bot", "--from", "main"],
     );
     assert!(default_spawn["workdir"].is_null());
+    assert_eq!(default_spawn["workdir_mode"], "virtual");
+    assert!(default_spawn["cow_backend"].is_null());
+    assert_eq!(default_spawn["sparse_paths"].as_array().unwrap().len(), 0);
+    assert_eq!(default_spawn["overlay_available"], false);
 
     let cli_workdir = workdir_parent.path().join("cli-bot");
     let cli_spawn = run_crabdb_json(
@@ -17958,6 +18138,8 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             cli_workdir.to_str().unwrap(),
         ],
     );
+    assert_eq!(cli_spawn["workdir_mode"], "full-cow");
+    assert_eq!(cli_spawn["cow_backend"], "filesystem-clone");
     assert_eq!(
         PathBuf::from(cli_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -17981,6 +18163,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         ],
     );
     assert!(headless_spawn["workdir"].is_null());
+    assert_eq!(headless_spawn["workdir_mode"], "virtual");
 
     let no_materialize_spawn = run_crabdb_json(
         temp.path(),
@@ -17994,6 +18177,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         ],
     );
     assert!(no_materialize_spawn["workdir"].is_null());
+    assert_eq!(no_materialize_spawn["workdir_mode"], "virtual");
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     assert_eq!(
@@ -18012,6 +18196,17 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             "--paths",
             "README.md",
         ],
+    );
+    assert_eq!(sparse_spawn["workdir_mode"], "sparse");
+    assert_eq!(sparse_spawn["cow_backend"], "filesystem-clone");
+    assert_eq!(
+        sparse_spawn["sparse_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["README.md"]
     );
     let sparse_workdir = PathBuf::from(sparse_spawn["workdir"].as_str().unwrap());
     assert!(sparse_workdir.join("README.md").is_file());
@@ -18057,6 +18252,12 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     );
     assert!(sparse_read["hydrated_paths"].is_null());
     assert!(!sparse_workdir.join("src/lib.rs").exists());
+    let sparse_hydrate = run_crabdb_json(
+        temp.path(),
+        &["lane", "hydrate", "sparse-bot", "src/lib.rs"],
+    );
+    assert_eq!(sparse_hydrate["forced"], false);
+    assert!(sparse_workdir.join("src/lib.rs").is_file());
     let sparse_read_hydrate = run_crabdb_json(
         temp.path(),
         &[
@@ -18294,13 +18495,14 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             serde_json::json!({
                 "name": "api-bot",
                 "from_ref": "main",
-                "materialize": true,
+                "workdir_mode": "full-cow",
                 "workdir": api_workdir
             }),
         ),
     );
     assert_eq!(api_response.status, 201);
     let api_spawn: serde_json::Value = api_response.body_json().unwrap();
+    assert_eq!(api_spawn["workdir_mode"], "full-cow");
     assert_eq!(
         PathBuf::from(api_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -18318,7 +18520,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             serde_json::json!({
                 "name": "api-sparse-bot",
                 "from_ref": "main",
-                "materialize": true,
+                "workdir_mode": "sparse",
                 "workdir": api_sparse_workdir,
                 "paths": ["README.md"]
             }),
@@ -18326,6 +18528,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     );
     assert_eq!(api_sparse_response.status, 201);
     let api_sparse_spawn: serde_json::Value = api_sparse_response.body_json().unwrap();
+    assert_eq!(api_sparse_spawn["workdir_mode"], "sparse");
     assert!(api_sparse_workdir.join("README.md").is_file());
     assert!(!api_sparse_workdir.join("src/lib.rs").exists());
     let api_sparse_lane = api_sparse_spawn["lane_id"].as_str().unwrap();
@@ -18411,7 +18614,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
                 "arguments": {
                     "name": "mcp-bot",
                     "from_ref": "main",
-                    "materialize": true,
+                    "workdir_mode": "full-cow",
                     "workdir": mcp_workdir
                 }
             }
@@ -18419,6 +18622,10 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     )
     .unwrap();
     assert_eq!(mcp_spawn["result"]["isError"], false);
+    assert_eq!(
+        mcp_spawn["result"]["structuredContent"]["workdir_mode"],
+        "full-cow"
+    );
     assert_eq!(
         PathBuf::from(
             mcp_spawn["result"]["structuredContent"]["workdir"]

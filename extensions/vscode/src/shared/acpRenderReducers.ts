@@ -28,6 +28,8 @@ import type {
   ToolNode
 } from "./renderModel";
 
+type AnonymousStreamNode = MessageNode | ThoughtNode;
+
 export interface AcpUpdateRenderer<TUpdate extends SessionUpdate = SessionUpdate> {
   match(update: SessionUpdate): update is TUpdate;
   reduce(update: TUpdate, context: RenderReduceContext): RenderPatch[];
@@ -83,17 +85,18 @@ export function reducePermissionRequest(
 export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]): RenderNode[] {
   let next = [...nodes];
   for (const patch of patches) {
-    if (patch.type === "append" && patch.node) {
-      next.push(patch.node);
+    const patchNode = patch.node ? normalizePatchNodeForTimeline(next, patch) : undefined;
+    if (patch.type === "append" && patchNode) {
+      next.push(patchNode);
       continue;
     }
-    if ((patch.type === "replace" || patch.type === "upsert") && patch.node) {
-      const index = next.findIndex((node) => node.id === patch.node?.id);
+    if ((patch.type === "replace" || patch.type === "upsert") && patchNode) {
+      const index = next.findIndex((node) => node.id === patchNode.id);
       if (index >= 0) {
         const existing = next[index];
-        next[index] = patch.type === "upsert" && existing ? mergeRenderNode(existing, patch.node) : patch.node;
+        next[index] = patch.type === "upsert" && existing ? mergeRenderNode(existing, patchNode) : patchNode;
       } else {
-        next.push(patch.node);
+        next.push(patchNode);
       }
       continue;
     }
@@ -102,6 +105,84 @@ export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]):
     }
   }
   return next;
+}
+
+function normalizePatchNodeForTimeline(nodes: RenderNode[], patch: RenderPatch): RenderNode | undefined {
+  const node = patch.node;
+  if (!node || patch.type !== "upsert" || !isAnonymousStreamNode(node)) {
+    return node;
+  }
+  const appendable = latestNodeInSameTurn(nodes, node);
+  if (appendable && canAppendAnonymousStreamNode(appendable, node)) {
+    return {
+      ...node,
+      id: appendable.id,
+      createdAt: appendable.createdAt,
+      acpMessageId: appendable.acpMessageId
+    };
+  }
+  return {
+    ...node,
+    id: nextAnonymousStreamNodeId(nodes, node)
+  };
+}
+
+function isAnonymousStreamNode(node: RenderNode): node is AnonymousStreamNode {
+  return isAnonymousMessageNode(node) || isAnonymousThoughtNode(node);
+}
+
+function isAnonymousMessageNode(node: RenderNode): node is MessageNode {
+  return node.kind === "message" && !node.acpMessageId && node.id.startsWith(`message:${node.role}:anonymous`);
+}
+
+function isAnonymousThoughtNode(node: RenderNode): node is ThoughtNode {
+  return (
+    node.kind === "thought" &&
+    !node.acpMessageId &&
+    (node.id === "thought:current" || node.id.startsWith("thought:anonymous"))
+  );
+}
+
+function canAppendAnonymousStreamNode(existing: RenderNode, incoming: AnonymousStreamNode): existing is AnonymousStreamNode {
+  if (incoming.kind === "message") {
+    return isAnonymousMessageNode(existing) && existing.role === incoming.role;
+  }
+  return isAnonymousThoughtNode(existing);
+}
+
+function latestNodeInSameTurn(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const candidate = nodes[index];
+    if (candidate && sameTimelineScope(candidate, node)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function sameTimelineScope(left: RenderNode, right: RenderNode): boolean {
+  return (
+    left.taskId === right.taskId &&
+    left.lane === right.lane &&
+    left.turnId === right.turnId &&
+    left.acpSessionId === right.acpSessionId &&
+    left.source === right.source
+  );
+}
+
+function nextAnonymousStreamNodeId(nodes: RenderNode[], node: AnonymousStreamNode): string {
+  const base = node.kind === "message" ? `message:${node.role}:anonymous` : "thought:anonymous";
+  const used = new Set(nodes.map((candidate) => candidate.id));
+  if (!used.has(base)) {
+    return base;
+  }
+  for (let sequence = 2; sequence < Number.MAX_SAFE_INTEGER; sequence += 1) {
+    const id = `${base}:${sequence}`;
+    if (!used.has(id)) {
+      return id;
+    }
+  }
+  return `${base}:${Date.now()}`;
 }
 
 export function sessionControlsToPatches(session: unknown, context: RenderReduceContext): RenderPatch[] {
@@ -180,9 +261,25 @@ function contentBlocksToText(blocks: ContentBlock[]): string {
   return blocks.map(contentToText).join("");
 }
 
+function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] {
+  const merged: ContentBlock[] = [];
+  for (const block of blocks) {
+    const previous = merged[merged.length - 1];
+    if (previous?.type === "text" && block.type === "text") {
+      merged[merged.length - 1] = {
+        ...previous,
+        text: `${previous.text}${block.text}`
+      };
+      continue;
+    }
+    merged.push(block);
+  }
+  return merged;
+}
+
 function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode {
   if (existing.kind === "message" && incoming.kind === "message") {
-    const content = [...existing.content, ...incoming.content];
+    const content = mergeAdjacentTextContentBlocks([...existing.content, ...incoming.content]);
     return {
       ...incoming,
       createdAt: existing.createdAt,
@@ -192,33 +289,93 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
     };
   }
   if (existing.kind === "thought" && incoming.kind === "thought") {
+    const content = mergeAdjacentTextContentBlocks([...existing.content, ...incoming.content]);
     return {
       ...incoming,
       createdAt: existing.createdAt,
-      content: [...existing.content, ...incoming.content]
+      content
+    };
+  }
+  if (existing.kind === "tool" && incoming.kind === "tool") {
+    const explicitStatus = hasExplicitToolStatus(incoming);
+    return {
+      ...incoming,
+      createdAt: existing.createdAt,
+      status: explicitStatus ? incoming.status : existing.status,
+      title: incoming.title && incoming.title !== "Tool call" ? incoming.title : existing.title,
+      toolKind: incoming.toolKind !== "other" ? incoming.toolKind : existing.toolKind,
+      toolStatus: explicitStatus ? incoming.toolStatus : existing.toolStatus,
+      locations: incoming.locations.length ? mergeToolLocations(existing.locations, incoming.locations) : existing.locations,
+      content: incoming.content.length ? mergeToolContent(existing.content, incoming.content) : existing.content,
+      rawInput: incoming.rawInput ?? existing.rawInput,
+      rawOutput: incoming.rawOutput ?? existing.rawOutput
     };
   }
   return incoming;
 }
 
+function hasExplicitToolStatus(node: ToolNode): boolean {
+  const raw = node.raw as Record<string, unknown> | undefined;
+  return typeof raw?.status === "string";
+}
+
+function mergeToolContent(existing: ToolCallContent[], incoming: ToolCallContent[]): ToolCallContent[] {
+  const seen = new Set(existing.map(stableContentKey));
+  const merged = [...existing];
+  for (const item of incoming) {
+    const key = stableContentKey(item);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function mergeToolLocations<TLocation extends { path: string; line?: number | null | undefined }>(
+  existing: TLocation[],
+  incoming: TLocation[]
+): TLocation[] {
+  const seen = new Set(existing.map((location) => `${location.path}:${location.line ?? ""}`));
+  const merged = [...existing];
+  for (const location of incoming) {
+    const key = `${location.path}:${location.line ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(location);
+  }
+  return merged;
+}
+
+function stableContentKey(content: ToolCallContent): string {
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
 const userMessageRenderer: AcpUpdateRenderer<UserMessageChunkUpdate> = {
   match: (update): update is UserMessageChunkUpdate => update.sessionUpdate === "user_message_chunk",
   reduce(update, context) {
-    return [messagePatch("user", update.messageId || "current", update.content, context, true)];
+    return [messagePatch("user", update.messageId || undefined, update.content, context, true)];
   }
 };
 
 const agentMessageRenderer: AcpUpdateRenderer<AgentMessageChunkUpdate> = {
   match: (update): update is AgentMessageChunkUpdate => update.sessionUpdate === "agent_message_chunk",
   reduce(update, context) {
-    return [messagePatch("assistant", update.messageId || "current", update.content, context, true)];
+    return [messagePatch("assistant", update.messageId || undefined, update.content, context, true)];
   }
 };
 
 const thoughtRenderer: AcpUpdateRenderer<AgentThoughtChunkUpdate> = {
   match: (update): update is AgentThoughtChunkUpdate => update.sessionUpdate === "agent_thought_chunk",
   reduce(update, context) {
-    const id = `thought:${update.messageId || "current"}`;
+    const id = `thought:${update.messageId || "anonymous"}`;
     const node: ThoughtNode = {
       id,
       kind: "thought",
@@ -230,6 +387,7 @@ const thoughtRenderer: AcpUpdateRenderer<AgentThoughtChunkUpdate> = {
       provider: context.provider,
       source: "acp-live",
       status: "in_progress",
+      createdAt: context.now(),
       updatedAt: context.now(),
       raw: update,
       content: [update.content],
@@ -279,11 +437,13 @@ const toolCallPatchRenderer: AcpUpdateRenderer<ToolCallPatchUpdate> = {
       sessionUpdate: "tool_call",
       toolCallId: update.toolCallId,
       title: update.title || "Tool call",
-      status: update.status || "in_progress",
       kind: update.kind || "other",
       locations: update.locations || [],
       content: update.content || []
     };
+    if (update.status) {
+      base.status = update.status;
+    }
     if (update.rawInput) {
       base.rawInput = update.rawInput;
     }
@@ -443,12 +603,12 @@ export const updateRenderers: AcpUpdateRenderer[] = [
 
 function messagePatch(
   role: "user" | "assistant",
-  messageId: string,
+  messageId: string | undefined,
   content: ContentBlock,
   context: RenderReduceContext,
   streaming: boolean
 ): RenderPatch {
-  const id = `message:${role}:${messageId}`;
+  const id = `message:${role}:${messageId || "anonymous"}`;
   const node: MessageNode = {
     id,
     kind: "message",
@@ -460,6 +620,7 @@ function messagePatch(
     provider: context.provider,
     source: "acp-live",
     status: streaming ? "in_progress" : "completed",
+    createdAt: context.now(),
     updatedAt: context.now(),
     raw: content,
     role,
@@ -603,8 +764,8 @@ function numberField(record: Record<string, unknown>, key: string): number | und
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function mapToolStatus(status: string | undefined): "pending" | "in_progress" | "completed" | "failed" {
-  if (status === "pending" || status === "completed" || status === "failed") {
+function mapToolStatus(status: string | undefined): "pending" | "in_progress" | "completed" | "failed" | "cancelled" {
+  if (status === "pending" || status === "completed" || status === "failed" || status === "cancelled") {
     return status;
   }
   return "in_progress";

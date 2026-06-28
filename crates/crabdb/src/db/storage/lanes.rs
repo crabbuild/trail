@@ -181,7 +181,7 @@ impl CrabDb {
     pub(crate) fn lane_session_events(&self, session_id: &str) -> Result<Vec<LaneEventRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, lane_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
-             FROM lane_events WHERE session_id = ?1 ORDER BY created_at ASC, event_id ASC",
+             FROM lane_events WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], lane_event_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -220,7 +220,7 @@ impl CrabDb {
     pub(crate) fn lane_turn_events(&self, turn_id: &str) -> Result<Vec<LaneEventRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT event_id, lane_id, session_id, turn_id, event_type, change_id, message_id, payload_json, created_at \
-             FROM lane_events WHERE turn_id = ?1 ORDER BY created_at ASC, event_id ASC",
+             FROM lane_events WHERE turn_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![turn_id], lane_event_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

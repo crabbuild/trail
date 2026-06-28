@@ -19,6 +19,48 @@ impl CrabDb {
         Ok(root.file_count <= LARGE_LANE_MATERIALIZE_FILE_THRESHOLD)
     }
 
+    pub fn resolve_lane_spawn_workdir_mode(
+        &self,
+        from: Option<&str>,
+        requested_mode: Option<&str>,
+        materialize: Option<bool>,
+        no_materialize: bool,
+        custom_workdir: bool,
+        sparse_paths: &[String],
+    ) -> Result<LaneWorkdirMode> {
+        let mode = if let Some(requested_mode) = requested_mode {
+            parse_lane_workdir_mode(requested_mode)?
+        } else if no_materialize || materialize == Some(false) {
+            LaneWorkdirMode::Virtual
+        } else if !sparse_paths.is_empty() {
+            LaneWorkdirMode::Sparse
+        } else if custom_workdir || materialize == Some(true) {
+            LaneWorkdirMode::FullCow
+        } else if self.default_lane_materialize_for_ref(from)? {
+            LaneWorkdirMode::FullCow
+        } else {
+            LaneWorkdirMode::Virtual
+        };
+
+        if no_materialize && mode != LaneWorkdirMode::Virtual {
+            return Err(Error::InvalidInput(
+                "--no-materialize requires workdir mode `virtual`".to_string(),
+            ));
+        }
+        if materialize == Some(false) && mode != LaneWorkdirMode::Virtual {
+            return Err(Error::InvalidInput(
+                "--materialize=false requires workdir mode `virtual`".to_string(),
+            ));
+        }
+        if materialize == Some(true) && mode == LaneWorkdirMode::Virtual {
+            return Err(Error::InvalidInput(
+                "--materialize=true cannot be combined with workdir mode `virtual`".to_string(),
+            ));
+        }
+        validate_lane_workdir_mode_request(&mode, custom_workdir, sparse_paths)?;
+        Ok(mode)
+    }
+
     pub fn spawn_lane(
         &mut self,
         name: &str,
@@ -75,18 +117,41 @@ impl CrabDb {
         sparse_paths: &[String],
         include_neighbors: bool,
     ) -> Result<LaneSpawnReport> {
+        let workdir_mode = if materialize {
+            if sparse_paths.is_empty() {
+                LaneWorkdirMode::FullCow
+            } else {
+                LaneWorkdirMode::Sparse
+            }
+        } else {
+            LaneWorkdirMode::Virtual
+        };
+        self.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            name,
+            from,
+            workdir_mode,
+            provider,
+            model,
+            workdir,
+            sparse_paths,
+            include_neighbors,
+        )
+    }
+
+    pub fn spawn_lane_with_workdir_mode_paths_and_neighbors(
+        &mut self,
+        name: &str,
+        from: Option<&str>,
+        workdir_mode: LaneWorkdirMode,
+        provider: Option<String>,
+        model: Option<String>,
+        workdir: Option<PathBuf>,
+        sparse_paths: &[String],
+        include_neighbors: bool,
+    ) -> Result<LaneSpawnReport> {
         let _lock = self.acquire_write_lock()?;
         validate_ref_segment(name)?;
-        if workdir.is_some() && !materialize {
-            return Err(Error::InvalidInput(
-                "custom lane workdir requires materialization to be enabled".to_string(),
-            ));
-        }
-        if !sparse_paths.is_empty() && !materialize {
-            return Err(Error::InvalidInput(
-                "sparse lane workdir paths require materialization to be enabled".to_string(),
-            ));
-        }
+        validate_lane_workdir_mode_request(&workdir_mode, workdir.is_some(), sparse_paths)?;
         let sparse_paths = normalize_record_paths(sparse_paths)?;
         let source = match from {
             Some(refish) => self.resolve_refish(refish)?,
@@ -97,7 +162,7 @@ impl CrabDb {
         if self.try_get_ref(&ref_name)?.is_some() {
             return Err(Error::InvalidInput(format!("lane `{name}` already exists")));
         }
-        let workdir_path = if materialize {
+        let workdir_path = if workdir_mode.materializes() {
             Some(self.resolve_lane_workdir_path(name, workdir.as_deref())?)
         } else {
             None
@@ -118,15 +183,14 @@ impl CrabDb {
         } else {
             None
         };
-        let metadata_json = sparse_policy_paths
-            .as_ref()
-            .map(|paths| {
-                serde_json::to_string(&serde_json::json!({
-                    "sparse_paths": paths,
-                    "include_neighbors": include_neighbors
-                }))
-            })
-            .transpose()?;
+        let sparse_paths_for_report = sparse_policy_paths.clone().unwrap_or_default();
+        let metadata_json = serde_json::to_string(&serde_json::json!({
+            "workdir_mode": workdir_mode.as_str(),
+            "cow_backend": workdir_mode.cow_backend(),
+            "sparse_paths": sparse_paths_for_report,
+            "include_neighbors": include_neighbors,
+            "overlay_available": false
+        }))?;
         self.set_ref(
             &ref_name,
             &source.change_id,
@@ -172,8 +236,11 @@ impl CrabDb {
                 "ref_name": ref_name.clone(),
                 "base_root": source.root_id.0.clone(),
                 "workdir": materialized_workdir.clone(),
+                "workdir_mode": workdir_mode.as_str(),
+                "cow_backend": workdir_mode.cow_backend(),
                 "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
-                "include_neighbors": include_neighbors
+                "include_neighbors": include_neighbors,
+                "overlay_available": false
             }),
         )?;
         Ok(LaneSpawnReport {
@@ -181,6 +248,10 @@ impl CrabDb {
             ref_name,
             base_change: source.change_id,
             workdir: materialized_workdir,
+            cow_backend: workdir_mode.cow_backend().map(str::to_string),
+            sparse_paths: sparse_policy_paths.unwrap_or_default(),
+            overlay_available: false,
+            workdir_mode,
         })
     }
 
@@ -203,9 +274,16 @@ impl CrabDb {
                     )));
                 }
             }
+            let record = self.lane_record(&branch.lane_id)?;
+            let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
+            let sparse_paths = self.lane_report_sparse_paths(&branch)?;
             return Ok(LaneWorkdirReport {
                 lane_id: branch.lane_id,
                 workdir: Some(existing),
+                cow_backend: workdir_mode.cow_backend().map(str::to_string),
+                sparse_paths,
+                overlay_available: false,
+                workdir_mode,
             });
         }
 
@@ -229,6 +307,10 @@ impl CrabDb {
         Ok(LaneWorkdirReport {
             lane_id: branch.lane_id,
             workdir: Some(dir.to_string_lossy().to_string()),
+            workdir_mode: LaneWorkdirMode::FullCow,
+            cow_backend: (LaneWorkdirMode::FullCow).cow_backend().map(str::to_string),
+            sparse_paths: Vec::new(),
+            overlay_available: false,
         })
     }
 
@@ -394,7 +476,49 @@ impl CrabDb {
         self.lane_sparse_paths_from_metadata(&branch.lane_id)
     }
 
-    fn lane_sparse_paths_from_metadata(&self, lane_id: &str) -> Result<Option<Vec<String>>> {
+    pub(crate) fn lane_workdir_mode_for(
+        &self,
+        record: &LaneRecord,
+        branch: &LaneBranch,
+    ) -> Result<LaneWorkdirMode> {
+        if let Some(metadata_json) = &record.metadata_json {
+            let value: serde_json::Value = serde_json::from_str(metadata_json)?;
+            if let Some(mode) = value
+                .get("workdir_mode")
+                .and_then(serde_json::Value::as_str)
+            {
+                return parse_lane_workdir_mode(mode);
+            }
+            if value
+                .get("sparse_paths")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|paths| !paths.is_empty())
+            {
+                return Ok(LaneWorkdirMode::Sparse);
+            }
+        }
+        if branch.workdir.is_some() {
+            Ok(LaneWorkdirMode::FullCow)
+        } else {
+            Ok(LaneWorkdirMode::Virtual)
+        }
+    }
+
+    pub(crate) fn lane_report_sparse_paths(&self, branch: &LaneBranch) -> Result<Vec<String>> {
+        if let Some(workdir) = &branch.workdir {
+            if let Some(paths) = self.lane_sparse_workdir_paths(branch, Path::new(workdir))? {
+                return Ok(paths);
+            }
+        }
+        Ok(self
+            .lane_sparse_paths_from_metadata(&branch.lane_id)?
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn lane_sparse_paths_from_metadata(
+        &self,
+        lane_id: &str,
+    ) -> Result<Option<Vec<String>>> {
         let metadata_json = self
             .conn
             .query_row(
@@ -549,6 +673,55 @@ impl CrabDb {
         }
         Ok(normalized)
     }
+}
+
+fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
+    LaneWorkdirMode::parse(value).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "unknown lane workdir mode `{value}`; expected virtual, sparse, full-cow, or overlay-cow"
+        ))
+    })
+}
+
+fn validate_lane_workdir_mode_request(
+    mode: &LaneWorkdirMode,
+    custom_workdir: bool,
+    sparse_paths: &[String],
+) -> Result<()> {
+    match mode {
+        LaneWorkdirMode::Virtual => {
+            if custom_workdir {
+                return Err(Error::InvalidInput(
+                    "custom lane workdir requires materialization to be enabled".to_string(),
+                ));
+            }
+            if !sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(
+                    "sparse lane workdir paths require materialization to be enabled".to_string(),
+                ));
+            }
+        }
+        LaneWorkdirMode::Sparse => {
+            if sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(
+                    "sparse lane workdir mode requires at least one --paths entry".to_string(),
+                ));
+            }
+        }
+        LaneWorkdirMode::FullCow => {
+            if !sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(
+                    "full-cow lane workdir mode cannot be combined with sparse paths".to_string(),
+                ));
+            }
+        }
+        LaneWorkdirMode::OverlayCow => {
+            return Err(Error::InvalidInput(
+                "overlay-cow lane workdir mode is experimental and unavailable in this build; use sparse or full-cow".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn selected_file_entries(

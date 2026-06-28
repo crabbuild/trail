@@ -9,6 +9,13 @@ pub(crate) fn render_lane_spawn(report: &LaneSpawnReport, json: bool, quiet: boo
     }
     if !quiet {
         println!("Spawned {} at {}", report.lane_id, report.base_change.0);
+        println!("Workdir mode: {}", report.workdir_mode.as_str());
+        if let Some(cow_backend) = &report.cow_backend {
+            println!("COW backend: {cow_backend}");
+        }
+        if !report.sparse_paths.is_empty() {
+            println!("Sparse paths: {}", report.sparse_paths.join(", "));
+        }
         if let Some(workdir) = &report.workdir {
             println!("Workdir: {workdir}");
         }
@@ -56,6 +63,16 @@ pub(crate) fn render_lane_details(details: &LaneDetails, json: bool, quiet: bool
         }
         if let Some(workdir) = &details.branch.workdir {
             println!("Workdir: {workdir}");
+        }
+        if let Some(metadata_json) = &details.record.metadata_json {
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_json) {
+                if let Some(mode) = metadata
+                    .get("workdir_mode")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    println!("Workdir mode: {mode}");
+                }
+            }
         }
     }
     Ok(())

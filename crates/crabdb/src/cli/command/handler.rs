@@ -101,12 +101,13 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 InitImportMode::Empty
             };
-            let report = CrabDb::init_with_text_policy(
+            let report = CrabDb::init_with_text_policy_and_prolly_backend(
                 workspace,
                 args.branch,
                 mode,
                 args.force,
                 args.text_policy.as_ref().map(TextPolicyArg::as_str),
+                args.prolly_backend.as_ref().map(ProllyBackendArg::as_str),
             )?;
             render_init(&report, ctx.json, ctx.quiet)
         }

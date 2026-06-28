@@ -71,6 +71,16 @@ The schema contains these major table groups:
 
 SQLite is therefore both object store and index store. The `objects` table stores durable object bytes. Other tables make common queries fast and hold coordination state that is not modeled as content-addressed objects.
 
+## Semantic Memory Indexes
+
+Agent memory should use SQLite as the first storage and indexing substrate. The
+structured memory rows are durable truth; `sqlite-vec` `vec0` tables are the
+preferred local vector accelerator. Portable exact ranking over little-endian
+`f32` BLOBs remains available as a fallback and verification backend.
+
+See [SQLite Vector Memory Direction](sqlite-vector-memory.md) for the memory
+schema direction, extension policy, and baseline benchmark.
+
 ## Schema Versioning
 
 Schema versioning has two layers:

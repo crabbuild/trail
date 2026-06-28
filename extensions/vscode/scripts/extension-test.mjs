@@ -7,8 +7,10 @@ import esbuild from "esbuild";
 import { runTests } from "@vscode/test-electron";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const testOut = path.join(root, "dist-test", "vscode");
+const testOut = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-vscode-extension-test-"));
 const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-vscode-test-"));
+
+sanitizeElectronHostEnv();
 
 fs.writeFileSync(path.join(workspaceRoot, "README.md"), "hello from vscode extension test\n");
 const init = spawnSync("crabdb", ["--workspace", workspaceRoot, "init", "--quiet"], {
@@ -42,4 +44,14 @@ try {
   });
 } finally {
   fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  fs.rmSync(testOut, { recursive: true, force: true });
+}
+
+function sanitizeElectronHostEnv() {
+  delete process.env.ELECTRON_RUN_AS_NODE;
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("VSCODE_")) {
+      delete process.env[key];
+    }
+  }
 }

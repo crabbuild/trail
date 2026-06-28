@@ -189,6 +189,7 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "crabdb.conflict_resolve"
         | "crabdb.apply_patch"
         | "crabdb.read_file"
+        | "crabdb.lane_hydrate"
         | "crabdb.sync_workdir" => Some(ToolRiskClass::DestructiveWrite),
         "crabdb.agent_test" | "crabdb.agent_eval" | "crabdb.run_test" | "crabdb.run_eval" => {
             Some(ToolRiskClass::OpenWorldWrite)

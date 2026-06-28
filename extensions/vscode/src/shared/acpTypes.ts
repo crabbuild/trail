@@ -164,7 +164,7 @@ export interface ToolCallPatchUpdate {
   _meta?: JsonObject | null;
 }
 
-export type ToolCallStatus = "pending" | "in_progress" | "completed" | "failed";
+export type ToolCallStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
 
 export type ToolKind =
   | "read"

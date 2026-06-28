@@ -1,9 +1,55 @@
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaneWorkdirMode {
+    Virtual,
+    Sparse,
+    FullCow,
+    OverlayCow,
+}
+
+impl LaneWorkdirMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LaneWorkdirMode::Virtual => "virtual",
+            LaneWorkdirMode::Sparse => "sparse",
+            LaneWorkdirMode::FullCow => "full-cow",
+            LaneWorkdirMode::OverlayCow => "overlay-cow",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "virtual" => Some(LaneWorkdirMode::Virtual),
+            "sparse" => Some(LaneWorkdirMode::Sparse),
+            "full-cow" | "full_cow" => Some(LaneWorkdirMode::FullCow),
+            "overlay-cow" | "overlay_cow" => Some(LaneWorkdirMode::OverlayCow),
+            _ => None,
+        }
+    }
+
+    pub fn materializes(&self) -> bool {
+        !matches!(self, LaneWorkdirMode::Virtual)
+    }
+
+    pub fn cow_backend(&self) -> Option<&'static str> {
+        match self {
+            LaneWorkdirMode::Virtual => None,
+            LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => Some("filesystem-clone"),
+            LaneWorkdirMode::OverlayCow => Some("overlay"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneSpawnReport {
     pub lane_id: String,
     pub ref_name: String,
     pub base_change: ChangeId,
     pub workdir: Option<String>,
+    pub workdir_mode: LaneWorkdirMode,
+    pub cow_backend: Option<String>,
+    pub sparse_paths: Vec<String>,
+    pub overlay_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,6 +158,10 @@ pub struct LaneRewindReport {
 pub struct LaneWorkdirReport {
     pub lane_id: String,
     pub workdir: Option<String>,
+    pub workdir_mode: LaneWorkdirMode,
+    pub cow_backend: Option<String>,
+    pub sparse_paths: Vec<String>,
+    pub overlay_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

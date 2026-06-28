@@ -1,11 +1,21 @@
 # Spawn and Materialize Workdirs
 
 Lane branches can stay virtual or be materialized into a filesystem workdir.
+New commands and JSON reports expose this as `workdir_mode`:
+
+- `virtual`: no workdir; branch state changes through patches or API calls.
+- `sparse`: materialize selected paths and hydrate more paths explicitly.
+- `full-cow`: materialize the full root, using filesystem clone COW when safe.
+- `overlay-cow`: reserved for a future transparent write-time COW backend.
+
+Current COW means safe file clone during materialization or hydration. It does
+not intercept arbitrary writes to unhydrated paths.
 
 ## Spawn Without Materialization
 
 ```sh
 crabdb lane spawn doc-bot --from main --no-materialize
+crabdb lane spawn doc-bot --from main --workdir-mode virtual
 ```
 
 The default is controlled by `lane.default_materialize`, and large roots default lanes to no materialization.
@@ -14,6 +24,7 @@ The default is controlled by `lane.default_materialize`, and large roots default
 
 ```sh
 crabdb lane spawn doc-bot --from main --materialize=true
+crabdb lane spawn doc-bot --from main --workdir-mode full-cow
 ```
 
 Use a custom workdir:
@@ -28,6 +39,7 @@ Custom workdirs must be empty or absent and cannot be symlinks.
 
 ```sh
 crabdb lane spawn doc-bot --from main --materialize=true --paths docs README.md
+crabdb lane spawn doc-bot --from main --workdir-mode sparse --paths docs README.md
 ```
 
 Use `--include-neighbors` when selected files should include nearby context.
@@ -49,9 +61,11 @@ otherwise it hydrates the path from CrabDB objects.
 crabdb lane read doc-bot docs/README.md
 crabdb lane read doc-bot docs/README.md --no-hydrate
 crabdb lane read doc-bot docs/README.md --hydrate --include-neighbors
+crabdb lane hydrate doc-bot docs/README.md --include-neighbors
 ```
 
 Reads hydrate sparse workdirs by default unless `--no-hydrate` is passed.
+Use `lane hydrate` when a tool is about to edit paths through the filesystem.
 
 ## Sync a Workdir
 

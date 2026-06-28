@@ -103,6 +103,7 @@ pub struct TranscriptTurn {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TranscriptMessage {
+    pub message_id: MessageId,
     pub role: String,
     pub body: String,
     pub created_at: i64,

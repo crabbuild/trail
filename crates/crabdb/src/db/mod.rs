@@ -12,12 +12,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
 use prolly::{
-    BatchBuilder, Cid, Config, Diff, Encoding, Prolly, SortedBatchBuilder, SqliteStore, Tree,
+    BatchBuilder, BatchOp, Cid, Config, Diff, Encoding, Prolly, SlateDbStore, SortedBatchBuilder,
+    SqliteStore, Store, Tree,
 };
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
+use slatedb::object_store::aws::AmazonS3Builder;
+use slatedb::object_store::ObjectStore;
 
 use crate::error::{cbor, from_cbor, Error, Result};
 use crate::ids::{
@@ -69,12 +72,266 @@ pub struct CrabDb {
     workspace_root: PathBuf,
     db_dir: PathBuf,
     conn: Connection,
-    store: Arc<SqliteStore>,
-    prolly: Prolly<Arc<SqliteStore>>,
-    root_prolly: Prolly<Arc<SqliteStore>>,
+    store: CrabProllyStore,
+    prolly: Prolly<CrabProllyStore>,
+    root_prolly: Prolly<CrabProllyStore>,
     config: CrabConfig,
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
+}
+
+#[derive(Clone)]
+enum CrabProllyStore {
+    Sqlite(Arc<SqliteStore>),
+    SlateDb(Arc<SlateDbStore>),
+}
+
+#[derive(Debug)]
+struct CrabProllyStoreError {
+    message: String,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl CrabProllyStoreError {
+    fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl std::fmt::Display for CrabProllyStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CrabDB prolly store error: {}", self.message)
+    }
+}
+
+impl std::error::Error for CrabProllyStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl Store for CrabProllyStore {
+    type Error = CrabProllyStoreError;
+
+    fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store
+                .get(key)
+                .map_err(|err| CrabProllyStoreError::with_source("SQLite prolly get failed", err)),
+            CrabProllyStore::SlateDb(store) => store
+                .get(key)
+                .map_err(|err| CrabProllyStoreError::with_source("SlateDB prolly get failed", err)),
+        }
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store
+                .put(key, value)
+                .map_err(|err| CrabProllyStoreError::with_source("SQLite prolly put failed", err)),
+            CrabProllyStore::SlateDb(store) => store
+                .put(key, value)
+                .map_err(|err| CrabProllyStoreError::with_source("SlateDB prolly put failed", err)),
+        }
+    }
+
+    fn delete(&self, key: &[u8]) -> std::result::Result<(), Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.delete(key).map_err(|err| {
+                CrabProllyStoreError::with_source("SQLite prolly delete failed", err)
+            }),
+            CrabProllyStore::SlateDb(store) => store.delete(key).map_err(|err| {
+                CrabProllyStoreError::with_source("SlateDB prolly delete failed", err)
+            }),
+        }
+    }
+
+    fn batch(&self, ops: &[BatchOp]) -> std::result::Result<(), Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.batch(ops).map_err(|err| {
+                CrabProllyStoreError::with_source("SQLite prolly batch failed", err)
+            }),
+            CrabProllyStore::SlateDb(store) => store.batch(ops).map_err(|err| {
+                CrabProllyStoreError::with_source("SlateDB prolly batch failed", err)
+            }),
+        }
+    }
+
+    fn batch_get(
+        &self,
+        keys: &[&[u8]],
+    ) -> std::result::Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.batch_get(keys).map_err(|err| {
+                CrabProllyStoreError::with_source("SQLite prolly batch_get failed", err)
+            }),
+            CrabProllyStore::SlateDb(store) => store.batch_get(keys).map_err(|err| {
+                CrabProllyStoreError::with_source("SlateDB prolly batch_get failed", err)
+            }),
+        }
+    }
+
+    fn batch_get_ordered(
+        &self,
+        keys: &[&[u8]],
+    ) -> std::result::Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.batch_get_ordered(keys).map_err(|err| {
+                CrabProllyStoreError::with_source("SQLite prolly batch_get_ordered failed", err)
+            }),
+            CrabProllyStore::SlateDb(store) => store.batch_get_ordered(keys).map_err(|err| {
+                CrabProllyStoreError::with_source("SlateDB prolly batch_get_ordered failed", err)
+            }),
+        }
+    }
+
+    fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> std::result::Result<(), Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.batch_put(entries).map_err(|err| {
+                CrabProllyStoreError::with_source("SQLite prolly batch_put failed", err)
+            }),
+            CrabProllyStore::SlateDb(store) => store.batch_put(entries).map_err(|err| {
+                CrabProllyStoreError::with_source("SlateDB prolly batch_put failed", err)
+            }),
+        }
+    }
+
+    fn supports_hints(&self) -> bool {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.supports_hints(),
+            CrabProllyStore::SlateDb(store) => store.supports_hints(),
+        }
+    }
+
+    fn get_hint(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+    ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store.get_hint(namespace, key).map_err(|err| {
+                CrabProllyStoreError::with_source("SQLite prolly get_hint failed", err)
+            }),
+            CrabProllyStore::SlateDb(store) => store.get_hint(namespace, key).map_err(|err| {
+                CrabProllyStoreError::with_source("SlateDB prolly get_hint failed", err)
+            }),
+        }
+    }
+
+    fn put_hint(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> std::result::Result<(), Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => {
+                store.put_hint(namespace, key, value).map_err(|err| {
+                    CrabProllyStoreError::with_source("SQLite prolly put_hint failed", err)
+                })
+            }
+            CrabProllyStore::SlateDb(store) => {
+                store.put_hint(namespace, key, value).map_err(|err| {
+                    CrabProllyStoreError::with_source("SlateDB prolly put_hint failed", err)
+                })
+            }
+        }
+    }
+
+    fn batch_put_with_hint(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> std::result::Result<(), Self::Error> {
+        match self {
+            CrabProllyStore::Sqlite(store) => store
+                .batch_put_with_hint(entries, namespace, key, value)
+                .map_err(|err| {
+                    CrabProllyStoreError::with_source(
+                        "SQLite prolly batch_put_with_hint failed",
+                        err,
+                    )
+                }),
+            CrabProllyStore::SlateDb(store) => store
+                .batch_put_with_hint(entries, namespace, key, value)
+                .map_err(|err| {
+                    CrabProllyStoreError::with_source(
+                        "SlateDB prolly batch_put_with_hint failed",
+                        err,
+                    )
+                }),
+        }
+    }
+}
+
+fn open_prolly_store(config: &CrabConfig, sqlite_path: &Path) -> Result<CrabProllyStore> {
+    match config.storage.prolly_backend.as_str() {
+        "sqlite" => Ok(CrabProllyStore::Sqlite(Arc::new(SqliteStore::open(
+            sqlite_path,
+        )?))),
+        "slatedb" => open_slatedb_prolly_store(&config.storage),
+        other => Err(Error::InvalidInput(format!(
+            "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
+        ))),
+    }
+}
+
+fn open_slatedb_prolly_store(storage: &StorageConfig) -> Result<CrabProllyStore> {
+    let path = storage.slatedb_path.trim().trim_matches('/');
+    if path.is_empty() {
+        return Err(Error::InvalidInput(
+            "storage.slatedb_path must not be empty".to_string(),
+        ));
+    }
+
+    let object_store = build_slatedb_object_store(storage)?;
+    let store = SlateDbStore::open(path, object_store)?;
+    Ok(CrabProllyStore::SlateDb(Arc::new(store)))
+}
+
+fn build_slatedb_object_store(storage: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
+    if storage.slatedb_s3_endpoint.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "storage.slatedb_s3_endpoint must not be empty".to_string(),
+        ));
+    }
+    if storage.slatedb_s3_bucket.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "storage.slatedb_s3_bucket must not be empty".to_string(),
+        ));
+    }
+    if storage.slatedb_s3_region.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "storage.slatedb_s3_region must not be empty".to_string(),
+        ));
+    }
+
+    let store = AmazonS3Builder::new()
+        .with_endpoint(storage.slatedb_s3_endpoint.trim_end_matches('/'))
+        .with_bucket_name(storage.slatedb_s3_bucket.trim())
+        .with_region(storage.slatedb_s3_region.trim())
+        .with_access_key_id(&storage.slatedb_s3_access_key_id)
+        .with_secret_access_key(&storage.slatedb_s3_secret_access_key)
+        .with_allow_http(storage.slatedb_s3_allow_http)
+        .with_virtual_hosted_style_request(false)
+        .build()
+        .map_err(|err| {
+            Error::InvalidInput(format!(
+                "failed to configure SlateDB S3 object store: {err}"
+            ))
+        })?;
+
+    Ok(Arc::new(store))
 }
 
 #[derive(Debug, Default)]

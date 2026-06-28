@@ -21,6 +21,35 @@ impl CrabDb {
         force: bool,
         text_policy: Option<&str>,
     ) -> Result<InitReport> {
+        Self::init_with_options(workspace_root, branch, mode, force, text_policy, None)
+    }
+
+    pub fn init_with_text_policy_and_prolly_backend(
+        workspace_root: impl AsRef<Path>,
+        branch: impl Into<String>,
+        mode: InitImportMode,
+        force: bool,
+        text_policy: Option<&str>,
+        prolly_backend: Option<&str>,
+    ) -> Result<InitReport> {
+        Self::init_with_options(
+            workspace_root,
+            branch,
+            mode,
+            force,
+            text_policy,
+            prolly_backend,
+        )
+    }
+
+    fn init_with_options(
+        workspace_root: impl AsRef<Path>,
+        branch: impl Into<String>,
+        mode: InitImportMode,
+        force: bool,
+        text_policy: Option<&str>,
+        prolly_backend: Option<&str>,
+    ) -> Result<InitReport> {
         let workspace_root = workspace_root.as_ref().canonicalize()?;
         let db_dir = workspace_root.join(".crabdb");
         if db_dir.exists() {
@@ -38,6 +67,22 @@ impl CrabDb {
         let branch = branch.into();
         let workspace_id = WorkspaceId::new(workspace_root.to_string_lossy().as_bytes());
         let mut config = CrabConfig::new(workspace_id.clone(), branch.clone());
+        if let Some(prolly_backend) = prolly_backend {
+            match prolly_backend {
+                "sqlite" | "slatedb" => {
+                    config.storage.prolly_backend = prolly_backend.to_string();
+                    if prolly_backend == "slatedb" {
+                        config.storage.slatedb_path =
+                            format!("crabdb/workspaces/{}/prolly", workspace_id.0);
+                    }
+                }
+                other => {
+                    return Err(Error::InvalidInput(format!(
+                        "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
+                    )));
+                }
+            }
+        }
         let explicit_text_policy = text_policy.is_some();
         apply_text_policy(&mut config.text, text_policy)?;
         if !explicit_text_policy
@@ -207,7 +252,7 @@ impl CrabDb {
     ) -> Result<Self> {
         fs::create_dir_all(db_dir.join("index"))?;
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
-        let store = Arc::new(SqliteStore::open(&sqlite_path)?);
+        let store = open_prolly_store(&config, &sqlite_path)?;
         let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());

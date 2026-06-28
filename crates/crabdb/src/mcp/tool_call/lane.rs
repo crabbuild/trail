@@ -10,16 +10,18 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
     let value = match name {
         "crabdb.lane_spawn" => {
             let args: LaneSpawnArgs = parse_args(arguments)?;
-            let materialize = if args.workdir.is_some() || !args.paths.is_empty() {
-                args.materialize.unwrap_or(true)
-            } else {
-                args.materialize
-                    .unwrap_or(db.default_lane_materialize_for_ref(args.from_ref.as_deref())?)
-            };
-            tool_result(db.spawn_lane_with_workdir_paths_and_neighbors(
+            let workdir_mode = db.resolve_lane_spawn_workdir_mode(
+                args.from_ref.as_deref(),
+                args.workdir_mode.as_deref(),
+                args.materialize,
+                false,
+                args.workdir.is_some(),
+                &args.paths,
+            )?;
+            tool_result(db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 &args.name,
                 args.from_ref.as_deref(),
-                materialize,
+                workdir_mode,
                 args.provider,
                 args.model,
                 args.workdir.map(PathBuf::from),
@@ -151,6 +153,20 @@ pub(super) fn handle(db: &mut CrabDb, name: &str, arguments: &Value) -> Result<O
         }
         "crabdb.sync_workdir" => {
             let args: SyncWorkdirArgs = parse_args(arguments)?;
+            tool_result(db.sync_lane_workdir_with_paths_and_neighbors(
+                &args.lane,
+                args.force,
+                &args.paths,
+                args.include_neighbors,
+            )?)
+        }
+        "crabdb.lane_hydrate" => {
+            let args: SyncWorkdirArgs = parse_args(arguments)?;
+            if args.paths.is_empty() {
+                return Err(crate::Error::InvalidInput(
+                    "lane hydrate requires at least one path".to_string(),
+                ));
+            }
             tool_result(db.sync_lane_workdir_with_paths_and_neighbors(
                 &args.lane,
                 args.force,

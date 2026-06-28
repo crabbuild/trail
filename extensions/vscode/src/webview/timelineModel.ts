@@ -1,0 +1,496 @@
+import type { ContentBlock, ToolCallContent } from "../shared/acpTypes";
+import type { RenderNode } from "../shared/renderModel";
+import { buildToolPresentation } from "./toolModel";
+
+export const TIMELINE_FILTERS = [
+  { id: "all", label: "All" },
+  { id: "chat", label: "Chat" },
+  { id: "tools", label: "Tools" },
+  { id: "diffs", label: "Diffs" },
+  { id: "approvals", label: "Approvals" },
+  { id: "events", label: "Events" }
+] as const;
+
+export type TimelineFilter = (typeof TIMELINE_FILTERS)[number]["id"];
+
+export type TimelineCounts = Record<TimelineFilter, number>;
+
+export type ToolActivityTone = "empty" | "ok" | "warning" | "risk" | "active";
+
+export interface ToolActivityMetric {
+  label: string;
+  value: string;
+  tone: Exclude<ToolActivityTone, "empty">;
+}
+
+export interface ToolActivityPath {
+  path: string;
+  count: number;
+  detail: string;
+  tone: Exclude<ToolActivityTone, "empty" | "active">;
+}
+
+export interface ToolActivitySummary {
+  total: number;
+  label: string;
+  detail: string;
+  tone: ToolActivityTone;
+  metrics: ToolActivityMetric[];
+  paths: ToolActivityPath[];
+}
+
+export function isTimelineFilter(value: unknown): value is TimelineFilter {
+  return typeof value === "string" && TIMELINE_FILTERS.some((filter) => filter.id === value);
+}
+
+export function filterTimelineNodes(nodes: RenderNode[], filter: TimelineFilter, query: string): RenderNode[] {
+  const tokens = timelineSearchTokens(query);
+  return nodes.filter((node) => {
+    if (!nodeMatchesTimelineFilter(node, filter)) {
+      return false;
+    }
+    if (!tokens.length) {
+      return true;
+    }
+    const searchable = normalizeTimelineSearchText(timelineNodeSearchText(node));
+    return tokens.every((token) => searchable.includes(token));
+  });
+}
+
+export function timelineSearchTokens(query: string): string[] {
+  return normalizeTimelineSearchText(query).split(" ").filter(Boolean);
+}
+
+export function timelineFilterCounts(nodes: RenderNode[]): TimelineCounts {
+  const counts: TimelineCounts = {
+    all: nodes.length,
+    chat: 0,
+    tools: 0,
+    diffs: 0,
+    approvals: 0,
+    events: 0
+  };
+  for (const node of nodes) {
+    const bucket = timelineNodeBucket(node);
+    counts[bucket] += 1;
+  }
+  return counts;
+}
+
+export function buildToolActivitySummary(nodes: RenderNode[], maxPaths = 5): ToolActivitySummary {
+  const counts = {
+    total: 0,
+    readOnly: 0,
+    changes: 0,
+    commands: 0,
+    approvals: 0,
+    running: 0,
+    failed: 0,
+    warnings: 0,
+    risks: 0
+  };
+  const paths = new Map<string, { count: number; tone: ToolActivityPath["tone"]; kinds: Set<string> }>();
+
+  for (const node of nodes) {
+    if (node.kind === "tool") {
+      counts.total += 1;
+      const model = buildToolPresentation({
+        title: node.title,
+        toolKind: node.toolKind,
+        toolStatus: node.toolStatus,
+        locations: node.locations,
+        content: node.content,
+        rawInput: node.rawInput,
+        source: node.source
+      });
+      incrementOperationCounts(model.kind, counts);
+      incrementRiskCounts(model.riskTone, counts);
+      incrementStatusCounts(node.toolStatus, counts);
+      for (const location of node.locations) {
+        addActivityPath(paths, location.path, pathToneForTool(model.kind, model.riskTone), model.kind);
+      }
+      continue;
+    }
+
+    if (node.kind === "diff") {
+      counts.total += 1;
+      counts.changes += 1;
+      counts.warnings += 1;
+      incrementStatusCounts(node.status, counts);
+      addActivityPath(paths, node.path, "warning", "diff");
+      continue;
+    }
+
+    if (node.kind === "terminal") {
+      counts.total += 1;
+      counts.commands += 1;
+      counts.warnings += 1;
+      incrementStatusCounts(node.status, counts);
+      continue;
+    }
+
+    if (node.kind === "approval") {
+      counts.total += 1;
+      counts.approvals += 1;
+      counts.risks += 1;
+      incrementStatusCounts(node.status, counts);
+      for (const location of node.tool.locations) {
+        addActivityPath(paths, location.path, "risk", `approval ${node.tool.toolKind}`);
+      }
+    }
+  }
+
+  const tone = toolActivityTone(counts);
+  return {
+    total: counts.total,
+    label: toolActivityLabel(tone),
+    detail: toolActivityDetail(counts),
+    tone,
+    metrics: toolActivityMetrics(counts),
+    paths: toolActivityPaths(paths, maxPaths)
+  };
+}
+
+export function nodeMatchesTimelineFilter(node: RenderNode, filter: TimelineFilter): boolean {
+  return filter === "all" || timelineNodeBucket(node) === filter;
+}
+
+export function timelineNodeBucket(node: RenderNode): Exclude<TimelineFilter, "all"> {
+  switch (node.kind) {
+    case "message":
+    case "thought":
+    case "plan":
+      return "chat";
+    case "tool":
+    case "terminal":
+    case "resource":
+      return "tools";
+    case "diff":
+      return "diffs";
+    case "approval":
+      return "approvals";
+    default:
+      return "events";
+  }
+}
+
+export function timelineNodeSearchText(node: RenderNode): string {
+  const parts: Array<string | null | undefined> = [node.kind, node.status, node.provider, node.lane, node.turnId, node.acpSessionId];
+  switch (node.kind) {
+    case "message":
+      parts.push(node.role, node.text, ...contentBlocksText(node.content));
+      break;
+    case "thought":
+      parts.push(...contentBlocksText(node.content));
+      break;
+    case "plan":
+      parts.push(...node.entries.flatMap((entry) => [entry.title, entry.content, entry.status, entry.priority]));
+      break;
+    case "tool":
+      parts.push(
+        node.title,
+        node.toolKind,
+        node.toolStatus,
+        ...node.locations.map((location) => [location.path, String(location.line || "")]).flat(),
+        ...node.content.flatMap(toolContentText)
+      );
+      break;
+    case "diff":
+      parts.push(node.path, node.oldText || "", node.newText);
+      break;
+    case "terminal":
+      parts.push(node.title, node.command, node.cwd, node.terminalStatus, node.output, node.stdout, node.stderr);
+      break;
+    case "approval":
+      parts.push(
+        node.title,
+        node.requestId,
+        node.tool.title,
+        node.tool.toolKind,
+        ...node.tool.locations.map((location) => [location.path, String(location.line || "")]).flat(),
+        ...node.options.flatMap((option) => [option.label, option.description, option.optionId])
+      );
+      break;
+    case "checkpoint":
+      parts.push(node.label, node.checkpointId);
+      break;
+    case "completion":
+      parts.push(node.label, node.stopReason);
+      break;
+    case "usage":
+      parts.push(String(node.used), String(node.size));
+      break;
+    case "mode":
+      parts.push(node.modeId, ...node.availableModes.flatMap((mode) => [mode.id, mode.name, mode.description]));
+      break;
+    case "config":
+      parts.push(
+        ...node.configOptions.flatMap((option) => [
+          option.id,
+          option.name,
+          option.description,
+          option.category,
+          String(option.currentValue || "")
+        ])
+      );
+      break;
+    case "commands":
+      parts.push(...node.availableCommands.flatMap((command) => [command.name, command.description, command.input?.hint]));
+      break;
+    case "session":
+      parts.push(node.title || "", node.sessionUpdatedAt || "");
+      break;
+    case "resource":
+      parts.push(...contentBlocksText([node.content]));
+      break;
+    case "unknown":
+      parts.push(node.label);
+      break;
+  }
+  return parts.filter((part): part is string => typeof part === "string" && part.length > 0).join(" ");
+}
+
+function contentBlocksText(blocks: ContentBlock[]): string[] {
+  return blocks.flatMap((block) => {
+    const record = asRecord(block);
+    const resource = asRecord(record.resource);
+    return [
+      record.type,
+      record.text,
+      record.uri,
+      record.name,
+      record.title,
+      record.description,
+      resource.uri,
+      resource.mimeType,
+      resource.text
+    ].filter((part): part is string => typeof part === "string" && part.length > 0);
+  });
+}
+
+function normalizeTimelineSearchText(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function toolContentText(content: ToolCallContent): string[] {
+  const record = asRecord(content);
+  return [
+    record.type,
+    record.path,
+    record.terminalId,
+    record.title,
+    record.name,
+    terminalCommand(record),
+    record.cwd,
+    record.workingDirectory,
+    record.working_directory,
+    record.status,
+    record.state,
+    record.output,
+    record.stdout,
+    record.stderr,
+    ...contentBlocksText(record.type === "content" ? [record.content as ContentBlock] : [])
+  ].filter((part): part is string => typeof part === "string" && part.length > 0);
+}
+
+function incrementOperationCounts(
+  kind: string,
+  counts: {
+    readOnly: number;
+    changes: number;
+    commands: number;
+  }
+): void {
+  switch (kind) {
+    case "edit":
+    case "delete":
+    case "move":
+      counts.changes += 1;
+      return;
+    case "execute":
+      counts.commands += 1;
+      return;
+    default:
+      counts.readOnly += 1;
+  }
+}
+
+function incrementRiskCounts(
+  tone: "ok" | "warning" | "risk",
+  counts: {
+    warnings: number;
+    risks: number;
+  }
+): void {
+  if (tone === "risk") {
+    counts.risks += 1;
+  } else if (tone === "warning") {
+    counts.warnings += 1;
+  }
+}
+
+function incrementStatusCounts(
+  status: string,
+  counts: {
+    running: number;
+    failed: number;
+  }
+): void {
+  if (status === "pending" || status === "in_progress") {
+    counts.running += 1;
+  }
+  if (status === "failed" || status === "cancelled") {
+    counts.failed += 1;
+  }
+}
+
+function pathToneForTool(kind: string, riskTone: "ok" | "warning" | "risk"): ToolActivityPath["tone"] {
+  if (riskTone === "risk" || kind === "delete") {
+    return "risk";
+  }
+  if (riskTone === "warning" || kind === "edit" || kind === "move") {
+    return "warning";
+  }
+  return "ok";
+}
+
+function addActivityPath(
+  paths: Map<string, { count: number; tone: ToolActivityPath["tone"]; kinds: Set<string> }>,
+  path: string | undefined,
+  tone: ToolActivityPath["tone"],
+  kind: string
+): void {
+  const normalized = typeof path === "string" ? path.trim() : "";
+  if (!normalized) {
+    return;
+  }
+  const current = paths.get(normalized) || { count: 0, tone: "ok" as const, kinds: new Set<string>() };
+  current.count += 1;
+  current.tone = strongestPathTone(current.tone, tone);
+  current.kinds.add(kind);
+  paths.set(normalized, current);
+}
+
+function strongestPathTone(current: ToolActivityPath["tone"], next: ToolActivityPath["tone"]): ToolActivityPath["tone"] {
+  const priority: Record<ToolActivityPath["tone"], number> = {
+    ok: 1,
+    warning: 2,
+    risk: 3
+  };
+  return priority[next] > priority[current] ? next : current;
+}
+
+function toolActivityTone(counts: { total: number; failed: number; risks: number; running: number; warnings: number; changes: number; commands: number }): ToolActivityTone {
+  if (!counts.total) {
+    return "empty";
+  }
+  if (counts.failed || counts.risks) {
+    return "risk";
+  }
+  if (counts.running) {
+    return "active";
+  }
+  if (counts.warnings || counts.changes || counts.commands) {
+    return "warning";
+  }
+  return "ok";
+}
+
+function toolActivityLabel(tone: ToolActivityTone): string {
+  switch (tone) {
+    case "empty":
+      return "No visible tool activity";
+    case "risk":
+      return "Needs inspection";
+    case "active":
+      return "Agent is working";
+    case "warning":
+      return "Review tool activity";
+    default:
+      return "Read-only activity";
+  }
+}
+
+function toolActivityDetail(counts: { total: number; readOnly: number; changes: number; commands: number; approvals: number; running: number; failed: number }): string {
+  if (!counts.total) {
+    return "The current transcript filter does not include tool, diff, terminal, or approval items.";
+  }
+  const parts = [
+    activityCountLabel(counts.readOnly, "read-only"),
+    activityCountLabel(counts.changes, "change"),
+    activityCountLabel(counts.commands, "command"),
+    activityCountLabel(counts.approvals, "approval"),
+    activityCountLabel(counts.running, "running"),
+    activityCountLabel(counts.failed, "failed")
+  ].filter(Boolean);
+  return parts.length ? parts.join(" / ") : `${counts.total} operation${counts.total === 1 ? "" : "s"}`;
+}
+
+function toolActivityMetrics(counts: {
+  total: number;
+  readOnly: number;
+  changes: number;
+  commands: number;
+  approvals: number;
+  running: number;
+  failed: number;
+}): ToolActivityMetric[] {
+  if (!counts.total) {
+    return [];
+  }
+  const metrics: ToolActivityMetric[] = [
+    { label: "operations", value: formatCount(counts.total), tone: counts.failed ? "risk" : counts.running ? "active" : "ok" },
+    { label: "read-only", value: formatCount(counts.readOnly), tone: "ok" },
+    { label: "changes", value: formatCount(counts.changes), tone: counts.changes ? "warning" : "ok" },
+    { label: "commands", value: formatCount(counts.commands), tone: counts.commands ? "warning" : "ok" },
+    { label: "approvals", value: formatCount(counts.approvals), tone: counts.approvals ? "risk" : "ok" },
+    { label: counts.failed ? "failed" : "running", value: formatCount(counts.failed || counts.running), tone: counts.failed ? "risk" : "active" }
+  ];
+  return metrics.filter((metric) => metric.value !== "0" || metric.label === "operations").slice(0, 6);
+}
+
+function toolActivityPaths(paths: Map<string, { count: number; tone: ToolActivityPath["tone"]; kinds: Set<string> }>, maxPaths: number): ToolActivityPath[] {
+  return Array.from(paths.entries())
+    .map(([path, summary]) => ({
+      path,
+      count: summary.count,
+      detail: `${formatCount(summary.count)} ${summary.count === 1 ? "reference" : "references"} · ${Array.from(summary.kinds).slice(0, 3).join(", ")}`,
+      tone: summary.tone
+    }))
+    .sort((left, right) => right.count - left.count || tonePriority(right.tone) - tonePriority(left.tone) || left.path.localeCompare(right.path))
+    .slice(0, Math.max(0, maxPaths));
+}
+
+function tonePriority(tone: ToolActivityPath["tone"]): number {
+  switch (tone) {
+    case "risk":
+      return 3;
+    case "warning":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function formatCount(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function activityCountLabel(count: number, label: string): string {
+  if (!count) {
+    return "";
+  }
+  return `${formatCount(count)} ${label}${count === 1 || label === "read-only" || label === "running" ? "" : "s"}`;
+}
+
+function terminalCommand(record: Record<string, unknown>): string | undefined {
+  const command = record.command || record.commandLine || record.command_line;
+  if (Array.isArray(command)) {
+    return command.map((part) => String(part)).join(" ");
+  }
+  return typeof command === "string" ? command : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}

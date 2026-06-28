@@ -50,6 +50,8 @@ pub enum Error {
     Prolly(#[from] prolly::Error),
     #[error("prolly SQLite error: {0}")]
     ProllySqlite(#[from] prolly::SqliteStoreError),
+    #[error("prolly SlateDB error: {0}")]
+    ProllySlateDb(#[from] prolly::SlateDbStoreError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("TOML error: {0}")]
@@ -87,6 +89,7 @@ impl Error {
             Error::Serialization(_) => "SERIALIZATION_ERROR",
             Error::Prolly(_) => "PROLLY_ERROR",
             Error::ProllySqlite(_) => "PROLLY_SQLITE_ERROR",
+            Error::ProllySlateDb(_) => "PROLLY_SLATEDB_ERROR",
             Error::Json(_) => "JSON_ERROR",
             Error::TomlSer(_) | Error::TomlDe(_) => "TOML_ERROR",
             Error::DaemonUnavailable(_) => "DAEMON_UNAVAILABLE",

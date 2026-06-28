@@ -120,7 +120,7 @@ impl CrabDb {
                 "SELECT event_id, lane_id, session_id, turn_id, event_type, payload_json, created_at \
                  FROM lane_events \
                  WHERE event_type IN ('span_started', 'span_ended') \
-                 ORDER BY created_at ASC, event_id ASC",
+                 ORDER BY created_at ASC, rowid ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((

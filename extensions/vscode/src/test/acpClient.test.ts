@@ -129,6 +129,31 @@ test("AcpClient cancels pending permission requests when cancelling a turn", asy
   }
 });
 
+test("AcpClient preserves numeric permission request ids when approving", async () => {
+  const { client, cleanup } = clientForLifecycleStub(numericPermissionStubSource());
+  let seenRequestId: string | undefined;
+
+  try {
+    await client.start({
+      ...emptyListeners(),
+      permission: (requestId) => {
+        seenRequestId = requestId;
+        client.approve(requestId, "allow");
+      }
+    });
+    const response = await client.prompt([{ type: "text", text: "numeric permission" }]);
+    assert.equal(seenRequestId, "0");
+    assert.deepEqual(response, {
+      stopReason: "end_turn",
+      permissionResponseIdType: "number",
+      selected: true
+    });
+  } finally {
+    client.dispose();
+    cleanup();
+  }
+});
+
 test("AcpClient serves safe read-only workspace file requests", async () => {
   const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-workspace-"));
   const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
@@ -813,6 +838,84 @@ rl.on("line", (line) => {
   if (message.id === "permission-cancel") {
     permissionCancelled = message.result?.outcome?.outcome === "cancelled";
     finishIfReady();
+  }
+});
+`;
+}
+
+function numericPermissionStubSource(): string {
+  return `
+import readline from "node:readline";
+
+let promptRequestId = null;
+const rl = readline.createInterface({ input: process.stdin });
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        protocolVersion: "1",
+        agentCapabilities: {}
+      }
+    });
+    return;
+  }
+
+  if (message.method === "session/new") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        sessionId: "numeric-permission-session"
+      }
+    });
+    return;
+  }
+
+  if (message.method === "session/prompt") {
+    promptRequestId = message.id;
+    send({
+      jsonrpc: "2.0",
+      id: 0,
+      method: "session/request_permission",
+      params: {
+        sessionId: "numeric-permission-session",
+        toolCall: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-numeric",
+          title: "Run numeric id command",
+          kind: "execute",
+          status: "pending"
+        },
+        options: [
+          {
+            optionId: "allow",
+            name: "Allow once"
+          }
+        ]
+      }
+    });
+    return;
+  }
+
+  if (message.id === 0 || message.id === "0") {
+    send({
+      jsonrpc: "2.0",
+      id: promptRequestId,
+      result: {
+        stopReason: "end_turn",
+        permissionResponseIdType: typeof message.id,
+        selected: message.result?.outcome?.outcome === "selected" && message.result?.outcome?.optionId === "allow"
+      }
+    });
+    setTimeout(() => process.exit(0), 10);
   }
 });
 `;

@@ -89,11 +89,10 @@ export class ChatPanel {
       }
     );
 
-    const chat = new ChatPanel(extensionUri, panel, repository, output, diffProvider, provider, task, attachments);
+    const chat = new ChatPanel(extensionUri, panel, repository, output, diffProvider, provider, key, task, attachments);
     ChatPanel.panels.set(key, chat);
     panel.onDidDispose(() => {
       chat.dispose();
-      ChatPanel.panels.delete(key);
     });
     await chat.initialize();
     return chat;
@@ -134,6 +133,7 @@ export class ChatPanel {
     private readonly output: vscode.OutputChannel,
     private readonly diffProvider: DiffContentProvider,
     private provider: AcpProviderProfile,
+    private panelKey: string,
     private task?: AgentTask,
     attachments: PromptAttachment[] = []
   ) {
@@ -149,12 +149,12 @@ export class ChatPanel {
     await this.refresh();
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(options: { claimLatestTask?: boolean | undefined } = {}): Promise<void> {
     let listedTasks: AgentTask[] | undefined;
-    if (!this.task) {
+    if (!this.task && options.claimLatestTask) {
       try {
         listedTasks = await this.repository.listTasks();
-        this.task = listedTasks[0];
+        this.task = this.claimTaskFromList(listedTasks);
       } catch {
         // No task may exist yet for a new chat.
       }
@@ -164,6 +164,8 @@ export class ChatPanel {
       try {
         this.taskView = await this.repository.viewTask(this.task.lane);
         this.task = this.taskView.task;
+        this.panel.title = `Agent: ${this.task.title}`;
+        this.registerPanelKey(this.task.lane);
         if (!this.acpSessionId && this.task.acpSessionId) {
           this.acpSessionId = this.task.acpSessionId;
         }
@@ -573,6 +575,9 @@ export class ChatPanel {
       this.postState();
 
       await this.acp.prompt(content);
+      await this.refresh({
+        claimLatestTask: this.provider.crabdbBacked && !this.task
+      });
       this.attachments.splice(0);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -672,7 +677,6 @@ export class ChatPanel {
       }
     ]);
     this.postState();
-    void this.refresh();
   }
 
   private finalizeCurrentTurn(status: RenderNode["status"]): RenderNode[] {
@@ -995,7 +999,8 @@ export class ChatPanel {
       providers: new ProviderRegistry(this.repository.workspaceRoot).profiles().map((profile) => ({
         id: profile.id,
         label: profile.label,
-        crabdbBacked: profile.crabdbBacked
+        crabdbBacked: profile.crabdbBacked,
+        supportsFromRef: profile.supportsFromRef
       })),
       acpSessionId: this.acpSessionId,
       persistedAcpSessionId: this.task?.acpSessionId,
@@ -1023,15 +1028,43 @@ export class ChatPanel {
     void this.panel.webview.postMessage(message);
   }
 
+  private claimTaskFromList(tasks: AgentTask[]): AgentTask | undefined {
+    if (!tasks.length) {
+      return undefined;
+    }
+    if (this.acpSessionId) {
+      const sessionTask = tasks.find(
+        (task) => task.acpSessionId === this.acpSessionId || task.sessionId === this.acpSessionId
+      );
+      if (sessionTask) {
+        return sessionTask;
+      }
+    }
+    return tasks[0];
+  }
+
+  private registerPanelKey(nextKey: string): void {
+    if (nextKey === this.panelKey) {
+      return;
+    }
+    if (ChatPanel.panels.get(this.panelKey) === this) {
+      ChatPanel.panels.delete(this.panelKey);
+    }
+    if (!ChatPanel.panels.has(nextKey)) {
+      ChatPanel.panels.set(nextKey, this);
+      this.panelKey = nextKey;
+    }
+  }
+
   private html(): string {
-    const script = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "dist", "webview.js"));
-    const style = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "dist", "webview.css"));
+    const script = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "main.js"));
+    const style = this.panel.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "main.css"));
     const nonce = nonceValue();
     const csp = [
       "default-src 'none'",
       `img-src ${this.panel.webview.cspSource} data:`,
-      `style-src ${this.panel.webview.cspSource}`,
-      `script-src 'nonce-${nonce}'`
+      `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
+      `script-src 'nonce-${nonce}' ${this.panel.webview.cspSource}`
     ].join("; ");
 
     return `<!doctype html>
@@ -1045,7 +1078,7 @@ export class ChatPanel {
 </head>
 <body>
   <main id="app" aria-label="CrabDB agent chat"></main>
-  <script nonce="${nonce}" src="${script}"></script>
+  <script nonce="${nonce}" type="module" src="${script}"></script>
 </body>
 </html>`;
   }
@@ -1054,6 +1087,9 @@ export class ChatPanel {
     if (this.statePostTimer) {
       clearTimeout(this.statePostTimer);
       this.statePostTimer = undefined;
+    }
+    if (ChatPanel.panels.get(this.panelKey) === this) {
+      ChatPanel.panels.delete(this.panelKey);
     }
     this.acp?.dispose();
   }

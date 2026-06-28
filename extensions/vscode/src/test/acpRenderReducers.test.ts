@@ -64,7 +64,8 @@ test("aggregates streamed assistant chunks by message id", () => {
   assert.equal(nodes.length, 1);
   assert.equal(nodes[0]?.kind, "message");
   assert.equal(nodes[0]?.text, "Hello world");
-  assert.equal(nodes[0]?.content.length, 2);
+  assert.equal(nodes[0]?.content.length, 1);
+  assert.deepEqual(nodes[0]?.content[0], { type: "text", text: "Hello world" });
 });
 
 test("keeps distinct streamed message ids separate", () => {
@@ -97,6 +98,93 @@ test("keeps distinct streamed message ids separate", () => {
   assert.equal(nodes[1]?.id, "message:assistant:msg-2");
 });
 
+test("keeps anonymous streamed assistant messages in tool-interleaved timeline order", () => {
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: "Before tool. "
+        }
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: "Still before tool."
+        }
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-interleave",
+        title: "Read README.md",
+        kind: "read",
+        status: "completed"
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: "After tool. "
+        }
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: "Still after tool."
+        }
+      },
+      context
+    )
+  );
+
+  assert.deepEqual(
+    nodes.map((node) => node.kind),
+    ["message", "tool", "message"]
+  );
+  const first = nodes[0];
+  const second = nodes[2];
+  assert.equal(first?.kind, "message");
+  assert.equal(second?.kind, "message");
+  if (first?.kind !== "message" || second?.kind !== "message") {
+    throw new Error("expected anonymous assistant messages");
+  }
+  assert.equal(first.text, "Before tool. Still before tool.");
+  assert.equal(second.text, "After tool. Still after tool.");
+  assert.equal(first.content.length, 1);
+  assert.equal(second.content.length, 1);
+  assert.deepEqual(first.content[0], { type: "text", text: "Before tool. Still before tool." });
+  assert.deepEqual(second.content[0], { type: "text", text: "After tool. Still after tool." });
+  assert.notEqual(nodes[0]?.id, nodes[2]?.id);
+});
+
 test("aggregates streamed thought chunks without showing them as transcript messages", () => {
   const first = reduceSessionUpdate(
     {
@@ -124,7 +212,79 @@ test("aggregates streamed thought chunks without showing them as transcript mess
   const nodes = applyRenderPatches(applyRenderPatches([], first), second);
   assert.equal(nodes.length, 1);
   assert.equal(nodes[0]?.kind, "thought");
-  assert.equal(nodes[0]?.content.length, 2);
+  assert.equal(nodes[0]?.content.length, 1);
+  assert.deepEqual(nodes[0]?.content[0], { type: "text", text: "Inspect files" });
+});
+
+test("keeps anonymous streamed thoughts in tool-interleaved timeline order", () => {
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_thought_chunk",
+        content: {
+          type: "text",
+          text: "Think first. "
+        }
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_thought_chunk",
+        content: {
+          type: "text",
+          text: "Still thinking."
+        }
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-between-thoughts",
+        title: "Read README.md",
+        kind: "read",
+        status: "completed"
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_thought_chunk",
+        content: {
+          type: "text",
+          text: "Think after tool."
+        }
+      },
+      context
+    )
+  );
+
+  assert.deepEqual(
+    nodes.map((node) => node.kind),
+    ["thought", "tool", "thought"]
+  );
+  const first = nodes[0];
+  const second = nodes[2];
+  assert.equal(first?.kind, "thought");
+  assert.equal(second?.kind, "thought");
+  if (first?.kind !== "thought" || second?.kind !== "thought") {
+    throw new Error("expected anonymous thought nodes");
+  }
+  assert.deepEqual(first.content, [{ type: "text", text: "Think first. Still thinking." }]);
+  assert.deepEqual(second.content, [{ type: "text", text: "Think after tool." }]);
+  assert.equal(first.id, "thought:anonymous");
+  assert.equal(second.id, "thought:anonymous:2");
 });
 
 test("expands tool diff content into tool and diff nodes", () => {
@@ -188,6 +348,76 @@ test("expands terminal tool content with command metadata", () => {
   assert.equal(terminal?.elapsedMs, 1200);
   assert.equal(terminal?.stdout, "ok");
   assert.equal(terminal?.stderr, "failed");
+});
+
+test("merges status-only tool updates without losing the original call details", () => {
+  const start = reduceSessionUpdate(
+    {
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-merge",
+      title: "Read README.md",
+      kind: "read",
+      status: "pending",
+      locations: [{ path: "README.md", line: 1 }],
+      rawInput: {
+        path: "README.md"
+      }
+    },
+    context
+  );
+  const update = reduceSessionUpdate(
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool-merge",
+      status: "completed"
+    },
+    context
+  );
+
+  const nodes = applyRenderPatches(applyRenderPatches([], start), update);
+  const tool = nodes.find((node) => node.kind === "tool");
+  assert.equal(tool?.kind, "tool");
+  assert.equal(tool?.title, "Read README.md");
+  assert.equal(tool?.toolKind, "read");
+  assert.equal(tool?.toolStatus, "completed");
+  assert.equal(tool?.locations[0]?.path, "README.md");
+  assert.deepEqual(tool?.rawInput, { path: "README.md" });
+});
+
+test("keeps completed tool status when later updates omit status", () => {
+  const start = reduceSessionUpdate(
+    {
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-status",
+      title: "Read README.md",
+      kind: "read",
+      status: "completed"
+    },
+    context
+  );
+  const update = reduceSessionUpdate(
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool-status",
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "README"
+          }
+        }
+      ]
+    },
+    context
+  );
+
+  const nodes = applyRenderPatches(applyRenderPatches([], start), update);
+  const tool = nodes.find((node) => node.kind === "tool");
+  assert.equal(tool?.kind, "tool");
+  assert.equal(tool?.status, "completed");
+  assert.equal(tool?.toolStatus, "completed");
+  assert.equal(tool?.content.length, 1);
 });
 
 test("creates an approval node from ACP permission requests", () => {

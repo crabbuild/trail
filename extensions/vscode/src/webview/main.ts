@@ -1,8 +1,97 @@
+import {
+  CircleAlert,
+  Copy,
+  Diff as DiffIcon,
+  ExternalLink,
+  FileDiff,
+  FileText,
+  FolderGit2,
+  History,
+  ListTree,
+  MessageSquare,
+  MessagesSquare,
+  PanelRightOpen,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Send,
+  Settings,
+  SquareCheckBig,
+  SquareDashedMousePointer,
+  SquareStop,
+  Terminal,
+  Wrench,
+  X
+} from "lucide";
+import type { ToolCallContent } from "../shared/acpTypes";
 import type { RenderNode } from "../shared/renderModel";
 import { coordinationSummaryFromSources, type CoordinationSummary } from "../shared/coordinationSummary";
 import { conflictSetIdsFromSources } from "../shared/conflicts";
 import { redactedJson, redactString } from "../shared/securityRedaction";
-import "./styles.css";
+import {
+  approvalDecisionDescription,
+  approvalDecisionTone,
+  approvalImpactText,
+  approvalScopeLabel,
+  approvalStateLabel,
+  approvalTone,
+  type ApprovalDecisionTone
+} from "./approvalModel";
+import {
+  attachmentModeSummary,
+  composerDraftState,
+  composerMetrics as formatComposerMetrics,
+  composerRailItems,
+  composerSendBlockedReason as blockedComposerSendReason,
+  type ComposerRailItem,
+  MAX_COMPOSER_DRAFT_CHARS
+} from "./composerModel";
+import type { DiffModel, DiffRow, DiffSegment } from "./diffModel";
+import type { DiffCardProps } from "./DiffCard";
+import { buildEventPresentation, type EventAction, type EventFact, type EventPresentation } from "./eventModel";
+import { buildFilePreviewModel, type FilePreviewModel } from "./filePreviewModel";
+import { dispatchFloatingMenuClose } from "./floatingMenu";
+import {
+  buildToolActivitySummary,
+  filterTimelineNodes,
+  isTimelineFilter,
+  TIMELINE_FILTERS,
+  timelineSearchTokens,
+  timelineFilterCounts,
+  type TimelineFilter
+} from "./timelineModel";
+import { buildReviewReadiness, type ReviewAction, type ReviewActionGroup } from "./reviewModel";
+import {
+  buildToolPresentation,
+  toolArgumentRecord,
+  toolStatusLabel,
+  type ToolPresentation
+} from "./toolModel";
+import {
+  buildTerminalPresentation,
+  terminalCommand,
+  type TerminalPresentation
+} from "./terminalModel";
+import { buildToolbarModel, type ToolbarAction } from "./toolbarModel";
+import type { MessageCardProps } from "./MessageCard";
+import type { TimelineScrollerItemView, TimelineScrollerProps } from "./TimelineScroller";
+import type { ToolCallCardLocation, ToolCallCardProps } from "./ToolCallCard";
+import type { EmptyStateAction, EmptyStateCardProps } from "./EmptyStateCard";
+import type { ApprovalCardAction, ApprovalCardDisclosure, ApprovalCardProps } from "./ApprovalCard";
+import type { ComposerCardProps } from "./ComposerCard";
+import type { EventCardAction, EventCardFact, EventCardProps } from "./EventCard";
+import type { HeaderBarProps } from "./HeaderBar";
+import type { InlineActionsProps } from "./InlineActions";
+import type { PayloadDisclosureProps } from "./PayloadDisclosure";
+import type { PlanCardProps } from "./PlanCard";
+import type { RawDetailsView } from "./RawDetails";
+import type { RecoveryBannerProps } from "./RecoveryBanner";
+import type { ResultDrawerProps, ResultDrawerWidget } from "./ResultDrawer";
+import type { ReviewDrawerProps } from "./ReviewDrawer";
+import type { TerminalCardProps, TerminalTranscriptRow } from "./TerminalCard";
+import type { ThoughtCardProps } from "./ThoughtCard";
+import type { TimelineGroupCardProps } from "./TimelineGroup";
+import type { TimelineNavigationProps } from "./TimelineNavigation";
 
 declare const acquireVsCodeApi: () => {
   postMessage(message: unknown): void;
@@ -35,7 +124,14 @@ interface WebviewState {
   sending?: boolean | undefined;
   provider?: string | undefined;
   providerId?: string | undefined;
-  providers?: Array<{ id: string; label: string; crabdbBacked?: boolean | undefined }> | undefined;
+  providers?:
+    | Array<{
+        id: string;
+        label: string;
+        crabdbBacked?: boolean | undefined;
+        supportsFromRef?: boolean | undefined;
+      }>
+    | undefined;
   acpSessionId?: string | undefined;
   persistedAcpSessionId?: string | undefined;
   acpStartMode?: "new" | "load" | "resume" | undefined;
@@ -67,24 +163,151 @@ interface TaskOverlapView {
   changedPaths: number;
 }
 
+type PromptAttachmentView = NonNullable<WebviewState["attachments"]>[number];
+
+interface ComposerStatus {
+  tone: "ready" | "context" | "running" | "waiting" | "warning";
+  label: string;
+  detail: string;
+}
+
+interface PendingDiffPreview {
+  id: string;
+  path: string;
+  oldText: string;
+  newText: string;
+  patch?: string | undefined;
+  additions?: number | undefined;
+  deletions?: number | undefined;
+  nodeId?: string | undefined;
+  title?: string | undefined;
+}
+
 const vscode = acquireVsCodeApi();
 const app = document.getElementById("app");
 const MAX_TEXT_CHARS = 60_000;
 const MAX_RAW_JSON_CHARS = 40_000;
 const MAX_INLINE_MEDIA_CHARS = 2_000_000;
 const MAX_TERMINAL_CHARS = 24_000;
+const FLOATING_DETAILS_SELECTOR = ".composer-controls,.header-details,.toolbar-capabilities";
+const DRAWER_FOCUSABLE_SELECTOR =
+  'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),audio[controls],video[controls],[tabindex]:not([tabindex="-1"])';
+const STREAM_RENDER_INTERVAL_MS = 50;
+let highlightModulePromise: Promise<typeof import("./highlight.js")> | undefined;
+let diffModelModulePromise: Promise<typeof import("./diffModel.js")> | undefined;
+let diffEnhancerModulePromise: Promise<typeof import("./diffEnhancer.js")> | undefined;
+let diffReviewDrawerModulePromise: Promise<typeof import("./diffReviewDrawer.js")> | undefined;
+let diffEnhancerModule: typeof import("./diffEnhancer.js") | undefined;
+let markdownModulePromise: Promise<typeof import("./markdownModel.js")> | undefined;
+let markdownModule: typeof import("./markdownModel.js") | undefined;
+let approvalCardModulePromise: Promise<typeof import("./ApprovalCard.js")> | undefined;
+let composerCardModulePromise: Promise<typeof import("./ComposerCard.js")> | undefined;
+let diffCardModulePromise: Promise<typeof import("./DiffCard.js")> | undefined;
+let emptyStateCardModulePromise: Promise<typeof import("./EmptyStateCard.js")> | undefined;
+let eventCardModulePromise: Promise<typeof import("./EventCard.js")> | undefined;
+let headerBarModulePromise: Promise<typeof import("./HeaderBar.js")> | undefined;
+let inlineActionsModulePromise: Promise<typeof import("./InlineActions.js")> | undefined;
+let messageCardModulePromise: Promise<typeof import("./MessageCard.js")> | undefined;
+let payloadDisclosureModulePromise: Promise<typeof import("./PayloadDisclosure.js")> | undefined;
+let planCardModulePromise: Promise<typeof import("./PlanCard.js")> | undefined;
+let recoveryBannerModulePromise: Promise<typeof import("./RecoveryBanner.js")> | undefined;
+let resultDrawerModulePromise: Promise<typeof import("./ResultDrawer.js")> | undefined;
+let resultDrawerModule: typeof import("./ResultDrawer.js") | undefined;
+let reviewDrawerModulePromise: Promise<typeof import("./ReviewDrawer.js")> | undefined;
+let terminalCardModulePromise: Promise<typeof import("./TerminalCard.js")> | undefined;
+let thoughtCardModulePromise: Promise<typeof import("./ThoughtCard.js")> | undefined;
+let timelineGroupModulePromise: Promise<typeof import("./TimelineGroup.js")> | undefined;
+let timelineNavigationModulePromise: Promise<typeof import("./TimelineNavigation.js")> | undefined;
+let timelineScrollerModulePromise: Promise<typeof import("./TimelineScroller.js")> | undefined;
+let toolCallCardModulePromise: Promise<typeof import("./ToolCallCard.js")> | undefined;
+let diffPreviewCounter = 0;
+let diffRenderEpoch = 0;
+let renderEpoch = 0;
+let renderTimeoutHandle: number | undefined;
+let renderAnimationFrameHandle: number | undefined;
+let renderScheduled = false;
+let lastRenderAt = 0;
+let pendingDiffPreviews: PendingDiffPreview[] = [];
+let approvalCardProps = new Map<string, ApprovalCardProps>();
+let composerCardProps: ComposerCardProps | undefined;
+let diffCardProps = new Map<string, DiffCardProps>();
+let emptyStateCardProps = new Map<string, EmptyStateCardProps>();
+let eventCardProps = new Map<string, EventCardProps>();
+let headerBarProps: HeaderBarProps | undefined;
+let inlineActionsProps = new Map<string, InlineActionsProps>();
+let messageCardProps = new Map<string, MessageCardProps>();
+let payloadDisclosureProps = new Map<string, PayloadDisclosureProps>();
+let planCardProps = new Map<string, PlanCardProps>();
+let recoveryBannerProps = new Map<string, RecoveryBannerProps>();
+let reviewDrawerProps: ReviewDrawerProps | undefined;
+let terminalCardProps = new Map<string, TerminalCardProps>();
+let thoughtCardProps = new Map<string, ThoughtCardProps>();
+let timelineGroupProps = new Map<string, TimelineGroupCardProps>();
+let timelineNavigationProps: TimelineNavigationProps | undefined;
+let timelineScrollerProps: TimelineScrollerProps | undefined;
+let toolCallCardProps = new Map<string, ToolCallCardProps>();
 let state: WebviewState = {
   nodes: []
 };
 let announcement = "";
 let composerDraft = "";
+let pendingTimelineSearchFocus = false;
+let payloadDisclosureCounter = 0;
+let inlineActionsCounter = 0;
+type ComposerSendMode = "fast" | "draft";
+const COMPOSER_SEND_MODES = new Set<ComposerSendMode>(["fast", "draft"]);
+const COMPOSER_PROMPT_PRESETS: Array<{ id: string; label: string; detail: string; text: string; icon: IconName }> = [
+  {
+    id: "implement",
+    label: "Implement",
+    detail: "Start a focused code change",
+    text: "Implement this change. First inspect the relevant files, then update the code and focused tests.",
+    icon: "tool"
+  },
+  {
+    id: "review",
+    label: "Review",
+    detail: "Look for bugs and gaps",
+    text: "Review the current changes for bugs, regressions, risky edge cases, and missing tests.",
+    icon: "review"
+  },
+  {
+    id: "test",
+    label: "Test",
+    detail: "Run and fix focused tests",
+    text: "Run the focused tests for this change. If anything fails, diagnose it and fix the issue.",
+    icon: "check"
+  },
+  {
+    id: "explain",
+    label: "Explain",
+    detail: "Summarize the current implementation",
+    text: "Explain how this part works, what changed recently, and the safest next step.",
+    icon: "message"
+  }
+];
+let composerSendMode: ComposerSendMode = "fast";
 let reviewVisible = false;
-const restoredState = vscode.getState() as { composerDraft?: string; reviewVisible?: boolean } | undefined;
+let timelineFilter: TimelineFilter = "all";
+let timelineQuery = "";
+let drawerRestoreFocus: HTMLElement | undefined;
+const restoredState = vscode.getState() as
+  | { composerDraft?: string; composerSendMode?: unknown; reviewVisible?: boolean; timelineFilter?: unknown; timelineQuery?: unknown }
+  | undefined;
 if (typeof restoredState?.composerDraft === "string") {
   composerDraft = restoredState.composerDraft;
 }
+if (isComposerSendMode(restoredState?.composerSendMode)) {
+  composerSendMode = restoredState.composerSendMode;
+}
 if (typeof restoredState?.reviewVisible === "boolean") {
   reviewVisible = restoredState.reviewVisible;
+}
+if (isTimelineFilter(restoredState?.timelineFilter)) {
+  timelineFilter = restoredState.timelineFilter;
+}
+if (typeof restoredState?.timelineQuery === "string") {
+  timelineQuery = restoredState.timelineQuery;
 }
 
 window.addEventListener("message", (event: MessageEvent) => {
@@ -115,19 +338,17 @@ window.addEventListener("message", (event: MessageEvent) => {
       announcement = "Prompt running.";
     }
     persistWebviewState();
-    render();
+    scheduleRender();
     return;
   }
 
   if (message.type === "error") {
-    announcement = String(message.message || "Unknown error");
-    toast(announcement, "error");
+    announceToast(String(message.message || "Unknown error"), "error");
     return;
   }
 
   if (message.type === "status") {
-    announcement = String(message.message || "Status updated");
-    toast(announcement, "status");
+    announceToast(String(message.message || "Status updated"), "status");
     return;
   }
 
@@ -141,13 +362,20 @@ window.addEventListener("message", (event: MessageEvent) => {
     return;
   }
 
-  if (["diff", "applyDryRun", "rewind", "queueMerge", "laneTest", "laneEval"].includes(message.type)) {
+  if (message.type === "diff") {
+    void openDiffReviewDrawer(message.result);
+    return;
+  }
+
+  if (["applyDryRun", "rewind", "queueMerge", "laneTest", "laneEval"].includes(message.type)) {
     openJsonDrawer(message.type, message.result);
   }
 });
 
 document.addEventListener("click", (event) => {
   const target = event.target as HTMLElement | null;
+  const activeFloatingDetails = target?.closest<HTMLElement>(FLOATING_DETAILS_SELECTOR);
+  closeFloatingDetails(activeFloatingDetails || undefined);
   const action = target?.closest<HTMLElement>("[data-action]");
   if (!action) {
     return;
@@ -190,8 +418,20 @@ document.addEventListener("click", (event) => {
     if (reviewVisible) {
       focusReview();
     }
+  } else if (name === "setTimelineFilter") {
+    if (isTimelineFilter(action.dataset.timelineFilter)) {
+      timelineFilter = action.dataset.timelineFilter;
+      persistWebviewState();
+      render();
+    }
+  } else if (name === "clearTimelineSearch") {
+    clearTimelineSearch(true);
   } else if (name === "focusReview") {
     focusReview();
+  } else if (name === "focusTranscript") {
+    focusTranscript();
+  } else if (name === "focusComposer") {
+    focusComposer();
   } else if (name === "openSettings") {
     vscode.postMessage({ type: "openSettings" });
   } else if (name === "startFollowUp") {
@@ -203,12 +443,24 @@ document.addEventListener("click", (event) => {
     vscode.postMessage({ type: "openNodeDiff", nodeId: action.dataset.nodeId });
   } else if (name === "openTerminal") {
     vscode.postMessage({ type: "openTerminal", nodeId: action.dataset.nodeId });
-  } else if (name === "copyTerminalOutput") {
-    void copyTerminalOutput(action);
+  } else if (name === "focusToolDiff") {
+    focusToolDiff(action);
+  } else if (name === "inspectToolDetails") {
+    inspectToolDetails(action);
+  } else if (name === "copyCheckpoint") {
+    void copyCheckpoint(action);
   } else if (name === "copyCode") {
     void copyCode(action);
+  } else if (name === "copyDiff") {
+    void copyDiff(action);
   } else if (name === "openTextPreview") {
     openTextPreview(action);
+  } else if (name === "openDiffPreview") {
+    openDiffPreview(action);
+  } else if (name === "selectDiffReviewFile") {
+    selectDiffReviewFile(action.dataset.path || "");
+  } else if (name === "insertDiffSuggestion") {
+    insertDiffSuggestion(action);
   } else if (name === "openMediaPreview") {
     openMediaPreview(action);
   } else if (name === "openLocation") {
@@ -221,13 +473,19 @@ document.addEventListener("click", (event) => {
   } else if (name === "openResource") {
     vscode.postMessage({ type: "openResource", uri: action.dataset.uri });
   } else if (name === "rewind") {
-    vscode.postMessage({ type: "rewind", target: "before-last-turn" });
+    vscode.postMessage({ type: "rewind", target: action.dataset.target || "before-last-turn" });
   } else if (name === "preserveFailedAttempt") {
     vscode.postMessage({ type: "preserveFailedAttempt" });
   } else if (name === "removeTask") {
     vscode.postMessage({ type: "removeTask" });
   } else if (name === "removeAttachment") {
     vscode.postMessage({ type: "removeAttachment", attachmentId: action.dataset.attachmentId });
+  } else if (name === "insertPromptPreset") {
+    insertPromptPreset(action.dataset.presetId || "");
+  } else if (name === "clearComposerDraft") {
+    clearComposerDraft();
+  } else if (name === "setComposerSendMode") {
+    setComposerSendMode(action.dataset.sendMode);
   } else if (name === "attachSelection") {
     vscode.postMessage({ type: "attachSelection" });
   } else if (name === "attachFile") {
@@ -251,11 +509,15 @@ document.addEventListener("click", (event) => {
 
 document.addEventListener("input", (event) => {
   const target = event.target as HTMLInputElement | HTMLTextAreaElement | null;
-  if (target?.classList.contains("composer-input")) {
+  if (target instanceof HTMLTextAreaElement && target.classList.contains("composer-input")) {
     composerDraft = target.value;
     persistWebviewState();
-  } else if (target?.classList.contains("terminal-search") && target instanceof HTMLInputElement) {
-    filterTerminalOutput(target);
+    resizeComposerInput(target);
+    syncComposerAffordances();
+  } else if (target instanceof HTMLInputElement && target.classList.contains("timeline-search-input")) {
+    timelineQuery = target.value;
+    persistWebviewState();
+    render();
   }
 });
 
@@ -289,6 +551,13 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   const target = event.target as HTMLElement | null;
+  if (handleJsonDrawerKeydown(event)) {
+    return;
+  }
+  if (event.key === "Escape" && closeFloatingDetails(undefined, true)) {
+    event.preventDefault();
+    return;
+  }
   const composerInput = target?.closest<HTMLTextAreaElement>(".composer-input");
   if (
     composerInput &&
@@ -296,14 +565,17 @@ document.addEventListener("keydown", (event) => {
     !event.shiftKey &&
     !event.altKey &&
     !event.ctrlKey &&
-    !event.metaKey
+    !event.metaKey &&
+    composerSendMode === "fast"
   ) {
     event.preventDefault();
     sendPrompt();
     return;
   }
-  if (event.key === "Escape") {
-    closeJsonDrawer();
+  const timelineSearchInput = target?.closest<HTMLInputElement>(".timeline-search-input");
+  if (timelineSearchInput && event.key === "Escape" && (timelineQuery || timelineFilter !== "all")) {
+    event.preventDefault();
+    clearTimelineSearch(true);
     return;
   }
   if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
@@ -329,52 +601,222 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-render();
-vscode.postMessage({ type: "ready" });
+interface RenderFocusSnapshot {
+  composerFocused: boolean;
+  timelineSearchFocused: boolean;
+  selectionStart?: number | null | undefined;
+  selectionEnd?: number | null | undefined;
+  searchSelectionStart?: number | null | undefined;
+  searchSelectionEnd?: number | null | undefined;
+  wasPinnedToBottom: boolean;
+  previousScrollTop: number;
+}
+
+interface RenderPass {
+  renderEpoch: number;
+  diffEpoch: number;
+}
+
+function scheduleRender(): void {
+  if (renderScheduled) {
+    return;
+  }
+  renderScheduled = true;
+  const elapsed = Date.now() - lastRenderAt;
+  const delay = Math.max(0, STREAM_RENDER_INTERVAL_MS - elapsed);
+  renderTimeoutHandle = window.setTimeout(() => {
+    renderTimeoutHandle = undefined;
+    renderAnimationFrameHandle = window.requestAnimationFrame(() => {
+      renderAnimationFrameHandle = undefined;
+      renderStateUpdate();
+    });
+  }, delay);
+}
+
+function clearScheduledRender(): void {
+  if (renderTimeoutHandle !== undefined) {
+    window.clearTimeout(renderTimeoutHandle);
+    renderTimeoutHandle = undefined;
+  }
+  if (renderAnimationFrameHandle !== undefined) {
+    window.cancelAnimationFrame(renderAnimationFrameHandle);
+    renderAnimationFrameHandle = undefined;
+  }
+  renderScheduled = false;
+}
+
+function captureRenderFocus(): RenderFocusSnapshot {
+  const active = document.activeElement as HTMLTextAreaElement | HTMLInputElement | null;
+  const composerFocused = Boolean(active?.classList.contains("composer-input"));
+  const timelineSearchFocused = Boolean(active?.classList.contains("timeline-search-input"));
+  const selectionStart = composerFocused ? active?.selectionStart : undefined;
+  const selectionEnd = composerFocused ? active?.selectionEnd : undefined;
+  const searchSelectionStart = timelineSearchFocused ? active?.selectionStart : undefined;
+  const searchSelectionEnd = timelineSearchFocused ? active?.selectionEnd : undefined;
+  const oldTimeline = document.querySelector<HTMLElement>(".timeline");
+  const wasPinnedToBottom = oldTimeline
+    ? oldTimeline.scrollHeight - oldTimeline.scrollTop - oldTimeline.clientHeight < 48
+    : true;
+  const previousScrollTop = oldTimeline?.scrollTop ?? 0;
+
+  return {
+    composerFocused,
+    timelineSearchFocused,
+    selectionStart,
+    selectionEnd,
+    searchSelectionStart,
+    searchSelectionEnd,
+    wasPinnedToBottom,
+    previousScrollTop
+  };
+}
+
+function prepareRenderProps(visibleNodes: RenderNode[]): RenderPass {
+  pendingDiffPreviews = [];
+  approvalCardProps = new Map<string, ApprovalCardProps>();
+  composerCardProps = undefined;
+  diffCardProps = new Map<string, DiffCardProps>();
+  emptyStateCardProps = new Map<string, EmptyStateCardProps>();
+  eventCardProps = new Map<string, EventCardProps>();
+  headerBarProps = undefined;
+  inlineActionsProps = new Map<string, InlineActionsProps>();
+  messageCardProps = new Map<string, MessageCardProps>();
+  payloadDisclosureProps = new Map<string, PayloadDisclosureProps>();
+  planCardProps = new Map<string, PlanCardProps>();
+  recoveryBannerProps = new Map<string, RecoveryBannerProps>();
+  reviewDrawerProps = undefined;
+  terminalCardProps = new Map<string, TerminalCardProps>();
+  thoughtCardProps = new Map<string, ThoughtCardProps>();
+  timelineGroupProps = new Map<string, TimelineGroupCardProps>();
+  timelineNavigationProps = undefined;
+  toolCallCardProps = new Map<string, ToolCallCardProps>();
+  diffPreviewCounter = 0;
+  timelineScrollerProps = {
+    items: timelineScrollerItems(visibleNodes)
+  };
+  cleanupDiffEnhancements();
+  return {
+    renderEpoch: ++renderEpoch,
+    diffEpoch: ++diffRenderEpoch
+  };
+}
 
 function render(): void {
+  clearScheduledRender();
+  lastRenderAt = Date.now();
   if (!app) {
     return;
   }
 
   const task = state.task;
   const visibleNodes = visibleTimelineNodes();
-  const active = document.activeElement as HTMLTextAreaElement | null;
-  const composerFocused = Boolean(active?.classList.contains("composer-input"));
-  const selectionStart = composerFocused ? active?.selectionStart : undefined;
-  const selectionEnd = composerFocused ? active?.selectionEnd : undefined;
-  const oldTimeline = document.querySelector<HTMLElement>(".timeline");
-  const wasPinnedToBottom = oldTimeline
-    ? oldTimeline.scrollHeight - oldTimeline.scrollTop - oldTimeline.clientHeight < 48
-    : true;
-  const previousScrollTop = oldTimeline?.scrollTop ?? 0;
+  const focus = captureRenderFocus();
+  const pass = prepareRenderProps(visibleNodes);
+  const headerHtml = header(task);
+  const timelineNavigationHtml = timelineNavigation(visibleNodes);
+  const composerHtml = composer();
+  const reviewHtml = reviewVisible ? reviewDrawer(task) : "";
   app.innerHTML = `
     <section class="shell ${reviewVisible ? "review-open" : ""}">
-      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(announcement)}</div>
+      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-live-announcement>${escapeHtml(announcement)}</div>
       ${skipLinks()}
-      ${header(task)}
-      <section id="timeline" class="timeline" aria-label="Agent transcript" tabindex="-1">
-        ${state.providerFailure ? providerFailureBanner(state.providerFailure) : ""}
-        ${overlapWarningBanner()}
-        ${visibleNodes.length ? visibleNodes.map(renderNode).join("") : emptyTimeline()}
+      ${headerHtml}
+      <section class="timeline-shell" aria-label="Transcript workspace">
+        ${timelineNavigationHtml}
+        <div class="timeline-scroller-root" data-timeline-scroller-root></div>
       </section>
-      ${composer()}
-      ${reviewVisible ? reviewDrawer(task) : ""}
+      ${composerHtml}
+      ${reviewHtml}
     </section>
   `;
-  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
-  if (input) {
-    input.value = composerDraft;
-    if (composerFocused) {
-      input.focus();
-      if (selectionStart !== undefined && selectionEnd !== undefined) {
-        input.setSelectionRange(selectionStart, selectionEnd);
-      }
-    }
+  hydrateExistingShell(pass, focus);
+}
+
+function renderStateUpdate(): void {
+  clearScheduledRender();
+  lastRenderAt = Date.now();
+  if (!app || !existingShellCanHydrate()) {
+    render();
+    return;
   }
-  const timeline = document.querySelector<HTMLElement>(".timeline");
-  if (timeline) {
-    timeline.scrollTop = wasPinnedToBottom ? timeline.scrollHeight : previousScrollTop;
+
+  const task = state.task;
+  const visibleNodes = visibleTimelineNodes();
+  const focus = captureRenderFocus();
+  const pass = prepareRenderProps(visibleNodes);
+  header(task);
+  timelineNavigation(visibleNodes);
+  composer();
+  if (reviewVisible) {
+    reviewDrawer(task);
+  }
+  hydrateExistingShell(pass, focus);
+}
+
+function existingShellCanHydrate(): boolean {
+  return Boolean(
+    document.querySelector("[data-header-bar-root]") &&
+      document.querySelector("[data-timeline-navigation-root]") &&
+      document.querySelector("[data-timeline-scroller-root]") &&
+      document.querySelector("[data-composer-card-root]")
+  );
+}
+
+function isCurrentRender(epoch: number): boolean {
+  return epoch === renderEpoch;
+}
+
+function hydrateExistingShell(pass: RenderPass, focus: RenderFocusSnapshot): void {
+  const restoreTimelineSearchFocus = focus.timelineSearchFocused || pendingTimelineSearchFocus;
+  pendingTimelineSearchFocus = false;
+  syncLiveAnnouncement();
+  void (async () => {
+    await Promise.all([
+      hydrateHeaderBars(),
+      hydrateTimelineNavigation().then(() => {
+        restoreTimelineSearchInput({
+          searchFocused: restoreTimelineSearchFocus,
+          selectionStart: focus.searchSelectionStart,
+          selectionEnd: focus.searchSelectionEnd
+        });
+      }),
+      hydrateComposerCards().then(() => {
+        restoreComposerInput({
+          composerFocused: focus.composerFocused,
+          selectionStart: focus.selectionStart,
+          selectionEnd: focus.selectionEnd
+        });
+      })
+    ]);
+    if (!isCurrentRender(pass.renderEpoch)) {
+      return;
+    }
+    await hydrateTimelineScroller();
+    if (!isCurrentRender(pass.renderEpoch)) {
+      return;
+    }
+    const timeline = document.querySelector<HTMLElement>(".timeline");
+    if (timeline) {
+      timeline.scrollTop = focus.wasPinnedToBottom ? timeline.scrollHeight : focus.previousScrollTop;
+    }
+    await hydrateReactIslands();
+    if (!isCurrentRender(pass.renderEpoch)) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      if (!isCurrentRender(pass.renderEpoch)) {
+        return;
+      }
+      void highlightCodeBlocks();
+      void hydrateDiffPreviews(pass.diffEpoch);
+    });
+  })();
+}
+
+function syncLiveAnnouncement(): void {
+  const liveRegion = document.querySelector<HTMLElement>("[data-live-announcement]");
+  if (liveRegion) {
+    liveRegion.textContent = announcement;
   }
 }
 
@@ -389,27 +831,289 @@ function skipLinks(): string {
   `;
 }
 
+function restoreComposerInput({
+  composerFocused,
+  selectionEnd,
+  selectionStart
+}: {
+  composerFocused: boolean;
+  selectionEnd?: number | null | undefined;
+  selectionStart?: number | null | undefined;
+}): void {
+  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
+  if (input) {
+    input.value = composerDraft;
+    resizeComposerInput(input);
+    if (composerFocused) {
+      input.focus();
+      if (selectionStart !== undefined && selectionEnd !== undefined) {
+        input.setSelectionRange(selectionStart, selectionEnd);
+      }
+    }
+  }
+  syncComposerAffordances();
+}
+
+async function hydrateComposerCards(): Promise<void> {
+  if (!document.querySelector("[data-composer-card-root]")) {
+    return;
+  }
+  composerCardModulePromise ??= import("./ComposerCard.js");
+  const module = await composerCardModulePromise;
+  module.mountComposerCards({
+    getProps: (id) => (id === "composer" ? composerCardProps : undefined)
+  });
+}
+
+async function hydrateHeaderBars(): Promise<void> {
+  if (!document.querySelector("[data-header-bar-root]")) {
+    return;
+  }
+  headerBarModulePromise ??= import("./HeaderBar.js");
+  const module = await headerBarModulePromise;
+  module.mountHeaderBars({
+    getProps: (id) => (id === "header" ? headerBarProps : undefined)
+  });
+}
+
+async function hydrateTimelineNavigation(): Promise<void> {
+  if (!document.querySelector("[data-timeline-navigation-root]")) {
+    return;
+  }
+  timelineNavigationModulePromise ??= import("./TimelineNavigation.js");
+  const module = await timelineNavigationModulePromise;
+  module.mountTimelineNavigation({
+    getProps: (id) => (id === "timeline" ? timelineNavigationProps : undefined)
+  });
+}
+
+async function hydrateToolCallCards(): Promise<void> {
+  if (!document.querySelector("[data-tool-call-card-root]")) {
+    return;
+  }
+  toolCallCardModulePromise ??= import("./ToolCallCard.js");
+  const module = await toolCallCardModulePromise;
+  module.mountToolCallCards({
+    getProps: (nodeId) => toolCallCardProps.get(nodeId),
+    onOpenLocation: ({ path, line }) => {
+      vscode.postMessage({
+        type: "openLocation",
+        path,
+        line
+      });
+    }
+  });
+}
+
+async function hydrateMessageCards(): Promise<void> {
+  if (!document.querySelector("[data-message-card-root]")) {
+    return;
+  }
+  messageCardModulePromise ??= import("./MessageCard.js");
+  const module = await messageCardModulePromise;
+  module.mountMessageCards({
+    getProps: (nodeId) => messageCardProps.get(nodeId)
+  });
+}
+
+async function hydratePayloadDisclosures(): Promise<void> {
+  if (!document.querySelector("[data-payload-disclosure-root]")) {
+    payloadDisclosureModulePromise?.then((module) => module.cleanupDetachedPayloadDisclosures()).catch(() => undefined);
+    return;
+  }
+  payloadDisclosureModulePromise ??= import("./PayloadDisclosure.js");
+  const module = await payloadDisclosureModulePromise;
+  module.mountPayloadDisclosures({
+    getProps: (id) => payloadDisclosureProps.get(id)
+  });
+  window.requestAnimationFrame(() => {
+    module.mountPayloadDisclosures({
+      getProps: (id) => payloadDisclosureProps.get(id)
+    });
+  });
+}
+
+async function hydrateInlineActions(): Promise<void> {
+  if (!document.querySelector("[data-inline-actions-root]")) {
+    inlineActionsModulePromise?.then((module) => module.cleanupDetachedInlineActions()).catch(() => undefined);
+    return;
+  }
+  inlineActionsModulePromise ??= import("./InlineActions.js");
+  const module = await inlineActionsModulePromise;
+  module.mountInlineActions({
+    getProps: (id) => inlineActionsProps.get(id)
+  });
+  window.requestAnimationFrame(() => {
+    module.mountInlineActions({
+      getProps: (id) => inlineActionsProps.get(id)
+    });
+  });
+}
+
+async function hydratePlanCards(): Promise<void> {
+  if (!document.querySelector("[data-plan-card-root]")) {
+    return;
+  }
+  planCardModulePromise ??= import("./PlanCard.js");
+  const module = await planCardModulePromise;
+  module.mountPlanCards({
+    getProps: (nodeId) => planCardProps.get(nodeId)
+  });
+}
+
+async function hydrateEmptyStateCards(): Promise<void> {
+  if (!document.querySelector("[data-empty-state-card-root]")) {
+    return;
+  }
+  emptyStateCardModulePromise ??= import("./EmptyStateCard.js");
+  const module = await emptyStateCardModulePromise;
+  module.mountEmptyStateCards({
+    getProps: (id) => emptyStateCardProps.get(id)
+  });
+}
+
+async function hydrateDiffCards(): Promise<void> {
+  if (!document.querySelector("[data-diff-card-root]")) {
+    return;
+  }
+  diffCardModulePromise ??= import("./DiffCard.js");
+  const module = await diffCardModulePromise;
+  module.mountDiffCards({
+    getProps: (nodeId) => diffCardProps.get(nodeId)
+  });
+}
+
+async function hydrateEventCards(): Promise<void> {
+  if (!document.querySelector("[data-event-card-root]")) {
+    return;
+  }
+  eventCardModulePromise ??= import("./EventCard.js");
+  const module = await eventCardModulePromise;
+  module.mountEventCards({
+    getProps: (nodeId) => eventCardProps.get(nodeId)
+  });
+}
+
+async function hydrateApprovalCards(): Promise<void> {
+  if (!document.querySelector("[data-approval-card-root]")) {
+    return;
+  }
+  approvalCardModulePromise ??= import("./ApprovalCard.js");
+  const module = await approvalCardModulePromise;
+  module.mountApprovalCards({
+    getProps: (nodeId) => approvalCardProps.get(nodeId)
+  });
+}
+
+async function hydrateTerminalCards(): Promise<void> {
+  if (!document.querySelector("[data-terminal-card-root]")) {
+    return;
+  }
+  terminalCardModulePromise ??= import("./TerminalCard.js");
+  const module = await terminalCardModulePromise;
+  module.mountTerminalCards({
+    getProps: (nodeId) => terminalCardProps.get(nodeId)
+  });
+}
+
+async function hydrateThoughtCards(): Promise<void> {
+  if (!document.querySelector("[data-thought-card-root]")) {
+    return;
+  }
+  thoughtCardModulePromise ??= import("./ThoughtCard.js");
+  const module = await thoughtCardModulePromise;
+  module.mountThoughtCards({
+    getProps: (nodeId) => thoughtCardProps.get(nodeId)
+  });
+}
+
+async function hydrateTimelineGroups(): Promise<void> {
+  if (!document.querySelector("[data-timeline-group-root]")) {
+    return;
+  }
+  timelineGroupModulePromise ??= import("./TimelineGroup.js");
+  const module = await timelineGroupModulePromise;
+  module.mountTimelineGroups({
+    getProps: (id) => timelineGroupProps.get(id)
+  });
+}
+
+async function hydrateRecoveryBanners(): Promise<void> {
+  if (!document.querySelector("[data-recovery-banner-root]")) {
+    return;
+  }
+  recoveryBannerModulePromise ??= import("./RecoveryBanner.js");
+  const module = await recoveryBannerModulePromise;
+  module.mountRecoveryBanners({
+    getProps: (id) => recoveryBannerProps.get(id)
+  });
+}
+
+async function hydrateReviewDrawers(): Promise<void> {
+  if (!document.querySelector("[data-review-drawer-root]")) {
+    return;
+  }
+  reviewDrawerModulePromise ??= import("./ReviewDrawer.js");
+  const module = await reviewDrawerModulePromise;
+  module.mountReviewDrawers({
+    getProps: (id) => (id === "review" ? reviewDrawerProps : undefined)
+  });
+}
+
+async function hydrateTimelineScroller(): Promise<void> {
+  const element = document.querySelector<HTMLElement>("[data-timeline-scroller-root]");
+  if (!element || !timelineScrollerProps) {
+    return;
+  }
+  timelineScrollerModulePromise ??= import("./TimelineScroller.js");
+  const module = await timelineScrollerModulePromise;
+  module.cleanupTimelineScroller();
+  module.mountTimelineScroller(element, timelineScrollerProps);
+}
+
+async function hydrateReactIslands(): Promise<void> {
+  await hydrateTimelineGroups();
+  await Promise.all([
+    hydrateApprovalCards(),
+    hydrateDiffCards(),
+    hydrateEmptyStateCards(),
+    hydrateEventCards(),
+    hydrateMessageCards(),
+    hydratePlanCards(),
+    hydrateRecoveryBanners(),
+    hydrateReviewDrawers(),
+    hydrateTerminalCards(),
+    hydrateThoughtCards(),
+    hydrateToolCallCards()
+  ]);
+  await hydratePayloadDisclosures();
+  await hydrateInlineActions();
+}
+
 function providerFailureBanner(failure: NonNullable<WebviewState["providerFailure"]>): string {
   const when = failure.occurredAt ? new Date(failure.occurredAt).toLocaleTimeString() : "";
-  return `
-    <article class="recovery-banner" role="alert" aria-live="assertive">
-      <div>
-        <div class="card-chrome">
-          <span class="role">Agent interrupted</span>
-          ${failure.code !== undefined && failure.code !== null ? `<span class="tool-status">exit ${failure.code}</span>` : ""}
-          ${when ? `<span class="tool-status">${escapeHtml(when)}</span>` : ""}
-        </div>
-        <h2>${escapeHtml(failure.message)}</h2>
-        <p>Partial transcript and lane changes remain in CrabDB. Review the task or start a follow-up from the latest checkpoint.</p>
-        ${failure.detail ? `<p class="muted">${escapeHtml(failure.detail)}</p>` : ""}
-      </div>
-      <div class="recovery-actions">
-        <button data-action="focusReview">Open review</button>
-        <button class="primary" data-action="startFollowUp">Start follow-up</button>
-        <button data-action="showAcpLogs">Show logs</button>
-      </div>
-    </article>
-  `;
+  const id = "provider-failure";
+  recoveryBannerProps.set(id, {
+    id,
+    kind: "failure",
+    role: "alert",
+    ariaLive: "assertive",
+    eyebrow: "Agent interrupted",
+    title: failure.message,
+    description: "Partial transcript and lane changes remain in CrabDB. Review the task or start a follow-up from the latest checkpoint.",
+    detail: failure.detail,
+    badges: [
+      failure.code !== undefined && failure.code !== null ? `exit ${failure.code}` : "",
+      when
+    ].filter(Boolean),
+    actions: [
+      { action: "focusReview", label: "Open review", tone: "review" },
+      { action: "startFollowUp", label: "Start follow-up", tone: "primary" },
+      { action: "showAcpLogs", label: "Show logs", tone: "provider" }
+    ],
+    paths: []
+  });
+  return recoveryBannerRoot(id);
 }
 
 function overlapWarningBanner(): string {
@@ -419,102 +1123,435 @@ function overlapWarningBanner(): string {
   }
   const sharedCount = uniqueStrings(overlaps.flatMap((overlap) => overlap.sharedPaths)).length;
   const top = overlaps[0];
-  return `
-    <article class="overlap-banner" role="status" aria-live="polite">
-      <div>
-        <div class="card-chrome">
-          <span class="role">Parallel work overlap</span>
-          <span class="tool-status">${overlaps.length} task${overlaps.length === 1 ? "" : "s"}</span>
-          <span class="tool-status">${sharedCount} shared path${sharedCount === 1 ? "" : "s"}</span>
-        </div>
-        <h2>${escapeHtml(top ? `${top.title} also changes ${top.sharedPaths[0] || "this task's files"}` : "Another task changes the same files")}</h2>
-        <p>Compare tasks or refresh CrabDB state before applying this lane.</p>
-        <div class="overlap-paths">
-          ${overlaps
-            .slice(0, 3)
-            .map(
-              (overlap) => `
-                <span>
-                  <b>${escapeHtml(shortLabel(overlap.title))}</b>
-                  ${escapeHtml(overlap.sharedPaths.slice(0, 3).map(shortLabel).join(", "))}
-                </span>
-              `
-            )
-            .join("")}
-        </div>
-      </div>
-      <div class="recovery-actions">
-        <button data-action="compareTasks">Compare tasks</button>
-        <button data-action="refresh">Refresh</button>
-        <button data-action="queueMerge">Queue merge</button>
-      </div>
-    </article>
-  `;
+  const id = "task-overlap";
+  recoveryBannerProps.set(id, {
+    id,
+    kind: "overlap",
+    role: "status",
+    ariaLive: "polite",
+    eyebrow: "Parallel work overlap",
+    title: top ? `${top.title} also changes ${top.sharedPaths[0] || "this task's files"}` : "Another task changes the same files",
+    description: "Compare tasks or refresh CrabDB state before applying this lane.",
+    badges: [
+      `${overlaps.length} task${overlaps.length === 1 ? "" : "s"}`,
+      `${sharedCount} shared path${sharedCount === 1 ? "" : "s"}`
+    ],
+    actions: [
+      { action: "compareTasks", label: "Compare tasks", tone: "provider" },
+      { action: "refresh", label: "Refresh", tone: "lane" },
+      { action: "queueMerge", label: "Queue merge", tone: "lane" }
+    ],
+    paths: overlaps.slice(0, 3).map((overlap) => ({
+      id: overlap.taskId,
+      title: shortLabel(overlap.title),
+      labels: overlap.sharedPaths.slice(0, 3).map(shortLabel).join(", ")
+    }))
+  });
+  return recoveryBannerRoot(id);
+}
+
+function recoveryBannerRoot(id: string): string {
+  return `<div class="recovery-banner-react-root" data-recovery-banner-root data-recovery-banner-id="${escapeHtml(id)}"></div>`;
+}
+
+function timelineScrollerItems(nodes: RenderNode[]): TimelineScrollerItemView[] {
+  const items: TimelineScrollerItemView[] = [];
+  if (state.providerFailure) {
+    items.push({
+      id: "provider-failure",
+      className: "timeline-scroller-row-recovery",
+      html: providerFailureBanner(state.providerFailure)
+    });
+  }
+  const overlap = overlapWarningBanner();
+  if (overlap) {
+    items.push({
+      id: "task-overlap",
+      className: "timeline-scroller-row-recovery",
+      html: overlap
+    });
+  }
+  if (!nodes.length) {
+    items.push({
+      id: "timeline-empty",
+      className: "timeline-scroller-row-empty",
+      html: emptyTimeline()
+    });
+    return items;
+  }
+  items.push(...renderTimeline(nodes));
+  return items;
 }
 
 function header(task: WebviewState["task"]): string {
   const status = task?.status || "new";
+  const showStatusPill = !["new", "ready"].includes(status);
   const changed = task?.changedPaths?.length || 0;
-  const usage = state.nodes.find((node) => node.kind === "usage") as Extract<RenderNode, { kind: "usage" }> | undefined;
+  const usage = currentUsageNode();
   const modeLabel = currentModeLabel();
   const configCount = currentConfigOptions().length;
   const sessionState = sessionStateLabel();
-  const providerTitle = providerSessionTitle(task?.title);
   const coordination = coordinationSummaryFromSources(task, state.taskView);
+  const currentProvider = currentProviderProfile();
+  const toolbar = buildToolbarModel({
+    taskStatus: status,
+    lane: task?.lane,
+    changedPaths: changed,
+    providerLabel: state.provider || currentProvider?.label || task?.provider,
+    providerCrabdbBacked: currentProvider?.crabdbBacked,
+    sending: state.sending,
+    permissionPending: state.permissionPending,
+    providerFailure: Boolean(state.providerFailure),
+    supportsFromRef: currentProvider?.supportsFromRef,
+    reviewVisible,
+    sessionLabel: sessionState?.label,
+    sessionTone: sessionState?.tone,
+    acpSessionId: state.acpSessionId || state.persistedAcpSessionId,
+    nextAction: task?.nextAction,
+    modeLabel,
+    configCount,
+    commandCount: currentCommands().length,
+    coordinationLabels: coordination.labels,
+    coordinationSeverity: coordination.severity,
+    capabilities: state.capabilities?.promptCapabilities
+  });
+  const reviewLabel = reviewVisible ? "Hide review" : "Open review";
+  headerBarProps = {
+    id: "header",
+    title: task?.title || "New agent task",
+    status,
+    showStatusPill,
+    toolbar,
+    usage: usage ? { used: usage.used, size: usage.size } : undefined,
+    detailsIconHtml: iconSvg("tool"),
+    capabilitiesIconHtml: iconSvg("tool"),
+    primaryActionIconHtml: iconSvg(toolbarActionIcon(toolbar.primaryAction.action)),
+    inspectActions: [
+      {
+        action: "toggleReview",
+        label: reviewLabel,
+        iconHtml: iconSvg("review"),
+        active: reviewVisible,
+        ariaPressed: reviewVisible,
+        ariaExpanded: reviewVisible,
+        ariaControls: "review"
+      },
+      { action: "openDiff", label: "Open diff", iconHtml: iconSvg("diff") },
+      { action: "openSettings", label: "Open CrabDB settings", iconHtml: iconSvg("settings") }
+    ],
+    runActions: [
+      { action: "refresh", label: "Refresh task", iconHtml: iconSvg("refresh") },
+      { action: "cancel", label: "Cancel current turn", iconHtml: iconSvg("stop"), disabled: !state.sending && !state.permissionPending }
+    ]
+  };
   return `
     <header class="chat-header">
-      <div class="title-block">
-        <div class="eyebrow">
-          <span class="provider">${escapeHtml(state.provider || task?.provider || "provider")}</span>
-          <span class="status status-${escapeClass(status)}">${escapeHtml(status)}</span>
-          ${state.acpSessionId ? `<span class="muted">Session ${escapeHtml(state.acpSessionId)}</span>` : ""}
-          ${sessionState ? `<span class="status status-${escapeClass(sessionState.tone)}">${escapeHtml(sessionState.label)}</span>` : ""}
-        </div>
-        <h1>${escapeHtml(task?.title || "New agent task")}</h1>
-        ${providerTitle ? `<p class="provider-title">Provider session: ${escapeHtml(providerTitle)}</p>` : ""}
-        <div class="meta-row">
-          <span>Lane ${escapeHtml(task?.lane || "pending")}</span>
-          <span>${changed} changed path${changed === 1 ? "" : "s"}</span>
-          ${modeLabel ? `<span>Mode ${escapeHtml(modeLabel)}</span>` : ""}
-          ${configCount ? `<span>${configCount} config option${configCount === 1 ? "" : "s"}</span>` : ""}
-          ${coordination.labels.slice(0, 3).map((label) => `<span class="coordination-chip coordination-${escapeClass(coordination.severity)}">${escapeHtml(label)}</span>`).join("")}
-          ${task?.nextAction ? `<span>${escapeHtml(task.nextAction)}</span>` : ""}
-        </div>
-      </div>
-      <div class="header-actions">
-        ${usage ? contextMeter(usage.used, usage.size) : ""}
-        ${iconButton("toggleReview", reviewVisible ? "Hide review" : "Open review", "review", {
-          className: reviewVisible ? "active" : "",
-          attrs: `aria-pressed="${reviewVisible ? "true" : "false"}"`
-        })}
-        ${iconButton("refresh", "Refresh task", "refresh")}
-        ${iconButton("openDiff", "Open diff", "diff")}
-        ${iconButton("openSettings", "Open CrabDB settings", "settings")}
-        ${iconButton("dryRunApply", "Dry-run apply", "check", { className: "primary" })}
-        ${iconButton("cancel", "Cancel current turn", "stop", { className: "danger", disabled: !state.sending && !state.permissionPending })}
-      </div>
+      <div class="header-bar-react-root" data-header-bar-root data-header-bar-id="header"></div>
     </header>
   `;
 }
 
-function contextMeter(used: number, size: number): string {
-  const pct = size > 0 ? Math.min(100, Math.round((used / size) * 100)) : 0;
-  const tone = pct >= 90 ? "risk" : pct >= 70 ? "review" : "ok";
-  return `
-    <div class="context-meter" title="${used} / ${size} tokens">
-      <span>${pct}%</span>
-      <progress class="meter ${tone}" value="${pct}" max="100" aria-label="Context usage ${pct}%"></progress>
-    </div>
-  `;
+function toolbarActionIcon(action: ToolbarAction["action"]): IconName {
+  switch (action) {
+    case "cancel":
+      return "stop";
+    case "dryRunApply":
+      return "check";
+    case "focusReview":
+      return "review";
+    case "focusTranscript":
+      return "tree";
+    case "refresh":
+      return "refresh";
+    case "startFollowUp":
+      return "message";
+    default:
+      return "message";
+  }
+}
+
+function currentUsageNode(): Extract<RenderNode, { kind: "usage" }> | undefined {
+  return state.nodes.find((node) => node.kind === "usage") as Extract<RenderNode, { kind: "usage" }> | undefined;
+}
+
+function contextUsageGauge(usage: Extract<RenderNode, { kind: "usage" }> | undefined): string {
+  if (!usage) {
+    return "";
+  }
+  const pct = usage.size > 0 ? Math.min(100, Math.round((usage.used / usage.size) * 100)) : 0;
+  const tone = pct >= 90 ? "risk" : pct >= 70 ? "warning" : "ok";
+  const detail = `${pct}% context (${usage.used}/${usage.size} tokens)`;
+  return `<span class="composer-context-gauge composer-context-gauge-${tone}" role="meter" aria-label="Context usage" aria-valuenow="${pct}" title="${detail}" style="--context-pct:${pct}%"><span>${pct}%</span></span>`;
+}
+
+function timelineNavigation(visibleNodes: RenderNode[]): string {
+  const counts = timelineFilterCounts(state.nodes);
+  const queryTokens = timelineSearchTokens(timelineQuery);
+  const filtered = timelineFilter !== "all" || queryTokens.length > 0;
+  const queryDetail = queryTokens.length ? ` matching ${queryTokens.join(" + ")}` : "";
+  const allGroups = timelineGroups(state.nodes);
+  const visibleGroups = timelineGroups(visibleNodes);
+  const task = state.task;
+  const lane = task?.lane || visibleNodes[0]?.lane || "pending";
+  const sessionId = state.acpSessionId || state.persistedAcpSessionId || visibleNodes.find((node) => node.acpSessionId)?.acpSessionId;
+  const messageCount = state.nodes.filter((node) => node.kind === "message").length;
+  const toolCount = state.nodes.filter((node) => node.kind === "tool").length;
+  const activity = buildToolActivitySummary(visibleNodes);
+  const turnGroups = allGroups.filter((group) => group.turnId);
+  const visibleTurnGroups = visibleGroups.filter((group) => group.turnId);
+  timelineNavigationProps = {
+    id: "timeline",
+    filters: TIMELINE_FILTERS.map((filter) => ({
+      id: filter.id,
+      label: filter.label,
+      count: counts[filter.id],
+      active: timelineFilter === filter.id
+    })),
+    query: timelineQuery,
+    queryDetail,
+    filtered,
+    visibleCount: visibleNodes.length,
+    searchIconHtml: iconSvg("search"),
+    mapIconHtml: iconSvg("tree"),
+    activityIconHtml: iconSvg(activity.tone === "risk" ? "diagnostics" : "tool"),
+    visibleGroups: visibleGroups.length,
+    chips: [
+      { id: "lane", label: `Lane ${shortLabel(lane)}`, iconHtml: iconSvg("lane"), active: true },
+      { id: "session", label: `Session ${sessionId ? shortLabel(sessionId) : "new"}`, iconHtml: iconSvg("session") },
+      { id: "turns", label: `${turnGroups.length} turn${turnGroups.length === 1 ? "" : "s"}`, iconHtml: iconSvg("turn") },
+      { id: "messages", label: `${messageCount} message${messageCount === 1 ? "" : "s"}`, iconHtml: iconSvg("message") },
+      { id: "tools", label: `${toolCount} tool${toolCount === 1 ? "" : "s"}`, iconHtml: iconSvg("tool") }
+    ],
+    activity,
+    turnLinks: visibleTurnGroups.slice(-8).map((group) => {
+      const target = timelineGroupDomId(group);
+      return {
+        id: group.key,
+        href: `#${target}`,
+        label: group.label,
+        detail: group.detail
+      };
+    })
+  };
+  return `<div class="timeline-navigation-react-root" data-timeline-navigation-root data-timeline-navigation-id="timeline"></div>`;
 }
 
 function emptyTimeline(): string {
-  return `
-    <article class="empty-state">
-      <h2>No transcript yet</h2>
-      <p>${escapeHtml(state.provider || "Agent provider")} is ready.</p>
-    </article>
-  `;
+  if (state.nodes.length) {
+    const activeFilter = TIMELINE_FILTERS.find((filter) => filter.id === timelineFilter);
+    const filterLabel = activeFilter && activeFilter.id !== "all" ? activeFilter.label : "";
+    const queryTokens = timelineSearchTokens(timelineQuery);
+    const constraints = [filterLabel ? `${filterLabel} items` : "", queryTokens.length ? queryTokens.join(" + ") : ""].filter(Boolean);
+    const detail = constraints.length
+      ? `No transcript items matched ${constraints.join(" and ")}. Clear filters to return to the full run.`
+      : "Clear the search or filter to see the full agent run.";
+    const id = "filtered";
+    emptyStateCardProps.set(id, {
+      id,
+      variant: "filtered",
+      ariaLabel: "No transcript items match the active filters.",
+      iconHtml: iconSvg("search"),
+      roleLabel: "Transcript filter",
+      title: "No matching transcript items",
+      description: detail,
+      actions: [emptyStateAction("clearTimelineSearch", "Clear filters", "search", "primary", false)]
+    });
+    return `<div class="empty-state-root" data-empty-state-card-root data-empty-state-id="${id}"></div>`;
+  }
+  const blocked = Boolean(state.permissionPending);
+  const running = Boolean(state.sending);
+  const id = "ready";
+  emptyStateCardProps.set(id, {
+    id,
+    variant: "ready",
+    ariaLabel: "Empty transcript",
+    iconHtml: iconSvg(blocked ? "review" : "message"),
+    roleLabel: "CrabDB workspace",
+    title: blocked ? "Permission needed before the next turn" : "Ready for a CrabDB turn",
+    description: blocked
+      ? "Resolve the pending tool request, then continue from the preserved transcript."
+      : "Message the agent or attach editor context. CrabDB will record checkpoints, tool evidence, and review state.",
+    actions: [
+      emptyStateAction(blocked ? "focusReview" : "focusComposer", blocked ? "Open review" : "Start in composer", blocked ? "review" : "message", "primary", running),
+      emptyStateAction("attachSelection", "Attach selection", "selection", "secondary", blocked || running),
+      emptyStateAction("attachFile", "Attach file", "file", "secondary", blocked || running),
+      emptyStateAction("openSettings", "Settings", "settings", "secondary", false)
+    ]
+  });
+  return `<div class="empty-state-root" data-empty-state-card-root data-empty-state-id="${id}"></div>`;
+}
+
+function clearTimelineSearch(refocusSearch = false): void {
+  timelineQuery = "";
+  timelineFilter = "all";
+  persistWebviewState();
+  pendingTimelineSearchFocus = refocusSearch;
+  render();
+}
+
+function restoreTimelineSearchInput({
+  searchFocused,
+  selectionEnd,
+  selectionStart
+}: {
+  searchFocused: boolean;
+  selectionEnd?: number | null | undefined;
+  selectionStart?: number | null | undefined;
+}): void {
+  const search = document.querySelector<HTMLInputElement>(".timeline-search-input");
+  if (!search) {
+    return;
+  }
+  search.value = timelineQuery;
+  if (searchFocused) {
+    search.focus();
+    if (selectionStart !== undefined && selectionEnd !== undefined) {
+      search.setSelectionRange(selectionStart, selectionEnd);
+    }
+  }
+}
+
+function emptyStateAction(name: string, label: string, icon: IconName, tone: "primary" | "secondary", disabled: boolean): EmptyStateAction {
+  return {
+    action: name,
+    label,
+    iconHtml: iconSvg(icon),
+    tone,
+    disabled
+  };
+}
+
+interface TimelineGroup {
+  key: string;
+  label: string;
+  detail: string;
+  turnId?: string | undefined;
+  sessionId?: string | undefined;
+  lane: string;
+  status: RenderNode["status"];
+  index: number;
+  nodes: RenderNode[];
+}
+
+function renderTimeline(nodes: RenderNode[]): TimelineScrollerItemView[] {
+  const groups = timelineGroups(nodes);
+  if (!groups.length) {
+    return [];
+  }
+  return groups.map((group, index) => renderTimelineGroup(group, index, groups.length));
+}
+
+function renderTimelineGroup(group: TimelineGroup, index: number, total: number): TimelineScrollerItemView {
+  const open = shouldOpenTimelineGroup(group, index, total);
+  const id = timelineGroupDomId(group);
+  const bodyHtml = group.nodes.map(renderNode).join("");
+  timelineGroupProps.set(id, {
+    id,
+    label: group.label,
+    detail: group.detail,
+    status: group.status,
+    statusLabel: toolStatusLabel(group.status),
+    laneLabel: shortLabel(group.lane),
+    iconHtml: iconSvg(group.turnId ? "turn" : "session"),
+    bodyHtml,
+    open
+  });
+  return {
+    id,
+    className: `timeline-scroller-row-group timeline-scroller-row-${escapeClass(group.status)}`,
+    scrollAnchor: Boolean(group.turnId),
+    html: `<div id="${id}" class="timeline-group timeline-group-${escapeClass(group.status)}" data-timeline-group-root data-timeline-group-id="${escapeHtml(id)}"></div>`
+  };
+}
+
+function timelineGroupDomId(group: TimelineGroup): string {
+  return nodeDomId(`group:${group.key}`);
+}
+
+function timelineGroups(nodes: RenderNode[]): TimelineGroup[] {
+  const groups: TimelineGroup[] = [];
+  const byKey = new Map<string, TimelineGroup>();
+  for (const node of nodes) {
+    const key = node.turnId ? `turn:${node.turnId}` : "session";
+    let group = byKey.get(key);
+    if (!group) {
+      group = {
+        key,
+        label: "",
+        detail: "",
+        turnId: node.turnId,
+        sessionId: node.acpSessionId,
+        lane: node.lane,
+        status: node.status,
+        index: groups.length,
+        nodes: []
+      };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.nodes.push(node);
+    group.status = combinedStatus(group.status, node.status);
+    group.sessionId = group.sessionId || node.acpSessionId;
+  }
+  groups.forEach((group) => {
+    group.label = group.turnId ? `Turn ${turnSequenceLabel(group.index, groups)}` : "Session events";
+    group.detail = timelineGroupDetail(group);
+  });
+  return groups;
+}
+
+function timelineGroupDetail(group: TimelineGroup): string {
+  const messages = group.nodes.filter((node) => node.kind === "message").length;
+  const tools = group.nodes.filter((node) => node.kind === "tool").length;
+  const diffs = group.nodes.filter((node) => node.kind === "diff").length;
+  const approvals = group.nodes.filter((node) => node.kind === "approval").length;
+  const events = group.nodes.length - messages - tools - diffs - approvals;
+  const parts = [
+    countLabel(messages, "message"),
+    countLabel(tools, "tool"),
+    countLabel(diffs, "diff"),
+    countLabel(approvals, "approval"),
+    countLabel(events, "event")
+  ].filter(Boolean);
+  return parts.length ? parts.join(" / ") : `${group.nodes.length} item${group.nodes.length === 1 ? "" : "s"}`;
+}
+
+function turnSequenceLabel(groupIndex: number, groups: TimelineGroup[]): string {
+  let turn = 0;
+  for (let index = 0; index <= groupIndex; index += 1) {
+    if (groups[index]?.turnId) {
+      turn += 1;
+    }
+  }
+  return String(turn || groupIndex + 1);
+}
+
+function countLabel(count: number, label: string): string {
+  if (!count) {
+    return "";
+  }
+  return `${count} ${label}${count === 1 ? "" : "s"}`;
+}
+
+function combinedStatus(current: RenderNode["status"], next: RenderNode["status"]): RenderNode["status"] {
+  const priority: Record<RenderNode["status"], number> = {
+    failed: 5,
+    cancelled: 4,
+    pending: 3,
+    in_progress: 3,
+    completed: 1
+  };
+  return priority[next] > priority[current] ? next : current;
+}
+
+function shouldOpenTimelineGroup(group: TimelineGroup, index: number, total: number): boolean {
+  if (timelineFilter !== "all" || timelineSearchTokens(timelineQuery).length) {
+    return true;
+  }
+  if (group.status !== "completed") {
+    return true;
+  }
+  return total <= 2 || index === total - 1;
 }
 
 function renderNode(node: RenderNode): string {
@@ -522,7 +1559,7 @@ function renderNode(node: RenderNode): string {
     case "message":
       return messageNode(node);
     case "thought":
-      return activityNode("Thinking", "In progress", "thought");
+      return thoughtNode(node);
     case "plan":
       return planNode(node);
     case "tool":
@@ -538,17 +1575,17 @@ function renderNode(node: RenderNode): string {
     case "completion":
       return completionNode(node);
     case "mode":
-      return "";
+      return modeNode(node);
     case "config":
-      return "";
+      return configNode(node);
     case "commands":
-      return "";
+      return commandsNode(node);
     case "session":
-      return activityNode("Session updated", node.title || "Metadata changed", "session");
+      return sessionNode(node);
     case "usage":
-      return "";
+      return usageNode(node);
     case "resource":
-      return resourceBlock(node.content);
+      return resourceBlock(node);
     case "unknown":
       return unknownNode(node);
     default:
@@ -557,323 +1594,570 @@ function renderNode(node: RenderNode): string {
 }
 
 function messageNode(node: Extract<RenderNode, { kind: "message" }>): string {
+  messageCardProps.set(node.id, {
+    nodeId: node.id,
+    role: node.role,
+    streaming: node.streaming,
+    contentHtml: renderContentBlocks(node.content)
+  });
   return `
     <article id="${nodeDomId(node.id)}" class="turn-card message ${node.role}">
       <div class="rail"></div>
-      <div class="card-body">
-        <div class="card-chrome">
-          <span class="role">${node.role === "user" ? "You" : "Agent"}</span>
-          ${node.streaming ? `<span class="streaming">streaming</span>` : ""}
-        </div>
-        <div class="markdown">${renderContentBlocks(node.content)}</div>
-      </div>
+      <div class="card-body" data-message-card-root data-message-node-id="${escapeHtml(node.id)}"></div>
     </article>
   `;
 }
 
 function planNode(node: Extract<RenderNode, { kind: "plan" }>): string {
+  const entries = node.entries.map((entry, index) => {
+    const status = String(entry.status || "pending");
+    return {
+      id: `${node.id}-${index}`,
+      title: String(entry.title || entry.content || "Task"),
+      status,
+      statusClass: escapeClass(status),
+      priority: entry.priority ? String(entry.priority) : undefined
+    };
+  });
+  planCardProps.set(node.id, {
+    nodeId: node.id,
+    title: "Plan",
+    detail: entries.length ? `${entries.length} tracked ${entries.length === 1 ? "step" : "steps"}` : "No plan steps reported",
+    entries,
+    emptyText: "No plan steps reported."
+  });
   return `
     <article id="${nodeDomId(node.id)}" class="turn-card plan">
       <div class="rail"></div>
-      <div class="card-body">
-        <div class="card-chrome"><span class="role">Plan</span></div>
-        <ol class="plan-list">
-          ${node.entries
-            .map((entry) => {
-              const status = String(entry.status || "pending");
-              return `<li class="plan-${escapeClass(status)}"><span>${escapeHtml(status)}</span>${escapeHtml(entry.title || entry.content || "Task")}</li>`;
-            })
-            .join("")}
-        </ol>
-      </div>
+      <div class="plan-card-react-root" data-plan-card-root data-plan-node-id="${escapeHtml(node.id)}"></div>
+    </article>
+  `;
+}
+
+function thoughtNode(node: Extract<RenderNode, { kind: "thought" }>): string {
+  const text = contentBlocksToPlainText(node.content);
+  const statusLabel = node.status === "pending" || node.status === "in_progress" ? "live" : node.status === "completed" ? "done" : node.status;
+  thoughtCardProps.set(node.id, {
+    nodeId: node.id,
+    title: "Thinking",
+    detail: text ? shortLabel(text) : "Agent reasoning update",
+    statusLabel,
+    iconHtml: iconSvg("message"),
+    contentHtml: node.content.length ? renderContentBlocks(node.content) : "",
+    emptyText: "No thought content reported."
+  });
+  return `
+    <article id="${nodeDomId(node.id)}" class="turn-card thought activity">
+      <div class="rail"></div>
+      <div class="thought-card-react-root" data-thought-card-root data-thought-node-id="${escapeHtml(node.id)}"></div>
     </article>
   `;
 }
 
 type ToolNodeView = Extract<RenderNode, { kind: "tool" }>;
 
-function toolVisual(kind: ToolNodeView["toolKind"]): {
-  label: string;
-  description: string;
-  icon: IconName;
-  tone: "default" | "file" | "change" | "query" | "terminal" | "risk";
-} {
-  switch (kind) {
-    case "read":
-      return { label: "Read", description: "Inspecting workspace context", icon: "file", tone: "file" };
-    case "edit":
-      return { label: "Edit", description: "Changing file content", icon: "changed", tone: "change" };
-    case "delete":
-      return { label: "Delete", description: "Removing a file or resource", icon: "close", tone: "risk" };
-    case "move":
-      return { label: "Move", description: "Moving or renaming a path", icon: "changed", tone: "change" };
-    case "search":
-      return { label: "Search", description: "Finding matches in the workspace", icon: "search", tone: "query" };
-    case "execute":
-      return { label: "Run", description: "Executing a command", icon: "terminal", tone: "terminal" };
-    case "think":
-      return { label: "Think", description: "Planning or reasoning", icon: "review", tone: "default" };
-    case "fetch":
-      return { label: "Fetch", description: "Reading an external or linked resource", icon: "open", tone: "query" };
-    case "switch_mode":
-      return { label: "Mode", description: "Changing provider session mode", icon: "settings", tone: "default" };
-    default:
-      return { label: "Tool", description: "Provider tool call", icon: "settings", tone: "default" };
-  }
+function toolNode(node: ToolNodeView): string {
+  const model = buildToolPresentation({
+    title: node.title,
+    toolKind: node.toolKind,
+    toolStatus: node.toolStatus,
+    locations: node.locations,
+    content: node.content,
+    rawInput: node.rawInput,
+    rawOutput: node.rawOutput,
+    source: node.source
+  });
+  const terminal = model.kind === "execute";
+  const title = terminal ? "Bash" : model.title;
+  const subtitle = terminal ? terminalToolIntent(node, model) : model.summary;
+  const readPreview = model.kind === "read" && node.content.some((content) => renderedToolContentType(content) === "text");
+  const contentHtml = terminal
+    ? terminalToolPreview(node, model)
+    : node.content.length
+      ? node.content.map((item) => renderToolContent(item, node, model.kind)).join("")
+      : `<p class="muted">${escapeHtml(model.emptyText)}</p>`;
+  const rawDetails = !terminal && (node.rawInput || node.rawOutput)
+    ? rawDetailsView(`${node.id}-raw`, { input: node.rawInput, output: node.rawOutput })
+    : undefined;
+  toolCallCardProps.set(node.id, {
+    nodeId: node.id,
+    rawToolKind: node.toolKind,
+    title,
+    subtitle,
+    status: node.toolStatus,
+    terminal,
+    readPreview,
+    model,
+    stats: model.stats,
+    facts: model.facts,
+    actions: model.actions,
+    locations: node.locations.map(toolCallCardLocation),
+    contentHtml,
+    rawDetails
+  });
+  return `<article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(model.kind)} tool-risk-${escapeClass(model.riskTone)}${terminal ? " terminal-tool" : ""}" data-raw-tool-kind="${escapeHtml(node.toolKind)}"><div class="rail"></div><div class="tool-call-react-root" data-tool-call-card-root data-tool-node-id="${escapeHtml(node.id)}"></div></article>`;
 }
 
-function isRiskyTool(node: ToolNodeView): boolean {
-  return ["delete", "execute"].includes(node.toolKind) || node.toolStatus === "failed";
+function toolCallCardLocation(location: { path?: string | undefined; line?: number | null | undefined }): ToolCallCardLocation {
+  const result: ToolCallCardLocation = { path: String(location.path || "") };
+  if (typeof location.line === "number") {
+    result.line = location.line;
+  }
+  return result;
 }
 
-function toolStatusLabel(status: string): string {
-  switch (status) {
-    case "in_progress":
-      return "running";
-    case "completed":
-      return "done";
-    case "failed":
-      return "failed";
-    case "pending":
-      return "pending";
-    default:
-      return status;
+function renderedToolContentType(content: ToolCallContent): string {
+  const record = asRecord(content);
+  if (record.type === "content") {
+    return String(asRecord(record.content).type || "");
   }
-}
-
-function toolStats(node: ToolNodeView): Array<[string, string]> {
-  const diffBlocks = node.content.filter((item) => asRecord(item).type === "diff");
-  const terminalBlocks = node.content.filter((item) => asRecord(item).type === "terminal");
-  const contentBlocks = node.content.filter((item) => asRecord(item).type === "content");
-  const stats: Array<[string, string]> = [];
-  if (node.locations.length) {
-    stats.push([`location${node.locations.length === 1 ? "" : "s"}`, String(node.locations.length)]);
-  }
-  if (diffBlocks.length) {
-    stats.push([`diff${diffBlocks.length === 1 ? "" : "s"}`, String(diffBlocks.length)]);
-  }
-  if (terminalBlocks.length) {
-    stats.push([`terminal${terminalBlocks.length === 1 ? "" : "s"}`, String(terminalBlocks.length)]);
-  }
-  if (contentBlocks.length) {
-    stats.push([`content block${contentBlocks.length === 1 ? "" : "s"}`, String(contentBlocks.length)]);
-  }
-  if (!stats.length) {
-    stats.push(["state", toolStatusLabel(node.toolStatus)]);
-  }
-  return stats.slice(0, 4);
-}
-
-function toolInputSummary(node: ToolNodeView): string {
-  const input = asRecord(node.rawInput);
-  if (!Object.keys(input).length) {
-    return "";
-  }
-  const command = terminalCommand(input);
-  const facts: Array<[string, string]> = [];
-  const path = stringChoice(input, ["path", "file", "filePath", "target", "targetPath"]);
-  const from = stringChoice(input, ["from", "oldPath", "source", "sourcePath"]);
-  const to = stringChoice(input, ["to", "newPath", "destination", "destinationPath"]);
-  const query = stringChoice(input, ["query", "pattern", "regex", "search"]);
-  const url = stringChoice(input, ["url", "uri", "href"]);
-  const cwd = stringChoice(input, ["cwd", "workingDirectory", "working_directory"]);
-  const line = numberChoice(input, ["line", "startLine", "start_line"]);
-  if (path) {
-    facts.push(["Path", path]);
-  }
-  if (from || to) {
-    facts.push(["Move", [from, to].filter(Boolean).join(" -> ")]);
-  }
-  if (query) {
-    facts.push(["Query", query]);
-  }
-  if (url) {
-    facts.push(["Resource", url]);
-  }
-  if (command) {
-    facts.push(["Command", command]);
-  }
-  if (cwd) {
-    facts.push(["Cwd", cwd]);
-  }
-  if (typeof line === "number") {
-    facts.push(["Line", String(line)]);
-  }
-  if (!facts.length) {
-    return "";
-  }
-  return `
-    <dl class="tool-facts">
-      ${facts
-        .slice(0, 5)
-        .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(shortLabel(redactString(value)))}</dd></div>`)
-        .join("")}
-    </dl>
-  `;
-}
-
-function toolNode(node: Extract<RenderNode, { kind: "tool" }>): string {
-  const visual = toolVisual(node.toolKind);
-  const risky = isRiskyTool(node);
-  const open = risky || node.toolStatus === "in_progress";
-  const stats = toolStats(node);
-  return `
-    <article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(node.toolKind)} ${risky ? "risky" : ""}">
-      <div class="rail"></div>
-      <details class="card-body tool-card tool-tone-${visual.tone}" ${open ? "open" : ""}>
-        <summary class="tool-summary">
-          <span class="tool-icon">${iconSvg(visual.icon)}</span>
-          <span class="tool-summary-main">
-            <span class="tool-title">${escapeHtml(node.title || visual.label)}</span>
-            <span class="tool-subtitle">${escapeHtml(visual.description)}</span>
-          </span>
-          <span class="tool-summary-meta">
-            <span class="tool-kind">${escapeHtml(visual.label)}</span>
-            <span class="tool-status tool-status-${escapeClass(node.toolStatus)}">${escapeHtml(toolStatusLabel(node.toolStatus))}</span>
-          </span>
-        </summary>
-        <div class="tool-overview">
-          ${stats.map(([label, value]) => `<span><b>${escapeHtml(value)}</b>${escapeHtml(label)}</span>`).join("")}
-        </div>
-        ${toolInputSummary(node)}
-        ${node.locations.length ? `<div class="chips">${node.locations.map((loc) => locationChip(String(loc.path || ""), typeof loc.line === "number" ? loc.line : undefined)).join("")}</div>` : ""}
-        ${node.content.length ? `<div class="tool-content">${node.content.map(renderToolContent).join("")}</div>` : `<p class="muted">No rendered tool output yet.</p>`}
-        ${node.rawInput || node.rawOutput ? rawDetails({ input: node.rawInput, output: node.rawOutput }) : ""}
-      </details>
-    </article>
-  `;
+  return String(record.type || "");
 }
 
 function diffNode(node: Extract<RenderNode, { kind: "diff" }>): string {
   const stats = diffStats(node.oldText || "", node.newText);
+  diffCardProps.set(node.id, {
+    nodeId: node.id,
+    path: node.path,
+    subtitle: diffSummaryText(stats),
+    iconHtml: iconSvg("diff"),
+    stats: [{ label: `${stats.oldLineCount} old` }, { label: `${stats.newLineCount} new` }],
+    previewHtml: diffPreview({
+      path: node.path,
+      oldText: node.oldText || "",
+      newText: node.newText,
+      nodeId: node.id,
+      title: "Agent file diff"
+    })
+  });
   return `
     <article id="${nodeDomId(node.id)}" class="turn-card diff">
       <div class="rail"></div>
-      <details class="card-body diff-card">
-        <summary class="tool-summary">
-          <span class="tool-icon">${iconSvg("diff")}</span>
-          <span class="tool-summary-main">
-            <span class="tool-title">${escapeHtml(node.path)}</span>
-            <span class="tool-subtitle">${escapeHtml(diffSummaryText(stats))}</span>
-          </span>
-          <span class="tool-summary-meta">
-            <span class="diff-stat additions">+${stats.additions}</span>
-            <span class="diff-stat deletions">-${stats.deletions}</span>
-          </span>
-        </summary>
-        <div class="inline-actions">${iconButton("openNodeDiff", "Open native diff", "diff", { attrs: `data-node-id="${escapeHtml(node.id)}"` })}</div>
-        ${codeBlock(compactDiff(node.oldText || "", node.newText), { language: "diff", title: node.path })}
-      </details>
+      <div class="diff-card-react-root" data-diff-card-root data-diff-node-id="${escapeHtml(node.id)}"></div>
     </article>
   `;
 }
 
 function terminalNode(node: Extract<RenderNode, { kind: "terminal" }>): string {
+  const model = buildTerminalPresentation(node, MAX_TERMINAL_CHARS);
+  terminalCardProps.set(node.id, {
+    nodeId: node.id,
+    status: node.status,
+    tone: model.tone,
+    title: model.title,
+    subtitle: model.command || "Terminal output",
+    statusLabel: model.statusLabel,
+    iconHtml: iconSvg("terminal"),
+    openIconHtml: iconSvg("terminal"),
+    rows: terminalTranscriptRows(model)
+  });
   return `
-    <article id="${nodeDomId(node.id)}" class="turn-card terminal terminal-${escapeClass(node.status)}">
+    <article id="${nodeDomId(node.id)}" class="turn-card terminal terminal-${escapeClass(node.status)} terminal-tone-${escapeClass(model.tone)}">
       <div class="rail"></div>
-      <details class="card-body" ${node.status === "failed" ? "open" : ""}>
-        <summary>
-          <span class="tool-kind">terminal</span>
-          <span>${escapeHtml(node.title || node.command || node.terminalId)}</span>
-          <span class="tool-status">${escapeHtml(node.terminalStatus || node.status)}</span>
-        </summary>
-        ${terminalPreview(node, node.id)}
-      </details>
+      <div class="terminal-card-react-root" data-terminal-card-root data-terminal-node-id="${escapeHtml(node.id)}"></div>
     </article>
   `;
 }
 
 function approvalNode(node: Extract<RenderNode, { kind: "approval" }>): string {
   const resolved = node.status !== "pending";
-  const stateLabel = node.status === "completed" ? "approved" : node.status === "cancelled" ? "rejected" : "pending";
   const locations = node.tool.locations || [];
+  const stateLabel = approvalStateLabel(node.status);
+  const toolModel = buildToolPresentation({
+    title: node.tool.title,
+    toolKind: node.tool.toolKind,
+    toolStatus: node.tool.toolStatus,
+    locations: node.tool.locations,
+    content: node.tool.content,
+    rawInput: node.tool.rawInput,
+    rawOutput: node.tool.rawOutput,
+    source: node.tool.source
+  });
+  const tone = approvalTone({ status: node.status, toolKind: toolModel.kind });
+  const actionTitle = node.tool.title || node.title;
+  const scope = approvalScopeLabel(locations.length, node.lane);
+  const provider = node.provider || state.provider || "provider";
+  const summaryDetail = [actionTitle, scope].filter(Boolean).join(" · ");
+  const decisionOptions = resolved ? [] : node.options.filter((option) => !isRejectPermissionOption(option));
+  const resolvedNote =
+    node.status === "completed"
+      ? `${toolModel.operationLabel} allowed for ${scope} from ${provider}.`
+      : node.status === "failed"
+        ? `${toolModel.operationLabel} permission failed for ${scope}.`
+        : `${toolModel.operationLabel} was not allowed for ${scope}.`;
+  approvalCardProps.set(node.id, {
+    nodeId: node.id,
+    requestId: node.requestId,
+    status: node.status,
+    statusLabel: stateLabel,
+    tone,
+    resolved,
+    summaryIconHtml: iconSvg(resolved ? (node.status === "completed" ? "check" : "stop") : "review"),
+    title: resolved ? `Permission ${stateLabel.toLowerCase()}` : "Permission required",
+    detail: summaryDetail,
+    resolvedNote,
+    impactText: approvalImpactText(toolModel.kind, locations.length),
+    meta: [
+      { iconHtml: iconSvg(toolModel.icon as IconName), label: toolModel.operationLabel },
+      { label: scope },
+      { label: provider }
+    ],
+    locationsHtml: approvalLocations(locations),
+    preview: approvalToolPreview(node, toolModel.kind),
+    requestDetails: approvalRequestDetails(node.requestId, provider, toolModel.operationLabel, scope, node.raw),
+    actions: resolved
+      ? []
+      : [
+          ...decisionOptions.map((option) => approvalOptionAction(option, node.status, toolModel.kind)),
+          approvalRejectAction(node.status)
+        ]
+  });
+
   return `
-    <article id="${nodeDomId(node.id)}" class="turn-card approval">
+    <article id="${nodeDomId(node.id)}" class="turn-card approval approval-${escapeClass(node.status)} approval-tone-${tone}">
       <div class="rail"></div>
-      <div class="card-body">
-        <div class="card-chrome">
-          <span class="role">Permission required</span>
-          <span class="tool-status">${escapeHtml(node.tool.toolKind)}</span>
-          <span class="tool-status">${escapeHtml(stateLabel)}</span>
-        </div>
-        <h2>${escapeHtml(node.title)}</h2>
-        <dl class="approval-summary">
-          <div><dt>Action</dt><dd>${escapeHtml(node.tool.title)}</dd></div>
-          <div><dt>Provider</dt><dd>${escapeHtml(node.provider || state.provider || "provider")}</dd></div>
-          <div><dt>Scope</dt><dd>${escapeHtml(locations.length ? `${locations.length} affected location${locations.length === 1 ? "" : "s"}` : node.lane)}</dd></div>
-        </dl>
-        ${locations.length ? `<div class="chips">${locations.map((loc) => locationChip(String(loc.path || ""), typeof loc.line === "number" ? loc.line : undefined)).join("")}</div>` : ""}
-        ${node.tool.content.length ? `<div class="tool-content">${node.tool.content.map(renderToolContent).join("")}</div>` : ""}
-        <div class="approval-actions">
-          ${node.options
-            .map(
-              (option, index) =>
-                `<button class="${index === 0 ? "primary" : ""}" title="${escapeHtml(option.description || option.label)}" data-action="approve" data-request-id="${escapeHtml(node.requestId)}" data-option-id="${escapeHtml(option.optionId)}" ${resolved ? "disabled" : ""}>${escapeHtml(option.label)}</button>`
-            )
-            .join("")}
-          <button class="danger" data-action="reject" data-request-id="${escapeHtml(node.requestId)}" ${resolved ? "disabled" : ""}>Reject</button>
-        </div>
-        ${rawDetails(node.raw)}
-      </div>
+      <div class="approval-card-react-root" data-approval-card-root data-approval-node-id="${escapeHtml(node.id)}"></div>
     </article>
   `;
+}
+
+function approvalLocations(locations: Array<{ path?: string | undefined; line?: number | null | undefined }>): string {
+  if (!locations.length) {
+    return `<p class="approval-muted">No file scope was reported. Review the preview before deciding.</p>`;
+  }
+  const locationList = locations
+    .slice(0, 5)
+    .map((loc) => locationChip(String(loc.path || ""), typeof loc.line === "number" ? loc.line : undefined))
+    .join("");
+  const remaining = locations.length > 5 ? `<span>${locations.length - 5} more</span>` : "";
+  return `<div class="chips approval-locations" aria-label="Affected locations">${locationList}${remaining}</div>`;
+}
+
+function approvalToolPreview(
+  node: Extract<RenderNode, { kind: "approval" }>,
+  toolKind: ToolPresentation["kind"]
+): ApprovalCardDisclosure | undefined {
+  if (!node.tool.content.length) {
+    return undefined;
+  }
+  const count = node.tool.content.length;
+  return {
+    id: "approval-preview",
+    title: "Preview",
+    meta: `${count} block${count === 1 ? "" : "s"}`,
+    className: "approval-preview approval-section",
+    contentClassName: "tool-content approval-tool-content",
+    contentHtml: node.tool.content.map((content) => renderToolContent(content, node.tool, toolKind)).join(""),
+    defaultOpen: true
+  };
+}
+
+function approvalRequestDetails(
+  requestId: string,
+  provider: string,
+  operation: string,
+  scope: string,
+  raw: unknown
+): ApprovalCardDisclosure {
+  return {
+    id: "approval-request-details",
+    title: "Request details",
+    className: "approval-request-details",
+    contentClassName: "approval-request-content",
+    contentHtml: `
+      <dl class="approval-detail-list">
+        <div><dt>Provider</dt><dd>${escapeHtml(provider)}</dd></div>
+        <div><dt>Kind</dt><dd>${escapeHtml(operation)}</dd></div>
+        <div><dt>Scope</dt><dd>${escapeHtml(scope)}</dd></div>
+        <div><dt>Request</dt><dd>${escapeHtml(shortLabel(requestId))}</dd></div>
+      </dl>
+      ${rawDetails(raw)}
+    `,
+    defaultOpen: false
+  };
+}
+
+function isRejectPermissionOption(option: { optionId: string; label: string }): boolean {
+  const value = `${option.optionId} ${option.label}`.toLowerCase();
+  return /\b(reject|deny|decline|cancel|refuse|disallow)\b/.test(value);
+}
+
+function approvalOptionAction(
+  option: { optionId: string; label: string; description?: string | undefined },
+  status: string,
+  toolKind: ToolPresentation["kind"]
+): ApprovalCardAction {
+  const label = String(option.label || option.optionId || "Allow");
+  const description = String(option.description || "").trim() || approvalDecisionDescription(toolKind);
+  const tone = approvalDecisionTone({ status, toolKind });
+  return {
+    kind: "approve",
+    optionId: option.optionId,
+    label,
+    description,
+    tone,
+    iconHtml: iconSvg(approvalDecisionIcon(tone)),
+    disabled: status !== "pending"
+  };
+}
+
+function approvalRejectAction(status: string): ApprovalCardAction {
+  return {
+    kind: "reject",
+    label: "Reject",
+    description: "Do not allow this action.",
+    tone: "risk",
+    iconHtml: iconSvg("stop"),
+    disabled: status !== "pending"
+  };
+}
+
+function approvalDecisionIcon(tone: ApprovalDecisionTone): IconName {
+  return tone === "primary" ? "check" : tone === "risk" ? "diagnostics" : tone === "warning" ? "review" : "tool";
 }
 
 function checkpointNode(node: Extract<RenderNode, { kind: "checkpoint" }>): string {
-  return `
-    <article id="${nodeDomId(node.id)}" class="turn-card checkpoint">
-      <div class="rail rail-dot"></div>
-      <div class="card-body">
-        <div class="card-chrome"><span class="role">Checkpoint</span></div>
-        <p>${escapeHtml(node.label)}</p>
-      </div>
-    </article>
-  `;
+  return auditEventNode({
+    id: node.id,
+    className: "checkpoint",
+    rail: "rail-dot",
+    presentation: buildEventPresentation({
+      kind: "checkpoint",
+      label: node.label,
+      checkpointId: node.checkpointId,
+      updatedAt: node.updatedAt ? formatTimestamp(node.updatedAt) : undefined
+    })
+  });
 }
 
 function completionNode(node: Extract<RenderNode, { kind: "completion" }>): string {
-  return `
-    <article id="${nodeDomId(node.id)}" class="turn-card completion completion-${escapeClass(node.status)}">
-      <div class="rail ${node.status === "pending" ? "" : "rail-dot"}"></div>
-      <div class="card-body">
-        <div class="card-chrome">
-          <span class="role">Turn ${escapeHtml(node.status)}</span>
-          <span class="tool-status">${escapeHtml(node.stopReason)}</span>
-        </div>
-        <p>${escapeHtml(node.label)}</p>
-        ${node.checkpointPending ? `<p class="muted">Waiting for CrabDB checkpoint confirmation.</p>` : ""}
-      </div>
-    </article>
-  `;
+  return auditEventNode({
+    id: node.id,
+    className: `completion completion-${escapeClass(node.status)}`,
+    rail: node.status === "pending" ? "" : "rail-dot",
+    presentation: buildEventPresentation({
+      kind: "completion",
+      label: node.label,
+      status: node.status,
+      stopReason: node.stopReason,
+      checkpointPending: node.checkpointPending
+    })
+  });
 }
 
 function activityNode(title: string, detail: string, kind: string): string {
   return `
     <article class="turn-card activity ${escapeClass(kind)}">
       <div class="rail"></div>
-      <div class="card-body compact">
-        <span class="role">${escapeHtml(title)}</span>
-        <span>${escapeHtml(detail)}</span>
+      <div class="card-body compact event-card event-info">
+        <span class="activity-title">${escapeHtml(title)}</span>
+        <span class="event-detail">${escapeHtml(detail)}</span>
       </div>
     </article>
   `;
 }
 
+function usageNode(node: Extract<RenderNode, { kind: "usage" }>): string {
+  const pct = node.size > 0 ? Math.min(100, Math.round((node.used / node.size) * 100)) : 0;
+  const tone = pct >= 90 ? "risk" : pct >= 70 ? "warning" : "info";
+  const cost = node.cost ? eventCostLabel(node.cost) : "";
+  const event = buildEventPresentation({
+    kind: "usage",
+    used: node.used,
+    size: node.size,
+    costLabel: cost
+  });
+  return auditEventNode({
+    id: node.id,
+    className: "usage activity",
+    presentation: event,
+    meterHtml: `<div class="event-meter">
+      <progress class="meter ${tone === "risk" ? "risk" : tone === "warning" ? "review" : "ok"}" value="${pct}" max="100" aria-label="Context usage ${pct}%"></progress>
+      ${cost ? `<span>${escapeHtml(cost)}</span>` : ""}
+    </div>`
+  });
+}
+
+function modeNode(node: Extract<RenderNode, { kind: "mode" }>): string {
+  const active = node.availableModes.find((mode) => mode.id === node.modeId);
+  const detail = active?.description || active?.name || node.modeId;
+  const chips = [
+    `<span class="event-chip active">Mode ${escapeHtml(active?.name || node.modeId)}</span>`,
+    ...node.availableModes
+      .filter((mode) => mode.id !== node.modeId)
+      .slice(0, 4)
+      .map((mode) => `<span class="event-chip">${escapeHtml(mode.name || mode.id)}</span>`)
+  ];
+  return eventNode({
+    id: node.id,
+    className: "mode",
+    presentation: buildEventPresentation({
+      kind: "mode",
+      label: detail,
+      modeName: active?.name || node.modeId,
+      modeCount: node.availableModes.length
+    }),
+    chips
+  });
+}
+
+function configNode(node: Extract<RenderNode, { kind: "config" }>): string {
+  const chips = node.configOptions.slice(0, 6).map((option) => {
+    const value = option.currentValue === undefined || option.currentValue === null ? "unset" : optionValueLabel(option, String(option.currentValue));
+    return `<span class="event-chip"><b>${escapeHtml(option.name || option.id)}</b>${escapeHtml(shortLabel(String(value)))}</span>`;
+  });
+  if (node.configOptions.length > chips.length) {
+    chips.push(`<span class="event-chip">${node.configOptions.length - chips.length} more</span>`);
+  }
+  return eventNode({
+    id: node.id,
+    className: "config",
+    presentation: buildEventPresentation({
+      kind: "config",
+      configCount: node.configOptions.length
+    }),
+    chips
+  });
+}
+
+function commandsNode(node: Extract<RenderNode, { kind: "commands" }>): string {
+  const chips = node.availableCommands.slice(0, 8).map((command) => {
+    const hint = asRecord(command.input).hint;
+    return `<span class="event-chip" title="${escapeHtml(command.description || "")}"><b>/${escapeHtml(command.name)}</b>${hint ? escapeHtml(shortLabel(String(hint))) : ""}</span>`;
+  });
+  if (node.availableCommands.length > chips.length) {
+    chips.push(`<span class="event-chip">${node.availableCommands.length - chips.length} more</span>`);
+  }
+  return eventNode({
+    id: node.id,
+    className: "commands",
+    presentation: buildEventPresentation({
+      kind: "commands",
+      commandCount: node.availableCommands.length
+    }),
+    chips
+  });
+}
+
+function sessionNode(node: Extract<RenderNode, { kind: "session" }>): string {
+  const when = node.sessionUpdatedAt ? formatTimestamp(node.sessionUpdatedAt) : node.updatedAt ? formatTimestamp(node.updatedAt) : "";
+  return eventNode({
+    id: node.id,
+    className: "session",
+    presentation: buildEventPresentation({
+      kind: "session",
+      sessionId: node.acpSessionId,
+      sessionTitle: node.title || undefined,
+      updatedAt: when || undefined
+    })
+  });
+}
+
+function eventNode({
+  id,
+  className,
+  presentation,
+  chips
+}: {
+  id: string;
+  className: string;
+  presentation: EventPresentation;
+  chips?: string[] | undefined;
+}): string {
+  return auditEventNode({ id, className: `activity ${escapeClass(className)}`, presentation, chips });
+}
+
+function auditEventNode({
+  id,
+  className,
+  presentation,
+  chips,
+  rail = "",
+  meterHtml = "",
+  contentHtml = "",
+  rawDetails
+}: {
+  id: string;
+  className: string;
+  presentation: EventPresentation;
+  chips?: string[] | undefined;
+  rail?: string | undefined;
+  meterHtml?: string | undefined;
+  contentHtml?: string | undefined;
+  rawDetails?: RawDetailsView | undefined;
+}): string {
+  eventCardProps.set(id, {
+    nodeId: id,
+    tone: presentation.tone,
+    iconHtml: iconSvg(presentation.icon as IconName),
+    title: presentation.title,
+    detail: presentation.detail,
+    statusLabel: presentation.statusLabel,
+    facts: eventCardFacts(presentation.facts),
+    chipsHtml: chips?.join("") || "",
+    callout: presentation.callout,
+    actions: eventCardActions(presentation.actions || []),
+    meterHtml,
+    contentHtml,
+    rawDetails
+  });
+  return `<article id="${nodeDomId(id)}" class="turn-card ${escapeHtml(className)} audit-event-node"><div class="rail ${escapeHtml(rail)}"></div><div class="event-card-react-root" data-event-card-root data-event-node-id="${escapeHtml(id)}"></div></article>`;
+}
+
+function eventCardFacts(facts: EventFact[]): EventCardFact[] {
+  return facts.map((fact) => ({
+    label: fact.label,
+    value: fact.value,
+    shortValue: shortLabel(fact.value),
+    active: fact.active === true
+  }));
+}
+
+function eventCardActions(actions: EventAction[]): EventCardAction[] {
+  return actions.map((action) => {
+    const icon = action.action === "copyCheckpoint" ? "copy" : action.action === "rewind" ? "rewind" : "message";
+    return {
+      action: action.action,
+      label: action.label,
+      tone: action.tone,
+      target: action.target,
+      iconHtml: iconSvg(icon)
+    };
+  });
+}
+
 function unknownNode(node: Extract<RenderNode, { kind: "unknown" }>): string {
-  return `
-    <article id="${nodeDomId(node.id)}" class="turn-card unknown">
-      <div class="rail"></div>
-      <details class="card-body">
-        <summary>${escapeHtml(node.label)}</summary>
-        ${rawDetails(node.payload)}
-      </details>
-    </article>
-  `;
+  const presentation = buildEventPresentation({ kind: "unknown", label: node.label });
+  return auditEventNode({
+    id: node.id,
+    className: "unknown",
+    presentation,
+    rawDetails: rawDetailsView(`${node.id}-raw`, node.payload)
+  });
 }
 
 function renderContentBlocks(blocks: unknown[]): string {
   return blocks.map((block) => renderContentBlock(block)).join("");
+}
+
+function contentBlocksToPlainText(blocks: unknown[]): string {
+  return blocks
+    .map((block) => {
+      const record = asRecord(block);
+      if (record.type === "text") {
+        return String(record.text || "");
+      }
+      if (record.type === "resource_link") {
+        return String(record.title || record.name || record.uri || "resource");
+      }
+      if (record.type === "resource") {
+        const resource = asRecord(record.resource);
+        return String(resource.uri || resource.text || "resource");
+      }
+      return String(record.type || "");
+    })
+    .filter(Boolean)
+    .join(" ");
 }
 
 function renderContentBlock(block: unknown): string {
@@ -906,7 +2190,20 @@ function renderContentBlock(block: unknown): string {
     const detail = [record.mimeType, typeof record.size === "number" ? `${record.size} bytes` : ""]
       .filter(Boolean)
       .join(" - ");
-    return `<button class="resource-chip chip-button" data-action="openResource" data-uri="${escapeHtml(uri)}">${escapeHtml(label)}${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</button>`;
+    return inlineActions({
+      ariaLabel: "Resource link actions",
+      className: "resource-link-actions",
+      actions: [
+        {
+          action: "openResource",
+          className: "resource-chip chip-button",
+          data: { uri },
+          detail,
+          label,
+          tone: "provider"
+        }
+      ]
+    });
   }
   if (type === "resource") {
     const resource = asRecord(record.resource);
@@ -915,11 +2212,25 @@ function renderContentBlock(block: unknown): string {
     const text = typeof resource.text === "string" ? truncateText(resource.text, MAX_TEXT_CHARS) : undefined;
     const blob = typeof resource.blob === "string" ? resource.blob : undefined;
     const summaryParts = [uri || "embedded resource", mime].filter(Boolean);
-    return `<details class="resource"><summary>${escapeHtml(summaryParts.join(" - "))}</summary>${uri ? `<div class="inline-actions"><button data-action="openResource" data-uri="${escapeHtml(uri)}">Open source</button></div>` : ""}${
-      text
-        ? `<p class="muted">${lineCount(text.text)} lines${text.truncated ? " - preview truncated" : ""}</p>${codeBlock(text.text, { language: languageForResource(uri, mime), title: uri || "Embedded resource" })}${text.truncated ? `<p class="muted">Truncated after ${MAX_TEXT_CHARS} characters.</p>` : ""}`
-        : embeddedBinaryResourcePreview(uri, mime, blob)
-    }</details>`;
+    return payloadDisclosure({
+      className: "resource",
+      label: summaryParts.join(" - "),
+      bodyHtml: `${uri ? inlineActions({
+        ariaLabel: "Resource actions",
+        actions: [
+          {
+            action: "openResource",
+            data: { uri },
+            label: "Open source",
+            tone: "provider"
+          }
+        ]
+      }) : ""}${
+        text
+          ? `<p class="muted">${lineCount(text.text)} lines${text.truncated ? " - preview truncated" : ""}</p>${codeBlock(text.text, { language: languageForResource(uri, mime), title: uri || "Embedded resource" })}${text.truncated ? `<p class="muted">Truncated at ${MAX_TEXT_CHARS} chars.</p>` : ""}`
+          : embeddedBinaryResourcePreview(uri, mime, blob)
+      }`
+    });
   }
   return unsupportedContent(`Unsupported content: ${type}`, block);
 }
@@ -937,7 +2248,7 @@ function embeddedBinaryResourcePreview(uri: string, mime: string, blob: string |
   if (mime.startsWith("audio/")) {
     return mediaPreviewBlock("audio", mime, blob, uri || "Embedded audio", false);
   }
-  return `<p class="muted">Binary resource, ${blob.length} encoded characters.</p>`;
+  return `<p class="muted">Binary resource, ${blob.length} encoded chars.</p>`;
 }
 
 function mediaPreviewBlock(kind: "image" | "audio", mime: string, data: string, label: string, open: boolean): string {
@@ -946,29 +2257,44 @@ function mediaPreviewBlock(kind: "image" | "audio", mime: string, data: string, 
     kind === "image"
       ? `<img class="inline-image" src="${src}" alt="${escapeHtml(label)}">`
       : `<audio controls src="${src}"></audio>`;
-  return `
-    <details class="media-preview" ${open ? "open" : ""}>
-      <summary>${escapeHtml(label)}</summary>
-      <div class="inline-actions">${iconButton("openMediaPreview", `Open ${kind} preview`, "open")}</div>
+  return payloadDisclosure({
+    className: "media-preview",
+    label,
+    defaultOpen: open,
+    bodyHtml: `
+      ${inlineActions({
+        ariaLabel: `${kind} preview actions`,
+        actions: [
+          {
+            action: "openMediaPreview",
+            ariaLabel: `Open ${kind} preview`,
+            iconHtml: iconSvg("open"),
+            iconOnly: true,
+            label: `Open ${kind} preview`,
+            tone: "provider"
+          }
+        ]
+      })}
       ${preview}
-    </details>
-  `;
+    `
+  });
 }
 
-function renderToolContent(content: unknown): string {
+function renderToolContent(content: unknown, tool?: ToolNodeView, effectiveKind?: ToolPresentation["kind"]): string {
   const record = asRecord(content);
   const type = typeof record.type === "string" ? record.type : "unknown";
   if (type === "content") {
-    return renderContentBlock(record.content);
+    return renderToolContentBlock(record.content, tool, effectiveKind || tool?.toolKind);
   }
   if (type === "diff") {
-    const path = String(record.path || "Tool diff");
+    const path = String(record.path || primaryToolPath(tool) || "Tool diff");
     const oldText = String(record.oldText || "");
     const newText = String(record.newText || "");
-    const stats = diffStats(oldText, newText);
-    return codeBlock(compactDiff(String(record.oldText || ""), String(record.newText || "")), {
-      language: "diff",
-      title: `${path} (${diffSummaryText(stats)})`
+    return diffPreview({
+      path,
+      oldText,
+      newText,
+      title: "Tool diff"
     });
   }
   if (type === "terminal") {
@@ -977,64 +2303,441 @@ function renderToolContent(content: unknown): string {
   return unsupportedContent(`Unsupported tool content: ${type}`, content);
 }
 
-function terminalPreview(value: unknown, nodeId?: string): string {
-  const record = asRecord(value);
-  const command = terminalCommand(record);
-  const cwd = stringChoice(record, ["cwd", "workingDirectory", "working_directory"]);
-  const status = stringChoice(record, ["terminalStatus", "status", "state"]);
-  const exitCode = numberChoice(record, ["exitCode", "exit_code"]);
-  const elapsedMs = numberChoice(record, ["elapsedMs", "elapsed_ms", "durationMs"]);
-  const stdout = stringChoice(record, ["stdout", "stdoutPreview", "stdout_preview"]);
-  const stderr = stringChoice(record, ["stderr", "stderrPreview", "stderr_preview"]);
-  const output = stringChoice(record, ["output"]);
-  const meta = [
-    command ? `<div><dt>Command</dt><dd><code>${escapeHtml(redactString(command))}</code></dd></div>` : "",
-    cwd ? `<div><dt>Cwd</dt><dd>${escapeHtml(cwd)}</dd></div>` : "",
-    status ? `<div><dt>Status</dt><dd>${escapeHtml(status)}</dd></div>` : "",
-    typeof exitCode === "number" ? `<div><dt>Exit</dt><dd>${exitCode}</dd></div>` : "",
-    typeof elapsedMs === "number" ? `<div><dt>Elapsed</dt><dd>${formatDuration(elapsedMs)}</dd></div>` : ""
-  ].filter(Boolean);
-  const sections = [
-    terminalOutputSection("Output", output),
-    terminalOutputSection("Stdout", stdout),
-    terminalOutputSection("Stderr", stderr)
-  ].filter(Boolean);
+function renderToolContentBlock(block: unknown, tool: ToolNodeView | undefined, effectiveKind: string | undefined): string {
+  const record = asRecord(block);
+  const type = typeof record.type === "string" ? record.type : "unknown";
+  const path = primaryToolPath(tool);
+  if ((effectiveKind === "read" || effectiveKind === "edit") && type === "text") {
+    if (effectiveKind === "edit" && !path) {
+      return renderContentBlock(block);
+    }
+    const title = path || tool?.title || "Read result";
+    return filePreviewBlock(
+      buildFilePreviewModel({
+        path: title,
+        language: languageForResource(title, "text/plain"),
+        text: String(record.text || ""),
+        maxChars: MAX_TEXT_CHARS
+      })
+    );
+  }
+  return renderContentBlock(block);
+}
+
+function filePreviewBlock(model: FilePreviewModel): string {
+  const markdown = model.language === "markdown";
+  const text = model.language === "text" || model.language === "plaintext";
+  const body =
+    markdown
+      ? `<div class="file-document markdown" tabindex="0">${markdownText(model.text)}</div>`
+      : text
+        ? `<pre class="file-document" tabindex="0">${escapeHtml(model.text)}</pre>`
+        : codeBlock(model.text, {
+            language: model.language,
+            title: model.title,
+            meta: model.metaLabel,
+            copyLabel: "Copy file preview",
+            openPath: filePreviewOpenPath(model.title)
+          });
   return `
-    ${nodeId || command ? `<div class="inline-actions">${nodeId ? iconButton("openTerminal", "Open terminal", "terminal", { attrs: `data-node-id="${escapeHtml(nodeId)}"` }) : ""}</div>` : ""}
-    ${meta.length ? `<dl class="terminal-meta">${meta.join("")}</dl>` : ""}
-    ${sections.length ? `<div class="terminal-output-grid">${sections.join("")}</div>` : `<p class="muted">No terminal output preview is available.</p>`}
+    <section class="file-preview file-preview-${model.truncated ? "truncated" : "ready"}" data-highlight-capable="${model.highlightSupported ? "true" : "false"}" aria-label="${escapeHtml(model.accessibilityLabel)}">
+      ${body}
+      ${model.truncated ? `<p class="muted">Preview truncated before Shiki highlighting to keep the chat responsive.</p>` : ""}
+    </section>
   `;
 }
 
-function terminalOutputSection(label: string, value: string | undefined): string {
-  if (!value) {
+function filePreviewOpenPath(title: string): string {
+  return /[/\\]/.test(title) || pathFromToolTitle(title) === title ? title : "";
+}
+
+function primaryToolPath(tool: ToolNodeView | undefined): string {
+  const location = tool?.locations.find((candidate) => candidate.path);
+  if (location?.path) {
+    return location.path;
+  }
+  const rawInput = toolArgumentRecord(asRecord(tool?.rawInput));
+  return (
+    stringChoice(rawInput, ["path", "file", "filePath", "file_path", "filename", "target", "targetPath", "target_path"]) ||
+    pathFromToolTitle(tool?.title)
+  );
+}
+
+function pathFromToolTitle(title: string | undefined): string {
+  return String(title || "").match(/[^\s()'"]+\.(?:bash|cjs|css|go|html?|jsx?|jsonc?|lock|mdx?|mjs|[mc]?ts|py|rs|sh|text|tsx?|txt|xml|ya?ml|zsh)\b/i)?.[0] || "";
+}
+
+function terminalToolIntent(tool: ToolNodeView, presentation: ToolPresentation): string {
+  const data = terminalToolData(tool, presentation);
+  const parsed = terminalCommandParts(data.command);
+  const title = shellCommentText(tool.title);
+  const genericTitle = /^(bash|shell|terminal|execute|command|run)$/i.test(String(tool.title || "").trim());
+  return shortLabel(parsed.intent || title || (genericTitle ? "" : tool.title) || parsed.command || presentation.summary || "Run shell command");
+}
+
+function terminalToolPreview(tool: ToolNodeView, presentation: ToolPresentation): string {
+  const data = terminalToolData(tool, presentation);
+  const base: Record<string, unknown> = {
+    ...data.rawInput,
+    ...data.rawOutput,
+    terminalId: tool.toolCallId,
+    title: tool.title,
+    status: tool.toolStatus,
+    command: data.command
+  };
+  if (data.contentOutput && !terminalHasOutput(base)) {
+    base.output = data.contentOutput;
+  }
+  if (data.terminalBlocks.length) {
+    return data.terminalBlocks
+      .map((block) => terminalPreviewFromModel(buildTerminalPresentation(terminalBlockPreviewInput(base, block, data), MAX_TERMINAL_CHARS)))
+      .join("");
+  }
+  return terminalPreviewFromModel(buildTerminalPresentation(base, MAX_TERMINAL_CHARS));
+}
+
+function terminalBlockPreviewInput(
+  base: Record<string, unknown>,
+  block: Record<string, unknown>,
+  data: Pick<ReturnType<typeof terminalToolData>, "command" | "contentOutput">
+): Record<string, unknown> {
+  const input = { ...base, ...block };
+  const command = terminalCommand(input) || "";
+  if (!command || isCountSummary(command)) {
+    input.command = data.command;
+  }
+  if (data.contentOutput && !terminalHasOutput(input)) {
+    input.output = data.contentOutput;
+  }
+  return input;
+}
+
+function terminalToolData(tool: ToolNodeView, presentation: ToolPresentation): {
+  rawInput: Record<string, unknown>;
+  rawOutput: Record<string, unknown>;
+  terminalBlocks: Record<string, unknown>[];
+  command: string;
+  contentOutput: string;
+} {
+  const terminalBlocks = tool.content.map(asRecord).filter((block) => block.type === "terminal");
+  const rawInput = toolArgumentRecord(asRecord(tool.rawInput));
+  const rawOutput = asRecord(tool.rawOutput);
+  const texts = terminalContentTexts(tool.content);
+  const parsedTexts = texts.map(terminalCommandFromText);
+  const textCommand = parsedTexts.find((parsed) => parsed.command) || parsedTexts[0] || { command: "", output: "", intent: "" };
+  const textIntent = parsedTexts.find((parsed) => parsed.intent)?.intent || "";
+  const command =
+    terminalCommand(rawInput) ||
+    terminalCommand(rawOutput) ||
+    terminalBlocks.map(terminalCommand).find(Boolean) ||
+    textCommand.command ||
+    textIntent ||
+    (isCountSummary(presentation.summary) ? "" : presentation.summary) ||
+    (/^(bash|shell|terminal|execute|command|run)$/i.test(tool.title) ? "" : tool.title) ||
+    "Command not provided";
+  const outputParts = parsedTexts.map((parsed) => parsed.output).filter(Boolean);
+  return { rawInput, rawOutput, terminalBlocks, command, contentOutput: outputParts.join("\n") };
+}
+
+function terminalContentTexts(content: unknown[]): string[] {
+  return content
+    .map((blockValue) => {
+      const block = asRecord(blockValue);
+      if (block.type !== "content") {
+        return "";
+      }
+      const contentBlock = asRecord(block.content);
+      if (contentBlock.type === "text") {
+        return String(contentBlock.text || "").trim();
+      }
+      const resource = asRecord(contentBlock.resource);
+      return typeof resource.text === "string" ? resource.text.trim() : "";
+    })
+    .filter(Boolean);
+}
+
+function terminalCommandFromText(text: string): { command: string; output: string; intent: string } {
+  const fenced = terminalFenceBlock(text);
+  if (fenced) {
+    const preamble = terminalTextPreamble(fenced.before);
+    const fencedBody = terminalCommandFromLines(fenced.body.split("\n"));
+    return {
+      command: preamble.command || fencedBody.command,
+      output: fencedBody.output || fenced.body.trim(),
+      intent: preamble.intent
+    };
+  }
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  while (lines.length && !lines[0]?.trim()) {
+    lines.shift();
+  }
+  return terminalCommandFromLines(lines);
+}
+
+function terminalFenceBlock(text: string): { before: string; body: string } | undefined {
+  const match = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").match(/```(?:console|terminal|shell|bash|sh|zsh|text)?\n([\s\S]*?)```/i);
+  return match?.index === undefined ? undefined : { before: text.slice(0, match.index), body: match[1] || "" };
+}
+
+function terminalCommandFromLines(lines: string[]): { command: string; output: string; intent: string } {
+  const working = [...lines];
+  while (working.length && !working[0]?.trim()) {
+    working.shift();
+  }
+  const first = working[0]?.trim() || "";
+  const second = working[1]?.trim() || "";
+  if (/^[$>]\s+/.test(first)) {
+    return { command: first.replace(/^[$>]\s+/, ""), output: working.slice(1).join("\n").trim(), intent: "" };
+  }
+  if (shellCommentText(first) && second) {
+    return { command: `${first}\n${second.replace(/^[$>]\s+/, "")}`, output: working.slice(2).join("\n").trim(), intent: shellCommentText(first) };
+  }
+  if (looksLikeShellCommand(first)) {
+    return { command: first, output: working.slice(1).join("\n").trim(), intent: "" };
+  }
+  return { command: "", output: looksLikeTerminalOutput(working) ? working.join("\n").trim() : "", intent: terminalIntentFromLines(working) };
+}
+
+function terminalTextPreamble(text: string): { command: string; intent: string } {
+  const parsed = terminalCommandFromLines(text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n"));
+  return { command: parsed.command, intent: parsed.intent || terminalIntentFromLines(text.split(/\r?\n/)) };
+}
+
+function terminalIntentFromLines(lines: string[]): string {
+  const seen = new Set<string>();
+  const cleaned = lines
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("```"))
+    .filter((line) => {
+      const key = line.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  const first = cleaned.find((line) => !looksLikeShellCommand(line));
+  return first ? shellCommentText(first) || first : "";
+}
+
+function looksLikeTerminalOutput(lines: string[]): boolean {
+  const text = lines.join("\n").trim();
+  return (
+    lines.length > 2 ||
+    /^\s/.test(lines[0] || "") ||
+    /(?:^|\n)\s*(?:error|warning|failed|passed|success|total)\b/i.test(text) ||
+    /(?:https?:\/\/|[│┌└├─]{2,}|^\d+\s+\w+)/m.test(text)
+  );
+}
+
+function looksLikeShellCommand(value: string): boolean {
+  return /^(?:\.\/|\/|[A-Z_][A-Z0-9_]*=|(?:npm|pnpm|yarn|bun|npx|node|git|rg|grep|find|ls|cat|sed|awk|python3?|pytest|go|cargo|make|bash|sh|zsh|cd|mkdir|rm|cp|mv|curl|docker|kubectl|tsc|crabdb)\b)/.test(value) || /\s(?:--?[A-Za-z0-9]|&&|\|\s|2>)/.test(value);
+}
+
+function terminalHasOutput(record: Record<string, unknown>): boolean {
+  return Boolean(stringChoice(record, ["output", "stdout", "stdoutPreview", "stdout_preview", "stderr", "stderrPreview", "stderr_preview"]));
+}
+
+function isCountSummary(value: string): boolean {
+  return /^\d+\s+(?:output|outputs|terminal preview|terminal previews)$/.test(value);
+}
+
+function terminalPreview(value: unknown, nodeId?: string): string {
+  return terminalPreviewFromModel(buildTerminalPresentation(asRecord(value), MAX_TERMINAL_CHARS), nodeId);
+}
+
+function terminalTranscriptRows(model: TerminalPresentation): TerminalTranscriptRow[] {
+  const command = terminalCommandParts(model.command || model.title).command || model.title;
+  const rows: TerminalTranscriptRow[] = [
+    {
+      id: "command",
+      kind: "in",
+      label: "IN",
+      title: "Command",
+      detail: model.cwd || "shell",
+      textHtml: escapeHtml(command),
+      language: "shellscript",
+      meta: model.cwd,
+      tone: "muted",
+      truncated: false,
+      empty: false,
+      openByDefault: true
+    }
+  ];
+
+  if (!model.sections.length) {
+    rows.push({
+      id: "empty-output",
+      kind: "out",
+      label: "OUT",
+      title: "Output",
+      detail: "empty",
+      textHtml: escapeHtml(model.emptyText),
+      tone: "muted",
+      truncated: false,
+      empty: true,
+      openByDefault: true
+    });
+    return rows;
+  }
+
+  for (const section of model.sections) {
+    rows.push({
+      id: `section-${section.id}`,
+      kind: section.id === "stderr" ? "err" : "out",
+      label: section.id === "stderr" ? "ERR" : "OUT",
+      title: section.label,
+      detail: `${new Intl.NumberFormat("en-US").format(section.lineCount)} line${section.lineCount === 1 ? "" : "s"}`,
+      textHtml: renderAnsiText(section.text),
+      tone: section.tone,
+      truncated: section.truncated,
+      empty: false,
+      openByDefault: section.openByDefault
+    });
+  }
+  return rows;
+}
+
+function terminalPreviewFromModel(model: TerminalPresentation, nodeId?: string): string {
+  const openTerminal = nodeId
+    ? inlineActions({
+        ariaLabel: "Terminal transcript actions",
+        className: "terminal-transcript-actions",
+        actions: [
+          {
+            action: "openTerminal",
+            ariaLabel: "Open terminal",
+            data: { "node-id": nodeId },
+            iconHtml: iconSvg("terminal"),
+            iconOnly: true,
+            label: "Open terminal",
+            tone: "provider"
+          }
+        ]
+      })
+    : "";
+  const command = terminalCommandParts(model.command || model.title).command || model.title;
+  const rows = [
+    terminalTranscriptRow("in", "IN", command, { language: "shellscript", meta: model.cwd }),
+    ...(model.sections.length
+      ? model.sections.map((section) =>
+          terminalTranscriptRow(section.id === "stderr" ? "err" : "out", section.id === "stderr" ? "ERR" : "OUT", section.text, {
+            truncated: section.truncated,
+            tone: section.tone
+          })
+        )
+      : [terminalTranscriptRow("out", "OUT", model.emptyText, { empty: true })])
+  ].join("");
+  return `<div class="terminal-transcript terminal-tone-${escapeClass(model.tone)}">${rows}${openTerminal}</div>`;
+}
+
+function terminalTranscriptRow(
+  kind: "in" | "out" | "err",
+  label: string,
+  text: string,
+  options: { language?: string | undefined; meta?: string | undefined; tone?: string | undefined; truncated?: boolean | undefined; empty?: boolean | undefined } = {}
+): string {
+  const attrs = options.language ? ` data-highlight-language="${escapeHtml(options.language)}"` : "";
+  const content = options.language ? escapeHtml(text) : renderAnsiText(text);
+  const note = options.truncated ? `<small class="terminal-transcript-note">truncated at ${MAX_TERMINAL_CHARS.toLocaleString()} chars</small>` : "";
+  const meta = options.meta ? `<small class="terminal-transcript-note">${escapeHtml(options.meta)}</small>` : "";
+  return `<div class="terminal-transcript-row terminal-transcript-${kind} terminal-tone-${escapeClass(options.tone || "muted")}"><span class="terminal-transcript-label">${escapeHtml(label)}</span><div class="terminal-transcript-cell"><pre class="terminal-transcript-code code${options.empty ? " terminal-transcript-empty" : ""}"${attrs} tabindex="0">${content}</pre>${meta}${note}</div></div>`;
+}
+
+function terminalCommandParts(value: string): { intent: string; command: string } {
+  const lines = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const intentLines: string[] = [];
+  while (lines.length && shellCommentText(lines[0])) {
+    intentLines.push(shellCommentText(lines.shift()) || "");
+  }
+  const command = lines.join("\n").trim() || value.trim();
+  return { intent: intentLines.join(" ").trim(), command };
+}
+
+function shellCommentText(value: string | undefined): string {
+  const match = String(value || "").trim().match(/^#\s+(.+)$/);
+  return match?.[1]?.trim() || "";
+}
+
+function renderAnsiText(value: string): string {
+  const input = value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const pattern = /\x1b\[([0-9;]*)m/g;
+  let cursor = 0;
+  let color = "";
+  let html = "";
+  const append = (text: string) => {
+    if (!text) {
+      return;
+    }
+    const escaped = escapeHtml(text);
+    html += color ? `<span class="ansi-fg-${color}">${escaped}</span>` : escaped;
+  };
+  for (let match = pattern.exec(input); match; match = pattern.exec(input)) {
+    append(input.slice(cursor, match.index));
+    cursor = match.index + match[0].length;
+    color = ansiColor(String(match[1] || "0"));
+  }
+  append(input.slice(cursor));
+  return html;
+}
+
+function ansiColor(value: string): string {
+  const code = Number(value.split(";").pop() || 0);
+  if (code === 0 || code === 39) {
     return "";
   }
-  const text = truncateText(redactString(value), MAX_TERMINAL_CHARS);
-  return `
-    <details class="terminal-output" ${label === "Stderr" ? "open" : ""}>
-      <summary>${escapeHtml(label)}${text.truncated ? " - truncated" : ""}</summary>
-      <div class="terminal-output-tools">
-        <input class="terminal-search" type="search" placeholder="Filter ${escapeHtml(label.toLowerCase())}" aria-label="Filter ${escapeHtml(label)}">
-        ${iconButton("copyTerminalOutput", `Copy ${label}`, "copy")}
-      </div>
-      <pre class="code">${escapeHtml(text.text)}</pre>
-      ${text.truncated ? `<p class="muted">Preview truncated after ${MAX_TERMINAL_CHARS} characters.</p>` : ""}
-    </details>
-  `;
+  const colors = ["muted", "red", "green", "yellow", "blue", "magenta", "cyan"];
+  return (code >= 30 && code <= 36 ? colors[code - 30] : code >= 90 && code <= 96 ? colors[code - 90] : "") || "";
 }
 
-async function copyTerminalOutput(action: HTMLElement): Promise<void> {
-  const pre = action.closest(".terminal-output")?.querySelector<HTMLPreElement>("pre.code");
-  const text = pre?.dataset.fullText || pre?.textContent || "";
-  if (!text) {
+async function copyCheckpoint(action: HTMLElement): Promise<void> {
+  await copyTextToClipboard(action.dataset.target || "", "checkpoint id", "Copied checkpoint id.");
+}
+
+function focusToolDiff(action: HTMLElement): void {
+  const card = action.closest<HTMLElement>(".tool-card");
+  if (!card) {
+    return;
+  }
+  const diff = card.querySelector<HTMLElement>(".diff-preview");
+  if (!diff) {
+    return;
+  }
+  diff.setAttribute("tabindex", "-1");
+  diff.scrollIntoView({ block: "nearest", inline: "nearest" });
+  diff.focus();
+}
+
+function inspectToolDetails(action: HTMLElement): void {
+  const card = action.closest<HTMLElement>(".tool-card");
+  if (!card) {
+    return;
+  }
+  const rawSummary = card.querySelector<HTMLElement>(".raw-summary");
+  if (rawSummary) {
+    rawSummary.scrollIntoView({ block: "nearest", inline: "nearest" });
+    rawSummary.focus();
+    return;
+  }
+  const fallback = card.querySelector<HTMLElement>(".tool-content, .tool-evidence-strip, .tool-summary");
+  fallback?.setAttribute("tabindex", "-1");
+  fallback?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  fallback?.focus();
+}
+
+async function copyTextToClipboard(text: string, label: string, successMessage: string): Promise<void> {
+  if (!text.length) {
+    announceToast(`No ${label} available to copy.`, "error");
     return;
   }
   try {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("Clipboard API unavailable");
+    }
     await navigator.clipboard.writeText(text);
-    toast("Copied terminal output.", "status");
+    announceToast(successMessage, "status");
   } catch {
-    fallbackCopy(text, "terminal output");
+    fallbackCopy(text, label);
   }
 }
 
@@ -1046,49 +2749,24 @@ function fallbackCopy(text: string, label = "preview text"): void {
   textarea.style.left = "-9999px";
   document.body.append(textarea);
   textarea.select();
-  const copied = document.execCommand("copy");
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  }
   textarea.remove();
-  toast(copied ? `Copied ${label}.` : `Unable to copy ${label}.`, copied ? "status" : "error");
-}
-
-function filterTerminalOutput(input: HTMLInputElement): void {
-  const pre = input.closest(".terminal-output")?.querySelector<HTMLPreElement>("pre.code");
-  if (!pre) {
-    return;
-  }
-  const source = pre.dataset.fullText || pre.textContent || "";
-  pre.dataset.fullText = source;
-  const query = input.value.trim().toLowerCase();
-  if (!query) {
-    pre.textContent = source;
-    return;
-  }
-  const matches = source.split("\n").filter((line) => line.toLowerCase().includes(query));
-  pre.textContent = matches.length ? matches.join("\n") : "No matching lines in this preview.";
-}
-
-function terminalCommand(record: Record<string, unknown>): string | undefined {
-  const command = record.command;
-  if (typeof command === "string") {
-    return command;
-  }
-  if (Array.isArray(command)) {
-    return command.map((part) => String(part)).join(" ");
-  }
-  return stringChoice(record, ["commandLine", "command_line"]);
+  announceToast(copied ? `Copied ${label}.` : `Unable to copy ${label}.`, copied ? "status" : "error");
 }
 
 async function copyCode(action: HTMLElement): Promise<void> {
   const text = codeTextForAction(action);
-  if (!text) {
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(text);
-    toast("Copied preview text.", "status");
-  } catch {
-    fallbackCopy(text);
-  }
+  await copyTextToClipboard(text, "preview text", "Copied preview text.");
+}
+
+async function copyDiff(action: HTMLElement): Promise<void> {
+  const text = diffTextForAction(action);
+  await copyTextToClipboard(text, "unified diff", "Copied unified diff.");
 }
 
 function openTextPreview(action: HTMLElement): void {
@@ -1104,26 +2782,92 @@ function openTextPreview(action: HTMLElement): void {
   });
 }
 
+function openDiffPreview(action: HTMLElement): void {
+  const text = diffTextForAction(action);
+  if (!text) {
+    return;
+  }
+  vscode.postMessage({
+    type: "openTextPreview",
+    text,
+    title: action.dataset.title || "CrabDB unified diff",
+    language: action.dataset.language || "diff"
+  });
+}
+
+function selectDiffReviewFile(path: string): void {
+  if (!path) {
+    return;
+  }
+  const drawer = document.querySelector<HTMLElement>(".diff-review-drawer");
+  if (!drawer) {
+    return;
+  }
+  drawer.querySelectorAll<HTMLElement>("[data-diff-review-path]").forEach((element) => {
+    const active = element.dataset.diffReviewPath === path;
+    element.classList.toggle("active", active);
+    if (element instanceof HTMLButtonElement) {
+      element.setAttribute("aria-pressed", active ? "true" : "false");
+    }
+  });
+  drawer.querySelectorAll<HTMLElement>("[data-diff-review-file]").forEach((element) => {
+    const active = element.dataset.diffReviewFile === path;
+    element.hidden = !active;
+    element.classList.toggle("active", active);
+    if (active) {
+      element.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+  });
+}
+
+function insertDiffSuggestion(action: HTMLElement): void {
+  const command = action.dataset.command || "";
+  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
+  if (!command || !input) {
+    return;
+  }
+  insertComposerText(input, command);
+  closeJsonDrawer({ restoreFocus: false });
+  announceToast("Command inserted in composer.", "status");
+}
+
+function diffTextForAction(action: HTMLElement): string {
+  const template = action.closest(".diff-preview")?.querySelector<HTMLTemplateElement>("template.diff-source");
+  return template?.content.textContent || "";
+}
+
 function openMediaPreview(action: HTMLElement): void {
   const preview = action.closest(".media-preview");
   const image = preview?.querySelector<HTMLImageElement>("img.inline-image");
   const audio = preview?.querySelector<HTMLAudioElement>("audio");
   const media = image || audio;
   if (!media?.src) {
-    toast("No media preview is available.", "status");
+    announceToast("No media preview is available.", "status");
     return;
   }
-  const label = preview?.querySelector("summary")?.textContent || "Media preview";
-  closeJsonDrawer();
+  const label = preview?.querySelector(".payload-summary")?.textContent || "Media preview";
+  prepareJsonDrawer();
   const drawer = document.createElement("section");
   drawer.className = "json-drawer media-drawer";
-  drawer.setAttribute("role", "dialog");
-  drawer.setAttribute("aria-label", label);
-  drawer.setAttribute("tabindex", "-1");
+  configureJsonDrawer(drawer, label);
+  const closeActions = inlineActions({
+    ariaLabel: "Media preview drawer actions",
+    className: "media-drawer-actions",
+    actions: [
+      {
+        action: "closeDrawer",
+        ariaLabel: "Close media preview",
+        iconHtml: iconSvg("close"),
+        iconOnly: true,
+        label: "Close media preview",
+        tone: "provider"
+      }
+    ]
+  });
   drawer.innerHTML = `
     <div class="drawer-header">
       <h2>${escapeHtml(label)}</h2>
-      ${iconButton("closeDrawer", "Close media preview", "close")}
+      ${closeActions}
     </div>
     ${
       image
@@ -1131,8 +2875,8 @@ function openMediaPreview(action: HTMLElement): void {
         : `<audio class="media-full-audio" controls src="${escapeHtml(media.src)}"></audio>`
     }
   `;
-  document.body.append(drawer);
-  drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus();
+  mountJsonDrawer(drawer);
+  void hydrateInlineActions().then(() => drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus());
 }
 
 function codeTextForAction(action: HTMLElement): string {
@@ -1159,61 +2903,204 @@ function numberChoice(record: Record<string, unknown>, keys: string[]): number |
   return undefined;
 }
 
-function resourceBlock(block: unknown): string {
-  return `
-    <article class="turn-card resource-node">
-      <div class="rail"></div>
-      <div class="card-body">${renderContentBlock(block)}</div>
-    </article>
-  `;
+function resourceBlock(node: Extract<RenderNode, { kind: "resource" }>): string {
+  const label = resourceBlockLabel(node.content);
+  const presentation = buildEventPresentation({
+    kind: "resource",
+    resourceLabel: label
+  });
+  return auditEventNode({
+    id: node.id,
+    className: "resource-node",
+    presentation,
+    contentHtml: `<div class="event-content">${renderContentBlock(node.content)}</div>`
+  });
 }
 
 function composer(): string {
   const attachments = state.attachments || [];
   const controlsDisabled = Boolean(state.sending || state.permissionPending);
   const disabled = controlsDisabled ? "disabled" : "";
-  const placeholder = state.permissionPending ? "Permission pending" : "Message agent";
+  const usage = currentUsageNode();
+  const status = composerStatus(attachments);
+  const draftState = composerDraftState(composerDraft, attachments.length);
+  const sendBlockedReason = composerSendBlockedReason(Boolean(composerDraft.trim()), attachments.length, draftState.chars);
+  const placeholder = composerPlaceholder(status);
+  const provider = currentProviderProfile();
+  const railItems = composerRailItems({
+    statusTone: status.tone,
+    statusLabel: status.label,
+    attachmentModes: attachments.map(attachmentMode),
+    sendMode: composerSendMode,
+    providerCrabdbBacked: provider?.crabdbBacked
+  });
+  composerCardProps = {
+    id: "composer",
+    status,
+    draft: {
+      tone: draftState.tone,
+      label: draftState.label,
+      detail: draftState.detail,
+      maxChars: draftState.maxChars,
+      meterValue: draftState.meterValue,
+      meterPercent: draftState.meterPercent
+    },
+    draftValue: composerDraft,
+    placeholder,
+    keyShortcuts: composerKeyShortcuts(),
+    maxChars: MAX_COMPOSER_DRAFT_CHARS,
+    controlsDisabled,
+    sendBlockedReason,
+    metricsText: composerMetrics(composerDraft, attachments),
+    attachments: attachments.map(composerAttachmentView),
+    attachmentSummary: attachmentSummary(attachments),
+    railItems,
+    presets: COMPOSER_PROMPT_PRESETS.map((preset) => ({
+      id: preset.id,
+      label: preset.label,
+      detail: preset.detail,
+      iconHtml: iconSvg(preset.icon)
+    })),
+    sendMode: composerSendMode,
+    contextUsageHtml: contextUsageGauge(usage),
+    sessionControlsHtml: composerSessionControlsHtml(disabled),
+    contextActions: [
+      composerIconAction("attachSelection", "Attach the current editor selection", "selection", controlsDisabled),
+      composerIconAction("attachFile", "Attach the active file", "file", controlsDisabled),
+      composerIconAction("attachDiagnostics", "Attach diagnostics for the active file", "diagnostics", controlsDisabled),
+      composerIconAction("attachTerminalOutput", "Attach the latest terminal output from this chat", "terminal", controlsDisabled),
+      composerIconAction("attachChangedFiles", "Attach the changed file list for this task", "changed", controlsDisabled),
+      composerIconAction("attachHistory", "Attach CrabDB history for the active file", "history", controlsDisabled)
+    ],
+    rewindIconHtml: iconSvg("rewind"),
+    sendIconHtml: iconSvg("send"),
+    clearIconHtml: iconSvg("close"),
+    settingsIconHtml: iconSvg("settings")
+  };
   return `
     <section id="composer" class="composer" aria-label="Prompt composer" tabindex="-1">
-      <div class="composer-box">
-        <div class="composer-topbar">
-          <div class="composer-session">
-            <span class="provider-chip">${escapeHtml(state.provider || "provider")}</span>
-            ${providerSelector(disabled)}
-            ${sessionControlSelectors()}
-          </div>
-          ${capabilityChips()}
-        </div>
-        ${
-          attachments.length
-            ? `<div class="attachments" aria-label="Attached context">${attachments
-                .map(
-                  (attachment) =>
-                    `<span class="attachment-chip"><b>${escapeHtml(attachment.kind)}</b>${escapeHtml(shortLabel(attachment.label))}<small>${escapeHtml(attachmentMode(attachment))}</small>${iconButton("removeAttachment", `Remove ${attachment.label}`, "close", { attrs: `data-attachment-id="${escapeHtml(attachment.id)}"`, className: "micro" })}</span>`
-                )
-                .join("")}</div>`
-            : ""
-        }
-        <textarea class="composer-input" rows="4" placeholder="${escapeHtml(placeholder)}" aria-keyshortcuts="Enter Control+Enter Meta+Enter" ${disabled}>${escapeHtml(composerDraft)}</textarea>
-        <div class="composer-actions">
-          <span class="composer-count">${attachments.length} attachment${attachments.length === 1 ? "" : "s"}</span>
-          <span class="composer-icon-tools" role="group" aria-label="Context attachments">
-            ${iconButton("attachSelection", "Attach the current editor selection", "selection", { disabled: controlsDisabled })}
-            ${iconButton("attachFile", "Attach the active file", "file", { disabled: controlsDisabled })}
-            ${iconButton("attachDiagnostics", "Attach diagnostics for the active file", "diagnostics", { disabled: controlsDisabled })}
-            ${iconButton("attachTerminalOutput", "Attach the latest terminal output from this chat", "terminal", { disabled: controlsDisabled })}
-            ${iconButton("attachChangedFiles", "Attach the changed file list for this task", "changed", { disabled: controlsDisabled })}
-            ${iconButton("attachHistory", "Attach CrabDB history for the active file", "history", { disabled: controlsDisabled })}
-            ${iconButton("rewind", "Rewind latest turn", "rewind")}
-            ${iconButton("send", state.permissionPending ? "Permission required before sending" : state.sending ? "Sending prompt" : "Send prompt", "send", {
-              className: "primary send-button",
-              disabled: controlsDisabled
-            })}
-          </span>
-        </div>
-      </div>
+      <div class="composer-card-react-root" data-composer-card-root data-composer-id="composer"></div>
     </section>
   `;
+}
+
+function composerAttachmentView(attachment: PromptAttachmentView): ComposerCardProps["attachments"][number] {
+  return {
+    id: attachment.id,
+    kind: attachment.kind,
+    label: shortLabel(attachment.label),
+    mode: attachmentMode(attachment),
+    title: `${attachment.kind}: ${attachment.label}`
+  };
+}
+
+function composerIconAction(
+  action: string,
+  label: string,
+  icon: IconName,
+  disabled: boolean
+): ComposerCardProps["contextActions"][number] {
+  return {
+    action,
+    label,
+    iconHtml: iconSvg(icon),
+    disabled
+  };
+}
+
+function composerKeyShortcuts(): string {
+  return composerSendMode === "fast" ? "Enter Control+Enter Meta+Enter" : "Control+Enter Meta+Enter";
+}
+
+function composerSessionControlsHtml(disabled: string): string {
+  const controls = [providerSelector(disabled), sessionControlSelectors(disabled)].filter(Boolean).join("");
+  return controls;
+}
+
+function closeComposerControls(): void {
+  closeFloatingDetails();
+}
+
+function closeFloatingDetails(except?: HTMLElement, restoreFocus = false): boolean {
+  let closed = false;
+  document.querySelectorAll<HTMLElement>(`${FLOATING_DETAILS_SELECTOR}[data-floating-open="true"]`).forEach((menu) => {
+    if (menu === except) {
+      return;
+    }
+    closed = true;
+  });
+  if (closed) {
+    dispatchFloatingMenuClose({ except, restoreFocus });
+  }
+  return closed;
+}
+
+function composerStatus(attachments: PromptAttachmentView[]): ComposerStatus {
+  if (state.permissionPending) {
+    return {
+      tone: "waiting",
+      label: "Permission required",
+      detail: "Approve or reject the pending tool request before sending another prompt."
+    };
+  }
+  if (state.sending) {
+    return {
+      tone: "running",
+      label: "Agent is working",
+      detail: "Watch the transcript, open review, or cancel the current turn from the toolbar."
+    };
+  }
+  if (state.providerFailure) {
+    return {
+      tone: "warning",
+      label: "Follow-up recommended",
+      detail: "The last provider turn stopped early. Start a follow-up from CrabDB's latest checkpoint when ready."
+    };
+  }
+  if (attachments.length) {
+    return {
+      tone: "context",
+      label: "Context ready",
+      detail: `${attachmentSummary(attachments)} attached to the next prompt.`
+    };
+  }
+  return {
+    tone: "ready",
+    label: "Ready for the next turn",
+    detail: "Ask for code, tests, review, or attach editor context before sending."
+  };
+}
+
+function composerPlaceholder(status: ComposerStatus): string {
+  if (status.tone === "waiting") {
+    return "Permission pending";
+  }
+  if (status.tone === "running") {
+    return "Prompt running";
+  }
+  if (status.tone === "warning") {
+    return "Start a follow-up or describe what to do next";
+  }
+  return "Message agent";
+}
+
+function composerSendBlockedReason(hasDraft: boolean, attachmentCount: number, draftChars = Array.from(composerDraft).length): string | undefined {
+  return blockedComposerSendReason({
+    hasDraft,
+    attachmentCount,
+    draftChars,
+    maxChars: MAX_COMPOSER_DRAFT_CHARS,
+    sending: state.sending,
+    permissionPending: state.permissionPending
+  });
+}
+
+function composerMetrics(text: string, attachments: PromptAttachmentView[]): string {
+  return formatComposerMetrics(text, attachments.length);
+}
+
+function attachmentSummary(attachments: PromptAttachmentView[]): string {
+  return attachmentModeSummary(attachments.map(attachmentMode));
 }
 
 function reviewDrawer(task: WebviewState["task"]): string {
@@ -1224,150 +3111,264 @@ function reviewDrawer(task: WebviewState["task"]): string {
   const turns = arrayField(taskView, "turns");
   const events = arrayField(taskView, "events");
   const changes = arrayField(taskView, "changes").concat(arrayField(review, "changed_paths"));
+  const changedFiles = uniqueStrings(changed.concat(changes.map(reviewValueLabel)));
   const blockers = reviewStrings(readiness, ["blockers", "blocking", "failed_gates"]).concat(
     reviewStrings(review, ["blockers", "blocking", "failed_gates"])
   );
   const warnings = reviewStrings(readiness, ["warnings", "stale_base", "risky_files", "ignored_paths"]).concat(
     reviewStrings(review, ["warnings", "stale_base", "risky_files", "ignored_paths"])
   );
-  const testRuns = arrayField(review, "recent_gates").concat(arrayField(review, "latest_test").filter(Boolean));
+  const latestTest = asRecord(review.latest_test);
+  const latestEval = asRecord(review.latest_eval);
+  const testRuns = arrayField(review, "recent_gates").concat(Object.keys(latestTest).length ? [latestTest] : []);
+  const evalRuns = arrayField(review, "recent_evals")
+    .concat(arrayField(review, "evals"))
+    .concat(arrayField(review, "evaluations"))
+    .concat(Object.keys(latestEval).length ? [latestEval] : []);
   const transcriptLinks = transcriptAnchors();
   const coordination = coordinationSummaryFromSources(task, taskView, review, readiness);
   const conflictIds = conflictSetIdsFromSources(readiness, review);
   const overlaps = state.taskOverlaps || [];
   const providerTitle = providerSessionTitle(task?.title);
+  const turnCount = turns.length || transcriptTurnCount();
+  const reviewReadiness = buildReviewReadiness({
+    taskStatus: task?.status,
+    changedPaths: changedFiles.length,
+    turnCount,
+    eventCount: events.length,
+    blockers: blockers.length,
+    warnings: warnings.length,
+    conflictCount: conflictIds.length,
+    overlapCount: overlaps.length,
+    testRunCount: testRuns.length,
+    evalRunCount: evalRuns.length,
+    coordination
+  });
+  const refreshAction: ReviewAction = { action: "refresh", label: "Refresh", description: "Fetch the latest review state.", tone: "default" };
+  const actionIcons = reviewActionIconHtml(reviewReadiness.actionGroups, [refreshAction]);
+  const sectionsHtml = [
+    `<section class="review-section">
+      <h3>Summary</h3>
+      <dl class="review-facts">
+        <div><dt>Task</dt><dd>${escapeHtml(task?.title || "New agent task")}</dd></div>
+        ${providerTitle ? `<div><dt>Provider session</dt><dd>${escapeHtml(providerTitle)}</dd></div>` : ""}
+        <div><dt>Provider</dt><dd>${escapeHtml(state.provider || task?.provider || "provider")}</dd></div>
+        ${state.providerSwitchFrom ? `<div><dt>Switched from</dt><dd>${escapeHtml(state.providerSwitchFrom)}</dd></div>` : ""}
+        ${task?.model ? `<div><dt>Model</dt><dd>${escapeHtml(task.model)}</dd></div>` : ""}
+        <div><dt>Lane</dt><dd>${escapeHtml(task?.lane || "pending")}</dd></div>
+        <div><dt>Session</dt><dd>${escapeHtml(sessionStateLabel()?.label || "New session")}</dd></div>
+        ${state.persistedAcpSessionId ? `<div><dt>Saved session</dt><dd>${escapeHtml(state.persistedAcpSessionId)}</dd></div>` : ""}
+        <div><dt>Turns</dt><dd>${turnCount}</dd></div>
+        <div><dt>Events</dt><dd>${events.length}</dd></div>
+        <div><dt>Changes</dt><dd>${changedFiles.length}</dd></div>
+      </dl>
+    </section>`,
+    `<section class="review-section">
+      <h3>Blockers and warnings</h3>
+      ${reviewIssueList(blockers, warnings, readinessText(task?.status || "new"))}
+    </section>`,
+    `<section class="review-section">
+      <h3>Coordination</h3>
+      ${coordinationPanel(coordination)}
+    </section>`,
+    overlaps.length
+      ? `<section class="review-section">
+          <h3>Parallel work</h3>
+          ${overlapReviewList(overlaps)}
+          ${inlineActions({
+            ariaLabel: "Parallel work actions",
+            actions: [
+              { action: "compareTasks", label: "Compare tasks", tone: "provider" },
+              { action: "refresh", label: "Refresh", tone: "lane" },
+              { action: "queueMerge", label: "Queue merge", tone: "lane" }
+            ]
+          })}
+        </section>`
+      : "",
+    conflictIds.length
+      ? `<section class="review-section">
+          <h3>Conflicts</h3>
+          <p class="muted">CrabDB reports ${conflictIds.length} open conflict set${conflictIds.length === 1 ? "" : "s"} for this task.</p>
+          ${inlineActions({
+            ariaLabel: "Conflict actions",
+            className: "conflict-actions",
+            actions: conflictIds.map((id) => ({
+              action: "showConflict",
+              data: { "conflict-id": id },
+              label: `Open ${shortLabel(id)}`,
+              tone: "review"
+            }))
+          })}
+        </section>`
+      : "",
+    `<section class="review-section">
+      <h3>Tests and evals</h3>
+      ${testSummary(taskView, testRuns.concat(evalRuns))}
+      ${inlineActions({
+        ariaLabel: "Test and eval actions",
+        actions: [
+          { action: "runTests", label: "Run test", tone: "lane" },
+          { action: "runEvals", label: "Run eval", tone: "lane" }
+        ]
+      })}
+    </section>`,
+    `<section class="review-section">
+      <h3>Diffs</h3>
+      ${changedFiles.length ? `<ul>${changedFiles.map((file) => `<li>${locationChip(file)}</li>`).join("")}</ul>` : `<p class="muted">No changed paths recorded yet.</p>`}
+    </section>`,
+    `<section class="review-section">
+      <h3>Transcript</h3>
+      ${transcriptLinks.length ? `<ul>${transcriptLinks.map((link) => `<li><a href="#${escapeHtml(link.id)}">${escapeHtml(link.label)}</a></li>`).join("")}</ul>` : `<p class="muted">No persisted turns yet.</p>`}
+    </section>`
+  ].join("");
+  reviewDrawerProps = {
+    id: "review",
+    readiness: reviewReadiness,
+    sectionsHtml,
+    actionIcons,
+    refreshAction
+  };
   return `
     <aside id="review" class="review-drawer" aria-label="Review" tabindex="-1">
-      <h2>Review</h2>
-      <div class="review-status status-${escapeClass(task?.status || "new")}">${escapeHtml(task?.status || "New task")}</div>
-      <section class="review-section">
-        <h3>Summary</h3>
-        <dl class="review-facts">
-          <div><dt>Task</dt><dd>${escapeHtml(task?.title || "New agent task")}</dd></div>
-          ${providerTitle ? `<div><dt>Provider session</dt><dd>${escapeHtml(providerTitle)}</dd></div>` : ""}
-          <div><dt>Provider</dt><dd>${escapeHtml(state.provider || task?.provider || "provider")}</dd></div>
-          ${state.providerSwitchFrom ? `<div><dt>Switched from</dt><dd>${escapeHtml(state.providerSwitchFrom)}</dd></div>` : ""}
-          ${task?.model ? `<div><dt>Model</dt><dd>${escapeHtml(task.model)}</dd></div>` : ""}
-          <div><dt>Lane</dt><dd>${escapeHtml(task?.lane || "pending")}</dd></div>
-          <div><dt>Session</dt><dd>${escapeHtml(sessionStateLabel()?.label || "New session")}</dd></div>
-          ${state.persistedAcpSessionId ? `<div><dt>Saved session</dt><dd>${escapeHtml(state.persistedAcpSessionId)}</dd></div>` : ""}
-          <div><dt>Turns</dt><dd>${turns.length || transcriptTurnCount()}</dd></div>
-          <div><dt>Events</dt><dd>${events.length}</dd></div>
-          <div><dt>Changes</dt><dd>${changed.length || changes.length}</dd></div>
-        </dl>
-      </section>
-      <section class="review-section">
-        <h3>Readiness</h3>
-        ${
-          blockers.length || warnings.length
-            ? `<ul>${[...blockers.map((item) => `Blocked: ${item}`), ...warnings.map((item) => `Warning: ${item}`)].map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
-            : `<p class="muted">${readinessText(task?.status || "new")}</p>`
-        }
-      </section>
-      <section class="review-section">
-        <h3>Coordination</h3>
-        ${coordinationPanel(coordination)}
-      </section>
-      ${
-        overlaps.length
-          ? `<section class="review-section">
-              <h3>Parallel work</h3>
-              ${overlapReviewList(overlaps)}
-              <div class="inline-actions">
-                <button data-action="compareTasks">Compare tasks</button>
-                <button data-action="refresh">Refresh</button>
-                <button data-action="queueMerge">Queue merge</button>
-              </div>
-            </section>`
-          : ""
-      }
-      ${
-        conflictIds.length
-          ? `<section class="review-section">
-              <h3>Conflicts</h3>
-              <p class="muted">CrabDB reports ${conflictIds.length} open conflict set${conflictIds.length === 1 ? "" : "s"} for this task.</p>
-              <div class="inline-actions conflict-actions">
-                ${conflictIds
-                  .map(
-                    (id) =>
-                      `<button data-action="showConflict" data-conflict-id="${escapeHtml(id)}">Open ${escapeHtml(shortLabel(id))}</button>`
-                  )
-                  .join("")}
-              </div>
-            </section>`
-          : ""
-      }
-      <section class="review-section">
-        <h3>Tests and evals</h3>
-        ${testSummary(taskView, testRuns)}
-        <div class="inline-actions">
-          <button data-action="runTests">Run test</button>
-          <button data-action="runEvals">Run eval</button>
-        </div>
-      </section>
-      <section class="review-section">
-        <h3>Diffs</h3>
-        ${changed.length || changes.length ? `<ul>${uniqueStrings(changed.concat(changes.map(reviewValueLabel))).map((file) => `<li>${locationChip(file)}</li>`).join("")}</ul>` : `<p class="muted">No changed paths recorded yet.</p>`}
-      </section>
-      <section class="review-section">
-        <h3>Transcript</h3>
-        ${transcriptLinks.length ? `<ul>${transcriptLinks.map((link) => `<li><a href="#${escapeHtml(link.id)}">${escapeHtml(link.label)}</a></li>`).join("")}</ul>` : `<p class="muted">No persisted turns yet.</p>`}
-      </section>
-      <div class="review-actions">
-        <button data-action="openDiff">Open diff</button>
-        <button data-action="compareTasks">Compare tasks</button>
-        <button data-action="openWorkdir">Open workdir</button>
-        <button class="primary" data-action="dryRunApply">Dry-run apply</button>
-        <button data-action="queueMerge">Queue merge</button>
-        <button data-action="rewind">Rewind</button>
-        <button data-action="preserveFailedAttempt">Preserve and rewind</button>
-        <button class="danger" data-action="removeTask">Remove task</button>
-      </div>
+      <div class="review-drawer-react-root" data-review-drawer-root data-review-drawer-id="review"></div>
     </aside>
   `;
 }
 
+function reviewActionIconHtml(groups: ReviewActionGroup[], extraActions: ReviewAction[] = []): Record<string, string> {
+  const icons: Record<string, string> = {};
+  groups.flatMap((group) => group.actions).concat(extraActions).forEach((action) => {
+    icons[action.action] = iconSvg(reviewActionIcon(action.action));
+  });
+  return icons;
+}
+
+const REVIEW_ACTION_ICONS: Record<string, IconName> = {
+  compareTasks: "diff",
+  dryRunApply: "selection",
+  focusTranscript: "turn",
+  openDiff: "diff",
+  openWorkdir: "open",
+  preserveFailedAttempt: "history",
+  queueMerge: "lane",
+  refresh: "refresh",
+  rewind: "rewind",
+  removeTask: "stop",
+  runEvals: "review",
+  runTests: "check"
+};
+
+function reviewActionIcon(action: string): IconName {
+  return REVIEW_ACTION_ICONS[action] || "tool";
+}
+
+function reviewIssueList(blockers: string[], warnings: string[], fallback: string): string {
+  const items = [
+    ...blockers.map((item) => ({ tone: "blocked", label: "Blocked", item })),
+    ...warnings.map((item) => ({ tone: "warning", label: "Warning", item }))
+  ];
+  if (!items.length) {
+    return `<p class="muted">${escapeHtml(fallback)}</p>`;
+  }
+  return `<ul class="review-issue-list">${items
+    .slice(0, 12)
+    .map((issue) => `<li class="review-issue-${escapeClass(issue.tone)}"><span>${escapeHtml(issue.label)}</span>${escapeHtml(issue.item)}</li>`)
+    .join("")}</ul>${items.length > 12 ? `<p class="muted">Showing 12 of ${items.length} readiness findings.</p>` : ""}`;
+}
+
 function overlapReviewList(overlaps: TaskOverlapView[]): string {
-  return `
-    <ul class="overlap-list">
-      ${overlaps
-        .slice(0, 6)
-        .map(
-          (overlap) => `
-            <li>
-              <strong>${escapeHtml(overlap.title)}</strong>
-              <span>${escapeHtml(overlap.lane)} - ${escapeHtml(overlap.status)}${overlap.provider ? ` - ${escapeHtml(overlap.provider)}` : ""}</span>
-              <div class="chips">${overlap.sharedPaths.slice(0, 6).map((path) => locationChip(path)).join("")}</div>
-            </li>
-          `
-        )
-        .join("")}
-    </ul>
-    ${overlaps.length > 6 ? `<p class="muted">Showing 6 of ${overlaps.length} overlapping tasks.</p>` : ""}
-  `;
+  return `<ul class="overlap-list">${overlaps
+    .slice(0, 6)
+    .map(
+      (overlap) =>
+        `<li><strong>${escapeHtml(overlap.title)}</strong><span>${escapeHtml(overlap.lane)} - ${escapeHtml(overlap.status)}${overlap.provider ? ` - ${escapeHtml(overlap.provider)}` : ""}</span><div class="chips">${overlap.sharedPaths.slice(0, 6).map((path) => locationChip(path)).join("")}</div></li>`
+    )
+    .join("")}</ul>${overlaps.length > 6 ? `<p class="muted">Showing 6 of ${overlaps.length} overlapping tasks.</p>` : ""}`;
 }
 
 function sendPrompt(): void {
   const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
   const text = input?.value || "";
-  if (!text.trim()) {
-    if (!state.attachments?.length) {
-      return;
+  const attachments = state.attachments || [];
+  const draftState = composerDraftState(text, attachments.length);
+  const sendBlockedReason = composerSendBlockedReason(Boolean(text.trim()), attachments.length, draftState.chars);
+  if (sendBlockedReason) {
+    announceToast(sendBlockedReason, "status");
+    if (!text.trim() || draftState.tone === "limit") {
+      focusComposer();
     }
-  }
-  if (state.sending) {
-    return;
-  }
-  if (state.permissionPending) {
-    toast("Resolve the pending permission request before sending another prompt.", "status");
+    syncComposerAffordances();
     return;
   }
   vscode.postMessage({ type: "sendPrompt", text });
   composerDraft = "";
-  vscode.setState({ composerDraft });
+  persistWebviewState();
   if (input) {
     input.value = "";
+    resizeComposerInput(input);
   }
+  syncComposerAffordances();
+}
+
+function syncComposerAffordances(): void {
+  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
+  const text = input?.value || composerDraft;
+  const attachments = state.attachments || [];
+  const draftState = composerDraftState(text, attachments.length);
+  const reason = composerSendBlockedReason(Boolean(text.trim()), attachments.length, draftState.chars);
+  const sendButton = document.querySelector<HTMLButtonElement>('[data-action="send"]');
+  if (sendButton) {
+    const label = reason || "Send prompt";
+    sendButton.disabled = Boolean(reason);
+    sendButton.title = label;
+    sendButton.setAttribute("aria-label", label);
+  }
+  const meta = document.querySelector<HTMLElement>("[data-composer-meta]");
+  if (meta) {
+    meta.textContent = composerMetrics(text, attachments);
+  }
+  const frame = input?.closest<HTMLElement>(".composer-input-frame");
+  if (frame) {
+    frame.classList.remove("composer-input-frame-empty", "composer-input-frame-ready", "composer-input-frame-warning", "composer-input-frame-limit");
+    frame.classList.add(`composer-input-frame-${draftState.tone}`);
+  }
+  const draftStateNode = document.getElementById("composer-draft-state");
+  const draftLabel = draftStateNode?.querySelector<HTMLElement>(".composer-draft-copy strong");
+  const draftDetail = draftStateNode?.querySelector<HTMLElement>(".composer-draft-copy span");
+  const meter = draftStateNode?.querySelector<HTMLElement>(".composer-meter");
+  if (draftLabel) {
+    draftLabel.textContent = draftState.label;
+  }
+  if (draftDetail) {
+    draftDetail.textContent = draftState.detail;
+  }
+  if (meter) {
+    meter.style.setProperty("--composer-meter", `${draftState.meterPercent}%`);
+    meter.setAttribute("aria-valuemax", String(draftState.maxChars));
+    meter.setAttribute("aria-valuenow", String(draftState.meterValue));
+  }
+  if (input) {
+    if (draftState.tone === "limit") {
+      input.setAttribute("aria-invalid", "true");
+    } else {
+      input.removeAttribute("aria-invalid");
+    }
+  }
+  const hint = document.querySelector<HTMLElement>("[data-composer-empty-reason]");
+  if (hint) {
+    hint.textContent = reason || "";
+    hint.hidden = !reason;
+  }
+  const clearButton = document.querySelector<HTMLButtonElement>("[data-composer-clear]");
+  if (clearButton) {
+    clearButton.disabled = !text || Boolean(state.sending || state.permissionPending);
+  }
+  syncComposerSendModeControls();
+}
+
+function resizeComposerInput(input: HTMLTextAreaElement): void {
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 220)}px`;
 }
 
 function coordinationPanel(summary: CoordinationSummary): string {
@@ -1396,7 +3397,7 @@ function coordinationPanel(summary: CoordinationSummary): string {
         .join("")}
     </div>
     ${summary.labels.length ? `<div class="chips coordination-labels">${summary.labels.map((label) => `<span class="coordination-chip coordination-${escapeClass(summary.severity)}">${escapeHtml(label)}</span>`).join("")}</div>` : ""}
-    ${issues.length ? `<ul>${issues.map((issue) => `<li><span class="tool-status">${escapeHtml(issue.tone)}</span> ${escapeHtml(issue.message)}</li>`).join("")}</ul>` : `<p class="muted">No CrabDB coordination blockers reported.</p>`}
+    ${issues.length ? `<ul>${issues.map((issue) => `<li><span class="coordination-issue-tone coordination-${escapeClass(issue.tone)}">${escapeHtml(issue.tone)}</span> ${escapeHtml(issue.message)}</li>`).join("")}</ul>` : `<p class="muted">No CrabDB coordination blockers reported.</p>`}
     ${stale}${dirty}
   `;
 }
@@ -1410,9 +3411,77 @@ function insertSlashCommand(commandName: string, hint: string): void {
   const existing = input.value.trim();
   input.value = existing ? `${prefix} ${existing}` : `${prefix}${hint ? " " : ""}`;
   composerDraft = input.value;
-  vscode.setState({ composerDraft });
+  persistWebviewState();
+  resizeComposerInput(input);
+  syncComposerAffordances();
+  closeComposerControls();
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
+  if (hint) {
+    announceToast(hint, "status");
+  }
+}
+
+function insertPromptPreset(presetId: string): void {
+  const preset = COMPOSER_PROMPT_PRESETS.find((item) => item.id === presetId);
+  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
+  if (!preset || !input) {
+    return;
+  }
+  insertComposerText(input, preset.text);
+  announceToast(`${preset.label} prompt added.`, "status");
+}
+
+function insertComposerText(input: HTMLTextAreaElement, text: string): void {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  const before = input.value.slice(0, start);
+  const after = input.value.slice(end);
+  const hasSelection = start !== end;
+  const separatorBefore = before && !before.endsWith("\n") ? "\n\n" : "";
+  const separatorAfter = after && !after.startsWith("\n") ? "\n\n" : "";
+  input.value = hasSelection ? `${before}${text}${after}` : `${before}${separatorBefore}${text}${separatorAfter}${after}`;
+  composerDraft = input.value;
+  persistWebviewState();
+  resizeComposerInput(input);
+  syncComposerAffordances();
+  input.focus();
+  const cursor = before.length + (hasSelection ? text.length : separatorBefore.length + text.length);
+  input.setSelectionRange(cursor, cursor);
+}
+
+function clearComposerDraft(): void {
+  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
+  if (!input || (!input.value && !composerDraft)) {
+    return;
+  }
+  input.value = "";
+  composerDraft = "";
+  persistWebviewState();
+  resizeComposerInput(input);
+  syncComposerAffordances();
+  input.focus();
+  announceToast("Draft cleared.", "status");
+}
+
+function setComposerSendMode(mode: unknown): void {
+  if (!isComposerSendMode(mode) || composerSendMode === mode) {
+    return;
+  }
+  composerSendMode = mode;
+  persistWebviewState();
+  syncComposerSendModeControls();
+  announceToast(mode === "fast" ? "Fast send enabled." : "Draft mode enabled.", "status");
+}
+
+function syncComposerSendModeControls(): void {
+  document.querySelectorAll<HTMLButtonElement>(".composer-mode-button").forEach((button) => {
+    const active = button.dataset.sendMode === composerSendMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  const input = document.querySelector<HTMLTextAreaElement>(".composer-input");
+  input?.setAttribute("aria-keyshortcuts", composerKeyShortcuts());
 }
 
 function focusComposer(): void {
@@ -1443,7 +3512,12 @@ function focusReview(): void {
   review.focus();
 }
 
-function toast(message: string, tone: "error" | "status"): void {
+function announceToast(message: string, tone: "error" | "status"): void {
+  announcement = message;
+  const liveRegion = document.querySelector<HTMLElement>("[data-live-announcement]");
+  if (liveRegion) {
+    liveRegion.textContent = message;
+  }
   const existing = document.querySelector(".toast");
   existing?.remove();
   const node = document.createElement("div");
@@ -1454,28 +3528,194 @@ function toast(message: string, tone: "error" | "status"): void {
   setTimeout(() => node.remove(), 6000);
 }
 
-function openJsonDrawer(type: string, result: unknown): void {
-  closeJsonDrawer();
-  const drawer = document.createElement("section");
-  const json = truncateText(redactedJson(result), MAX_RAW_JSON_CHARS);
-  drawer.className = "json-drawer";
+function prepareJsonDrawer(): void {
+  const active = document.activeElement;
+  closeJsonDrawer({ restoreFocus: false });
+  drawerRestoreFocus =
+    active instanceof HTMLElement && active !== document.body && !active.closest(".json-drawer") ? active : undefined;
+}
+
+function configureJsonDrawer(drawer: HTMLElement, label: string): void {
   drawer.setAttribute("role", "dialog");
-  drawer.setAttribute("aria-label", drawerTitle(type));
+  drawer.setAttribute("aria-modal", "true");
+  drawer.setAttribute("aria-label", label);
   drawer.setAttribute("tabindex", "-1");
-  drawer.innerHTML = `
-    <div class="drawer-header">
-      <h2>${escapeHtml(drawerTitle(type))}</h2>
-      ${iconButton("closeDrawer", "Close result drawer", "close")}
-    </div>
-    ${codeBlock(json.text, { language: "json", title: drawerTitle(type), copyLabel: "Copy redacted JSON" })}
-    ${json.truncated ? `<p class="muted">Result truncated after ${MAX_RAW_JSON_CHARS} characters.</p>` : ""}
-  `;
+}
+
+function mountJsonDrawer(drawer: HTMLElement): void {
+  setAppModalInert(true);
   document.body.append(drawer);
   drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus();
+  window.requestAnimationFrame(() => {
+    void hydratePayloadDisclosures().then(hydrateInlineActions);
+  });
+}
+
+function mountResultDrawer(props: ResultDrawerProps): void {
+  setAppModalInert(true);
+  resultDrawerModulePromise ??= import("./ResultDrawer.js")
+    .then((module) => {
+      resultDrawerModule = module;
+      return module;
+    })
+    .catch((error) => {
+      resultDrawerModulePromise = undefined;
+      setAppModalInert(false);
+      announceToast(`Unable to open drawer: ${error instanceof Error ? error.message : "unknown error"}`, "error");
+      throw error;
+    });
+  void resultDrawerModulePromise.then((module) => {
+    module.mountResultDrawer({
+      props,
+      onClose: () => closeJsonDrawer()
+    });
+    window.requestAnimationFrame(() => {
+      void hydratePayloadDisclosures().then(hydrateInlineActions);
+    });
+  }).catch(() => undefined);
+}
+
+function setAppModalInert(inert: boolean): void {
+  app?.toggleAttribute("inert", inert);
+  if (inert) {
+    app?.setAttribute("aria-hidden", "true");
+  } else {
+    app?.removeAttribute("aria-hidden");
+  }
+}
+
+function activeJsonDrawer(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(".json-drawer");
+}
+
+function handleJsonDrawerKeydown(event: KeyboardEvent): boolean {
+  if (!activeJsonDrawer()) {
+    return false;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeJsonDrawer();
+    return true;
+  }
+  if (event.key === "Tab") {
+    trapJsonDrawerFocus(event);
+    return true;
+  }
+  return true;
+}
+
+function trapJsonDrawerFocus(event: KeyboardEvent): boolean {
+  const drawer = activeJsonDrawer();
+  if (!drawer) {
+    return false;
+  }
+  const focusable = drawerFocusableElements(drawer);
+  if (!focusable.length) {
+    event.preventDefault();
+    drawer.focus();
+    return true;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (!first || !last) {
+    event.preventDefault();
+    drawer.focus();
+    return true;
+  }
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !drawer.contains(active)) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  if (event.shiftKey && active === first) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
+function drawerFocusableElements(drawer: HTMLElement): HTMLElement[] {
+  return Array.from(drawer.querySelectorAll<HTMLElement>(DRAWER_FOCUSABLE_SELECTOR)).filter(isVisibleFocusable);
+}
+
+function isVisibleFocusable(element: HTMLElement): boolean {
+  if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
+    return false;
+  }
+  return window.getComputedStyle(element).visibility !== "hidden" && element.getClientRects().length > 0;
+}
+
+function openDiffReviewDrawer(result: unknown): void {
+  void getDiffReviewDrawerModule()
+    .then((module) => {
+      pendingDiffPreviews = [];
+      const rendered = module.renderDiffReviewDrawer(result, {
+        escapeHtml,
+        escapeClass,
+        shortLabel,
+        inlineActions: ({ actions, ariaLabel, className }) =>
+          inlineActions({
+            ariaLabel,
+            className,
+            actions: actions.map(({ icon, ...action }) => ({
+              ...action,
+              iconHtml: iconSvg(icon as IconName)
+            }))
+          }),
+        diffPreview,
+        rawDetails
+      });
+      if (!rendered) {
+        pendingDiffPreviews = [];
+        openJsonDrawer("diff", result);
+        return;
+      }
+
+      prepareJsonDrawer();
+      const drawer = document.createElement("section");
+      drawer.className = "json-drawer diff-review-drawer";
+      configureJsonDrawer(drawer, "Review changes");
+      drawer.innerHTML = rendered.html;
+      mountJsonDrawer(drawer);
+      selectDiffReviewFile(rendered.firstPath);
+      void hydratePayloadDisclosures()
+        .then(hydrateInlineActions)
+        .then(() => drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus());
+      void hydrateDiffPreviews(++diffRenderEpoch).then(hydrateInlineActions);
+    })
+    .catch(() => {
+      pendingDiffPreviews = [];
+      openJsonDrawer("diff", result);
+    });
+}
+
+function openJsonDrawer(type: string, result: unknown): void {
+  prepareJsonDrawer();
+  const drawer = document.createElement("section");
+  const json = truncateText(redactedJson(result), MAX_RAW_JSON_CHARS);
+  const title = drawerTitle(type);
+  drawer.innerHTML = `
+    ${codeBlock(json.text, { language: "json", title, copyLabel: "Copy JSON" })}
+    ${json.truncated ? `<p class="muted">Result truncated at ${MAX_RAW_JSON_CHARS} chars.</p>` : ""}
+  `;
+  mountResultDrawer({
+    title,
+    description: "Redacted provider result payload.",
+    badgeLabel: type,
+    closeLabel: "Close drawer",
+    bodyHtml: drawer.innerHTML
+  });
 }
 
 function openCompareDrawer(result: unknown): void {
-  closeJsonDrawer();
+  prepareJsonDrawer();
   const report = asRecord(result);
   const left = asRecord(report.left);
   const right = asRecord(report.right);
@@ -1486,16 +3726,9 @@ function openCompareDrawer(result: unknown): void {
   const rightOnly = arrayField(report, "right_only_paths");
   const recommendation = asRecord(report.recommendation);
   const suggestions = arrayField(report, "suggestions").map(asRecord);
-  const drawer = document.createElement("section");
-  drawer.className = "json-drawer compare-drawer";
-  drawer.setAttribute("role", "dialog");
-  drawer.setAttribute("aria-label", "Task compare");
-  drawer.setAttribute("tabindex", "-1");
-  drawer.innerHTML = `
-    <div class="drawer-header">
-      <h2>Task compare</h2>
-      ${iconButton("closeDrawer", "Close compare drawer", "close")}
-    </div>
+  const comparePathWidget = comparePathAccordionWidget(shared, leftOnly, rightOnly);
+  const widgets = comparePathWidget ? [comparePathWidget] : [];
+  const bodyHtml = `
     ${report.summary ? `<p class="compare-summary">${escapeHtml(String(report.summary))}</p>` : ""}
     <div class="compare-grid">
       ${compareTaskCard("Left", left, leftRisk)}
@@ -1508,9 +3741,7 @@ function openCompareDrawer(result: unknown): void {
         ${compareMetric("Left only", leftOnly.length, "lane")}
         ${compareMetric("Right only", rightOnly.length, "provider")}
       </div>
-      ${comparePathList("Shared changed files", shared, "shared")}
-      ${comparePathList("Left only", leftOnly, "single")}
-      ${comparePathList("Right only", rightOnly, "single")}
+      ${comparePathWidget ? resultDrawerWidgetHost(comparePathWidget.id) : ""}
     </section>
     ${recommendation.command || recommendation.reason ? `
       <section class="compare-section">
@@ -1529,12 +3760,19 @@ function openCompareDrawer(result: unknown): void {
     ` : ""}
     ${rawDetails(result)}
   `;
-  document.body.append(drawer);
-  drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus();
+  mountResultDrawer({
+    title: "Task compare",
+    description: "Changed-path overlap and suggested next commands.",
+    badgeLabel: `${shared.length} shared`,
+    className: "compare-drawer",
+    closeLabel: "Close drawer",
+    bodyHtml,
+    widgets
+  });
 }
 
 function openConflictDrawer(result: unknown): void {
-  closeJsonDrawer();
+  prepareJsonDrawer();
   const report = asRecord(result);
   const explanation = asRecord(report.explanation);
   const merge = asRecord(explanation.merge);
@@ -1553,16 +3791,8 @@ function openConflictDrawer(result: unknown): void {
     .concat(arrayField(explanation, "nextSteps"))
     .concat(arrayField(report, "next_steps"))
     .concat(arrayField(report, "nextSteps"));
-  const drawer = document.createElement("section");
-  drawer.className = "json-drawer conflict-drawer";
-  drawer.setAttribute("role", "dialog");
-  drawer.setAttribute("aria-label", "Conflict details");
-  drawer.setAttribute("tabindex", "-1");
-  drawer.innerHTML = `
-    <div class="drawer-header">
-      <h2>Conflict details</h2>
-      ${iconButton("closeDrawer", "Close conflict drawer", "close")}
-    </div>
+  const widgets: ResultDrawerWidget[] = [];
+  const bodyHtml = `
     <div class="conflict-summary">
       <span class="status status-${escapeClass(status)}">${escapeHtml(status)}</span>
       <strong>${escapeHtml(id)}</strong>
@@ -1586,7 +3816,7 @@ function openConflictDrawer(result: unknown): void {
       <h3>Affected paths</h3>
       ${
         paths.length
-          ? `<div class="conflict-path-list">${paths.slice(0, 20).map(conflictPathCard).join("")}</div>
+          ? `<div class="conflict-path-list">${paths.slice(0, 20).map((path, index) => conflictPathCard(path, index, widgets)).join("")}</div>
              ${paths.length > 20 ? `<p class="muted">Showing 20 of ${paths.length} paths.</p>` : ""}`
           : `<p class="muted">No path-level explanation was returned for this conflict set.</p>`
       }
@@ -1595,12 +3825,37 @@ function openConflictDrawer(result: unknown): void {
     ${nextSteps.length ? conflictItemSection("Next steps", nextSteps, "next step") : ""}
     ${rawDetails(result)}
   `;
-  document.body.append(drawer);
-  drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus();
+  mountResultDrawer({
+    title: "Conflict details",
+    description: "Conflict set summary, affected paths, and recommended recovery steps.",
+    badgeLabel: status,
+    className: "conflict-drawer",
+    closeLabel: "Close conflict drawer",
+    bodyHtml,
+    widgets
+  });
 }
 
-function closeJsonDrawer(): void {
-  document.querySelector(".json-drawer")?.remove();
+function resultDrawerWidgetHost(id: string): string {
+  return `<div data-result-drawer-widget="${escapeHtml(id)}"></div>`;
+}
+
+function closeJsonDrawer(options: { restoreFocus?: boolean } = {}): void {
+  resultDrawerModule?.closeResultDrawer();
+  document.querySelector("[data-result-drawer-host]")?.remove();
+  const drawer = document.querySelector(".json-drawer");
+  drawer?.remove();
+  diffEnhancerModule?.cleanupDetachedEnhancements?.();
+  payloadDisclosureModulePromise?.then((module) => module.cleanupDetachedPayloadDisclosures()).catch(() => undefined);
+  setAppModalInert(false);
+  if (options.restoreFocus === false) {
+    return;
+  }
+  const target = drawerRestoreFocus;
+  drawerRestoreFocus = undefined;
+  if (target?.isConnected) {
+    target.focus({ preventScroll: true });
+  }
 }
 
 function drawerTitle(type: string): string {
@@ -1629,7 +3884,7 @@ function conflictFact(label: string, value: string | undefined): string {
   return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`;
 }
 
-function conflictPathCard(value: unknown, index: number): string {
+function conflictPathCard(value: unknown, index: number, widgets: ResultDrawerWidget[]): string {
   const record = asRecord(value);
   const filePath = stringChoice(record, ["path", "file"]);
   const path = filePath || `Path ${index + 1}`;
@@ -1654,8 +3909,8 @@ function conflictPathCard(value: unknown, index: number): string {
         ${conflictFact("Signature", signature)}
       </dl>
       ${recommendation ? `<p class="conflict-recommendation"><strong>Recommendation</strong>${escapeHtml(recommendation)}</p>` : ""}
-      ${lines.length ? conflictItemDetails("Lines", lines, "line") : ""}
-      ${knownResolutions.length ? conflictItemDetails("Known resolutions", knownResolutions, "resolution") : ""}
+      ${lines.length ? conflictItemDetails("Lines", lines, "line", widgets, `path-${index + 1}-lines`) : ""}
+      ${knownResolutions.length ? conflictItemDetails("Known resolutions", knownResolutions, "resolution", widgets, `path-${index + 1}-known-resolutions`) : ""}
     </article>
   `;
 }
@@ -1683,16 +3938,34 @@ function conflictItemSection(title: string, items: unknown[], fallback: string):
   `;
 }
 
-function conflictItemDetails(title: string, items: unknown[], fallback: string): string {
-  return `
-    <details class="conflict-details">
-      <summary>${escapeHtml(title)} (${items.length})</summary>
+function conflictItemDetails(
+  title: string,
+  items: unknown[],
+  fallback: string,
+  widgets: ResultDrawerWidget[],
+  id: string
+): string {
+  const widgetId = `conflict-${id}`;
+  widgets.push({
+    type: "accordion",
+    id: widgetId,
+    className: "conflict-details",
+    items: [
+      {
+        id: `${widgetId}-items`,
+        title: `${title} (${items.length})`,
+        triggerClassName: "conflict-details-summary",
+        contentClassName: "conflict-details-panel",
+        contentHtml: `
       <ul class="conflict-list">
         ${items.slice(0, 12).map((item) => `<li>${conflictItemText(item, fallback)}</li>`).join("")}
       </ul>
       ${items.length > 12 ? `<p class="muted">Showing 12 of ${items.length} items.</p>` : ""}
-    </details>
-  `;
+        `
+      }
+    ]
+  });
+  return resultDrawerWidgetHost(widgetId);
 }
 
 function conflictItemText(value: unknown, fallback: string): string {
@@ -1746,9 +4019,9 @@ function compareTaskCard(label: string, task: Record<string, unknown>, risk: Rec
   const riskScore = typeof risk.score === "number" ? `${risk.score}/100` : "not scored";
   return `
     <article class="compare-task">
-      <div class="card-chrome">
-        <span class="role">${escapeHtml(label)}</span>
-        <span class="status status-${escapeClass(status)}">${escapeHtml(status)}</span>
+      <div class="compare-task-header">
+        <span class="compare-task-label">${escapeHtml(label)}</span>
+        <span class="compare-task-status status status-${escapeClass(status)}">${escapeHtml(status)}</span>
       </div>
       <h3>${escapeHtml(title)}</h3>
       <dl class="review-facts">
@@ -1770,19 +4043,51 @@ function compareMetric(label: string, value: number, tone: string): string {
   `;
 }
 
-function comparePathList(title: string, paths: unknown[], mode: "shared" | "single"): string {
-  if (!paths.length) {
-    return "";
+function comparePathAccordionWidget(
+  shared: unknown[],
+  leftOnly: unknown[],
+  rightOnly: unknown[]
+): ResultDrawerWidget | undefined {
+  const items = [
+    comparePathAccordionItem("compare-paths-shared", "Shared changed files", shared, "shared"),
+    comparePathAccordionItem("compare-paths-left-only", "Left only", leftOnly, "single"),
+    comparePathAccordionItem("compare-paths-right-only", "Right only", rightOnly, "single")
+  ].filter((item): item is NonNullable<typeof item> => Boolean(item));
+  if (!items.length) {
+    return undefined;
   }
-  return `
-    <details class="compare-paths" ${mode === "shared" ? "open" : ""}>
-      <summary>${escapeHtml(title)} (${paths.length})</summary>
+  return {
+    type: "accordion",
+    id: "compare-paths",
+    className: "compare-paths",
+    multiple: true,
+    defaultOpenIds: shared.length ? ["compare-paths-shared"] : [],
+    items
+  };
+}
+
+function comparePathAccordionItem(
+  id: string,
+  title: string,
+  paths: unknown[],
+  mode: "shared" | "single"
+): ResultDrawerWidget["items"][number] | undefined {
+  if (!paths.length) {
+    return undefined;
+  }
+  return {
+    id,
+    title: `${title} (${paths.length})`,
+    className: "compare-paths-item",
+    triggerClassName: "compare-paths-summary",
+    contentClassName: "compare-paths-panel",
+    contentHtml: `
       <ul>
         ${paths.slice(0, 30).map((path) => comparePathRow(path, mode)).join("")}
       </ul>
       ${paths.length > 30 ? `<p class="muted">Showing 30 of ${paths.length} paths.</p>` : ""}
-    </details>
-  `;
+    `
+  };
 }
 
 function comparePathRow(value: unknown, mode: "shared" | "single"): string {
@@ -1819,103 +4124,310 @@ function suggestionText(suggestion: Record<string, unknown>): string {
 }
 
 function markdownText(text: string): string {
+  if (markdownModule) {
+    return markdownModule.renderMarkdown(text, {
+      maxChars: MAX_TEXT_CHARS,
+      renderCodeBlock: (code, language) =>
+        codeBlock(code, { language: language || "plaintext", title: "Message code block" })
+    });
+  }
+  void loadMarkdownRenderer();
   const truncated = truncateText(text, MAX_TEXT_CHARS);
-  const segments = markdownSegments(truncated.text);
   return (
-    segments
-      .map((segment) =>
-        segment.kind === "code"
-          ? codeBlock(segment.text, { language: segment.language || "plaintext", title: "Message code block" })
-          : markdownInline(segment.text)
-      )
-      .join("") +
-    (truncated.truncated ? `<p class="muted">Message preview truncated after ${MAX_TEXT_CHARS} characters.</p>` : "")
+    `<p>${escapeHtml(truncated.text).replace(/\n/g, "<br>")}</p>` +
+    (truncated.truncated ? `<p class="muted">Message preview truncated at ${MAX_TEXT_CHARS} chars.</p>` : "")
   );
 }
 
-function markdownSegments(text: string): Array<{ kind: "text" | "code"; text: string; language?: string | undefined }> {
-  const segments: Array<{ kind: "text" | "code"; text: string; language?: string | undefined }> = [];
-  const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
-  let cursor = 0;
-  for (const match of text.matchAll(fence)) {
-    if (match.index === undefined) {
-      continue;
-    }
-    if (match.index > cursor) {
-      segments.push({ kind: "text", text: text.slice(cursor, match.index) });
-    }
-    segments.push({
-      kind: "code",
-      language: cleanLanguage(match[1] || "plaintext"),
-      text: match[2] || ""
+function loadMarkdownRenderer(): Promise<typeof import("./markdownModel.js")> {
+  if (!markdownModulePromise) {
+    markdownModulePromise = import("./markdownModel.js").then((module) => {
+      markdownModule = module;
+      scheduleRender();
+      return module;
     });
-    cursor = match.index + match[0].length;
   }
-  if (cursor < text.length) {
-    segments.push({ kind: "text", text: text.slice(cursor) });
-  }
-  return segments.length ? segments : [{ kind: "text", text }];
+  return markdownModulePromise;
 }
 
-function markdownInline(text: string): string {
-  if (!text) {
+function diffStats(oldText: string, newText: string): { oldLineCount: number; newLineCount: number; kind: string } {
+  return {
+    oldLineCount: lineCount(oldText),
+    newLineCount: lineCount(newText),
+    kind: !oldText && newText ? "created" : oldText && !newText ? "deleted" : "modified"
+  };
+}
+
+function diffSummaryText(stats: { oldLineCount: number; newLineCount: number; kind: string }): string {
+  return `${stats.kind} diff, ${stats.oldLineCount} before / ${stats.newLineCount} after`;
+}
+
+function diffPreview({
+  path,
+  oldText,
+  newText,
+  patch,
+  additions,
+  deletions,
+  nodeId,
+  title
+}: {
+  path: string;
+  oldText: string;
+  newText: string;
+  patch?: string | undefined;
+  additions?: number | undefined;
+  deletions?: number | undefined;
+  nodeId?: string | undefined;
+  title?: string | undefined;
+}): string {
+  const id = `diff-preview-${++diffPreviewCounter}`;
+  const language = languageForResource(path, "text/plain");
+  const stats = diffStats(oldText, newText);
+  pendingDiffPreviews.push({ id, path, oldText, newText, patch, additions, deletions, nodeId, title });
+  return `
+    <section class="diff-preview diff-preview-loading" data-diff-preview-id="${escapeHtml(id)}" aria-busy="true" aria-label="${escapeHtml(title || "Diff preview")} for ${escapeHtml(path)}">
+      ${diffPreviewToolbar({ path, language, nodeId, additions: undefined, deletions: undefined, loading: true })}
+      <div class="diff-preview-meta">
+        <span>${stats.oldLineCount} before</span>
+        <span>${stats.newLineCount} after</span>
+        <span>preparing structured diff</span>
+      </div>
+      <div class="diff-loading" role="status">
+        <span class="diff-loading-bar" aria-hidden="true"></span>
+        <span>Preparing structured diff preview...</span>
+      </div>
+      <template class="diff-source"></template>
+    </section>
+  `;
+}
+
+function diffPreviewToolbar({
+  path,
+  language,
+  nodeId,
+  additions,
+  deletions,
+  loading
+}: {
+  path: string;
+  language: string;
+  nodeId?: string | undefined;
+  additions?: number | undefined;
+  deletions?: number | undefined;
+  loading: boolean;
+}): string {
+  const actions = inlineActions({
+    ariaLabel: `${shortLabel(path)} diff preview actions`,
+    className: "diff-preview-actions",
+    actions: [
+      ...(nodeId
+        ? [
+            {
+              action: "openNodeDiff",
+              ariaLabel: "Open native diff",
+              data: { "node-id": nodeId },
+              iconHtml: iconSvg("diff"),
+              iconOnly: true,
+              label: "Open native diff",
+              tone: "review" as const
+            }
+          ]
+        : []),
+      {
+        action: "copyDiff",
+        ariaLabel: "Copy unified diff",
+        disabled: loading,
+        iconHtml: iconSvg("copy"),
+        iconOnly: true,
+        label: "Copy unified diff",
+        tone: "provider"
+      },
+      {
+        action: "openDiffPreview",
+        ariaLabel: "Open unified diff preview",
+        data: { title: path, language: "diff" },
+        disabled: loading,
+        iconHtml: iconSvg("open"),
+        iconOnly: true,
+        label: "Open unified diff preview",
+        tone: "provider"
+      }
+    ]
+  });
+  return `
+    <div class="diff-preview-toolbar">
+      <div class="diff-preview-title">
+        <span class="code-title">${escapeHtml(shortLabel(path))}</span>
+        <span class="code-language">${escapeHtml(language)}</span>
+        ${
+          loading
+            ? `<span class="diff-stat diff-stat-loading">loading</span>`
+            : `<span class="diff-stat additions">+${additions ?? 0}</span><span class="diff-stat deletions">-${deletions ?? 0}</span>`
+        }
+      </div>
+      ${actions}
+    </div>
+  `;
+}
+
+function renderDiffRow(row: DiffRow): string {
+  if (row.kind === "gap") {
+    return `<div class="diff-row diff-row-gap" role="row"><span class="diff-gap-message" role="cell">${row.omitted || 0} unchanged line${row.omitted === 1 ? "" : "s"} hidden</span></div>`;
+  }
+  return `
+    <div class="diff-row diff-row-${row.kind}" role="row">
+      <span class="diff-line-number" role="cell">${row.oldLine ?? ""}</span>
+      <code class="diff-code diff-code-old" role="cell">${renderDiffCell(row, "old")}</code>
+      <span class="diff-line-number" role="cell">${row.newLine ?? ""}</span>
+      <code class="diff-code diff-code-new" role="cell">${renderDiffCell(row, "new")}</code>
+    </div>
+  `;
+}
+
+function renderDiffCell(row: DiffRow, side: "old" | "new"): string {
+  const text = side === "old" ? row.oldText : row.newText;
+  if (text === undefined) {
     return "";
   }
-  return escapeHtml(text)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\n/g, "<br>");
+  const segments = side === "old" ? row.oldSegments : row.newSegments;
+  if (segments?.length) {
+    return renderDiffSegments(segments);
+  }
+  return escapeHtml(text) || " ";
 }
 
-function diffStats(oldText: string, newText: string): { additions: number; deletions: number; kind: string } {
-  const oldLines = oldText ? oldText.split("\n").filter((line, index, lines) => line || index < lines.length - 1).length : 0;
-  const newLines = newText ? newText.split("\n").filter((line, index, lines) => line || index < lines.length - 1).length : 0;
-  if (!oldText && newText) {
-    return { additions: newLines, deletions: 0, kind: "created" };
-  }
-  if (oldText && !newText) {
-    return { additions: 0, deletions: oldLines, kind: "deleted" };
-  }
-  return { additions: newLines, deletions: oldLines, kind: "changed" };
-}
-
-function diffSummaryText(stats: { additions: number; deletions: number; kind: string }): string {
-  return `${stats.kind} with ${stats.additions} new line${stats.additions === 1 ? "" : "s"} and ${stats.deletions} old line${stats.deletions === 1 ? "" : "s"}`;
-}
-
-function compactDiff(oldText: string, newText: string): string {
-  if (!oldText) {
-    return `+ ${newText.split("\n").slice(0, 80).join("\n+ ")}`;
-  }
-  const oldLines = oldText.split("\n");
-  const newLines = newText.split("\n");
-  const lines = [`- ${oldLines.slice(0, 40).join("\n- ")}`, `+ ${newLines.slice(0, 40).join("\n+ ")}`];
-  return lines.join("\n");
+function renderDiffSegments(segments: DiffSegment[]): string {
+  return segments
+    .map((segment) => {
+      const content = escapeHtml(segment.text) || " ";
+      if (segment.tone === "added") {
+        return `<ins>${content}</ins>`;
+      }
+      if (segment.tone === "removed") {
+        return `<del>${content}</del>`;
+      }
+      return content;
+    })
+    .join("");
 }
 
 function rawDetails(value: unknown): string {
+  const details = rawDetailsContent(value);
+  return payloadDisclosure({
+    className: "raw",
+    label: "Details",
+    bodyHtml: details
+  });
+}
+
+function rawDetailsContent(value: unknown): string {
   const json = truncateText(redactedJson(value), MAX_RAW_JSON_CHARS);
-  return `<details class="raw"><summary>Details</summary>${codeBlock(json.text, { language: "json", title: "Redacted details", copyLabel: "Copy redacted JSON" })}${json.truncated ? `<p class="muted">Details truncated after ${MAX_RAW_JSON_CHARS} characters.</p>` : ""}</details>`;
+  return `${codeBlock(json.text, { language: "json", title: "Redacted details", copyLabel: "Copy JSON" })}${json.truncated ? `<p class="muted">Details truncated at ${MAX_RAW_JSON_CHARS} chars.</p>` : ""}`;
+}
+
+function payloadDisclosure({
+  bodyHtml,
+  className,
+  defaultOpen,
+  label
+}: {
+  bodyHtml: string;
+  className: string;
+  defaultOpen?: boolean | undefined;
+  label: string;
+}): string {
+  const id = `payload-${++payloadDisclosureCounter}`;
+  payloadDisclosureProps.set(id, {
+    id,
+    bodyHtml,
+    className,
+    defaultOpen,
+    label
+  });
+  return `<div data-payload-disclosure-root data-payload-disclosure-id="${escapeHtml(id)}"></div>`;
+}
+
+function inlineActions({
+  actions,
+  ariaLabel,
+  className
+}: Omit<InlineActionsProps, "id">): string {
+  const id = `inline-actions-${++inlineActionsCounter}`;
+  inlineActionsProps.set(id, {
+    id,
+    actions,
+    ariaLabel,
+    className
+  });
+  return `<div data-inline-actions-root data-inline-actions-id="${escapeHtml(id)}"></div>`;
+}
+
+function rawDetailsView(id: string, value: unknown): RawDetailsView {
+  const json = truncateText(redactedJson(value), MAX_RAW_JSON_CHARS);
+  return {
+    id,
+    label: "Details",
+    contentHtml: codeBlock(json.text, { language: "json", title: "Redacted details", copyLabel: "Copy JSON" }),
+    truncatedText: json.truncated ? `Details truncated at ${MAX_RAW_JSON_CHARS} chars.` : undefined
+  };
 }
 
 function codeBlock(
   text: string,
-  options: { language?: string | undefined; title?: string | undefined; copyLabel?: string | undefined } = {}
+  options: {
+    language?: string | undefined;
+    title?: string | undefined;
+    meta?: string | undefined;
+    copyLabel?: string | undefined;
+    openPath?: string | undefined;
+  } = {}
 ): string {
   const language = cleanLanguage(options.language || "plaintext");
   const title = shortLabel(options.title || "Preview");
   const copyLabel = options.copyLabel || "Copy";
+  const openPath = String(options.openPath || "").trim();
+  const codeActions = inlineActions({
+    ariaLabel: `${title} preview actions`,
+    className: "code-actions",
+    actions: [
+      {
+        action: "copyCode",
+        ariaLabel: copyLabel,
+        iconHtml: iconSvg("copy"),
+        iconOnly: true,
+        label: copyLabel,
+        tone: "provider"
+      },
+      openPath
+        ? {
+            action: "openLocation",
+            ariaLabel: "Open path",
+            data: { path: openPath },
+            iconHtml: iconSvg("open"),
+            iconOnly: true,
+            label: "Open path",
+            tone: "provider"
+          }
+        : {
+            action: "openTextPreview",
+            ariaLabel: "Open preview in editor",
+            data: { language, title },
+            iconHtml: iconSvg("open"),
+            iconOnly: true,
+            label: "Open preview in editor",
+            tone: "provider"
+          }
+    ]
+  });
   return `
     <div class="code-frame">
       <div class="code-tools">
-        <span class="code-title">${escapeHtml(title)}</span>
+        <span class="code-title"><span>${escapeHtml(title)}</span>${options.meta ? `<small>${escapeHtml(options.meta)}</small>` : ""}</span>
         <span class="code-language">${escapeHtml(language)}</span>
-        ${iconButton("copyCode", copyLabel, "copy")}
-        ${iconButton("openTextPreview", "Open preview in editor", "open", {
-          attrs: `data-language="${escapeHtml(language)}" data-title="${escapeHtml(title)}"`
-        })}
+        ${codeActions}
       </div>
-      <pre class="code">${escapeHtml(text)}</pre>
+      <pre class="code" data-highlight-language="${escapeHtml(language)}" aria-label="${escapeHtml(`${title} source preview`)}" tabindex="0">${escapeHtml(text)}</pre>
     </div>
   `;
 }
@@ -1945,23 +4457,39 @@ function languageForResource(uri: string, mime: string): string {
   if (lowerMime.includes("css")) {
     return "css";
   }
-  const extension = uri.split(/[?#]/, 1)[0]?.split(".").pop()?.toLowerCase();
+  if (lowerMime.includes("diff") || lowerMime.includes("patch")) {
+    return "diff";
+  }
+  const extension = uri.split(/[?#]/, 1)[0]?.split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase();
   switch (extension) {
+    case "bash":
+    case "sh":
+    case "zsh":
+      return "shellscript";
     case "md":
+    case "mdx":
       return "markdown";
     case "js":
-    case "jsx":
+    case "mjs":
+    case "cjs":
       return "javascript";
+    case "jsx":
+      return "jsx";
     case "ts":
-    case "tsx":
+    case "mts":
+    case "cts":
       return "typescript";
+    case "tsx":
+      return "tsx";
     case "json":
+    case "jsonc":
+    case "lock":
+      return "json";
     case "html":
+    case "htm":
+      return "html";
     case "css":
-    case "rust":
     case "go":
-    case "python":
-    case "yaml":
     case "xml":
       return extension;
     case "rs":
@@ -1969,10 +4497,223 @@ function languageForResource(uri: string, mime: string): string {
     case "py":
       return "python";
     case "yml":
+    case "yaml":
       return "yaml";
+    case "txt":
+    case "text":
+      return "text";
     default:
       return "plaintext";
   }
+}
+
+async function highlightCodeBlocks(): Promise<void> {
+  if (!document.querySelector("pre.code[data-highlight-language]:not([data-highlight-state])")) {
+    return;
+  }
+  try {
+    const highlighter = await getHighlightModule();
+    await highlighter.highlightCodeBlocks();
+  } catch {
+    document.querySelectorAll<HTMLPreElement>("pre.code[data-highlight-language]:not([data-highlight-state])").forEach((block) => {
+      block.dataset.highlightState = "failed";
+    });
+  }
+}
+
+function getHighlightModule(): Promise<typeof import("./highlight.js")> {
+  if (!highlightModulePromise) {
+    highlightModulePromise = import("./highlight.js").catch((error) => {
+      highlightModulePromise = undefined;
+      throw error;
+    });
+  }
+  return highlightModulePromise;
+}
+
+function getDiffModelModule(): Promise<typeof import("./diffModel.js")> {
+  if (!diffModelModulePromise) {
+    diffModelModulePromise = import("./diffModel.js").catch((error) => {
+      diffModelModulePromise = undefined;
+      throw error;
+    });
+  }
+  return diffModelModulePromise;
+}
+
+function getDiffEnhancerModule(): Promise<typeof import("./diffEnhancer.js")> {
+  if (!diffEnhancerModulePromise) {
+    diffEnhancerModulePromise = import("./diffEnhancer.js")
+      .then((module) => {
+        diffEnhancerModule = module;
+        return module;
+      })
+      .catch((error) => {
+        diffEnhancerModulePromise = undefined;
+        throw error;
+      });
+  }
+  return diffEnhancerModulePromise;
+}
+
+function getDiffReviewDrawerModule(): Promise<typeof import("./diffReviewDrawer.js")> {
+  if (!diffReviewDrawerModulePromise) {
+    diffReviewDrawerModulePromise = import("./diffReviewDrawer.js").catch((error) => {
+      diffReviewDrawerModulePromise = undefined;
+      throw error;
+    });
+  }
+  return diffReviewDrawerModulePromise;
+}
+
+function cleanupDiffEnhancements(): void {
+  diffEnhancerModule?.cleanupDiffEnhancements();
+}
+
+function renderPatchDiffPreview(
+  preview: PendingDiffPreview,
+  language: string,
+  stats: { additions: number; deletions: number }
+): string {
+  const patch = preview.patch || "";
+  const truncated = truncateText(patch, MAX_RAW_JSON_CHARS);
+  return `
+    ${diffPreviewToolbar({
+      path: preview.path,
+      language,
+      nodeId: preview.nodeId,
+      additions: stats.additions,
+      deletions: stats.deletions,
+      loading: false
+    })}
+    <div class="diff-preview-meta">
+      <span>patch</span>
+      <span>+${stats.additions}</span>
+      <span>-${stats.deletions}</span>
+    </div>
+    <div class="diffs-mount" data-diffs-mode="patch" data-diffs-path="${escapeHtml(preview.path)}" data-diffs-language="${escapeHtml(language)}" role="region" aria-label="${escapeHtml(preview.title || "Diff")}"></div>
+    <div class="diff-fallback" aria-label="Raw patch fallback">
+      ${codeBlock(truncated.text, { language: "diff", title: "Patch", copyLabel: "Copy patch" })}
+      ${truncated.truncated ? `<p class="muted">Patch truncated at ${MAX_RAW_JSON_CHARS} chars.</p>` : ""}
+    </div>
+    <template class="diff-patch-source">${escapeHtml(patch)}</template>
+    <template class="diff-source">${escapeHtml(patch)}</template>
+  `;
+}
+
+async function hydrateDiffPreviews(epoch: number): Promise<void> {
+  const previews = pendingDiffPreviews.slice();
+  if (!previews.length) {
+    return;
+  }
+
+  try {
+    const diffModel = await getDiffModelModule();
+    if (epoch !== diffRenderEpoch) {
+      return;
+    }
+
+    let enhancedPreviewCount = 0;
+    for (const preview of previews) {
+      const previewElement = document.querySelector<HTMLElement>(`.diff-preview[data-diff-preview-id="${preview.id}"]`);
+      if (!previewElement) {
+        continue;
+      }
+      if (preview.patch && !preview.oldText && !preview.newText) {
+        const language = languageForResource(preview.path, "text/x-diff");
+        const stats = { additions: preview.additions ?? 0, deletions: preview.deletions ?? 0 };
+        previewElement.classList.remove("diff-preview-loading");
+        previewElement.toggleAttribute("aria-busy", false);
+        previewElement.innerHTML = renderPatchDiffPreview(preview, language, stats);
+        enhancedPreviewCount += 1;
+        continue;
+      }
+      const model = diffModel.buildDiffModel(preview.path, preview.oldText, preview.newText);
+      const language = languageForResource(preview.path, "text/plain");
+      previewElement.classList.remove("diff-preview-loading");
+      previewElement.toggleAttribute("aria-busy", false);
+      previewElement.innerHTML = renderHydratedDiffPreview(preview, model, language);
+      if (!model.tooLarge && preview.oldText.length + preview.newText.length <= MAX_TEXT_CHARS * 4) {
+        enhancedPreviewCount += 1;
+      }
+    }
+
+    if (enhancedPreviewCount > 0) {
+      const enhancer = await getDiffEnhancerModule();
+      if (epoch === diffRenderEpoch) {
+        await enhancer.enhanceDiffPreviews();
+      }
+    }
+  } catch {
+    if (epoch !== diffRenderEpoch) {
+      return;
+    }
+    for (const preview of previews) {
+      const previewElement = document.querySelector<HTMLElement>(`.diff-preview[data-diff-preview-id="${preview.id}"]`);
+      if (previewElement) {
+        previewElement.classList.remove("diff-preview-loading");
+        previewElement.classList.add("diff-preview-error");
+        previewElement.toggleAttribute("aria-busy", false);
+        previewElement.innerHTML = renderDiffPreviewError(preview);
+      }
+    }
+  }
+}
+
+function renderHydratedDiffPreview(preview: PendingDiffPreview, model: DiffModel, language: string): string {
+  return `
+    ${diffPreviewToolbar({
+      path: preview.path,
+      language,
+      nodeId: preview.nodeId,
+      additions: model.additions,
+      deletions: model.deletions,
+      loading: false
+    })}
+    <div class="diff-preview-meta">
+      <span>${escapeHtml(model.kind)}</span>
+      <span>${model.oldLineCount} before</span>
+      <span>${model.newLineCount} after</span>
+      ${model.omittedRows > 0 ? `<span>${model.omittedRows} unchanged hidden</span>` : ""}
+      ${model.tooLarge ? `<span>large preview</span>` : ""}
+    </div>
+    ${
+      model.tooLarge
+        ? ""
+        : `<div class="diffs-mount" data-diffs-path="${escapeHtml(preview.path)}" data-diffs-language="${escapeHtml(language)}" role="region" aria-label="${escapeHtml(preview.title || "Diff")}"></div>`
+    }
+    <div class="diff-fallback" aria-label="Structured diff fallback">
+      ${renderDiffGrid(model)}
+    </div>
+    <template class="diff-old-source">${escapeHtml(preview.oldText)}</template>
+    <template class="diff-new-source">${escapeHtml(preview.newText)}</template>
+    <template class="diff-source">${escapeHtml(model.rawDiff)}</template>
+  `;
+}
+
+function renderDiffPreviewError(preview: PendingDiffPreview): string {
+  const language = languageForResource(preview.path, "text/plain");
+  return `
+    ${diffPreviewToolbar({ path: preview.path, language, nodeId: preview.nodeId, loading: false })}
+    <div class="diff-loading" role="status">
+      <span>Diff preview failed. Raw before/after content is still available.</span>
+    </div>
+    <template class="diff-source"></template>
+  `;
+}
+
+function renderDiffGrid(model: DiffModel): string {
+  return `
+    <div class="diff-grid" role="table" aria-label="Diff rows">
+      <div class="diff-row diff-row-header" role="row">
+        <span role="columnheader">Before</span>
+        <span role="columnheader">Content</span>
+        <span role="columnheader">After</span>
+        <span role="columnheader">Content</span>
+      </div>
+      ${model.rows.map(renderDiffRow).join("")}
+    </div>
+  `;
 }
 
 function escapeHtml(value: string): string {
@@ -2085,7 +4826,7 @@ function testSummary(taskView: Record<string, unknown>, extraRuns: unknown[] = [
       const command = Array.isArray(record.command) ? record.command.join(" ") : record.command;
       const name = String(record.name || command || record.title || record.kind || "Run");
       const status = String(record.status || record.outcome || "recorded");
-      return `<li>${escapeHtml(name)} <span class="tool-status">${escapeHtml(status)}</span></li>`;
+      return `<li>${escapeHtml(name)} <span class="test-run-status status-${escapeClass(status)}">${escapeHtml(status)}</span></li>`;
     })
     .join("")}</ul>`;
 }
@@ -2124,9 +4865,42 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`;
 }
 
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function eventCostLabel(cost: Record<string, unknown>): string {
+  const total = numberChoice(cost, ["total", "totalCost", "cost"]);
+  const input = numberChoice(cost, ["input", "inputCost"]);
+  const output = numberChoice(cost, ["output", "outputCost"]);
+  if (typeof total === "number") {
+    return `$${total.toFixed(total < 1 ? 4 : 2)}`;
+  }
+  if (typeof input === "number" || typeof output === "number") {
+    return [`in ${input?.toFixed(4) || "0"}`, `out ${output?.toFixed(4) || "0"}`].join(" / ");
+  }
+  return "";
+}
+
 function contentLabel(record: Record<string, unknown>, fallback: string): string {
   const annotations = asRecord(record.annotations);
   return String(record.title || record.name || annotations.title || annotations.label || fallback);
+}
+
+function resourceBlockLabel(block: unknown): string {
+  const record = asRecord(block);
+  if (record.type === "resource") {
+    const resource = asRecord(record.resource);
+    return shortLabel(String(resource.uri || resource.mimeType || "Embedded resource"));
+  }
+  if (record.type === "resource_link") {
+    return shortLabel(String(record.title || record.name || record.uri || "Resource link"));
+  }
+  return shortLabel(String(record.type || "Resource"));
 }
 
 type IconName =
@@ -2138,6 +4912,8 @@ type IconName =
   | "diff"
   | "file"
   | "history"
+  | "lane"
+  | "message"
   | "open"
   | "refresh"
   | "rewind"
@@ -2145,72 +4921,71 @@ type IconName =
   | "search"
   | "selection"
   | "send"
+  | "session"
   | "settings"
   | "stop"
-  | "terminal";
+  | "terminal"
+  | "tool"
+  | "tree"
+  | "turn";
 
-function iconButton(
-  action: string,
-  label: string,
-  icon: IconName,
-  options: { attrs?: string | undefined; className?: string | undefined; disabled?: boolean | undefined } = {}
-): string {
-  const classes = ["icon-button", "icon-only", options.className].filter(Boolean).join(" ");
-  const attrs = options.attrs ? ` ${options.attrs}` : "";
-  const disabled = options.disabled ? " disabled" : "";
-  return `<button class="${escapeHtml(classes)}" data-action="${escapeHtml(action)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"${attrs}${disabled}>${iconSvg(icon)}<span class="sr-only">${escapeHtml(label)}</span></button>`;
-}
+type LucideIconNode = Array<[tag: string, attrs: Record<string, string | number | undefined>]>;
+
+const LUCIDE_ICONS: Record<IconName, LucideIconNode> = {
+  changed: FileDiff,
+  check: SquareCheckBig,
+  close: X,
+  copy: Copy,
+  diagnostics: CircleAlert,
+  diff: DiffIcon,
+  file: FileText,
+  history: History,
+  lane: FolderGit2,
+  message: MessageSquare,
+  open: ExternalLink,
+  refresh: RefreshCw,
+  rewind: RotateCcw,
+  review: PanelRightOpen,
+  search: Search,
+  selection: SquareDashedMousePointer,
+  send: Send,
+  session: MessagesSquare,
+  settings: Settings,
+  stop: SquareStop,
+  terminal: Terminal,
+  tool: Wrench,
+  tree: ListTree,
+  turn: MessagesSquare
+};
 
 function iconSvg(icon: IconName): string {
-  const open = `<svg class="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">`;
-  switch (icon) {
-    case "changed":
-      return `${open}<path d="M5 5h7"/><path d="M5 10h10"/><path d="M5 15h5"/><path d="M14 13l2 2 2-2"/><path d="M16 8v7"/></svg>`;
-    case "check":
-      return `${open}<path d="M4 10l4 4 8-9"/></svg>`;
-    case "close":
-      return `${open}<path d="M5 5l10 10"/><path d="M15 5L5 15"/></svg>`;
-    case "copy":
-      return `${open}<rect x="7" y="5" width="9" height="11" rx="1.5"/><path d="M4 13V4a1 1 0 0 1 1-1h8"/></svg>`;
-    case "diagnostics":
-      return `${open}<path d="M10 3l8 14H2L10 3z"/><path d="M10 8v4"/><path d="M10 15h.01"/></svg>`;
-    case "diff":
-      return `${open}<path d="M6 4v12"/><path d="M14 4v12"/><path d="M3 8h6"/><path d="M11 12h6"/><path d="M14 9v6"/></svg>`;
-    case "file":
-      return `${open}<path d="M6 3h6l4 4v10H6z"/><path d="M12 3v5h4"/></svg>`;
-    case "history":
-      return `${open}<path d="M4 5v4h4"/><path d="M5 9a6 6 0 1 0 2-4"/><path d="M10 7v4l3 2"/></svg>`;
-    case "open":
-      return `${open}<path d="M7 5h8v8"/><path d="M15 5l-9 9"/><path d="M5 8v7h7"/></svg>`;
-    case "refresh":
-      return `${open}<path d="M4 7a6 6 0 0 1 10-3l2 2"/><path d="M16 2v4h-4"/><path d="M16 13a6 6 0 0 1-10 3l-2-2"/><path d="M4 18v-4h4"/></svg>`;
-    case "rewind":
-      return `${open}<path d="M11 6l-6 4 6 4V6z"/><path d="M17 6l-6 4 6 4V6z"/></svg>`;
-    case "review":
-      return `${open}<path d="M6 4h8"/><path d="M6 8h8"/><path d="M6 12h5"/><path d="M4 4h.01"/><path d="M4 8h.01"/><path d="M4 12h.01"/><path d="M13 15l2 2 3-5"/></svg>`;
-    case "search":
-      return `${open}<circle cx="9" cy="9" r="5"/><path d="M13 13l4 4"/></svg>`;
-    case "selection":
-      return `${open}<rect x="4" y="4" width="12" height="12" rx="2" stroke-dasharray="2 2"/><path d="M8 8h4"/><path d="M8 12h2"/></svg>`;
-    case "send":
-      return `${open}<path d="M3 10l14-7-4 14-3-6-7-1z"/><path d="M10 11l7-8"/></svg>`;
-    case "settings":
-      return `${open}<circle cx="10" cy="10" r="2.5"/><path d="M10 3v2"/><path d="M10 15v2"/><path d="M4.4 5.2l1.4 1.4"/><path d="M14.2 13.4l1.4 1.4"/><path d="M3 10h2"/><path d="M15 10h2"/><path d="M4.4 14.8l1.4-1.4"/><path d="M14.2 6.6l1.4-1.4"/></svg>`;
-    case "stop":
-      return `${open}<rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`;
-    case "terminal":
-      return `${open}<path d="M4 6l4 4-4 4"/><path d="M10 14h6"/></svg>`;
-    default:
-      return `${open}<circle cx="10" cy="10" r="6"/></svg>`;
-  }
+  const node = LUCIDE_ICONS[icon] || LUCIDE_ICONS.tool;
+  return `<svg class="icon lucide lucide-${escapeClass(icon)}" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${node
+    .map(([tag, attrs]) => `<${tag}${lucideAttrs(attrs)}/>`)
+    .join("")}</svg>`;
+}
+
+function lucideAttrs(attrs: Record<string, string | number | undefined>): string {
+  const rendered = Object.entries(attrs)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}="${escapeHtml(String(value))}"`);
+  return rendered.length ? ` ${rendered.join(" ")}` : "";
 }
 
 function persistWebviewState(): void {
-  vscode.setState({ composerDraft, reviewVisible });
+  vscode.setState({ composerDraft, composerSendMode, reviewVisible, timelineFilter, timelineQuery });
+}
+
+function isComposerSendMode(value: unknown): value is ComposerSendMode {
+  return typeof value === "string" && COMPOSER_SEND_MODES.has(value as ComposerSendMode);
 }
 
 function unsupportedContent(label: string, detail: unknown): string {
-  return `<details class="unsupported"><summary>${escapeHtml(label)}</summary>${rawDetails(detail)}</details>`;
+  return payloadDisclosure({
+    className: "unsupported",
+    label,
+    bodyHtml: rawDetailsContent(detail)
+  });
 }
 
 function asCapabilityState(value: unknown): WebviewState["capabilities"] {
@@ -2270,7 +5045,7 @@ function locationChip(locationPath: string, line?: number): string {
 }
 
 function visibleTimelineNodes(): RenderNode[] {
-  return state.nodes.filter((node) => !["usage", "mode", "config", "commands"].includes(node.kind));
+  return filterTimelineNodes(state.nodes, timelineFilter, timelineQuery);
 }
 
 function currentConfigOptions(): Array<Record<string, unknown>> {
@@ -2323,8 +5098,8 @@ function currentCommands(): Array<Record<string, unknown>> {
   return commands?.availableCommands || [];
 }
 
-function sessionControlSelectors(): string {
-  const controls = [...configSelectors(), modeSelector(), commandSelector()].filter(Boolean);
+function sessionControlSelectors(disabled = ""): string {
+  const controls = [...configSelectors(disabled), modeSelector(disabled), commandSelector(disabled)].filter(Boolean);
   if (!controls.length) {
     return "";
   }
@@ -2352,7 +5127,12 @@ function providerSelector(disabled: string): string {
   `;
 }
 
-function configSelectors(): string[] {
+function currentProviderProfile(): NonNullable<WebviewState["providers"]>[number] | undefined {
+  const providers = state.providers || [];
+  return providers.find((provider) => provider.id === state.providerId) || providers.find((provider) => provider.label === state.provider);
+}
+
+function configSelectors(disabled = ""): string[] {
   return currentConfigOptions()
     .filter((option) => option.type === "select" && Array.isArray(option.options))
     .slice(0, 4)
@@ -2362,7 +5142,7 @@ function configSelectors(): string[] {
       return `
         <label class="select-control" title="${escapeHtml(String(option.description || option.name || "Configuration"))}">
           <span>${escapeHtml(String(option.name || option.id))}</span>
-          <select data-action="setConfigOption" data-config-id="${escapeHtml(String(option.id))}" aria-label="${escapeHtml(String(option.name || option.id))}">
+          <select data-action="setConfigOption" data-config-id="${escapeHtml(String(option.id))}" aria-label="${escapeHtml(String(option.name || option.id))}" ${disabled}>
             ${options
               .map((value) => {
                 const optionValue = String(value.value || "");
@@ -2376,7 +5156,7 @@ function configSelectors(): string[] {
     });
 }
 
-function modeSelector(): string {
+function modeSelector(disabled = ""): string {
   if (currentConfigOptions().some((option) => String(option.category || "") === "mode")) {
     return "";
   }
@@ -2387,7 +5167,7 @@ function modeSelector(): string {
   return `
     <label class="select-control">
       <span>Mode</span>
-      <select data-action="setMode" aria-label="Mode">
+      <select data-action="setMode" aria-label="Mode" ${disabled}>
         ${mode.availableModes
           .map((candidate) => {
             const selected = candidate.id === mode.modeId ? "selected" : "";
@@ -2399,7 +5179,7 @@ function modeSelector(): string {
   `;
 }
 
-function commandSelector(): string {
+function commandSelector(disabled = ""): string {
   const commands = currentCommands();
   if (!commands.length) {
     return "";
@@ -2407,7 +5187,7 @@ function commandSelector(): string {
   return `
     <label class="select-control command-control">
       <span>Command</span>
-      <select data-action="insertCommand" aria-label="Command">
+      <select data-action="insertCommand" aria-label="Command" ${disabled}>
         <option value="">Slash command</option>
         ${commands
           .map((command) => {
@@ -2458,3 +5238,6 @@ function shortLabel(value: string): string {
   }
   return `${value.slice(0, 45)}...${value.slice(-45)}`;
 }
+
+render();
+vscode.postMessage({ type: "ready" });

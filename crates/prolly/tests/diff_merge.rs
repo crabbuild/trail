@@ -157,8 +157,8 @@ fn range_diff_matches_filtered_eager_diff() {
         .put(&other, b"k130".to_vec(), b"outside-new".to_vec())
         .unwrap();
 
-    let start = b"k030";
-    let end = b"k070";
+    let start = b"k030".as_slice();
+    let end = b"k070".as_slice();
     let expected = prolly
         .diff(&base, &other)
         .unwrap()

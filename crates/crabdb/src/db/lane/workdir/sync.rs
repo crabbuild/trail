@@ -4,9 +4,16 @@ impl CrabDb {
     pub fn lane_workdir(&self, lane: &str) -> Result<LaneWorkdirReport> {
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
+        let record = self.lane_record(&branch.lane_id)?;
+        let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
+        let sparse_paths = self.lane_report_sparse_paths(&branch)?;
         Ok(LaneWorkdirReport {
             lane_id: branch.lane_id,
             workdir: branch.workdir,
+            cow_backend: workdir_mode.cow_backend().map(str::to_string),
+            sparse_paths,
+            overlay_available: false,
+            workdir_mode,
         })
     }
 
@@ -564,8 +571,13 @@ impl CrabDb {
         let diffs =
             self.diff_file_maps_to_manifest_for_paths(target_files, &disk_manifest, &target_paths);
         if let Some(diff) = diffs.first() {
+            let detail = sparse_hydration_diff_detail(
+                diff,
+                target_files.get(&diff.path),
+                disk_manifest.get(&diff.path),
+            );
             return Err(Error::Corrupt(format!(
-                "sparse lane workdir `{}` failed hydration verification for `{}`",
+                "sparse lane workdir `{}` failed hydration verification for `{}`: {detail}",
                 workdir_path.display(),
                 diff.path
             )));
@@ -648,6 +660,30 @@ impl CrabDb {
             ),
         )
     }
+}
+
+fn sparse_hydration_diff_detail(
+    diff: &FileDiffSummary,
+    expected: Option<&FileEntry>,
+    actual: Option<&DiskManifest>,
+) -> String {
+    let expected = expected
+        .map(|entry| {
+            format!(
+                "expected kind={:?} executable={} hash={} size={}",
+                entry.kind, entry.executable, entry.content_hash, entry.size_bytes
+            )
+        })
+        .unwrap_or_else(|| "expected missing".to_string());
+    let actual = actual
+        .map(|manifest| {
+            format!(
+                "actual kind={:?} executable={} hash={}",
+                manifest.kind, manifest.executable, manifest.content_hash
+            )
+        })
+        .unwrap_or_else(|| "actual missing".to_string());
+    format!("diff={:?}; {expected}; {actual}", diff.kind)
 }
 
 fn branch_has_sparse_workdir(db: &CrabDb, branch: &LaneBranch) -> Result<bool> {

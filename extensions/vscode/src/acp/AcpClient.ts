@@ -65,7 +65,7 @@ export class AcpClient {
   private sessionId?: string;
   private authMethods: AcpAuthMethod[] = [];
   private activeAdditionalWorkspaceRoots: string[] = [];
-  private readonly pendingPermissionRequests = new Set<string>();
+  private readonly pendingPermissionRequests = new Map<string, JsonRpcMessage["id"]>();
 
   constructor(
     private readonly workspaceRoot: string,
@@ -301,22 +301,28 @@ export class AcpClient {
   }
 
   approve(requestId: string, optionId: string): void {
-    this.pendingPermissionRequests.delete(requestId);
-    this.rpc.respond(requestId, {
+    const rpcId = this.pendingPermissionRequests.has(requestId)
+      ? this.pendingPermissionRequests.get(requestId)
+      : requestId;
+    this.rpc.respond(rpcId, {
       outcome: {
         outcome: "selected",
         optionId
       }
     });
+    this.pendingPermissionRequests.delete(requestId);
   }
 
   reject(requestId: string): void {
-    this.pendingPermissionRequests.delete(requestId);
-    this.rpc.respond(requestId, {
+    const rpcId = this.pendingPermissionRequests.has(requestId)
+      ? this.pendingPermissionRequests.get(requestId)
+      : requestId;
+    this.rpc.respond(rpcId, {
       outcome: {
         outcome: "cancelled"
       }
     });
+    this.pendingPermissionRequests.delete(requestId);
   }
 
   dispose(): void {
@@ -337,7 +343,7 @@ export class AcpClient {
     if (message.method === "session/request_permission") {
       const params = message.params as RequestPermissionParams;
       const requestId = String(message.id);
-      this.pendingPermissionRequests.add(requestId);
+      this.pendingPermissionRequests.set(requestId, message.id);
       this.listeners?.permission(requestId, params);
       return;
     }
@@ -361,7 +367,7 @@ export class AcpClient {
   }
 
   private cancelPendingPermissionRequests(): string[] {
-    const cancelled = [...this.pendingPermissionRequests];
+    const cancelled = [...this.pendingPermissionRequests.keys()];
     for (const requestId of cancelled) {
       this.reject(requestId);
     }
