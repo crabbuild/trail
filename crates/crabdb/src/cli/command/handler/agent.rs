@@ -1429,10 +1429,23 @@ fn handle_agent_empty_action(
                 editor: "vscode".to_string(),
             },
         ),
+        "setup_codex_vscode" => handle_agent_setup(
+            ctx,
+            AgentSetupArgs {
+                provider: "codex".to_string(),
+                editor: "vscode".to_string(),
+            },
+        ),
         "doctor_claude_code" => handle_agent_doctor(
             ctx,
             AgentDoctorArgs {
                 provider: "claude-code".to_string(),
+            },
+        ),
+        "doctor_codex" => handle_agent_doctor(
+            ctx,
+            AgentDoctorArgs {
+                provider: "codex".to_string(),
             },
         ),
         "start_terminal_task" => handle_agent_start(

@@ -263,6 +263,8 @@ pub use prolly::{
     // Re-export for testing
     split_into_chunks,
     split_oversized_node,
+    BatchApplyResult,
+    BatchApplyStats,
     BatchWriteCollector,
     BatchWriter,
     BatchWriterConfig,

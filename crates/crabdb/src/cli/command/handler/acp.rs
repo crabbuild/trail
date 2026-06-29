@@ -1,5 +1,5 @@
 use super::*;
-use crabdb::model::{AcpDoctorCheck, AcpDoctorReport};
+use crabdb::model::{AcpDoctorCheck, AcpDoctorReport, AcpProviderProfile};
 
 pub(super) fn handle_acp_command(ctx: &RuntimeContext, acp: AcpCommand) -> Result<()> {
     match acp.command {
@@ -91,7 +91,17 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
         }
     }
 
-    let profile = crabdb::acp::acp_provider_profile(&args.agent)?;
+    let profile = match crabdb::acp::acp_provider_profile(&args.agent) {
+        Ok(profile) => profile,
+        Err(_) if !args.relay_command.is_empty() => AcpProviderProfile {
+            agent: args.agent.clone(),
+            display_name: args.agent.clone(),
+            available: true,
+            relay_command: args.relay_command.clone(),
+            notes: vec!["using caller-supplied ACP relay command".to_string()],
+        },
+        Err(err) => return Err(err),
+    };
     if profile.available {
         checks.push(acp_check(
             "provider",
@@ -104,9 +114,9 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
     }
 
     let relay_command = if args.relay_command.is_empty() {
-        profile.relay_command
+        profile.relay_command.clone()
     } else {
-        args.relay_command
+        args.relay_command.clone()
     };
     if relay_command.iter().any(|part| part == "relay")
         && relay_command.iter().any(|part| part == "--")

@@ -40,7 +40,7 @@ function baseProps(overrides: Partial<ApprovalCardProps> = {}): ApprovalCardProp
     },
     requestDetails: {
       id: "approval-request-details",
-      title: "Request details",
+      title: "Details",
       className: "approval-request-details",
       contentClassName: "approval-request-content",
       contentHtml: '<dl class="approval-detail-list"><div><dt>Provider</dt><dd>provider</dd></div></dl>',
@@ -69,12 +69,12 @@ function baseProps(overrides: Partial<ApprovalCardProps> = {}): ApprovalCardProp
   };
 }
 
-test("renders pending approvals with shadcn card alert badge and decision buttons", () => {
+test("renders pending approvals with compact shadcn card badge and decision buttons", () => {
   const html = renderApproval(baseProps());
 
   assert.match(html, /data-approval-card/);
   assert.match(html, /data-slot="card"/);
-  assert.match(html, /data-slot="alert"/);
+  assert.match(html, /approval-impact/);
   assert.match(html, /data-slot="accordion"/);
   assert.match(html, /data-slot="accordion-item"/);
   assert.match(html, /data-slot="accordion-trigger"/);
@@ -91,6 +91,7 @@ test("renders pending approvals with shadcn card alert badge and decision button
   assert.match(html, /approval-tool-content/);
   assert.match(html, /approval-request-content/);
   assert.doesNotMatch(html, /class="icon" data-icon="inline-start"/);
+  assert.doesNotMatch(html, /data-slot="alert"/);
   assert.doesNotMatch(html, /<details class="approval-preview/);
   assert.doesNotMatch(html, /<summary>Preview/);
   assert.doesNotMatch(html, /<details class="approval-request-details/);

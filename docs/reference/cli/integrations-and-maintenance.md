@@ -41,8 +41,8 @@ Starts the MCP stdio server.
 
 ```text
 crabdb agent
-crabdb agent setup [--provider claude-code] [--editor vscode|zed|generic]
-crabdb agent acp --provider claude-code [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
+crabdb agent setup [--provider <claude-code|codex>] [--editor vscode|zed|generic]
+crabdb agent acp --provider <claude-code|codex> [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 crabdb agent start --provider claude-code [--name <NAME>] [--from <REF>] [-- <COMMAND>...]
 crabdb agent continue [latest|<TASK_OR_LANE_OR_SESSION>] [--provider <PROVIDER>] [--name <NAME>] [-- <COMMAND>...]
 crabdb agent follow-up [latest|<TASK_OR_LANE_OR_SESSION>] [--provider <PROVIDER>] [--name <NAME>] [-- <COMMAND>...]
@@ -135,7 +135,7 @@ crabdb agent ship [latest|<TASK_OR_LANE_OR_SESSION>] [--dry-run] [-m <MESSAGE>] 
 crabdb agent undo [latest|<TASK_OR_LANE_OR_SESSION>] [--last-turn|--turn <N_OR_TURN_ID>|--prompt <TEXT>|--last-operation]
 crabdb agent undo-last [latest|<TASK_OR_LANE_OR_SESSION>] [--last-turn|--turn <N_OR_TURN_ID>|--prompt <TEXT>|--last-operation]
 crabdb agent rewind [latest|<TASK_OR_LANE_OR_SESSION>] --to <CHECKPOINT|before-last-turn|turn:N|before-turn:N|prompt:TEXT|before-prompt:TEXT|before-last-operation>
-crabdb agent doctor --provider claude-code
+crabdb agent doctor --provider <claude-code|codex>
 ```
 
 `agent` is the task-oriented workflow for coding agents. It creates fresh lanes
@@ -144,9 +144,10 @@ that the current Git tree matches CrabDB's internal apply base, creates a Git
 commit, and fast-forwards only when safe.
 
 `crabdb agent setup` defaults to Claude Code plus VS Code. Use
-`--editor zed` or `--editor generic` when you want another tested snippet. The
-setup report includes the editor snippet plus copyable next commands for doctor,
-the task inbox, and the action palette.
+`--provider codex` for Codex, and use `--editor zed` or `--editor generic`
+when you want another tested snippet. The setup report includes the editor
+snippet plus copyable next commands for doctor, the task inbox, and the action
+palette.
 
 Run bare `crabdb agent` when you are not sure what to do next. It opens the
 agent inbox home view, groups tasks by what needs attention, shows new
@@ -485,19 +486,22 @@ or advanced friendly target.
 
 ```text
 crabdb acp relay [--lane <LANE>] [--from <REF>] [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] [--provider <NAME>] [--model <NAME>] [--no-mcp] -- <COMMAND>...
-crabdb acp install --agent claude-code [--editor generic|zed] [--dry-run] [--print]
-crabdb acp doctor --agent claude-code [--relay-command <COMMAND>...]
+crabdb acp install --agent <claude-code|codex> [--editor generic|zed] [--dry-run] [--print]
+crabdb acp doctor --agent <claude-code|codex> [--relay-command <COMMAND>...]
 crabdb acp list
 crabdb acp sessions [--lane <LANE>]
 ```
 
 `acp install` prints setup snippets and does not mutate editor config. `acp
 relay` remains the low-level ACP stdio relay in front of the real coding agent.
+The built-in profiles use `@agentclientprotocol/claude-agent-acp` and
+`@agentclientprotocol/codex-acp`; any ACP-compatible command can still be
+wrapped directly with `crabdb acp relay -- <COMMAND>...`.
 
 ## `demo`
 
 ```text
-crabdb demo acp [--agent claude-code]
+crabdb demo acp [--agent <claude-code|codex>]
 ```
 
 `demo acp` prints a guided workflow for configuring an ACP editor and reviewing

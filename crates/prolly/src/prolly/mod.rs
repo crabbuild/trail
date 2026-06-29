@@ -84,8 +84,15 @@
 //! The `Prolly<S>` struct is `Send` and `Sync` when the underlying store is. The immutable
 //! nature of trees means multiple threads can safely read from the same tree simultaneously.
 
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::collections::{hash_map::Entry, HashMap};
+use std::ops::Range;
 use std::sync::{Arc, RwLock};
+
+const PARALLEL_NODE_DECODE_THRESHOLD: usize = 16;
+const GET_MANY_PREFETCH_PARALLELISM: usize = 16;
+const GET_MANY_BOUNDARY_ROUTE_MIN_POSITIONS: usize = 32;
+const STATS_FRONTIER_PREFETCH_PARALLELISM: usize = 16;
 
 // Core modules - moved from root level
 pub mod boundary;
@@ -125,6 +132,97 @@ use stats::TreeStats;
 use store::Store;
 use tree::Tree;
 
+struct KeyLookupFrame {
+    cid: Cid,
+    positions: InlinePositions,
+}
+
+#[derive(Default)]
+struct MissingNodeBatch {
+    indexes: HashMap<Cid, usize>,
+    cids: Vec<Cid>,
+    positions: Vec<InlinePositions>,
+}
+
+struct InlinePositions {
+    first: usize,
+    rest: Vec<usize>,
+}
+
+impl InlinePositions {
+    fn new(first: usize) -> Self {
+        Self {
+            first,
+            rest: Vec::new(),
+        }
+    }
+
+    fn with_rest_capacity(first: usize, rest_capacity: usize) -> Self {
+        Self {
+            first,
+            rest: Vec::with_capacity(rest_capacity),
+        }
+    }
+
+    fn from_vec(positions: Vec<usize>) -> Option<Self> {
+        let mut iter = positions.into_iter();
+        let first = iter.next()?;
+        Some(Self {
+            first,
+            rest: iter.collect(),
+        })
+    }
+
+    fn push(&mut self, position: usize) {
+        self.rest.push(position);
+    }
+
+    fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    fn at(&self, offset: usize) -> usize {
+        if offset == 0 {
+            self.first
+        } else {
+            self.rest[offset - 1]
+        }
+    }
+}
+
+impl IntoIterator for InlinePositions {
+    type Item = usize;
+    type IntoIter = std::iter::Chain<std::iter::Once<usize>, std::vec::IntoIter<usize>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self.first).chain(self.rest)
+    }
+}
+
+impl MissingNodeBatch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            indexes: HashMap::with_capacity(capacity),
+            cids: Vec::with_capacity(capacity),
+            positions: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn record(&mut self, cid: &Cid, position: usize) {
+        match self.indexes.entry(cid.clone()) {
+            Entry::Occupied(entry) => {
+                self.positions[*entry.get()].push(position);
+            }
+            Entry::Vacant(entry) => {
+                let missing_idx = self.cids.len();
+                self.cids.push(cid.clone());
+                self.positions.push(InlinePositions::new(position));
+                entry.insert(missing_idx);
+            }
+        }
+    }
+}
+
 // Re-export RangeIter for range queries
 pub use range::RangeIter;
 
@@ -147,6 +245,8 @@ pub use batch::preprocess_mutations;
 pub use batch::rebuild_from_modified_leaves;
 pub use batch::should_use_deferred_rebalancing;
 pub use batch::split_oversized_node;
+pub use batch::BatchApplyResult;
+pub use batch::BatchApplyStats;
 pub use batch::BatchWriteCollector;
 pub use batch::BatchWriter;
 pub use batch::BatchWriterConfig;
@@ -269,17 +369,96 @@ impl<S: Store> Prolly<S> {
 
             if node.leaf {
                 if node.keys.get(idx).map(|k| k.as_slice()) == Some(key) {
-                    return Ok(Some(node.vals[idx].clone()));
+                    return Ok(Some(leaf_value_at(&node, idx)?));
                 }
                 return Ok(None);
             }
 
             // Descend to child
-            cid = Cid(node.vals[idx]
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::InvalidNode)?);
+            cid = child_cid_at(&node, idx)?;
         }
+    }
+
+    /// Get multiple values from the tree while preserving caller order.
+    ///
+    /// This descends the tree level-by-level and batches node loads for the
+    /// current lookup frontier. It is useful for random read-after-write
+    /// verification and merge conflict checks because shared ancestors and
+    /// leaves are loaded once instead of once per key.
+    ///
+    /// Duplicate keys are allowed; each output slot corresponds to the input
+    /// key at the same index.
+    ///
+    /// # Arguments
+    /// * `tree` - The tree to search
+    /// * `keys` - Keys to look up
+    ///
+    /// # Returns
+    /// A vector of values in the same order as `keys`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let tree = prolly.create();
+    /// let tree = prolly.put(&tree, b"a".to_vec(), b"1".to_vec()).unwrap();
+    /// let tree = prolly.put(&tree, b"b".to_vec(), b"2".to_vec()).unwrap();
+    ///
+    /// let values = prolly.get_many(&tree, &[b"b".to_vec(), b"missing".to_vec(), b"a".to_vec()]).unwrap();
+    /// assert_eq!(values, vec![Some(b"2".to_vec()), None, Some(b"1".to_vec())]);
+    /// ```
+    pub fn get_many<K: AsRef<[u8]>>(
+        &self,
+        tree: &Tree,
+        keys: &[K],
+    ) -> Result<Vec<Option<Vec<u8>>>, Error> {
+        let mut values = vec![None; keys.len()];
+        let Some(root_cid) = &tree.root else {
+            return Ok(values);
+        };
+
+        if keys.is_empty() {
+            return Ok(values);
+        }
+
+        let positions = InlinePositions::from_vec(sorted_key_positions(keys))
+            .expect("keys is non-empty after early return");
+
+        let mut frames = vec![KeyLookupFrame {
+            cid: root_cid.clone(),
+            positions,
+        }];
+
+        while !frames.is_empty() {
+            let cids = frames
+                .iter()
+                .map(|frame| frame.cid.clone())
+                .collect::<Vec<_>>();
+            let nodes = if self.store.prefers_batch_reads() {
+                self.load_many_ordered_with_parallelism(&cids, GET_MANY_PREFETCH_PARALLELISM)?
+            } else {
+                self.load_many_ordered(&cids)?
+            };
+            let mut next_frames = Vec::new();
+
+            for (frame, node) in frames.into_iter().zip(nodes) {
+                if node.leaf {
+                    fill_leaf_lookup_values(&node, frame.positions, keys, &mut values)?;
+                    continue;
+                }
+
+                next_frames.extend(route_key_positions_to_children(
+                    &node,
+                    frame.positions,
+                    keys,
+                )?);
+            }
+
+            frames = next_frames;
+        }
+
+        Ok(values)
     }
 
     /// Insert or update a key-value pair in the tree.
@@ -598,8 +777,7 @@ impl<S: Store> Prolly<S> {
         // Initialize TreeStats
         let mut stats = TreeStats::new();
 
-        // Call recursive helper
-        self.collect_stats_recursive(root_cid, &mut stats)?;
+        self.collect_stats_from_frontier(root_cid, &mut stats)?;
 
         // Finalize statistics
         stats.finalize();
@@ -608,34 +786,49 @@ impl<S: Store> Prolly<S> {
         Ok(stats)
     }
 
-    /// Recursive helper for collecting statistics
+    /// Frontier helper for collecting statistics
     ///
-    /// Traverses the tree depth-first, accumulating statistics at each node.
+    /// Traverses the tree level-by-level, accumulating statistics at each node
+    /// and batching each frontier's child loads when the store supports it.
     ///
     /// # Arguments
-    /// * `cid` - The CID of the current node
+    /// * `root_cid` - The CID of the root node
     /// * `stats` - Mutable reference to the statistics accumulator
     ///
     /// # Returns
     /// * `Ok(())` - Statistics accumulated successfully
     /// * `Err(Error)` - On storage or deserialization errors
-    fn collect_stats_recursive(&self, cid: &Cid, stats: &mut TreeStats) -> Result<(), Error> {
-        // Load node from store (propagate errors)
-        let node = self.load(cid)?;
+    fn collect_stats_from_frontier(
+        &self,
+        root_cid: &Cid,
+        stats: &mut TreeStats,
+    ) -> Result<(), Error> {
+        let parallelism = if self.store.prefers_batch_reads() {
+            STATS_FRONTIER_PREFETCH_PARALLELISM
+        } else {
+            1
+        };
+        let mut frontier = vec![root_cid.clone()];
 
-        // Call stats.accumulate(&node)
-        stats.accumulate(&node);
+        while !frontier.is_empty() {
+            let nodes = self.load_many_ordered_with_parallelism(&frontier, parallelism)?;
+            let mut next_frontier = Vec::new();
 
-        // For internal nodes, recursively visit children
-        if !node.leaf {
-            for child_cid_bytes in &node.vals {
-                // Handle CID conversion errors
-                let child_cid = Cid(child_cid_bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::InvalidNode)?);
-                self.collect_stats_recursive(&child_cid, stats)?;
+            for node in nodes {
+                if node.keys.len() != node.vals.len() {
+                    return Err(Error::InvalidNode);
+                }
+                stats.accumulate(&node);
+
+                if !node.leaf {
+                    next_frontier.reserve(node.vals.len());
+                    for idx in 0..node.len() {
+                        next_frontier.push(child_cid_at(&node, idx)?);
+                    }
+                }
             }
+
+            frontier = next_frontier;
         }
 
         Ok(())
@@ -711,6 +904,15 @@ impl<S: Store> Prolly<S> {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> Result<cursor::CursorIterator<'a, S>, Error> {
+        if end.is_some_and(|end| end <= start) {
+            return Ok(cursor::CursorIterator::with_bounds(
+                cursor::Cursor::invalid(),
+                &self.store,
+                Some(start.to_vec()),
+                end.map(|e| e.to_vec()),
+            ));
+        }
+
         let cursor = cursor::Cursor::at_item(&self.store, tree, start)?;
         Ok(cursor::CursorIterator::with_bounds(
             cursor,
@@ -842,56 +1044,141 @@ impl<S: Store> Prolly<S> {
 
     /// Load nodes by CID in input order, batching cache misses through the store.
     pub(crate) fn load_many_ordered(&self, cids: &[Cid]) -> Result<Vec<Arc<Node>>, Error> {
-        let mut nodes = vec![None; cids.len()];
-        let mut missing_positions: HashMap<Cid, Vec<usize>> = HashMap::new();
-        let mut missing_cids = Vec::new();
+        self.load_many_ordered_with_parallelism(cids, 1)
+    }
 
+    /// Load nodes by CID in input order, splitting cache misses across up to
+    /// `parallelism` concurrent ordered batch reads.
+    pub(crate) fn load_many_ordered_with_parallelism(
+        &self,
+        cids: &[Cid],
+        parallelism: usize,
+    ) -> Result<Vec<Arc<Node>>, Error> {
+        if cids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut nodes: Vec<Option<Arc<Node>>>;
+        let mut missing: Option<MissingNodeBatch>;
         if let Ok(cache) = self.node_cache.read() {
+            let mut cached_nodes = Vec::with_capacity(cids.len());
+            let mut first_miss = None;
             for (idx, cid) in cids.iter().enumerate() {
                 if let Some(node) = cache.get(cid) {
-                    nodes[idx] = Some(node.clone());
+                    cached_nodes.push(node.clone());
                 } else {
-                    if !missing_positions.contains_key(cid) {
-                        missing_cids.push(cid.clone());
-                        missing_positions.insert(cid.clone(), Vec::new());
+                    first_miss = Some(idx);
+                    break;
+                }
+            }
+
+            let Some(first_miss) = first_miss else {
+                return Ok(cached_nodes);
+            };
+
+            nodes = Vec::with_capacity(cids.len());
+            nodes.extend(cached_nodes.into_iter().map(Some));
+            nodes.resize_with(cids.len(), || None);
+            missing = Some(MissingNodeBatch::with_capacity(cids.len() - first_miss));
+            if let Some(missing_batch) = missing.as_mut() {
+                missing_batch.record(&cids[first_miss], first_miss);
+                for (idx, cid) in cids.iter().enumerate().skip(first_miss + 1) {
+                    if let Some(node) = cache.get(cid) {
+                        nodes[idx] = Some(node.clone());
+                    } else {
+                        missing_batch.record(cid, idx);
                     }
-                    missing_positions
-                        .get_mut(cid)
-                        .ok_or(Error::InvalidNode)?
-                        .push(idx);
                 }
             }
         } else {
+            nodes = vec![None; cids.len()];
+            let mut missing_batch = MissingNodeBatch::with_capacity(cids.len());
             for (idx, cid) in cids.iter().enumerate() {
-                if !missing_positions.contains_key(cid) {
-                    missing_cids.push(cid.clone());
-                    missing_positions.insert(cid.clone(), Vec::new());
-                }
-                missing_positions
-                    .get_mut(cid)
-                    .ok_or(Error::InvalidNode)?
-                    .push(idx);
+                missing_batch.record(cid, idx);
             }
+            missing = Some(missing_batch);
         }
 
-        if !missing_cids.is_empty() {
-            let keys = missing_cids
-                .iter()
-                .map(|cid| cid.as_bytes())
-                .collect::<Vec<_>>();
-            let loaded = self
-                .store
-                .batch_get_ordered(&keys)
-                .map_err(|e| Error::Store(Box::new(e)))?;
+        if let Some(MissingNodeBatch {
+            cids: missing_cids,
+            positions: missing_positions,
+            ..
+        }) = missing
+        {
+            if missing_cids.len() == 1 && !self.store.prefers_batch_reads() {
+                let node = self.load_arc(&missing_cids[0])?;
+                let positions = missing_positions
+                    .into_iter()
+                    .next()
+                    .ok_or(Error::InvalidNode)?;
+                for idx in positions {
+                    nodes[idx] = Some(node.clone());
+                }
 
-            if loaded.len() != missing_cids.len() {
-                return Err(Error::InvalidNode);
+                return nodes
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(Error::InvalidNode);
             }
 
+            let loaded = if parallelism <= 1 || missing_cids.len() <= parallelism {
+                let keys = missing_cids
+                    .iter()
+                    .map(|cid| cid.as_bytes())
+                    .collect::<Vec<_>>();
+                let loaded = self
+                    .store
+                    .batch_get_ordered_unique(&keys)
+                    .map_err(|e| Error::Store(Box::new(e)))?;
+                if loaded.len() != missing_cids.len() {
+                    return Err(Error::InvalidNode);
+                }
+                loaded
+            } else {
+                let chunk_size = missing_cids.len().div_ceil(parallelism);
+                missing_cids
+                    .par_chunks(chunk_size)
+                    .map(|chunk| {
+                        let keys = chunk.iter().map(|cid| cid.as_bytes()).collect::<Vec<_>>();
+                        let loaded = self
+                            .store
+                            .batch_get_ordered_unique(&keys)
+                            .map_err(|e| Error::Store(Box::new(e)))?;
+                        if loaded.len() != chunk.len() {
+                            return Err(Error::InvalidNode);
+                        }
+                        Ok(loaded)
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            };
+
+            let decoded = if loaded.len() >= PARALLEL_NODE_DECODE_THRESHOLD {
+                missing_cids
+                    .into_par_iter()
+                    .zip(loaded.into_par_iter())
+                    .map(|(cid, bytes)| {
+                        let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
+                        let node = Arc::new(Node::from_bytes(&bytes)?);
+                        Ok((cid, node))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?
+            } else {
+                missing_cids
+                    .into_iter()
+                    .zip(loaded)
+                    .map(|(cid, bytes)| {
+                        let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
+                        let node = Arc::new(Node::from_bytes(&bytes)?);
+                        Ok((cid, node))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?
+            };
+
             let mut cache = self.node_cache.write().ok();
-            for (cid, bytes) in missing_cids.into_iter().zip(loaded) {
-                let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
-                let node = Arc::new(Node::from_bytes(&bytes)?);
+            for ((cid, node), positions) in decoded.into_iter().zip(missing_positions) {
                 let node = if let Some(cache) = cache.as_mut() {
                     cache
                         .entry(cid.clone())
@@ -900,7 +1187,6 @@ impl<S: Store> Prolly<S> {
                 } else {
                     node
                 };
-                let positions = missing_positions.remove(&cid).ok_or(Error::InvalidNode)?;
                 for idx in positions {
                     nodes[idx] = Some(node.clone());
                 }
@@ -930,6 +1216,13 @@ impl<S: Store> Prolly<S> {
         if let Ok(mut cache) = self.node_cache.write() {
             cache.insert(cid, Arc::new(node));
         }
+    }
+
+    pub(crate) fn cached_node_arc(&self, cid: &Cid) -> Option<Arc<Node>> {
+        self.node_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(cid).cloned())
     }
 
     pub(crate) fn cached_rightmost_path(
@@ -1000,10 +1293,39 @@ impl<S: Store> Prolly<S> {
                 break;
             }
 
-            cid = Cid(node.vals[idx]
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::InvalidNode)?);
+            cid = child_cid_at(&node, idx)?;
+        }
+
+        Ok(path)
+    }
+
+    /// Find the path from root to the key using shared cached nodes.
+    pub(crate) fn find_path_arcs(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+    ) -> Result<Vec<(Arc<Node>, usize)>, Error> {
+        let mut path = Vec::new();
+
+        let Some(root_cid) = &tree.root else {
+            return Ok(path);
+        };
+
+        let mut cid = root_cid.clone();
+        loop {
+            let node = self.load_arc(&cid)?;
+            let idx = match node.search(key) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+
+            path.push((node.clone(), idx));
+
+            if node.leaf {
+                break;
+            }
+
+            cid = child_cid_at(&node, idx)?;
         }
 
         Ok(path)
@@ -1195,6 +1517,201 @@ impl<S: Store> Prolly<S> {
     }
 }
 
+fn fill_leaf_lookup_values<K: AsRef<[u8]>>(
+    node: &Node,
+    positions: InlinePositions,
+    keys: &[K],
+    values: &mut [Option<Vec<u8>>],
+) -> Result<(), Error> {
+    if node.keys.len() != node.vals.len() {
+        return Err(Error::InvalidNode);
+    }
+
+    let mut leaf_idx = 0usize;
+    let mut positions = positions.into_iter().peekable();
+    while let Some(position) = positions.next() {
+        let key = keys[position].as_ref();
+
+        while leaf_idx < node.keys.len() && node.keys[leaf_idx].as_slice() < key {
+            leaf_idx += 1;
+        }
+
+        let found_value = if leaf_idx < node.keys.len() && node.keys[leaf_idx].as_slice() == key {
+            Some(&node.vals[leaf_idx])
+        } else {
+            None
+        };
+
+        if let Some(value) = found_value {
+            values[position] = Some(value.clone());
+        }
+
+        while let Some(next_position) =
+            positions.next_if(|next_position| keys[*next_position].as_ref() == key)
+        {
+            if let Some(value) = found_value {
+                values[next_position] = Some(value.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn sorted_key_positions<K: AsRef<[u8]>>(keys: &[K]) -> Vec<usize> {
+    let mut positions = (0..keys.len()).collect::<Vec<_>>();
+    if keys_are_sorted(keys) {
+        return positions;
+    }
+
+    positions.sort_by(|left, right| {
+        keys[*left]
+            .as_ref()
+            .cmp(keys[*right].as_ref())
+            .then_with(|| left.cmp(right))
+    });
+    positions
+}
+
+fn keys_are_sorted<K: AsRef<[u8]>>(keys: &[K]) -> bool {
+    keys.windows(2)
+        .all(|pair| pair[0].as_ref() <= pair[1].as_ref())
+}
+
+fn route_key_positions_to_children<K: AsRef<[u8]>>(
+    node: &Node,
+    positions: InlinePositions,
+    keys: &[K],
+) -> Result<Vec<KeyLookupFrame>, Error> {
+    if node.is_empty() {
+        return Err(Error::InvalidNode);
+    }
+
+    if positions.len() >= GET_MANY_BOUNDARY_ROUTE_MIN_POSITIONS && node.len() > 1 {
+        return route_key_positions_to_children_by_boundary(node, positions, keys);
+    }
+
+    let mut frames: Vec<KeyLookupFrame> = Vec::with_capacity(node.len().min(positions.len()));
+    let mut child_index = child_index_for_lookup_key(node, keys[positions.first].as_ref());
+    let mut last_child_index = None;
+
+    for position in positions {
+        let key = keys[position].as_ref();
+        while child_index + 1 < node.len() && key >= node.keys[child_index + 1].as_slice() {
+            child_index += 1;
+        }
+
+        if last_child_index == Some(child_index) {
+            let frame = frames.last_mut().ok_or(Error::InvalidNode)?;
+            frame.positions.push(position);
+        } else {
+            frames.push(KeyLookupFrame {
+                cid: child_cid_at(node, child_index)?,
+                positions: InlinePositions::new(position),
+            });
+            last_child_index = Some(child_index);
+        }
+    }
+
+    Ok(frames)
+}
+
+fn route_key_positions_to_children_by_boundary<K: AsRef<[u8]>>(
+    node: &Node,
+    positions: InlinePositions,
+    keys: &[K],
+) -> Result<Vec<KeyLookupFrame>, Error> {
+    let position_count = positions.len();
+    let mut frames = Vec::with_capacity(node.len().min(position_count));
+    let mut child_index = child_index_for_lookup_key(node, keys[positions.at(0)].as_ref());
+    let last_child_index =
+        child_index_for_lookup_key(node, keys[positions.at(position_count - 1)].as_ref());
+    let mut bucket_start = 0usize;
+
+    while child_index < last_child_index {
+        let boundary = node.keys.get(child_index + 1).ok_or(Error::InvalidNode)?;
+        let bucket_end = lower_bound_position_key(
+            &positions,
+            keys,
+            bucket_start..position_count,
+            boundary.as_slice(),
+        );
+
+        if bucket_start < bucket_end {
+            frames.push(KeyLookupFrame {
+                cid: child_cid_at(node, child_index)?,
+                positions: inline_positions_from_range(&positions, bucket_start..bucket_end),
+            });
+        }
+
+        bucket_start = bucket_end;
+        child_index += 1;
+    }
+
+    if bucket_start < position_count {
+        frames.push(KeyLookupFrame {
+            cid: child_cid_at(node, last_child_index)?,
+            positions: inline_positions_from_range(&positions, bucket_start..position_count),
+        });
+    }
+
+    Ok(frames)
+}
+
+fn lower_bound_position_key<K: AsRef<[u8]>>(
+    positions: &InlinePositions,
+    keys: &[K],
+    range: Range<usize>,
+    key: &[u8],
+) -> usize {
+    let mut left = range.start;
+    let mut right = range.end;
+
+    while left < right {
+        let mid = left + (right - left) / 2;
+        if keys[positions.at(mid)].as_ref() < key {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
+    left
+}
+
+fn inline_positions_from_range(
+    positions: &InlinePositions,
+    range: Range<usize>,
+) -> InlinePositions {
+    debug_assert!(range.start < range.end);
+    let first = positions.at(range.start);
+    let mut bucket = InlinePositions::with_rest_capacity(first, range.end - range.start - 1);
+
+    for offset in range.start + 1..range.end {
+        bucket.push(positions.at(offset));
+    }
+
+    bucket
+}
+
+fn child_index_for_lookup_key(node: &Node, key: &[u8]) -> usize {
+    node.keys
+        .partition_point(|candidate| candidate.as_slice() <= key)
+        .saturating_sub(1)
+}
+
+fn leaf_value_at(node: &Node, idx: usize) -> Result<Vec<u8>, Error> {
+    node.vals.get(idx).cloned().ok_or(Error::InvalidNode)
+}
+
+fn child_cid_at(node: &Node, idx: usize) -> Result<Cid, Error> {
+    let child = node.vals.get(idx).ok_or(Error::InvalidNode)?;
+    Ok(Cid(child
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::InvalidNode)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1735,8 @@ mod tests {
     #[derive(Default)]
     struct CountingStore {
         data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+        prefer_batch_reads: bool,
+        get_calls: AtomicUsize,
         put_calls: AtomicUsize,
         batch_calls: AtomicUsize,
         batch_put_calls: AtomicUsize,
@@ -1230,6 +1749,7 @@ mod tests {
 
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
             let data = self.data.lock().unwrap();
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
             Ok(data.get(key).cloned())
         }
 
@@ -1278,6 +1798,10 @@ mod tests {
             let data = self.data.lock().unwrap();
             Ok(keys.iter().map(|key| data.get(*key).cloned()).collect())
         }
+
+        fn prefers_batch_reads(&self) -> bool {
+            self.prefer_batch_reads
+        }
     }
 
     #[test]
@@ -1298,6 +1822,28 @@ mod tests {
     }
 
     #[test]
+    fn missing_node_batch_keeps_unique_positions_inline() {
+        let cid_a = Cid::from_bytes(b"a");
+        let cid_b = Cid::from_bytes(b"b");
+        let mut batch = MissingNodeBatch::with_capacity(2);
+
+        batch.record(&cid_a, 3);
+        batch.record(&cid_b, 9);
+
+        assert_eq!(batch.cids, vec![cid_a.clone(), cid_b]);
+        assert_eq!(batch.positions[0].first, 3);
+        assert_eq!(batch.positions[0].rest.capacity(), 0);
+        assert_eq!(batch.positions[1].first, 9);
+        assert_eq!(batch.positions[1].rest.capacity(), 0);
+
+        batch.record(&cid_a, 11);
+        assert_eq!(
+            batch.positions.remove(0).into_iter().collect::<Vec<_>>(),
+            vec![3, 11]
+        );
+    }
+
+    #[test]
     fn load_many_ordered_deduplicates_missing_cids() {
         let store = Arc::new(CountingStore::default());
         let prolly = Prolly::new(store.clone(), Config::default());
@@ -1315,11 +1861,617 @@ mod tests {
         assert!(Arc::ptr_eq(&nodes[0], &nodes[1]));
         assert!(Arc::ptr_eq(&nodes[1], &nodes[2]));
         assert_eq!(prolly.cache_len(), 1);
-        assert_eq!(store.batch_get_ordered_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            1,
+            "duplicate CIDs should collapse to one point read"
+        );
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            0,
+            "single-CID miss batches should not pay ordered batch overhead"
+        );
+    }
+
+    #[test]
+    fn load_many_ordered_serves_cache_hits_without_store_reads() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut cids = Vec::new();
+
+        for idx in 0..3 {
+            let mut node = Node::new_leaf();
+            node.keys.push(format!("k{idx:02}").into_bytes());
+            node.vals.push(format!("v{idx:02}").into_bytes());
+            cids.push(prolly.save(&node).unwrap());
+        }
+
+        let calls_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+        let nodes = prolly
+            .load_many_ordered_with_parallelism(
+                &[cids[2].clone(), cids[0].clone(), cids[2].clone()],
+                4,
+            )
+            .unwrap();
+
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].keys[0], b"k02".to_vec());
+        assert_eq!(nodes[1].keys[0], b"k00".to_vec());
+        assert!(Arc::ptr_eq(&nodes[0], &nodes[2]));
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            calls_before,
+            "all-cache-hit frontiers should not allocate miss work or call the store"
+        );
+    }
+
+    #[test]
+    fn load_many_ordered_reuses_cached_prefix_and_deduplicates_later_misses() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut nodes_to_cache = Vec::new();
+        let mut cids = Vec::new();
+
+        for idx in 0..3 {
+            let mut node = Node::new_leaf();
+            node.keys.push(format!("k{idx:02}").into_bytes());
+            node.vals.push(format!("v{idx:02}").into_bytes());
+            cids.push(prolly.save(&node).unwrap());
+            nodes_to_cache.push(node);
+        }
+
+        prolly.clear_cache();
+        prolly.cache_node(cids[0].clone(), nodes_to_cache[0].clone());
+        prolly.cache_node(cids[2].clone(), nodes_to_cache[2].clone());
+
+        let loaded = prolly
+            .load_many_ordered(&[
+                cids[0].clone(),
+                cids[1].clone(),
+                cids[0].clone(),
+                cids[2].clone(),
+                cids[1].clone(),
+            ])
+            .unwrap();
+
+        assert_eq!(loaded.len(), 5);
+        assert_eq!(loaded[0].keys[0], b"k00".to_vec());
+        assert_eq!(loaded[1].keys[0], b"k01".to_vec());
+        assert_eq!(loaded[3].keys[0], b"k02".to_vec());
+        assert!(Arc::ptr_eq(&loaded[0], &loaded[2]));
+        assert!(Arc::ptr_eq(&loaded[1], &loaded[4]));
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            1,
+            "only the single cold CID should be point-read, even when it appears twice"
+        );
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            0,
+            "default stores should avoid ordered batch overhead for one cold CID"
+        );
+    }
+
+    #[test]
+    fn load_many_ordered_unique_misses_use_point_reads_for_non_batched_stores() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut cids = Vec::new();
+
+        for idx in 0..3 {
+            let mut node = Node::new_leaf();
+            node.keys.push(format!("k{idx:02}").into_bytes());
+            node.vals.push(format!("v{idx:02}").into_bytes());
+            cids.push(prolly.save(&node).unwrap());
+        }
+        prolly.clear_cache();
+
+        let loaded = prolly.load_many_ordered(&cids).unwrap();
+
+        assert_eq!(loaded.len(), cids.len());
+        for (idx, node) in loaded.iter().enumerate() {
+            assert_eq!(node.keys[0], format!("k{idx:02}").into_bytes());
+        }
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            cids.len(),
+            "point-read stores should avoid duplicate ordered-batch planning for unique misses"
+        );
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            0,
+            "point-read stores should not route already-unique misses through ordered batch reads"
+        );
+    }
+
+    #[test]
+    fn load_many_ordered_with_parallelism_splits_wide_misses() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut cids = Vec::new();
+
+        for idx in 0..12 {
+            let mut node = Node::new_leaf();
+            node.keys.push(format!("k{idx:02}").into_bytes());
+            node.vals.push(format!("v{idx:02}").into_bytes());
+            cids.push(prolly.save(&node).unwrap());
+        }
+        prolly.clear_cache();
+
+        let nodes = prolly.load_many_ordered_with_parallelism(&cids, 3).unwrap();
+
+        assert_eq!(nodes.len(), cids.len());
+        for (idx, node) in nodes.iter().enumerate() {
+            assert_eq!(node.keys[0], format!("k{idx:02}").into_bytes());
+        }
+        assert_eq!(prolly.cache_len(), cids.len());
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            3,
+            "12 misses with parallelism 3 should split into 3 ordered batch reads"
+        );
         assert_eq!(
             store.max_batch_get_ordered_len.load(Ordering::Relaxed),
-            1,
-            "duplicate CIDs should be fetched and decoded once"
+            4,
+            "wide miss sets should be split into roughly even ordered batches"
+        );
+    }
+
+    #[test]
+    fn load_many_ordered_parallel_decode_preserves_order_cache_and_duplicates() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let unique_count = PARALLEL_NODE_DECODE_THRESHOLD + 4;
+        let mut cids = Vec::new();
+
+        for idx in 0..unique_count {
+            let mut node = Node::new_leaf();
+            node.keys.push(format!("k{idx:02}").into_bytes());
+            node.vals.push(format!("v{idx:02}").into_bytes());
+            cids.push(prolly.save(&node).unwrap());
+        }
+
+        let mut requested = Vec::with_capacity(unique_count + 2);
+        requested.push(cids[3].clone());
+        requested.extend(cids.iter().cloned());
+        requested.push(cids[3].clone());
+        prolly.clear_cache();
+
+        let nodes = prolly
+            .load_many_ordered_with_parallelism(&requested, 4)
+            .unwrap();
+
+        assert_eq!(nodes.len(), requested.len());
+        assert!(Arc::ptr_eq(&nodes[0], nodes.last().unwrap()));
+        assert!(Arc::ptr_eq(&nodes[0], &nodes[4]));
+        for (idx, node) in nodes[1..=unique_count].iter().enumerate() {
+            assert_eq!(node.keys[0], format!("k{idx:02}").into_bytes());
+        }
+        assert_eq!(prolly.cache_len(), unique_count);
+        assert_eq!(store.batch_get_ordered_calls.load(Ordering::Relaxed), 4);
+        assert!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed) <= unique_count.div_ceil(4),
+            "wide parallel-decode misses should still use bounded ordered batches"
+        );
+    }
+
+    #[test]
+    fn collect_stats_batches_child_frontiers_for_batched_read_stores() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut child_cids = Vec::new();
+
+        for idx in 0..4 {
+            let mut leaf = prolly.new_leaf_node();
+            leaf.keys.push(format!("k{idx:02}").into_bytes());
+            leaf.vals.push(format!("v{idx:02}").into_bytes());
+            child_cids.push(prolly.save(&leaf).unwrap());
+        }
+
+        let mut root = prolly.new_internal_node(1);
+        root.keys = (0..4)
+            .map(|idx| format!("k{idx:02}").into_bytes())
+            .collect();
+        root.vals = child_cids.iter().map(|cid| cid.0.to_vec()).collect();
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        prolly.clear_cache();
+        let stats = prolly.collect_stats(&tree).unwrap();
+
+        assert_eq!(stats.num_nodes, 5);
+        assert_eq!(stats.num_internal_nodes, 1);
+        assert_eq!(stats.num_leaves, 4);
+        assert_eq!(stats.total_key_value_pairs, 4);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            0,
+            "batched stats collection should hydrate frontiers through ordered batch reads"
+        );
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            2,
+            "stats should load the root frontier and then all leaf children as one child frontier"
+        );
+        assert_eq!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed),
+            4,
+            "the child frontier should be loaded as a single ordered batch"
+        );
+        assert_eq!(prolly.cache_len(), 5);
+    }
+
+    #[test]
+    fn collect_stats_rejects_nodes_with_mismatched_values() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut child = prolly.new_leaf_node();
+        child.keys.push(b"k".to_vec());
+        child.vals.push(b"v".to_vec());
+        let child_cid = prolly.save(&child).unwrap();
+
+        let mut malformed = prolly.new_internal_node(1);
+        malformed.keys = vec![b"a".to_vec(), b"m".to_vec()];
+        malformed.vals = vec![child_cid.0.to_vec()];
+        let tree = Tree {
+            root: Some(prolly.save(&malformed).unwrap()),
+            config: Config::default(),
+        };
+        prolly.clear_cache();
+
+        let err = prolly.collect_stats(&tree).unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidNode | Error::Deserialize(_)),
+            "malformed stats roots should not be silently accepted: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sorted_key_positions_keeps_already_sorted_inputs_in_place() {
+        let keys = vec![b"a".to_vec(), b"b".to_vec(), b"b".to_vec(), b"c".to_vec()];
+
+        let positions = sorted_key_positions(&keys);
+
+        assert_eq!(positions, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn sorted_key_positions_sorts_unsorted_inputs_stably() {
+        let keys = vec![b"c".to_vec(), b"a".to_vec(), b"b".to_vec(), b"a".to_vec()];
+
+        let positions = sorted_key_positions(&keys);
+
+        assert_eq!(positions, vec![1, 3, 2, 0]);
+    }
+
+    #[test]
+    fn get_many_child_routing_keeps_singleton_positions_inline() {
+        let child_cids = [
+            Cid::from_bytes(b"child-0"),
+            Cid::from_bytes(b"child-1"),
+            Cid::from_bytes(b"child-2"),
+        ];
+        let mut node = Node::new_internal(1);
+        node.keys = vec![b"a".to_vec(), b"d".to_vec(), b"g".to_vec()];
+        node.vals = child_cids.iter().map(|cid| cid.0.to_vec()).collect();
+        let keys = vec![b"a".to_vec(), b"d".to_vec(), b"g".to_vec()];
+        let positions = InlinePositions::from_vec(vec![0, 1, 2]).unwrap();
+
+        let frames = route_key_positions_to_children(&node, positions, &keys).unwrap();
+
+        assert_eq!(frames.len(), 3);
+        for (idx, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.cid, child_cids[idx]);
+            assert_eq!(frame.positions.first, idx);
+            assert_eq!(frame.positions.rest.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn lookup_child_index_uses_separator_floor() {
+        let mut node = Node::new_internal(1);
+        node.keys = vec![b"a".to_vec(), b"d".to_vec(), b"g".to_vec()];
+
+        assert_eq!(child_index_for_lookup_key(&node, b"0"), 0);
+        assert_eq!(child_index_for_lookup_key(&node, b"a"), 0);
+        assert_eq!(child_index_for_lookup_key(&node, b"c"), 0);
+        assert_eq!(child_index_for_lookup_key(&node, b"d"), 1);
+        assert_eq!(child_index_for_lookup_key(&node, b"f"), 1);
+        assert_eq!(child_index_for_lookup_key(&node, b"g"), 2);
+        assert_eq!(child_index_for_lookup_key(&node, b"z"), 2);
+    }
+
+    #[test]
+    fn get_many_child_routing_starts_at_first_target_child() {
+        let child_cids = [
+            Cid::from_bytes(b"child-0"),
+            Cid::from_bytes(b"child-1"),
+            Cid::from_bytes(b"child-2"),
+            Cid::from_bytes(b"child-3"),
+        ];
+        let mut node = Node::new_internal(1);
+        node.keys = vec![b"a".to_vec(), b"d".to_vec(), b"g".to_vec(), b"m".to_vec()];
+        node.vals = child_cids.iter().map(|cid| cid.0.to_vec()).collect();
+        let keys = vec![b"h".to_vec(), b"z".to_vec()];
+        let positions = InlinePositions::from_vec(vec![0, 1]).unwrap();
+
+        let frames = route_key_positions_to_children(&node, positions, &keys).unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].cid, child_cids[2]);
+        assert_eq!(frames[0].positions.first, 0);
+        assert_eq!(frames[1].cid, child_cids[3]);
+        assert_eq!(frames[1].positions.first, 1);
+    }
+
+    #[test]
+    fn get_many_boundary_routing_skips_empty_children_and_routes_separator_keys_right() {
+        let child_cids = [
+            Cid::from_bytes(b"child-0"),
+            Cid::from_bytes(b"child-1"),
+            Cid::from_bytes(b"child-2"),
+            Cid::from_bytes(b"child-3"),
+            Cid::from_bytes(b"child-4"),
+            Cid::from_bytes(b"child-5"),
+        ];
+        let mut node = Node::new_internal(1);
+        node.keys = [0, 10, 20, 30, 40, 50]
+            .into_iter()
+            .map(|idx| format!("k{idx:03}").into_bytes())
+            .collect();
+        node.vals = child_cids.iter().map(|cid| cid.0.to_vec()).collect();
+        let lookup_keys = [0, 1, 2, 10, 11, 49, 50, 51]
+            .into_iter()
+            .map(|idx| format!("k{idx:03}").into_bytes())
+            .collect::<Vec<_>>();
+        let positions = InlinePositions::from_vec((0..lookup_keys.len()).collect()).unwrap();
+
+        let frames =
+            route_key_positions_to_children_by_boundary(&node, positions, &lookup_keys).unwrap();
+        let routed = frames
+            .into_iter()
+            .map(|frame| (frame.cid, frame.positions.into_iter().collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routed,
+            vec![
+                (child_cids[0].clone(), vec![0, 1, 2]),
+                (child_cids[1].clone(), vec![3, 4]),
+                (child_cids[4].clone(), vec![5]),
+                (child_cids[5].clone(), vec![6, 7]),
+            ]
+        );
+    }
+
+    #[test]
+    fn large_get_many_child_routing_keeps_clustered_positions_together() {
+        let child_cids = (0..10)
+            .map(|idx| Cid::from_bytes(format!("child-{idx}").as_bytes()))
+            .collect::<Vec<_>>();
+        let mut node = Node::new_internal(1);
+        node.keys = (0..10)
+            .map(|idx| format!("k{:03}", idx * 100).into_bytes())
+            .collect();
+        node.vals = child_cids.iter().map(|cid| cid.0.to_vec()).collect();
+        let lookup_keys = (500..580)
+            .map(|idx| format!("k{idx:03}").into_bytes())
+            .collect::<Vec<_>>();
+        let positions = InlinePositions::from_vec((0..lookup_keys.len()).collect()).unwrap();
+
+        let frames = route_key_positions_to_children(&node, positions, &lookup_keys).unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].cid, child_cids[5]);
+        assert_eq!(frames[0].positions.len(), lookup_keys.len());
+        assert_eq!(frames[0].positions.first, 0);
+        assert_eq!(
+            frames[0].positions.rest.last(),
+            Some(&(lookup_keys.len() - 1))
+        );
+    }
+
+    #[test]
+    fn get_many_preserves_input_order_duplicates_and_missing_keys() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let tree = prolly.create();
+        let tree = prolly.put(&tree, b"a".to_vec(), b"1".to_vec()).unwrap();
+        let tree = prolly.put(&tree, b"b".to_vec(), b"2".to_vec()).unwrap();
+        let tree = prolly.put(&tree, b"c".to_vec(), b"3".to_vec()).unwrap();
+        let keys = vec![
+            b"c".to_vec(),
+            b"missing".to_vec(),
+            b"a".to_vec(),
+            b"c".to_vec(),
+        ];
+
+        let values = prolly.get_many(&tree, &keys).unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                Some(b"3".to_vec()),
+                None,
+                Some(b"1".to_vec()),
+                Some(b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn clustered_get_many_uses_point_reads_for_singleton_frontiers_without_batched_read_preference()
+    {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = builder::BatchBuilder::new(store.clone(), config.clone());
+        for idx in 0..128 {
+            builder.add(
+                format!("k{idx:03}").into_bytes(),
+                format!("v{idx:03}").into_bytes(),
+            );
+        }
+        let tree = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        prolly.clear_cache();
+        let batch_gets_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+
+        let values = prolly
+            .get_many(
+                &tree,
+                &[b"k001".to_vec(), b"k002".to_vec(), b"k003".to_vec()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                Some(b"v001".to_vec()),
+                Some(b"v002".to_vec()),
+                Some(b"v003".to_vec())
+            ]
+        );
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            batch_gets_before,
+            "clustered get_many should avoid one-key ordered batch reads at each level"
+        );
+        assert!(
+            store.get_calls.load(Ordering::Relaxed) > 0,
+            "clustered get_many should still hydrate the singleton path"
+        );
+    }
+
+    #[test]
+    fn get_many_rejects_leaf_with_mismatched_values() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let mut leaf = prolly.new_leaf_node();
+        leaf.keys.push(b"a".to_vec());
+        let tree = Tree {
+            root: Some(prolly.save(&leaf).unwrap()),
+            config: Config::default(),
+        };
+
+        let err = prolly.get_many(&tree, &[b"a".to_vec()]).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn get_rejects_leaf_with_mismatched_values() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let mut leaf = prolly.new_leaf_node();
+        leaf.keys.push(b"a".to_vec());
+        let tree = Tree {
+            root: Some(prolly.save(&leaf).unwrap()),
+            config: Config::default(),
+        };
+
+        let err = match prolly.get(&tree, b"a") {
+            Ok(_) => panic!("malformed leaf should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn get_and_find_path_reject_internal_node_with_missing_child_cid() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let mut root = Node::new_internal(1);
+        root.keys.push(b"a".to_vec());
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        let get_err = match prolly.get(&tree, b"a") {
+            Ok(_) => panic!("malformed internal node should be rejected by get"),
+            Err(err) => err,
+        };
+        let path_err = match prolly.find_path(&tree, b"a") {
+            Ok(_) => panic!("malformed internal node should be rejected by find_path"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(get_err, Error::InvalidNode));
+        assert!(matches!(path_err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn get_many_rejects_internal_node_with_missing_child_cid() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let mut root = Node::new_internal(1);
+        root.keys.push(b"a".to_vec());
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        let err = prolly.get_many(&tree, &[b"a".to_vec()]).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn get_many_splits_wide_frontiers_for_batched_read_stores() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let key_for = |idx: usize| format!("k{idx:04}").into_bytes();
+
+        let mut builder = builder::BatchBuilder::new(store.clone(), config.clone());
+        for idx in 0..4096 {
+            builder.add(key_for(idx), format!("v{idx:04}").into_bytes());
+        }
+        let tree = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let indices = (0..4096).step_by(8).rev().collect::<Vec<_>>();
+        let keys = indices.iter().map(|idx| key_for(*idx)).collect::<Vec<_>>();
+
+        prolly.clear_cache();
+        let calls_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+        let values = prolly.get_many(&tree, &keys).unwrap();
+
+        assert_eq!(values.len(), keys.len());
+        for (idx, value) in values.into_iter().enumerate() {
+            assert_eq!(value, Some(format!("v{:04}", indices[idx]).into_bytes()));
+        }
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed)
+                > calls_before + GET_MANY_PREFETCH_PARALLELISM,
+            "wide get_many should split frontier reads into parallel ordered batches"
+        );
+        assert!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed) <= 64,
+            "bounded parallel get_many should avoid one huge ordered batch for hundreds of misses"
         );
     }
 
@@ -1766,6 +2918,36 @@ mod tests {
     }
 
     #[test]
+    fn range_empty_half_open_bounds_skip_tree_seek() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let tree = prolly
+            .put(&prolly.create(), b"k001".to_vec(), b"v001".to_vec())
+            .unwrap();
+        prolly.clear_cache();
+        let get_calls_before = store.get_calls.load(Ordering::Relaxed);
+        let batch_get_calls_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+
+        let results = prolly
+            .range(&tree, b"k010", Some(b"k001"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            get_calls_before,
+            "empty half-open ranges should not seek into the tree"
+        );
+        assert_eq!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed),
+            batch_get_calls_before,
+            "empty half-open ranges should not batch-load nodes"
+        );
+    }
+
+    #[test]
     fn test_range_single_element() {
         let store = MemStore::new();
         let prolly = Prolly::new(store, Config::default());
@@ -1849,6 +3031,292 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], (b"a".to_vec(), b"1".to_vec()));
         assert_eq!(results[1], (b"b".to_vec(), b"2".to_vec()));
+    }
+
+    #[test]
+    fn range_rejects_leaf_with_mismatched_values() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let mut leaf = prolly.new_leaf_node();
+        leaf.keys.push(b"a".to_vec());
+        let tree = Tree {
+            root: Some(prolly.save(&leaf).unwrap()),
+            config: Config::default(),
+        };
+
+        let err = prolly.range(&tree, &[], None).unwrap().next().unwrap();
+
+        assert!(matches!(err, Err(Error::InvalidNode)));
+    }
+
+    #[test]
+    fn range_rejects_internal_node_with_missing_next_child_cid() {
+        let store = MemStore::new();
+        let prolly = Prolly::new(store, Config::default());
+        let mut first_leaf = prolly.new_leaf_node();
+        first_leaf.keys.push(b"a".to_vec());
+        first_leaf.vals.push(b"1".to_vec());
+        let first_cid = prolly.save(&first_leaf).unwrap();
+
+        let mut root = prolly.new_internal_node(1);
+        root.keys = vec![b"a".to_vec(), b"m".to_vec()];
+        root.vals = vec![first_cid.0.to_vec()];
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        let mut iter = prolly.range(&tree, &[], None).unwrap();
+        assert_eq!(
+            iter.next().unwrap().unwrap(),
+            (b"a".to_vec(), b"1".to_vec())
+        );
+        let err = iter.next().unwrap();
+
+        assert!(matches!(err, Err(Error::InvalidNode)));
+    }
+
+    #[test]
+    fn range_end_bound_skips_loading_next_child_subtree() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+
+        let mut first = prolly.new_leaf_node();
+        first.keys = vec![b"a".to_vec(), b"b".to_vec()];
+        first.vals = vec![b"1".to_vec(), b"2".to_vec()];
+        let first_cid = prolly.save(&first).unwrap();
+
+        let mut second = prolly.new_leaf_node();
+        second.keys = vec![b"c".to_vec(), b"d".to_vec()];
+        second.vals = vec![b"3".to_vec(), b"4".to_vec()];
+        let second_cid = prolly.save(&second).unwrap();
+
+        let mut third = prolly.new_leaf_node();
+        third.keys = vec![b"e".to_vec(), b"f".to_vec()];
+        third.vals = vec![b"5".to_vec(), b"6".to_vec()];
+        let third_cid = prolly.save(&third).unwrap();
+
+        let mut root = prolly.new_internal_node(1);
+        root.keys = vec![b"a".to_vec(), b"c".to_vec(), b"e".to_vec()];
+        root.vals = vec![
+            first_cid.0.to_vec(),
+            second_cid.0.to_vec(),
+            third_cid.0.to_vec(),
+        ];
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        prolly.clear_cache();
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+        let results = prolly
+            .range(&tree, &[], Some(b"e"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            results,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+            ]
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed) - gets_before,
+            3,
+            "bounded range should load root and in-range leaves, not the first leaf at the exclusive end"
+        );
+    }
+
+    #[test]
+    fn range_batches_in_range_sibling_hydration_for_batched_read_stores() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let prolly = Prolly::new(store.clone(), Config::default());
+
+        let mut child_cids = Vec::new();
+        let mut expected = Vec::new();
+        for leaf_idx in 0..5 {
+            let mut leaf = prolly.new_leaf_node();
+            for entry_idx in 0..2 {
+                let idx = leaf_idx * 2 + entry_idx;
+                leaf.keys.push(format!("k{idx:02}").into_bytes());
+                leaf.vals.push(format!("v{idx:02}").into_bytes());
+                if idx < 6 {
+                    expected.push((
+                        format!("k{idx:02}").into_bytes(),
+                        format!("v{idx:02}").into_bytes(),
+                    ));
+                }
+            }
+            child_cids.push(prolly.save(&leaf).unwrap());
+        }
+
+        let mut root = prolly.new_internal_node(1);
+        root.keys = (0..5)
+            .map(|leaf_idx| format!("k{:02}", leaf_idx * 2).into_bytes())
+            .collect();
+        root.vals = child_cids.iter().map(|cid| cid.0.to_vec()).collect();
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        prolly.clear_cache();
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+        let ordered_gets_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+        let results = prolly
+            .range(&tree, &[], Some(b"k06"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(results, expected);
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > ordered_gets_before,
+            "batched-read range scans should hydrate upcoming in-range siblings together"
+        );
+        assert_eq!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed),
+            2,
+            "prefetch should include the two remaining in-range leaves but stop before the exclusive end"
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed) - gets_before,
+            2,
+            "range should only point-read the root and initial seek leaf"
+        );
+        assert_eq!(
+            prolly.cache_len(),
+            4,
+            "cache should contain root plus the three in-range leaves, not the leaf at the exclusive end"
+        );
+    }
+
+    #[test]
+    fn range_reuses_cached_nodes_on_repeated_scan() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+
+        let mut first = prolly.new_leaf_node();
+        first.keys = vec![b"a".to_vec(), b"b".to_vec()];
+        first.vals = vec![b"1".to_vec(), b"2".to_vec()];
+        let first_cid = prolly.save(&first).unwrap();
+
+        let mut second = prolly.new_leaf_node();
+        second.keys = vec![b"c".to_vec(), b"d".to_vec()];
+        second.vals = vec![b"3".to_vec(), b"4".to_vec()];
+        let second_cid = prolly.save(&second).unwrap();
+
+        let mut root = prolly.new_internal_node(1);
+        root.keys = vec![b"a".to_vec(), b"c".to_vec()];
+        root.vals = vec![first_cid.0.to_vec(), second_cid.0.to_vec()];
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        prolly.clear_cache();
+        let first_results = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let gets_after_first = store.get_calls.load(Ordering::Relaxed);
+        let second_results = prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(first_results, second_results);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            gets_after_first,
+            "second range scan should reuse cached Arc<Node> path and child leaves"
+        );
+    }
+
+    #[test]
+    fn range_cursor_end_bound_skips_loading_next_child_subtree() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+
+        let mut first = prolly.new_leaf_node();
+        first.keys = vec![b"a".to_vec(), b"b".to_vec()];
+        first.vals = vec![b"1".to_vec(), b"2".to_vec()];
+        let first_cid = prolly.save(&first).unwrap();
+
+        let mut second = prolly.new_leaf_node();
+        second.keys = vec![b"c".to_vec(), b"d".to_vec()];
+        second.vals = vec![b"3".to_vec(), b"4".to_vec()];
+        let second_cid = prolly.save(&second).unwrap();
+
+        let mut third = prolly.new_leaf_node();
+        third.keys = vec![b"e".to_vec(), b"f".to_vec()];
+        third.vals = vec![b"5".to_vec(), b"6".to_vec()];
+        let third_cid = prolly.save(&third).unwrap();
+
+        let mut root = prolly.new_internal_node(1);
+        root.keys = vec![b"a".to_vec(), b"c".to_vec(), b"e".to_vec()];
+        root.vals = vec![
+            first_cid.0.to_vec(),
+            second_cid.0.to_vec(),
+            third_cid.0.to_vec(),
+        ];
+        let tree = Tree {
+            root: Some(prolly.save(&root).unwrap()),
+            config: Config::default(),
+        };
+
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+        let results = prolly
+            .range_cursor(&tree, &[], Some(b"e"))
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+            ]
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed) - gets_before,
+            3,
+            "bounded cursor range should load root and in-range leaves, not the first leaf at the exclusive end"
+        );
+    }
+
+    #[test]
+    fn range_cursor_empty_half_open_bounds_skip_tree_seek() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let tree = prolly
+            .put(&prolly.create(), b"k001".to_vec(), b"v001".to_vec())
+            .unwrap();
+        let get_calls_before = store.get_calls.load(Ordering::Relaxed);
+
+        let results = prolly
+            .range_cursor(&tree, b"k010", Some(b"k001"))
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert!(results.is_empty());
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            get_calls_before,
+            "empty cursor ranges should not load the root node"
+        );
     }
 
     #[test]

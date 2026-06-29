@@ -46,6 +46,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastRecoveryBannerPropsJson = new Map<string, string>()
 
 export function RecoveryBanner({ props }: { props: RecoveryBannerProps }) {
   const destructive = props.kind === "failure"
@@ -143,6 +144,11 @@ export function mountRecoveryBanners(options: MountRecoveryBannersOptions): void
       return
     }
     activeIds.add(id)
+    const propsJson = JSON.stringify(props)
+    if (lastRecoveryBannerPropsJson.get(id) === propsJson) {
+      return
+    }
+    lastRecoveryBannerPropsJson.set(id, propsJson)
     let mounted = mountedRoots.get(id)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -159,6 +165,7 @@ export function mountRecoveryBanners(options: MountRecoveryBannersOptions): void
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastRecoveryBannerPropsJson.delete(id)
     }
   })
 }

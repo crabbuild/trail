@@ -165,6 +165,7 @@ where
             .par_iter()
             .map(|range| {
                 let mut node = new_builder_node(config, true, INIT_LEVEL);
+                reserve_node_entries(&mut node, *range.end() - *range.start() + 1);
 
                 for i in range.clone() {
                     node.keys.push(entries[i].0.clone());
@@ -267,29 +268,31 @@ where
             .collect();
         let chunk_ranges = chunk_ranges_from_hash_boundaries(&self.config, &hash_boundaries);
 
-        // Build internal nodes
-        let mut nodes = Vec::new();
+        let config = &self.config;
+        let nodes: Vec<BuiltNode> = chunk_ranges
+            .par_iter()
+            .map(|range| {
+                let start = *range.start();
+                let end = *range.end();
 
-        for range in chunk_ranges {
-            let start = *range.start();
-            let end = *range.end();
+                let mut node = new_builder_node(config, false, level);
+                reserve_node_entries(&mut node, end - start + 1);
 
-            let mut node = new_builder_node(&self.config, false, level);
+                for child in children.iter().take(end + 1).skip(start) {
+                    node.keys.push(child.first_key.clone());
+                    node.vals.push(child.cid.0.to_vec());
+                }
 
-            for child in children.iter().take(end + 1).skip(start) {
-                node.keys.push(child.first_key.clone());
-                node.vals.push(child.cid.0.to_vec());
-            }
-
-            let first_key = node.keys.first().cloned().unwrap_or_default();
-            let bytes = node.to_bytes();
-            let cid = Cid::from_bytes(&bytes);
-            nodes.push(BuiltNode {
-                cid,
-                first_key,
-                bytes,
-            });
-        }
+                let first_key = node.keys.first().cloned().unwrap_or_default();
+                let bytes = node.to_bytes();
+                let cid = Cid::from_bytes(&bytes);
+                BuiltNode {
+                    cid,
+                    first_key,
+                    bytes,
+                }
+            })
+            .collect();
 
         self.persist_nodes(&nodes)?;
         Ok(nodes
@@ -405,6 +408,11 @@ fn new_builder_node(config: &Config, leaf: bool, level: u8) -> Node {
         .hash_seed(config.hash_seed)
         .encoding(config.encoding.clone())
         .build()
+}
+
+fn reserve_node_entries(node: &mut Node, additional: usize) {
+    node.keys.reserve_exact(additional);
+    node.vals.reserve_exact(additional);
 }
 
 fn persist_nodes<S: Store>(store: &S, nodes: &[BuiltNode]) -> Result<(), Error>
@@ -617,6 +625,56 @@ mod tests {
         assert_eq!(leaf_lengths, vec![4; 16]);
         assert_eq!(level_one_lengths, vec![4; 4]);
         assert_eq!(root_length, Some(4));
+    }
+
+    #[test]
+    fn builder_node_entry_reservation_preserves_node_shape() {
+        let config = Config::default();
+        let mut node = new_builder_node(&config, true, INIT_LEVEL);
+
+        reserve_node_entries(&mut node, 17);
+
+        assert!(node.keys.capacity() >= 17);
+        assert!(node.vals.capacity() >= 17);
+        assert!(node.keys.is_empty());
+        assert!(node.vals.is_empty());
+        assert!(node.leaf);
+        assert_eq!(node.level, INIT_LEVEL);
+    }
+
+    #[test]
+    fn batch_builder_parallel_internal_level_preserves_child_order() {
+        let store = CountingStore::default();
+        let config = Config::builder()
+            .min_chunk_size(4)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let builder = BatchBuilder::new(store.clone(), config);
+        let children = (0..16)
+            .map(|idx| NodeSummary {
+                cid: Cid::from_bytes(format!("child-{idx:03}").as_bytes()),
+                first_key: format!("k{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        let level = builder.build_level(children, 1).unwrap();
+
+        assert_eq!(level.len(), 4);
+        let inner = store.inner.lock().unwrap();
+        for (group_idx, summary) in level.iter().enumerate() {
+            assert_eq!(
+                summary.first_key,
+                format!("k{:03}", group_idx * 4).into_bytes()
+            );
+            let bytes = inner.data.get(summary.cid.as_bytes()).unwrap();
+            let node = Node::from_bytes(bytes).unwrap();
+            let expected_keys = (group_idx * 4..group_idx * 4 + 4)
+                .map(|idx| format!("k{idx:03}").into_bytes())
+                .collect::<Vec<_>>();
+            assert_eq!(node.keys, expected_keys);
+            assert_eq!(node.vals.len(), 4);
+        }
     }
 
     #[test]

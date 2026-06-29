@@ -194,9 +194,8 @@
 //! let prolly = Prolly::new(store, Config::default());
 //! let tree = prolly.create();
 //!
-//! // Configure for in-memory store (disable prefetch)
+//! // Configure the merge strategy
 //! let config = BatchWriterConfig::new()
-//!     .with_prefetch(false)
 //!     .with_optimized_merge(true);
 //!
 //! let writer = BatchWriter::with_config(config);
@@ -212,9 +211,9 @@
 //!
 //! | Option | Default | Description |
 //! |--------|---------|-------------|
-//! | `enable_prefetch` | `true` | Prefetch affected leaves before processing |
+//! | `enable_prefetch` | `true` | Legacy compatibility flag; current route planning hydrates affected leaves directly |
 //! | `use_optimized_merge` | `true` | Use O(n+m) two-pointer merge |
-//! | `prefetch_parallelism` | `16` | Max concurrent prefetch operations |
+//! | `prefetch_parallelism` | `16` | Max ordered route-hydration batch width |
 //!
 //! ### Recommended Configurations
 //!
@@ -222,15 +221,14 @@
 //! ```rust
 //! # use prolly::BatchWriterConfig;
 //! let config = BatchWriterConfig::new()
-//!     .with_prefetch(false);  // No benefit for in-memory
+//!     .with_optimized_merge(true);
 //! ```
 //!
 //! **Network store with high latency:**
 //! ```rust
 //! # use prolly::BatchWriterConfig;
 //! let config = BatchWriterConfig::new()
-//!     .with_prefetch(true)
-//!     .with_prefetch_parallelism(32);  // More parallelism for high latency
+//!     .with_prefetch_parallelism(32);  // Wider route-hydration batches for high latency
 //! ```
 //!
 //! **Debugging/comparison:**
@@ -240,8 +238,10 @@
 //!     .with_optimized_merge(false);  // Use binary search for comparison
 //! ```
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use super::boundary::is_boundary;
@@ -255,6 +255,14 @@ use super::tree::Tree;
 
 use super::rebalance;
 use super::{CachedRightmostPathEntry, Prolly};
+
+const PARALLEL_COLLECTOR_ADD_THRESHOLD: usize = 16;
+const PARALLEL_LEAF_APPLY_THRESHOLD: usize = 16;
+const SPARSE_LEAF_APPLY_MAX_MUTATIONS: usize = 8;
+const SPARSE_LEAF_APPLY_MIN_LEAF_TO_MUTATION_RATIO: usize = 8;
+const EXISTING_KEY_LINEAR_SCAN_MIN_MUTATIONS: usize = 16;
+const EXISTING_KEY_LINEAR_SCAN_MIN_DENSITY_DIVISOR: usize = 4;
+const EXACT_ROUTE_BUCKET_MIN_MUTATIONS: usize = 32;
 
 /// Leaf span affected by mutations.
 ///
@@ -302,8 +310,8 @@ pub struct LeafSpan {
 /// collector.flush(&store)?;
 /// ```
 pub struct BatchWriteCollector {
-    /// Nodes to write: (cid_bytes, node_bytes)
-    nodes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Nodes to write: (cid, node_bytes)
+    nodes: Vec<(Cid, Vec<u8>)>,
     seen_cids: HashSet<Cid>,
     cache_nodes: Option<Vec<(Cid, Node)>>,
 }
@@ -323,9 +331,9 @@ impl BatchWriteCollector {
 
     /// Create a collector that also retains node clones for cheap cache warming.
     ///
-    /// This is intended for small hot paths such as single-key `put`, where the
-    /// caller will cache rewritten nodes after the atomic flush. Larger batch
-    /// writers should use `new` to avoid holding duplicate node payloads.
+    /// Use this when the caller will cache rewritten nodes after the atomic
+    /// flush. It avoids decoding freshly written bytes during cache warming at
+    /// the cost of retaining node payloads until the flush completes.
     pub(crate) fn new_cached() -> Self {
         Self {
             nodes: Vec::new(),
@@ -354,8 +362,42 @@ impl BatchWriteCollector {
         if let Some(cache_nodes) = &mut self.cache_nodes {
             cache_nodes.push((cid.clone(), node.clone()));
         }
-        self.nodes.push((cid.0.to_vec(), bytes));
+        self.nodes.push((cid.clone(), bytes));
         cid
+    }
+
+    pub(crate) fn add_many(&mut self, nodes: Vec<Node>) -> Vec<Cid> {
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+
+        if nodes.len() < PARALLEL_COLLECTOR_ADD_THRESHOLD {
+            return nodes.iter().map(|node| self.add(node)).collect();
+        }
+
+        let retain_nodes = self.cache_nodes.is_some();
+        let encoded = nodes
+            .into_par_iter()
+            .map(|node| {
+                let bytes = node.to_bytes();
+                let cid = Cid::from_bytes(&bytes);
+                let node = retain_nodes.then_some(node);
+                (cid, bytes, node)
+            })
+            .collect::<Vec<_>>();
+
+        let mut cids = Vec::with_capacity(encoded.len());
+        for (cid, bytes, node) in encoded {
+            cids.push(cid.clone());
+            if self.seen_cids.insert(cid.clone()) {
+                if let (Some(cache_nodes), Some(node)) = (&mut self.cache_nodes, node) {
+                    cache_nodes.push((cid.clone(), node));
+                }
+                self.nodes.push((cid.clone(), bytes));
+            }
+        }
+
+        cids
     }
 
     /// Write all collected nodes to the store atomically.
@@ -378,7 +420,7 @@ impl BatchWriteCollector {
         let entries: Vec<(&[u8], &[u8])> = self
             .nodes
             .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .map(|(cid, v)| (cid.as_bytes(), v.as_slice()))
             .collect();
 
         store
@@ -396,7 +438,7 @@ impl BatchWriteCollector {
         let entries: Vec<(&[u8], &[u8])> = self
             .nodes
             .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .map(|(cid, v)| (cid.as_bytes(), v.as_slice()))
             .collect();
 
         store
@@ -412,13 +454,9 @@ impl BatchWriteCollector {
             return Ok(());
         }
 
-        for (cid_bytes, node_bytes) in &self.nodes {
-            let cid = Cid(cid_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::InvalidNode)?);
+        for (cid, node_bytes) in &self.nodes {
             let node = Node::from_bytes(node_bytes)?;
-            prolly.cache_node(cid, node);
+            prolly.cache_node(cid.clone(), node);
         }
 
         Ok(())
@@ -432,6 +470,11 @@ impl BatchWriteCollector {
         self.nodes.len()
     }
 
+    /// Get the total serialized bytes collected for writing.
+    pub fn bytes_len(&self) -> usize {
+        self.nodes.iter().map(|(_, bytes)| bytes.len()).sum()
+    }
+
     /// Check if the collector is empty.
     ///
     /// # Returns
@@ -443,10 +486,72 @@ impl BatchWriteCollector {
     /// Get an iterator over the collected nodes.
     ///
     /// # Returns
-    /// An iterator yielding `(&Vec<u8>, &Vec<u8>)` pairs of (cid_bytes, node_bytes).
-    pub fn nodes_iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Vec<u8>)> {
-        self.nodes.iter().map(|(cid, bytes)| (cid, bytes))
+    /// An iterator yielding `(cid_bytes, node_bytes)` pairs.
+    pub fn nodes_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.nodes
+            .iter()
+            .map(|(cid, bytes)| (cid.as_bytes(), bytes.as_slice()))
     }
+}
+
+/// Store-neutral execution stats for a batch mutation.
+///
+/// These counters describe tree work and write amplification before any
+/// storage-engine-specific buffering, compaction, or object layout effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchApplyStats {
+    /// Number of mutations supplied by the caller before preprocessing.
+    pub input_mutations: usize,
+    /// Number of mutations left after sort/deduplication preprocessing.
+    pub effective_mutations: usize,
+    /// Whether the input mutation keys were already sorted before preprocessing.
+    pub preprocess_input_sorted: bool,
+    /// Number of distinct leaf groups planned for this batch.
+    pub affected_leaves: usize,
+    /// Number of affected leaves whose contents actually changed.
+    pub changed_leaves: usize,
+    /// Number of leaf groups applied with sparse binary-search mutation.
+    pub sparse_leaf_applies: usize,
+    /// Unique content-addressed nodes written by the batch collector.
+    pub written_nodes: usize,
+    /// Total serialized bytes for unique nodes written by the batch collector.
+    pub written_bytes: usize,
+    /// Whether the append-only right-edge fast path completed the batch.
+    pub used_append_fast_path: bool,
+    /// Whether planning used the batched read routing path.
+    pub used_batched_route: bool,
+    /// Whether the multi-leaf coalesced rebuild path was used.
+    pub used_coalesced_rebuild: bool,
+    /// Whether the deferred single-leaf/group rebalance path was used.
+    pub used_deferred_rebalancing: bool,
+    /// Whether the configured bottom-up rebuild path was used.
+    pub used_bottom_up_rebuild: bool,
+    /// Whether newly written nodes were retained in the in-process node cache.
+    pub cache_written_nodes: bool,
+}
+
+impl BatchApplyStats {
+    fn new(input_mutations: usize, cache_written_nodes: bool) -> Self {
+        Self {
+            input_mutations,
+            cache_written_nodes,
+            ..Self::default()
+        }
+    }
+
+    fn record_collector(&mut self, collector: &BatchWriteCollector) {
+        self.written_nodes = collector.len();
+        self.written_bytes = collector.bytes_len();
+    }
+}
+
+/// Result of applying a batch with execution stats.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchApplyResult {
+    /// New immutable tree root/configuration after the batch.
+    pub tree: Tree,
+    /// Store-neutral counters describing the batch execution.
+    pub stats: BatchApplyStats,
 }
 
 impl Default for BatchWriteCollector {
@@ -809,19 +914,71 @@ struct LeafMutationGroupWithPath {
     ancestors: Vec<(Node, usize)>,
     ancestor_cids: Vec<Cid>,
     route_path: Option<Arc<MutationRoutePath>>,
-    mutations: Vec<Mutation>,
+    mutations: GroupedMutations,
 }
+
+#[derive(Clone)]
+enum GroupedMutations {
+    Owned(Vec<Mutation>),
+    Shared {
+        mutations: Arc<Vec<Mutation>>,
+        range: Range<usize>,
+    },
+}
+
+impl GroupedMutations {
+    fn shared(mutations: Arc<Vec<Mutation>>, range: Range<usize>) -> Self {
+        Self::Shared { mutations, range }
+    }
+
+    fn as_slice(&self) -> &[Mutation] {
+        match self {
+            Self::Owned(mutations) => mutations,
+            Self::Shared { mutations, range } => &mutations[range.clone()],
+        }
+    }
+
+    fn into_owned(self) -> Vec<Mutation> {
+        match self {
+            Self::Owned(mutations) => mutations,
+            Self::Shared { mutations, range } => mutations[range].to_vec(),
+        }
+    }
+}
+
+impl From<Vec<Mutation>> for GroupedMutations {
+    fn from(mutations: Vec<Mutation>) -> Self {
+        Self::Owned(mutations)
+    }
+}
+
+struct PreparedLeafMutationGroup {
+    modified_leaf: Node,
+    ancestors: Vec<(Node, usize)>,
+    ancestor_cids: Vec<Cid>,
+    route_path: Option<Arc<MutationRoutePath>>,
+    leaf_changed: bool,
+    used_sparse_leaf_apply: bool,
+}
+
+struct CoalescedApplyResult {
+    root: Option<Cid>,
+    changed_leaves: usize,
+    sparse_leaf_applies: usize,
+}
+
+type ChildReplacements = Vec<(usize, Vec<ChildRef>)>;
 
 struct MutationRouteFrame {
     cid: Cid,
     path: Option<Arc<MutationRoutePath>>,
-    mutations: Vec<Mutation>,
-    mutations_sorted: bool,
+    mutations: Arc<Vec<Mutation>>,
+    range: Range<usize>,
 }
 
 struct MutationRoutePath {
     parent: Option<Arc<MutationRoutePath>>,
-    node: Node,
+    node: Arc<Node>,
     cid: Cid,
     child_index: usize,
     depth: usize,
@@ -837,7 +994,7 @@ impl From<LeafMutationGroupWithPath> for LeafMutationGroup {
         Self {
             leaf: group.leaf,
             ancestors,
-            mutations: group.mutations,
+            mutations: group.mutations.into_owned(),
         }
     }
 }
@@ -847,6 +1004,40 @@ struct ChildRef {
     cid: Cid,
     first_key: Vec<u8>,
     level: u8,
+}
+
+fn child_refs_from_nodes(nodes: Vec<Node>, collector: &mut BatchWriteCollector) -> Vec<ChildRef> {
+    let metadata = nodes
+        .iter()
+        .map(|node| (node.keys.first().cloned().unwrap_or_default(), node.level))
+        .collect::<Vec<_>>();
+    let cids = collector.add_many(nodes);
+
+    cids.into_iter()
+        .zip(metadata)
+        .map(|(cid, (first_key, level))| ChildRef {
+            cid,
+            first_key,
+            level,
+        })
+        .collect()
+}
+
+fn node_cids_with_first_keys(
+    nodes: Vec<Node>,
+    collector: &mut BatchWriteCollector,
+) -> Vec<(Cid, Vec<u8>)> {
+    let first_keys = nodes
+        .iter()
+        .map(|node| node.keys.first().cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let cids = collector.add_many(nodes);
+    cids.into_iter().zip(first_keys).collect()
+}
+
+fn reserve_node_entries(node: &mut Node, additional: usize) {
+    node.keys.reserve_exact(additional);
+    node.vals.reserve_exact(additional);
 }
 
 #[derive(Clone)]
@@ -1132,7 +1323,8 @@ pub fn build_internal_level<S: Store>(
     // Get max_chunk_size from a template internal node
     let max_chunk_size = prolly.new_internal_node(level).max_chunk_size;
 
-    let mut result = Vec::new();
+    let mut nodes = Vec::new();
+    let mut first_result_keys = Vec::new();
     let mut start = 0;
 
     while start < child_cids.len() {
@@ -1142,21 +1334,21 @@ pub fn build_internal_level<S: Store>(
 
         // Create internal node for this chunk
         let mut node = prolly.new_internal_node(level);
+        reserve_node_entries(&mut node, end - start);
 
         for i in start..end {
             node.keys.push(first_keys[i].clone());
             node.vals.push(child_cids[i].0.to_vec());
         }
 
-        // Add to collector and record result
-        let cid = collector.add(&node);
-        let first_key = node.keys.first().cloned().unwrap_or_default();
-        result.push((cid, first_key));
+        first_result_keys.push(node.keys.first().cloned().unwrap_or_default());
+        nodes.push(node);
 
         start = end;
     }
 
-    Ok(result)
+    let cids = collector.add_many(nodes);
+    Ok(cids.into_iter().zip(first_result_keys).collect())
 }
 
 /// Rebuilds the tree from modified leaves using bottom-up construction.
@@ -1321,17 +1513,43 @@ pub fn rebuild_from_modified_leaves<S: Store>(
 /// // The value for "b" is "3" (last-write-wins)
 /// ```
 pub fn preprocess_mutations(mutations: Vec<Mutation>) -> Vec<Mutation> {
-    if mutations.is_empty() {
-        return mutations;
+    preprocess_mutations_with_info(mutations).mutations
+}
+
+struct PreprocessedMutations {
+    mutations: Vec<Mutation>,
+    input_was_sorted: bool,
+}
+
+fn preprocess_mutations_with_info(mut mutations: Vec<Mutation>) -> PreprocessedMutations {
+    if mutations.len() < 2 {
+        return PreprocessedMutations {
+            mutations,
+            input_was_sorted: true,
+        };
     }
 
-    // Sort by key (lexicographic order)
-    let mut sorted = mutations;
-    sorted.sort_by(|a, b| a.key().cmp(b.key()));
+    let (input_was_sorted, mut has_duplicates) = inspect_sorted_mutations(&mutations);
 
-    // Deduplicate: keep last mutation for each key
-    let mut deduped: Vec<Mutation> = Vec::with_capacity(sorted.len());
-    for mutation in sorted {
+    if !input_was_sorted {
+        // Stable sort keeps duplicate keys in caller order, preserving
+        // last-write-wins semantics during the deduplication pass below.
+        mutations.sort_by(|a, b| a.key().cmp(b.key()));
+        has_duplicates = mutations
+            .windows(2)
+            .any(|pair| pair[0].key() == pair[1].key());
+    }
+
+    if !has_duplicates {
+        return PreprocessedMutations {
+            mutations,
+            input_was_sorted,
+        };
+    }
+
+    // Deduplicate: keep last mutation for each key.
+    let mut deduped: Vec<Mutation> = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
         if let Some(last) = deduped.last() {
             if last.key() == mutation.key() {
                 deduped.pop();
@@ -1340,7 +1558,23 @@ pub fn preprocess_mutations(mutations: Vec<Mutation>) -> Vec<Mutation> {
         deduped.push(mutation);
     }
 
-    deduped
+    PreprocessedMutations {
+        mutations: deduped,
+        input_was_sorted,
+    }
+}
+
+fn inspect_sorted_mutations(mutations: &[Mutation]) -> (bool, bool) {
+    let mut has_duplicates = false;
+    for pair in mutations.windows(2) {
+        match pair[0].key().cmp(pair[1].key()) {
+            std::cmp::Ordering::Greater => return (false, false),
+            std::cmp::Ordering::Equal => has_duplicates = true,
+            std::cmp::Ordering::Less => {}
+        }
+    }
+
+    (true, has_duplicates)
 }
 
 /// Apply mutations to a leaf node using binary search (O(m log n) approach).
@@ -1388,7 +1622,16 @@ pub fn preprocess_mutations(mutations: Vec<Mutation>) -> Vec<Mutation> {
 /// - Memory is extremely constrained (avoids pre-allocation)
 ///
 /// For typical batch operations, use `apply_mutations_to_leaf` instead.
-pub fn apply_mutations_to_leaf_binary_search(mut leaf: Node, mutations: &[Mutation]) -> Node {
+pub fn apply_mutations_to_leaf_binary_search(leaf: Node, mutations: &[Mutation]) -> Node {
+    apply_mutations_to_leaf_binary_search_with_change(leaf, mutations).0
+}
+
+fn apply_mutations_to_leaf_binary_search_with_change(
+    mut leaf: Node,
+    mutations: &[Mutation],
+) -> (Node, bool) {
+    let mut changed = false;
+
     for mutation in mutations {
         match mutation {
             Mutation::Upsert { key, val } => {
@@ -1397,12 +1640,14 @@ pub fn apply_mutations_to_leaf_binary_search(mut leaf: Node, mutations: &[Mutati
                         // Key exists - update value if different (idempotent if same)
                         if leaf.vals[i] != *val {
                             leaf.vals[i] = val.clone();
+                            changed = true;
                         }
                     }
                     Err(i) => {
                         // Key doesn't exist - insert in sorted order
                         leaf.keys.insert(i, key.clone());
                         leaf.vals.insert(i, val.clone());
+                        changed = true;
                     }
                 }
             }
@@ -1411,11 +1656,13 @@ pub fn apply_mutations_to_leaf_binary_search(mut leaf: Node, mutations: &[Mutati
                 if let Ok(i) = leaf.search(key) {
                     leaf.keys.remove(i);
                     leaf.vals.remove(i);
+                    changed = true;
                 }
             }
         }
     }
-    leaf
+
+    (leaf, changed)
 }
 
 /// Apply mutations to a leaf node using O(n+m) two-pointer merge algorithm.
@@ -1543,10 +1790,7 @@ fn apply_mutations_to_leaf_with_change(leaf: Node, mutations: &[Mutation]) -> (N
         return (new_leaf, changed);
     }
 
-    // Pre-allocate result vectors with appropriate capacity
-    let mut new_keys = Vec::with_capacity(leaf.keys.len() + mutations.len());
-    let mut new_vals = Vec::with_capacity(leaf.vals.len() + mutations.len());
-
+    let mut result: Option<LeafMergeBuffers> = None;
     let mut old_idx = 0;
     let mut mut_idx = 0;
     let mut changed = false;
@@ -1558,8 +1802,9 @@ fn apply_mutations_to_leaf_with_change(leaf: Node, mutations: &[Mutation]) -> (N
                 match old_key.as_slice().cmp(mutation.key()) {
                     Ordering::Less => {
                         // Old entry comes before mutation - keep old entry
-                        new_keys.push(old_key.clone());
-                        new_vals.push(leaf.vals[old_idx].clone());
+                        if let Some(result) = result.as_mut() {
+                            result.push_existing(&leaf, old_idx);
+                        }
                         old_idx += 1;
                     }
                     Ordering::Equal => {
@@ -1567,12 +1812,20 @@ fn apply_mutations_to_leaf_with_change(leaf: Node, mutations: &[Mutation]) -> (N
                         match mutation {
                             Mutation::Upsert { key, val } => {
                                 if leaf.vals[old_idx] != *val {
+                                    let result = leaf_merge_result(
+                                        &mut result,
+                                        &leaf,
+                                        old_idx,
+                                        mutations.len(),
+                                    );
+                                    result.push_upsert(key, val);
                                     changed = true;
+                                } else if let Some(result) = result.as_mut() {
+                                    result.push_existing(&leaf, old_idx);
                                 }
-                                new_keys.push(key.clone());
-                                new_vals.push(val.clone());
                             }
                             Mutation::Delete { .. } => {
+                                leaf_merge_result(&mut result, &leaf, old_idx, mutations.len());
                                 // Skip both (delete the old entry)
                                 changed = true;
                             }
@@ -1584,9 +1837,10 @@ fn apply_mutations_to_leaf_with_change(leaf: Node, mutations: &[Mutation]) -> (N
                         // Mutation comes before old entry - insert new entry
                         match mutation {
                             Mutation::Upsert { key, val } => {
+                                let result =
+                                    leaf_merge_result(&mut result, &leaf, old_idx, mutations.len());
+                                result.push_upsert(key, val);
                                 changed = true;
-                                new_keys.push(key.clone());
-                                new_vals.push(val.clone());
                             }
                             Mutation::Delete { .. } => {
                                 // Delete of non-existent key is a no-op
@@ -1596,18 +1850,19 @@ fn apply_mutations_to_leaf_with_change(leaf: Node, mutations: &[Mutation]) -> (N
                     }
                 }
             }
-            (Some(old_key), None) => {
+            (Some(_), None) => {
                 // No more mutations - copy remaining old entries
-                new_keys.push(old_key.clone());
-                new_vals.push(leaf.vals[old_idx].clone());
+                if let Some(result) = result.as_mut() {
+                    result.push_existing(&leaf, old_idx);
+                }
                 old_idx += 1;
             }
             (None, Some(mutation)) => {
                 // No more old entries - apply remaining mutations
                 if let Mutation::Upsert { key, val } = mutation {
+                    let result = leaf_merge_result(&mut result, &leaf, old_idx, mutations.len());
+                    result.push_upsert(key, val);
                     changed = true;
-                    new_keys.push(key.clone());
-                    new_vals.push(val.clone());
                 }
                 // Delete of non-existent key is a no-op
                 mut_idx += 1;
@@ -1621,9 +1876,78 @@ fn apply_mutations_to_leaf_with_change(leaf: Node, mutations: &[Mutation]) -> (N
     }
 
     let mut new_leaf = leaf;
-    new_leaf.keys = new_keys;
-    new_leaf.vals = new_vals;
+    let result = result.expect("changed leaf has merge buffers");
+    new_leaf.keys = result.keys;
+    new_leaf.vals = result.vals;
     (new_leaf, true)
+}
+
+struct LeafMergeBuffers {
+    keys: Vec<Vec<u8>>,
+    vals: Vec<Vec<u8>>,
+}
+
+impl LeafMergeBuffers {
+    fn from_prefix(leaf: &Node, prefix_len: usize, mutation_count: usize) -> Self {
+        let mut keys = Vec::with_capacity(leaf.keys.len().saturating_add(mutation_count));
+        let mut vals = Vec::with_capacity(leaf.vals.len().saturating_add(mutation_count));
+        keys.extend(leaf.keys[..prefix_len].iter().cloned());
+        vals.extend(leaf.vals[..prefix_len].iter().cloned());
+        Self { keys, vals }
+    }
+
+    fn push_existing(&mut self, leaf: &Node, index: usize) {
+        self.keys.push(leaf.keys[index].clone());
+        self.vals.push(leaf.vals[index].clone());
+    }
+
+    fn push_upsert(&mut self, key: &[u8], val: &[u8]) {
+        self.keys.push(key.to_vec());
+        self.vals.push(val.to_vec());
+    }
+}
+
+fn leaf_merge_result<'a>(
+    result: &'a mut Option<LeafMergeBuffers>,
+    leaf: &Node,
+    prefix_len: usize,
+    mutation_count: usize,
+) -> &'a mut LeafMergeBuffers {
+    if result.is_none() {
+        *result = Some(LeafMergeBuffers::from_prefix(
+            leaf,
+            prefix_len,
+            mutation_count,
+        ));
+    }
+    result.as_mut().expect("leaf merge result initialized")
+}
+
+fn apply_leaf_mutations_with_change(
+    leaf: Node,
+    mutations: &[Mutation],
+    use_optimized_merge: bool,
+) -> (Node, bool, bool) {
+    let use_sparse_leaf_apply =
+        use_optimized_merge && should_use_sparse_leaf_apply(&leaf, mutations);
+    if !use_optimized_merge || use_sparse_leaf_apply {
+        let (modified_leaf, leaf_changed) =
+            apply_mutations_to_leaf_binary_search_with_change(leaf, mutations);
+        return (modified_leaf, leaf_changed, use_sparse_leaf_apply);
+    }
+
+    let (modified_leaf, leaf_changed) = apply_mutations_to_leaf_with_change(leaf, mutations);
+    (modified_leaf, leaf_changed, false)
+}
+
+fn should_use_sparse_leaf_apply(leaf: &Node, mutations: &[Mutation]) -> bool {
+    !mutations.is_empty()
+        && !leaf.keys.is_empty()
+        && mutations.len() <= SPARSE_LEAF_APPLY_MAX_MUTATIONS
+        && leaf.len()
+            >= mutations
+                .len()
+                .saturating_mul(SPARSE_LEAF_APPLY_MIN_LEAF_TO_MUTATION_RATIO)
 }
 
 fn existing_key_mutation_changes<'a>(
@@ -1634,6 +1958,25 @@ fn existing_key_mutation_changes<'a>(
         return None;
     }
 
+    if should_scan_existing_key_mutations_linearly(leaf, mutations) {
+        return existing_key_mutation_changes_linear(leaf, mutations);
+    }
+
+    existing_key_mutation_changes_binary(leaf, mutations)
+}
+
+fn should_scan_existing_key_mutations_linearly(leaf: &Node, mutations: &[Mutation]) -> bool {
+    mutations.len() >= EXISTING_KEY_LINEAR_SCAN_MIN_MUTATIONS
+        && mutations
+            .len()
+            .saturating_mul(EXISTING_KEY_LINEAR_SCAN_MIN_DENSITY_DIVISOR)
+            >= leaf.keys.len()
+}
+
+fn existing_key_mutation_changes_binary<'a>(
+    leaf: &Node,
+    mutations: &'a [Mutation],
+) -> Option<Vec<(usize, Option<&'a Vec<u8>>)>> {
     let mut changes = Vec::with_capacity(mutations.len());
     let mut previous_key: Option<&[u8]> = None;
 
@@ -1654,6 +1997,45 @@ fn existing_key_mutation_changes<'a>(
                 let index = leaf.search(key).ok()?;
                 changes.push((index, None));
             }
+        }
+    }
+
+    Some(changes)
+}
+
+fn existing_key_mutation_changes_linear<'a>(
+    leaf: &Node,
+    mutations: &'a [Mutation],
+) -> Option<Vec<(usize, Option<&'a Vec<u8>>)>> {
+    let mut changes = Vec::with_capacity(mutations.len());
+    let mut leaf_index = 0usize;
+    let mut previous_key: Option<&[u8]> = None;
+
+    for mutation in mutations {
+        let key = mutation.key();
+        if let Some(previous_key) = previous_key {
+            if previous_key >= key {
+                return None;
+            }
+        }
+        previous_key = Some(key);
+
+        while leaf_index < leaf.keys.len() && leaf.keys[leaf_index].as_slice() < key {
+            leaf_index += 1;
+        }
+
+        if leaf
+            .keys
+            .get(leaf_index)
+            .map(|candidate| candidate.as_slice())
+            != Some(key)
+        {
+            return None;
+        }
+
+        match mutation {
+            Mutation::Upsert { val, .. } => changes.push((leaf_index, Some(val))),
+            Mutation::Delete { .. } => changes.push((leaf_index, None)),
         }
     }
 
@@ -1713,25 +2095,32 @@ pub fn append_batch<S: Store>(
     tree: &Tree,
     mutations: Vec<Mutation>,
 ) -> Result<Tree, Error> {
+    let input_mutations = mutations.len();
+
     // Handle empty mutations
     if mutations.is_empty() {
         return Ok(tree.clone());
     }
 
     // Preprocess mutations
-    let mutations = preprocess_mutations(mutations);
+    let preprocessed = preprocess_mutations_with_info(mutations);
+    let mutations = preprocessed.mutations;
     if mutations.is_empty() {
         return Ok(tree.clone());
     }
 
-    match try_append_batch_preprocessed(prolly, tree, mutations)? {
-        AppendBatchAttempt::Appended(tree) => Ok(tree),
+    let mut stats = BatchApplyStats::new(input_mutations, false);
+    stats.effective_mutations = mutations.len();
+    stats.preprocess_input_sorted = preprocessed.input_was_sorted;
+
+    match try_append_batch_preprocessed(prolly, tree, mutations, false, stats)? {
+        AppendBatchAttempt::Appended(result) => Ok(result.tree),
         AppendBatchAttempt::NotAppend(mutations) => apply_batch(prolly, tree, mutations),
     }
 }
 
 enum AppendBatchAttempt {
-    Appended(Tree),
+    Appended(BatchApplyResult),
     NotAppend(Vec<Mutation>),
 }
 
@@ -1765,12 +2154,18 @@ fn try_append_batch_preprocessed<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     mutations: Vec<Mutation>,
+    cache_written_nodes: bool,
+    mut stats: BatchApplyStats,
 ) -> Result<AppendBatchAttempt, Error> {
     if !mutations
         .iter()
         .any(|mutation| matches!(mutation, Mutation::Upsert { .. }))
     {
-        return Ok(AppendBatchAttempt::Appended(tree.clone()));
+        stats.used_append_fast_path = true;
+        return Ok(AppendBatchAttempt::Appended(BatchApplyResult {
+            tree: tree.clone(),
+            stats,
+        }));
     }
 
     let rightmost_path = if tree.root.is_some() {
@@ -1791,8 +2186,15 @@ fn try_append_batch_preprocessed<S: Store>(
         }
     }
 
-    let tree = append_batch_to_rightmost_path(prolly, tree, mutations, rightmost_path, false)?;
-    Ok(AppendBatchAttempt::Appended(tree))
+    let result = append_batch_to_rightmost_path(
+        prolly,
+        tree,
+        mutations,
+        rightmost_path,
+        cache_written_nodes,
+        stats,
+    )?;
+    Ok(AppendBatchAttempt::Appended(result))
 }
 
 pub(crate) fn append_upsert_with_path<S: Store>(
@@ -1803,13 +2205,20 @@ pub(crate) fn append_upsert_with_path<S: Store>(
     path: &[(Node, usize)],
 ) -> Result<Tree, Error> {
     let rightmost_path = rightmost_path_from_find_path(tree, path)?;
-    append_batch_to_rightmost_path(
+    Ok(append_batch_to_rightmost_path(
         prolly,
         tree,
         vec![Mutation::Upsert { key, val }],
         rightmost_path,
         true,
-    )
+        BatchApplyStats {
+            input_mutations: 1,
+            effective_mutations: 1,
+            cache_written_nodes: true,
+            ..BatchApplyStats::default()
+        },
+    )?
+    .tree)
 }
 
 fn append_batch_to_rightmost_path<S: Store>(
@@ -1818,7 +2227,10 @@ fn append_batch_to_rightmost_path<S: Store>(
     mutations: Vec<Mutation>,
     rightmost_path: Vec<RightmostPathEntry>,
     cache_written_nodes: bool,
-) -> Result<Tree, Error> {
+    mut stats: BatchApplyStats,
+) -> Result<BatchApplyResult, Error> {
+    stats.used_append_fast_path = true;
+
     let mut collector = if cache_written_nodes {
         BatchWriteCollector::new_cached()
     } else {
@@ -1844,10 +2256,16 @@ fn append_batch_to_rightmost_path<S: Store>(
             cache_written_nodes,
             Some((&update.root, &update.rightmost_path)),
         )?;
+        stats.affected_leaves = new_leaves.len();
+        stats.changed_leaves = new_leaves.len();
+        stats.record_collector(&collector);
 
-        return Ok(Tree {
-            root: Some(update.root),
-            config: tree.config.clone(),
+        return Ok(BatchApplyResult {
+            tree: Tree {
+                root: Some(update.root),
+                config: tree.config.clone(),
+            },
+            stats,
         });
     }
 
@@ -1881,11 +2299,29 @@ fn append_batch_to_rightmost_path<S: Store>(
         cache_written_nodes,
         Some((&update.root, &update.rightmost_path)),
     )?;
+    stats.affected_leaves = new_leaves.len();
+    stats.changed_leaves = append_changed_leaf_count(&existing_tail_leaf, &new_leaves);
+    stats.record_collector(&collector);
 
-    Ok(Tree {
-        root: Some(update.root),
-        config: tree.config.clone(),
+    Ok(BatchApplyResult {
+        tree: Tree {
+            root: Some(update.root),
+            config: tree.config.clone(),
+        },
+        stats,
     })
+}
+
+fn append_changed_leaf_count(existing_tail_leaf: &Node, new_leaves: &[Node]) -> usize {
+    new_leaves.len() - usize::from(new_leaves.first() == Some(existing_tail_leaf))
+}
+
+fn ensure_node_value_count(node: &Node) -> Result<(), Error> {
+    if node.keys.len() == node.vals.len() {
+        Ok(())
+    } else {
+        Err(Error::InvalidNode)
+    }
 }
 
 fn flush_append_collector<S: Store>(
@@ -1933,6 +2369,7 @@ fn rightmost_path_from_find_path(
     let mut rightmost_path = Vec::with_capacity(path.len());
 
     for (node, child_index) in path {
+        ensure_node_value_count(node)?;
         if *child_index + 1 != node.len() {
             return Err(Error::InvalidNode);
         }
@@ -2066,7 +2503,11 @@ fn rightmost_path_hint_is_valid(root: &Cid, path: &[RightmostPathEntry]) -> bool
     }
 
     for (idx, entry) in path.iter().enumerate() {
-        if entry.node.is_empty() || entry.child_index + 1 != entry.node.len() {
+        if entry.node.keys.len() != entry.node.vals.len() || entry.node.is_empty() {
+            return false;
+        }
+
+        if entry.child_index != entry.node.len() - 1 {
             return false;
         }
 
@@ -2076,11 +2517,13 @@ fn rightmost_path_hint_is_valid(root: &Cid, path: &[RightmostPathEntry]) -> bool
         }
 
         if !is_last {
-            let child_bytes: [u8; 32] =
-                match entry.node.vals[entry.child_index].as_slice().try_into() {
-                    Ok(bytes) => bytes,
-                    Err(_) => return false,
-                };
+            let Some(child) = entry.node.vals.get(entry.child_index) else {
+                return false;
+            };
+            let child_bytes: [u8; 32] = match child.as_slice().try_into() {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            };
             if Cid(child_bytes) != path[idx + 1].cid {
                 return false;
             }
@@ -2174,6 +2617,7 @@ pub fn get_max_key<S: Store>(prolly: &Prolly<S>, root_cid: &Cid) -> Result<Optio
 
     loop {
         let node = prolly.load(&cid)?;
+        ensure_node_value_count(&node)?;
 
         if node.leaf {
             return Ok(node.keys.last().cloned());
@@ -2282,6 +2726,10 @@ fn find_rightmost_path<S: Store>(
 
     loop {
         let node = prolly.load(&cid)?;
+        ensure_node_value_count(&node)?;
+        if node.is_empty() {
+            return Err(Error::InvalidNode);
+        }
         let last_idx = node.len().saturating_sub(1);
 
         let is_leaf = node.leaf;
@@ -2405,8 +2853,10 @@ fn build_parent_nodes<S: Store>(
 
     let mut parents = Vec::new();
     let mut current_parent = prolly.new_internal_node(level);
+    let parent_capacity = child_cids.len().min(current_parent.max_chunk_size.max(1));
+    reserve_node_entries(&mut current_parent, parent_capacity);
 
-    for (cid, first_key) in child_cids.iter().zip(first_keys) {
+    for (idx, (cid, first_key)) in child_cids.iter().zip(first_keys).enumerate() {
         current_parent.keys.push(first_key.clone());
         current_parent.vals.push(cid.0.to_vec());
 
@@ -2415,6 +2865,9 @@ fn build_parent_nodes<S: Store>(
         if is_boundary(&current_parent, current_parent.len() - 1) {
             parents.push(current_parent);
             current_parent = prolly.new_internal_node(level);
+            let remaining = child_cids.len().saturating_sub(idx + 1);
+            let parent_capacity = remaining.min(current_parent.max_chunk_size.max(1));
+            reserve_node_entries(&mut current_parent, parent_capacity);
         }
     }
 
@@ -2650,9 +3103,6 @@ pub fn apply_batch_with_rebuild<S: Store>(
         return Ok(tree.clone());
     }
 
-    // Step 2.5: Prefetch affected leaves (optimization)
-    prefetch_leaves(prolly.store(), &groups);
-
     // Collector for batch writes
     let mut collector = BatchWriteCollector::new();
 
@@ -2677,29 +3127,47 @@ pub fn apply_batch_with_rebuild<S: Store>(
     })
 }
 
+fn flush_batch_collector<S: Store>(
+    prolly: &Prolly<S>,
+    collector: &BatchWriteCollector,
+    cache_written_nodes: bool,
+) -> Result<(), Error> {
+    collector.flush(prolly.store())?;
+    if cache_written_nodes {
+        collector.cache_nodes(prolly)?;
+    }
+    Ok(())
+}
+
+fn batch_write_collector(cache_written_nodes: bool) -> BatchWriteCollector {
+    if cache_written_nodes {
+        BatchWriteCollector::new_cached()
+    } else {
+        BatchWriteCollector::new()
+    }
+}
+
 /// Prefetch affected leaves to warm the store cache.
 ///
 /// This function collects unique leaf CIDs from mutation groups and uses
 /// the store's `batch_get` method to prefetch them in a single operation.
-/// This optimization reduces I/O latency for stores that support parallel
-/// retrieval (e.g., network stores).
+/// `BatchWriter` does not call this internally because route planning has
+/// already loaded affected leaves before mutation application.
 ///
 /// # Arguments
 /// * `store` - The store to prefetch from
 /// * `groups` - Mutation groups containing leaf nodes to prefetch
 ///
-/// # Returns
-/// * `Ok(())` - Prefetch completed (or was skipped for empty groups)
-///
 /// # Error Handling
 /// Prefetch errors are handled gracefully and do not affect correctness.
-/// If prefetch fails, the batch operation will fall back to on-demand loading.
-/// This function always returns `Ok(())` to ensure prefetch failures are non-fatal.
+/// This function intentionally ignores store errors because it is only a
+/// cache-warming hint.
 ///
 /// # Performance
 /// - Collects unique leaf CIDs to avoid redundant fetches
 /// - Uses `batch_get` for parallel I/O when supported by the store
-/// - For in-memory stores, this is essentially a no-op but still safe to call
+/// - Avoid calling it with freshly routed groups unless the store benefits from
+///   duplicate cache probes
 pub fn prefetch_leaves<S: Store>(store: &S, groups: &[LeafMutationGroup]) {
     if groups.is_empty() {
         return;
@@ -2707,25 +3175,24 @@ pub fn prefetch_leaves<S: Store>(store: &S, groups: &[LeafMutationGroup]) {
 
     // Collect unique leaf CIDs from groups
     // We use the leaf node's serialized bytes to compute the CID
-    let mut seen_cids = std::collections::HashSet::new();
-    let mut leaf_cid_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut seen_cids = HashSet::new();
+    let mut leaf_cids: Vec<Cid> = Vec::new();
 
     for group in groups {
         let bytes = group.leaf.to_bytes();
         let cid = Cid::from_bytes(&bytes);
-        let cid_bytes = cid.0.to_vec();
 
-        if seen_cids.insert(cid_bytes.clone()) {
-            leaf_cid_bytes.push(cid_bytes);
+        if seen_cids.insert(cid.clone()) {
+            leaf_cids.push(cid);
         }
     }
 
-    if leaf_cid_bytes.is_empty() {
+    if leaf_cids.is_empty() {
         return;
     }
 
     // Convert to slice of slices for batch_get
-    let keys: Vec<&[u8]> = leaf_cid_bytes.iter().map(|v| v.as_slice()).collect();
+    let keys: Vec<&[u8]> = leaf_cids.iter().map(|cid| cid.as_bytes()).collect();
 
     // Call batch_get to warm the cache
     // Errors are intentionally ignored - prefetch is an optimization,
@@ -2839,7 +3306,7 @@ fn group_mutations_by_leaf_optimized<S: Store>(
     mutations: Vec<Mutation>,
 ) -> Result<Vec<LeafMutationGroup>, Error> {
     let groups = if prolly.store().prefers_batch_reads() {
-        group_mutations_by_leaf_with_paths_batched(prolly, tree, mutations)?
+        group_mutations_by_leaf_with_paths_batched(prolly, tree, mutations, usize::MAX)?
     } else {
         group_mutations_by_leaf_with_paths(prolly, tree, mutations)?
     };
@@ -2851,26 +3318,30 @@ fn group_mutations_by_leaf_with_paths_batched<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     mutations: Vec<Mutation>,
+    prefetch_parallelism: usize,
 ) -> Result<Vec<LeafMutationGroupWithPath>, Error> {
     if mutations.is_empty() {
         return Ok(Vec::new());
     }
 
     let Some(root_cid) = &tree.root else {
+        let mutations = Arc::new(mutations);
+        let range = 0..mutations.len();
         return Ok(vec![LeafMutationGroupWithPath {
             leaf: prolly.new_leaf_node(),
             ancestors: vec![],
             ancestor_cids: vec![],
             route_path: None,
-            mutations,
+            mutations: GroupedMutations::shared(mutations, range),
         }]);
     };
 
+    let mutations = Arc::new(mutations);
     let mut frames = vec![MutationRouteFrame {
         cid: root_cid.clone(),
         path: None,
+        range: 0..mutations.len(),
         mutations,
-        mutations_sorted: true,
     }];
     let mut groups = Vec::new();
 
@@ -2879,8 +3350,8 @@ fn group_mutations_by_leaf_with_paths_batched<S: Store>(
             .iter()
             .map(|frame| frame.cid.clone())
             .collect::<Vec<_>>();
-        let nodes = prolly.load_many_ordered(&cids)?;
-        let mut next_frames = Vec::new();
+        let nodes = prolly.load_many_ordered_with_parallelism(&cids, prefetch_parallelism)?;
+        let mut next_frames = Vec::with_capacity(frames.len());
 
         for (frame, node) in frames.into_iter().zip(nodes) {
             if node.leaf {
@@ -2889,35 +3360,37 @@ fn group_mutations_by_leaf_with_paths_batched<S: Store>(
                     ancestors: Vec::new(),
                     ancestor_cids: Vec::new(),
                     route_path: frame.path,
-                    mutations: frame.mutations,
+                    mutations: GroupedMutations::shared(frame.mutations, frame.range),
                 });
                 continue;
             }
 
-            for (child_index, child_mutations) in route_mutations_to_children_with_order(
+            route_sorted_mutation_ranges_to_children_each(
                 &node,
-                frame.mutations,
-                frame.mutations_sorted,
-            )? {
-                let child = node.vals.get(child_index).ok_or(Error::InvalidNode)?;
-                let child_cid = Cid(child
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::InvalidNode)?);
-                let path = Arc::new(MutationRoutePath {
-                    parent: frame.path.clone(),
-                    node: (*node).clone(),
-                    cid: frame.cid.clone(),
-                    child_index,
-                    depth: frame.path.as_ref().map_or(1, |path| path.depth + 1),
-                });
-                next_frames.push(MutationRouteFrame {
-                    cid: child_cid,
-                    path: Some(path),
-                    mutations: child_mutations,
-                    mutations_sorted: frame.mutations_sorted,
-                });
-            }
+                &frame.mutations,
+                frame.range.clone(),
+                |child_index, child_range| {
+                    let child = node.vals.get(child_index).ok_or(Error::InvalidNode)?;
+                    let child_cid = Cid(child
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::InvalidNode)?);
+                    let path = Arc::new(MutationRoutePath {
+                        parent: frame.path.clone(),
+                        node: node.clone(),
+                        cid: frame.cid.clone(),
+                        child_index,
+                        depth: frame.path.as_ref().map_or(1, |path| path.depth + 1),
+                    });
+                    next_frames.push(MutationRouteFrame {
+                        cid: child_cid,
+                        path: Some(path),
+                        mutations: frame.mutations.clone(),
+                        range: child_range,
+                    });
+                    Ok(())
+                },
+            )?;
         }
 
         frames = next_frames;
@@ -2933,7 +3406,7 @@ fn materialize_route_path(path: Option<&Arc<MutationRoutePath>>) -> (Vec<(Node, 
     let mut current = path.cloned();
 
     while let Some(path) = current {
-        ancestors.push((path.node.clone(), path.child_index));
+        ancestors.push(((*path.node).clone(), path.child_index));
         ancestor_cids.push(path.cid.clone());
         current = path.parent.clone();
     }
@@ -2952,6 +3425,7 @@ fn route_mutations_to_children(
     route_mutations_to_children_with_order(node, mutations, mutations_sorted)
 }
 
+#[cfg(test)]
 fn route_mutations_to_children_with_order(
     node: &Node,
     mutations: Vec<Mutation>,
@@ -2961,7 +3435,8 @@ fn route_mutations_to_children_with_order(
         return route_sorted_mutations_to_children(node, mutations);
     }
 
-    let mut routed: Vec<(usize, Vec<Mutation>)> = Vec::new();
+    let mut routed: Vec<(usize, Vec<Mutation>)> =
+        Vec::with_capacity(node.len().min(mutations.len()));
 
     for mutation in mutations {
         let child_index = node_child_index_for_key(node, mutation.key())?;
@@ -2974,6 +3449,7 @@ fn route_mutations_to_children_with_order(
     Ok(routed)
 }
 
+#[cfg(test)]
 fn route_sorted_mutations_to_children(
     node: &Node,
     mutations: Vec<Mutation>,
@@ -2981,9 +3457,17 @@ fn route_sorted_mutations_to_children(
     if node.is_empty() {
         return Err(Error::InvalidNode);
     }
+    if mutations.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let mut routed: Vec<(usize, Vec<Mutation>)> = Vec::new();
-    let mut child_index = 0usize;
+    if mutations.len() >= EXACT_ROUTE_BUCKET_MIN_MUTATIONS {
+        return route_sorted_mutations_to_children_exact_buckets(node, mutations);
+    }
+
+    let mut routed: Vec<(usize, Vec<Mutation>)> =
+        Vec::with_capacity(node.len().min(mutations.len()));
+    let mut child_index = node_child_index_for_key(node, mutations[0].key())?;
 
     for mutation in mutations {
         let key = mutation.key();
@@ -2995,6 +3479,152 @@ fn route_sorted_mutations_to_children(
             Some((idx, bucket)) if *idx == child_index => bucket.push(mutation),
             _ => routed.push((child_index, vec![mutation])),
         }
+    }
+
+    Ok(routed)
+}
+
+#[cfg(test)]
+fn route_sorted_mutation_ranges_to_children(
+    node: &Node,
+    mutations: &[Mutation],
+    range: Range<usize>,
+) -> Result<Vec<(usize, Range<usize>)>, Error> {
+    if !validate_sorted_mutation_range_route_input(node, mutations, &range)? {
+        return Ok(Vec::new());
+    }
+
+    let mut routed: Vec<(usize, Range<usize>)> =
+        Vec::with_capacity(node.len().min(range.end.saturating_sub(range.start)));
+    route_sorted_mutation_ranges_to_children_each(node, mutations, range, |child_index, range| {
+        routed.push((child_index, range));
+        Ok(())
+    })?;
+    Ok(routed)
+}
+
+fn route_sorted_mutation_ranges_to_children_each<F>(
+    node: &Node,
+    mutations: &[Mutation],
+    range: Range<usize>,
+    mut emit: F,
+) -> Result<(), Error>
+where
+    F: FnMut(usize, Range<usize>) -> Result<(), Error>,
+{
+    if !validate_sorted_mutation_range_route_input(node, mutations, &range)? {
+        return Ok(());
+    }
+
+    if range.end - range.start >= EXACT_ROUTE_BUCKET_MIN_MUTATIONS && node.len() > 1 {
+        return route_sorted_mutation_ranges_to_children_by_boundary(node, mutations, range, emit);
+    }
+
+    let mut child_index = node_child_index_for_key(node, mutations[range.start].key())?;
+    let mut bucket_child_index = child_index;
+    let mut bucket_start = range.start;
+
+    for mutation_index in range.clone() {
+        let key = mutations[mutation_index].key();
+        while child_index + 1 < node.len() && key >= node.keys[child_index + 1].as_slice() {
+            child_index += 1;
+        }
+
+        if child_index != bucket_child_index {
+            emit(bucket_child_index, bucket_start..mutation_index)?;
+            bucket_child_index = child_index;
+            bucket_start = mutation_index;
+        }
+    }
+
+    emit(bucket_child_index, bucket_start..range.end)?;
+    Ok(())
+}
+
+fn route_sorted_mutation_ranges_to_children_by_boundary<F>(
+    node: &Node,
+    mutations: &[Mutation],
+    range: Range<usize>,
+    mut emit: F,
+) -> Result<(), Error>
+where
+    F: FnMut(usize, Range<usize>) -> Result<(), Error>,
+{
+    let mut child_index = node_child_index_for_key(node, mutations[range.start].key())?;
+    let last_child_index = node_child_index_for_key(node, mutations[range.end - 1].key())?;
+    let mut bucket_start = range.start;
+
+    while child_index < last_child_index {
+        let boundary = node.keys.get(child_index + 1).ok_or(Error::InvalidNode)?;
+        let bucket_end =
+            lower_bound_mutation_key(mutations, bucket_start..range.end, boundary.as_slice());
+
+        if bucket_start < bucket_end {
+            emit(child_index, bucket_start..bucket_end)?;
+        }
+
+        bucket_start = bucket_end;
+        child_index += 1;
+    }
+
+    if bucket_start < range.end {
+        emit(last_child_index, bucket_start..range.end)?;
+    }
+
+    Ok(())
+}
+
+fn lower_bound_mutation_key(mutations: &[Mutation], range: Range<usize>, key: &[u8]) -> usize {
+    let offset = mutations[range.clone()].partition_point(|mutation| mutation.key() < key);
+    range.start + offset
+}
+
+fn validate_sorted_mutation_range_route_input(
+    node: &Node,
+    mutations: &[Mutation],
+    range: &Range<usize>,
+) -> Result<bool, Error> {
+    if node.is_empty() {
+        return Err(Error::InvalidNode);
+    }
+    if range.start >= range.end {
+        return Ok(false);
+    }
+    if range.end > mutations.len() {
+        return Err(Error::InvalidNode);
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+fn route_sorted_mutations_to_children_exact_buckets(
+    node: &Node,
+    mutations: Vec<Mutation>,
+) -> Result<Vec<(usize, Vec<Mutation>)>, Error> {
+    if mutations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut counts: Vec<(usize, usize)> = Vec::with_capacity(node.len().min(mutations.len()));
+    let mut child_index = node_child_index_for_key(node, mutations[0].key())?;
+
+    for mutation in &mutations {
+        let key = mutation.key();
+        while child_index + 1 < node.len() && key >= node.keys[child_index + 1].as_slice() {
+            child_index += 1;
+        }
+
+        match counts.last_mut() {
+            Some((idx, count)) if *idx == child_index => *count += 1,
+            _ => counts.push((child_index, 1)),
+        }
+    }
+
+    let mut routed = Vec::with_capacity(counts.len());
+    let mut mutations = mutations.into_iter();
+    for (child_index, count) in counts {
+        let bucket = mutations.by_ref().take(count).collect::<Vec<_>>();
+        routed.push((child_index, bucket));
     }
 
     Ok(routed)
@@ -3022,7 +3652,7 @@ fn group_mutations_by_leaf_with_paths<S: Store>(
             ancestors: vec![],
             ancestor_cids: vec![],
             route_path: None,
-            mutations,
+            mutations: mutations.into(),
         }]);
     }
 
@@ -3088,7 +3718,7 @@ fn group_mutations_by_leaf_with_paths<S: Store>(
             ancestors: current_ancestors,
             ancestor_cids: current_ancestor_cids,
             route_path: None,
-            mutations: leaf_mutations,
+            mutations: leaf_mutations.into(),
         });
     }
 
@@ -3307,13 +3937,8 @@ pub fn bottom_up_rebuild<S: Store>(
 
         // Multiple leaves need a parent node
         let mut parent = prolly.new_internal_node(new_leaves[0].level + 1);
-        for leaf in &new_leaves {
-            let leaf_cid = collector.add(leaf);
-            if !leaf.keys.is_empty() {
-                parent.keys.push(leaf.keys[0].clone());
-            } else {
-                parent.keys.push(Vec::new());
-            }
+        for (leaf_cid, first_key) in node_cids_with_first_keys(new_leaves, collector) {
+            parent.keys.push(first_key);
             parent.vals.push(leaf_cid.0.to_vec());
         }
 
@@ -3325,14 +3950,7 @@ pub fn bottom_up_rebuild<S: Store>(
     }
 
     // Write all new leaves and collect their CIDs
-    let mut current_level_cids: Vec<(Cid, Vec<u8>)> = new_leaves
-        .iter()
-        .map(|leaf| {
-            let cid = collector.add(leaf);
-            let first_key = leaf.keys.first().cloned().unwrap_or_default();
-            (cid, first_key)
-        })
-        .collect();
+    let mut current_level_cids = node_cids_with_first_keys(new_leaves, collector);
 
     // Process ancestors from bottom to top (reverse order since ancestors[0] is closest to root)
     // ancestors is ordered from root to leaf, so we process from the end
@@ -3412,97 +4030,34 @@ pub fn bottom_up_rebuild_groups<S: Store>(
         return Ok(None);
     }
 
-    // Filter out empty leaves - they represent deleted entries
-    let non_empty_groups: Vec<_> = leaf_groups
-        .into_iter()
-        .filter(|(leaf, _)| !leaf.is_empty())
-        .collect();
-
-    // If all leaves are empty, the tree becomes empty
-    if non_empty_groups.is_empty() {
-        return Ok(None);
-    }
-
-    // For a single group, use the simple rebuild
-    if non_empty_groups.len() == 1 {
-        let (leaf, ancestors) = &non_empty_groups[0];
-        let result = bottom_up_rebuild(prolly, vec![leaf.clone()], ancestors, collector)?;
-        return Ok(result.root_cid);
-    }
-
-    // For multiple groups, we need to merge their changes
-    // This is more complex as we need to handle overlapping ancestor paths
-
-    // Simple approach: process each group and track the final root
-    // This works correctly when groups don't share ancestors
-    let mut final_root: Option<Cid> = None;
-
-    for (leaf, ancestors) in non_empty_groups {
-        let result = bottom_up_rebuild(prolly, vec![leaf], &ancestors, collector)?;
-        final_root = result.root_cid;
-    }
-
-    Ok(final_root)
-}
-
-fn apply_groups_coalesced<S: Store>(
-    prolly: &Prolly<S>,
-    tree: &Tree,
-    groups: Vec<LeafMutationGroupWithPath>,
-    use_optimized_merge: bool,
-    collector: &mut BatchWriteCollector,
-) -> Result<Option<Cid>, Error> {
-    let mut contexts: HashMap<Cid, AncestorContext> = HashMap::new();
-    let mut pending: HashMap<Cid, BTreeMap<usize, Vec<ChildRef>>> = HashMap::new();
+    let group_count = leaf_groups.len();
+    let mut contexts: HashMap<Cid, AncestorContext> =
+        HashMap::with_capacity(group_count.saturating_mul(2));
+    let mut pending: HashMap<Cid, ChildReplacements> = HashMap::with_capacity(group_count);
     let mut root_replacement: Option<Vec<ChildRef>> = None;
-    let mut changed = false;
 
-    for group in groups {
-        let LeafMutationGroupWithPath {
-            leaf,
-            ancestors,
-            ancestor_cids,
-            route_path,
-            mutations,
-        } = group;
+    for (leaf, ancestors) in leaf_groups {
+        let ancestor_cids = ancestors
+            .iter()
+            .map(|(node, _)| Cid::from_bytes(&node.to_bytes()))
+            .collect::<Vec<_>>();
 
-        let (modified_leaf, leaf_changed) = if use_optimized_merge {
-            apply_mutations_to_leaf_with_change(leaf, &mutations)
-        } else {
-            let modified_leaf = apply_mutations_to_leaf_binary_search(leaf.clone(), &mutations);
-            let leaf_changed = modified_leaf != leaf;
-            (modified_leaf, leaf_changed)
-        };
+        collect_ancestor_contexts(&ancestors, &ancestor_cids, &mut contexts);
 
-        if !leaf_changed {
-            continue;
-        }
-        changed = true;
-        collect_group_ancestor_contexts_from_parts(
-            route_path.as_ref(),
-            &ancestors,
-            &ancestor_cids,
-            &mut contexts,
-        );
-
-        let child_refs = child_refs_from_modified_node(prolly, modified_leaf, collector);
+        let child_refs = child_refs_from_modified_node(prolly, leaf, collector);
         if let Some((parent_cid, child_index)) =
-            group_leaf_parent_from_parts(route_path.as_ref(), &ancestors, &ancestor_cids)?
+            group_leaf_parent_from_parts(None, &ancestors, &ancestor_cids)?
         {
-            let previous = pending
+            pending
                 .entry(parent_cid)
                 .or_default()
-                .insert(child_index, child_refs);
-            if previous.is_some() {
+                .push((child_index, child_refs));
+        } else {
+            if root_replacement.is_some() {
                 return Err(Error::InvalidNode);
             }
-        } else {
             root_replacement = Some(child_refs);
         }
-    }
-
-    if !changed {
-        return Ok(tree.root.clone());
     }
 
     if let Some(replacement) = root_replacement {
@@ -3519,13 +4074,105 @@ fn apply_groups_coalesced<S: Store>(
                 apply_child_replacements(prolly, &context.node, replacements, collector)?;
 
             if let Some(parent) = &context.parent {
-                let previous = pending
+                pending
                     .entry(parent.parent_cid.clone())
                     .or_default()
-                    .insert(parent.child_index, replacement_refs);
-                if previous.is_some() {
-                    return Err(Error::InvalidNode);
-                }
+                    .push((parent.child_index, replacement_refs));
+            } else {
+                root_refs = Some(replacement_refs);
+            }
+        }
+    }
+
+    build_root_from_child_refs(prolly, root_refs.unwrap_or_default(), collector)
+}
+
+fn apply_groups_coalesced<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    groups: Vec<LeafMutationGroupWithPath>,
+    use_optimized_merge: bool,
+    collector: &mut BatchWriteCollector,
+) -> Result<CoalescedApplyResult, Error> {
+    let group_count = groups.len();
+    let mut contexts: HashMap<Cid, AncestorContext> =
+        HashMap::with_capacity(group_count.saturating_mul(2));
+    let mut pending: HashMap<Cid, ChildReplacements> = HashMap::with_capacity(group_count);
+    let mut root_replacement: Option<Vec<ChildRef>> = None;
+    let mut changed_leaves = 0usize;
+    let mut sparse_leaf_applies = 0usize;
+
+    for group in prepare_leaf_groups_for_coalesced_rebuild(groups, use_optimized_merge) {
+        let PreparedLeafMutationGroup {
+            modified_leaf,
+            ancestors,
+            ancestor_cids,
+            route_path,
+            leaf_changed,
+            used_sparse_leaf_apply,
+        } = group;
+
+        if used_sparse_leaf_apply {
+            sparse_leaf_applies += 1;
+        }
+
+        if !leaf_changed {
+            continue;
+        }
+        changed_leaves += 1;
+        collect_group_ancestor_contexts_from_parts(
+            route_path.as_ref(),
+            &ancestors,
+            &ancestor_cids,
+            &mut contexts,
+        );
+
+        let child_refs = child_refs_from_modified_node(prolly, modified_leaf, collector);
+        if let Some((parent_cid, child_index)) =
+            group_leaf_parent_from_parts(route_path.as_ref(), &ancestors, &ancestor_cids)?
+        {
+            pending
+                .entry(parent_cid)
+                .or_default()
+                .push((child_index, child_refs));
+        } else {
+            if root_replacement.is_some() {
+                return Err(Error::InvalidNode);
+            }
+            root_replacement = Some(child_refs);
+        }
+    }
+
+    if changed_leaves == 0 {
+        return Ok(CoalescedApplyResult {
+            root: tree.root.clone(),
+            changed_leaves,
+            sparse_leaf_applies,
+        });
+    }
+
+    if let Some(replacement) = root_replacement {
+        return Ok(CoalescedApplyResult {
+            root: build_root_from_child_refs(prolly, replacement, collector)?,
+            changed_leaves,
+            sparse_leaf_applies,
+        });
+    }
+
+    let mut root_refs: Option<Vec<ChildRef>> = None;
+    while !pending.is_empty() {
+        let current = std::mem::take(&mut pending);
+
+        for (node_cid, replacements) in current {
+            let context = contexts.get(&node_cid).ok_or(Error::InvalidNode)?;
+            let replacement_refs =
+                apply_child_replacements(prolly, &context.node, replacements, collector)?;
+
+            if let Some(parent) = &context.parent {
+                pending
+                    .entry(parent.parent_cid.clone())
+                    .or_default()
+                    .push((parent.child_index, replacement_refs));
             } else {
                 root_refs = Some(replacement_refs);
             }
@@ -3533,7 +4180,53 @@ fn apply_groups_coalesced<S: Store>(
     }
 
     let root_refs = root_refs.ok_or(Error::InvalidNode)?;
-    build_root_from_child_refs(prolly, root_refs, collector)
+    Ok(CoalescedApplyResult {
+        root: build_root_from_child_refs(prolly, root_refs, collector)?,
+        changed_leaves,
+        sparse_leaf_applies,
+    })
+}
+
+fn prepare_leaf_groups_for_coalesced_rebuild(
+    groups: Vec<LeafMutationGroupWithPath>,
+    use_optimized_merge: bool,
+) -> Vec<PreparedLeafMutationGroup> {
+    if groups.len() < PARALLEL_LEAF_APPLY_THRESHOLD {
+        return groups
+            .into_iter()
+            .map(|group| prepare_leaf_group_for_coalesced_rebuild(group, use_optimized_merge))
+            .collect();
+    }
+
+    groups
+        .into_par_iter()
+        .map(|group| prepare_leaf_group_for_coalesced_rebuild(group, use_optimized_merge))
+        .collect()
+}
+
+fn prepare_leaf_group_for_coalesced_rebuild(
+    group: LeafMutationGroupWithPath,
+    use_optimized_merge: bool,
+) -> PreparedLeafMutationGroup {
+    let LeafMutationGroupWithPath {
+        leaf,
+        ancestors,
+        ancestor_cids,
+        route_path,
+        mutations,
+    } = group;
+
+    let (modified_leaf, leaf_changed, used_sparse_leaf_apply) =
+        apply_leaf_mutations_with_change(leaf, mutations.as_slice(), use_optimized_merge);
+
+    PreparedLeafMutationGroup {
+        modified_leaf,
+        ancestors,
+        ancestor_cids,
+        route_path,
+        leaf_changed,
+        used_sparse_leaf_apply,
+    }
 }
 
 #[cfg(test)]
@@ -3577,7 +4270,7 @@ fn collect_route_path_contexts(
         contexts
             .entry(path.cid.clone())
             .or_insert_with(|| AncestorContext {
-                node: path.node.clone(),
+                node: (*path.node).clone(),
                 parent,
             });
 
@@ -3645,38 +4338,72 @@ fn child_refs_from_modified_node<S: Store>(
         return Vec::new();
     }
 
-    let nodes = if node.len() > node.max_chunk_size && node.len() > 1 {
-        rebalance::split_into_chunks(prolly, &node, node.max_chunk_size)
-    } else {
-        vec![node]
-    };
+    if node.len() <= node.max_chunk_size || node.len() == 1 {
+        let first_key = node.keys.first().cloned().unwrap_or_default();
+        let level = node.level;
+        let cid = collector.add(&node);
+        return vec![ChildRef {
+            cid,
+            first_key,
+            level,
+        }];
+    }
 
-    nodes
-        .into_iter()
-        .filter(|node| !node.is_empty())
-        .map(|node| {
-            let first_key = node.keys.first().cloned().unwrap_or_default();
-            let level = node.level;
-            let cid = collector.add(&node);
-            ChildRef {
-                cid,
-                first_key,
-                level,
-            }
-        })
-        .collect()
+    child_refs_from_nodes(
+        rebalance::split_into_chunks(prolly, &node, node.max_chunk_size),
+        collector,
+    )
 }
 
 fn apply_child_replacements<S: Store>(
     prolly: &Prolly<S>,
     node: &Node,
-    replacements: BTreeMap<usize, Vec<ChildRef>>,
+    mut replacements: ChildReplacements,
     collector: &mut BatchWriteCollector,
 ) -> Result<Vec<ChildRef>, Error> {
+    ensure_node_value_count(node)?;
+
+    replacements.sort_by_key(|(idx, _)| *idx);
+    let mut previous_idx = None;
+    for (idx, _) in &replacements {
+        if *idx >= node.len() || previous_idx == Some(*idx) {
+            return Err(Error::InvalidNode);
+        }
+        previous_idx = Some(*idx);
+    }
+
+    if replacements.iter().all(|(_, children)| children.len() == 1) {
+        let mut updated = node.clone();
+        for (idx, children) in replacements {
+            let child = &children[0];
+            updated.keys[idx] = child.first_key.clone();
+            updated.vals[idx] = child.cid.0.to_vec();
+        }
+
+        debug_assert!(
+            updated.keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "coalesced batch rebuild must preserve parent key order"
+        );
+
+        return Ok(child_refs_from_modified_node(prolly, updated, collector));
+    }
+
+    let replacement_len = node.len() - replacements.len()
+        + replacements
+            .iter()
+            .map(|(_, children)| children.len())
+            .sum::<usize>();
     let mut updated = prolly.new_node_like(node);
+    reserve_node_entries(&mut updated, replacement_len);
+    let mut replacements = replacements.into_iter().peekable();
 
     for idx in 0..node.len() {
-        if let Some(children) = replacements.get(&idx) {
+        if replacements
+            .peek()
+            .map(|(replacement_idx, _)| *replacement_idx == idx)
+            .unwrap_or(false)
+        {
+            let (_, children) = replacements.next().ok_or(Error::InvalidNode)?;
             for child in children {
                 updated.keys.push(child.first_key.clone());
                 updated.vals.push(child.cid.0.to_vec());
@@ -3685,10 +4412,6 @@ fn apply_child_replacements<S: Store>(
             updated.keys.push(node.keys[idx].clone());
             updated.vals.push(node.vals[idx].clone());
         }
-    }
-
-    if replacements.keys().any(|idx| *idx >= node.len()) {
-        return Err(Error::InvalidNode);
     }
 
     debug_assert!(
@@ -3724,19 +4447,7 @@ fn build_root_from_child_refs<S: Store>(
 
     loop {
         let parents = build_parent_nodes(prolly, &cids, &first_keys, level);
-        let parent_refs = parents
-            .into_iter()
-            .map(|node| {
-                let first_key = node.keys.first().cloned().unwrap_or_default();
-                let level = node.level;
-                let cid = collector.add(&node);
-                ChildRef {
-                    cid,
-                    first_key,
-                    level,
-                }
-            })
-            .collect::<Vec<_>>();
+        let parent_refs = child_refs_from_nodes(parents, collector);
 
         if parent_refs.len() == 1 {
             return Ok(Some(parent_refs[0].cid.clone()));
@@ -3761,12 +4472,13 @@ fn build_root_from_child_refs<S: Store>(
 ///
 /// # Fields
 ///
-/// - `prefetch_parallelism`: Maximum concurrent prefetch operations (default: 16)
-/// - `enable_prefetch`: Whether to enable prefetch optimization (default: true)
+/// - `prefetch_parallelism`: Maximum ordered route-hydration batch width (default: 16)
+/// - `enable_prefetch`: Legacy compatibility flag (default: true)
 /// - `use_optimized_merge`: Whether to use two-pointer merge vs binary search (default: true)
 /// - `use_bottom_up_rebuild`: Whether to use bottom-up rebuild strategy (default: false)
 /// - `enable_deferred_rebalancing`: Whether to enable deferred rebalancing optimization (default: true)
 /// - `force_deferred`: Force deferred rebalancing regardless of pattern detection (default: false)
+/// - `cache_written_nodes`: Warm the in-process node cache after successful batch writes (default: false)
 ///
 /// # Example
 ///
@@ -3783,26 +4495,26 @@ fn build_root_from_child_refs<S: Store>(
 ///     .with_optimized_merge(true)
 ///     .with_bottom_up_rebuild(true)
 ///     .with_deferred_rebalancing(true)
-///     .with_force_deferred(false);
+///     .with_force_deferred(false)
+///     .with_cache_written_nodes(false);
 ///
-/// // Disable prefetch for in-memory stores
-/// let config = BatchWriterConfig::new()
-///     .with_prefetch(false);
 /// ```
 #[derive(Debug, Clone)]
 pub struct BatchWriterConfig {
-    /// Maximum concurrent prefetch operations.
+    /// Maximum ordered route-hydration batch width.
     ///
-    /// Controls how many leaf nodes can be prefetched in parallel.
-    /// Higher values may improve performance for high-latency stores
-    /// but increase memory usage.
+    /// Controls how many node CIDs are fetched per ordered batch while routing
+    /// random updates through stores that prefer batched reads. Higher values
+    /// may improve high-latency stores but increase transient memory usage.
     pub prefetch_parallelism: usize,
 
-    /// Whether to enable prefetch optimization.
+    /// Legacy compatibility flag for speculative leaf prefetch.
     ///
-    /// When enabled, affected leaves are prefetched before processing
-    /// mutations. This can significantly improve performance for network
-    /// stores but has minimal impact for in-memory stores.
+    /// Current route planning hydrates the affected leaves before mutation
+    /// application, so the writer does not issue a second post-routing
+    /// prefetch. Stores that prefer batched reads still use ordered batched
+    /// route planning even when this is disabled, because that path is
+    /// required node hydration rather than speculative prefetch.
     pub enable_prefetch: bool,
 
     /// Whether to use the optimized two-pointer merge algorithm.
@@ -3845,6 +4557,17 @@ pub struct BatchWriterConfig {
     ///
     /// Default: false
     pub force_deferred: bool,
+
+    /// Whether to cache newly written nodes after a successful batch flush.
+    ///
+    /// When enabled, read-after-write workloads such as immediate random
+    /// `get`, `diff`, `stream_diff`, `range_diff`, or merge validation can
+    /// reuse the rewritten frontier without fetching it back from the store.
+    /// Keep this disabled for pure write-heavy ingest jobs where cache memory
+    /// and cache-warming CPU are not worth paying during the write.
+    ///
+    /// Default: false
+    pub cache_written_nodes: bool,
 }
 
 impl Default for BatchWriterConfig {
@@ -3856,6 +4579,7 @@ impl Default for BatchWriterConfig {
             use_bottom_up_rebuild: false,
             enable_deferred_rebalancing: true,
             force_deferred: false,
+            cache_written_nodes: false,
         }
     }
 }
@@ -3871,6 +4595,7 @@ impl BatchWriterConfig {
     /// - `use_bottom_up_rebuild`: false
     /// - `enable_deferred_rebalancing`: true
     /// - `force_deferred`: false
+    /// - `cache_written_nodes`: false
     ///
     /// # Example
     /// ```rust
@@ -3883,6 +4608,7 @@ impl BatchWriterConfig {
     /// assert!(!config.use_bottom_up_rebuild);
     /// assert!(config.enable_deferred_rebalancing);
     /// assert!(!config.force_deferred);
+    /// assert!(!config.cache_written_nodes);
     /// ```
     pub fn new() -> Self {
         Self::default()
@@ -3909,10 +4635,14 @@ impl BatchWriterConfig {
         self
     }
 
-    /// Enable or disable prefetch optimization.
+    /// Set the legacy prefetch compatibility flag.
+    ///
+    /// The current writer hydrates affected leaves during route planning and
+    /// does not issue a second post-routing leaf prefetch. This setter is kept
+    /// for source compatibility and for callers that inspect the config.
     ///
     /// # Arguments
-    /// * `enabled` - Whether to enable prefetch
+    /// * `enabled` - Stored value for the legacy prefetch flag
     ///
     /// # Returns
     /// Self for method chaining
@@ -3921,7 +4651,6 @@ impl BatchWriterConfig {
     /// ```rust
     /// use prolly::BatchWriterConfig;
     ///
-    /// // Disable prefetch for in-memory stores
     /// let config = BatchWriterConfig::new()
     ///     .with_prefetch(false);
     /// assert!(!config.enable_prefetch);
@@ -4037,6 +4766,31 @@ impl BatchWriterConfig {
         self.force_deferred = force;
         self
     }
+
+    /// Enable or disable cache warming for nodes written by batch operations.
+    ///
+    /// This is useful when a workload performs random updates and then
+    /// immediately reads, diffs, streams diffs, range-diffs, or merges the
+    /// updated tree. It should usually stay disabled for write-only ingest.
+    ///
+    /// # Arguments
+    /// * `enabled` - Whether to cache newly written batch nodes after flush
+    ///
+    /// # Returns
+    /// Self for method chaining
+    ///
+    /// # Example
+    /// ```rust
+    /// use prolly::BatchWriterConfig;
+    ///
+    /// let config = BatchWriterConfig::new()
+    ///     .with_cache_written_nodes(true);
+    /// assert!(config.cache_written_nodes);
+    /// ```
+    pub fn with_cache_written_nodes(mut self, enabled: bool) -> Self {
+        self.cache_written_nodes = enabled;
+        self
+    }
 }
 
 /// Batch writer with configurable settings.
@@ -4056,7 +4810,6 @@ impl BatchWriterConfig {
 ///
 /// // Create a batch writer with custom configuration
 /// let config = BatchWriterConfig::new()
-///     .with_prefetch(false)  // Disable prefetch for in-memory store
 ///     .with_optimized_merge(true);
 ///
 /// let writer = BatchWriter::with_config(config);
@@ -4140,7 +4893,7 @@ impl BatchWriter {
     /// This method applies mutations to a tree using the optimizations
     /// specified in the configuration:
     ///
-    /// - If `enable_prefetch` is true, affected leaves are prefetched
+    /// - Stores that prefer batched reads hydrate mutation paths in ordered batches
     /// - If `use_optimized_merge` is true, uses O(n+m) two-pointer merge
     /// - Otherwise, uses O(m log n) binary search approach
     /// - If `use_bottom_up_rebuild` is true, uses bottom-up rebuild strategy
@@ -4176,17 +4929,43 @@ impl BatchWriter {
         tree: &Tree,
         mutations: Vec<Mutation>,
     ) -> Result<Tree, Error> {
+        Ok(self.apply_batch_with_stats(prolly, tree, mutations)?.tree)
+    }
+
+    /// Apply batch mutations and return store-neutral execution stats.
+    ///
+    /// This is useful for tuning workload shape across storage backends. The
+    /// returned stats report tree-level work such as affected leaves and unique
+    /// prolly nodes/bytes written, independent of backend compaction or object
+    /// layout.
+    pub fn apply_batch_with_stats<S: Store>(
+        &self,
+        prolly: &Prolly<S>,
+        tree: &Tree,
+        mutations: Vec<Mutation>,
+    ) -> Result<BatchApplyResult, Error> {
+        let mut stats = BatchApplyStats::new(mutations.len(), self.config.cache_written_nodes);
+
         // Handle empty mutations
         if mutations.is_empty() {
-            return Ok(tree.clone());
+            return Ok(BatchApplyResult {
+                tree: tree.clone(),
+                stats,
+            });
         }
 
-        // Step 1: Preprocess - sort and deduplicate
-        let mut mutations = preprocess_mutations(mutations);
+        // Step 1: Preprocess - sort if needed, then deduplicate
+        let preprocessed = preprocess_mutations_with_info(mutations);
+        let mut mutations = preprocessed.mutations;
+        stats.effective_mutations = mutations.len();
+        stats.preprocess_input_sorted = preprocessed.input_was_sorted;
 
         // Handle case where preprocessing results in empty mutations
         if mutations.is_empty() {
-            return Ok(tree.clone());
+            return Ok(BatchApplyResult {
+                tree: tree.clone(),
+                stats,
+            });
         }
 
         // Fast path for the paper's sequential workload: avoid grouping every
@@ -4197,10 +4976,20 @@ impl BatchWriter {
                 .iter()
                 .all(|mutation| matches!(mutation, Mutation::Upsert { .. }))
         {
-            match try_append_batch_preprocessed(prolly, tree, mutations)? {
-                AppendBatchAttempt::Appended(tree) => return Ok(tree),
+            match try_append_batch_preprocessed(
+                prolly,
+                tree,
+                mutations,
+                self.config.cache_written_nodes,
+                stats,
+            )? {
+                AppendBatchAttempt::Appended(result) => return Ok(result),
                 AppendBatchAttempt::NotAppend(returned_mutations) => {
                     mutations = returned_mutations;
+                    stats = BatchApplyStats {
+                        effective_mutations: mutations.len(),
+                        ..stats
+                    };
                 }
             }
         }
@@ -4208,31 +4997,49 @@ impl BatchWriter {
         // Step 2: Group mutations by affected leaf. Keep ancestor CIDs in the
         // private representation so multi-leaf rebuilds can avoid deriving
         // them from cloned ancestor nodes.
-        let path_groups = if self.config.enable_prefetch && prolly.store().prefers_batch_reads() {
-            group_mutations_by_leaf_with_paths_batched(prolly, tree, mutations)?
+        let used_batched_route = prolly.store().prefers_batch_reads();
+        let path_groups = if used_batched_route {
+            group_mutations_by_leaf_with_paths_batched(
+                prolly,
+                tree,
+                mutations,
+                self.config.prefetch_parallelism,
+            )?
         } else {
             group_mutations_by_leaf_with_paths(prolly, tree, mutations)?
         };
+        stats.used_batched_route = used_batched_route;
+        stats.affected_leaves = path_groups.len();
 
         // Handle case where all mutations result in no changes
         if path_groups.is_empty() {
-            return Ok(tree.clone());
+            return Ok(BatchApplyResult {
+                tree: tree.clone(),
+                stats,
+            });
         }
 
         if path_groups.len() > 1 {
-            let mut collector = BatchWriteCollector::new();
-            let current_root = apply_groups_coalesced(
+            stats.used_coalesced_rebuild = true;
+            let mut collector = batch_write_collector(self.config.cache_written_nodes);
+            let coalesced = apply_groups_coalesced(
                 prolly,
                 tree,
                 path_groups,
                 self.config.use_optimized_merge,
                 &mut collector,
             )?;
-            collector.flush(prolly.store())?;
+            flush_batch_collector(prolly, &collector, self.config.cache_written_nodes)?;
+            stats.changed_leaves = coalesced.changed_leaves;
+            stats.sparse_leaf_applies = coalesced.sparse_leaf_applies;
+            stats.record_collector(&collector);
 
-            return Ok(Tree {
-                root: current_root,
-                config: tree.config.clone(),
+            return Ok(BatchApplyResult {
+                tree: Tree {
+                    root: coalesced.root,
+                    config: tree.config.clone(),
+                },
+                stats,
             });
         }
 
@@ -4248,16 +5055,12 @@ impl BatchWriter {
                 && should_use_deferred_rebalancing(prolly, tree, &groups)?);
 
         if use_deferred {
-            return self.apply_batch_deferred(prolly, tree, groups);
-        }
-
-        // Step 3: Prefetch affected leaves (if enabled)
-        if self.config.enable_prefetch {
-            prefetch_leaves(prolly.store(), &groups);
+            return self.apply_batch_deferred(prolly, tree, groups, stats);
         }
 
         // Collector for batch writes
-        let mut collector = BatchWriteCollector::new();
+        let mut collector = batch_write_collector(self.config.cache_written_nodes);
+        stats.used_bottom_up_rebuild = self.config.use_bottom_up_rebuild;
 
         // Choose rebuild strategy based on configuration
         let current_root = if self.config.use_bottom_up_rebuild {
@@ -4266,12 +5069,26 @@ impl BatchWriter {
 
             for group in groups {
                 // Apply mutations to leaf using configured merge algorithm
-                let modified_leaf = if self.config.use_optimized_merge {
-                    apply_mutations_to_leaf(group.leaf, &group.mutations)
-                } else {
-                    apply_mutations_to_leaf_binary_search(group.leaf, &group.mutations)
-                };
-                leaf_groups.push((modified_leaf, group.ancestors));
+                let (modified_leaf, leaf_changed, used_sparse_leaf_apply) =
+                    apply_leaf_mutations_with_change(
+                        group.leaf,
+                        &group.mutations,
+                        self.config.use_optimized_merge,
+                    );
+                if used_sparse_leaf_apply {
+                    stats.sparse_leaf_applies += 1;
+                }
+                if leaf_changed {
+                    stats.changed_leaves += 1;
+                    leaf_groups.push((modified_leaf, group.ancestors));
+                }
+            }
+
+            if leaf_groups.is_empty() {
+                return Ok(BatchApplyResult {
+                    tree: tree.clone(),
+                    stats,
+                });
             }
 
             // Use bottom-up rebuild for efficient parent reconstruction
@@ -4282,11 +5099,19 @@ impl BatchWriter {
 
             for group in groups {
                 // Apply mutations to leaf using configured merge algorithm
-                let modified_leaf = if self.config.use_optimized_merge {
-                    apply_mutations_to_leaf(group.leaf, &group.mutations)
-                } else {
-                    apply_mutations_to_leaf_binary_search(group.leaf, &group.mutations)
-                };
+                let (modified_leaf, leaf_changed, used_sparse_leaf_apply) =
+                    apply_leaf_mutations_with_change(
+                        group.leaf,
+                        &group.mutations,
+                        self.config.use_optimized_merge,
+                    );
+                if used_sparse_leaf_apply {
+                    stats.sparse_leaf_applies += 1;
+                }
+                if !leaf_changed {
+                    continue;
+                }
+                stats.changed_leaves += 1;
 
                 // Rebalance and collect writes
                 current_root = rebalance::rebalance_with_collector(
@@ -4297,15 +5122,26 @@ impl BatchWriter {
                 )?;
             }
 
+            if stats.changed_leaves == 0 {
+                return Ok(BatchApplyResult {
+                    tree: tree.clone(),
+                    stats,
+                });
+            }
+
             current_root
         };
 
         // Step 5: Flush all writes atomically
-        collector.flush(prolly.store())?;
+        flush_batch_collector(prolly, &collector, self.config.cache_written_nodes)?;
+        stats.record_collector(&collector);
 
-        Ok(Tree {
-            root: current_root,
-            config: tree.config.clone(),
+        Ok(BatchApplyResult {
+            tree: Tree {
+                root: current_root,
+                config: tree.config.clone(),
+            },
+            stats,
         })
     }
 
@@ -4359,58 +5195,44 @@ impl BatchWriter {
         prolly: &Prolly<S>,
         tree: &Tree,
         groups: Vec<LeafMutationGroup>,
-    ) -> Result<Tree, Error> {
-        // Check if any mutations actually change the tree
-        // If all mutations are no-ops (upserting same value or deleting non-existent key),
-        // return the original tree to preserve idempotence
-        let mut has_changes = false;
-        for group in &groups {
-            for mutation in &group.mutations {
-                match mutation {
-                    Mutation::Upsert { key, val } => {
-                        // Check if this key exists with the same value
-                        if let Ok(idx) = group.leaf.search(key) {
-                            if &group.leaf.vals[idx] != val {
-                                has_changes = true;
-                                break;
-                            }
-                        } else {
-                            // Key doesn't exist, this is a new insert
-                            has_changes = true;
-                            break;
-                        }
-                    }
-                    Mutation::Delete { key } => {
-                        // Check if this key exists
-                        if group.leaf.search(key).is_ok() {
-                            has_changes = true;
-                            break;
-                        }
-                    }
-                }
+        mut stats: BatchApplyStats,
+    ) -> Result<BatchApplyResult, Error> {
+        stats.used_deferred_rebalancing = true;
+
+        let mut changed_groups = Vec::new();
+        for group in groups {
+            let (modified_leaf, leaf_changed, used_sparse_leaf_apply) =
+                apply_leaf_mutations_with_change(
+                    group.leaf,
+                    &group.mutations,
+                    self.config.use_optimized_merge,
+                );
+            if used_sparse_leaf_apply {
+                stats.sparse_leaf_applies += 1;
             }
-            if has_changes {
-                break;
+            if leaf_changed {
+                stats.changed_leaves += 1;
+                changed_groups.push((modified_leaf, group.ancestors));
             }
         }
 
         // If no changes, return the original tree
-        if !has_changes {
-            return Ok(tree.clone());
+        if changed_groups.is_empty() {
+            return Ok(BatchApplyResult {
+                tree: tree.clone(),
+                stats,
+            });
         }
 
         // Use the standard rebalance approach which correctly handles splits
         // The "deferred" aspect here is that we've already grouped mutations
         // and can process them efficiently
-        let mut collector = BatchWriteCollector::new();
+        let mut collector = batch_write_collector(self.config.cache_written_nodes);
         let mut current_root: Option<Cid> = tree.root.clone();
 
-        for group in groups {
-            // Apply mutations to leaf
-            let modified_leaf = apply_mutations_to_leaf(group.leaf, &group.mutations);
-
+        for (modified_leaf, ancestors) in changed_groups {
             // Skip empty leaves (all entries deleted)
-            if modified_leaf.is_empty() && group.ancestors.is_empty() {
+            if modified_leaf.is_empty() && ancestors.is_empty() {
                 current_root = None;
                 continue;
             }
@@ -4419,17 +5241,21 @@ impl BatchWriter {
             current_root = rebalance::rebalance_with_collector(
                 prolly,
                 modified_leaf,
-                &group.ancestors,
+                &ancestors,
                 &mut collector,
             )?;
         }
 
         // Flush all writes atomically
-        collector.flush(prolly.store())?;
+        flush_batch_collector(prolly, &collector, self.config.cache_written_nodes)?;
+        stats.record_collector(&collector);
 
-        Ok(Tree {
-            root: current_root,
-            config: tree.config.clone(),
+        Ok(BatchApplyResult {
+            tree: Tree {
+                root: current_root,
+                config: tree.config.clone(),
+            },
+            stats,
         })
     }
 }
@@ -4493,6 +5319,13 @@ pub fn compute_affected_spans<S: Store>(
         return Ok(Vec::new());
     }
 
+    if let Some((previous, next)) = first_unsorted_mutation_pair(mutations) {
+        return Err(Error::UnsortedInput {
+            previous: previous.to_vec(),
+            next: next.to_vec(),
+        });
+    }
+
     let first_key = mutations.first().unwrap().key();
     let last_key = mutations.last().unwrap().key();
 
@@ -4507,8 +5340,8 @@ pub fn compute_affected_spans<S: Store>(
     }
 
     loop {
-        // Get the current leaf node
-        let leaf_node = cursor.node.as_ref();
+        let current_leaf = cursor.node.clone();
+        let leaf_node = current_leaf.as_ref();
 
         // Only process leaf nodes
         if !leaf_node.leaf {
@@ -4542,27 +5375,7 @@ pub fn compute_affected_spans<S: Store>(
         }
 
         // Advance to the next leaf
-        // We need to advance past all entries in the current leaf
-        // to get to the next leaf
-        let mut advanced = false;
-        while cursor.is_valid() {
-            // Check if we're still in the same leaf
-            let current_leaf_bytes = cursor.node.to_bytes();
-            let current_cid = Cid::from_bytes(&current_leaf_bytes);
-
-            if current_cid != spans.last().unwrap().leaf_cid {
-                // We've moved to a new leaf
-                advanced = true;
-                break;
-            }
-
-            // Advance within or past this leaf
-            if !cursor.advance(store) {
-                break;
-            }
-        }
-
-        if !advanced && !cursor.is_valid() {
+        if !advance_cursor_to_next_leaf(&mut cursor, store, &current_leaf) && !cursor.is_valid() {
             // No more leaves to process
             break;
         }
@@ -4571,13 +5384,35 @@ pub fn compute_affected_spans<S: Store>(
     Ok(spans)
 }
 
+fn first_unsorted_mutation_pair(mutations: &[Mutation]) -> Option<(&[u8], &[u8])> {
+    mutations.windows(2).find_map(|pair| {
+        let previous = pair[0].key();
+        let next = pair[1].key();
+        (previous > next).then_some((previous, next))
+    })
+}
+
+fn advance_cursor_to_next_leaf<S: Store>(
+    cursor: &mut Cursor,
+    store: &S,
+    current_leaf: &Arc<Node>,
+) -> bool {
+    while cursor.is_valid() && Arc::ptr_eq(&cursor.node, current_leaf) {
+        if !cursor.advance(store) {
+            return false;
+        }
+    }
+
+    cursor.is_valid()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::builder::BatchBuilder;
     use super::super::config::Config;
     use super::super::store::{BatchOp, MemStore};
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -4604,6 +5439,8 @@ mod tests {
         batch_calls: AtomicUsize,
         batch_put_calls: AtomicUsize,
         batch_put_entries: AtomicUsize,
+        batch_get_calls: AtomicUsize,
+        batch_get_keys: AtomicUsize,
         batch_get_ordered_calls: AtomicUsize,
         max_batch_get_ordered_len: AtomicUsize,
         hint_get_calls: AtomicUsize,
@@ -4657,6 +5494,19 @@ mod tests {
                 data.insert(key.to_vec(), value.to_vec());
             }
             Ok(())
+        }
+
+        fn batch_get(&self, keys: &[&[u8]]) -> Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
+            self.batch_get_calls.fetch_add(1, Ordering::Relaxed);
+            self.batch_get_keys.fetch_add(keys.len(), Ordering::Relaxed);
+            let data = self.data.lock().unwrap();
+            let mut result = HashMap::with_capacity(keys.len());
+            for key in keys {
+                if let Some(value) = data.get(*key) {
+                    result.insert((*key).to_vec(), value.clone());
+                }
+            }
+            Ok(result)
         }
 
         fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
@@ -4791,6 +5641,260 @@ mod tests {
     }
 
     #[test]
+    fn sorted_mutation_router_presizes_large_child_buckets() {
+        let node = create_test_internal(vec![b"k000".to_vec(), b"k030".to_vec(), b"k060".to_vec()]);
+        let mutations = (0..75)
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        let routed = route_mutations_to_children(&node, mutations).unwrap();
+        let routed_keys = routed
+            .iter()
+            .map(|(idx, mutations)| {
+                (
+                    *idx,
+                    mutations
+                        .first()
+                        .map(|mutation| mutation.key().to_vec())
+                        .unwrap(),
+                    mutations
+                        .last()
+                        .map(|mutation| mutation.key().to_vec())
+                        .unwrap(),
+                    mutations.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routed_keys,
+            vec![
+                (0, b"k000".to_vec(), b"k029".to_vec(), 30),
+                (1, b"k030".to_vec(), b"k059".to_vec(), 30),
+                (2, b"k060".to_vec(), b"k074".to_vec(), 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn sorted_mutation_router_starts_at_first_target_child() {
+        let node = create_test_internal(
+            (0..10)
+                .map(|idx| format!("k{:03}", idx * 10).into_bytes())
+                .collect(),
+        );
+        let mutations = [73, 79, 80, 99]
+            .into_iter()
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        let routed = route_mutations_to_children(&node, mutations).unwrap();
+        let routed_keys = routed
+            .iter()
+            .map(|(idx, mutations)| {
+                (
+                    *idx,
+                    mutations
+                        .iter()
+                        .map(|mutation| mutation.key().to_vec())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routed_keys,
+            vec![
+                (7, vec![b"k073".to_vec(), b"k079".to_vec()]),
+                (8, vec![b"k080".to_vec()]),
+                (9, vec![b"k099".to_vec()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_bucket_router_starts_at_first_target_child() {
+        let node = create_test_internal(
+            (0..10)
+                .map(|idx| format!("k{:03}", idx * 10).into_bytes())
+                .collect(),
+        );
+        let mutations = (50..90)
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        let routed = route_mutations_to_children(&node, mutations).unwrap();
+        let routed_spans = routed
+            .iter()
+            .map(|(idx, mutations)| {
+                (
+                    *idx,
+                    mutations.first().unwrap().key().to_vec(),
+                    mutations.last().unwrap().key().to_vec(),
+                    mutations.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routed_spans,
+            vec![
+                (5, b"k050".to_vec(), b"k059".to_vec(), 10),
+                (6, b"k060".to_vec(), b"k069".to_vec(), 10),
+                (7, b"k070".to_vec(), b"k079".to_vec(), 10),
+                (8, b"k080".to_vec(), b"k089".to_vec(), 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn sorted_mutation_range_router_keeps_shared_subranges() {
+        let node = create_test_internal(
+            (0..10)
+                .map(|idx| format!("k{:03}", idx * 10).into_bytes())
+                .collect(),
+        );
+        let mutations = (50..90)
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        let routed = route_sorted_mutation_ranges_to_children(&node, &mutations, 13..36).unwrap();
+        let routed_spans = routed
+            .iter()
+            .map(|(idx, range)| {
+                (
+                    *idx,
+                    range.clone(),
+                    mutations[range.start].key().to_vec(),
+                    mutations[range.end - 1].key().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routed_spans,
+            vec![
+                (6, 13..20, b"k063".to_vec(), b"k069".to_vec()),
+                (7, 20..30, b"k070".to_vec(), b"k079".to_vec()),
+                (8, 30..36, b"k080".to_vec(), b"k085".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sorted_mutation_range_router_streams_child_ranges() {
+        let node = create_test_internal(
+            (0..10)
+                .map(|idx| format!("k{:03}", idx * 10).into_bytes())
+                .collect(),
+        );
+        let mutations = (50..90)
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let mut routed = Vec::new();
+
+        route_sorted_mutation_ranges_to_children_each(&node, &mutations, 13..36, |idx, range| {
+            routed.push((idx, range));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(routed, vec![(6, 13..20), (7, 20..30), (8, 30..36)]);
+
+        let mut visited_empty_range = false;
+        route_sorted_mutation_ranges_to_children_each(&node, &mutations, 20..20, |_, _| {
+            visited_empty_range = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!visited_empty_range);
+
+        let invalid_range = route_sorted_mutation_ranges_to_children_each(
+            &node,
+            &mutations,
+            0..mutations.len() + 1,
+            |_, _| Ok(()),
+        );
+        assert!(matches!(invalid_range, Err(Error::InvalidNode)));
+    }
+
+    #[test]
+    fn boundary_route_skips_empty_children_and_routes_separator_keys_right() {
+        let node = create_test_internal(
+            [0, 10, 20, 30, 40, 50]
+                .into_iter()
+                .map(|idx| format!("k{idx:03}").into_bytes())
+                .collect(),
+        );
+        let mutation_keys = [0, 1, 2, 10, 11, 49, 50, 51];
+        let mutations = mutation_keys
+            .into_iter()
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let mut routed = Vec::new();
+
+        route_sorted_mutation_ranges_to_children_by_boundary(
+            &node,
+            &mutations,
+            0..mutations.len(),
+            |idx, range| {
+                routed.push((idx, range));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(routed, vec![(0, 0..3), (1, 3..5), (4, 5..6), (5, 6..8)]);
+    }
+
+    #[test]
+    fn large_sorted_mutation_range_router_keeps_clustered_range_together() {
+        let node = create_test_internal(
+            (0..10)
+                .map(|idx| format!("k{:03}", idx * 100).into_bytes())
+                .collect(),
+        );
+        let mutations = (500..580)
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:03}").into_bytes(),
+                val: format!("v{idx:03}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let mut routed = Vec::new();
+
+        route_sorted_mutation_ranges_to_children_each(
+            &node,
+            &mutations,
+            0..mutations.len(),
+            |idx, range| {
+                routed.push((idx, range));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(routed, vec![(5, 0..80)]);
+    }
+
+    #[test]
     fn unsorted_mutation_router_keeps_safe_binary_routing() {
         let node = create_test_internal(vec![b"a".to_vec(), b"d".to_vec(), b"h".to_vec()]);
         let mutations = vec![
@@ -4828,14 +5932,14 @@ mod tests {
         let child_cid = Cid::from_bytes(b"child");
         let root_path = Arc::new(MutationRoutePath {
             parent: None,
-            node: root.clone(),
+            node: Arc::new(root.clone()),
             cid: root_cid.clone(),
             child_index: 1,
             depth: 1,
         });
         let child_path = Arc::new(MutationRoutePath {
             parent: Some(root_path),
-            node: child.clone(),
+            node: Arc::new(child.clone()),
             cid: child_cid.clone(),
             child_index: 0,
             depth: 2,
@@ -4855,14 +5959,14 @@ mod tests {
         let child_cid = Cid::from_bytes(b"child");
         let root_path = Arc::new(MutationRoutePath {
             parent: None,
-            node: root.clone(),
+            node: Arc::new(root.clone()),
             cid: root_cid.clone(),
             child_index: 1,
             depth: 1,
         });
         let child_path = Arc::new(MutationRoutePath {
             parent: Some(root_path),
-            node: child.clone(),
+            node: Arc::new(child.clone()),
             cid: child_cid.clone(),
             child_index: 0,
             depth: 2,
@@ -4872,7 +5976,7 @@ mod tests {
             ancestors: Vec::new(),
             ancestor_cids: Vec::new(),
             route_path: Some(child_path),
-            mutations: Vec::new(),
+            mutations: Vec::new().into(),
         };
 
         let mut contexts = HashMap::new();
@@ -4897,6 +6001,626 @@ mod tests {
     }
 
     #[test]
+    fn bottom_up_rebuild_groups_coalesces_multiple_leaf_updates() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for idx in 0..96 {
+            builder.add(
+                format!("k{idx:03}").into_bytes(),
+                format!("v{idx:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config.clone());
+        let mutations = preprocess_mutations(vec![
+            Mutation::Upsert {
+                key: b"k003".to_vec(),
+                val: b"updated-003".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k057".to_vec(),
+                val: b"updated-057".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k091".to_vec(),
+                val: b"updated-091".to_vec(),
+            },
+        ]);
+        let groups = group_mutations_by_leaf(&prolly, &base, mutations).unwrap();
+        assert!(groups.len() > 1, "fixture should cover multiple leaf paths");
+        let leaf_groups = groups
+            .into_iter()
+            .map(|group| {
+                let modified_leaf = apply_mutations_to_leaf(group.leaf, &group.mutations);
+                (modified_leaf, group.ancestors)
+            })
+            .collect::<Vec<_>>();
+        let mut collector = BatchWriteCollector::new();
+
+        let root = bottom_up_rebuild_groups(&prolly, leaf_groups, &mut collector).unwrap();
+        collector.flush(prolly.store()).unwrap();
+        let updated = Tree {
+            root,
+            config: config.clone(),
+        };
+
+        assert_eq!(
+            prolly.get(&updated, b"k003").unwrap(),
+            Some(b"updated-003".to_vec())
+        );
+        assert_eq!(
+            prolly.get(&updated, b"k057").unwrap(),
+            Some(b"updated-057".to_vec())
+        );
+        assert_eq!(
+            prolly.get(&updated, b"k091").unwrap(),
+            Some(b"updated-091".to_vec())
+        );
+        assert_eq!(
+            prolly.get(&updated, b"k040").unwrap(),
+            Some(b"v040".to_vec())
+        );
+    }
+
+    #[test]
+    fn bottom_up_rebuild_groups_collapses_empty_root_leaf() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::default();
+        let prolly = Prolly::new(store, config);
+        let mut collector = BatchWriteCollector::new();
+
+        let root = bottom_up_rebuild_groups(
+            &prolly,
+            vec![(prolly.new_leaf_node(), Vec::new())],
+            &mut collector,
+        )
+        .unwrap();
+
+        assert_eq!(root, None);
+        assert_eq!(collector.len(), 0);
+    }
+
+    #[test]
+    fn compute_affected_spans_rejects_unsorted_mutations() {
+        let store = MemStore::new();
+        let config = Config::default();
+        let prolly = Prolly::new(store, config);
+        let tree = create_tree_with_entries(
+            &prolly,
+            &[
+                (b"k001".to_vec(), b"v001".to_vec()),
+                (b"k010".to_vec(), b"v010".to_vec()),
+            ],
+        );
+
+        let err = compute_affected_spans(
+            prolly.store(),
+            &tree,
+            &[
+                Mutation::Upsert {
+                    key: b"k010".to_vec(),
+                    val: b"updated-010".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"k001".to_vec(),
+                    val: b"updated-001".to_vec(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::UnsortedInput { previous, next }
+                if previous == b"k010".to_vec() && next == b"k001".to_vec()
+        ));
+    }
+
+    #[test]
+    fn affected_span_cursor_hops_to_next_leaf_by_node_identity() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for idx in 0..32 {
+            builder.add(
+                format!("k{idx:03}").into_bytes(),
+                format!("v{idx:03}").into_bytes(),
+            );
+        }
+        let tree = builder.build().unwrap();
+        let mut cursor = Cursor::at_item(store.as_ref(), &tree, b"k000").unwrap();
+        let current_leaf = cursor.node.clone();
+        let current_leaf_end = current_leaf.keys.last().cloned().unwrap();
+
+        assert!(advance_cursor_to_next_leaf(
+            &mut cursor,
+            store.as_ref(),
+            &current_leaf
+        ));
+        assert!(!Arc::ptr_eq(&cursor.node, &current_leaf));
+        assert!(
+            cursor.get_key().unwrap() > current_leaf_end.as_slice(),
+            "cursor should land on the next leaf, not just the next item"
+        );
+    }
+
+    #[test]
+    fn compute_affected_spans_collects_multi_leaf_window() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for idx in 0..64 {
+            builder.add(
+                format!("k{idx:03}").into_bytes(),
+                format!("v{idx:03}").into_bytes(),
+            );
+        }
+        let tree = builder.build().unwrap();
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+
+        let spans = compute_affected_spans(
+            store.as_ref(),
+            &tree,
+            &[
+                Mutation::Upsert {
+                    key: b"k003".to_vec(),
+                    val: b"updated-003".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"k020".to_vec(),
+                    val: b"updated-020".to_vec(),
+                },
+                Mutation::Upsert {
+                    key: b"k041".to_vec(),
+                    val: b"updated-041".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(spans.len() > 1);
+        assert!(spans.first().unwrap().start_key.as_slice() <= b"k003".as_slice());
+        assert!(spans.last().unwrap().end_key.as_slice() >= b"k041".as_slice());
+        assert!(spans.windows(2).all(
+            |pair| pair[0].leaf_cid != pair[1].leaf_cid && pair[0].end_key < pair[1].start_key
+        ));
+        assert!(
+            store.get_calls.load(Ordering::Relaxed) - gets_before < 64,
+            "span discovery should walk leaves, not perform one store read per covered key"
+        );
+    }
+
+    #[test]
+    fn rightmost_path_hint_rejects_internal_node_with_missing_child_cid() {
+        let mut root = Node::new_internal(1);
+        root.keys.push(b"a".to_vec());
+        let root_cid = Cid::from_bytes(b"root");
+
+        let leaf = create_test_leaf(vec![b"a".to_vec()], vec![b"1".to_vec()]);
+        let child_cid = Cid::from_bytes(b"child");
+
+        let path = vec![
+            RightmostPathEntry {
+                cid: root_cid.clone(),
+                node: root,
+                child_index: 0,
+            },
+            RightmostPathEntry {
+                cid: child_cid,
+                node: leaf,
+                child_index: 0,
+            },
+        ];
+
+        assert!(
+            !rightmost_path_hint_is_valid(&root_cid, &path),
+            "malformed rightmost hints should be ignored instead of panicking"
+        );
+    }
+
+    #[test]
+    fn rightmost_path_hint_rejects_overflow_child_index() {
+        let child_cid = Cid::from_bytes(b"child");
+        let mut root = create_test_internal(vec![b"a".to_vec()]);
+        root.vals[0] = child_cid.0.to_vec();
+        let root_cid = Cid::from_bytes(b"root");
+
+        let leaf = create_test_leaf(vec![b"a".to_vec()], vec![b"1".to_vec()]);
+        let path = vec![
+            RightmostPathEntry {
+                cid: root_cid.clone(),
+                node: root,
+                child_index: usize::MAX,
+            },
+            RightmostPathEntry {
+                cid: child_cid,
+                node: leaf,
+                child_index: 0,
+            },
+        ];
+
+        assert!(
+            !rightmost_path_hint_is_valid(&root_cid, &path),
+            "overflowing hint child indexes should be rejected without panicking"
+        );
+    }
+
+    #[test]
+    fn append_fast_path_rejects_malformed_rightmost_root() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::default();
+        let prolly = Prolly::new(store, config.clone());
+        let mut malformed_root = prolly.new_internal_node(1);
+        malformed_root.keys.push(b"a".to_vec());
+        let tree = Tree {
+            root: Some(prolly.save(&malformed_root).unwrap()),
+            config,
+        };
+
+        let err = append_batch(
+            &prolly,
+            &tree,
+            vec![Mutation::Upsert {
+                key: b"z".to_vec(),
+                val: b"1".to_vec(),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn coalesced_replacement_rejects_parent_with_missing_child_cid() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut malformed_parent = prolly.new_internal_node(1);
+        malformed_parent.keys.push(b"a".to_vec());
+        let mut collector = BatchWriteCollector::new();
+
+        let err = match apply_child_replacements(
+            &prolly,
+            &malformed_parent,
+            Vec::new(),
+            &mut collector,
+        ) {
+            Ok(_) => panic!("malformed parent should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn child_refs_from_modified_node_skips_empty_nodes_without_writes() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut collector = BatchWriteCollector::new();
+
+        let refs = child_refs_from_modified_node(&prolly, prolly.new_leaf_node(), &mut collector);
+
+        assert!(refs.is_empty());
+        assert_eq!(collector.len(), 0);
+    }
+
+    #[test]
+    fn child_refs_from_modified_node_uses_single_node_fast_path() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let leaf = create_test_leaf(
+            vec![b"k001".to_vec(), b"k002".to_vec()],
+            vec![b"v001".to_vec(), b"v002".to_vec()],
+        );
+        let expected_cid = Cid::from_bytes(&leaf.to_bytes());
+        let mut collector = BatchWriteCollector::new();
+
+        let refs = child_refs_from_modified_node(&prolly, leaf, &mut collector);
+
+        assert_eq!(collector.len(), 1);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].cid, expected_cid);
+        assert_eq!(refs[0].first_key, b"k001".to_vec());
+        assert_eq!(refs[0].level, 0);
+    }
+
+    #[test]
+    fn child_refs_from_modified_node_splits_oversized_nodes() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut leaf = create_test_leaf(
+            (0..5)
+                .map(|idx| format!("k{idx:03}").into_bytes())
+                .collect(),
+            (0..5)
+                .map(|idx| format!("v{idx:03}").into_bytes())
+                .collect(),
+        );
+        leaf.max_chunk_size = 2;
+        let mut collector = BatchWriteCollector::new();
+
+        let refs = child_refs_from_modified_node(&prolly, leaf, &mut collector);
+
+        assert!(refs.len() > 1);
+        assert_eq!(collector.len(), refs.len());
+        assert!(refs
+            .windows(2)
+            .all(|pair| pair[0].first_key < pair[1].first_key));
+    }
+
+    #[test]
+    fn coalesced_same_width_replacement_patches_parent_slot() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut parent =
+            create_test_internal(vec![b"k000".to_vec(), b"k010".to_vec(), b"k020".to_vec()]);
+        let original_cids = [
+            Cid::from_bytes(b"child-0"),
+            Cid::from_bytes(b"child-1"),
+            Cid::from_bytes(b"child-2"),
+        ];
+        parent.vals = original_cids
+            .iter()
+            .map(|cid| cid.as_bytes().to_vec())
+            .collect();
+        let replacement_cid = Cid::from_bytes(b"updated-child-1");
+        let replacements = vec![(
+            1,
+            vec![ChildRef {
+                cid: replacement_cid.clone(),
+                first_key: b"k010".to_vec(),
+                level: 0,
+            }],
+        )];
+        let mut collector = BatchWriteCollector::new();
+
+        let refs =
+            apply_child_replacements(&prolly, &parent, replacements, &mut collector).unwrap();
+        let entries = collector.nodes_iter().collect::<Vec<_>>();
+        let rebuilt_parent = Node::from_bytes(entries[0].1).unwrap();
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].level, parent.level);
+        assert_eq!(collector.len(), 1);
+        assert_eq!(rebuilt_parent.keys, parent.keys);
+        assert_eq!(rebuilt_parent.vals[0], original_cids[0].as_bytes());
+        assert_eq!(rebuilt_parent.vals[1], replacement_cid.as_bytes());
+        assert_eq!(rebuilt_parent.vals[2], original_cids[2].as_bytes());
+    }
+
+    #[test]
+    fn coalesced_wider_replacement_preserves_parent_order() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut parent =
+            create_test_internal(vec![b"k000".to_vec(), b"k010".to_vec(), b"k020".to_vec()]);
+        let original_cids = [
+            Cid::from_bytes(b"child-0"),
+            Cid::from_bytes(b"child-1"),
+            Cid::from_bytes(b"child-2"),
+        ];
+        parent.vals = original_cids
+            .iter()
+            .map(|cid| cid.as_bytes().to_vec())
+            .collect();
+        let left_split_cid = Cid::from_bytes(b"left-split-child");
+        let right_split_cid = Cid::from_bytes(b"right-split-child");
+        let replacements = vec![(
+            1,
+            vec![
+                ChildRef {
+                    cid: left_split_cid.clone(),
+                    first_key: b"k010".to_vec(),
+                    level: 0,
+                },
+                ChildRef {
+                    cid: right_split_cid.clone(),
+                    first_key: b"k015".to_vec(),
+                    level: 0,
+                },
+            ],
+        )];
+        let mut collector = BatchWriteCollector::new();
+
+        let refs =
+            apply_child_replacements(&prolly, &parent, replacements, &mut collector).unwrap();
+        let entries = collector.nodes_iter().collect::<Vec<_>>();
+        let rebuilt_parent = Node::from_bytes(entries[0].1).unwrap();
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            rebuilt_parent.keys,
+            vec![
+                b"k000".to_vec(),
+                b"k010".to_vec(),
+                b"k015".to_vec(),
+                b"k020".to_vec()
+            ]
+        );
+        assert_eq!(rebuilt_parent.vals[0], original_cids[0].as_bytes());
+        assert_eq!(rebuilt_parent.vals[1], left_split_cid.as_bytes());
+        assert_eq!(rebuilt_parent.vals[2], right_split_cid.as_bytes());
+        assert_eq!(rebuilt_parent.vals[3], original_cids[2].as_bytes());
+    }
+
+    #[test]
+    fn coalesced_replacement_rejects_duplicate_child_slots() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store, Config::default());
+        let mut parent = create_test_internal(vec![b"k000".to_vec(), b"k010".to_vec()]);
+        parent.vals = vec![
+            Cid::from_bytes(b"child-0").as_bytes().to_vec(),
+            Cid::from_bytes(b"child-1").as_bytes().to_vec(),
+        ];
+        let replacements = vec![
+            (
+                1,
+                vec![ChildRef {
+                    cid: Cid::from_bytes(b"updated-child-1"),
+                    first_key: b"k010".to_vec(),
+                    level: 0,
+                }],
+            ),
+            (
+                1,
+                vec![ChildRef {
+                    cid: Cid::from_bytes(b"updated-child-1-again"),
+                    first_key: b"k010".to_vec(),
+                    level: 0,
+                }],
+            ),
+        ];
+        let mut collector = BatchWriteCollector::new();
+
+        let err = match apply_child_replacements(&prolly, &parent, replacements, &mut collector) {
+            Ok(_) => panic!("duplicate parent replacement slots should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::InvalidNode));
+    }
+
+    #[test]
+    fn preprocess_mutations_detects_sorted_input_and_deduplicates_linearly() {
+        let preprocessed = preprocess_mutations_with_info(vec![
+            Mutation::Upsert {
+                key: b"a".to_vec(),
+                val: b"1".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"b".to_vec(),
+                val: b"old".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"b".to_vec(),
+                val: b"new".to_vec(),
+            },
+        ]);
+
+        assert!(preprocessed.input_was_sorted);
+        assert_eq!(preprocessed.mutations.len(), 2);
+        assert_eq!(preprocessed.mutations[0].key(), b"a");
+        assert_eq!(preprocessed.mutations[1].key(), b"b");
+        assert!(matches!(
+            &preprocessed.mutations[1],
+            Mutation::Upsert { val, .. } if val == b"new"
+        ));
+    }
+
+    #[test]
+    fn preprocess_mutations_preserves_last_write_for_unsorted_duplicates() {
+        let preprocessed = preprocess_mutations_with_info(vec![
+            Mutation::Upsert {
+                key: b"b".to_vec(),
+                val: b"old".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"a".to_vec(),
+                val: b"1".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"b".to_vec(),
+                val: b"new".to_vec(),
+            },
+        ]);
+
+        assert!(!preprocessed.input_was_sorted);
+        assert_eq!(preprocessed.mutations.len(), 2);
+        assert_eq!(preprocessed.mutations[0].key(), b"a");
+        assert_eq!(preprocessed.mutations[1].key(), b"b");
+        assert!(matches!(
+            &preprocessed.mutations[1],
+            Mutation::Upsert { val, .. } if val == b"new"
+        ));
+    }
+
+    #[test]
+    fn inspect_sorted_mutations_detects_order_and_duplicates_in_one_pass() {
+        let sorted_unique = vec![
+            Mutation::Delete { key: b"a".to_vec() },
+            Mutation::Delete { key: b"b".to_vec() },
+        ];
+        let sorted_duplicate = vec![
+            Mutation::Delete { key: b"a".to_vec() },
+            Mutation::Upsert {
+                key: b"a".to_vec(),
+                val: b"2".to_vec(),
+            },
+        ];
+        let unsorted = vec![
+            Mutation::Delete { key: b"b".to_vec() },
+            Mutation::Delete { key: b"a".to_vec() },
+        ];
+
+        assert_eq!(inspect_sorted_mutations(&sorted_unique), (true, false));
+        assert_eq!(inspect_sorted_mutations(&sorted_duplicate), (true, true));
+        assert_eq!(inspect_sorted_mutations(&unsorted), (false, false));
+    }
+
+    #[test]
+    fn preprocess_mutations_reuses_unique_sorted_input_allocation() {
+        let mutations = vec![
+            Mutation::Upsert {
+                key: b"a".to_vec(),
+                val: b"1".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"b".to_vec(),
+                val: b"2".to_vec(),
+            },
+            Mutation::Delete { key: b"c".to_vec() },
+        ];
+        let original_ptr = mutations.as_ptr();
+
+        let preprocessed = preprocess_mutations_with_info(mutations);
+
+        assert!(preprocessed.input_was_sorted);
+        assert_eq!(preprocessed.mutations.as_ptr(), original_ptr);
+        assert_eq!(preprocessed.mutations.len(), 3);
+    }
+
+    #[test]
+    fn preprocess_mutations_reuses_unique_unsorted_input_allocation_after_sort() {
+        let mutations = vec![
+            Mutation::Upsert {
+                key: b"c".to_vec(),
+                val: b"3".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"a".to_vec(),
+                val: b"1".to_vec(),
+            },
+            Mutation::Delete { key: b"b".to_vec() },
+        ];
+        let original_ptr = mutations.as_ptr();
+
+        let preprocessed = preprocess_mutations_with_info(mutations);
+
+        assert!(!preprocessed.input_was_sorted);
+        assert_eq!(preprocessed.mutations.as_ptr(), original_ptr);
+        assert_eq!(
+            preprocessed
+                .mutations
+                .iter()
+                .map(|mutation| mutation.key().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+    }
+
+    #[test]
     fn batch_write_collector_flush_uses_bulk_upsert_path() {
         let store = CountingStore::default();
         let mut collector = BatchWriteCollector::new();
@@ -4912,6 +6636,22 @@ mod tests {
         );
         assert_eq!(store.batch_put_calls.load(Ordering::Relaxed), 1);
         assert_eq!(store.batch_put_entries.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn batch_write_collector_nodes_iter_exposes_cid_and_node_bytes() {
+        let mut collector = BatchWriteCollector::new();
+        let node = create_test_leaf(vec![b"a".to_vec()], vec![b"1".to_vec()]);
+        let expected_bytes = node.to_bytes();
+        let expected_cid = Cid::from_bytes(&expected_bytes);
+
+        let cid = collector.add(&node);
+        let entries = collector.nodes_iter().collect::<Vec<_>>();
+
+        assert_eq!(cid, expected_cid);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, expected_cid.as_bytes());
+        assert_eq!(entries[0].1, expected_bytes.as_slice());
     }
 
     #[test]
@@ -4935,6 +6675,164 @@ mod tests {
             1,
             "identical content-addressed nodes should only be written once"
         );
+    }
+
+    #[test]
+    fn batch_write_collector_add_many_preserves_order_and_deduplicates() {
+        let mut collector = BatchWriteCollector::new();
+        let mut nodes = (0..PARALLEL_COLLECTOR_ADD_THRESHOLD + 4)
+            .map(|idx| {
+                create_test_leaf(
+                    vec![format!("k{idx:03}").into_bytes()],
+                    vec![format!("v{idx:03}").into_bytes()],
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.push(nodes[3].clone());
+        nodes.push(nodes[7].clone());
+
+        let expected_cids = nodes
+            .iter()
+            .map(|node| Cid::from_bytes(&node.to_bytes()))
+            .collect::<Vec<_>>();
+        let cids = collector.add_many(nodes);
+
+        assert_eq!(cids, expected_cids);
+        assert_eq!(collector.len(), expected_cids.len() - 2);
+    }
+
+    #[test]
+    fn batch_write_collector_add_many_cached_preserves_order_and_caches_unique_nodes() {
+        let store = Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut collector = BatchWriteCollector::new_cached();
+        let mut nodes = (0..PARALLEL_COLLECTOR_ADD_THRESHOLD + 4)
+            .map(|idx| {
+                create_test_leaf(
+                    vec![format!("k{idx:03}").into_bytes()],
+                    vec![format!("v{idx:03}").into_bytes()],
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.push(nodes[3].clone());
+        nodes.push(nodes[7].clone());
+
+        let expected_cids = nodes
+            .iter()
+            .map(|node| Cid::from_bytes(&node.to_bytes()))
+            .collect::<Vec<_>>();
+        let cids = collector.add_many(nodes);
+        collector.flush(prolly.store()).unwrap();
+        collector.cache_nodes(&prolly).unwrap();
+
+        assert_eq!(cids, expected_cids);
+        assert_eq!(collector.len(), expected_cids.len() - 2);
+        assert_eq!(prolly.cache_len(), expected_cids.len() - 2);
+        assert_eq!(store.batch_put_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store.batch_put_entries.load(Ordering::Relaxed),
+            expected_cids.len() - 2,
+            "cached parallel add_many should still only write unique content-addressed nodes"
+        );
+    }
+
+    #[test]
+    fn prefetch_leaves_deduplicates_leaf_cids() {
+        let store = CountingStore::default();
+        let leaf = create_test_leaf(vec![b"a".to_vec()], vec![b"1".to_vec()]);
+        let groups = vec![
+            create_test_group(leaf.clone(), Vec::new(), Vec::new()),
+            create_test_group(leaf, Vec::new(), Vec::new()),
+        ];
+
+        prefetch_leaves(&store, &groups);
+
+        assert_eq!(store.batch_get_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            store.batch_get_keys.load(Ordering::Relaxed),
+            1,
+            "duplicate leaf groups should prefetch one content-addressed node"
+        );
+    }
+
+    #[test]
+    fn node_cids_with_first_keys_preserves_order_and_uses_bulk_collector() {
+        let mut collector = BatchWriteCollector::new();
+        let mut nodes = (0..PARALLEL_COLLECTOR_ADD_THRESHOLD + 4)
+            .map(|idx| {
+                create_test_leaf(
+                    vec![format!("k{idx:03}").into_bytes()],
+                    vec![format!("v{idx:03}").into_bytes()],
+                )
+            })
+            .collect::<Vec<_>>();
+        nodes.push(nodes[2].clone());
+
+        let expected = nodes
+            .iter()
+            .map(|node| {
+                (
+                    Cid::from_bytes(&node.to_bytes()),
+                    node.keys.first().cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let actual = node_cids_with_first_keys(nodes, &mut collector);
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            collector.len(),
+            expected.len() - 1,
+            "bulk collection should deduplicate identical content while preserving returned order"
+        );
+    }
+
+    #[test]
+    fn coalesced_leaf_preparation_parallel_path_preserves_order_and_detects_noops() {
+        let group_count = PARALLEL_LEAF_APPLY_THRESHOLD + 4;
+        let groups = (0..group_count)
+            .map(|idx| {
+                let key = format!("k{idx:03}").into_bytes();
+                let old_val = format!("v{idx:03}").into_bytes();
+                let new_val = if idx % 2 == 0 {
+                    old_val.clone()
+                } else {
+                    format!("updated-{idx:03}").into_bytes()
+                };
+
+                LeafMutationGroupWithPath {
+                    leaf: create_test_leaf(vec![key.clone()], vec![old_val]),
+                    ancestors: Vec::new(),
+                    ancestor_cids: Vec::new(),
+                    route_path: None,
+                    mutations: vec![Mutation::Upsert { key, val: new_val }].into(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let prepared = prepare_leaf_groups_for_coalesced_rebuild(groups, true);
+
+        assert_eq!(prepared.len(), group_count);
+        for (idx, group) in prepared.iter().enumerate() {
+            assert_eq!(
+                group.modified_leaf.keys[0],
+                format!("k{idx:03}").into_bytes()
+            );
+            if idx % 2 == 0 {
+                assert!(!group.leaf_changed);
+                assert_eq!(
+                    group.modified_leaf.vals[0],
+                    format!("v{idx:03}").into_bytes()
+                );
+            } else {
+                assert!(group.leaf_changed);
+                assert_eq!(
+                    group.modified_leaf.vals[0],
+                    format!("updated-{idx:03}").into_bytes()
+                );
+            }
+        }
     }
 
     #[test]
@@ -5484,6 +7382,530 @@ mod tests {
     }
 
     #[test]
+    fn batch_random_updates_honor_prefetch_parallelism_for_batched_route() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..512 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer = BatchWriter::with_config(
+            BatchWriterConfig::new()
+                .with_prefetch(true)
+                .with_prefetch_parallelism(2),
+        );
+        prolly.clear_cache();
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+        let ordered_gets_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+
+        let updated = writer
+            .apply_batch(
+                &prolly,
+                &base,
+                vec![
+                    Mutation::Upsert {
+                        key: b"k433".to_vec(),
+                        val: b"updated-433".to_vec(),
+                    },
+                    Mutation::Delete {
+                        key: b"k003".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k271".to_vec(),
+                        val: b"updated-271".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k097".to_vec(),
+                        val: b"updated-097".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k184".to_vec(),
+                        val: b"updated-184".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            gets_before,
+            "bounded batched routing should still avoid point reads"
+        );
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > ordered_gets_before,
+            "random batch planning should hydrate paths through ordered batched reads"
+        );
+        assert!(
+            store.max_batch_get_ordered_len.load(Ordering::Relaxed) <= 3,
+            "five routed mutations with prefetch parallelism 2 should split wide frontiers"
+        );
+        assert_eq!(
+            prolly.get(&updated, b"k433").unwrap(),
+            Some(b"updated-433".to_vec())
+        );
+    }
+
+    #[test]
+    fn batch_random_updates_keep_batched_route_when_prefetch_disabled() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..512 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer = BatchWriter::with_config(BatchWriterConfig::new().with_prefetch(false));
+        prolly.clear_cache();
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+        let ordered_gets_before = store.batch_get_ordered_calls.load(Ordering::Relaxed);
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &base,
+                vec![
+                    Mutation::Upsert {
+                        key: b"k433".to_vec(),
+                        val: b"updated-433".to_vec(),
+                    },
+                    Mutation::Delete {
+                        key: b"k003".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k271".to_vec(),
+                        val: b"updated-271".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k097".to_vec(),
+                        val: b"updated-097".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k184".to_vec(),
+                        val: b"updated-184".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert!(result.stats.used_batched_route);
+        assert!(result.stats.used_coalesced_rebuild);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            gets_before,
+            "disabling speculative prefetch should not force random route planning back to point reads"
+        );
+        assert!(
+            store.batch_get_ordered_calls.load(Ordering::Relaxed) > ordered_gets_before,
+            "stores that prefer batched reads should still hydrate random-update routes in batches"
+        );
+        assert_eq!(
+            prolly.get(&result.tree, b"k433").unwrap(),
+            Some(b"updated-433".to_vec())
+        );
+        assert_eq!(prolly.get(&result.tree, b"k003").unwrap(), None);
+    }
+
+    #[test]
+    fn batch_writer_does_not_prefetch_leaf_after_routing() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(8)
+            .max_chunk_size(128)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..16 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer = BatchWriter::with_config(
+            BatchWriterConfig::new()
+                .with_prefetch(true)
+                .with_deferred_rebalancing(false),
+        );
+        prolly.clear_cache();
+        let batch_gets_before = store.batch_get_calls.load(Ordering::Relaxed);
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &base,
+                vec![Mutation::Upsert {
+                    key: b"k007".to_vec(),
+                    val: b"updated-007".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(result.stats.affected_leaves, 1);
+        assert_eq!(result.stats.changed_leaves, 1);
+        assert!(!result.stats.used_deferred_rebalancing);
+        assert_eq!(
+            store.batch_get_calls.load(Ordering::Relaxed),
+            batch_gets_before,
+            "routing already loaded the affected leaf; post-routing prefetch would refetch it"
+        );
+        assert_eq!(
+            prolly.get(&result.tree, b"k007").unwrap(),
+            Some(b"updated-007".to_vec())
+        );
+    }
+
+    #[test]
+    fn batch_apply_with_stats_reports_random_update_shape() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..512 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store, config);
+        let writer = BatchWriter::new();
+        prolly.clear_cache();
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &base,
+                vec![
+                    Mutation::Upsert {
+                        key: b"k433".to_vec(),
+                        val: b"updated-433".to_vec(),
+                    },
+                    Mutation::Delete {
+                        key: b"k003".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k271".to_vec(),
+                        val: b"updated-271".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k097".to_vec(),
+                        val: b"updated-097".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k184".to_vec(),
+                        val: b"updated-184".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(result.stats.input_mutations, 5);
+        assert_eq!(result.stats.effective_mutations, 5);
+        assert!(
+            result.stats.affected_leaves > 1,
+            "random keys should touch multiple leaf groups in this fixture"
+        );
+        assert_eq!(result.stats.changed_leaves, result.stats.affected_leaves);
+        assert!(result.stats.written_nodes > 0);
+        assert!(result.stats.written_bytes > 0);
+        assert!(result.stats.used_batched_route);
+        assert!(result.stats.used_coalesced_rebuild);
+        assert!(!result.stats.used_append_fast_path);
+        assert!(!result.stats.used_deferred_rebalancing);
+        assert_eq!(
+            prolly.get(&result.tree, b"k433").unwrap(),
+            Some(b"updated-433".to_vec())
+        );
+    }
+
+    #[test]
+    fn batch_apply_with_stats_skips_single_leaf_noop_without_deferred_rebalancing() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(8)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        builder.add(b"k001".to_vec(), b"v001".to_vec());
+        builder.add(b"k002".to_vec(), b"v002".to_vec());
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer =
+            BatchWriter::with_config(BatchWriterConfig::new().with_deferred_rebalancing(false));
+        let writes_before = store.batch_put_entries.load(Ordering::Relaxed);
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &base,
+                vec![Mutation::Upsert {
+                    key: b"k001".to_vec(),
+                    val: b"v001".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(result.tree.root, base.root);
+        assert_eq!(result.stats.affected_leaves, 1);
+        assert_eq!(result.stats.changed_leaves, 0);
+        assert_eq!(result.stats.written_nodes, 0);
+        assert_eq!(result.stats.written_bytes, 0);
+        assert_eq!(
+            store.batch_put_entries.load(Ordering::Relaxed),
+            writes_before
+        );
+    }
+
+    #[test]
+    fn batch_apply_with_stats_skips_bottom_up_noop_without_writes() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(8)
+            .chunking_factor(u32::MAX)
+            .build();
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        builder.add(b"k001".to_vec(), b"v001".to_vec());
+        builder.add(b"k002".to_vec(), b"v002".to_vec());
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer = BatchWriter::with_config(
+            BatchWriterConfig::new()
+                .with_deferred_rebalancing(false)
+                .with_bottom_up_rebuild(true),
+        );
+        let writes_before = store.batch_put_entries.load(Ordering::Relaxed);
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &base,
+                vec![Mutation::Upsert {
+                    key: b"k001".to_vec(),
+                    val: b"v001".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(result.tree.root, base.root);
+        assert!(result.stats.used_bottom_up_rebuild);
+        assert_eq!(result.stats.affected_leaves, 1);
+        assert_eq!(result.stats.changed_leaves, 0);
+        assert_eq!(result.stats.written_nodes, 0);
+        assert_eq!(
+            store.batch_put_entries.load(Ordering::Relaxed),
+            writes_before
+        );
+    }
+
+    #[test]
+    fn batch_apply_with_stats_reports_coalesced_noop_changed_leaves() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..128 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer = BatchWriter::new();
+        prolly.clear_cache();
+        let writes_before = store.batch_put_entries.load(Ordering::Relaxed);
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &base,
+                vec![
+                    Mutation::Upsert {
+                        key: b"k003".to_vec(),
+                        val: b"v003".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k097".to_vec(),
+                        val: b"v097".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(result.tree.root, base.root);
+        assert!(
+            result.stats.affected_leaves > 1,
+            "fixture should route no-op mutations to multiple leaves"
+        );
+        assert_eq!(result.stats.changed_leaves, 0);
+        assert_eq!(result.stats.written_nodes, 0);
+        assert_eq!(result.stats.written_bytes, 0);
+        assert!(result.stats.used_batched_route);
+        assert!(result.stats.used_coalesced_rebuild);
+        assert_eq!(
+            store.batch_put_entries.load(Ordering::Relaxed),
+            writes_before
+        );
+    }
+
+    #[test]
+    fn batch_apply_with_stats_reports_append_fast_path_shape() {
+        let store = Arc::new(CountingStore::default());
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store, config);
+        let writer = BatchWriter::new();
+        let tree = prolly.create();
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &tree,
+                vec![
+                    Mutation::Upsert {
+                        key: b"k001".to_vec(),
+                        val: b"v001".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k002".to_vec(),
+                        val: b"v002".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(result.stats.input_mutations, 2);
+        assert_eq!(result.stats.effective_mutations, 2);
+        assert!(result.stats.affected_leaves >= 1);
+        assert!(result.stats.changed_leaves >= 1);
+        assert!(result.stats.written_nodes > 0);
+        assert!(result.stats.written_bytes > 0);
+        assert!(result.stats.used_append_fast_path);
+        assert!(!result.stats.used_batched_route);
+        assert!(!result.stats.used_coalesced_rebuild);
+        assert_eq!(
+            prolly.get(&result.tree, b"k002").unwrap(),
+            Some(b"v002".to_vec())
+        );
+    }
+
+    #[test]
+    fn batch_cache_written_nodes_avoids_read_after_random_update() {
+        let store = Arc::new(CountingStore {
+            prefer_batch_reads: true,
+            ..CountingStore::default()
+        });
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+
+        let mut builder = BatchBuilder::new(store.clone(), config.clone());
+        for i in 0..512 {
+            builder.add(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+            );
+        }
+        let base = builder.build().unwrap();
+        let prolly = Prolly::new(store.clone(), config);
+        let writer =
+            BatchWriter::with_config(BatchWriterConfig::new().with_cache_written_nodes(true));
+        prolly.clear_cache();
+
+        let updated = writer
+            .apply_batch(
+                &prolly,
+                &base,
+                vec![
+                    Mutation::Upsert {
+                        key: b"k433".to_vec(),
+                        val: b"updated-433".to_vec(),
+                    },
+                    Mutation::Delete {
+                        key: b"k003".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k271".to_vec(),
+                        val: b"updated-271".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k097".to_vec(),
+                        val: b"updated-097".to_vec(),
+                    },
+                    Mutation::Upsert {
+                        key: b"k184".to_vec(),
+                        val: b"updated-184".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            prolly.cache_len() > 0,
+            "batch cache warming should retain newly written nodes"
+        );
+
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            prolly.get(&updated, b"k433").unwrap(),
+            Some(b"updated-433".to_vec())
+        );
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            gets_before,
+            "immediate reads of rewritten random-update paths should hit the node cache"
+        );
+    }
+
+    #[test]
     fn batch_random_updates_skip_batched_route_without_batched_read_support() {
         let store = Arc::new(CountingStore::default());
         let config = Config::builder()
@@ -5761,6 +8183,263 @@ mod tests {
         assert_eq!(updated.vals.as_ptr(), vals_ptr);
         assert_eq!(updated.keys, vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(updated.vals, vec![b"1".to_vec(), b"22".to_vec()]);
+    }
+
+    #[test]
+    fn dense_existing_key_leaf_mutations_reuse_owned_leaf_buffers() {
+        let leaf = create_test_leaf(
+            (0..64)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect(),
+            (0..64)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect(),
+        );
+        let keys_ptr = leaf.keys.as_ptr();
+        let vals_ptr = leaf.vals.as_ptr();
+        let mutations = (16..48)
+            .map(|idx| Mutation::Upsert {
+                key: format!("k{idx:04}").into_bytes(),
+                val: format!("updated-{idx:04}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            should_scan_existing_key_mutations_linearly(&leaf, &mutations),
+            "dense existing-key updates should avoid repeated binary searches"
+        );
+
+        let (updated, changed) = apply_mutations_to_leaf_with_change(leaf, &mutations);
+
+        assert!(changed);
+        assert_eq!(updated.keys.as_ptr(), keys_ptr);
+        assert_eq!(updated.vals.as_ptr(), vals_ptr);
+        assert_eq!(updated.keys.len(), 64);
+        assert_eq!(updated.vals[16], b"updated-0016".to_vec());
+        assert_eq!(updated.vals[47], b"updated-0047".to_vec());
+    }
+
+    #[test]
+    fn sparse_existing_key_leaf_mutations_keep_binary_search_path() {
+        let leaf = create_test_leaf(
+            (0..64)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect(),
+            (0..64)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect(),
+        );
+        let mutations = vec![
+            Mutation::Upsert {
+                key: b"k0001".to_vec(),
+                val: b"updated-0001".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k0048".to_vec(),
+                val: b"updated-0048".to_vec(),
+            },
+        ];
+
+        assert!(
+            !should_scan_existing_key_mutations_linearly(&leaf, &mutations),
+            "sparse existing-key updates should keep the cheaper binary-search probe"
+        );
+    }
+
+    #[test]
+    fn two_pointer_leaf_apply_returns_original_for_missing_delete_noops() {
+        let leaf = create_test_leaf(
+            (0..64)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect(),
+            (0..64)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect(),
+        );
+        let keys_ptr = leaf.keys.as_ptr();
+        let vals_ptr = leaf.vals.as_ptr();
+        let mutations = (0..16)
+            .map(|idx| Mutation::Delete {
+                key: format!("j{idx:04}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+
+        let (updated, changed) = apply_mutations_to_leaf_with_change(leaf, &mutations);
+
+        assert!(!changed);
+        assert_eq!(updated.keys.as_ptr(), keys_ptr);
+        assert_eq!(updated.vals.as_ptr(), vals_ptr);
+        assert_eq!(updated.keys.len(), 64);
+    }
+
+    #[test]
+    fn two_pointer_leaf_apply_materializes_prefix_after_leading_noops() {
+        let leaf = create_test_leaf(
+            (0..8)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect(),
+            (0..8)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect(),
+        );
+        let mutations = vec![
+            Mutation::Delete {
+                key: b"j0000".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k0001".to_vec(),
+                val: b"v0001".to_vec(),
+            },
+            Mutation::Delete {
+                key: b"k0002a".to_vec(),
+            },
+            Mutation::Upsert {
+                key: b"k0003a".to_vec(),
+                val: b"inserted".to_vec(),
+            },
+        ];
+
+        let (updated, changed) = apply_mutations_to_leaf_with_change(leaf, &mutations);
+
+        assert!(changed);
+        assert_eq!(
+            updated
+                .keys
+                .iter()
+                .map(|key| String::from_utf8(key.clone()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["k0000", "k0001", "k0002", "k0003", "k0003a", "k0004", "k0005", "k0006", "k0007",]
+        );
+        assert_eq!(updated.vals[1], b"v0001".to_vec());
+        assert_eq!(updated.vals[4], b"inserted".to_vec());
+    }
+
+    #[test]
+    fn sparse_leaf_apply_handles_small_insert_without_full_merge() {
+        let leaf = create_test_leaf(
+            (0..64)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect(),
+            (0..64)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect(),
+        );
+        let mutations = vec![Mutation::Upsert {
+            key: b"k0032a".to_vec(),
+            val: b"inserted".to_vec(),
+        }];
+
+        let (updated, changed, used_sparse) =
+            apply_leaf_mutations_with_change(leaf, &mutations, true);
+
+        assert!(used_sparse);
+        assert!(changed);
+        let inserted = updated.search(b"k0032a").unwrap();
+        assert_eq!(updated.vals[inserted], b"inserted".to_vec());
+        assert_eq!(updated.keys.len(), 65);
+    }
+
+    #[test]
+    fn sparse_leaf_apply_detects_missing_delete_noop() {
+        let leaf = create_test_leaf(
+            (0..64)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect(),
+            (0..64)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect(),
+        );
+        let mutations = vec![Mutation::Delete {
+            key: b"k0032a".to_vec(),
+        }];
+
+        let (updated, changed, used_sparse) =
+            apply_leaf_mutations_with_change(leaf, &mutations, true);
+
+        assert!(used_sparse);
+        assert!(!changed);
+        assert_eq!(updated.keys.len(), 64);
+    }
+
+    #[test]
+    fn batch_apply_with_stats_reports_sparse_leaf_apply_for_single_leaf_insert() {
+        let store = MemStore::new();
+        let config = Config::builder()
+            .min_chunk_size(128)
+            .max_chunk_size(1024)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store, config);
+        let entries = (0..64)
+            .map(|idx| {
+                (
+                    format!("k{idx:04}").into_bytes(),
+                    format!("v{idx:04}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tree = create_tree_with_entries(&prolly, &entries);
+        let writer = BatchWriter::new();
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &tree,
+                vec![Mutation::Upsert {
+                    key: b"k0032a".to_vec(),
+                    val: b"inserted".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(result.stats.affected_leaves, 1);
+        assert_eq!(result.stats.changed_leaves, 1);
+        assert!(result.stats.preprocess_input_sorted);
+        assert_eq!(result.stats.sparse_leaf_applies, 1);
+        assert_eq!(
+            prolly.get(&result.tree, b"k0032a").unwrap(),
+            Some(b"inserted".to_vec())
+        );
+    }
+
+    #[test]
+    fn batch_apply_with_stats_does_not_count_forced_binary_search_as_sparse() {
+        let store = MemStore::new();
+        let config = Config::builder()
+            .min_chunk_size(128)
+            .max_chunk_size(1024)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(store, config);
+        let entries = (0..64)
+            .map(|idx| {
+                (
+                    format!("k{idx:04}").into_bytes(),
+                    format!("v{idx:04}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tree = create_tree_with_entries(&prolly, &entries);
+        let writer = BatchWriter::with_config(BatchWriterConfig::new().with_optimized_merge(false));
+
+        let result = writer
+            .apply_batch_with_stats(
+                &prolly,
+                &tree,
+                vec![Mutation::Upsert {
+                    key: b"k0032a".to_vec(),
+                    val: b"inserted".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(result.stats.affected_leaves, 1);
+        assert_eq!(result.stats.changed_leaves, 1);
+        assert_eq!(result.stats.sparse_leaf_applies, 0);
+        assert_eq!(
+            prolly.get(&result.tree, b"k0032a").unwrap(),
+            Some(b"inserted".to_vec())
+        );
     }
 
     // ==================== should_use_deferred_rebalancing tests ====================

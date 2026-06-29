@@ -26,6 +26,7 @@ export interface RenderNodeBase {
   provider?: string | undefined;
   source: RenderSource;
   status: RenderStatus;
+  timelineOrder?: number | undefined;
   createdAt?: string | undefined;
   updatedAt?: string | undefined;
   raw?: unknown;
@@ -78,6 +79,18 @@ export interface ToolNode extends RenderNodeBase {
   content: ToolCallContent[];
   rawInput?: JsonObject | undefined;
   rawOutput?: JsonObject | undefined;
+  permission?: ToolPermissionRequest | undefined;
+}
+
+export interface ToolPermissionRequest {
+  requestId: string;
+  title: string;
+  status: RenderStatus;
+  options: Array<{ optionId: string; label: string; description?: string | undefined }>;
+  raw?: unknown;
+  provider?: string | undefined;
+  createdAt?: string | undefined;
+  updatedAt?: string | undefined;
 }
 
 export interface DiffNode extends RenderNodeBase {

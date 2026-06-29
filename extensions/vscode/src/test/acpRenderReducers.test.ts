@@ -169,13 +169,20 @@ test("keeps anonymous streamed assistant messages in tool-interleaved timeline o
     nodes.map((node) => node.kind),
     ["message", "tool", "message"]
   );
+  assert.deepEqual(
+    nodes.map((node) => node.timelineOrder),
+    [1, 2, 3]
+  );
   const first = nodes[0];
+  const tool = nodes[1];
   const second = nodes[2];
   assert.equal(first?.kind, "message");
+  assert.equal(tool?.kind, "tool");
   assert.equal(second?.kind, "message");
-  if (first?.kind !== "message" || second?.kind !== "message") {
-    throw new Error("expected anonymous assistant messages");
+  if (first?.kind !== "message" || tool?.kind !== "tool" || second?.kind !== "message") {
+    throw new Error("expected anonymous assistant messages around a tool call");
   }
+  assert.equal(tool.createdAt, "2026-06-27T00:00:00.000Z");
   assert.equal(first.text, "Before tool. Still before tool.");
   assert.equal(second.text, "After tool. Still after tool.");
   assert.equal(first.content.length, 1);
@@ -348,6 +355,164 @@ test("expands terminal tool content with command metadata", () => {
   assert.equal(terminal?.elapsedMs, 1200);
   assert.equal(terminal?.stdout, "ok");
   assert.equal(terminal?.stderr, "failed");
+});
+
+test("recovers persisted formatted output into readable tool content", () => {
+  const nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-list-files",
+        title: "List files",
+        kind: "read",
+        status: "completed",
+        rawOutput: {
+          output: {
+            exit_code: 0,
+            formatted_output: "src/handler.ts\nsrc/view.ts\nREADME.md\n"
+          }
+        }
+      },
+      context
+    )
+  );
+  const tool = nodes.find((node) => node.kind === "tool");
+  assert.equal(tool?.kind, "tool");
+  assert.deepEqual(tool?.content, [
+    {
+      type: "content",
+      content: {
+        type: "text",
+        text: "src/handler.ts\nsrc/view.ts\nREADME.md"
+      }
+    }
+  ]);
+});
+
+test("recovers persisted command output into terminal content", () => {
+  const nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-recovered-terminal",
+        title: "Bash",
+        kind: "other",
+        status: "completed",
+        rawInput: { command: "ls" },
+        rawOutput: {
+          output: {
+            exit_code: 0,
+            formatted_output: "README.md\nsrc\n"
+          }
+        }
+      },
+      context
+    )
+  );
+  const tool = nodes.find((node) => node.kind === "tool");
+  const terminal = nodes.find((node) => node.kind === "terminal");
+  assert.equal(tool?.kind, "tool");
+  assert.equal((tool?.content[0] as Record<string, unknown> | undefined)?.type, "terminal");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.terminalId, "tool-recovered-terminal");
+  assert.equal(terminal?.command, "ls");
+  assert.equal(terminal?.exitCode, 0);
+  assert.equal(terminal?.stdout, "README.md\nsrc");
+});
+
+test("syncs expanded terminal status from status-only tool updates", () => {
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-terminal-sync",
+        title: "Run git remote",
+        kind: "execute",
+        status: "in_progress",
+        content: [
+          {
+            type: "terminal",
+            terminalId: "term-sync",
+            command: ["git", "remote", "-v"]
+          }
+        ]
+      },
+      context
+    )
+  );
+
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tool-terminal-sync",
+        status: "completed"
+      },
+      context
+    )
+  );
+
+  const terminal = nodes.find((node) => node.kind === "terminal");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.status, "completed");
+  assert.equal(terminal?.terminalStatus, "completed");
+  const tool = nodes.find((node) => node.kind === "tool");
+  assert.equal(tool?.kind, "tool");
+  assert.equal((tool?.content[0] as Record<string, unknown> | undefined)?.status, "completed");
+});
+
+test("merges repeated terminal updates without dropping prior command metadata", () => {
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-terminal-output",
+        title: "Run git rev-parse",
+        kind: "execute",
+        status: "completed",
+        content: [
+          {
+            type: "terminal",
+            terminalId: "term-output",
+            command: ["git", "rev-parse", "--show-toplevel"],
+            cwd: "/workspace/project"
+          }
+        ]
+      },
+      context
+    )
+  );
+
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tool-terminal-output",
+        content: [
+          {
+            type: "terminal",
+            terminalId: "term-output",
+            stdout: "/workspace/project\n"
+          }
+        ]
+      },
+      context
+    )
+  );
+
+  const terminal = nodes.find((node) => node.kind === "terminal");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.status, "completed");
+  assert.equal(terminal?.terminalStatus, "completed");
+  assert.equal(terminal?.command, "git rev-parse --show-toplevel");
+  assert.equal(terminal?.cwd, "/workspace/project");
+  assert.equal(terminal?.stdout, "/workspace/project\n");
 });
 
 test("merges status-only tool updates without losing the original call details", () => {

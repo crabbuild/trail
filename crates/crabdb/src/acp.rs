@@ -14,6 +14,7 @@ use crate::{CrabDb, Error, PatchDocument, PatchEdit, Result};
 
 const ACP_CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(30);
 const CLAUDE_ACP_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@latest";
+const CODEX_ACP_ADAPTER: &str = "@agentclientprotocol/codex-acp@latest";
 const ACP_MAX_PENDING_EVENTS_PER_TURN: usize = 128;
 const ACP_MAX_ASSISTANT_MESSAGE_BYTES: usize = 256 * 1024;
 const ACP_MAX_ASSISTANT_TOTAL_BYTES: usize = 1024 * 1024;
@@ -35,18 +36,7 @@ pub struct AcpRelayOptions {
 pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
     match agent {
         "claude-code" | "claude" => {
-            let relay_command = vec![
-                "crabdb".to_string(),
-                "acp".to_string(),
-                "relay".to_string(),
-                "--provider".to_string(),
-                "claude-code".to_string(),
-                "--materialize".to_string(),
-                "--".to_string(),
-                "npx".to_string(),
-                "-y".to_string(),
-                CLAUDE_ACP_ADAPTER.to_string(),
-            ];
+            let relay_command = npx_adapter_relay_command("claude-code", CLAUDE_ACP_ADAPTER);
             let npx_available = command_in_path("npx");
             Ok(AcpProviderProfile {
                 agent: "claude-code".to_string(),
@@ -54,20 +44,36 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
                 available: npx_available,
                 relay_command,
                 notes: if npx_available {
-                    vec!["uses the official Claude ACP adapter through npx".to_string()]
+                    vec!["uses the Claude ACP adapter through npx".to_string()]
+                } else {
+                    vec!["`npx` was not found on PATH".to_string()]
+                },
+            })
+        }
+        "codex" | "codex-cli" | "openai-codex" => {
+            let relay_command = npx_adapter_relay_command("codex", CODEX_ACP_ADAPTER);
+            let npx_available = command_in_path("npx");
+            Ok(AcpProviderProfile {
+                agent: "codex".to_string(),
+                display_name: "Codex".to_string(),
+                available: npx_available,
+                relay_command,
+                notes: if npx_available {
+                    vec!["uses the Codex ACP adapter through npx".to_string()]
                 } else {
                     vec!["`npx` was not found on PATH".to_string()]
                 },
             })
         }
         other => Err(Error::InvalidInput(format!(
-            "unsupported ACP agent `{other}`; supported agents: claude-code"
+            "unsupported ACP agent `{other}`; supported agents: {}; use `crabdb acp relay -- <COMMAND>...` for another ACP-compatible agent",
+            supported_acp_agents().join(", ")
         ))),
     }
 }
 
 pub fn acp_provider_profiles() -> Vec<AcpProviderProfile> {
-    ["claude-code"]
+    supported_acp_agents()
         .into_iter()
         .filter_map(|agent| acp_provider_profile(agent).ok())
         .collect()
@@ -83,7 +89,7 @@ pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<Ac
             )))
         }
     };
-    let snippet = acp_editor_snippet(editor, &profile.relay_command);
+    let snippet = acp_editor_snippet(editor, &profile.agent, &profile.relay_command);
     Ok(AcpInstallReport {
         agent: profile.agent,
         editor: editor.to_string(),
@@ -97,6 +103,25 @@ pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<Ac
             profile.notes
         },
     })
+}
+
+fn supported_acp_agents() -> Vec<&'static str> {
+    vec!["claude-code", "codex"]
+}
+
+fn npx_adapter_relay_command(provider: &str, adapter: &str) -> Vec<String> {
+    vec![
+        "crabdb".to_string(),
+        "acp".to_string(),
+        "relay".to_string(),
+        "--provider".to_string(),
+        provider.to_string(),
+        "--materialize".to_string(),
+        "--".to_string(),
+        "npx".to_string(),
+        "-y".to_string(),
+        adapter.to_string(),
+    ]
 }
 
 pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
@@ -198,12 +223,12 @@ fn command_in_path(command: &str) -> bool {
     env::split_paths(&path).any(|dir| dir.join(command).is_file())
 }
 
-fn acp_editor_snippet(editor: &str, relay_command: &[String]) -> String {
+fn acp_editor_snippet(editor: &str, agent: &str, relay_command: &[String]) -> String {
     let command = shell_join(relay_command);
     match editor {
         "zed" => serde_json::to_string_pretty(&serde_json::json!({
             "agent_servers": {
-                "crabdb-claude-code": {
+                (format!("crabdb-{agent}")): {
                     "type": "custom",
                     "command": relay_command.first().cloned().unwrap_or_default(),
                     "args": relay_command.iter().skip(1).cloned().collect::<Vec<_>>()

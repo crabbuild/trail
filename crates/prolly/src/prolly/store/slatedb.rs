@@ -11,7 +11,7 @@ use slatedb::object_store::ObjectStore;
 use slatedb::{Db, WriteBatch};
 use tokio::runtime::{Builder, Runtime};
 
-use super::{BatchOp, Store};
+use super::{BatchOp, OrderedBatchReadPlan, Store};
 
 const NODE_PREFIX: &[u8] = b"node:";
 const HINT_PREFIX: &[u8] = b"hint:";
@@ -182,6 +182,17 @@ impl SlateDbStore {
         context: &'static str,
     ) -> Result<Vec<Option<Vec<u8>>>, SlateDbStoreError> {
         let len = storage_keys.len();
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        if len == 1 {
+            let key = storage_keys.into_iter().next().expect("one key");
+            return self
+                .block_on(async { self.db.get(key).await }, context)
+                .map(|value| vec![value.map(|bytes| bytes.to_vec())]);
+        }
+
         let db = self.db.clone();
         let parallelism = self.read_parallelism;
 
@@ -273,11 +284,28 @@ impl Store for SlateDbStore {
     }
 
     fn batch_get(&self, keys: &[&[u8]]) -> Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
-        let storage_keys = keys.iter().map(|key| node_key(key)).collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        if keys.len() == 1 {
+            let mut results = HashMap::with_capacity(1);
+            if let Some(value) = self.get(keys[0])? {
+                results.insert(keys[0].to_vec(), value);
+            }
+            return Ok(results);
+        }
+
+        let plan = OrderedBatchReadPlan::new(keys);
+        let storage_keys = plan
+            .unique_keys()
+            .iter()
+            .map(|key| node_key(key))
+            .collect::<Vec<_>>();
         let values = self.batch_read_ordered(storage_keys, "failed to read keys in batch")?;
 
-        let mut results = HashMap::with_capacity(keys.len());
-        for (key, value) in keys.iter().zip(values) {
+        let mut results = HashMap::with_capacity(plan.unique_keys().len());
+        for (key, value) in plan.unique_keys().iter().zip(values) {
             if let Some(value) = value {
                 results.insert(key.to_vec(), value);
             }
@@ -286,8 +314,31 @@ impl Store for SlateDbStore {
     }
 
     fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if keys.len() == 1 {
+            return Ok(vec![self.get(keys[0])?]);
+        }
+
+        let plan = OrderedBatchReadPlan::new(keys);
+        let storage_keys = plan
+            .unique_keys()
+            .iter()
+            .map(|key| node_key(key))
+            .collect::<Vec<_>>();
+        let values =
+            self.batch_read_ordered(storage_keys, "failed to read keys in ordered batch")?;
+        Ok(plan.expand_owned(values))
+    }
+
+    fn batch_get_ordered_unique(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
         let storage_keys = keys.iter().map(|key| node_key(key)).collect::<Vec<_>>();
-        self.batch_read_ordered(storage_keys, "failed to read keys in ordered batch")
+        self.batch_read_ordered(storage_keys, "failed to read keys in unique ordered batch")
     }
 
     fn prefers_batch_reads(&self) -> bool {
@@ -402,16 +453,41 @@ mod tests {
 
         store.batch(&ops).unwrap();
 
-        let keys: Vec<&[u8]> = vec![b"c", b"missing", b"a", b"b"];
+        let keys: Vec<&[u8]> = vec![b"c", b"missing", b"a", b"c", b"missing", b"b"];
         assert_eq!(
             store.batch_get_ordered(&keys).unwrap(),
             vec![
                 Some(b"3".to_vec()),
                 None,
                 Some(b"1".to_vec()),
+                Some(b"3".to_vec()),
+                None,
                 Some(b"2".to_vec())
             ]
         );
+    }
+
+    #[test]
+    fn slatedb_store_fast_paths_empty_and_single_batch_reads() {
+        let store = in_memory_store("test_empty_single_batch_reads");
+        let empty: Vec<&[u8]> = Vec::new();
+
+        assert_eq!(store.batch_get_ordered(&empty).unwrap(), Vec::new());
+        assert!(store.batch_get(&empty).unwrap().is_empty());
+
+        store.put(b"a", b"1").unwrap();
+        let existing: Vec<&[u8]> = vec![b"a"];
+        let missing: Vec<&[u8]> = vec![b"missing"];
+
+        assert_eq!(
+            store.batch_get_ordered(&existing).unwrap(),
+            vec![Some(b"1".to_vec())]
+        );
+        assert_eq!(store.batch_get_ordered(&missing).unwrap(), vec![None]);
+
+        let values = store.batch_get(&existing).unwrap();
+        assert_eq!(values.get(b"a".as_slice()), Some(&b"1".to_vec()));
+        assert!(store.batch_get(&missing).unwrap().is_empty());
     }
 
     #[test]

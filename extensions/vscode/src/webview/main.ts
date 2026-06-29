@@ -24,7 +24,7 @@ import {
   X
 } from "lucide";
 import type { ToolCallContent } from "../shared/acpTypes";
-import type { RenderNode } from "../shared/renderModel";
+import type { RenderNode, RenderPatch, ToolPermissionRequest } from "../shared/renderModel";
 import { coordinationSummaryFromSources, type CoordinationSummary } from "../shared/coordinationSummary";
 import { conflictSetIdsFromSources } from "../shared/conflicts";
 import { redactedJson, redactString } from "../shared/securityRedaction";
@@ -32,7 +32,6 @@ import {
   approvalDecisionDescription,
   approvalDecisionTone,
   approvalImpactText,
-  approvalScopeLabel,
   approvalStateLabel,
   approvalTone,
   type ApprovalDecisionTone
@@ -55,6 +54,7 @@ import {
   buildToolActivitySummary,
   filterTimelineNodes,
   isTimelineFilter,
+  sortTimelineNodes,
   TIMELINE_FILTERS,
   timelineSearchTokens,
   timelineFilterCounts,
@@ -75,9 +75,13 @@ import {
 import { buildToolbarModel, type ToolbarAction } from "./toolbarModel";
 import type { MessageCardProps } from "./MessageCard";
 import type { TimelineScrollerItemView, TimelineScrollerProps } from "./TimelineScroller";
-import type { ToolCallCardLocation, ToolCallCardProps } from "./ToolCallCard";
+import type {
+  ToolCallApprovalAction,
+  ToolCallApprovalProps,
+  ToolCallCardLocation,
+  ToolCallCardProps
+} from "./ToolCallCard";
 import type { EmptyStateAction, EmptyStateCardProps } from "./EmptyStateCard";
-import type { ApprovalCardAction, ApprovalCardDisclosure, ApprovalCardProps } from "./ApprovalCard";
 import type { ComposerCardProps } from "./ComposerCard";
 import type { EventCardAction, EventCardFact, EventCardProps } from "./EventCard";
 import type { HeaderBarProps } from "./HeaderBar";
@@ -85,6 +89,16 @@ import type { InlineActionsProps } from "./InlineActions";
 import type { PayloadDisclosureProps } from "./PayloadDisclosure";
 import type { PlanCardProps } from "./PlanCard";
 import type { RawDetailsView } from "./RawDetails";
+import {
+  applyRenderPatchesLocally,
+  changedRenderNodes,
+  isLiveNodePatchPayload,
+  parseBaseRenderRevision,
+  parseRenderRevision,
+  renderPatchBatchDecision,
+  shouldAcceptRenderRevision,
+  type RenderPatchChanges
+} from "./renderPatchModel";
 import type { RecoveryBannerProps } from "./RecoveryBanner";
 import type { ResultDrawerProps, ResultDrawerWidget } from "./ResultDrawer";
 import type { ReviewDrawerProps } from "./ReviewDrawer";
@@ -100,6 +114,7 @@ declare const acquireVsCodeApi: () => {
 };
 
 interface WebviewState {
+  renderRevision?: number | undefined;
   task?: {
     id: string;
     lane: string;
@@ -189,10 +204,10 @@ const MAX_TEXT_CHARS = 60_000;
 const MAX_RAW_JSON_CHARS = 40_000;
 const MAX_INLINE_MEDIA_CHARS = 2_000_000;
 const MAX_TERMINAL_CHARS = 24_000;
-const FLOATING_DETAILS_SELECTOR = ".composer-controls,.header-details,.toolbar-capabilities";
+const FLOATING_DETAILS_SELECTOR = ".composer-controls,.header-details,.toolbar-capabilities,.timeline-toolbar";
 const DRAWER_FOCUSABLE_SELECTOR =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),audio[controls],video[controls],[tabindex]:not([tabindex="-1"])';
-const STREAM_RENDER_INTERVAL_MS = 50;
+const STREAM_RENDER_INTERVAL_MS = 80;
 let highlightModulePromise: Promise<typeof import("./highlight.js")> | undefined;
 let diffModelModulePromise: Promise<typeof import("./diffModel.js")> | undefined;
 let diffEnhancerModulePromise: Promise<typeof import("./diffEnhancer.js")> | undefined;
@@ -200,7 +215,6 @@ let diffReviewDrawerModulePromise: Promise<typeof import("./diffReviewDrawer.js"
 let diffEnhancerModule: typeof import("./diffEnhancer.js") | undefined;
 let markdownModulePromise: Promise<typeof import("./markdownModel.js")> | undefined;
 let markdownModule: typeof import("./markdownModel.js") | undefined;
-let approvalCardModulePromise: Promise<typeof import("./ApprovalCard.js")> | undefined;
 let composerCardModulePromise: Promise<typeof import("./ComposerCard.js")> | undefined;
 let diffCardModulePromise: Promise<typeof import("./DiffCard.js")> | undefined;
 let emptyStateCardModulePromise: Promise<typeof import("./EmptyStateCard.js")> | undefined;
@@ -227,8 +241,9 @@ let renderTimeoutHandle: number | undefined;
 let renderAnimationFrameHandle: number | undefined;
 let renderScheduled = false;
 let lastRenderAt = 0;
+let patchedNodeHydrationFrameHandle: number | undefined;
+const pendingPatchedNodeIds = new Set<string>();
 let pendingDiffPreviews: PendingDiffPreview[] = [];
-let approvalCardProps = new Map<string, ApprovalCardProps>();
 let composerCardProps: ComposerCardProps | undefined;
 let diffCardProps = new Map<string, DiffCardProps>();
 let emptyStateCardProps = new Map<string, EmptyStateCardProps>();
@@ -236,6 +251,7 @@ let eventCardProps = new Map<string, EventCardProps>();
 let headerBarProps: HeaderBarProps | undefined;
 let inlineActionsProps = new Map<string, InlineActionsProps>();
 let messageCardProps = new Map<string, MessageCardProps>();
+let lastUserMessageNodeId: string | undefined;
 let payloadDisclosureProps = new Map<string, PayloadDisclosureProps>();
 let planCardProps = new Map<string, PlanCardProps>();
 let recoveryBannerProps = new Map<string, RecoveryBannerProps>();
@@ -249,6 +265,7 @@ let toolCallCardProps = new Map<string, ToolCallCardProps>();
 let state: WebviewState = {
   nodes: []
 };
+let latestRenderRevision = 0;
 let announcement = "";
 let composerDraft = "";
 let pendingTimelineSearchFocus = false;
@@ -256,6 +273,7 @@ let payloadDisclosureCounter = 0;
 let inlineActionsCounter = 0;
 type ComposerSendMode = "fast" | "draft";
 const COMPOSER_SEND_MODES = new Set<ComposerSendMode>(["fast", "draft"]);
+const HIDDEN = new Set<RenderNode["kind"]>(["commands", "config", "mode", "session", "unknown", "usage"]);
 const COMPOSER_PROMPT_PRESETS: Array<{ id: string; label: string; detail: string; text: string; icon: IconName }> = [
   {
     id: "implement",
@@ -291,6 +309,7 @@ let reviewVisible = false;
 let timelineFilter: TimelineFilter = "all";
 let timelineQuery = "";
 let drawerRestoreFocus: HTMLElement | undefined;
+let renderResyncRequested = false;
 const restoredState = vscode.getState() as
   | { composerDraft?: string; composerSendMode?: unknown; reviewVisible?: boolean; timelineFilter?: unknown; timelineQuery?: unknown }
   | undefined;
@@ -313,7 +332,15 @@ if (typeof restoredState?.timelineQuery === "string") {
 window.addEventListener("message", (event: MessageEvent) => {
   const message = event.data as { type: string; [key: string]: unknown };
   if (message.type === "state") {
+    const renderRevision = parseRenderRevision(message.renderRevision);
+    if (!shouldAcceptRenderRevision(renderRevision, latestRenderRevision)) {
+      return;
+    }
+    if (renderRevision !== undefined) {
+      latestRenderRevision = renderRevision;
+    }
     state = {
+      renderRevision,
       task: message.task as WebviewState["task"],
       taskView: message.taskView,
       taskOverlaps: Array.isArray(message.taskOverlaps) ? (message.taskOverlaps as TaskOverlapView[]) : [],
@@ -338,7 +365,13 @@ window.addEventListener("message", (event: MessageEvent) => {
       announcement = "Prompt running.";
     }
     persistWebviewState();
+
     scheduleRender();
+    return;
+  }
+
+  if (message.type === "renderPatches") {
+    applyRenderPatchMessage(message);
     return;
   }
 
@@ -608,6 +641,7 @@ interface RenderFocusSnapshot {
   selectionEnd?: number | null | undefined;
   searchSelectionStart?: number | null | undefined;
   searchSelectionEnd?: number | null | undefined;
+  hadTimeline: boolean;
   wasPinnedToBottom: boolean;
   previousScrollTop: number;
 }
@@ -618,6 +652,7 @@ interface RenderPass {
 }
 
 function scheduleRender(): void {
+  cancelPatchedNodeHydration();
   if (renderScheduled) {
     return;
   }
@@ -645,6 +680,162 @@ function clearScheduledRender(): void {
   renderScheduled = false;
 }
 
+function applyRenderPatchMessage(message: { [key: string]: unknown }): void {
+  const renderRevision = parseRenderRevision(message.renderRevision);
+  const baseRenderRevision = parseBaseRenderRevision(message.baseRenderRevision);
+  const decision = renderPatchBatchDecision(baseRenderRevision, renderRevision, latestRenderRevision);
+  if (decision === "drop") {
+    return;
+  }
+  if (decision === "resync") {
+    requestRenderStateResync();
+    return;
+  }
+  if (renderRevision === undefined) {
+    return;
+  }
+  const patches = Array.isArray(message.patches) ? (message.patches as RenderPatch[]) : [];
+  if (!patches.length) {
+    return;
+  }
+  const beforeNodes = state.nodes;
+  const beforeById = new Map(beforeNodes.map((node) => [node.id, node]));
+  const nextNodes = applyRenderPatchesLocally(beforeNodes, patches);
+  const changes = changedRenderNodes(beforeById, nextNodes);
+  state = {
+    ...state,
+    renderRevision,
+    nodes: nextNodes,
+    sending: typeof message.sending === "boolean" ? message.sending : state.sending,
+    permissionPending: typeof message.permissionPending === "boolean" ? message.permissionPending : state.permissionPending
+  };
+  latestRenderRevision = renderRevision;
+  if (state.permissionPending) {
+    announcement = "Permission request pending.";
+  } else if (state.sending) {
+    announcement = "Prompt running.";
+  }
+  persistWebviewState();
+  if (canHydratePatchedNodes(patches, changes)) {
+    schedulePatchedNodeHydration(changes.changedNodeIds);
+    return;
+  }
+  scheduleRender();
+}
+
+function requestRenderStateResync(): void {
+  if (renderResyncRequested) {
+    return;
+  }
+  renderResyncRequested = true;
+  vscode.postMessage({ type: "refresh" });
+  window.setTimeout(() => {
+    renderResyncRequested = false;
+  }, 250);
+}
+
+function canHydratePatchedNodes(
+  patches: RenderPatch[],
+  changes: RenderPatchChanges
+): boolean {
+  if (!existingShellCanHydrate() || renderScheduled || state.providerFailure) {
+    return false;
+  }
+  if (timelineSearchTokens(timelineQuery).length) {
+    return false;
+  }
+  if (changes.addedNodeIds.size || changes.removedNodeIds.size) {
+    return false;
+  }
+  if (!patches.every(isLiveNodePatchPayload)) {
+    return false;
+  }
+  return [...changes.changedNodeIds].every((id) => {
+    const node = state.nodes.find((candidate) => candidate.id === id);
+    return Boolean(
+      node &&
+        (node.kind === "message" ||
+          node.kind === "thought" ||
+          node.kind === "plan" ||
+          node.kind === "tool" ||
+          node.kind === "diff" ||
+          node.kind === "terminal")
+    );
+  });
+}
+
+function schedulePatchedNodeHydration(nodeIds: Set<string>): void {
+  for (const nodeId of nodeIds) {
+    pendingPatchedNodeIds.add(nodeId);
+  }
+  if (patchedNodeHydrationFrameHandle !== undefined) {
+    return;
+  }
+  patchedNodeHydrationFrameHandle = window.requestAnimationFrame(() => {
+    patchedNodeHydrationFrameHandle = undefined;
+    void hydratePatchedNodes();
+  });
+}
+
+async function hydratePatchedNodes(): Promise<void> {
+  if (!pendingPatchedNodeIds.size) {
+    return;
+  }
+  if (!existingShellCanHydrate()) {
+    pendingPatchedNodeIds.clear();
+    scheduleRender();
+    return;
+  }
+  const nodeIds = [...pendingPatchedNodeIds];
+  pendingPatchedNodeIds.clear();
+  const visibleIds = new Set(visibleTimelineNodes().map((node) => node.id));
+  let needsFullRender = false;
+  let needsDiffHydration = false;
+  for (const nodeId of nodeIds) {
+    if (!visibleIds.has(nodeId)) {
+      continue;
+    }
+    const node = state.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node) {
+      needsFullRender = true;
+      continue;
+    }
+    const previousDiffPreviewCount = pendingDiffPreviews.length;
+    if (
+      node.kind === "message" ||
+      node.kind === "thought" ||
+      node.kind === "plan" ||
+      node.kind === "tool" ||
+      node.kind === "diff" ||
+      node.kind === "terminal"
+    ) {
+      renderNode(node);
+      needsDiffHydration ||= pendingDiffPreviews.length > previousDiffPreviewCount;
+    } else {
+      needsFullRender = true;
+    }
+  }
+  if (needsFullRender) {
+    scheduleRender();
+    return;
+  }
+  await hydrateReactIslands();
+  window.requestAnimationFrame(() => {
+    void highlightCodeBlocks();
+    if (needsDiffHydration) {
+      void hydrateDiffPreviews(++diffRenderEpoch).then(hydrateInlineActions);
+    }
+  });
+}
+
+function cancelPatchedNodeHydration(): void {
+  pendingPatchedNodeIds.clear();
+  if (patchedNodeHydrationFrameHandle !== undefined) {
+    window.cancelAnimationFrame(patchedNodeHydrationFrameHandle);
+    patchedNodeHydrationFrameHandle = undefined;
+  }
+}
+
 function captureRenderFocus(): RenderFocusSnapshot {
   const active = document.activeElement as HTMLTextAreaElement | HTMLInputElement | null;
   const composerFocused = Boolean(active?.classList.contains("composer-input"));
@@ -654,6 +845,7 @@ function captureRenderFocus(): RenderFocusSnapshot {
   const searchSelectionStart = timelineSearchFocused ? active?.selectionStart : undefined;
   const searchSelectionEnd = timelineSearchFocused ? active?.selectionEnd : undefined;
   const oldTimeline = document.querySelector<HTMLElement>(".timeline");
+  const hadTimeline = Boolean(oldTimeline);
   const wasPinnedToBottom = oldTimeline
     ? oldTimeline.scrollHeight - oldTimeline.scrollTop - oldTimeline.clientHeight < 48
     : true;
@@ -666,6 +858,7 @@ function captureRenderFocus(): RenderFocusSnapshot {
     selectionEnd,
     searchSelectionStart,
     searchSelectionEnd,
+    hadTimeline,
     wasPinnedToBottom,
     previousScrollTop
   };
@@ -673,7 +866,6 @@ function captureRenderFocus(): RenderFocusSnapshot {
 
 function prepareRenderProps(visibleNodes: RenderNode[]): RenderPass {
   pendingDiffPreviews = [];
-  approvalCardProps = new Map<string, ApprovalCardProps>();
   composerCardProps = undefined;
   diffCardProps = new Map<string, DiffCardProps>();
   emptyStateCardProps = new Map<string, EmptyStateCardProps>();
@@ -681,6 +873,8 @@ function prepareRenderProps(visibleNodes: RenderNode[]): RenderPass {
   headerBarProps = undefined;
   inlineActionsProps = new Map<string, InlineActionsProps>();
   messageCardProps = new Map<string, MessageCardProps>();
+  const lastUserMessage = visibleNodes.filter((n): n is Extract<RenderNode, { kind: "message" }> => n.kind === "message" && (n as Extract<RenderNode, { kind: "message" }>).role === "user").at(-1);
+  lastUserMessageNodeId = lastUserMessage?.id;
   payloadDisclosureProps = new Map<string, PayloadDisclosureProps>();
   planCardProps = new Map<string, PlanCardProps>();
   recoveryBannerProps = new Map<string, RecoveryBannerProps>();
@@ -712,17 +906,15 @@ function render(): void {
   const visibleNodes = visibleTimelineNodes();
   const focus = captureRenderFocus();
   const pass = prepareRenderProps(visibleNodes);
-  const headerHtml = header(task);
   const timelineNavigationHtml = timelineNavigation(visibleNodes);
+  const headerHtml = header(task, timelineNavigationHtml);
   const composerHtml = composer();
   const reviewHtml = reviewVisible ? reviewDrawer(task) : "";
   app.innerHTML = `
     <section class="shell ${reviewVisible ? "review-open" : ""}">
       <div class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-live-announcement>${escapeHtml(announcement)}</div>
-      ${skipLinks()}
       ${headerHtml}
       <section class="timeline-shell" aria-label="Transcript workspace">
-        ${timelineNavigationHtml}
         <div class="timeline-scroller-root" data-timeline-scroller-root></div>
       </section>
       ${composerHtml}
@@ -744,8 +936,8 @@ function renderStateUpdate(): void {
   const visibleNodes = visibleTimelineNodes();
   const focus = captureRenderFocus();
   const pass = prepareRenderProps(visibleNodes);
-  header(task);
   timelineNavigation(visibleNodes);
+  header(task);
   composer();
   if (reviewVisible) {
     reviewDrawer(task);
@@ -796,7 +988,7 @@ function hydrateExistingShell(pass: RenderPass, focus: RenderFocusSnapshot): voi
       return;
     }
     const timeline = document.querySelector<HTMLElement>(".timeline");
-    if (timeline) {
+    if (timeline && focus.hadTimeline) {
       timeline.scrollTop = focus.wasPinnedToBottom ? timeline.scrollHeight : focus.previousScrollTop;
     }
     await hydrateReactIslands();
@@ -823,9 +1015,9 @@ function syncLiveAnnouncement(): void {
 function skipLinks(): string {
   return `
     <nav class="skip-links" aria-label="Chat landmarks">
-      <a href="#timeline">Transcript</a>
-      <a href="#composer">Composer</a>
-      ${reviewVisible ? `<a href="#review">Review</a>` : `<button data-action="toggleReview">Review</button>`}
+      <a href="#timeline" aria-keyshortcuts="Alt+1">Transcript</a>
+      <a href="#composer" aria-keyshortcuts="Alt+2">Composer</a>
+      ${reviewVisible ? `<a href="#review" aria-keyshortcuts="Alt+3">Review</a>` : `<button data-action="toggleReview" aria-keyshortcuts="Alt+3">Review</button>`}
       <span aria-hidden="true">Alt+1/2/3</span>
     </nav>
   `;
@@ -994,17 +1186,6 @@ async function hydrateEventCards(): Promise<void> {
   });
 }
 
-async function hydrateApprovalCards(): Promise<void> {
-  if (!document.querySelector("[data-approval-card-root]")) {
-    return;
-  }
-  approvalCardModulePromise ??= import("./ApprovalCard.js");
-  const module = await approvalCardModulePromise;
-  module.mountApprovalCards({
-    getProps: (nodeId) => approvalCardProps.get(nodeId)
-  });
-}
-
 async function hydrateTerminalCards(): Promise<void> {
   if (!document.querySelector("[data-terminal-card-root]")) {
     return;
@@ -1074,7 +1255,6 @@ async function hydrateTimelineScroller(): Promise<void> {
 async function hydrateReactIslands(): Promise<void> {
   await hydrateTimelineGroups();
   await Promise.all([
-    hydrateApprovalCards(),
     hydrateDiffCards(),
     hydrateEmptyStateCards(),
     hydrateEventCards(),
@@ -1183,7 +1363,7 @@ function timelineScrollerItems(nodes: RenderNode[]): TimelineScrollerItemView[] 
   return items;
 }
 
-function header(task: WebviewState["task"]): string {
+function header(task: WebviewState["task"], timelineNavigationHtml = ""): string {
   const status = task?.status || "new";
   const showStatusPill = !["new", "ready"].includes(status);
   const changed = task?.changedPaths?.length || 0;
@@ -1226,6 +1406,7 @@ function header(task: WebviewState["task"]): string {
     detailsIconHtml: iconSvg("tool"),
     capabilitiesIconHtml: iconSvg("tool"),
     primaryActionIconHtml: iconSvg(toolbarActionIcon(toolbar.primaryAction.action)),
+    laneMap: timelineNavigationProps,
     inspectActions: [
       {
         action: "toggleReview",
@@ -1246,7 +1427,9 @@ function header(task: WebviewState["task"]): string {
   };
   return `
     <header class="chat-header">
+      ${skipLinks()}
       <div class="header-bar-react-root" data-header-bar-root data-header-bar-id="header"></div>
+      ${timelineNavigationHtml}
     </header>
   `;
 }
@@ -1285,20 +1468,22 @@ function contextUsageGauge(usage: Extract<RenderNode, { kind: "usage" }> | undef
 }
 
 function timelineNavigation(visibleNodes: RenderNode[]): string {
-  const counts = timelineFilterCounts(state.nodes);
+  const transcriptNodes = chatNodes(state.nodes);
+  const counts = timelineFilterCounts(transcriptNodes);
   const queryTokens = timelineSearchTokens(timelineQuery);
   const filtered = timelineFilter !== "all" || queryTokens.length > 0;
   const queryDetail = queryTokens.length ? ` matching ${queryTokens.join(" + ")}` : "";
-  const allGroups = timelineGroups(state.nodes);
+  const allGroups = timelineGroups(transcriptNodes);
   const visibleGroups = timelineGroups(visibleNodes);
   const task = state.task;
   const lane = task?.lane || visibleNodes[0]?.lane || "pending";
   const sessionId = state.acpSessionId || state.persistedAcpSessionId || visibleNodes.find((node) => node.acpSessionId)?.acpSessionId;
-  const messageCount = state.nodes.filter((node) => node.kind === "message").length;
-  const toolCount = state.nodes.filter((node) => node.kind === "tool").length;
+  const messageCount = transcriptNodes.filter((node) => node.kind === "message").length;
+  const toolCount = transcriptNodes.filter((node) => node.kind === "tool").length;
   const activity = buildToolActivitySummary(visibleNodes);
   const turnGroups = allGroups.filter((group) => group.turnId);
   const visibleTurnGroups = visibleGroups.filter((group) => group.turnId);
+  const lifecycleChip = timelineLifecycleChip(transcriptNodes);
   timelineNavigationProps = {
     id: "timeline",
     filters: TIMELINE_FILTERS.map((filter) => ({
@@ -1318,6 +1503,7 @@ function timelineNavigation(visibleNodes: RenderNode[]): string {
     chips: [
       { id: "lane", label: `Lane ${shortLabel(lane)}`, iconHtml: iconSvg("lane"), active: true },
       { id: "session", label: `Session ${sessionId ? shortLabel(sessionId) : "new"}`, iconHtml: iconSvg("session") },
+      ...(lifecycleChip ? [lifecycleChip] : []),
       { id: "turns", label: `${turnGroups.length} turn${turnGroups.length === 1 ? "" : "s"}`, iconHtml: iconSvg("turn") },
       { id: "messages", label: `${messageCount} message${messageCount === 1 ? "" : "s"}`, iconHtml: iconSvg("message") },
       { id: "tools", label: `${toolCount} tool${toolCount === 1 ? "" : "s"}`, iconHtml: iconSvg("tool") }
@@ -1334,6 +1520,31 @@ function timelineNavigation(visibleNodes: RenderNode[]): string {
     })
   };
   return `<div class="timeline-navigation-react-root" data-timeline-navigation-root data-timeline-navigation-id="timeline"></div>`;
+}
+
+function timelineLifecycleChip(nodes: RenderNode[]): { id: string; label: string; iconHtml: string; active?: boolean } | undefined {
+  const liveCount = nodes.filter((node) => node.status === "pending" || node.status === "in_progress").length;
+  if (state.sending || liveCount) {
+    const checkpointPending = nodes.some((node) => node.kind === "completion" && node.checkpointPending);
+    if (!state.sending && checkpointPending) {
+      return { id: "stream", label: "Checkpoint pending", iconHtml: iconSvg("check") };
+    }
+    return {
+      id: "stream",
+      label: liveCount ? `Streaming ${liveCount}` : "Streaming",
+      iconHtml: iconSvg("message"),
+      active: true
+    };
+  }
+  const completion = [...nodes].reverse().find((node) => node.kind === "completion");
+  if (completion) {
+    return {
+      id: "stream",
+      label: completion.status === "cancelled" ? "Cancelled" : completion.status === "failed" ? "Stopped" : "Completed",
+      iconHtml: completion.status === "completed" ? iconSvg("check") : iconSvg("diagnostics")
+    };
+  }
+  return undefined;
 }
 
 function emptyTimeline(): string {
@@ -1444,7 +1655,12 @@ function renderTimeline(nodes: RenderNode[]): TimelineScrollerItemView[] {
 function renderTimelineGroup(group: TimelineGroup, index: number, total: number): TimelineScrollerItemView {
   const open = shouldOpenTimelineGroup(group, index, total);
   const id = timelineGroupDomId(group);
-  const bodyHtml = group.nodes.map(renderNode).join("");
+  const bodyItems = group.nodes.map((node) => ({
+    id: node.id,
+    className: `timeline-group-body-item timeline-group-body-item-${escapeClass(node.kind)}`,
+    html: renderNode(node),
+    preserveDom: true
+  }));
   timelineGroupProps.set(id, {
     id,
     label: group.label,
@@ -1453,14 +1669,15 @@ function renderTimelineGroup(group: TimelineGroup, index: number, total: number)
     statusLabel: toolStatusLabel(group.status),
     laneLabel: shortLabel(group.lane),
     iconHtml: iconSvg(group.turnId ? "turn" : "session"),
-    bodyHtml,
+    bodyItems,
     open
   });
   return {
     id,
     className: `timeline-scroller-row-group timeline-scroller-row-${escapeClass(group.status)}`,
     scrollAnchor: Boolean(group.turnId),
-    html: `<div id="${id}" class="timeline-group timeline-group-${escapeClass(group.status)}" data-timeline-group-root data-timeline-group-id="${escapeHtml(id)}"></div>`
+    preserveDom: true,
+    html: `<div id="${id}" class="timeline-group" data-timeline-group-root data-timeline-group-id="${escapeHtml(id)}"></div>`
   };
 }
 
@@ -1494,7 +1711,7 @@ function timelineGroups(nodes: RenderNode[]): TimelineGroup[] {
     group.sessionId = group.sessionId || node.acpSessionId;
   }
   groups.forEach((group) => {
-    group.label = group.turnId ? `Turn ${turnSequenceLabel(group.index, groups)}` : "Session events";
+    group.label = group.turnId ? `Turn ${turnSequenceLabel(group.index, groups)}` : "Task updates";
     group.detail = timelineGroupDetail(group);
   });
   return groups;
@@ -1504,8 +1721,8 @@ function timelineGroupDetail(group: TimelineGroup): string {
   const messages = group.nodes.filter((node) => node.kind === "message").length;
   const tools = group.nodes.filter((node) => node.kind === "tool").length;
   const diffs = group.nodes.filter((node) => node.kind === "diff").length;
-  const approvals = group.nodes.filter((node) => node.kind === "approval").length;
-  const events = group.nodes.length - messages - tools - diffs - approvals;
+  const approvals = group.nodes.filter((node) => node.kind === "approval" || (node.kind === "tool" && node.permission)).length;
+  const events = group.nodes.filter((node) => node.kind !== "message" && node.kind !== "tool" && node.kind !== "diff" && node.kind !== "approval").length;
   const parts = [
     countLabel(messages, "message"),
     countLabel(tools, "tool"),
@@ -1594,14 +1811,16 @@ function renderNode(node: RenderNode): string {
 }
 
 function messageNode(node: Extract<RenderNode, { kind: "message" }>): string {
+  const isSticky = node.role === "user" && node.id === lastUserMessageNodeId;
   messageCardProps.set(node.id, {
     nodeId: node.id,
     role: node.role,
     streaming: node.streaming,
-    contentHtml: renderContentBlocks(node.content)
+    contentHtml: renderContentBlocks(node.content),
+    isSticky
   });
   return `
-    <article id="${nodeDomId(node.id)}" class="turn-card message ${node.role}">
+    <article id="${nodeDomId(node.id)}" class="turn-card message ${node.role}${isSticky ? " sticky-last-user" : ""}">
       <div class="rail"></div>
       <div class="card-body" data-message-card-root data-message-node-id="${escapeHtml(node.id)}"></div>
     </article>
@@ -1655,6 +1874,7 @@ function thoughtNode(node: Extract<RenderNode, { kind: "thought" }>): string {
 }
 
 type ToolNodeView = Extract<RenderNode, { kind: "tool" }>;
+type ApprovalNodeView = Extract<RenderNode, { kind: "approval" }>;
 
 function toolNode(node: ToolNodeView): string {
   const model = buildToolPresentation({
@@ -1667,6 +1887,9 @@ function toolNode(node: ToolNodeView): string {
     rawOutput: node.rawOutput,
     source: node.source
   });
+  const approval = toolApprovalProps(node, model);
+  const cardModel = approval ? toolCardModelWithApproval(model, node.permission) : model;
+  const displayStatus = toolDisplayStatus(node);
   const terminal = model.kind === "execute";
   const title = terminal ? "Bash" : model.title;
   const subtitle = terminal ? terminalToolIntent(node, model) : model.summary;
@@ -1675,7 +1898,9 @@ function toolNode(node: ToolNodeView): string {
     ? terminalToolPreview(node, model)
     : node.content.length
       ? node.content.map((item) => renderToolContent(item, node, model.kind)).join("")
-      : `<p class="muted">${escapeHtml(model.emptyText)}</p>`;
+      : node.permission
+        ? ""
+        : `<p class="muted tool-empty-state">${escapeHtml(model.emptyText)}</p>`;
   const rawDetails = !terminal && (node.rawInput || node.rawOutput)
     ? rawDetailsView(`${node.id}-raw`, { input: node.rawInput, output: node.rawOutput })
     : undefined;
@@ -1684,18 +1909,92 @@ function toolNode(node: ToolNodeView): string {
     rawToolKind: node.toolKind,
     title,
     subtitle,
-    status: node.toolStatus,
+    status: displayStatus,
     terminal,
     readPreview,
-    model,
+    model: cardModel,
     stats: model.stats,
     facts: model.facts,
     actions: model.actions,
     locations: node.locations.map(toolCallCardLocation),
     contentHtml,
-    rawDetails
+    rawDetails,
+    approval
   });
-  return `<article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(model.kind)} tool-risk-${escapeClass(model.riskTone)}${terminal ? " terminal-tool" : ""}" data-raw-tool-kind="${escapeHtml(node.toolKind)}"><div class="rail"></div><div class="tool-call-react-root" data-tool-call-card-root data-tool-node-id="${escapeHtml(node.id)}"></div></article>`;
+  return `<article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(model.kind)} tool-risk-${escapeClass(cardModel.riskTone)}${approval ? " tool-permission" : ""}${terminal ? " terminal-tool" : ""}" data-raw-tool-kind="${escapeHtml(node.toolKind)}"><div class="rail"></div><div class="tool-call-react-root" data-tool-call-card-root data-tool-node-id="${escapeHtml(node.id)}"></div></article>`;
+}
+
+function toolDisplayStatus(node: ToolNodeView): string {
+  if (node.permission?.status === "cancelled" || node.permission?.status === "failed") {
+    return node.permission.status;
+  }
+  return node.toolStatus;
+}
+
+function toolCardModelWithApproval(
+  model: ToolPresentation,
+  permission: ToolPermissionRequest | undefined
+): ToolPresentation {
+  if (!permission) {
+    return model;
+  }
+  if (permission.status === "pending") {
+    return {
+      ...model,
+      riskTone: model.riskTone === "risk" ? "risk" : "warning",
+      riskLabel: "Needs approval",
+      statusLabel: approvalStateLabel(permission.status)
+    };
+  }
+  if (permission.status === "cancelled" || permission.status === "failed") {
+    return {
+      ...model,
+      riskTone: "risk",
+      riskLabel: approvalStateLabel(permission.status),
+      statusLabel: approvalStateLabel(permission.status)
+    };
+  }
+  return {
+    ...model,
+    statusLabel: approvalStateLabel(permission.status)
+  };
+}
+
+function toolApprovalProps(
+  node: ToolNodeView,
+  model: ToolPresentation
+): ToolCallApprovalProps | undefined {
+  const permission = node.permission;
+  if (!permission) {
+    return undefined;
+  }
+  const resolved = permission.status !== "pending";
+  const locationCount = (node.locations || []).length;
+  const tone = approvalTone({ status: permission.status, toolKind: model.kind });
+  const decisionOptions = resolved ? [] : permission.options.filter((option) => !isRejectPermissionOption(option));
+  const resolvedNote =
+    permission.status === "completed"
+      ? "Allowed."
+      : permission.status === "failed"
+        ? "Permission failed."
+        : "Rejected.";
+
+  return {
+    requestId: permission.requestId,
+    status: permission.status,
+    statusLabel: approvalStateLabel(permission.status),
+    tone,
+    resolved,
+    title: permission.title || "Permission required",
+    resolvedNote,
+    impactText: approvalImpactText(model.kind, locationCount),
+    actions: resolved
+      ? []
+      : [
+          ...decisionOptions.map((option) => approvalOptionAction(option, permission.status, model.kind)),
+          approvalRejectAction(permission.status)
+        ]
+  };
 }
 
 function toolCallCardLocation(location: { path?: string | undefined; line?: number | null | undefined }): ToolCallCardLocation {
@@ -1760,121 +2059,50 @@ function terminalNode(node: Extract<RenderNode, { kind: "terminal" }>): string {
 }
 
 function approvalNode(node: Extract<RenderNode, { kind: "approval" }>): string {
-  const resolved = node.status !== "pending";
-  const locations = node.tool.locations || [];
-  const stateLabel = approvalStateLabel(node.status);
-  const toolModel = buildToolPresentation({
-    title: node.tool.title,
-    toolKind: node.tool.toolKind,
-    toolStatus: node.tool.toolStatus,
-    locations: node.tool.locations,
-    content: node.tool.content,
-    rawInput: node.tool.rawInput,
-    rawOutput: node.tool.rawOutput,
-    source: node.tool.source
-  });
-  const tone = approvalTone({ status: node.status, toolKind: toolModel.kind });
-  const actionTitle = node.tool.title || node.title;
-  const scope = approvalScopeLabel(locations.length, node.lane);
-  const provider = node.provider || state.provider || "provider";
-  const summaryDetail = [actionTitle, scope].filter(Boolean).join(" · ");
-  const decisionOptions = resolved ? [] : node.options.filter((option) => !isRejectPermissionOption(option));
-  const resolvedNote =
-    node.status === "completed"
-      ? `${toolModel.operationLabel} allowed for ${scope} from ${provider}.`
-      : node.status === "failed"
-        ? `${toolModel.operationLabel} permission failed for ${scope}.`
-        : `${toolModel.operationLabel} was not allowed for ${scope}.`;
-  approvalCardProps.set(node.id, {
-    nodeId: node.id,
-    requestId: node.requestId,
+  return toolNode(approvalAsToolNode(node));
+}
+
+function approvalAsToolNode(node: ApprovalNodeView): ToolNodeView {
+  const permission = permissionFromApproval(node);
+  const toolStatus =
+    node.status === "cancelled" || node.status === "failed"
+      ? node.status
+      : node.tool.toolStatus;
+  return {
+    ...node.tool,
+    id: node.id,
+    taskId: node.taskId,
+    lane: node.lane,
+    turnId: node.turnId,
+    acpSessionId: node.acpSessionId,
+    provider: node.provider,
+    source: node.source,
     status: node.status,
-    statusLabel: stateLabel,
-    tone,
-    resolved,
-    summaryIconHtml: iconSvg(resolved ? (node.status === "completed" ? "check" : "stop") : "review"),
-    title: resolved ? `Permission ${stateLabel.toLowerCase()}` : "Permission required",
-    detail: summaryDetail,
-    resolvedNote,
-    impactText: approvalImpactText(toolModel.kind, locations.length),
-    meta: [
-      { iconHtml: iconSvg(toolModel.icon as IconName), label: toolModel.operationLabel },
-      { label: scope },
-      { label: provider }
-    ],
-    locationsHtml: approvalLocations(locations),
-    preview: approvalToolPreview(node, toolModel.kind),
-    requestDetails: approvalRequestDetails(node.requestId, provider, toolModel.operationLabel, scope, node.raw),
-    actions: resolved
-      ? []
-      : [
-          ...decisionOptions.map((option) => approvalOptionAction(option, node.status, toolModel.kind)),
-          approvalRejectAction(node.status)
-        ]
-  });
-
-  return `
-    <article id="${nodeDomId(node.id)}" class="turn-card approval approval-${escapeClass(node.status)} approval-tone-${tone}">
-      <div class="rail"></div>
-      <div class="approval-card-react-root" data-approval-card-root data-approval-node-id="${escapeHtml(node.id)}"></div>
-    </article>
-  `;
-}
-
-function approvalLocations(locations: Array<{ path?: string | undefined; line?: number | null | undefined }>): string {
-  if (!locations.length) {
-    return `<p class="approval-muted">No file scope was reported. Review the preview before deciding.</p>`;
-  }
-  const locationList = locations
-    .slice(0, 5)
-    .map((loc) => locationChip(String(loc.path || ""), typeof loc.line === "number" ? loc.line : undefined))
-    .join("");
-  const remaining = locations.length > 5 ? `<span>${locations.length - 5} more</span>` : "";
-  return `<div class="chips approval-locations" aria-label="Affected locations">${locationList}${remaining}</div>`;
-}
-
-function approvalToolPreview(
-  node: Extract<RenderNode, { kind: "approval" }>,
-  toolKind: ToolPresentation["kind"]
-): ApprovalCardDisclosure | undefined {
-  if (!node.tool.content.length) {
-    return undefined;
-  }
-  const count = node.tool.content.length;
-  return {
-    id: "approval-preview",
-    title: "Preview",
-    meta: `${count} block${count === 1 ? "" : "s"}`,
-    className: "approval-preview approval-section",
-    contentClassName: "tool-content approval-tool-content",
-    contentHtml: node.tool.content.map((content) => renderToolContent(content, node.tool, toolKind)).join(""),
-    defaultOpen: true
+    createdAt: node.createdAt || node.tool.createdAt,
+    updatedAt: node.updatedAt,
+    toolStatus,
+    permission
   };
 }
 
-function approvalRequestDetails(
-  requestId: string,
-  provider: string,
-  operation: string,
-  scope: string,
-  raw: unknown
-): ApprovalCardDisclosure {
-  return {
-    id: "approval-request-details",
-    title: "Request details",
-    className: "approval-request-details",
-    contentClassName: "approval-request-content",
-    contentHtml: `
-      <dl class="approval-detail-list">
-        <div><dt>Provider</dt><dd>${escapeHtml(provider)}</dd></div>
-        <div><dt>Kind</dt><dd>${escapeHtml(operation)}</dd></div>
-        <div><dt>Scope</dt><dd>${escapeHtml(scope)}</dd></div>
-        <div><dt>Request</dt><dd>${escapeHtml(shortLabel(requestId))}</dd></div>
-      </dl>
-      ${rawDetails(raw)}
-    `,
-    defaultOpen: false
+function permissionFromApproval(node: ApprovalNodeView): ToolPermissionRequest {
+  const permission: ToolPermissionRequest = {
+    requestId: node.requestId,
+    title: node.title,
+    status: node.status,
+    options: node.options,
+    raw: node.raw
   };
+  if (node.provider) {
+    permission.provider = node.provider;
+  }
+  if (node.createdAt) {
+    permission.createdAt = node.createdAt;
+  }
+  if (node.updatedAt) {
+    permission.updatedAt = node.updatedAt;
+  }
+  return permission;
 }
 
 function isRejectPermissionOption(option: { optionId: string; label: string }): boolean {
@@ -1886,9 +2114,12 @@ function approvalOptionAction(
   option: { optionId: string; label: string; description?: string | undefined },
   status: string,
   toolKind: ToolPresentation["kind"]
-): ApprovalCardAction {
-  const label = String(option.label || option.optionId || "Allow");
-  const description = String(option.description || "").trim() || approvalDecisionDescription(toolKind);
+): ToolCallApprovalAction {
+  const rawLabel = String(option.label || option.optionId || "Allow").trim();
+  const value = `${rawLabel} ${option.optionId}`.toLowerCase();
+  const allows = value.includes("allow") || value.includes("approve");
+  const label = allows ? (value.includes("always") ? "Always allow" : "Allow") : shortLabel(rawLabel || option.optionId);
+  const description = String(option.description || rawLabel || "").trim() || approvalDecisionDescription(toolKind);
   const tone = approvalDecisionTone({ status, toolKind });
   return {
     kind: "approve",
@@ -1896,24 +2127,18 @@ function approvalOptionAction(
     label,
     description,
     tone,
-    iconHtml: iconSvg(approvalDecisionIcon(tone)),
     disabled: status !== "pending"
   };
 }
 
-function approvalRejectAction(status: string): ApprovalCardAction {
+function approvalRejectAction(status: string): ToolCallApprovalAction {
   return {
     kind: "reject",
     label: "Reject",
     description: "Do not allow this action.",
     tone: "risk",
-    iconHtml: iconSvg("stop"),
     disabled: status !== "pending"
   };
-}
-
-function approvalDecisionIcon(tone: ApprovalDecisionTone): IconName {
-  return tone === "primary" ? "check" : tone === "risk" ? "diagnostics" : tone === "warning" ? "review" : "tool";
 }
 
 function checkpointNode(node: Extract<RenderNode, { kind: "checkpoint" }>): string {
@@ -1921,6 +2146,7 @@ function checkpointNode(node: Extract<RenderNode, { kind: "checkpoint" }>): stri
     id: node.id,
     className: "checkpoint",
     rail: "rail-dot",
+    variant: "checkpoint",
     presentation: buildEventPresentation({
       kind: "checkpoint",
       label: node.label,
@@ -2075,7 +2301,8 @@ function auditEventNode({
   rail = "",
   meterHtml = "",
   contentHtml = "",
-  rawDetails
+  rawDetails,
+  variant
 }: {
   id: string;
   className: string;
@@ -2085,6 +2312,7 @@ function auditEventNode({
   meterHtml?: string | undefined;
   contentHtml?: string | undefined;
   rawDetails?: RawDetailsView | undefined;
+  variant?: EventCardProps["variant"] | undefined;
 }): string {
   eventCardProps.set(id, {
     nodeId: id,
@@ -2099,7 +2327,9 @@ function auditEventNode({
     actions: eventCardActions(presentation.actions || []),
     meterHtml,
     contentHtml,
-    rawDetails
+    rawDetails,
+    variant,
+    defaultOpen: presentation.openByDefault
   });
   return `<article id="${nodeDomId(id)}" class="turn-card ${escapeHtml(className)} audit-event-node"><div class="rail ${escapeHtml(rail)}"></div><div class="event-card-react-root" data-event-card-root data-event-node-id="${escapeHtml(id)}"></div></article>`;
 }
@@ -5045,7 +5275,50 @@ function locationChip(locationPath: string, line?: number): string {
 }
 
 function visibleTimelineNodes(): RenderNode[] {
-  return filterTimelineNodes(state.nodes, timelineFilter, timelineQuery);
+  const filtered = filterTimelineNodes(chatNodes(state.nodes), timelineFilter, timelineQuery);
+  return sortTimelineNodes(filtered);
+}
+
+function chatNodes(nodes: RenderNode[]): RenderNode[] {
+  const visible = nodes.filter((node) => !HIDDEN.has(node.kind));
+  const approvalsByTool = approvalsByToolCallId(visible);
+  const visibleToolIds = new Set(
+    visible
+      .filter((node): node is ToolNodeView => node.kind === "tool")
+      .map((node) => node.toolCallId)
+  );
+  return visible.flatMap<RenderNode>((node) => {
+    if (node.kind === "tool") {
+      const approval = approvalsByTool.get(node.toolCallId);
+      return [approval ? { ...node, permission: permissionFromApproval(approval) } : node];
+    }
+    if (node.kind === "approval") {
+      const toolCallId = approvalToolCallId(node);
+      if (toolCallId && visibleToolIds.has(toolCallId)) {
+        return [];
+      }
+      return [approvalAsToolNode(node)];
+    }
+    return [node];
+  });
+}
+
+function approvalsByToolCallId(nodes: RenderNode[]): Map<string, ApprovalNodeView> {
+  const approvals = new Map<string, ApprovalNodeView>();
+  for (const node of nodes) {
+    if (node.kind !== "approval") {
+      continue;
+    }
+    const toolCallId = approvalToolCallId(node);
+    if (toolCallId) {
+      approvals.set(toolCallId, node);
+    }
+  }
+  return approvals;
+}
+
+function approvalToolCallId(node: ApprovalNodeView): string {
+  return node.tool.toolCallId;
 }
 
 function currentConfigOptions(): Array<Record<string, unknown>> {

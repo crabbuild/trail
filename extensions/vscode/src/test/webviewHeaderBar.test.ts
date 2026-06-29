@@ -20,6 +20,38 @@ function baseProps(overrides: Partial<HeaderBarProps> = {}): HeaderBarProps {
     detailsIconHtml: iconHtml,
     capabilitiesIconHtml: iconHtml,
     primaryActionIconHtml: iconHtml,
+    laneMap: {
+      id: "timeline",
+      visibleCount: 5,
+      visibleGroups: 2,
+      mapIconHtml: iconHtml,
+      activityIconHtml: iconHtml,
+      chips: [
+        { id: "lane", label: "Lane agent-1", iconHtml, active: true },
+        { id: "session", label: "Session session-1", iconHtml }
+      ],
+      activity: {
+        total: 3,
+        label: "Tool activity",
+        detail: "2 edits / 1 command",
+        tone: "warning",
+        metrics: [
+          { label: "Changes", value: "2", tone: "warning" },
+          { label: "Commands", value: "1", tone: "active" }
+        ],
+        paths: [
+          {
+            path: "src/webview/main.ts",
+            count: 2,
+            detail: "2 edit operations",
+            tone: "warning"
+          }
+        ]
+      },
+      turnLinks: [
+        { id: "turn:1", href: "#node-group-turn-1", label: "Turn 1", detail: "2 messages / 1 tool" }
+      ]
+    },
     toolbar: {
       runState: {
         label: "Needs review",
@@ -105,6 +137,7 @@ test("renders the header toolbar with shadcn badges button groups cards and butt
   assert.match(html, /toolbar-capability-grid/);
   assert.match(html, /toolbar-capability-section-workflow/);
   assert.match(html, /toolbar-capability-section-input/);
+  assert.match(html, /data-lane-map-trigger="true"/);
 });
 
 test("preserves header actions and floating details selectors", () => {
@@ -138,6 +171,8 @@ test("preserves header actions and floating details selectors", () => {
   assert.match(html, /data-action="refresh"/);
   assert.match(html, /data-action="cancel"/);
   assert.match(html, /data-header-icon-only="true"/);
+  assert.match(html, /aria-controls="lane-map-drawer"/);
+  assert.match(html, /aria-label="Open lane map"/);
   assert.match(html, /data-icon="inline-start"/);
   assert.doesNotMatch(html, /icon-button/);
   assert.doesNotMatch(html, /class="icon" data-icon="inline-start"/);

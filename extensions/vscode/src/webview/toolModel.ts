@@ -85,7 +85,7 @@ export function buildToolPresentation(input: ToolPresentationInput): ToolPresent
     riskTone: risk.riskTone,
     riskLabel: risk.riskLabel,
     statusLabel,
-    openByDefault: openByDefault(input.toolStatus, risk.riskTone),
+    openByDefault: openByDefault(input.toolStatus),
     stats: toolStats(input, kind, content),
     facts,
     actions: toolActions(input, kind, content, risk.riskTone),
@@ -268,14 +268,8 @@ function toolRisk(kind: ToolKind, status: ToolCallStatus, content: ReturnType<ty
   return { riskTone: "ok", riskLabel: "Read-only" };
 }
 
-function openByDefault(status: ToolCallStatus, riskTone: ToolRiskTone): boolean {
-  if (status === "in_progress" || status === "failed" || status === "cancelled") {
-    return true;
-  }
-  if (riskTone === "risk") {
-    return true;
-  }
-  return false;
+function openByDefault(status: ToolCallStatus): boolean {
+  return status === "in_progress" || status === "pending";
 }
 
 function toolStats(input: ToolPresentationInput, kind: ToolKind, content: ReturnType<typeof contentCounts>): ToolStat[] {

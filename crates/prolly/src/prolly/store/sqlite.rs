@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{BatchOp, Store};
+use super::{BatchOp, OrderedBatchReadPlan, Store};
 
 const CREATE_TABLE_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS prolly_nodes (
@@ -233,9 +233,10 @@ impl Store for SqliteStore {
         let mut stmt = conn
             .prepare_cached(SELECT_SQL)
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to prepare batch read"))?;
-        let mut results = HashMap::with_capacity(keys.len());
+        let plan = OrderedBatchReadPlan::new(keys);
+        let mut results = HashMap::with_capacity(plan.unique_keys().len());
 
-        for key in keys {
+        for key in plan.unique_keys() {
             if let Some(value) = stmt
                 .query_row(params![key], |row| row.get(0))
                 .optional()
@@ -253,19 +254,43 @@ impl Store for SqliteStore {
         let mut stmt = conn.prepare_cached(SELECT_SQL).map_err(|e| {
             SqliteStoreError::from_sqlite(e, "Failed to prepare ordered batch read")
         })?;
-        let mut results = Vec::with_capacity(keys.len());
+        let plan = OrderedBatchReadPlan::new(keys);
+        let mut unique_values = Vec::with_capacity(plan.unique_keys().len());
 
-        for key in keys {
+        for key in plan.unique_keys() {
             let value = stmt
                 .query_row(params![key], |row| row.get(0))
                 .optional()
                 .map_err(|e| {
                     SqliteStoreError::from_sqlite(e, "Failed to read key in ordered batch")
                 })?;
-            results.push(value);
+            unique_values.push(value);
         }
 
-        Ok(results)
+        Ok(plan.expand_owned(unique_values))
+    }
+
+    fn batch_get_ordered_unique(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare_cached(SELECT_SQL).map_err(|e| {
+            SqliteStoreError::from_sqlite(e, "Failed to prepare unique ordered batch read")
+        })?;
+        let mut values = Vec::with_capacity(keys.len());
+
+        for key in keys {
+            let value = stmt
+                .query_row(params![key], |row| row.get(0))
+                .optional()
+                .map_err(|e| {
+                    SqliteStoreError::from_sqlite(e, "Failed to read key in unique ordered batch")
+                })?;
+            values.push(value);
+        }
+
+        Ok(values)
     }
 
     fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
@@ -389,13 +414,15 @@ mod tests {
 
         store.batch(&ops).unwrap();
 
-        let keys: Vec<&[u8]> = vec![b"c", b"missing", b"a", b"b"];
+        let keys: Vec<&[u8]> = vec![b"c", b"missing", b"a", b"c", b"missing", b"b"];
         assert_eq!(
             store.batch_get_ordered(&keys).unwrap(),
             vec![
                 Some(b"3".to_vec()),
                 None,
                 Some(b"1".to_vec()),
+                Some(b"3".to_vec()),
+                None,
                 Some(b"2".to_vec())
             ]
         );

@@ -37,6 +37,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastReviewDrawerPropsJson = new Map<string, string>()
 
 export function ReviewDrawer({ props }: { props: ReviewDrawerProps }) {
   return (
@@ -262,6 +263,11 @@ export function mountReviewDrawers(options: MountReviewDrawersOptions): void {
       return
     }
     activeIds.add(id)
+    const propsJson = JSON.stringify(props)
+    if (lastReviewDrawerPropsJson.get(id) === propsJson) {
+      return
+    }
+    lastReviewDrawerPropsJson.set(id, propsJson)
     let mounted = mountedRoots.get(id)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -278,6 +284,7 @@ export function mountReviewDrawers(options: MountReviewDrawersOptions): void {
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastReviewDrawerPropsJson.delete(id)
     }
   })
 }

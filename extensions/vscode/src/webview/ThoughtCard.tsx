@@ -30,6 +30,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastThoughtCardPropsJson = new Map<string, string>()
 
 export function ThoughtCard({ props }: { props: ThoughtCardProps }) {
   return (
@@ -82,8 +83,18 @@ export function mountThoughtCards(options: MountThoughtCardsOptions): void {
     if (!props) {
       return
     }
-    activeIds.add(nodeId)
+    const currentJson = JSON.stringify(props)
     let mounted = mountedRoots.get(nodeId)
+    if (
+      currentJson === lastThoughtCardPropsJson.get(nodeId) &&
+      mounted?.element === element &&
+      mounted.element.isConnected
+    ) {
+      activeIds.add(nodeId)
+      return
+    }
+    lastThoughtCardPropsJson.set(nodeId, currentJson)
+    activeIds.add(nodeId)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
       mounted = {
@@ -99,6 +110,7 @@ export function mountThoughtCards(options: MountThoughtCardsOptions): void {
     if (!activeIds.has(nodeId) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(nodeId)
+      lastThoughtCardPropsJson.delete(nodeId)
     }
   })
 }

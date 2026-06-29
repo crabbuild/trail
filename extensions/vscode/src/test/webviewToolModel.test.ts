@@ -24,7 +24,7 @@ test("classifies read tools as compact read-only operations", () => {
   );
 });
 
-test("opens small edit diffs by default and marks them as workspace changes", () => {
+test("keeps completed edit diffs collapsed while marking them as workspace changes", () => {
   const model = buildToolPresentation({
     title: "Edit README.md",
     toolKind: "edit",
@@ -61,7 +61,7 @@ test("keeps command tools focused on rendered terminal output", () => {
   assert.equal(model.actions.length, 0);
 });
 
-test("opens failed and destructive tools by default", () => {
+test("keeps failed and destructive tools collapsed after completion", () => {
   const failed = buildToolPresentation({
     title: "Delete generated file",
     toolKind: "delete",
@@ -72,7 +72,7 @@ test("opens failed and destructive tools by default", () => {
 
   assert.equal(failed.riskTone, "risk");
   assert.equal(failed.riskLabel, "Needs inspection");
-  assert.equal(failed.openByDefault, true);
+  assert.equal(failed.openByDefault, false);
   assert.equal(failed.statusLabel, "failed");
   assert.equal(failed.actions[0]?.kind, "inspectDetails");
   assert.equal(failed.actions[0]?.tone, "primary");

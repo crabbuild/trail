@@ -5155,6 +5155,24 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             false,
         ),
         agent_static_action(
+            "setup_codex_vscode",
+            "Set up VS Code for Codex",
+            "setup",
+            "crabdb agent setup --provider codex",
+            "print a copyable Codex ACP editor config that creates fresh task lanes automatically",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "doctor_codex",
+            "Check Codex",
+            "doctor",
+            "crabdb agent doctor --provider codex",
+            "verify CrabDB workspace readiness and provider availability",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
             "start_terminal_task",
             "Start terminal task",
             "start",
@@ -11888,6 +11906,7 @@ fn agent_editor_snippet(editor: &str, provider: &str, command: &[String]) -> Str
 fn provider_display_name(provider: &str) -> String {
     match provider {
         "claude-code" | "claude" => "Claude Code".to_string(),
+        "codex" | "codex-cli" | "openai-codex" => "Codex".to_string(),
         other => other.to_string(),
     }
 }

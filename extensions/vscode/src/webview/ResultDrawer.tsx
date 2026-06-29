@@ -61,6 +61,7 @@ interface MountedDrawer {
 }
 
 let mountedDrawer: MountedDrawer | undefined
+let lastResultDrawerPropsJson = ""
 
 export function ResultDrawer({
   onClose,
@@ -184,6 +185,11 @@ function ResultDrawerAccordionWidgetView({ widget }: { widget: ResultDrawerAccor
 }
 
 export function mountResultDrawer({ onClose, props }: MountResultDrawerOptions): void {
+  const propsJson = JSON.stringify(props)
+  if (propsJson === lastResultDrawerPropsJson) {
+    return
+  }
+  lastResultDrawerPropsJson = propsJson
   closeResultDrawer()
   const element = document.createElement("div")
   element.dataset.resultDrawerHost = ""
@@ -197,6 +203,7 @@ export function mountResultDrawer({ onClose, props }: MountResultDrawerOptions):
 }
 
 export function closeResultDrawer(): void {
+  lastResultDrawerPropsJson = ""
   if (!mountedDrawer) {
     return
   }

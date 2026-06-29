@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rocksdb::{DBCompressionType, Options, WriteBatch, DB};
 
-use super::{BatchOp, Store};
+use super::{BatchOp, OrderedBatchReadPlan, Store};
 
 /// Compression type for RocksDB
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -231,10 +231,11 @@ impl Store for RocksDBStore {
     }
 
     fn batch_get(&self, keys: &[&[u8]]) -> Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
-        let results = self.db.multi_get(keys);
-        let mut map = HashMap::with_capacity(keys.len());
+        let plan = OrderedBatchReadPlan::new(keys);
+        let results = self.db.multi_get(plan.unique_keys());
+        let mut map = HashMap::with_capacity(plan.unique_keys().len());
 
-        for (key, result) in keys.iter().zip(results) {
+        for (key, result) in plan.unique_keys().iter().zip(results) {
             match result {
                 Ok(Some(value)) => {
                     map.insert(key.to_vec(), value);
@@ -255,13 +256,14 @@ impl Store for RocksDBStore {
     }
 
     fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
-        let results = self.db.multi_get(keys);
-        let mut ordered = Vec::with_capacity(keys.len());
+        let plan = OrderedBatchReadPlan::new(keys);
+        let results = self.db.multi_get(plan.unique_keys());
+        let mut unique_values = Vec::with_capacity(plan.unique_keys().len());
 
         for result in results {
             match result {
                 Ok(value) => {
-                    ordered.push(value);
+                    unique_values.push(value);
                 }
                 Err(e) => {
                     return Err(RocksDBStoreError::from_rocksdb(
@@ -272,7 +274,29 @@ impl Store for RocksDBStore {
             }
         }
 
-        Ok(ordered)
+        Ok(plan.expand_owned(unique_values))
+    }
+
+    fn batch_get_ordered_unique(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let results = self.db.multi_get(keys);
+        let mut values = Vec::with_capacity(keys.len());
+
+        for result in results {
+            match result {
+                Ok(value) => values.push(value),
+                Err(e) => {
+                    return Err(RocksDBStoreError::from_rocksdb(
+                        e,
+                        "Failed to read key in unique ordered batch",
+                    ));
+                }
+            }
+        }
+
+        Ok(values)
     }
 
     fn prefers_batch_reads(&self) -> bool {

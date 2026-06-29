@@ -84,8 +84,10 @@ use super::store::Store;
 use super::tree::Tree;
 
 use super::Prolly;
+use std::sync::Arc;
 
 type RangeItem = Result<(Vec<u8>, Vec<u8>), Error>;
+pub(crate) const RANGE_CHILD_PREFETCH_PARALLELISM: usize = 16;
 
 /// Create a range iterator over key-value pairs.
 ///
@@ -107,8 +109,12 @@ pub fn create_range_iter<'a, S: Store>(
     start: &[u8],
     end: Option<&[u8]>,
 ) -> Result<RangeIter<'a, S>, Error> {
+    if end.is_some_and(|end| end <= start) {
+        return Ok(RangeIter::new(prolly, Vec::new(), start, end));
+    }
+
     // Find path to start key
-    let path = prolly.find_path(tree, start)?;
+    let path = prolly.find_path_arcs(tree, start)?;
     Ok(RangeIter::new(prolly, path, start, end))
 }
 
@@ -123,7 +129,7 @@ pub struct RangeIter<'a, S: Store> {
     /// Reference to the Prolly tree manager
     prolly: &'a Prolly<S>,
     /// Stack of (node, index) pairs representing the traversal path
-    stack: Vec<(Node, usize)>,
+    stack: Vec<(Arc<Node>, usize)>,
     /// Optional end bound (exclusive)
     end: Option<Vec<u8>>,
     /// Whether we've started iteration (for positioning at start key)
@@ -142,7 +148,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
     /// * `end` - Optional ending key (exclusive)
     pub(crate) fn new(
         prolly: &'a Prolly<S>,
-        stack: Vec<(Node, usize)>,
+        stack: Vec<(Arc<Node>, usize)>,
         start: &[u8],
         end: Option<&[u8]>,
     ) -> Self {
@@ -186,18 +192,14 @@ impl<'a, S: Store> RangeIter<'a, S> {
                 return self.advance_to_next_leaf();
             }
 
-            let key = node.keys[*idx].clone();
-            let val = node.vals[*idx].clone();
-            *idx += 1;
-
-            // Check end bound
-            if let Some(ref end) = self.end {
-                if key.as_slice() >= end.as_slice() {
-                    return None;
+            match leaf_entry_before_end(node, *idx, self.end.as_deref()) {
+                Ok(Some(entry)) => {
+                    *idx += 1;
+                    return Some(Ok(entry));
                 }
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
             }
-
-            return Some(Ok((key, val)));
         }
 
         // Not at a leaf - descend to the correct leaf
@@ -218,37 +220,31 @@ impl<'a, S: Store> RangeIter<'a, S> {
                     return self.advance_to_next_leaf();
                 }
 
-                let key = node.keys[*idx].clone();
-                let val = node.vals[*idx].clone();
-
-                // Check end bound
-                if let Some(ref end) = self.end {
-                    if key.as_slice() >= end.as_slice() {
-                        return None;
+                match leaf_entry_before_end(node, *idx, self.end.as_deref()) {
+                    Ok(Some(entry)) => {
+                        if let Some((_, idx)) = self.stack.last_mut() {
+                            *idx += 1;
+                        }
+                        return Some(Ok(entry));
                     }
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(e)),
                 }
-
-                // Increment index for next call
-                if let Some((_, idx)) = self.stack.last_mut() {
-                    *idx += 1;
-                }
-
-                return Some(Ok((key, val)));
             }
 
             // Internal node - descend to child
-            if *idx >= node.vals.len() {
+            if *idx >= node.len() {
                 // No more children, go back up
                 return self.advance_to_next_leaf();
             }
 
-            let child_cid_bytes = &node.vals[*idx];
-            let child_cid = match child_cid_bytes.as_slice().try_into() {
-                Ok(arr) => Cid(arr),
-                Err(_) => return Some(Err(Error::InvalidNode)),
-            };
+            match child_starts_at_or_after_end(self.end.as_deref(), node, *idx) {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(e) => return Some(Err(e)),
+            }
 
-            match self.prolly.load(&child_cid) {
+            match self.load_child_for_descent(node, *idx) {
                 Ok(child) => {
                     self.stack.push((child, 0));
                 }
@@ -275,13 +271,61 @@ impl<'a, S: Store> RangeIter<'a, S> {
                 *parent_idx += 1;
 
                 // Check if parent has more children
-                if *parent_idx < parent.vals.len() {
+                if *parent_idx < parent.len() {
+                    match child_starts_at_or_after_end(self.end.as_deref(), parent, *parent_idx) {
+                        Ok(true) => return None,
+                        Ok(false) => {}
+                        Err(e) => return Some(Err(e)),
+                    }
                     // Descend to the next child
                     return self.descend_to_leaf();
+                }
+                if parent.keys.len() != parent.vals.len() {
+                    return Some(Err(Error::InvalidNode));
                 }
                 // Otherwise, continue popping
             }
         }
+    }
+
+    fn load_child_for_descent(&self, node: &Node, idx: usize) -> Result<Arc<Node>, Error> {
+        let child_cid = child_cid_at(node, idx)?;
+
+        if !self.prolly.store().prefers_batch_reads() {
+            return self.prolly.load_arc(&child_cid);
+        }
+
+        if let Some(child) = self.prolly.cached_node_arc(&child_cid) {
+            return Ok(child);
+        }
+
+        let max_child_idx = node
+            .len()
+            .min(idx.saturating_add(RANGE_CHILD_PREFETCH_PARALLELISM));
+        let mut child_cids = Vec::with_capacity(max_child_idx.saturating_sub(idx));
+        child_cids.push(child_cid);
+
+        for child_idx in idx + 1..max_child_idx {
+            match child_starts_at_or_after_end(self.end.as_deref(), node, child_idx) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(_) => break,
+            }
+
+            match child_cid_at(node, child_idx) {
+                Ok(cid) => child_cids.push(cid),
+                Err(_) => break,
+            }
+        }
+
+        if child_cids.len() == 1 {
+            return self.prolly.load_arc(&child_cids[0]);
+        }
+
+        let children = self
+            .prolly
+            .load_many_ordered_with_parallelism(&child_cids, RANGE_CHILD_PREFETCH_PARALLELISM)?;
+        children.into_iter().next().ok_or(Error::InvalidNode)
     }
 }
 
@@ -301,6 +345,10 @@ impl<'a, S: Store> Iterator for RangeIter<'a, S> {
         loop {
             let (node, idx) = self.stack.last_mut()?;
 
+            if !node.leaf && node.keys.len() != node.vals.len() {
+                return Some(Err(Error::InvalidNode));
+            }
+
             // If we've exhausted this node, advance to next
             if *idx >= node.len() {
                 match self.advance_to_next_leaf() {
@@ -311,28 +359,29 @@ impl<'a, S: Store> Iterator for RangeIter<'a, S> {
 
             // If we're at a leaf, yield the current entry
             if node.leaf {
-                let key = node.keys[*idx].clone();
-                let val = node.vals[*idx].clone();
-                *idx += 1;
-
-                // Check end bound (exclusive)
-                if let Some(ref end) = self.end {
-                    if key.as_slice() >= end.as_slice() {
-                        return None;
+                match leaf_entry_before_end(node, *idx, self.end.as_deref()) {
+                    Ok(Some(entry)) => {
+                        *idx += 1;
+                        return Some(Ok(entry));
                     }
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(e)),
                 }
-
-                return Some(Ok((key, val)));
             }
 
             // Internal node - descend to child
-            let child_cid_bytes = &node.vals[*idx];
-            let child_cid = match child_cid_bytes.as_slice().try_into() {
-                Ok(arr) => Cid(arr),
-                Err(_) => return Some(Err(Error::InvalidNode)),
+            match child_starts_at_or_after_end(self.end.as_deref(), node, *idx) {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(e) => return Some(Err(e)),
+            }
+
+            let child = {
+                let (node, idx) = self.stack.last()?;
+                self.load_child_for_descent(node, *idx)
             };
 
-            match self.prolly.load(&child_cid) {
+            match child {
                 Ok(child) => {
                     self.stack.push((child, 0));
                 }
@@ -340,4 +389,41 @@ impl<'a, S: Store> Iterator for RangeIter<'a, S> {
             }
         }
     }
+}
+
+fn leaf_entry_before_end(
+    node: &Node,
+    idx: usize,
+    end: Option<&[u8]>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+    let key = node.keys.get(idx).ok_or(Error::InvalidNode)?;
+    if let Some(end) = end {
+        if key.as_slice() >= end {
+            return Ok(None);
+        }
+    }
+
+    let val = node.vals.get(idx).ok_or(Error::InvalidNode)?;
+    Ok(Some((key.clone(), val.clone())))
+}
+
+fn child_starts_at_or_after_end(
+    end: Option<&[u8]>,
+    node: &Node,
+    child_index: usize,
+) -> Result<bool, Error> {
+    let Some(end) = end else {
+        return Ok(false);
+    };
+
+    let first_key = node.keys.get(child_index).ok_or(Error::InvalidNode)?;
+    Ok(first_key.as_slice() >= end)
+}
+
+fn child_cid_at(node: &Node, idx: usize) -> Result<Cid, Error> {
+    let child = node.vals.get(idx).ok_or(Error::InvalidNode)?;
+    Ok(Cid(child
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::InvalidNode)?))
 }

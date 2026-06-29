@@ -4,14 +4,14 @@ CrabDB can run in front of a real ACP coding agent and record the agent's work
 as lane sessions, turns, tool events, and checkpoints. This runbook is for
 humans and automation agents that need to verify ACP behavior end to end.
 
-The examples use Claude Code through the official ACP adapter, but the CrabDB
-side is provider-neutral.
+The examples use Claude Code through the ACP adapter, but CrabDB also ships a
+Codex profile and the relay side is provider-neutral.
 
 ## Mental Model
 
 - **Agent task**: the easy-path unit a user starts, views, applies, or rewinds.
   CrabDB backs each task with a fresh lane by default.
-- **ACP agent**: the real coding agent, such as Claude Code.
+- **ACP agent**: the real coding agent, such as Claude Code or Codex.
 - **ACP client/editor**: the process that sends `initialize`, `session/new`,
   `session/prompt`, permission responses, and cancellation messages.
 - **CrabDB ACP relay**: the process between the client and the real agent.
@@ -32,6 +32,12 @@ The generated editor entry runs:
 crabdb --workspace /path/to/repo agent acp --provider claude-code
 ```
 
+Use `--provider codex` for the built-in Codex ACP adapter:
+
+```sh
+crabdb --workspace /path/to/repo agent acp --provider codex
+```
+
 That command creates a fresh lane for the ACP session, launches the real
 provider, captures the transcript and tools, and records the workdir checkpoint.
 
@@ -40,6 +46,13 @@ For Claude Code the low-level relay command is:
 ```sh
 crabdb acp relay --provider claude-code --materialize -- \
   npx -y @agentclientprotocol/claude-agent-acp@latest
+```
+
+For Codex the low-level relay command is:
+
+```sh
+crabdb acp relay --provider codex --materialize -- \
+  npx -y @agentclientprotocol/codex-acp@latest
 ```
 
 `--materialize` is the default mode for practical coding-agent work. CrabDB
@@ -60,12 +73,13 @@ Confirm the provider profile:
 
 ```sh
 crabdb agent doctor --provider claude-code
+crabdb agent doctor --provider codex
 crabdb agent setup
 crabdb acp list
 ```
 
-`claude-code` doctor validates the CrabDB workspace, the provider profile, the
-relay command shape, and upstream command availability.
+Provider doctor validates the CrabDB workspace, the provider profile, the relay
+command shape, and upstream command availability.
 
 ## Create a Playground Repo
 
@@ -98,6 +112,7 @@ Prefer the high-level setup command:
 ```sh
 crabdb agent setup
 crabdb agent setup --provider claude-code --editor zed
+crabdb agent setup --provider codex --editor zed
 ```
 
 These snippets use `crabdb agent acp`, so users do not hard-code or rotate lane

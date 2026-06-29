@@ -21,6 +21,7 @@ export interface TimelineScrollerItemView {
   html: string
   className?: string | undefined
   scrollAnchor?: boolean | undefined
+  preserveDom?: boolean | undefined
 }
 
 interface MountedRoot {
@@ -28,11 +29,22 @@ interface MountedRoot {
   root: Root
 }
 
+const TIMELINE_SCROLL_MARGIN = 72
+const TIMELINE_PREVIOUS_ITEM_PEEK = 64
+const TIMELINE_SCROLL_EDGE_THRESHOLD = 24
+
 let mountedRoot: MountedRoot | undefined
+let lastTimelineScrollerPropsJson = ""
 
 export function TimelineScroller({ props }: { props: TimelineScrollerProps }) {
   return (
-    <MessageScrollerProvider>
+    <MessageScrollerProvider
+      autoScroll
+      defaultScrollPosition="last-anchor"
+      scrollEdgeThreshold={TIMELINE_SCROLL_EDGE_THRESHOLD}
+      scrollMargin={TIMELINE_SCROLL_MARGIN}
+      scrollPreviousItemPeek={TIMELINE_PREVIOUS_ITEM_PEEK}
+    >
       <MessageScroller className="timeline-message-scroller">
         <MessageScrollerViewport
           id="timeline"
@@ -47,8 +59,13 @@ export function TimelineScroller({ props }: { props: TimelineScrollerProps }) {
                 messageId={item.id}
                 scrollAnchor={Boolean(item.scrollAnchor)}
                 className={cn("timeline-scroller-row", item.className)}
-                dangerouslySetInnerHTML={{ __html: item.html }}
-              />
+              >
+                {item.preserveDom ? (
+                  <StableHtmlSlot slotId={item.id} html={item.html} />
+                ) : (
+                  <div className="stable-html-slot" dangerouslySetInnerHTML={{ __html: item.html }} />
+                )}
+              </MessageScrollerItem>
             ))}
           </MessageScrollerContent>
         </MessageScrollerViewport>
@@ -58,7 +75,29 @@ export function TimelineScroller({ props }: { props: TimelineScrollerProps }) {
   )
 }
 
+const StableHtmlSlot = React.memo(
+  function StableHtmlSlot({
+    html,
+    slotId
+  }: {
+    html: string
+    slotId: string
+  }) {
+    return <div className="stable-html-slot" data-stable-html-slot={slotId} dangerouslySetInnerHTML={{ __html: html }} />
+  },
+  (previous, next) => previous.slotId === next.slotId
+)
+
 export function mountTimelineScroller(element: HTMLElement, props: TimelineScrollerProps): void {
+  const currentJson = timelineScrollerPropsSignature(props)
+  if (
+    currentJson === lastTimelineScrollerPropsJson &&
+    mountedRoot?.element === element &&
+    mountedRoot.element.isConnected
+  ) {
+    return
+  }
+  lastTimelineScrollerPropsJson = currentJson
   if (!mountedRoot || mountedRoot.element !== element) {
     mountedRoot?.root.unmount()
     mountedRoot = {
@@ -72,9 +111,22 @@ export function mountTimelineScroller(element: HTMLElement, props: TimelineScrol
   })
 }
 
+function timelineScrollerPropsSignature(props: TimelineScrollerProps): string {
+  return JSON.stringify({
+    items: props.items.map((item) => ({
+      id: item.id,
+      className: item.className,
+      scrollAnchor: item.scrollAnchor,
+      preserveDom: item.preserveDom,
+      html: item.preserveDom ? undefined : item.html
+    }))
+  })
+}
+
 export function cleanupTimelineScroller(): void {
   if (mountedRoot && !mountedRoot.element.isConnected) {
     mountedRoot.root.unmount()
     mountedRoot = undefined
+    lastTimelineScrollerPropsJson = ""
   }
 }

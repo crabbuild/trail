@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
-use super::{BatchOp, Store};
+use super::{BatchOp, OrderedBatchReadPlan, Store};
 
 /// In-memory store for testing and simple use cases
 #[derive(Debug, Default)]
@@ -88,8 +88,9 @@ impl Store for MemStore {
             .read()
             .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
 
-        let mut results = HashMap::with_capacity(keys.len());
-        for key in keys {
+        let plan = OrderedBatchReadPlan::new(keys);
+        let mut results = HashMap::with_capacity(plan.unique_keys().len());
+        for key in plan.unique_keys() {
             if let Some(value) = data.get(*key) {
                 results.insert(key.to_vec(), value.clone());
             }
@@ -104,11 +105,25 @@ impl Store for MemStore {
             .read()
             .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
 
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(data.get(*key).cloned());
-        }
-        Ok(results)
+        let plan = OrderedBatchReadPlan::new(keys);
+        let unique_values = plan
+            .unique_keys()
+            .iter()
+            .map(|key| data.get(*key).cloned())
+            .collect::<Vec<_>>();
+        Ok(plan.expand_owned(unique_values))
+    }
+
+    fn batch_get_ordered_unique(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+
+        Ok(keys.iter().map(|key| data.get(*key).cloned()).collect())
     }
 
     fn prefers_batch_reads(&self) -> bool {

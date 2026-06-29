@@ -4,6 +4,8 @@ import {
   buildToolActivitySummary,
   filterTimelineNodes,
   isTimelineFilter,
+  sortTimelineNodes,
+  transcriptTimelineNodes,
   timelineFilterCounts,
   timelineNodeBucket,
   timelineNodeSearchText,
@@ -92,6 +94,137 @@ test("counts timeline filter groups", () => {
     approvals: 1,
     events: 1
   });
+});
+
+test("counts approval-gated tools without rendering a separate approval row", () => {
+  const permissionTool: RenderNode = {
+    ...base,
+    id: "tool:permission",
+    kind: "tool",
+    toolCallId: "tool-permission",
+    title: "Run git log",
+    toolKind: "execute",
+    toolStatus: "pending",
+    locations: [],
+    content: [],
+    permission: {
+      requestId: "request-1",
+      title: "Permission required",
+      status: "pending",
+      options: [
+        { optionId: "allow_always", label: "Always allow" },
+        { optionId: "allow", label: "Allow" },
+        { optionId: "reject", label: "Reject" }
+      ]
+    }
+  };
+
+  assert.equal(timelineNodeBucket(permissionTool), "tools");
+  assert.deepEqual(timelineFilterCounts([permissionTool]), {
+    all: 1,
+    chat: 0,
+    tools: 1,
+    diffs: 0,
+    approvals: 1,
+    events: 0
+  });
+  assert.deepEqual(filterTimelineNodes([permissionTool], "approvals", "").map((node) => node.id), ["tool:permission"]);
+  assert.deepEqual(filterTimelineNodes([permissionTool], "approvals", "always allow").map((node) => node.id), ["tool:permission"]);
+});
+
+test("removes internal session controls from transcript-visible nodes", () => {
+  const internalNodes: RenderNode[] = [
+    ...nodes,
+    {
+      ...base,
+      id: "commands:1",
+      kind: "commands",
+      availableCommands: [{ name: "help", description: "" }]
+    },
+    {
+      ...base,
+      id: "tool:internal",
+      kind: "tool",
+      toolCallId: "internal",
+      title: "ACP prompt turn",
+      toolKind: "other",
+      toolStatus: "completed",
+      locations: [],
+      content: []
+    },
+    {
+      ...base,
+      id: "session:1",
+      kind: "session",
+      title: "Provider title"
+    },
+    {
+      ...base,
+      id: "unknown:span",
+      kind: "unknown",
+      label: "span_ended (completed)",
+      payload: {}
+    }
+  ];
+
+  assert.deepEqual(transcriptTimelineNodes(internalNodes).map((node) => node.id), nodes.map((node) => node.id));
+});
+
+test("sorts transcript nodes by durable stream order before timestamps", () => {
+  const ordered = sortTimelineNodes([
+    {
+      ...base,
+      id: "tool:late-created-missing-time",
+      kind: "tool",
+      timelineOrder: 3,
+      toolCallId: "tool-late",
+      title: "Run command",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: []
+    },
+    {
+      ...base,
+      id: "message:assistant:first",
+      kind: "message",
+      timelineOrder: 2,
+      createdAt: "2026-06-27T00:00:04.000Z",
+      role: "assistant",
+      content: [{ type: "text", text: "I will check the repo." }],
+      text: "I will check the repo.",
+      streaming: false
+    },
+    {
+      ...base,
+      id: "message:user:first",
+      kind: "message",
+      timelineOrder: 1,
+      createdAt: "2026-06-27T00:00:05.000Z",
+      role: "user",
+      content: [{ type: "text", text: "Count it." }],
+      text: "Count it.",
+      streaming: false
+    },
+    {
+      ...base,
+      id: "message:assistant:after",
+      kind: "message",
+      timelineOrder: 4,
+      createdAt: "2026-06-27T00:00:03.000Z",
+      role: "assistant",
+      content: [{ type: "text", text: "Here is the result." }],
+      text: "Here is the result.",
+      streaming: false
+    }
+  ]);
+
+  assert.deepEqual(ordered.map((node) => node.id), [
+    "message:user:first",
+    "message:assistant:first",
+    "tool:late-created-missing-time",
+    "message:assistant:after"
+  ]);
 });
 
 test("filters timeline nodes by group and search query", () => {

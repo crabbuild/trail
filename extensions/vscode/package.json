@@ -343,7 +343,7 @@
         "crabdb.defaultProvider": {
           "type": "string",
           "default": "claude-code",
-          "description": "Default ACP provider passed to `crabdb agent acp`."
+          "description": "Default ACP provider passed to `crabdb agent acp`. Built-ins include `claude-code` and `codex`; custom provider ids are also allowed."
         },
         "crabdb.autoStartDaemon": {
           "type": "boolean",

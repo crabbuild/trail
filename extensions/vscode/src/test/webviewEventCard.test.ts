@@ -16,8 +16,8 @@ function baseProps(overrides: Partial<EventCardProps> = {}): EventCardProps {
     tone: "success",
     iconHtml,
     title: "Checkpoint saved",
-    detail: "ch_123 can start follow-ups or restore this lane.",
-    statusLabel: "Durable",
+    detail: "ch_123 saved for follow-up or rewind.",
+    statusLabel: "Saved",
     facts: [
       {
         label: "Checkpoint",
@@ -74,6 +74,25 @@ test("renders audit events with shadcn card alert badge and buttons", () => {
   assert.doesNotMatch(html, /class="icon" data-icon="inline-start"/);
   assert.doesNotMatch(html, /event-action-primary/);
   assert.doesNotMatch(html, /class="event-action(?:\s|")|class="[^"]*\sevent-action(?:\s|")/);
+});
+
+test("renders checkpoints as collapsed accordion separators", () => {
+  const html = renderEvent(
+    baseProps({
+      variant: "checkpoint",
+      callout: undefined,
+      defaultOpen: false
+    })
+  );
+
+  assert.match(html, /checkpoint-separator/);
+  assert.match(html, /data-slot="accordion"/);
+  assert.match(html, /data-slot="accordion-trigger"/);
+  assert.match(html, /aria-expanded="false"/);
+  assert.match(html, /checkpoint-separator-rule/);
+  assert.match(html, /data-action="copyCheckpoint"/);
+  assert.doesNotMatch(html, /data-slot="card"/);
+  assert.doesNotMatch(html, /data-slot="alert"/);
 });
 
 test("renders usage meters and raw details without action chrome", () => {

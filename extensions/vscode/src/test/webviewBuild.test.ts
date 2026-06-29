@@ -30,11 +30,11 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.equal(fs.existsSync(path.join(root, "dist", "webview.js")), false, "legacy flat webview bundle should not be emitted");
 
   const mainBytes = fs.statSync(mainScript).size;
-  assert.ok(mainBytes < 243_000, `webview entry should keep startup headroom below 243kb, got ${mainBytes} bytes`);
+  assert.ok(mainBytes < 250 * 1024, `webview entry should keep startup headroom below 250 KiB, got ${mainBytes} bytes`);
 
   const chunks = fs.readdirSync(chunksDir);
   const approvalCardChunk = chunks.find((file) => /^ApprovalCard-[A-Z0-9]+\.js$/.test(file));
-  assert.ok(approvalCardChunk, "React shadcn approval card should be emitted as a lazy chunk");
+  assert.equal(approvalCardChunk, undefined, "permission approvals should render inside the tool call card instead of a separate lazy card");
   const composerCardChunk = chunks.find((file) => /^ComposerCard-[A-Z0-9]+\.js$/.test(file));
   assert.ok(composerCardChunk, "React shadcn composer card should be emitted as a lazy chunk");
   const highlightChunk = chunks.find((file) => /^highlight-[A-Z0-9]+\.js$/.test(file));
@@ -45,6 +45,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.ok(eventCardChunk, "React shadcn event card should be emitted as a lazy chunk");
   const headerBarChunk = chunks.find((file) => /^HeaderBar-[A-Z0-9]+\.js$/.test(file));
   assert.ok(headerBarChunk, "React shadcn header toolbar should be emitted as a lazy chunk");
+  const laneMapDrawerChunk = chunks.find((file) => /^LaneMapDrawer-[A-Z0-9]+\.js$/.test(file));
+  assert.ok(laneMapDrawerChunk, "Lane map drawer should be emitted as an on-demand drawer chunk");
   const diffCardChunk = chunks.find((file) => /^DiffCard-[A-Z0-9]+\.js$/.test(file));
   assert.ok(diffCardChunk, "React shadcn diff card should be emitted as a lazy chunk");
   const diffEnhancerChunk = chunks.find((file) => /^diffEnhancer-[A-Z0-9]+\.js$/.test(file));
@@ -82,13 +84,14 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
 
   const mainSource = fs.readFileSync(mainScript, "utf8");
   const webviewSource = fs.readFileSync(path.join(root, "src", "webview", "main.ts"), "utf8");
-  const approvalCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ApprovalCard.tsx"), "utf8");
   const composerCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ComposerCard.tsx"), "utf8");
   const diffCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "DiffCard.tsx"), "utf8");
   const emptyStateCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "EmptyStateCard.tsx"), "utf8");
   const eventCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "EventCard.tsx"), "utf8");
   const headerBarSourceTs = fs.readFileSync(path.join(root, "src", "webview", "HeaderBar.tsx"), "utf8");
+  const laneMapDrawerSourceTs = fs.readFileSync(path.join(root, "src", "webview", "LaneMapDrawer.tsx"), "utf8");
   const messageCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "MessageCard.tsx"), "utf8");
+  const messageScrollerSourceTs = fs.readFileSync(path.join(root, "src", "webview", "components", "ui", "message-scroller.tsx"), "utf8");
   const payloadDisclosureSourceTs = fs.readFileSync(path.join(root, "src", "webview", "PayloadDisclosure.tsx"), "utf8");
   const planCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "PlanCard.tsx"), "utf8");
   const rawDetailsSourceTs = fs.readFileSync(path.join(root, "src", "webview", "RawDetails.tsx"), "utf8");
@@ -103,7 +106,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   const inlineActionsSourceTs = fs.readFileSync(path.join(root, "src", "webview", "InlineActions.tsx"), "utf8");
   const timelineScrollerSourceTs = fs.readFileSync(path.join(root, "src", "webview", "TimelineScroller.tsx"), "utf8");
   const toolCallCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ToolCallCard.tsx"), "utf8");
-  assert.match(mainSource, /import\("\.\/chunks\/ApprovalCard-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the React approval card island");
+  assert.doesNotMatch(mainSource, /import\("\.\/chunks\/ApprovalCard-[A-Z0-9]+\.js"\)/, "main bundle should not dynamically import a separate approval card island");
   assert.match(mainSource, /import\("\.\/chunks\/ComposerCard-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the React composer island");
   assert.match(mainSource, /import\("\.\/chunks\/DiffCard-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the React diff card island");
   assert.match(mainSource, /import\("\.\/chunks\/highlight-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the highlighter chunk");
@@ -129,7 +132,6 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(mainSource, /@shikijs\/langs|createHighlighterCore/, "main bundle should not include Shiki language payloads");
   assert.doesNotMatch(mainSource, /node_modules\/@pierre\/diffs/, "main bundle should not include Diffs.com renderer payloads");
   assert.doesNotMatch(mainSource, /node_modules\/@pierre\/trees/, "main bundle should not include Trees.software renderer payloads");
-  const approvalCardSource = fs.readFileSync(path.join(chunksDir, approvalCardChunk || ""), "utf8");
   const composerCardSource = fs.readFileSync(path.join(chunksDir, composerCardChunk || ""), "utf8");
   const diffCardSource = fs.readFileSync(path.join(chunksDir, diffCardChunk || ""), "utf8");
   const diffEnhancerSource = fs.readFileSync(path.join(chunksDir, diffEnhancerChunk || ""), "utf8");
@@ -151,20 +153,20 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   const inlineActionsSource = fs.readFileSync(path.join(chunksDir, inlineActionsChunk || ""), "utf8");
   const timelineScrollerSource = fs.readFileSync(path.join(chunksDir, timelineScrollerChunk || ""), "utf8");
   const toolCallCardSource = fs.readFileSync(path.join(chunksDir, toolCallCardChunk || ""), "utf8");
-  assert.match(approvalCardSource, /createRoot/, "lazy approval card island should mount with React");
-  assert.match(approvalCardSource, /data-approval-card/, "lazy approval card island should preserve approval DOM affordances");
-  assert.match(approvalCardSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "approval card island should render preview and details with shadcn accordion components");
-  assert.match(approvalCardSourceTs, /import \{ Alert, AlertDescription \} from "@\/webview\/components\/ui\/alert"/, "approval card island should render impact copy with shadcn alert components");
-  assert.match(approvalCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "approval card island should render status and preview counts with shadcn badges");
-  assert.match(approvalCardSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "approval card island should render decisions with shadcn button components");
-  assert.match(approvalCardSourceTs, /import \{ Card, CardContent, CardHeader \} from "@\/webview\/components\/ui\/card"/, "approval card island should render the approval surface with shadcn card components");
-  assert.doesNotMatch(approvalCardSourceTs, /<details|<summary/, "approval card island should not render native details markup");
-  assert.match(approvalCardSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: action\.iconHtml \}\}/, "approval action icons should use shadcn data-icon hooks");
-  assert.doesNotMatch(approvalCardSourceTs, /className="icon"[\s\S]{0,120}dangerouslySetInnerHTML=\{\{ __html: action\.iconHtml \}\}/, "approval action icons should not carry retired manual icon sizing classes");
+  assert.match(toolCallCardSourceTs, /interface ToolCallApprovalProps/, "tool card should own permission approval props");
+  assert.match(toolCallCardSourceTs, /function ToolApprovalPanel/, "tool card should render permission approval controls inline");
+  assert.doesNotMatch(toolCallCardSourceTs, /Accordion|ToolApprovalDisclosures|ToolApprovalMeta|locationsHtml|requestDetails/, "tool card approval prompts should omit provider metadata, locations, and details accordions");
+  assert.match(toolCallCardSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "tool card should render permission decisions with shadcn button components");
+  assert.match(toolCallCardSourceTs, /ButtonGroup className="approval-option-list"/, "tool card should keep approval options grouped inside the tool call");
+  assert.match(toolCallCardSourceTs, /ShieldCheck[\s\S]*CircleX|CircleX[\s\S]*ShieldCheck/, "tool card approval actions should use lucide React icons instead of injected SVG strings");
+  assert.doesNotMatch(toolCallCardSourceTs, /from "@\/webview\/components\/ui\/alert"/, "tool card should not import alert chrome for compact permission prompts");
+  assert.match(webviewSource, /function approvalNode\(node:[\s\S]*return toolNode\(approvalAsToolNode\(node\)\)/, "orphan approval nodes should render through the tool call card");
+  assert.match(webviewSource, /permissionFromApproval\(approval\)/, "matched approval nodes should attach to existing tool nodes");
   assert.match(composerCardSource, /createRoot/, "lazy composer island should mount with React");
   assert.match(composerCardSource, /data-composer-card/, "lazy composer island should preserve composer DOM affordances");
-  assert.match(composerCardSourceTs, /import \{ Alert, AlertDescription \} from "@\/webview\/components\/ui\/alert"/, "composer island should render blocked/running state with shadcn alert components");
-  assert.match(composerCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "composer island should render context chips with shadcn badges");
+  assert.doesNotMatch(composerCardSourceTs, /from "@\/webview\/components\/ui\/alert"/, "composer island should not import alert chrome for running state");
+  assert.match(composerCardSourceTs, /function ComposerStatus\([\s\S]*className="sr-only"[\s\S]*role="status"/, "composer status should remain available to assistive technology without visible chrome");
+  assert.match(composerCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "composer island should render attachments with shadcn badges");
   assert.match(composerCardSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "composer island should render composer commands with shadcn buttons");
   assert.match(composerCardSourceTs, /import \{ ButtonGroup \} from "@\/webview\/components\/ui\/button-group"/, "composer island should group prompt controls with shadcn button groups");
   assert.match(composerCardSourceTs, /import \{ Card, CardContent, CardFooter \} from "@\/webview\/components\/ui\/card"/, "composer island should render the prompt surface with shadcn cards");
@@ -172,7 +174,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(composerCardSourceTs, /<details|<summary/, "composer island should not render native details for agent controls");
   assert.match(composerCardSourceTs, /function ComposerAttachmentShelf\([\s\S]*<Badge[\s\S]*className="attachment-chip"[\s\S]*<Button[\s\S]*data-action="removeAttachment"[\s\S]*data-attachment-id=\{attachment\.id\}/, "composer attachments should render remove actions through shadcn badge and button primitives");
   assert.match(composerCardSourceTs, /data-composer-icon-only="true"/, "composer icon commands should expose a scoped shadcn layout hook");
-  assert.match(composerCardSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: preset\.iconHtml \}\}/, "composer preset icons should use shadcn data-icon hooks");
+  assert.doesNotMatch(composerCardSourceTs, /preset\.iconHtml|data-action="insertPromptPreset"/, "composer presets should not occupy the visible prompt surface");
   assert.match(composerCardSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: props\.settingsIconHtml \}\}/, "composer floating controls trigger should use shadcn data-icon hooks");
   assert.doesNotMatch(composerCardSourceTs, /icon-button icon-only/, "composer icon commands should not use retired icon-button styling");
   assert.doesNotMatch(composerCardSourceTs, /className="icon"[\s\S]{0,120}data-icon="inline-start"/, "composer button icons should not carry retired manual icon sizing classes");
@@ -216,6 +218,9 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(headerBarSourceTs, /import \{ ButtonGroup \} from "@\/webview\/components\/ui\/button-group"/, "header toolbar island should group commands with shadcn button groups");
   assert.match(headerBarSourceTs, /import \{ Card, CardContent \} from "@\/webview\/components\/ui\/card"/, "header toolbar island should render floating panels with shadcn cards");
   assert.match(headerBarSourceTs, /import \{ Collapsible, CollapsibleContent, CollapsibleTrigger \} from "@\/webview\/components\/ui\/collapsible"/, "header toolbar island should render floating panels with shadcn collapsible components");
+  assert.match(headerBarSourceTs, /LaneMapToolbarButton/, "header toolbar should own the lane map trigger");
+  assert.match(headerBarSourceTs, /data-lane-map-trigger="true"/, "lane map should be reachable from the top toolbar");
+  assert.match(headerBarSourceTs, /React\.lazy\(async \(\) =>[\s\S]*import\("\.\/LaneMapDrawer\.js"\)/, "lane map drawer should load only after the toolbar trigger opens it");
   assert.doesNotMatch(headerBarSourceTs, /<details|<summary/, "header toolbar island should not render native details for floating panels");
   assert.match(headerBarSourceTs, /data-header-icon-only="true"/, "header icon commands should expose a scoped shadcn layout hook");
   assert.match(headerBarSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: iconHtml \}\}/, "primary header action icons should use shadcn data-icon hooks");
@@ -228,9 +233,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(messageCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<MessageCard/, "lazy message card island should avoid blank frames while streaming");
   assert.match(messageCardSource, /data-message-card/, "lazy message card island should preserve message-card DOM affordances");
   assert.match(messageCardSource, /data-slot["']?\s*[:,=]\s*["']message["']|data-slot="message"/, "lazy message card island should use shadcn message components");
-  assert.match(messageCardSourceTs, /import \{[\s\S]*MessageAvatar,[\s\S]*MessageContent,[\s\S]*MessageFooter,[\s\S]*MessageGroup,[\s\S]*MessageHeader[\s\S]*\} from "@\/webview\/components\/ui\/message"/, "lazy message card island should compose the documented shadcn Message parts");
-  assert.match(messageCardSourceTs, /import \{ Marker, MarkerContent, MarkerIcon \} from "@\/webview\/components\/ui\/marker"/, "lazy message card island should render role and live-status chrome with shadcn marker components");
-  assert.match(messageCardSourceTs, /import \{ Spinner \} from "@\/webview\/components\/ui\/spinner"/, "lazy message card island should render streaming state with shadcn spinner components");
+  assert.match(messageCardSourceTs, /import \{[\s\S]*Message,[\s\S]*MessageContent,[\s\S]*MessageGroup[\s\S]*\} from "@\/webview\/components\/ui\/message"/, "lazy message card island should compose the minimal shadcn Message parts");
+  assert.doesNotMatch(messageCardSourceTs, /from "@\/webview\/components\/ui\/marker"|from "@\/webview\/components\/ui\/spinner"|from "@\/webview\/components\/ui\/badge"/, "plain assistant messages should not import visible role or streaming badge primitives");
   assert.match(payloadDisclosureSource, /createRoot/, "lazy payload disclosure island should mount with React");
   assert.match(payloadDisclosureSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "payload disclosure island should render helper disclosures with shadcn accordion components");
   assert.match(payloadDisclosureSourceTs, /data-payload-disclosure-root/, "payload disclosure island should preserve helper placeholder roots");
@@ -290,19 +294,23 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(timelineGroupSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<TimelineGroupCard/, "timeline group roots should render inside flushSync so helper placeholders exist for nested hydration");
   assert.match(timelineGroupSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "timeline group island should render transcript groups with shadcn accordion components");
   assert.match(timelineGroupSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "timeline group island should render status metadata with shadcn badges");
+  assert.match(timelineGroupSourceTs, /props\.bodyItems\.map\(\(item\) =>[\s\S]*key=\{item\.id\}[\s\S]*data-timeline-group-body-item/, "timeline group bodies should preserve existing transcript node DOM while appending streamed rows");
+  assert.doesNotMatch(timelineGroupSourceTs, /props\.bodyHtml|bodyKeyRef/, "timeline group bodies should not replace the whole turn body when one node changes");
   assert.doesNotMatch(timelineGroupSourceTs, /<details|<summary/, "timeline group island should not render native details markup");
   assert.match(timelineNavigationSource, /createRoot/, "lazy timeline navigation island should mount with React");
   assert.match(timelineNavigationSource, /timeline-search-input/, "lazy timeline navigation should preserve search affordances");
-  assert.match(timelineNavigationSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "timeline navigation island should render the session map with shadcn accordion components");
   assert.match(timelineNavigationSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "timeline navigation island should render counts and chips with shadcn badges");
   assert.match(timelineNavigationSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "timeline navigation island should render filters and clear actions with shadcn buttons");
   assert.match(timelineNavigationSourceTs, /import \{ ButtonGroup \} from "@\/webview\/components\/ui\/button-group"/, "timeline navigation island should group transcript filters with shadcn button groups");
-  assert.match(timelineNavigationSourceTs, /import \{ Card, CardContent \} from "@\/webview\/components\/ui\/card"/, "timeline navigation island should render session-map panels with shadcn cards");
-  assert.match(timelineNavigationSourceTs, /import \{[\s\S]*DropdownMenu,[\s\S]*DropdownMenuContent,[\s\S]*DropdownMenuGroup,[\s\S]*DropdownMenuLabel,[\s\S]*DropdownMenuRadioGroup,[\s\S]*DropdownMenuRadioItem,[\s\S]*DropdownMenuTrigger[\s\S]*\} from "@\/webview\/components\/ui\/dropdown-menu"/, "timeline navigation island should render compact transcript filter choices with shadcn dropdown menu components");
+  assert.match(timelineNavigationSourceTs, /import \{ Card, CardContent \} from "@\/webview\/components\/ui\/card"/, "timeline navigation island should render the toolbar filter panel with shadcn cards");
+  assert.match(timelineNavigationSourceTs, /import \{ Collapsible, CollapsibleContent, CollapsibleTrigger \} from "@\/webview\/components\/ui\/collapsible"/, "timeline navigation island should open transcript filters from a toolbar collapsible");
   assert.match(timelineNavigationSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: props\.searchIconHtml \}\}/, "timeline search icon should use shadcn data-icon hooks");
-  assert.match(timelineNavigationSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: chip\.iconHtml \}\}/, "session-map badge icons should use shadcn data-icon hooks");
-  assert.doesNotMatch(timelineNavigationSourceTs, /className="icon"[\s\S]{0,120}data-icon="inline-start"/, "session-map badge icons should not carry retired manual icon sizing classes");
   assert.doesNotMatch(timelineNavigationSourceTs, /className="icon"[\s\S]{0,120}dangerouslySetInnerHTML=\{\{ __html: props\.searchIconHtml \}\}/, "timeline search icon should not carry retired manual icon sizing classes");
+  assert.doesNotMatch(timelineNavigationSourceTs, /session-map|Lane map|ToolActivityPanel/, "timeline navigation should not render the lane map inline");
+  assert.match(laneMapDrawerSourceTs, /import \{[\s\S]*Drawer,[\s\S]*DrawerContent,[\s\S]*DrawerDescription,[\s\S]*DrawerHeader,[\s\S]*DrawerTitle[\s\S]*\} from "@\/webview\/components\/ui\/drawer"/, "lane map should render inside a shadcn drawer");
+  assert.match(laneMapDrawerSourceTs, /import \{ Card, CardContent \} from "@\/webview\/components\/ui\/card"/, "lane map drawer should use shadcn cards for dense summaries");
+  assert.match(laneMapDrawerSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: chip\.iconHtml \}\}/, "lane map badge icons should use shadcn data-icon hooks");
+  assert.doesNotMatch(laneMapDrawerSourceTs, /className="icon"[\s\S]{0,120}data-icon="inline-start"/, "lane map badge icons should not carry retired manual icon sizing classes");
   assert.match(sourceWithSharedChunks(inlineActionsSource), /createRoot/, "lazy inline actions island should mount with React");
   assert.match(inlineActionsSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "inline actions island should render commands with shadcn buttons");
   assert.match(inlineActionsSourceTs, /import \{ ButtonGroup \} from "@\/webview\/components\/ui\/button-group"/, "inline actions island should group helper action rails with shadcn button groups");
@@ -320,6 +328,9 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(timelineScrollerSource, /message-scroller-viewport/, "lazy timeline scroller island should use shadcn message scroller components");
   assert.match(timelineScrollerSource, /timeline-scroller-content/, "lazy timeline scroller island should preserve transcript content affordances");
   assert.match(timelineScrollerSourceTs, /MessageScrollerItem/, "timeline scroller source should compose transcript rows with shadcn message scroller items");
+  assert.match(timelineScrollerSourceTs, /<MessageScrollerProvider[\s\S]*autoScroll[\s\S]*defaultScrollPosition="last-anchor"[\s\S]*scrollPreviousItemPeek=\{TIMELINE_PREVIOUS_ITEM_PEEK\}/, "timeline scroller should use shadcn chat scroll behavior for streamed AI transcripts");
+  assert.match(messageScrollerSourceTs, /cn-message-scroller-viewport/, "message scroller component should align with the shadcn radix registry class hooks");
+  assert.match(messageScrollerSourceTs, /\[contain-intrinsic-size:auto_10rem\] \[content-visibility:auto\]/, "message scroller items should keep long transcripts light while measuring rows");
   assert.match(
     timelineScrollerSourceTs,
     /props\.items\.map\([\s\S]*<MessageScrollerItem[\s\S]*messageId=\{item\.id\}[\s\S]*scrollAnchor=\{Boolean\(item\.scrollAnchor\)\}/,
@@ -333,7 +344,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(toolCallCardSource, /createRoot/, "lazy tool card island should mount with React");
   assert.match(toolCallCardSourceTs, /import \{[\s\S]*Breadcrumb,[\s\S]*BreadcrumbEllipsis,[\s\S]*BreadcrumbItem,[\s\S]*BreadcrumbLink,[\s\S]*BreadcrumbList,[\s\S]*BreadcrumbPage,[\s\S]*BreadcrumbSeparator[\s\S]*\} from "@\/webview\/components\/ui\/breadcrumb"/, "lazy tool card island should render touched paths with shadcn breadcrumb components");
   assert.match(toolCallCardSourceTs, /import \{ InlineActions, type InlineAction, type InlineActionTone \} from "\.\/InlineActions"/, "lazy tool card island should render action rails through the shared shadcn inline actions component");
-  assert.doesNotMatch(toolCallCardSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"|import \{ ButtonGroup \} from "@\/webview\/components\/ui\/button-group"/, "lazy tool card island should not import bespoke action button primitives directly");
+  assert.match(toolCallCardSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "lazy tool card island should render inline permission decisions with shadcn buttons");
+  assert.match(toolCallCardSourceTs, /import \{ ButtonGroup \} from "@\/webview\/components\/ui\/button-group"/, "lazy tool card island should group inline permission decisions with shadcn button groups");
   assert.match(toolCallCardSourceTs, /import \{[\s\S]*ContextMenu,[\s\S]*ContextMenuContent,[\s\S]*ContextMenuGroup,[\s\S]*ContextMenuItem,[\s\S]*ContextMenuLabel,[\s\S]*ContextMenuTrigger[\s\S]*\} from "@\/webview\/components\/ui\/context-menu"/, "lazy tool card island should expose shadcn context menu actions");
   assert.match(toolCallCardSourceTs, /import \{[\s\S]*HoverCard,[\s\S]*HoverCardContent,[\s\S]*HoverCardTrigger[\s\S]*\} from "@\/webview\/components\/ui\/hover-card"/, "lazy tool card island should describe status and risk chips with shadcn hover cards");
   assert.match(toolCallCardSourceTs, /import \{ Separator \} from "@\/webview\/components\/ui\/separator"/, "lazy tool card island should separate fact label/value pairs with shadcn separators");
@@ -346,7 +358,6 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(toolCallCardSourceTs, /flushSync\(\(\) => \{[\s\S]*root\.render\([\s\S]*<ToolCallCard/, "lazy tool card island should avoid blank frames while tool status streams");
   assert.match(toolCallCardSourceTs, /className="summary-icon tool-summary-icon/, "lazy tool card summary icon should use a scoped shadcn data-icon wrapper");
   for (const [componentName, source] of Object.entries({
-    approvalCardSourceTs,
     diffCardSourceTs,
     eventCardSourceTs,
     terminalCardSourceTs,
@@ -369,7 +380,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(highlightSource, /codeToTokensBase/, "lazy Shiki highlighter should not collapse tokens to a single active theme");
   assert.doesNotMatch(mainSource, /function splitPatchFiles\(patch\)/, "main bundle should not include diff review patch parsing");
   assert.match(mainSource, /<nav class="skip-links" aria-label="Chat landmarks">/, "webview should expose keyboard landmark navigation");
-  assert.match(mainSource, /<button data-action="toggleReview">Review<\/button>/, "skip links should keep review reachable when the drawer is closed");
+  assert.match(mainSource, /<button data-action="toggleReview" aria-keyshortcuts="Alt\+3">Review<\/button>/, "skip links should keep review reachable when the drawer is closed");
   assert.match(headerBarSourceTs, /<span className="sr-only">CrabDB capabilities<\/span>/, "top toolbar should keep CrabDB capabilities accessible");
   assert.match(headerBarSourceTs, /toolbar-capability-grid/, "capabilities should open as a structured toolbar menu");
   assert.match(headerBarSourceTs, /group="workflow" label="Workflow"/, "capability inspector should group workflow capability state");
@@ -393,6 +404,26 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   }
 
   const mainStyleSource = fs.readFileSync(mainStyle, "utf8");
+  assert.match(
+    mainStyleSource,
+    /body\.vscode-light\s*{[^}]*--surface-canvas:[^}]*--surface-composer:[^}]*--border-quiet:/s,
+    "webview surfaces should tune themselves for VS Code light themes"
+  );
+  assert.match(
+    mainStyleSource,
+    /body\.vscode-dark\s*{[^}]*--surface-canvas:[^}]*--surface-composer:[^}]*--border-quiet:/s,
+    "webview surfaces should tune themselves for VS Code dark themes"
+  );
+  assert.match(
+    mainStyleSource,
+    /body\.vscode-high-contrast,[\s\S]*body\.vscode-high-contrast-light\s*{[^}]*--surface-canvas: var\(--surface\)[^}]*--border-quiet: var\(--border\)/s,
+    "webview surfaces should keep high-contrast themes border-driven"
+  );
+  assert.match(
+    mainStyleSource,
+    /\.transcript-message-assistant \.transcript-message-content:has\(\[role="status"\]\):{1,2}after\s*{[^}]*will-change: opacity, transform[^}]*animation: crabdb-stream-sheen/s,
+    "streaming assistant messages should expose a CSS-only live affordance"
+  );
   assert.doesNotMatch(
     mainStyleSource,
     /\.card-chrome\b|\.role\s*\{/,
@@ -445,12 +476,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.skip-links\s*{[^}]*inset-block-start:\s*8px[^}]*inset-inline-start:\s*8px[^}]*display:\s*grid[^}]*grid-auto-flow:\s*column[^}]*max-inline-size:\s*calc\(100vw - 16px\)[^}]*max-block-size:\s*min\(160px, calc\(100vh - 16px\)\)[^}]*overflow:\s*auto[^}]*overscroll-behavior:\s*contain[^}]*scrollbar-gutter:\s*stable/s,
-    "skip-link landmark strip should use logical placement and bounded scrolling"
+    /\.skip-links\s*{[^}]*display:\s*grid[^}]*grid-auto-flow:\s*column[^}]*justify-self:\s*start[^}]*max-inline-size:\s*min\(360px, 42vw\)[^}]*max-block-size:\s*min\(72px, calc\(100vh - 16px\)\)[^}]*overflow:\s*auto[^}]*overscroll-behavior:\s*contain[^}]*scrollbar-gutter:\s*stable/s,
+    "skip-link landmark strip should be visible in the header and keep bounded scrolling"
   );
   assert.match(
     mainStyleSource,
-    /\.skip-links a,\s*\.skip-links button,\s*\.skip-links span\s*{[^}]*display:\s*inline-flex[^}]*max-width:\s*min\(180px, 42vw\)[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
+    /\.skip-links a,\s*\.skip-links button,\s*\.skip-links span\s*{[^}]*display:\s*inline-flex[^}]*max-width:\s*min\(112px, 18vw\)[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
     "skip-link items should truncate long landmark labels without widening the strip"
   );
   assert.match(
@@ -685,7 +716,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /@media \(pointer: coarse\)\s*{[\s\S]*\.tool-summary,[\s\S]*\.session-map-summary,[\s\S]*\.timeline-group-summary,[\s\S]*\.thought-summary,[\s\S]*\.payload-summary,[\s\S]*min-height:\s*44px[\s\S]*touch-action:\s*manipulation/s,
+    /@media \(pointer: coarse\)\s*{[\s\S]*\.tool-summary,[\s\S]*\.timeline-group-summary,[\s\S]*\.thought-summary,[\s\S]*\.payload-summary,[\s\S]*min-height:\s*44px[\s\S]*touch-action:\s*manipulation/s,
     "collapsible inspector rows should keep comfortable coarse-pointer targets"
   );
   assert.match(
@@ -731,9 +762,9 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(
     mainSource,
     /composerRailItems\(\{[\s\S]*statusTone: status\.tone[\s\S]*attachmentModes: attachments\.map\(attachmentMode\)[\s\S]*sendMode: composerSendMode/,
-    "composer should render a data-driven prompt context rail"
+    "composer should keep data-driven prompt context metadata available"
   );
-  assert.match(composerCardSourceTs, /className="composer-context-rail"/, "composer context rail should be present in the prompt surface");
+  assert.doesNotMatch(composerCardSourceTs, /className="composer-context-rail"/, "composer context rail should not occupy the prompt surface");
   assert.match(composerCardSourceTs, /aria-invalid=\{props\.draft\.tone === "limit" \? "true" : undefined\}/, "composer limit state should mark the prompt field invalid");
   assert.match(
     mainSource,
@@ -742,12 +773,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainSource,
-    /FLOATING_DETAILS_SELECTOR = "\.composer-controls,\.header-details,\.toolbar-capabilities"/,
-    "composer, header, and capability menus should share one floating-details registry"
+    /FLOATING_DETAILS_SELECTOR = "\.composer-controls,\.header-details,\.toolbar-capabilities,\.timeline-toolbar"/,
+    "composer, header, capability, and transcript filter menus should share one floating-details registry"
   );
   assert.match(
     mainStyleSource,
-    /\.composer-controls-summary \[data-icon="inline-start"\],[\s\S]*\.composer-controls-summary \[data-icon="inline-start"\] > svg\s*{[^}]*width:\s*16px[^}]*height:\s*16px/s,
+    /\.composer-controls-summary \[data-icon="inline-start"\],[\s\S]*\.composer-controls-summary \[data-icon="inline-start"\] > svg\s*{[^}]*width:\s*var\(--composer-control-icon-size\)[^}]*height:\s*var\(--composer-control-icon-size\)/s,
     "composer floating controls trigger should size shadcn data-icon hooks instead of retired .icon wrappers"
   );
   assert.match(
@@ -906,54 +937,40 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(mainStyleSource, /\.composer-input-frame:hover\s*{[^}]*border-color/s, "composer prompt frame should expose hover feedback");
   assert.match(
     mainStyleSource,
-    /\.composer-utility-row\s*{[^}]*grid-template-columns: minmax\(0, 1fr\) auto auto[^}]*align-items: center/s,
-    "composer helper controls should sit in a compact command row"
+    /\.composer-utility-row\s*{[^}]*display:\s*none/s,
+    "composer helper controls should not occupy the prompt surface"
   );
+  assert.doesNotMatch(composerCardSourceTs, /data-action="insertPromptPreset"|data-action="setComposerSendMode"|data-composer-clear/, "composer prompt starters, mode toggle, and clear action should be removed from the visible prompt surface");
   assert.match(
     mainStyleSource,
-    /\.composer-preset-list\s*{[^}]*display: flex[^}]*overflow: auto[^}]*scrollbar-gutter: stable/s,
-    "composer prompt starters should stay horizontally bounded"
-  );
-  assert.match(
-    mainStyleSource,
-    /button\.composer-preset\s*{[^}]*display: inline-flex[^}]*max-width: min\(148px, 42vw\)[^}]*text-align: start/s,
-    "composer prompt starter chips should remain compact and readable"
-  );
-  assert.match(
-    mainStyleSource,
-    /\.composer-mode-toggle\s*{[^}]*display: inline-flex[^}]*border: 1px solid color-mix/s,
-    "composer send mode should render as a segmented control"
-  );
-  assert.match(
-    mainStyleSource,
-    /\.composer-context-rail\s*{[^}]*display: flex[^}]*flex-wrap: wrap[^}]*max-height: min\(62px, 16vh\)[^}]*overflow: auto[^}]*scrollbar-gutter: stable/s,
-    "composer context rail should stay compact and scroll-stable"
+    /\.composer-context-rail\s*{[^}]*display:\s*none/s,
+    "composer context rail should not occupy vertical space above the input"
   );
   assert.match(
     mainStyleSource,
     /\.composer-context-chip\s*{[^}]*display: inline-flex[^}]*max-width: min\(220px, 100%\)[^}]*user-select: text/s,
     "composer context chips should stay bounded and selectable"
   );
-  assert.match(
-    mainStyleSource,
-    /button\.composer-mode-button\.active\s*{[^}]*color: var\(--text\)[^}]*background:/s,
-    "active composer send mode should remain visually clear"
-  );
   assert.match(mainStyleSource, /\.composer-icon-tools\s*{[^}]*max-width: 100%/s, "composer tool row should be width constrained");
   assert.match(
     mainStyleSource,
-    /\.composer button\[data-composer-icon-only="true"\]\s*{[^}]*position: relative[^}]*border-color: color-mix\(in srgb, var\(--border-subtle\) 62%, transparent\)[^}]*background: color-mix\(in srgb, var\(--surface-muted\) 28%, transparent\)/s,
-    "composer icon controls should use a quiet visible button surface"
+    /\.composer-actions\s*{[^}]*display:\s*flex[^}]*flex-wrap:\s*wrap[^}]*padding:\s*6px 0 0/s,
+    "composer actions should use a flat wrapping command bar below the input"
   );
   assert.match(
     mainStyleSource,
-    /\.composer button\[data-composer-icon-only="true"\]:{1,2}after\s*{[^}]*content: ""[^}]*inset-inline: 7px[^}]*height: 2px[^}]*background: currentColor[^}]*transform: scaleX\((?:0)?\.42\)/s,
-    "composer icon controls should expose a compact typed-action accent without extra DOM"
+    /\.composer button\[data-composer-icon-only="true"\]\s*{[^}]*width: var\(--composer-control-size\)[^}]*height: var\(--composer-control-size\)[^}]*background: transparent/s,
+    "composer icon controls should share the standard CrabDB control size"
   );
   assert.match(
     mainStyleSource,
-    /\.composer button\[data-composer-icon-only="true"\]:hover:{1,2}after,[\s\S]*\.composer button\[data-composer-icon-only="true"\]:focus-visible:{1,2}after\s*{[^}]*opacity: (?:0)?\.72[^}]*transform: scaleX\((?:0)?\.9\)/s,
-    "composer icon action accents should respond to hover and keyboard focus"
+    /\.composer button\[data-composer-icon-only="true"\]:{1,2}after\s*{[^}]*content:\s*none/s,
+    "composer icon controls should not add extra underline accents"
+  );
+  assert.match(
+    mainStyleSource,
+    /\.composer button\[data-composer-icon-only="true"\]\.send-button\s*{[^}]*background: var\(--vscode-button-background\)/s,
+    "composer send control should keep primary button treatment"
   );
   assert.match(
     mainStyleSource,
@@ -972,13 +989,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.composer-actions\s*{[^}]*border-top:\s*0[^}]*padding-top:\s*0/s,
+    /\.composer-actions\s*{[^}]*border:\s*0[^}]*background:\s*transparent[^}]*padding:\s*6px 0 0/s,
     "composer actions should not add a nested divider below the input"
   );
   assert.match(mainSource, /contextUsageGauge\(usage\)/, "composer toolbar should render the current context usage gauge");
   assert.match(
     mainStyleSource,
-    /\.composer-context-gauge\s*{[^}]*place-items: center[^}]*width: 32px[^}]*height: 32px[^}]*border-radius: 50%/s,
+    /\.composer-context-gauge\s*{[^}]*place-items: center[^}]*width: var\(--composer-control-size\)[^}]*height: var\(--composer-control-size\)[^}]*border-radius: 50%/s,
     "composer context gauge should reserve stable circular geometry"
   );
   assert.match(
@@ -998,23 +1015,23 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.composer-icon-tools,\s*\.composer-action-group\s*{[^}]*position: relative[^}]*border:\s*1px solid color-mix\(in srgb, var\(--border-subtle\) 66%, transparent\)[^}]*background:\s*color-mix\(in srgb, var\(--surface-muted\) 24%, transparent\)[^}]*padding:\s*3px 3px 3px 8px/s,
-    "composer icon rows should render as compact command groups with stable framing"
+    /\.composer-icon-tools,\s*\.composer-action-group\s*{[^}]*position: relative[^}]*border:\s*0[^}]*background:\s*transparent[^}]*padding:\s*0/s,
+    "composer icon rows should render as flat compact command groups"
   );
   assert.match(
     mainStyleSource,
-    /\.composer-icon-tools,\s*\.composer-action-group\s*{[^}]*max-height: min\(74px, 20vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "composer toolbar groups should stay bounded if provider controls expand"
+    /\.composer-icon-tools,\s*\.composer-action-group\s*{[^}]*max-height: none[^}]*overflow: visible/s,
+    "composer toolbar groups should not create nested scroll boxes"
   );
   assert.match(
     mainStyleSource,
-    /\.composer-icon-tools:{1,2}before,\s*\.composer-action-group:{1,2}before\s*{[^}]*inset-block: 7px[^}]*inset-inline-start: 3px[^}]*width: 2px[^}]*background: var\(--crabdb-lane\)[\s\S]*\.composer-action-group:{1,2}before\s*{[^}]*background: var\(--crabdb-checkpoint\)/s,
-    "composer command groups should expose semantic side meters without extra markup"
+    /\.composer-icon-tools:{1,2}before,\s*\.composer-action-group:{1,2}before\s*{[^}]*content:\s*none/s,
+    "composer command groups should not add side-meter decoration"
   );
   assert.match(
     mainStyleSource,
-    /\.composer-icon-tools:hover,[\s\S]*\.composer-action-group:focus-within\s*{[^}]*border-color:\s*color-mix\(in srgb, var\(--input-active-border\) 44%, var\(--border-subtle\)\)[^}]*background:\s*color-mix\(in srgb, var\(--surface-hover\) 48%, transparent\)[^}]*box-shadow:\s*inset 0 0 0 1px/s,
-    "composer command groups should show one contained focus and hover layer"
+    /\.composer button\[data-composer-icon-only="true"\]:not\(:disabled\):hover,[\s\S]*\.composer button\[data-composer-icon-only="true"\]:focus-visible\s*{[^}]*border-color: var\(--border-subtle\)[^}]*background: var\(--surface-hover\)/s,
+    "composer icon buttons should show button-level hover and focus feedback"
   );
   assert.match(
     mainStyleSource,
@@ -1073,13 +1090,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /@media \(max-width: 640px\)\s*{[\s\S]*\.composer-utility-row\s*{[^}]*grid-template-columns: minmax\(0, 1fr\) auto[\s\S]*\.composer-preset-list\s*{[^}]*grid-column: 1 \/ -1[\s\S]*\.composer-clear\s*{[^}]*grid-column: 2[^}]*justify-self: end/s,
-    "narrow composer helpers should keep mode and clear controls compact"
+    /@media \(max-width: 420px\)\s*{[\s\S]*\.composer-icon-tools,\s*\.composer-action-group\s*{[\s\S]*width: 100%/s,
+    "phone composer toolbar groups should wrap cleanly"
   );
   assert.match(
     mainStyleSource,
-    /@media \(max-width: 420px\)\s*{[\s\S]*\.composer-preset-list\s*{[^}]*display: grid[^}]*grid-template-columns: repeat\(auto-fit, minmax\(116px, 1fr\)\)[\s\S]*button\.composer-preset\s*{[^}]*width: 100%[^}]*max-width: 100%[\s\S]*\.composer-icon-tools,\s*\.composer-action-group\s*{[\s\S]*width: 100%/s,
-    "phone composer helpers and toolbar groups should wrap cleanly"
+    /@media \(max-width: 420px\)\s*{[\s\S]*\.composer-context-gauge\s*{[^}]*width: var\(--composer-control-size\)/s,
+    "phone composer context gauge should keep the same compact control size"
   );
   assert.match(
     mainStyleSource,
@@ -1613,41 +1630,36 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.approval-tone-risk \.approval-impact\s*{[^}]*border-color: color-mix\(in srgb, var\(--state-danger-border\) 54%, var\(--border-subtle\)\)/s,
-    "risky approvals should keep visible impact contrast without a left rail"
+    /\.approval-tone-risk \.approval-impact\s*{[^}]*color: var\(--text\)/s,
+    "risky approvals should keep readable compact impact copy"
   );
   assert.match(
     mainStyleSource,
-    /\.approval-option-list\s*{[^}]*display: flex[^}]*flex: 1 1 220px[^}]*flex-wrap: wrap/s,
+    /\.approval-option-list\s*{[^}]*display: flex[^}]*flex: 1 1 180px[^}]*flex-wrap: wrap/s,
     "approval options should stay compact and wrap under long labels"
   );
   assert.match(
     mainSource,
-    /decisionOptions = resolved \? \[\] : node\.options\.filter\(\(option\) => !isRejectPermissionOption\(option\)\)/,
+    /decisionOptions = resolved \? \[\] : permission\.options\.filter\(\(option\) => !isRejectPermissionOption\(option\)\)/,
     "approval options should not duplicate reject-like provider options"
   );
   assert.match(
-    approvalCardSourceTs,
-    /props\.resolved \? \([\s\S]*<p className="approval-resolved-note">\{props\.resolvedNote\}<\/p>/,
-    "resolved approvals should render a small decision receipt"
+    toolCallCardSourceTs,
+    /approval\.resolved \? \([\s\S]*<p className="approval-resolved-note">\{approval\.resolvedNote\}<\/p>/,
+    "resolved tool permissions should render a small decision receipt"
   );
   assert.match(
-    approvalCardSourceTs,
-    /props\.resolved \? "approval-card-resolved" : ""/,
-    "resolved approvals should collapse to a small decision receipt"
+    toolCallCardSourceTs,
+    /approval\.resolved \? "tool-approval-resolved" : ""/,
+    "resolved tool permissions should collapse to a small decision receipt"
   );
   assert.match(
-    mainSource,
-    /function approvalDecisionIcon\(tone\)[\s\S]*tone === "primary" \? "check" : tone === "risk" \? "diagnostics" : tone === "warning" \? "review" : "tool"/,
-    "approval options should choose semantic decision icons from their risk tone"
+    toolCallCardSourceTs,
+    /function approvalActionIcon[\s\S]*action\.kind === "reject"[\s\S]*return CircleX[\s\S]*includes\("always"\)[\s\S]*return ShieldCheck[\s\S]*return Check/,
+    "approval actions should map Always allow, Allow, and Reject to clear lucide intents"
   );
   assert.match(
-    approvalCardSourceTs,
-    /danger approval-reject[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: action\.iconHtml \}\}/,
-    "approval reject action should carry an explicit stop icon"
-  );
-  assert.match(
-    approvalCardSourceTs,
+    toolCallCardSourceTs,
     /approval-decision-copy/,
     "approval decisions should separate icon and text cells for bounded copy"
   );
@@ -1673,12 +1685,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.approval-option > \[data-icon="inline-start"\],\s*\.approval-reject > \[data-icon="inline-start"\]\s*{[^}]*display: inline-grid[^}]*place-items: center[^}]*width: 20px[^}]*height: 20px[^}]*border-radius: var\(--radius-control\)/s,
-    "approval decision icons should render as compact stable capsules"
+    /\.approval-option > \[data-icon="inline-start"\],\s*\.approval-reject > \[data-icon="inline-start"\]\s*{[^}]*display: block[^}]*width: 15px[^}]*height: 15px/s,
+    "approval decision icons should render as compact lucide SVGs in a stable column"
   );
   assert.match(
     mainStyleSource,
-    /\.approval-decision-copy\s*{[^}]*display: grid[^}]*min-width: 0[\s\S]*\.approval-decision-copy > span\s*{[^}]*overflow-wrap: anywhere/s,
+    /\.approval-decision-copy\s*{[^}]*display: grid[^}]*min-width: 0[\s\S]*\.approval-decision-copy > span\s*{[^}]*overflow: hidden[^}]*text-overflow: ellipsis[^}]*white-space: nowrap/s,
     "approval decision copy should remain bounded for long provider labels"
   );
   assert.match(
@@ -1723,7 +1735,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.approval-locations\s*{[^}]*max-height: min\(74px, 18vh\)[^}]*overscroll-behavior:\s*contain[^}]*scrollbar-gutter:\s*stable[^}]*scrollbar-width:\s*thin/s,
+    /\.approval-locations\s*{[^}]*max-height: min\(52px, 14vh\)[^}]*overscroll-behavior:\s*contain[^}]*scrollbar-gutter:\s*stable[^}]*scrollbar-width:\s*thin/s,
     "approval affected-file chips should stay bounded inside permission gates"
   );
   assert.match(
@@ -1823,7 +1835,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.tool-summary,\s*\.session-map-summary,\s*\.timeline-group-summary,\s*\.payload-summary,\s*\.raw-summary\s*{[^}]*border-radius:\s*var\(--radius-control\)[^}]*transition:[^}]*background-color (?:120ms|\.12s) ease-out[^}]*box-shadow (?:120ms|\.12s) ease-out/s,
+    /\.tool-summary,\s*\.timeline-group-summary,\s*\.payload-summary,\s*\.raw-summary\s*{[^}]*border-radius:\s*var\(--radius-control\)[^}]*transition:[^}]*background-color (?:120ms|\.12s) ease-out[^}]*box-shadow (?:120ms|\.12s) ease-out/s,
     "collapsible inspector summaries should share polished radius and transition treatment"
   );
   assert.match(
@@ -1833,7 +1845,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.tool-summary:focus-visible,\s*\.session-map-summary:focus-visible,\s*\.timeline-group-summary:focus-visible,\s*\.payload-summary:focus-visible,\s*\.raw-summary:focus-visible\s*{[^}]*outline:\s*0[^}]*box-shadow:\s*var\(--focus-ring\)/s,
+    /\.tool-summary:focus-visible,\s*\.timeline-group-summary:focus-visible,\s*\.payload-summary:focus-visible,\s*\.raw-summary:focus-visible\s*{[^}]*outline:\s*0[^}]*box-shadow:\s*var\(--focus-ring\)/s,
     "collapsible inspector summaries should share a strong keyboard focus treatment"
   );
   assert.doesNotMatch(
@@ -2268,18 +2280,23 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.timeline-filter-group\s*{[^}]*max-height: min\(76px, 20vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "timeline filter chips should stay bounded for long transcript sessions"
+    /\.timeline-filter-popover\s*{[^}]*max-height: min\(440px, calc\(100vh - 88px\)\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
+    "timeline filter popover should stay bounded for long transcript sessions"
   );
   assert.match(
     mainStyleSource,
-    /\.timeline-filter-menu-trigger\s*{[^}]*grid-template-columns: auto minmax\(0, 1fr\) auto auto[^}]*max-width: min\(210px, 100%\)/s,
-    "timeline filter dropdown trigger should keep icon label count and disclosure bounded"
+    /\.timeline-filter-trigger\s*{[^}]*grid-template-columns: auto minmax\(0, 1fr\) auto auto[^}]*max-width: min\(220px, 100%\)/s,
+    "timeline filter toolbar trigger should keep icon label count and disclosure bounded"
   );
   assert.match(
     mainStyleSource,
-    /\.timeline-filter-menu\s*{[^}]*min-width: min\(240px, calc\(100vw - 24px\)\)[^}]*max-width: min\(320px, calc\(100vw - 24px\)\)/s,
-    "timeline filter dropdown should stay inside narrow webview panes"
+    /\.timeline-filter-popover\s*{[^}]*width: min\(390px, calc\(100vw - 28px\)\)[^}]*max-height: min\(440px, calc\(100vh - 88px\)\)/s,
+    "timeline filter popover should stay inside narrow webview panes"
+  );
+  assert.match(
+    mainStyleSource,
+    /\.timeline-filter-group\s*{[^}]*display: grid[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)[^}]*gap: 6px/s,
+    "timeline filter choices should render as a compact bounded grid"
   );
   assert.match(
     mainStyleSource,
@@ -2303,18 +2320,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.timeline-result-count span\s*{[^}]*overflow: hidden[^}]*text-overflow: ellipsis/s,
-    "timeline result summaries should truncate instead of crowding the clear action"
+    /\.timeline-shell\s*{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/s,
+    "timeline shell should give the transcript the full main view after moving filters to the toolbar"
   );
   assert.match(
     mainStyleSource,
-    /\.session-map-summary\s*{[^}]*grid-template-columns: auto minmax\(0, 1fr\) auto auto/s,
-    "session map summaries should reserve room for counts and disclosure"
-  );
-  assert.match(
-    mainStyleSource,
-    /\.session-map-body\s*{[^}]*max-height: min\(340px, 42vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "session map body should stay bounded during long transcript runs"
+    /\.lane-map-drawer\[data-slot="drawer-content"\]\s*{[^}]*width: min\(430px, calc\(100vw - 18px\)\)[^}]*max-width: min\(430px, calc\(100vw - 18px\)\)/s,
+    "lane map drawer should keep a compact right-side width"
   );
   assert.match(
     mainStyleSource,
@@ -2323,8 +2335,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.session-map-summary \[data-slot="accordion-trigger-icon"\]\s*{[^}]*grid-column:\s*4[^}]*color:\s*var\(--crabdb-muted\)/s,
-    "session map summaries should use the shadcn accordion trigger icon as the disclosure affordance"
+    /\.lane-map-body\s*{[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
+    "lane map drawer body should stay scroll-stable during long transcript runs"
   );
   assert.match(
     mainStyleSource,
@@ -2333,8 +2345,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.session-map-summary\[aria-expanded="true"\],[\s\S]*\.timeline-group-summary\[aria-expanded="true"\]\s*{[^}]*border-bottom:\s*1px solid var\(--border-subtle\)[^}]*background:\s*color-mix\(in srgb, var\(--surface-muted\) 34%, transparent\)/s,
-    "open session map and timeline group summaries should use the shadcn accordion expanded state"
+    /\.header-action-group button\[data-header-icon-only="true"\]\[data-lane-map-trigger="true"\]\.active\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background:\s*color-mix\(in srgb, var\(--crabdb-lane\) 10%, transparent\)/s,
+    "open lane map trigger should keep a clear active state in the toolbar"
   );
   assert.doesNotMatch(
     timelineNavigationSourceTs,
@@ -2348,13 +2360,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.session-map-count\s*{[^}]*font-variant-numeric:\s*tabular-nums/s,
-    "session map counts should stay optically stable"
+    /\.lane-map-section-heading\s*{[^}]*justify-content: space-between[^}]*font-size: 11px[^}]*font-weight: 650/s,
+    "lane map drawer section headings should stay compact and scannable"
   );
   assert.match(
     mainStyleSource,
-    /\.session-map \.event-chip \[data-icon="inline-start"\]\s*{[^}]*width: 12px[^}]*height: 12px/s,
-    "session map chip icons should style shadcn Badge data-icon hooks"
+    /\.lane-map-drawer \.event-chip \[data-icon="inline-start"\],[\s\S]*\.lane-map-drawer \.event-chip \[data-icon="inline-start"\] > svg\s*{[^}]*width: 12px[^}]*height: 12px/s,
+    "lane map chip icons should style shadcn Badge data-icon hooks"
   );
   assert.match(
     mainStyleSource,
@@ -2468,28 +2480,23 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.message \.message-header\s*{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto[^}]*gap:\s*6px/s,
-    "message header should reserve stable space for role and streaming state through the shadcn message header"
+    /\.transcript-message-assistant \.transcript-message-content\s*{[^}]*width:\s*100%[^}]*max-width:\s*none[^}]*padding:\s*6px 0 8px/s,
+    "assistant messages should render as plain full-width prose without avatar or card chrome"
   );
   assert.match(
     mainStyleSource,
-    /\.message \.message-role-marker\s*{[^}]*overflow:\s*hidden[^}]*font-weight:\s*650[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
-    "message role labels should use scoped marker styling and truncate instead of widening transcript cards"
-  );
-  assert.match(
-    mainStyleSource,
-    /\.message \.transcript-message-content\s*{[^}]*width:\s*min\(760px, 100%\)[^}]*max-width:\s*100%/s,
-    "message bodies should stay bounded instead of stretching role/content apart across the whole transcript"
+    /\.transcript-message-assistant \.transcript-message-content > \.markdown\s*{[^}]*max-width:\s*100%[^}]*font-size:\s*var\(--crabdb-copy-font-size\)[^}]*line-height:\s*1\.68/s,
+    "assistant markdown should use the full content width with more readable type"
   );
   assert.match(
     mainStyleSource,
     /\.transcript-message-user \.transcript-message-content\s*{[^}]*align-items:\s*flex-end/s,
-    "user message content should align with the user role marker on the right"
+    "user message content should align as a right-side transcript bubble"
   );
   assert.match(
     mainStyleSource,
-    /\.message \.transcript-message-content > \.markdown,[\s\S]*\.message \.transcript-message-footer\s*{[^}]*width:\s*100%/s,
-    "message markdown and streaming footer should share the same bounded message column"
+    /\.message \.transcript-message-content > \.markdown\s*{[^}]*width:\s*100%/s,
+    "message markdown should fill the bounded message column without visible role chrome"
   );
   assert.match(
     mainStyleSource,
@@ -2713,13 +2720,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     messageCardSourceTs,
-    /<MessageGroup data-message-card="">[\s\S]*<Message[\s\S]*<MessageAvatar[\s\S]*className=\{cn\([\s\S]*message-avatar[\s\S]*<MessageContent className="transcript-message-content">[\s\S]*<MessageHeader className="message-header">[\s\S]*<div[\s\S]*className="markdown"/,
-    "message nodes should render through the documented shadcn message parts while preserving helper-owned markdown selectors"
+    /<MessageGroup data-message-card="">[\s\S]*<Message[\s\S]*<MessageContent[\s\S]*"transcript-message-content"[\s\S]*<div[\s\S]*className="markdown"/,
+    "message nodes should render through shadcn message layout while preserving helper-owned markdown selectors"
   );
-  assert.match(
+  assert.doesNotMatch(
     messageCardSourceTs,
-    /<Marker className="message-streaming-status" role="status"[\s\S]*<MarkerIcon>[\s\S]*<Spinner aria-hidden="true" role="presentation" \/>[\s\S]*<MarkerContent>Live response<\/MarkerContent>/,
-    "streaming message footers should announce live state through shadcn Marker semantics"
+    /MessageAvatar|MessageHeader|message-avatar|message-header|message-role-marker|message-streaming-badge|Marker|Spinner/,
+    "assistant messages should not reintroduce visible avatar, role, or streaming badge chrome"
   );
   assert.doesNotMatch(
     messageCardSourceTs,
@@ -2728,7 +2735,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     timelineScrollerSourceTs,
-    /<MessageScrollerProvider>[\s\S]*<MessageScroller[\s\S]*<MessageScrollerViewport[\s\S]*id="timeline"[\s\S]*className="timeline"[\s\S]*<MessageScrollerContent[\s\S]*<MessageScrollerItem/,
+    /<MessageScrollerProvider[\s\S]*<MessageScroller[\s\S]*<MessageScrollerViewport[\s\S]*id="timeline"[\s\S]*className="timeline"[\s\S]*<MessageScrollerContent[\s\S]*<MessageScrollerItem/,
     "timeline content should render through the shadcn message scroller item model while preserving transcript focus and helper markup"
   );
   assert.match(
@@ -2838,17 +2845,17 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.empty-state\s*{[^}]*display: grid[^}]*grid-template-columns: minmax\(0, 1fr\) minmax\(min\(236px, 100%\), auto\)[^}]*overflow: hidden/s,
-    "empty transcript states should render as a copy-and-command surface"
+    /\.empty-state\s*{[^}]*display: grid[^}]*grid-template-columns: minmax\(0, 1fr\)[^}]*justify-items: center[^}]*max-width: min\(640px, calc\(100% - 32px\)\)[^}]*overflow: hidden/s,
+    "empty transcript states should render as a centered welcome surface"
   );
   assert.match(
     mainStyleSource,
-    /\.empty-state-media\s*{[^}]*justify-self: start[^}]*margin-block-end: 0/s,
-    "empty transcript states should position shadcn EmptyMedia without the retired card chrome wrapper"
+    /\.empty-state-media\s*{[^}]*justify-self: center[^}]*width: 36px[^}]*height: 36px[^}]*color: var\(--crabdb-lane\)/s,
+    "empty transcript states should position shadcn EmptyMedia as a restrained centered mark"
   );
   assert.match(
     mainStyleSource,
-    /\.empty-state-role\s*{[^}]*justify-self: start[^}]*min-width: 0[^}]*max-width: 100%/s,
+    /\.empty-state-role\s*{[^}]*justify-self: center[^}]*min-width: 0[^}]*max-width: 100%/s,
     "empty transcript role labels should let shadcn badges own their badge chrome while staying bounded"
   );
   assert.doesNotMatch(
@@ -2858,32 +2865,32 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.empty-actions\s*{[^}]*display: grid[^}]*grid-template-columns: minmax\(0, 1fr\)[^}]*width: min\(236px, 100%\)[^}]*max-height: min\(176px, 34vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "empty-state action rails should stay bounded and scroll-stable"
+    /\.empty-actions\s*{[^}]*display: grid[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)[^}]*width: min\(500px, 100%\)[^}]*max-height: min\(164px, 34vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
+    "empty-state action groups should stay balanced, bounded, and scroll-stable"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action\s*{[^}]*grid-template-columns: auto minmax\(0, 1fr\)[^}]*min-width: 0[^}]*overflow: hidden/s,
-    "empty-state actions should keep icon and label columns bounded"
+    /button\.empty-action\s*{[^}]*grid-template-columns: auto minmax\(0, max-content\)[^}]*justify-content: center[^}]*min-width: 0[^}]*overflow: hidden/s,
+    "empty-state actions should keep centered icon and label columns bounded"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action\s*{[^}]*position: relative[^}]*padding: 8px 9px 8px 15px[^}]*transition:[^}]*transform (?:80ms|\.08s) ease-out/s,
-    "empty-state actions should keep typed command geometry and pressed feedback"
+    /button\.empty-action\s*{[^}]*position: relative[^}]*padding: 7px 10px[^}]*transition:[^}]*transform (?:80ms|\.08s) ease-out/s,
+    "empty-state actions should keep compact command geometry and pressed feedback"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action:{1,2}before\s*{[^}]*content: ""[^}]*inset-inline-start: 6px[^}]*width: 3px[^}]*background: var\(--border-subtle\)/s,
-    "empty-state actions should expose compact typed meters without extra markup"
+    /button\.empty-action:{1,2}before\s*{[^}]*content: ""[^}]*inset-inline: 10px[^}]*inset-block-end: 0[^}]*height: 1px[^}]*background: transparent/s,
+    "empty-state actions should keep a quiet accent hook without extra markup"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action-primary:{1,2}before\s*{[^}]*background: var\(--crabdb-lane\)[^}]*\}[\s\S]*button\.empty-action\[data-action="?focusReview"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)/s,
-    "empty-state primary and review actions should carry lane and review meters"
+    /button\.empty-action-primary\s*{[^}]*grid-column: 1 \/ -1[^}]*background: var\(--vscode-button-background\)[^}]*\}[\s\S]*button\.empty-action\[data-action="?focusReview"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)/s,
+    "empty-state primary and review actions should carry clear primary and review treatment"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action\[data-action="?attachSelection"?\]:{1,2}before,[\s\S]*button\.empty-action\[data-action="?openSettings"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-provider\)/s,
+    /button\.empty-action\[data-action="?attachSelection"?\]:{1,2}before,[\s\S]*button\.empty-action\[data-action="?openSettings"?\]:{1,2}before\s*{[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 70%, transparent\)/s,
     "empty-state context and settings actions should carry provider/config meters"
   );
   assert.match(

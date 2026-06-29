@@ -13,17 +13,20 @@ import type {
   SessionInfoUpdate,
   SessionMode,
   ToolCallContent,
+  ToolTerminalBlock,
   ToolCallPatchUpdate,
   ToolCallUpdate,
   UsageUpdate,
   UserMessageChunkUpdate
 } from "./acpTypes";
+import { redactString } from "./securityRedaction";
 import type {
   ApprovalNode,
   MessageNode,
   RenderNode,
   RenderPatch,
   RenderReduceContext,
+  TerminalNode,
   ThoughtNode,
   ToolNode
 } from "./renderModel";
@@ -84,19 +87,37 @@ export function reducePermissionRequest(
 
 export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]): RenderNode[] {
   let next = [...nodes];
+  let nextTimelineOrder = maxTimelineOrder(next);
   for (const patch of patches) {
     const patchNode = patch.node ? normalizePatchNodeForTimeline(next, patch) : undefined;
     if (patch.type === "append" && patchNode) {
-      next.push(patchNode);
+      const ordered = ensureTimelineOrder(patchNode, () => {
+        nextTimelineOrder += 1;
+        return nextTimelineOrder;
+      });
+      nextTimelineOrder = Math.max(nextTimelineOrder, ordered.timelineOrder ?? 0);
+      next.push(ordered);
       continue;
     }
     if ((patch.type === "replace" || patch.type === "upsert") && patchNode) {
       const index = next.findIndex((node) => node.id === patchNode.id);
+      let appliedNode: RenderNode | undefined;
       if (index >= 0) {
-        const existing = next[index];
-        next[index] = patch.type === "upsert" && existing ? mergeRenderNode(existing, patchNode) : patchNode;
+        const existing = next[index]!;
+        const orderedPatchNode = preserveTimelineOrder(patchNode, existing);
+        next[index] = patch.type === "upsert" ? mergeRenderNode(existing, orderedPatchNode) : orderedPatchNode;
+        appliedNode = next[index];
       } else {
-        next.push(patchNode);
+        const ordered = ensureTimelineOrder(patchNode, () => {
+          nextTimelineOrder += 1;
+          return nextTimelineOrder;
+        });
+        nextTimelineOrder = Math.max(nextTimelineOrder, ordered.timelineOrder ?? 0);
+        next.push(ordered);
+        appliedNode = ordered;
+      }
+      if (appliedNode?.kind === "tool") {
+        next = syncExpandedTerminalNodes(next, appliedNode);
       }
       continue;
     }
@@ -105,6 +126,22 @@ export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]):
     }
   }
   return next;
+}
+
+function maxTimelineOrder(nodes: RenderNode[]): number {
+  return nodes.reduce((max, node, index) => Math.max(max, node.timelineOrder ?? index + 1), 0);
+}
+
+function ensureTimelineOrder<TNode extends RenderNode>(node: TNode, allocate: () => number): TNode {
+  return node.timelineOrder === undefined ? ({ ...node, timelineOrder: allocate() } as TNode) : node;
+}
+
+function preserveTimelineOrder<TNode extends RenderNode>(incoming: TNode, existing: RenderNode): TNode {
+  if (incoming.timelineOrder !== undefined) {
+    return incoming;
+  }
+  const timelineOrder = existing.timelineOrder;
+  return timelineOrder === undefined ? incoming : ({ ...incoming, timelineOrder } as TNode);
 }
 
 function normalizePatchNodeForTimeline(nodes: RenderNode[], patch: RenderPatch): RenderNode | undefined {
@@ -118,6 +155,7 @@ function normalizePatchNodeForTimeline(nodes: RenderNode[], patch: RenderPatch):
       ...node,
       id: appendable.id,
       createdAt: appendable.createdAt,
+      timelineOrder: appendable.timelineOrder,
       acpMessageId: appendable.acpMessageId
     };
   }
@@ -283,6 +321,7 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
     return {
       ...incoming,
       createdAt: existing.createdAt,
+      timelineOrder: existing.timelineOrder,
       content,
       text: contentBlocksToText(content),
       streaming: existing.streaming || incoming.streaming
@@ -293,14 +332,16 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
     return {
       ...incoming,
       createdAt: existing.createdAt,
+      timelineOrder: existing.timelineOrder,
       content
     };
   }
   if (existing.kind === "tool" && incoming.kind === "tool") {
     const explicitStatus = hasExplicitToolStatus(incoming);
-    return {
+    return syncToolTerminalContent({
       ...incoming,
       createdAt: existing.createdAt,
+      timelineOrder: existing.timelineOrder,
       status: explicitStatus ? incoming.status : existing.status,
       title: incoming.title && incoming.title !== "Tool call" ? incoming.title : existing.title,
       toolKind: incoming.toolKind !== "other" ? incoming.toolKind : existing.toolKind,
@@ -309,7 +350,10 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
       content: incoming.content.length ? mergeToolContent(existing.content, incoming.content) : existing.content,
       rawInput: incoming.rawInput ?? existing.rawInput,
       rawOutput: incoming.rawOutput ?? existing.rawOutput
-    };
+    });
+  }
+  if (existing.kind === "terminal" && incoming.kind === "terminal") {
+    return mergeTerminalNode(existing, incoming);
   }
   return incoming;
 }
@@ -320,17 +364,70 @@ function hasExplicitToolStatus(node: ToolNode): boolean {
 }
 
 function mergeToolContent(existing: ToolCallContent[], incoming: ToolCallContent[]): ToolCallContent[] {
-  const seen = new Set(existing.map(stableContentKey));
   const merged = [...existing];
   for (const item of incoming) {
     const key = stableContentKey(item);
-    if (seen.has(key)) {
+    const index = merged.findIndex((candidate) => stableContentKey(candidate) === key);
+    if (index >= 0) {
+      const mergedItem = mergeToolContentItem(merged[index]!, item);
+      if (mergedItem) {
+        merged[index] = mergedItem;
+      }
       continue;
     }
-    seen.add(key);
     merged.push(item);
   }
   return merged;
+}
+
+function mergeToolContentItem(existing: ToolCallContent, incoming: ToolCallContent): ToolCallContent | undefined {
+  const existingRecord = existing as Record<string, unknown>;
+  const incomingRecord = incoming as Record<string, unknown>;
+  if (
+    existingRecord.type === "terminal" &&
+    incomingRecord.type === "terminal" &&
+    typeof existingRecord.terminalId === "string" &&
+    existingRecord.terminalId === incomingRecord.terminalId
+  ) {
+    return {
+      ...existingRecord,
+      ...incomingRecord
+    } as ToolCallContent;
+  }
+  return undefined;
+}
+
+function syncToolTerminalContent(tool: ToolNode): ToolNode {
+  let changed = false;
+  const content = tool.content.map((item) => {
+    const record = item as Record<string, unknown>;
+    if (record.type !== "terminal") {
+      return item;
+    }
+    const current =
+      stringRecordField(record, "terminalStatus") ||
+      stringRecordField(record, "status") ||
+      stringRecordField(record, "state");
+    const terminalStatus = syncTerminalStatusFromTool(current, tool.toolStatus);
+    if (!terminalStatus || terminalStatus === current) {
+      return item;
+    }
+    changed = true;
+    const next: Record<string, unknown> = {
+      ...record,
+      status: terminalStatus
+    };
+    if (typeof record.terminalStatus === "string") {
+      next.terminalStatus = terminalStatus;
+    }
+    return next as ToolCallContent;
+  });
+  return changed ? { ...tool, content } : tool;
+}
+
+function stringRecordField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
 }
 
 function mergeToolLocations<TLocation extends { path: string; line?: number | null | undefined }>(
@@ -351,6 +448,10 @@ function mergeToolLocations<TLocation extends { path: string; line?: number | nu
 }
 
 function stableContentKey(content: ToolCallContent): string {
+  const record = content as Record<string, unknown>;
+  if (record.type === "terminal" && typeof record.terminalId === "string") {
+    return `terminal:${record.terminalId}`;
+  }
   try {
     return JSON.stringify(content);
   } catch {
@@ -414,6 +515,7 @@ const planRenderer: AcpUpdateRenderer<PlanUpdate> = {
           provider: context.provider,
           source: "acp-live",
           status: "in_progress",
+          createdAt: context.now(),
           updatedAt: context.now(),
           raw: update,
           entries: Array.isArray(update.entries) ? update.entries : []
@@ -632,7 +734,9 @@ function messagePatch(
 }
 
 function toolNodeFromCall(call: ToolCallUpdate, context: RenderReduceContext): ToolNode {
-  return {
+  const timestamp = context.now();
+  const content = normalizedToolContent(call);
+  return syncToolTerminalContent({
     id: `tool:${call.toolCallId}`,
     kind: "tool",
     taskId: context.taskId,
@@ -643,17 +747,85 @@ function toolNodeFromCall(call: ToolCallUpdate, context: RenderReduceContext): T
     provider: context.provider,
     source: "acp-live",
     status: mapToolStatus(call.status),
-    updatedAt: context.now(),
+    createdAt: timestamp,
+    updatedAt: timestamp,
     raw: call,
     toolCallId: call.toolCallId,
     title: call.title,
     toolKind: call.kind || "other",
     toolStatus: call.status || "in_progress",
     locations: call.locations || [],
-    content: call.content || [],
+    content,
     rawInput: call.rawInput,
     rawOutput: call.rawOutput
-  };
+  });
+}
+
+function normalizedToolContent(call: ToolCallUpdate): ToolCallContent[] {
+  if (call.content?.length) {
+    return call.content;
+  }
+  const output = recoveredRawToolOutput(call.rawOutput);
+  if (!output) {
+    return [];
+  }
+  if (isCommandToolCall(call)) {
+    const command = commandField(asRecord(call.rawInput)) || call.title || "Command";
+    const terminal: ToolTerminalBlock = {
+      type: "terminal",
+      terminalId: call.toolCallId,
+      title: call.title,
+      command,
+      stdout: output.text
+    };
+    if (typeof output.exitCode === "number") {
+      terminal.exitCode = output.exitCode;
+    }
+    if (output.stderr) {
+      terminal.stderr = output.stderr;
+    }
+    return [terminal];
+  }
+  return [
+    {
+      type: "content",
+      content: {
+        type: "text",
+        text: output.text
+      }
+    }
+  ];
+}
+
+function recoveredRawToolOutput(rawOutput: Record<string, unknown> | undefined): { text: string; stderr?: string; exitCode?: number } | undefined {
+  const root = asPlainRecord(rawOutput);
+  const nested = asPlainRecord(root.output);
+  const records = Object.keys(nested).length ? [nested, root] : [root];
+  const formatted = stringFromRecords(records, ["formatted_output", "formattedOutput", "output", "stdout", "stdoutPreview", "stdout_preview", "text"]);
+  const stderr = cleanRecoveredOutput(stringFromRecords(records, ["stderr", "stderrPreview", "stderr_preview", "error"]) || "");
+  const text = cleanRecoveredOutput(formatted || stderr);
+  if (!text) {
+    return undefined;
+  }
+  const recovered: { text: string; stderr?: string; exitCode?: number } = { text };
+  if (stderr) {
+    recovered.stderr = stderr;
+  }
+  const exitCode = numberFromRecords(records, ["exit_code", "exitCode"]);
+  if (typeof exitCode === "number") {
+    recovered.exitCode = exitCode;
+  }
+  return recovered;
+}
+
+function isCommandToolCall(call: ToolCallUpdate): boolean {
+  if (call.kind === "execute") {
+    return true;
+  }
+  if (commandField(asRecord(call.rawInput))) {
+    return true;
+  }
+  return /^(bash|shell|terminal|execute|command|run)$/i.test(call.title.trim());
 }
 
 function expandToolContent(tool: ToolNode, context: RenderReduceContext): RenderPatch[] {
@@ -677,6 +849,7 @@ function expandToolContent(tool: ToolNode, context: RenderReduceContext): Render
           provider: context.provider,
           source: "acp-live",
           status: tool.status,
+          createdAt: context.now(),
           updatedAt: context.now(),
           raw: item,
           path,
@@ -700,6 +873,7 @@ function expandToolContent(tool: ToolNode, context: RenderReduceContext): Render
           provider: context.provider,
           source: "acp-live",
           status: tool.status,
+          createdAt: context.now(),
           updatedAt: context.now(),
           raw: item,
           terminalId,
@@ -717,6 +891,119 @@ function expandToolContent(tool: ToolNode, context: RenderReduceContext): Render
     }
   }
   return patches;
+}
+
+function syncExpandedTerminalNodes(nodes: RenderNode[], tool: ToolNode): RenderNode[] {
+  let changed = false;
+  const next = nodes.map((node) => {
+    if (node.kind !== "terminal" || node.acpToolCallId !== tool.toolCallId) {
+      return node;
+    }
+    const terminalStatus = syncTerminalStatusFromTool(node.terminalStatus, tool.toolStatus);
+    if (node.status === tool.status && node.terminalStatus === terminalStatus) {
+      return node;
+    }
+    changed = true;
+    return {
+      ...node,
+      status: tool.status,
+      terminalStatus,
+      updatedAt: tool.updatedAt
+    };
+  });
+  return changed ? next : nodes;
+}
+
+function syncTerminalStatusFromTool(current: string | undefined, next: string | undefined): string | undefined {
+  if (!next || current === next || !shouldAdoptToolTerminalStatus(current)) {
+    return current;
+  }
+  return next;
+}
+
+function shouldAdoptToolTerminalStatus(current: string | undefined): boolean {
+  if (!current) {
+    return true;
+  }
+  return isToolLikeStatus(current);
+}
+
+function mergeTerminalNode(existing: TerminalNode, incoming: TerminalNode): TerminalNode {
+  const preserveFinalStatus = isFinalRenderStatus(existing.status) && isActiveRenderStatus(incoming.status);
+  const merged: TerminalNode = {
+    ...incoming,
+    createdAt: existing.createdAt,
+    timelineOrder: existing.timelineOrder,
+    status: preserveFinalStatus ? existing.status : incoming.status,
+    terminalStatus: terminalStatusForMerge(existing, incoming, preserveFinalStatus),
+    exitCode: incoming.exitCode ?? existing.exitCode,
+    elapsedMs: incoming.elapsedMs ?? existing.elapsedMs,
+    output: incoming.output ?? existing.output,
+    stdout: incoming.stdout ?? existing.stdout,
+    stderr: incoming.stderr ?? existing.stderr
+  };
+  const title = incoming.title ?? existing.title;
+  if (title !== undefined) {
+    merged.title = title;
+  }
+  const command = incoming.command ?? existing.command;
+  if (command !== undefined) {
+    merged.command = command;
+  }
+  const cwd = incoming.cwd ?? existing.cwd;
+  if (cwd !== undefined) {
+    merged.cwd = cwd;
+  }
+  return merged;
+}
+
+function terminalStatusForMerge(
+  existing: TerminalNode,
+  incoming: TerminalNode,
+  preserveFinalStatus: boolean
+): string | undefined {
+  if (!incoming.terminalStatus) {
+    return existing.terminalStatus;
+  }
+  if (preserveFinalStatus && isToolLikeStatus(incoming.terminalStatus)) {
+    return existing.terminalStatus;
+  }
+  return incoming.terminalStatus;
+}
+
+function isActiveRenderStatus(status: string | undefined): boolean {
+  return status === "pending" || status === "in_progress";
+}
+
+function isFinalRenderStatus(status: string | undefined): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function isToolLikeStatus(status: string | undefined): boolean {
+  switch (normalizeStatus(status)) {
+    case "pending":
+    case "in-progress":
+    case "running":
+    case "completed":
+    case "succeeded":
+    case "success":
+    case "passed":
+    case "failed":
+    case "error":
+    case "cancelled":
+    case "canceled":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function normalizeStatus(status: string | undefined): string {
+  return String(status || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function terminalDetails(record: Record<string, unknown>): {
@@ -762,6 +1049,38 @@ function stringField(record: Record<string, unknown>, key: string): string | und
 function numberField(record: Record<string, unknown>, key: string): number | undefined {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringFromRecords(records: Record<string, unknown>[], keys: string[]): string | undefined {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === "string" && value) {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function numberFromRecords(records: Record<string, unknown>[], keys: string[]): number | undefined {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = numberField(record, key);
+      if (typeof value === "number") {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function cleanRecoveredOutput(value: string): string {
+  return redactString(value.replace(/\r\n/g, "\n").replace(/\r/g, "\n")).trimEnd();
+}
+
+function asPlainRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 function mapToolStatus(status: string | undefined): "pending" | "in_progress" | "completed" | "failed" | "cancelled" {

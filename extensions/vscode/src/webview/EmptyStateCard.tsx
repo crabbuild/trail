@@ -42,6 +42,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastEmptyStateCardPropsJson = new Map<string, string>()
 
 export function EmptyStateCard({ props }: { props: EmptyStateCardProps }) {
   return (
@@ -109,6 +110,12 @@ export function mountEmptyStateCards(options: MountEmptyStateCardsOptions): void
       }
       mountedRoots.set(id, mounted)
     }
+    const propsJson = JSON.stringify(props)
+    if (lastEmptyStateCardPropsJson.get(id) === propsJson) {
+      activeIds.add(id)
+      return
+    }
+    lastEmptyStateCardPropsJson.set(id, propsJson)
     mounted.root.render(<EmptyStateCard props={props} />)
   })
 
@@ -116,6 +123,7 @@ export function mountEmptyStateCards(options: MountEmptyStateCardsOptions): void
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastEmptyStateCardPropsJson.delete(id)
     }
   })
 }

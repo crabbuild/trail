@@ -362,6 +362,7 @@ commands after the binary is installed:
 
 ```sh
 crabdb agent doctor --provider claude-code
+crabdb agent doctor --provider codex
 crabdb agent setup
 ```
 
@@ -686,6 +687,7 @@ install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
 | `crabdb daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `crabdb mcp` | Start the MCP stdio server for agent hosts |
 | `crabdb acp install --agent claude-code` | Print an ACP relay command and editor snippet |
+| `crabdb acp install --agent codex` | Print the Codex ACP relay command and editor snippet |
 | `crabdb acp doctor --agent claude-code` | Check ACP provider and relay readiness |
 | `crabdb acp sessions` | List captured ACP sessions |
 | `crabdb transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
@@ -743,9 +745,10 @@ Configure an ACP editor once:
 crabdb agent setup
 ```
 
-`agent setup` defaults to Claude Code plus VS Code, the lowest-friction tested
-path. Use `--editor zed` or `--editor generic` when you want another snippet.
-It prints the editor snippet plus the next verification and review commands.
+`agent setup` defaults to Claude Code plus VS Code, and Codex is also available
+with `crabdb agent setup --provider codex`. Use `--editor zed` or
+`--editor generic` when you want another snippet. It prints the editor snippet
+plus the next verification and review commands.
 Paste the printed snippet into the editor's ACP custom-agent settings. After one
 prompt, ask CrabDB what needs attention:
 

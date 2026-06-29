@@ -27,6 +27,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastPayloadDisclosurePropsJson = new Map<string, string>()
 
 export function PayloadDisclosure({ props }: { props: PayloadDisclosureProps }) {
   return (
@@ -61,6 +62,11 @@ export function mountPayloadDisclosures(options: MountPayloadDisclosuresOptions)
       return
     }
     activeIds.add(id)
+    const propsJson = JSON.stringify(props)
+    if (lastPayloadDisclosurePropsJson.get(id) === propsJson) {
+      return
+    }
+    lastPayloadDisclosurePropsJson.set(id, propsJson)
     let mounted = mountedRoots.get(id)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -77,6 +83,7 @@ export function mountPayloadDisclosures(options: MountPayloadDisclosuresOptions)
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastPayloadDisclosurePropsJson.delete(id)
     }
   })
 }
@@ -86,6 +93,7 @@ export function cleanupDetachedPayloadDisclosures(): void {
     if (!mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastPayloadDisclosurePropsJson.delete(id)
     }
   })
 }

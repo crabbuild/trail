@@ -47,6 +47,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastInlineActionsPropsJson = new Map<string, string>()
 
 export function InlineActions({ props }: { props: InlineActionsProps }) {
   return (
@@ -156,6 +157,11 @@ export function mountInlineActions(options: MountInlineActionsOptions): void {
       return
     }
     activeIds.add(id)
+    const propsJson = JSON.stringify(props)
+    if (lastInlineActionsPropsJson.get(id) === propsJson) {
+      return
+    }
+    lastInlineActionsPropsJson.set(id, propsJson)
     let mounted = mountedRoots.get(id)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -172,6 +178,7 @@ export function mountInlineActions(options: MountInlineActionsOptions): void {
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastInlineActionsPropsJson.delete(id)
     }
   })
 }
@@ -181,6 +188,7 @@ export function cleanupDetachedInlineActions(): void {
     if (!mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastInlineActionsPropsJson.delete(id)
     }
   })
 }

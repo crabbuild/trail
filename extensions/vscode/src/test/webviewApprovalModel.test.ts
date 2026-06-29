@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  approvalActionLabel,
   approvalDecisionDescription,
   approvalDecisionTone,
   approvalImpactText,
@@ -44,4 +45,11 @@ test("classifies approval decision buttons by tool risk", () => {
 test("returns neutral decision tone after approval resolution", () => {
   assert.equal(approvalDecisionTone({ status: "completed", toolKind: "edit" }), "default");
   assert.equal(approvalDecisionDescription("unknown"), "Allow provider tool action.");
+});
+
+test("keeps approval action labels compact", () => {
+  assert.equal(approvalActionLabel("Always Allow Read(/Users/example/project/README.md)", "always-allow"), "Always allow");
+  assert.equal(approvalActionLabel("Allow once", "allow"), "Allow");
+  assert.equal(approvalActionLabel("Run command after review", "run"), "Run command after review");
+  assert.equal(approvalActionLabel("This label is too long for a compact approval button", "custom"), "This label is too long fo...");
 });

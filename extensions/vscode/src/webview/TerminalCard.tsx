@@ -51,6 +51,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastTerminalCardPropsJson = new Map<string, string>()
 
 export function TerminalCard({ props }: { props: TerminalCardProps }) {
   const commandRow = props.rows.find((row) => row.kind === "in")
@@ -206,6 +207,11 @@ export function mountTerminalCards(options: MountTerminalCardsOptions): void {
       return
     }
     activeIds.add(nodeId)
+    const currentJson = JSON.stringify(props)
+    if (currentJson === lastTerminalCardPropsJson.get(nodeId)) {
+      return
+    }
+    lastTerminalCardPropsJson.set(nodeId, currentJson)
     let mounted = mountedRoots.get(nodeId)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -222,6 +228,7 @@ export function mountTerminalCards(options: MountTerminalCardsOptions): void {
     if (!activeIds.has(nodeId) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(nodeId)
+      lastTerminalCardPropsJson.delete(nodeId)
     }
   })
 }

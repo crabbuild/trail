@@ -19,8 +19,15 @@ export interface TimelineGroupCardProps {
   statusLabel: string
   laneLabel: string
   iconHtml: string
-  bodyHtml: string
+  bodyItems: TimelineGroupBodyItem[]
   open: boolean
+}
+
+export interface TimelineGroupBodyItem {
+  id: string
+  className: string
+  html: string
+  preserveDom?: boolean | undefined
 }
 
 export interface MountTimelineGroupsOptions {
@@ -33,6 +40,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastTimelineGroupPropsJson = new Map<string, string>()
 
 export function TimelineGroupCard({ props }: { props: TimelineGroupCardProps }) {
   return (
@@ -57,12 +65,43 @@ export function TimelineGroupCard({ props }: { props: TimelineGroupCardProps }) 
           </span>
         </AccordionTrigger>
         <AccordionContent className="timeline-group-body" keepMounted>
-          <div dangerouslySetInnerHTML={{ __html: props.bodyHtml }} />
+          {props.bodyItems.map((item) => (
+            <TimelineGroupBodySlot key={item.id} item={item} />
+          ))}
         </AccordionContent>
       </AccordionItem>
     </Accordion>
   )
 }
+
+function TimelineGroupBodySlot({ item }: { item: TimelineGroupBodyItem }) {
+  return (
+    <div
+      className={item.className}
+      data-timeline-group-body-item=""
+      data-node-id={item.id}
+    >
+      {item.preserveDom ? (
+        <StableHtmlSlot slotId={item.id} html={item.html} />
+      ) : (
+        <div className="stable-html-slot" dangerouslySetInnerHTML={{ __html: item.html }} />
+      )}
+    </div>
+  )
+}
+
+const StableHtmlSlot = React.memo(
+  function StableHtmlSlot({
+    html,
+    slotId
+  }: {
+    html: string
+    slotId: string
+  }) {
+    return <div className="stable-html-slot" data-stable-html-slot={slotId} dangerouslySetInnerHTML={{ __html: html }} />
+  },
+  (previous, next) => previous.slotId === next.slotId
+)
 
 export function mountTimelineGroups(options: MountTimelineGroupsOptions): void {
   const activeIds = new Set<string>()
@@ -76,8 +115,18 @@ export function mountTimelineGroups(options: MountTimelineGroupsOptions): void {
       if (!props) {
         return
       }
-      activeIds.add(id)
+      const currentJson = timelineGroupPropsSignature(props)
       let mounted = mountedRoots.get(id)
+      if (
+        currentJson === lastTimelineGroupPropsJson.get(id) &&
+        mounted?.element === element &&
+        mounted.element.isConnected
+      ) {
+        activeIds.add(id)
+        return
+      }
+      lastTimelineGroupPropsJson.set(id, currentJson)
+      activeIds.add(id)
       if (!mounted || mounted.element !== element) {
         mounted?.root.unmount()
         mounted = {
@@ -94,6 +143,26 @@ export function mountTimelineGroups(options: MountTimelineGroupsOptions): void {
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastTimelineGroupPropsJson.delete(id)
     }
+  })
+}
+
+function timelineGroupPropsSignature(props: TimelineGroupCardProps): string {
+  return JSON.stringify({
+    id: props.id,
+    label: props.label,
+    detail: props.detail,
+    status: props.status,
+    statusLabel: props.statusLabel,
+    laneLabel: props.laneLabel,
+    iconHtml: props.iconHtml,
+    open: props.open,
+    bodyItems: props.bodyItems.map((item) => ({
+      id: item.id,
+      className: item.className,
+      preserveDom: item.preserveDom,
+      html: item.preserveDom ? undefined : item.html
+    }))
   })
 }

@@ -12,16 +12,18 @@ crabdb --help
 
 ## 2. Check ACP Readiness
 
-For Claude Code:
+For the built-in ACP providers:
 
 ```sh
 crabdb acp doctor --agent claude-code
+crabdb acp doctor --agent codex
 ```
 
 Print the editor command:
 
 ```sh
 crabdb acp install --agent claude-code --print
+crabdb acp install --agent codex --print
 ```
 
 ## 3. Run One Prompt

@@ -1,6 +1,12 @@
 import * as React from "react"
 import { createRoot, type Root } from "react-dom/client"
 
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger
+} from "@/webview/components/ui/accordion"
 import { Alert, AlertDescription, AlertTitle } from "@/webview/components/ui/alert"
 import { Badge } from "@/webview/components/ui/badge"
 import { Card, CardContent, CardHeader } from "@/webview/components/ui/card"
@@ -45,6 +51,8 @@ export interface EventCardProps {
   meterHtml: string
   contentHtml: string
   rawDetails?: RawDetailsView | undefined
+  variant?: "card" | "checkpoint" | undefined
+  defaultOpen?: boolean | undefined
 }
 
 export interface MountEventCardsOptions {
@@ -57,16 +65,14 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastEventCardPropsJson = new Map<string, string>()
 
 export function EventCard({ props }: { props: EventCardProps }) {
-  const hasBody =
-    props.facts.length > 0 ||
-    Boolean(props.chipsHtml) ||
-    Boolean(props.callout) ||
-    Boolean(props.meterHtml) ||
-    Boolean(props.contentHtml) ||
-    Boolean(props.rawDetails) ||
-    props.actions.length > 0
+  const hasBody = eventCardHasBody(props)
+
+  if (props.variant === "checkpoint") {
+    return <CheckpointSeparator props={props} hasBody={hasBody} />
+  }
 
   return (
     <Card
@@ -95,21 +101,83 @@ export function EventCard({ props }: { props: EventCardProps }) {
       </CardHeader>
       {hasBody ? (
         <CardContent className="event-card-content">
-          <EventFacts facts={props.facts} />
-          <HtmlBlock className="event-chips" html={props.chipsHtml} />
-          <EventCallout callout={props.callout} />
-          <HtmlBlock html={props.meterHtml} />
-          <HtmlBlock html={props.contentHtml} />
-          {props.rawDetails ? <RawDetails details={props.rawDetails} /> : null}
-          {props.actions.length ? (
-            <>
-              <Separator className="event-card-separator" />
-              <EventActions actions={props.actions} />
-            </>
-          ) : null}
+          <EventCardBody props={props} />
         </CardContent>
       ) : null}
     </Card>
+  )
+}
+
+function CheckpointSeparator({
+  props,
+  hasBody
+}: {
+  props: EventCardProps
+  hasBody: boolean
+}) {
+  return (
+    <Accordion
+      className="checkpoint-separator"
+      defaultValue={props.defaultOpen ? [props.nodeId] : undefined}
+      data-event-card=""
+    >
+      <AccordionItem className="checkpoint-separator-item" value={props.nodeId}>
+        <AccordionTrigger className="checkpoint-separator-summary">
+          <span
+            className="summary-icon checkpoint-separator-icon"
+            dangerouslySetInnerHTML={{ __html: props.iconHtml }}
+          />
+          <span className="event-main checkpoint-separator-main">
+            <span className="event-title">{props.title}</span>
+            <span className="event-detail">{props.detail}</span>
+          </span>
+          <span className="checkpoint-separator-rule" aria-hidden="true" />
+          {props.statusLabel ? (
+            <Badge className="tool-status checkpoint-separator-status" variant="outline">
+              {props.statusLabel}
+            </Badge>
+          ) : null}
+        </AccordionTrigger>
+        {hasBody ? (
+          <AccordionContent className="checkpoint-separator-body" keepMounted>
+            <div className="event-card-content checkpoint-separator-content">
+              <EventCardBody props={props} />
+            </div>
+          </AccordionContent>
+        ) : null}
+      </AccordionItem>
+    </Accordion>
+  )
+}
+
+function EventCardBody({ props }: { props: EventCardProps }) {
+  return (
+    <>
+      <EventFacts facts={props.facts} />
+      <HtmlBlock className="event-chips" html={props.chipsHtml} />
+      <EventCallout callout={props.callout} />
+      <HtmlBlock html={props.meterHtml} />
+      <HtmlBlock html={props.contentHtml} />
+      {props.rawDetails ? <RawDetails details={props.rawDetails} /> : null}
+      {props.actions.length ? (
+        <>
+          <Separator className="event-card-separator" />
+          <EventActions actions={props.actions} />
+        </>
+      ) : null}
+    </>
+  )
+}
+
+function eventCardHasBody(props: EventCardProps): boolean {
+  return (
+    props.facts.length > 0 ||
+    Boolean(props.chipsHtml) ||
+    Boolean(props.callout) ||
+    Boolean(props.meterHtml) ||
+    Boolean(props.contentHtml) ||
+    Boolean(props.rawDetails) ||
+    props.actions.length > 0
   )
 }
 
@@ -216,6 +284,11 @@ export function mountEventCards(options: MountEventCardsOptions): void {
       }
       mountedRoots.set(nodeId, mounted)
     }
+    const currentJson = JSON.stringify(props)
+    if (currentJson === lastEventCardPropsJson.get(nodeId)) {
+      return
+    }
+    lastEventCardPropsJson.set(nodeId, currentJson)
     mounted.root.render(<EventCard props={props} />)
   })
 
@@ -223,6 +296,7 @@ export function mountEventCards(options: MountEventCardsOptions): void {
     if (!activeIds.has(nodeId) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(nodeId)
+      lastEventCardPropsJson.delete(nodeId)
     }
   })
 }

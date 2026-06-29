@@ -1,7 +1,6 @@
 import * as React from "react"
 import { createRoot, type Root } from "react-dom/client"
 
-import { Alert, AlertDescription } from "@/webview/components/ui/alert"
 import {
   Accordion,
   AccordionContent,
@@ -69,6 +68,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastApprovalCardPropsJson = new Map<string, string>()
 
 export function ApprovalCard({ props }: { props: ApprovalCardProps }) {
   return (
@@ -104,16 +104,7 @@ export function ApprovalCard({ props }: { props: ApprovalCardProps }) {
           <p className="approval-resolved-note">{props.resolvedNote}</p>
         ) : (
           <>
-            <Alert
-              className="approval-impact"
-              role="status"
-              aria-live="polite"
-              variant={props.tone === "risk" ? "destructive" : "default"}
-            >
-              <AlertDescription>
-                <span>{props.impactText}</span>
-              </AlertDescription>
-            </Alert>
+            <p className="approval-impact">{props.impactText}</p>
             <ApprovalMeta meta={props.meta} />
             <HtmlBlock html={props.locationsHtml} />
             <ApprovalDisclosures disclosures={[props.preview].filter(Boolean) as ApprovalCardDisclosure[]} />
@@ -253,6 +244,11 @@ export function mountApprovalCards(options: MountApprovalCardsOptions): void {
       return
     }
     activeIds.add(nodeId)
+    const currentJson = JSON.stringify(props)
+    if (currentJson === lastApprovalCardPropsJson.get(nodeId)) {
+      return
+    }
+    lastApprovalCardPropsJson.set(nodeId, currentJson)
     let mounted = mountedRoots.get(nodeId)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -268,6 +264,7 @@ export function mountApprovalCards(options: MountApprovalCardsOptions): void {
   mountedRoots.forEach((mounted, nodeId) => {
     if (!activeIds.has(nodeId) || !mounted.element.isConnected) {
       mounted.root.unmount()
+      lastApprovalCardPropsJson.delete(nodeId)
       mountedRoots.delete(nodeId)
     }
   })

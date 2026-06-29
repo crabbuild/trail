@@ -408,8 +408,8 @@ impl TreeStats {
         // Update tree height
         self.tree_height = self.tree_height.max(node.level);
 
-        // Calculate node size
-        let node_size = node.to_bytes().len();
+        // Calculate node size without allocating a serialized buffer.
+        let node_size = node.encoded_len();
 
         // Update size statistics
         self.total_tree_size_bytes += node_size;

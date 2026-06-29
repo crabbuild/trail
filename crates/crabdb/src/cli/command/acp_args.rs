@@ -38,7 +38,7 @@ pub(super) struct AcpInstallArgs {
 pub(super) struct AcpDoctorArgs {
     #[arg(long, default_value = "claude-code")]
     pub(super) agent: String,
-    #[arg(long = "relay-command", num_args = 1..)]
+    #[arg(long = "relay-command", num_args = 1.., allow_hyphen_values = true)]
     pub(super) relay_command: Vec<String>,
 }
 

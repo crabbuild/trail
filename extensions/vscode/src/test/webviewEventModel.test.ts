@@ -12,12 +12,11 @@ test("presents checkpoints as durable CrabDB recovery points", () => {
 
   assert.equal(event.title, "Checkpoint saved");
   assert.equal(event.tone, "success");
-  assert.equal(event.statusLabel, "Durable");
-  assert.equal(event.detail, "ch_123 can start follow-ups or restore this lane.");
+  assert.equal(event.statusLabel, "Saved");
+  assert.equal(event.detail, "ch_123 saved for follow-up or rewind.");
   assert.equal(event.facts.find((fact) => fact.label === "Checkpoint")?.active, true);
-  assert.equal(event.facts.find((fact) => fact.label === "Recovery")?.value, "follow-up / rewind");
-  assert.equal(event.callout?.title, "Durable recovery point");
-  assert.match(event.callout?.detail ?? "", /follow-up starts, rewind/);
+  assert.equal(event.facts.find((fact) => fact.label === "Recovery")?.value, "follow-up or rewind");
+  assert.equal(event.callout, undefined);
   assert.deepEqual(
     event.actions?.map((action) => action.action),
     ["copyCheckpoint", "startFollowUp", "rewind"]

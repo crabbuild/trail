@@ -18,7 +18,8 @@ import {
   sessionControlsToPatches
 } from "../shared/acpRenderReducers";
 import { promptCompletionNode } from "../shared/promptCompletion";
-import type { RenderNode, RenderReduceContext } from "../shared/renderModel";
+import type { RenderNode, RenderPatch, RenderReduceContext } from "../shared/renderModel";
+import { RenderStreamScheduler } from "../shared/renderStreamScheduler";
 import { redactedJson, redactString } from "../shared/securityRedaction";
 import { findTaskOverlaps, type TaskOverlap } from "../shared/taskOverlaps";
 import { hydrateTaskView, mergeHydratedNodes } from "../state/crabDbHydration";
@@ -119,6 +120,8 @@ export class ChatPanel {
   private sending = false;
   private statePostTimer: ReturnType<typeof setTimeout> | undefined;
   private statePostPending = false;
+  private readonly streamScheduler: RenderStreamScheduler;
+  private renderRevision = 0;
   private acpStartMode: "new" | "load" | "resume" | undefined;
   private requestedAcpSessionId: string | undefined;
   private providerSwitchFrom: string | undefined;
@@ -139,6 +142,9 @@ export class ChatPanel {
   ) {
     this.attachments.push(...attachments);
     this.resourceOpener = new ResourceOpener(repository.workspaceRoot);
+    this.streamScheduler = new RenderStreamScheduler((patches) => this.applyAndPostRenderPatches(patches), {
+      shouldCoalescePatch: (patch) => this.canCoalesceRenderPatch(patch)
+    });
   }
 
   private async initialize(): Promise<void> {
@@ -150,6 +156,7 @@ export class ChatPanel {
   }
 
   private async refresh(options: { claimLatestTask?: boolean | undefined } = {}): Promise<void> {
+    this.streamScheduler.flush();
     let listedTasks: AgentTask[] | undefined;
     if (!this.task && options.claimLatestTask) {
       try {
@@ -590,11 +597,11 @@ export class ChatPanel {
   }
 
   private handleAcpUpdate(update: SessionUpdate): void {
-    this.nodes = applyRenderPatches(this.nodes, reduceSessionUpdate(update, this.renderContext()));
-    this.postState();
+    this.streamScheduler.push(reduceSessionUpdate(update, this.renderContext()));
   }
 
   private handlePermission(requestId: string, params: RequestPermissionParams): void {
+    this.streamScheduler.flush();
     this.nodes = applyRenderPatches(this.nodes, reducePermissionRequest(requestId, params, this.renderContext()));
     const title = params.toolCall.title || params.toolCall.kind || "tool call";
     vscode.window.showWarningMessage(`Agent permission required: ${title}`);
@@ -635,6 +642,7 @@ export class ChatPanel {
   }
 
   private cancelCurrentTurn(): void {
+    this.streamScheduler.flush();
     const cancelledRequests = this.acp?.cancel() ?? [];
     if (cancelledRequests.length) {
       this.resolveApprovals(cancelledRequests, "cancelled");
@@ -648,6 +656,7 @@ export class ChatPanel {
   }
 
   private resolveApprovals(requestIds: string[], status: ApprovalStatus): void {
+    this.streamScheduler.flush();
     const requestSet = new Set(requestIds);
     const updatedAt = new Date().toISOString();
     this.nodes = this.nodes.map((node) =>
@@ -667,6 +676,7 @@ export class ChatPanel {
   }
 
   private handlePromptComplete(response: unknown): void {
+    this.streamScheduler.flush();
     this.providerFailure = undefined;
     const completion = promptCompletionNode(response, this.renderContext());
     this.nodes = this.finalizeCurrentTurn(completion.status);
@@ -738,6 +748,7 @@ export class ChatPanel {
   }
 
   private markProviderFailure(message: string, detail?: string | undefined, code?: number | null | undefined): void {
+    this.streamScheduler.flush();
     const occurredAt = new Date().toISOString();
     this.providerFailure = {
       message,
@@ -762,6 +773,7 @@ export class ChatPanel {
   }
 
   private startFollowUpFromFailure(): void {
+    this.streamScheduler.flush();
     this.acp?.dispose();
     this.acp = undefined;
     this.forceCheckpointFollowUp = true;
@@ -938,6 +950,7 @@ export class ChatPanel {
   }
 
   private async setMode(modeId: string): Promise<void> {
+    this.streamScheduler.flush();
     if (!this.acp) {
       this.post({ type: "status", message: "Start an ACP session before changing mode." });
       return;
@@ -957,6 +970,7 @@ export class ChatPanel {
   }
 
   private async setConfigOption(configId: string, value: string): Promise<void> {
+    this.streamScheduler.flush();
     if (!this.acp) {
       this.post({ type: "status", message: "Start an ACP session before changing configuration." });
       return;
@@ -971,6 +985,7 @@ export class ChatPanel {
   }
 
   private postState(): void {
+    this.streamScheduler.flush();
     if (this.statePostTimer) {
       this.statePostPending = true;
       return;
@@ -985,9 +1000,57 @@ export class ChatPanel {
     }, 50);
   }
 
+  private applyAndPostRenderPatches(patches: RenderPatch[]): void {
+    if (!patches.length) {
+      return;
+    }
+    const beforeById = new Map(this.nodes.map((node) => [node.id, node]));
+    const nextNodes = applyRenderPatches(this.nodes, patches);
+    const nextIds = new Set(nextNodes.map((node) => node.id));
+    const appliedPatches: RenderPatch[] = [];
+    for (const node of nextNodes) {
+      if (beforeById.get(node.id) !== node) {
+        appliedPatches.push({ type: "upsert", node });
+      }
+    }
+    for (const id of beforeById.keys()) {
+      if (!nextIds.has(id)) {
+        appliedPatches.push({ type: "remove", id });
+      }
+    }
+    this.nodes = nextNodes;
+    if (!appliedPatches.length) {
+      return;
+    }
+    const baseRenderRevision = this.renderRevision;
+    this.post({
+      type: "renderPatches",
+      baseRenderRevision,
+      renderRevision: this.nextRenderRevision(),
+      patches: appliedPatches,
+      sending: this.sending,
+      permissionPending: this.hasPendingApproval()
+    });
+  }
+
+  private canCoalesceRenderPatch(patch: RenderPatch): boolean {
+    const node = patch.node;
+    if ((patch.type !== "upsert" && patch.type !== "replace") || !node) {
+      return false;
+    }
+    if (node.kind === "message" || node.kind === "thought") {
+      return false;
+    }
+    if (node.source !== "acp-live" || (node.status !== "pending" && node.status !== "in_progress")) {
+      return false;
+    }
+    return this.nodes.some((existing) => existing.id === node.id);
+  }
+
   private stateMessage(): unknown {
     return {
       type: "state",
+      renderRevision: this.nextRenderRevision(),
       task: this.task,
       taskView: this.taskView,
       taskOverlaps: this.taskOverlaps,
@@ -1026,6 +1089,11 @@ export class ChatPanel {
 
   private post(message: unknown): void {
     void this.panel.webview.postMessage(message);
+  }
+
+  private nextRenderRevision(): number {
+    this.renderRevision += 1;
+    return this.renderRevision;
   }
 
   private claimTaskFromList(tasks: AgentTask[]): AgentTask | undefined {
@@ -1084,6 +1152,7 @@ export class ChatPanel {
   }
 
   private dispose(): void {
+    this.streamScheduler.dispose();
     if (this.statePostTimer) {
       clearTimeout(this.statePostTimer);
       this.statePostTimer = undefined;

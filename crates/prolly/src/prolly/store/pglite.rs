@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::{json, Map, Value};
 
-use super::{BatchOp, Store};
+use super::{BatchOp, OrderedBatchReadPlan, Store};
 
 const SIDECAR_SCRIPT: &str = r#"
 import { PGlite } from '@electric-sql/pglite';
@@ -453,8 +453,13 @@ impl Store for PgliteStore {
     }
 
     fn batch_get(&self, keys: &[&[u8]]) -> Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
+        let plan = OrderedBatchReadPlan::new(keys);
         let mut fields = Map::new();
-        let key_hex = keys.iter().map(hex::encode).collect::<Vec<_>>();
+        let key_hex = plan
+            .unique_keys()
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>();
         fields.insert("keys".to_string(), json!(key_hex));
         let result = self.request("batch_get", fields)?;
         let values = result
@@ -472,8 +477,13 @@ impl Store for PgliteStore {
     }
 
     fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let plan = OrderedBatchReadPlan::new(keys);
         let mut fields = Map::new();
-        let key_hex = keys.iter().map(hex::encode).collect::<Vec<_>>();
+        let key_hex = plan
+            .unique_keys()
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>();
         fields.insert("keys".to_string(), json!(key_hex));
         let result = self.request("batch_get_ordered", fields)?;
         let values = result
@@ -482,7 +492,31 @@ impl Store for PgliteStore {
             .ok_or_else(|| {
                 PgliteStoreError::new("PGlite batch_get_ordered response missing values")
             })?;
-        values.iter().map(|value| hex_option(Some(value))).collect()
+        let unique_values = values
+            .iter()
+            .map(|value| hex_option(Some(value)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(plan.expand_owned(unique_values))
+    }
+
+    fn batch_get_ordered_unique(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let mut fields = Map::new();
+        let key_hex = keys.iter().map(hex::encode).collect::<Vec<_>>();
+        fields.insert("keys".to_string(), json!(key_hex));
+        let result = self.request("batch_get_ordered", fields)?;
+        let values = result
+            .get("values")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                PgliteStoreError::new("PGlite unique ordered batch response missing values")
+            })?;
+        values
+            .iter()
+            .map(|value| hex_option(Some(value)))
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn prefers_batch_reads(&self) -> bool {

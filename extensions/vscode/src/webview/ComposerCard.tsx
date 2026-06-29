@@ -1,7 +1,6 @@
 import * as React from "react"
 import { createRoot, type Root } from "react-dom/client"
 
-import { Alert, AlertDescription } from "@/webview/components/ui/alert"
 import { Badge } from "@/webview/components/ui/badge"
 import { Button } from "@/webview/components/ui/button"
 import { ButtonGroup } from "@/webview/components/ui/button-group"
@@ -93,6 +92,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+let lastComposerCardPropsJson = ""
 
 export function ComposerCard({ props }: { props: ComposerCardProps }) {
   return (
@@ -104,8 +104,6 @@ export function ComposerCard({ props }: { props: ComposerCardProps }) {
       <CardContent className="composer-card-content">
         <ComposerStatus status={props.status} />
         <ComposerAttachmentShelf props={props} />
-        <ComposerContextRail items={props.railItems} />
-        <ComposerUtilityRow props={props} />
         <ComposerInput props={props} />
       </CardContent>
       <CardFooter className="composer-actions">
@@ -201,132 +199,15 @@ function ComposerAttachmentShelf({ props }: { props: ComposerCardProps }) {
 }
 
 function ComposerStatus({ status }: { status: ComposerStatusView }) {
-  if (status.tone === "ready" || status.tone === "context") {
-    return (
-      <div id="composer-status" className="sr-only" aria-live="polite">
-        {status.label}. {status.detail}
-      </div>
-    )
-  }
   return (
-    <Alert
+    <div
       id="composer-status"
-      className={cn("composer-run-state", `composer-run-${status.tone}`)}
+      className="sr-only"
       role="status"
       aria-live="polite"
-      variant={status.tone === "waiting" || status.tone === "warning" ? "destructive" : "default"}
     >
-      <span className="composer-state-dot" aria-hidden="true" />
-      <AlertDescription className="composer-state-copy">
-        <strong>{status.label}</strong>
-        <span>{status.detail}</span>
-      </AlertDescription>
-    </Alert>
-  )
-}
-
-function ComposerContextRail({ items }: { items: ComposerRailItemView[] }) {
-  return (
-    <div className="composer-context-rail" aria-label="Prompt context">
-      {items.map((item) => {
-        const label = `${item.label}: ${item.value}`
-        return (
-          <Badge
-            key={item.id}
-            className={cn("composer-context-chip", `composer-context-chip-${item.tone}`)}
-            title={label}
-            aria-label={label}
-            variant="outline"
-          >
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
-          </Badge>
-        )
-      })}
+      {status.label}. {status.detail}
     </div>
-  )
-}
-
-function ComposerUtilityRow({ props }: { props: ComposerCardProps }) {
-  const clearDisabled = props.controlsDisabled || !props.draftValue
-  return (
-    <div className="composer-utility-row" aria-label="Prompt helpers">
-      <ButtonGroup className="composer-preset-list" aria-label="Prompt starters">
-        {props.presets.map((preset) => (
-          <Button
-            key={preset.id}
-            type="button"
-            className="composer-preset"
-            data-action="insertPromptPreset"
-            data-preset-id={preset.id}
-            title={preset.detail}
-            disabled={props.controlsDisabled}
-            variant="outline"
-            size="sm"
-          >
-            <span
-              data-icon="inline-start"
-              dangerouslySetInnerHTML={{ __html: preset.iconHtml }}
-            />
-            <span>{preset.label}</span>
-          </Button>
-        ))}
-      </ButtonGroup>
-      <ButtonGroup className="composer-mode-toggle" aria-label="Send mode">
-        <ComposerModeButton
-          mode="fast"
-          label="Fast"
-          title="Enter sends the prompt"
-          active={props.sendMode === "fast"}
-          disabled={props.controlsDisabled}
-        />
-        <ComposerModeButton
-          mode="draft"
-          label="Draft"
-          title="Enter inserts a new line"
-          active={props.sendMode === "draft"}
-          disabled={props.controlsDisabled}
-        />
-      </ButtonGroup>
-      <ComposerIconButton
-        action="clearComposerDraft"
-        label="Clear draft"
-        iconHtml={props.clearIconHtml}
-        disabled={clearDisabled}
-        className="micro composer-clear"
-        extraAttrs={{ "data-composer-clear": "" }}
-      />
-    </div>
-  )
-}
-
-function ComposerModeButton({
-  active,
-  disabled,
-  label,
-  mode,
-  title
-}: {
-  active: boolean
-  disabled: boolean
-  label: string
-  mode: ComposerSendMode
-  title: string
-}) {
-  return (
-    <Button
-      type="button"
-      className={cn("composer-mode-button", active ? "active" : "")}
-      data-action="setComposerSendMode"
-      data-send-mode={mode}
-      aria-pressed={active ? "true" : "false"}
-      title={title}
-      disabled={disabled}
-      variant="ghost"
-      size="xs"
-    >
-      {label}
-    </Button>
   )
 }
 
@@ -458,6 +339,11 @@ export function mountComposerCards(options: MountComposerCardOptions): void {
       }
       mountedRoots.set(id, mounted)
     }
+    const currentJson = JSON.stringify(props)
+    if (currentJson === lastComposerCardPropsJson) {
+      return
+    }
+    lastComposerCardPropsJson = currentJson
     mounted.root.render(<ComposerCard props={props} />)
   })
 
@@ -465,6 +351,7 @@ export function mountComposerCards(options: MountComposerCardOptions): void {
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastComposerCardPropsJson = ""
     }
   })
 }

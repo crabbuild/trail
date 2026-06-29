@@ -160,7 +160,10 @@ impl<'a, S: Store> Iterator for CursorIterator<'a, S> {
 
         // If we've already started, advance to the next entry
         if self.started {
-            if !self.cursor.advance(self.store) {
+            if !self
+                .cursor
+                .advance_before(self.store, self.end_key.as_deref())
+            {
                 return None;
             }
         } else {
@@ -168,7 +171,10 @@ impl<'a, S: Store> Iterator for CursorIterator<'a, S> {
             // On first call, skip entries that are before the start bound
             // (cursor may be positioned at greatest key <= start, but we need >= start)
             while self.cursor.is_valid() && !self.is_at_or_after_start() {
-                if !self.cursor.advance(self.store) {
+                if !self
+                    .cursor
+                    .advance_before(self.store, self.end_key.as_deref())
+                {
                     return None;
                 }
             }
@@ -246,6 +252,16 @@ impl<'a, S: Store> DiffCursor<'a, S> {
     /// - If base is empty, all entries from other are yielded as Added
     /// - If other is empty, all entries from base are yielded as Removed
     pub fn new(store: &'a S, base: &Tree, other: &Tree) -> Result<Self, Error> {
+        if base.root == other.root {
+            let invalid = Cursor::invalid();
+            return Ok(DiffCursor {
+                cursor_base: invalid.clone(),
+                cursor_other: invalid,
+                store,
+                done: true,
+            });
+        }
+
         // Initialize cursors at leftmost positions (empty key = start)
         let cursor_base = Cursor::at_item(store, base, &[])?;
         let cursor_other = Cursor::at_item(store, other, &[])?;
@@ -362,6 +378,14 @@ pub struct Cursor {
 }
 
 impl Cursor {
+    pub(crate) fn invalid() -> Self {
+        Self {
+            index: 0,
+            node: Arc::new(Node::new_leaf()),
+            parent: None,
+        }
+    }
+
     /// Navigate to the position of a key in the tree.
     ///
     /// Follows the Arbor spec's CursorAtItem algorithm:
@@ -385,11 +409,7 @@ impl Cursor {
     pub fn at_item<S: Store>(store: &S, tree: &Tree, key: &[u8]) -> Result<Self, Error> {
         // Handle empty tree
         let Some(root_cid) = &tree.root else {
-            return Ok(Self {
-                index: 0,
-                node: Arc::new(Node::new_leaf()),
-                parent: None,
-            });
+            return Ok(Self::invalid());
         };
 
         // Load root node
@@ -418,20 +438,17 @@ impl Cursor {
                 parent,
             })
         } else {
+            let child_cid = child_cid_at(&node, index)?;
+
             // Internal node - descend to child
             // Create cursor for this internal node (will be parent of child cursor)
             let current_cursor = Self {
                 index,
-                node: Arc::new(node.clone()),
+                node: Arc::new(node),
                 parent,
             };
 
             // Load child node
-            let child_cid_bytes = &node.vals[index];
-            let child_cid = Cid(child_cid_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::InvalidNode)?);
             let child_node = Self::load_node(store, &child_cid)?;
 
             // Recurse with current cursor as parent
@@ -470,7 +487,7 @@ impl Cursor {
     /// * `None` - If the cursor is invalid or at an internal node
     pub fn get_value(&self) -> Option<&[u8]> {
         if self.is_valid() && self.node.leaf {
-            Some(&self.node.vals[self.index])
+            self.node.vals.get(self.index).map(|value| value.as_slice())
         } else {
             None
         }
@@ -514,6 +531,10 @@ impl Cursor {
     /// # Behavior
     /// After returning `false`, the cursor becomes invalid (`is_valid()` returns `false`).
     pub fn advance<S: Store>(&mut self, store: &S) -> bool {
+        self.advance_before(store, None)
+    }
+
+    fn advance_before<S: Store>(&mut self, store: &S, end: Option<&[u8]>) -> bool {
         // If cursor is already invalid, can't advance
         if !self.is_valid() {
             return false;
@@ -521,16 +542,21 @@ impl Cursor {
 
         // Try to advance within current node
         if self.index + 1 < self.node.len() {
+            if let Some(end) = end {
+                if self.node.keys[self.index + 1].as_slice() >= end {
+                    self.index = self.node.len();
+                    return false;
+                }
+            }
             self.index += 1;
             return true;
         }
 
         // At end of current node - need to navigate up and find next subtree
-        self.advance_via_parent(store)
+        self.advance_via_parent_before(store, end)
     }
 
-    /// Navigate up through parents to find the next subtree, then descend to its leftmost leaf.
-    fn advance_via_parent<S: Store>(&mut self, store: &S) -> bool {
+    fn advance_via_parent_before<S: Store>(&mut self, store: &S, end: Option<&[u8]>) -> bool {
         // Take ownership of parent to navigate up
         let Some(mut parent) = self.parent.take() else {
             // No parent - we're at root and exhausted, mark as invalid
@@ -541,7 +567,12 @@ impl Cursor {
         // Try to advance the parent
         if parent.index + 1 < parent.node.len() {
             // Parent can advance - move to next child
-            parent.index += 1;
+            let next_index = parent.index + 1;
+            if child_starts_at_or_after_end(end, &parent.node, next_index) {
+                self.index = self.node.len();
+                return false;
+            }
+            parent.index = next_index;
 
             // Load the next child and descend to its leftmost leaf
             match self.descend_to_leftmost_leaf(store, &parent) {
@@ -559,7 +590,7 @@ impl Cursor {
             // Parent is also at end - recurse up
             // Temporarily set self to parent to continue navigation
             let mut temp_cursor = *parent;
-            if temp_cursor.advance_via_parent(store) {
+            if temp_cursor.advance_via_parent_before(store, end) {
                 *self = temp_cursor;
                 true
             } else {
@@ -577,11 +608,7 @@ impl Cursor {
         parent: &Cursor,
     ) -> Result<Cursor, Error> {
         // Load the child node at parent's current index
-        let child_cid_bytes = &parent.node.vals[parent.index];
-        let child_cid = Cid(child_cid_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::InvalidNode)?);
+        let child_cid = child_cid_at(&parent.node, parent.index)?;
         let child_node = Self::load_node(store, &child_cid)?;
 
         if child_node.leaf {
@@ -609,11 +636,7 @@ impl Cursor {
         }
 
         // Load child at index 0
-        let child_cid_bytes = &self.node.vals[self.index];
-        let child_cid = Cid(child_cid_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::InvalidNode)?);
+        let child_cid = child_cid_at(&self.node, self.index)?;
         let child_node = Self::load_node(store, &child_cid)?;
 
         let child_cursor = Cursor {
@@ -660,12 +683,88 @@ impl Cursor {
     }
 }
 
+fn child_cid_at(node: &Node, index: usize) -> Result<Cid, Error> {
+    let child_cid_bytes = node.vals.get(index).ok_or(Error::InvalidNode)?;
+    Ok(Cid(child_cid_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::InvalidNode)?))
+}
+
+fn child_starts_at_or_after_end(end: Option<&[u8]>, node: &Node, child_index: usize) -> bool {
+    let Some(end) = end else {
+        return false;
+    };
+
+    match node.keys.get(child_index) {
+        Some(first_key) => first_key.as_slice() >= end,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::config::Config;
-    use super::super::store::MemStore;
+    use super::super::store::{BatchOp, MemStore};
     use super::super::Prolly;
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct CountingStoreError;
+
+    impl std::fmt::Display for CountingStoreError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("counting store error")
+        }
+    }
+
+    impl std::error::Error for CountingStoreError {}
+
+    #[derive(Default)]
+    struct CountingStore {
+        data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+        get_calls: AtomicUsize,
+    }
+
+    impl Store for CountingStore {
+        type Error = CountingStoreError;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.data.lock().unwrap().get(key).cloned())
+        }
+
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+            self.data
+                .lock()
+                .unwrap()
+                .insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, key: &[u8]) -> Result<(), Self::Error> {
+            self.data.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        fn batch(&self, ops: &[BatchOp]) -> Result<(), Self::Error> {
+            let mut data = self.data.lock().unwrap();
+            for op in ops {
+                match op {
+                    BatchOp::Upsert { key, value } => {
+                        data.insert(key.to_vec(), value.to_vec());
+                    }
+                    BatchOp::Delete { key } => {
+                        data.remove(*key);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_key_index_empty_keys() {
@@ -722,6 +821,59 @@ mod tests {
         assert!(!cursor.is_valid());
         assert_eq!(cursor.get_key(), None);
         assert_eq!(cursor.get_value(), None);
+    }
+
+    #[test]
+    fn diff_cursor_skips_identical_roots_without_reads() {
+        let store = std::sync::Arc::new(CountingStore::default());
+        let prolly = Prolly::new(store.clone(), Config::default());
+        let mut tree = prolly.create();
+        tree = prolly.put(&tree, b"a".to_vec(), b"1".to_vec()).unwrap();
+        tree = prolly.put(&tree, b"b".to_vec(), b"2".to_vec()).unwrap();
+        let gets_before = store.get_calls.load(Ordering::Relaxed);
+
+        let mut diff = DiffCursor::new(store.as_ref(), &tree, &tree).unwrap();
+
+        assert_eq!(diff.next(), None);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            gets_before,
+            "identical-root cursor diffs should avoid root and leaf reads"
+        );
+    }
+
+    #[test]
+    fn get_value_returns_none_for_leaf_with_missing_value() {
+        let mut leaf = Node::new_leaf();
+        leaf.keys.push(b"a".to_vec());
+        let cursor = Cursor {
+            index: 0,
+            node: Arc::new(leaf),
+            parent: None,
+        };
+
+        assert!(cursor.is_valid());
+        assert_eq!(cursor.get_key(), Some(b"a".as_slice()));
+        assert_eq!(cursor.get_value(), None);
+    }
+
+    #[test]
+    fn internal_descent_rejects_missing_child_cid() {
+        let store = std::sync::Arc::new(MemStore::new());
+        let mut root = Node::new_internal(1);
+        root.keys.push(b"a".to_vec());
+        let cursor = Cursor {
+            index: 0,
+            node: Arc::new(root),
+            parent: None,
+        };
+
+        let err = match cursor.descend_to_leftmost_leaf_from_self(store.as_ref()) {
+            Ok(_) => panic!("malformed internal node should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::InvalidNode));
     }
 
     #[test]

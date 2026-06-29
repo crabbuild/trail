@@ -174,23 +174,16 @@ function checkpointPresentation(input: EventPresentationInput): EventPresentatio
   }
   return {
     title: "Checkpoint saved",
-    detail: checkpointRef ? `${checkpointRef} can start follow-ups or restore this lane.` : input.label || "CrabDB saved a durable recovery point.",
+    detail: checkpointRef ? `${checkpointRef} saved for follow-up or rewind.` : input.label || "Saved for follow-up or rewind.",
     tone: "success",
     icon: "history",
-    statusLabel: "Durable",
+    statusLabel: "Saved",
     openByDefault: false,
     facts: compactFacts([
       checkpointId ? { label: "Checkpoint", value: checkpointId, active: true } : undefined,
       input.updatedAt ? { label: "Saved", value: input.updatedAt } : undefined,
-      { label: "Recovery", value: "follow-up / rewind" }
+      { label: "Recovery", value: "follow-up or rewind" }
     ]),
-    callout: {
-      title: "Durable recovery point",
-      detail: checkpointRef
-        ? `${checkpointRef} is available for follow-up starts, rewind, and failed-attempt preservation.`
-        : "Available for follow-up starts, rewind, and failed-attempt preservation.",
-      tone: "success"
-    },
     actions
   };
 }

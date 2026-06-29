@@ -6,6 +6,7 @@ import type { MessageNode, RenderNode } from "../shared/renderModel";
 export function hydrateTaskView(view: TaskView): RenderNode[] {
   const nodes: RenderNode[] = [];
   const task = view.task;
+  let nextTimelineOrder = 0;
 
   view.turns.forEach((turnValue, turnIndex) => {
     const turnNodes: RenderNode[] = [];
@@ -20,7 +21,9 @@ export function hydrateTaskView(view: TaskView): RenderNode[] {
 
     turnNodes.push(...hydrateTurnTimeline(messages, events, view, turnId, status));
 
-    const toolSummaries = turnNodes.some((node) => node.kind === "tool") ? [] : arrayField(turnWrapper, "tool_summaries");
+    const toolSummaries = turnNodes.some((node) => node.kind === "tool")
+      ? []
+      : arrayField(turnWrapper, "tool_summaries").filter((summary) => !isInternalToolSummary(summary));
     toolSummaries.forEach((summary, summaryIndex) => {
       turnNodes.push({
         id: `crabdb-tool:${turnId}:${summaryIndex}`,
@@ -61,10 +64,26 @@ export function hydrateTaskView(view: TaskView): RenderNode[] {
         label: `Checkpoint ${checkpoint}`
       });
     }
-    nodes.push(...turnNodes);
+    const orderedTurnNodes = assignTimelineOrder(turnNodes, nextTimelineOrder);
+    nextTimelineOrder += orderedTurnNodes.length;
+    nodes.push(...orderedTurnNodes);
   });
 
   return nodes;
+}
+
+function assignTimelineOrder(nodes: RenderNode[], start: number): RenderNode[] {
+  return nodes.map((node, index) => (
+    node.timelineOrder === undefined ? { ...node, timelineOrder: start + index + 1 } : node
+  ));
+}
+
+function isInternalToolSummary(value: unknown): boolean {
+  const text = String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  return (
+    /^acp prompt turn(?: \([^)]+\))?$/.test(text) ||
+    /^span_(?:started|ended)(?: \([^)]+\))?$/.test(text)
+  );
 }
 
 interface HydratedMessageEntry {
@@ -320,7 +339,8 @@ function isSessionUpdate(value: unknown): value is SessionUpdate {
 }
 
 export function mergeHydratedNodes(hydrated: RenderNode[], current: RenderNode[]): RenderNode[] {
-  const hydratedIds = new Set(hydrated.map((node) => node.id));
+  const orderedHydrated = orderHydratedNodesFromCurrent(hydrated, current);
+  const hydratedIds = new Set(orderedHydrated.map((node) => node.id));
   const hasHydratedTranscript = hydrated.some((node) => node.turnId);
   const live = current.filter((node) => {
     if (node.source === "crabdb") {
@@ -331,7 +351,119 @@ export function mergeHydratedNodes(hydrated: RenderNode[], current: RenderNode[]
     }
     return !hydratedIds.has(node.id) && ["pending", "in_progress"].includes(node.status);
   });
-  return [...hydrated, ...live];
+  return reindexTimelineOrder([...orderedHydrated, ...live]);
+}
+
+function reindexTimelineOrder(nodes: RenderNode[]): RenderNode[] {
+  return nodes.map((node, index) => {
+    const timelineOrder = index + 1;
+    return node.timelineOrder === timelineOrder ? node : { ...node, timelineOrder };
+  });
+}
+
+interface CurrentTimelineOrder {
+  index: number;
+  timelineOrder?: number | undefined;
+}
+
+function orderHydratedNodesFromCurrent(hydrated: RenderNode[], current: RenderNode[]): RenderNode[] {
+  const orderQueues = new Map<string, CurrentTimelineOrder[]>();
+  current.forEach((node, index) => {
+    for (const key of timelineOrderKeys(node)) {
+      const queue = orderQueues.get(key);
+      const order = { index, timelineOrder: node.timelineOrder };
+      if (queue) {
+        queue.push(order);
+      } else {
+        orderQueues.set(key, [order]);
+      }
+    }
+  });
+  if (!orderQueues.size) {
+    return hydrated;
+  }
+  const ordered: RenderNode[] = [];
+  for (const segment of hydratedTimelineSegments(hydrated)) {
+    ordered.push(...orderHydratedSegmentFromCurrent(segment, orderQueues));
+  }
+  return ordered;
+}
+
+function hydratedTimelineSegments(nodes: RenderNode[]): RenderNode[][] {
+  const segments: RenderNode[][] = [];
+  for (const node of nodes) {
+    const previous = segments[segments.length - 1];
+    if (previous?.length && timelineScopeKey(previous[0]!) === timelineScopeKey(node)) {
+      previous.push(node);
+    } else {
+      segments.push([node]);
+    }
+  }
+  return segments;
+}
+
+function orderHydratedSegmentFromCurrent(segment: RenderNode[], orderQueues: Map<string, CurrentTimelineOrder[]>): RenderNode[] {
+  return segment
+    .map((node, index) => {
+      const currentOrder = takeTimelineOrderIndex(node, orderQueues);
+      return {
+        node: currentOrder?.timelineOrder === undefined ? node : { ...node, timelineOrder: currentOrder.timelineOrder },
+        index,
+        currentIndex: currentOrder?.index
+      };
+    })
+    .sort((left, right) => {
+      const leftMatched = left.currentIndex !== undefined;
+      const rightMatched = right.currentIndex !== undefined;
+      if (leftMatched && rightMatched) {
+        return left.currentIndex! - right.currentIndex! || left.index - right.index;
+      }
+      if (leftMatched !== rightMatched) {
+        return leftMatched ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .map((item) => item.node);
+}
+
+function takeTimelineOrderIndex(node: RenderNode, orderQueues: Map<string, CurrentTimelineOrder[]>): CurrentTimelineOrder | undefined {
+  for (const key of timelineOrderKeys(node)) {
+    const queue = orderQueues.get(key);
+    const order = queue?.shift();
+    if (order) {
+      return order;
+    }
+  }
+  return undefined;
+}
+
+function timelineOrderKeys(node: RenderNode): string[] {
+  const scope = timelineScopeKey(node);
+  const keys = [`${scope}:id:${node.id}`];
+  if (node.kind === "message") {
+    if (node.acpMessageId) {
+      keys.push(`${scope}:message-id:${node.acpMessageId}`);
+    }
+    keys.push(`${scope}:message:${node.role}:${stableTimelineText(node.text)}`);
+  } else if (node.kind === "tool") {
+    keys.push(`${scope}:tool:${node.toolCallId}`);
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:tool:${node.acpToolCallId}`);
+    }
+  } else if (node.kind === "terminal" || node.kind === "diff" || node.kind === "approval") {
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:${node.kind}:tool:${node.acpToolCallId}`);
+    }
+  }
+  return [...new Set(keys)];
+}
+
+function timelineScopeKey(node: RenderNode): string {
+  return `${node.taskId}:${node.lane}:${node.turnId || ""}`;
+}
+
+function stableTimelineText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function renderStatus(status: string | undefined): RenderNode["status"] {

@@ -3,7 +3,9 @@ import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 import {
   ChevronDown,
+  Check,
   CircleAlert,
+  CircleX,
   Diff,
   ExternalLink,
   FileDiff,
@@ -11,12 +13,15 @@ import {
   PanelRightOpen,
   Search,
   Settings,
+  ShieldCheck,
   Terminal,
   Wrench,
   X,
   type LucideIcon
 } from "lucide-react"
 
+import { Button } from "@/webview/components/ui/button"
+import { ButtonGroup } from "@/webview/components/ui/button-group"
 import { Badge } from "@/webview/components/ui/badge"
 import {
   Breadcrumb,
@@ -74,6 +79,27 @@ export interface ToolCallCardLocation {
   line?: number | undefined
 }
 
+export interface ToolCallApprovalAction {
+  kind: "approve" | "reject"
+  optionId?: string | undefined
+  label: string
+  description: string
+  tone: "default" | "primary" | "risk" | "warning"
+  disabled: boolean
+}
+
+export interface ToolCallApprovalProps {
+  requestId: string
+  status: string
+  statusLabel: string
+  tone: "info" | "risk" | "success" | "warning"
+  resolved: boolean
+  title: string
+  resolvedNote: string
+  impactText: string
+  actions: ToolCallApprovalAction[]
+}
+
 export interface ToolCallCardProps {
   nodeId: string
   rawToolKind: string
@@ -89,6 +115,7 @@ export interface ToolCallCardProps {
   locations: ToolCallCardLocation[]
   contentHtml: string
   rawDetails?: RawDetailsView | undefined
+  approval?: ToolCallApprovalProps | undefined
 }
 
 export interface ToolCallCardCallbacks {
@@ -105,6 +132,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastToolCallCardPropsJson = new Map<string, string>()
 
 const ICONS: Record<string, LucideIcon> = {
   changed: FileDiff,
@@ -127,11 +155,16 @@ export function ToolCallCard({
   props: ToolCallCardProps
   callbacks: ToolCallCardCallbacks
 }) {
-  const [open, setOpen] = React.useState(props.model.openByDefault)
+  const isActive = props.status === "in_progress" || props.status === "pending"
+  const [open, setOpen] = React.useState(isActive)
   const [rawOpen, setRawOpen] = React.useState(Boolean(props.rawDetails?.defaultOpen))
   const cardRef = React.useRef<HTMLDivElement>(null)
   const Icon = ICONS[props.model.icon] ?? Wrench
   const compactMeta = props.terminal && props.status === "completed"
+
+  React.useEffect(() => {
+    setOpen(isActive)
+  }, [isActive, props.nodeId])
 
   React.useEffect(() => {
     setRawOpen(Boolean(props.rawDetails?.defaultOpen))
@@ -206,6 +239,9 @@ export function ToolCallCard({
                 props.terminal ? "tool-detail-terminal" : ""
               )}
             >
+              {props.approval ? (
+                <ToolApprovalPanel approval={props.approval} />
+              ) : null}
               {props.terminal ? (
                 <HtmlBlock html={props.contentHtml} />
               ) : (
@@ -260,6 +296,114 @@ function ToolDetail({
       ) : null}
     </>
   )
+}
+
+function ToolApprovalPanel({ approval }: { approval: ToolCallApprovalProps }) {
+  return (
+    <section
+      className={cn(
+        "tool-approval",
+        `approval-tone-${approval.tone}`,
+        approval.resolved ? "tool-approval-resolved" : ""
+      )}
+      aria-label="Permission request"
+    >
+      <div className="tool-approval-copy">
+        <div className="tool-approval-title-row">
+          <span className="tool-approval-title">
+            {approval.resolved ? "Permission decided" : approval.title}
+          </span>
+          {approval.resolved ? null : (
+            <Badge
+              className={cn("tool-status", `tool-status-${approval.status}`)}
+              variant="outline"
+            >
+              {approval.statusLabel}
+            </Badge>
+          )}
+        </div>
+        {approval.resolved ? (
+          <p className="approval-resolved-note">{approval.resolvedNote}</p>
+        ) : (
+          <p className="approval-impact">{approval.impactText}</p>
+        )}
+      </div>
+      {approval.resolved ? null : <ToolApprovalDecision approval={approval} />}
+    </section>
+  )
+}
+
+function ToolApprovalDecision({
+  approval
+}: {
+  approval: ToolCallApprovalProps
+}) {
+  const approveActions = approval.actions.filter((action) => action.kind === "approve")
+  const rejectAction = approval.actions.find((action) => action.kind === "reject")
+  return (
+    <div className="approval-decision" role="group" aria-label="Permission decision">
+      {approveActions.length ? (
+        <ButtonGroup className="approval-option-list" aria-label="Approval options">
+          {approveActions.map((action) => (
+            <ToolApprovalButton
+              key={`${action.kind}-${action.optionId ?? action.label}`}
+              action={action}
+              requestId={approval.requestId}
+            />
+          ))}
+        </ButtonGroup>
+      ) : null}
+      {rejectAction ? (
+        <ToolApprovalButton action={rejectAction} requestId={approval.requestId} />
+      ) : null}
+    </div>
+  )
+}
+
+function ToolApprovalButton({
+  action,
+  requestId
+}: {
+  action: ToolCallApprovalAction
+  requestId: string
+}) {
+  const isReject = action.kind === "reject"
+  const variant = isReject || action.tone === "risk" ? "destructive" : action.tone === "primary" ? "default" : "outline"
+  const ApprovalIcon = approvalActionIcon(action)
+  return (
+    <Button
+      type="button"
+      data-action={action.kind}
+      data-request-id={requestId}
+      data-option-id={action.optionId}
+      title={action.description}
+      aria-label={`${action.label}. ${action.description}`}
+      disabled={action.disabled}
+      variant={variant}
+      size="sm"
+      className={cn(
+        isReject ? "danger approval-reject" : "approval-option",
+        isReject ? "" : `approval-option-${action.tone}`,
+        action.tone === "primary" ? "primary" : ""
+      )}
+    >
+      <ApprovalIcon data-icon="inline-start" aria-hidden="true" />
+      <span className="approval-decision-copy">
+        <span>{action.label}</span>
+      </span>
+    </Button>
+  )
+}
+
+function approvalActionIcon(action: ToolCallApprovalAction): LucideIcon {
+  if (action.kind === "reject") {
+    return CircleX
+  }
+  const value = `${action.label} ${action.optionId ?? ""}`.toLowerCase()
+  if (value.includes("always")) {
+    return ShieldCheck
+  }
+  return Check
 }
 
 function ToolSummaryMeta({
@@ -708,7 +852,16 @@ export function mountToolCallCards(options: MountToolCallCardsOptions): void {
       return
     }
     activeIds.add(nodeId)
+    const currentJson = JSON.stringify(props)
     const mounted = mountedRoots.get(nodeId)
+    if (
+      currentJson === lastToolCallCardPropsJson.get(nodeId) &&
+      mounted?.element === element &&
+      mounted.element.isConnected
+    ) {
+      return
+    }
+    lastToolCallCardPropsJson.set(nodeId, currentJson)
     const root = mounted?.element === element ? mounted.root : createRoot(element)
     if (!mounted || mounted.element !== element) {
       mounted?.root.unmount()
@@ -730,5 +883,6 @@ export function mountToolCallCards(options: MountToolCallCardsOptions): void {
     }
     mounted.root.unmount()
     mountedRoots.delete(nodeId)
+    lastToolCallCardPropsJson.delete(nodeId)
   })
 }

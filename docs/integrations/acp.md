@@ -4,7 +4,17 @@ CrabDB can sit between an ACP-capable editor and a real ACP coding agent. The
 relay is neutral: Claude Code, Codex, or another ACP agent remains the real
 agent, while CrabDB records lanes, turns, transcripts, events, and checkpoints.
 
-## Claude Code Quickstart
+## Built-In ACP Providers
+
+CrabDB ships provider profiles for:
+
+- `claude-code`, via `@agentclientprotocol/claude-agent-acp`
+- `codex`, via `@agentclientprotocol/codex-acp`
+
+Any other ACP-compatible agent can still be used by passing its upstream ACP
+command after `--` to `crabdb agent acp` or `crabdb acp relay`.
+
+## Quickstart
 
 Install CrabDB normally:
 
@@ -16,6 +26,7 @@ Check the agent setup:
 
 ```sh
 crabdb agent doctor --provider claude-code
+crabdb agent doctor --provider codex
 ```
 
 Print editor configuration that creates a fresh CrabDB task lane for each ACP
@@ -80,6 +91,12 @@ The lower-level Claude Code ACP profile still uses:
 
 ```sh
 crabdb acp relay --provider claude-code --materialize -- npx -y @agentclientprotocol/claude-agent-acp@latest
+```
+
+The lower-level Codex ACP profile uses:
+
+```sh
+crabdb acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
 ```
 
 For a full operator and automation-agent runbook, including real Claude Code

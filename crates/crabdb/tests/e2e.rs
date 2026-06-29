@@ -769,6 +769,11 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .unwrap()
         .iter()
         .any(|profile| profile["agent"] == "claude-code"));
+    assert!(profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|profile| profile["agent"] == "codex"));
     assert!(!profiles
         .as_array()
         .unwrap()
@@ -832,6 +837,53 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
     assert!(doctor["lane"].is_null());
     assert!(doctor["session_id"].is_null());
 
+    let custom_doctor = run_crabdb_json(
+        temp.path(),
+        &[
+            "acp",
+            "doctor",
+            "--agent",
+            "custom-acp",
+            "--relay-command",
+            "crabdb",
+            "acp",
+            "relay",
+            "--",
+            "<custom-acp>",
+        ],
+    );
+    assert_eq!(custom_doctor["provider"], "custom-acp");
+    assert!(custom_doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "relay" && check["status"] == "ok"));
+
+    let codex_install = run_crabdb_json(
+        temp.path(),
+        &[
+            "acp",
+            "install",
+            "--agent",
+            "codex",
+            "--editor",
+            "zed",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(codex_install["agent"], "codex");
+    assert!(codex_install["relay_command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| part == "@agentclientprotocol/codex-acp@latest"));
+    let codex_zed_snippet: serde_json::Value =
+        serde_json::from_str(codex_install["snippet"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        codex_zed_snippet["agent_servers"]["crabdb-codex"]["command"],
+        "crabdb"
+    );
+
     let demo = run_crabdb_json(temp.path(), &["demo", "acp", "--agent", "claude-code"]);
     assert_eq!(demo["agent"], "claude-code");
     assert!(demo["relay_command"]
@@ -880,6 +932,23 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|suggestion| suggestion["command"] == "crabdb agent action"));
+
+    let codex_setup = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "setup",
+            "--provider",
+            "codex",
+            "--editor",
+            "vscode",
+        ],
+    );
+    assert_eq!(codex_setup["provider"], "codex");
+    assert!(codex_setup["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("CrabDB Codex"));
 
     let setup = run_crabdb_json(
         temp.path(),
@@ -933,6 +1002,18 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|action| action["id"] == "setup_vscode" && action["command"] == "crabdb agent setup"));
+    assert!(empty_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "setup_codex_vscode"
+            && action["command"] == "crabdb agent setup --provider codex"));
+    assert!(empty_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "doctor_codex"
+            && action["command"] == "crabdb agent doctor --provider codex"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()

@@ -22,6 +22,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Lanes, sessions, turns, and traces](concepts/lanes-sessions-turns-and-traces.md)
 - [Readiness gates and merge safety](concepts/readiness-gates-and-merge-safety.md)
 - [Storage, indexes, and backups](concepts/storage-indexes-and-backups.md)
+- [Prolly tree deep dive](concepts/prolly-tree-deep-dive.md)
 
 ## Guides
 

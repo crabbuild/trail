@@ -8,6 +8,7 @@ import { Card, CardContent } from "@/webview/components/ui/card"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/webview/components/ui/collapsible"
 import { cn } from "@/webview/lib/utils"
 import { useFloatingDisclosure } from "./floatingDisclosure"
+import type { LaneMapDrawerProps } from "./LaneMapDrawer"
 import type {
   ToolbarAction,
   ToolbarCapability,
@@ -42,6 +43,7 @@ export interface HeaderBarProps {
   detailsIconHtml: string
   capabilitiesIconHtml: string
   primaryActionIconHtml: string
+  laneMap?: LaneMapDrawerProps | undefined
   inspectActions: HeaderIconAction[]
   runActions: HeaderIconAction[]
 }
@@ -55,7 +57,13 @@ interface MountedRoot {
   root: Root
 }
 
+const LazyLaneMapDrawer = React.lazy(async () => {
+  const module = await import("./LaneMapDrawer.js")
+  return { default: module.LaneMapDrawer }
+})
+
 const mountedRoots = new Map<string, MountedRoot>()
+const lastHeaderBarPropsJson = new Map<string, string>()
 
 export function HeaderBar({ props }: { props: HeaderBarProps }) {
   return (
@@ -95,6 +103,7 @@ export function HeaderBar({ props }: { props: HeaderBarProps }) {
             reviewAction={props.inspectActions.find((action) => action.action === "toggleReview")}
             settingsAction={props.inspectActions.find((action) => action.action === "openSettings")}
           />
+          {props.laneMap ? <LaneMapToolbarButton laneMap={props.laneMap} /> : null}
           {props.inspectActions.map((action) => (
             <HeaderIconButton key={action.action} action={action} />
           ))}
@@ -105,6 +114,37 @@ export function HeaderBar({ props }: { props: HeaderBarProps }) {
           ))}
         </ButtonGroup>
       </div>
+    </>
+  )
+}
+
+function LaneMapToolbarButton({ laneMap }: { laneMap: LaneMapDrawerProps }) {
+  const [open, setOpen] = React.useState(false)
+  return (
+    <>
+      <Button
+        type="button"
+        className={open ? "active" : undefined}
+        data-header-icon-only="true"
+        data-lane-map-trigger="true"
+        title="Lane map"
+        aria-label="Open lane map"
+        aria-expanded={open}
+        aria-controls="lane-map-drawer"
+        onClick={() => setOpen(true)}
+        variant={open ? "outline" : "ghost"}
+        size="icon-sm"
+      >
+        <span
+          data-icon="inline-start"
+          dangerouslySetInnerHTML={{ __html: laneMap.mapIconHtml }}
+        />
+      </Button>
+      {open ? (
+        <React.Suspense fallback={null}>
+          <LazyLaneMapDrawer open={open} onOpenChange={setOpen} props={laneMap} />
+        </React.Suspense>
+      ) : null}
     </>
   )
 }
@@ -390,6 +430,11 @@ export function mountHeaderBars(options: MountHeaderBarsOptions): void {
       }
       mountedRoots.set(id, mounted)
     }
+    const currentJson = JSON.stringify(props)
+    if (currentJson === lastHeaderBarPropsJson.get(id)) {
+      return
+    }
+    lastHeaderBarPropsJson.set(id, currentJson)
     mounted.root.render(<HeaderBar props={props} />)
   })
 
@@ -397,6 +442,7 @@ export function mountHeaderBars(options: MountHeaderBarsOptions): void {
     if (!activeIds.has(id) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(id)
+      lastHeaderBarPropsJson.delete(id)
     }
   })
 }

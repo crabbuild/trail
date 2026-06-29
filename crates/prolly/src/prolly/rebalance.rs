@@ -65,6 +65,11 @@ use super::node::Node;
 use super::store::Store;
 use super::Prolly;
 
+fn reserve_node_entries(node: &mut Node, additional: usize) {
+    node.keys.reserve_exact(additional);
+    node.vals.reserve_exact(additional);
+}
+
 /// Rebalance the tree after modification.
 ///
 /// Handles:
@@ -264,6 +269,7 @@ fn split_node<S: Store>(
     if ancestors.is_empty() {
         // Create new root
         let mut parent = prolly.new_internal_node(node.level + 1);
+        reserve_node_entries(&mut parent, 2);
         parent.keys.push(left.keys[0].clone());
         parent.vals.push(left_cid.0.to_vec());
         parent.keys.push(right.keys[0].clone());
@@ -284,6 +290,7 @@ fn split_node<S: Store>(
     parent.vals[idx] = left_cid.0.to_vec();
 
     // Insert new entry for right node
+    reserve_node_entries(&mut parent, 1);
     parent.keys.insert(idx + 1, right.keys[0].clone());
     parent.vals.insert(idx + 1, right_cid.0.to_vec());
 
@@ -317,12 +324,13 @@ fn split_and_save_oversized<S: Store>(
 
     // Need to split this node into multiple smaller nodes
     // and create a parent to hold them
-    let mut chunks: Vec<Node> = Vec::new();
+    let capacity = max_size.max(1);
+    let mut chunks: Vec<Node> = Vec::with_capacity(node.len().div_ceil(capacity));
     let mut start = 0;
 
     while start < node.len() {
         // Calculate end index for this chunk. Chunks may fill max_size exactly.
-        let chunk_size = max_size.min(node.len() - start).max(1);
+        let chunk_size = capacity.min(node.len() - start);
         let end = start + chunk_size;
 
         let mut chunk = prolly.new_node_like(node);
@@ -340,6 +348,7 @@ fn split_and_save_oversized<S: Store>(
 
     // Create a parent node to hold all chunks
     let mut parent = prolly.new_internal_node(node.level + 1);
+    reserve_node_entries(&mut parent, chunks.len());
     for chunk in &chunks {
         let chunk_cid = prolly.save(chunk)?;
         parent.keys.push(chunk.keys[0].clone());
@@ -498,12 +507,15 @@ fn is_valid_boundary_between<S: Store>(_prolly: &Prolly<S>, left: &Node, _right:
 /// * `Err(Error)` - On processing errors
 fn merge_nodes<S: Store>(prolly: &Prolly<S>, left: &Node, right: &Node) -> Result<Node, Error> {
     let mut merged = prolly.new_node_like(left);
+    let merged_len = left.len() + right.len();
 
     // Combine keys and values from both nodes
-    merged.keys = left.keys.clone();
+    merged.keys = Vec::with_capacity(merged_len);
+    merged.keys.extend(left.keys.iter().cloned());
     merged.keys.extend(right.keys.iter().cloned());
 
-    merged.vals = left.vals.clone();
+    merged.vals = Vec::with_capacity(merged_len);
+    merged.vals.extend(left.vals.iter().cloned());
     merged.vals.extend(right.vals.iter().cloned());
 
     Ok(merged)
@@ -652,14 +664,17 @@ fn split_node_with_collector<S: Store>(
         );
     }
 
-    // Save all chunks and collect their CIDs and first keys
-    let chunk_info: Vec<(Cid, Vec<u8>)> = chunks
+    // Save all chunks and collect their CIDs and first keys. Use the bulk
+    // collector path so large splits can parallelize serialization and CID
+    // computation before the atomic store write.
+    let first_keys = chunks
         .iter()
-        .map(|chunk| {
-            let cid = collector.add(chunk);
-            let first_key = chunk.keys.first().cloned().unwrap_or_default();
-            (cid, first_key)
-        })
+        .map(|chunk| chunk.keys.first().cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let chunk_info: Vec<(Cid, Vec<u8>)> = collector
+        .add_many(chunks)
+        .into_iter()
+        .zip(first_keys)
         .collect();
 
     // Debug assertion: verify chunk keys don't overlap with siblings (Requirement 2.3, 3.3)
@@ -673,6 +688,7 @@ fn split_node_with_collector<S: Store>(
     if ancestors.is_empty() {
         // Create new root
         let mut parent = prolly.new_internal_node(node.level + 1);
+        reserve_node_entries(&mut parent, chunk_info.len());
         for (cid, first_key) in &chunk_info {
             parent.keys.push(first_key.clone());
             parent.vals.push(cid.0.to_vec());
@@ -694,6 +710,8 @@ fn split_node_with_collector<S: Store>(
     parent.vals.remove(idx);
 
     // Insert all new entries at idx
+    let additional_entries = chunk_info.len().saturating_sub(1);
+    reserve_node_entries(&mut parent, additional_entries);
     for (i, (cid, first_key)) in chunk_info.iter().enumerate() {
         parent.keys.insert(idx + i, first_key.clone());
         parent.vals.insert(idx + i, cid.0.to_vec());
@@ -743,7 +761,7 @@ pub fn split_into_chunks<S: Store>(prolly: &Prolly<S>, node: &Node, max_size: us
     // Calculate the number of chunks needed
     let num_chunks = node.len().div_ceil(capacity);
 
-    let mut chunks: Vec<Node> = Vec::new();
+    let mut chunks: Vec<Node> = Vec::with_capacity(num_chunks);
     let mut start = 0;
 
     while start < node.len() {
@@ -923,4 +941,82 @@ fn try_merge_with_sibling_collector<S: Store>(
 
     // No merge possible
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::config::Config;
+    use super::super::store::MemStore;
+    use super::*;
+
+    fn leaf_with_entries<S: Store>(prolly: &Prolly<S>, start: usize, end: usize) -> Node {
+        let mut node = prolly.new_leaf_node();
+        for idx in start..end {
+            node.keys.push(format!("k{idx:04}").into_bytes());
+            node.vals.push(format!("v{idx:04}").into_bytes());
+        }
+        node
+    }
+
+    #[test]
+    fn merge_nodes_preserves_order_and_node_settings() {
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(8)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(MemStore::new(), config);
+        let left = leaf_with_entries(&prolly, 0, 2);
+        let right = leaf_with_entries(&prolly, 2, 5);
+
+        let merged = merge_nodes(&prolly, &left, &right).unwrap();
+
+        assert!(merged.leaf);
+        assert_eq!(merged.level, left.level);
+        assert_eq!(merged.min_chunk_size, left.min_chunk_size);
+        assert_eq!(merged.max_chunk_size, left.max_chunk_size);
+        assert_eq!(
+            merged.keys,
+            (0..5)
+                .map(|idx| format!("k{idx:04}").into_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            merged.vals,
+            (0..5)
+                .map(|idx| format!("v{idx:04}").into_bytes())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn split_into_chunks_preserves_all_entries_in_order() {
+        let config = Config::builder()
+            .min_chunk_size(2)
+            .max_chunk_size(4)
+            .chunking_factor(u32::MAX)
+            .build();
+        let prolly = Prolly::new(MemStore::new(), config);
+        let node = leaf_with_entries(&prolly, 0, 11);
+
+        let chunks = split_into_chunks(&prolly, &node, 4);
+
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 4));
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.keys.iter().cloned())
+                .collect::<Vec<_>>(),
+            node.keys
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.vals.iter().cloned())
+                .collect::<Vec<_>>(),
+            node.vals
+        );
+    }
 }

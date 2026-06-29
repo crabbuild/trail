@@ -105,3 +105,21 @@ export function approvalDecisionDescription(toolKind: string): string {
       return "Allow provider tool action.";
   }
 }
+
+export function approvalActionLabel(label: string, optionId: string): string {
+  const raw = String(label || optionId || "").trim();
+  const value = `${raw} ${optionId || ""}`.toLowerCase();
+  if (/\balways\b/.test(value) && /\b(allow|approve)\b/.test(value)) {
+    return "Always allow";
+  }
+  if (/\b(allow|approve)\b/.test(value)) {
+    return "Allow";
+  }
+  if (/\b(reject|deny|decline|cancel|refuse|disallow)\b/.test(value)) {
+    return "Reject";
+  }
+  if (!raw) {
+    return "Allow";
+  }
+  return raw.length > 28 ? `${raw.slice(0, 25)}...` : raw;
+}

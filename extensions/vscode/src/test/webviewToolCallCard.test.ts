@@ -28,7 +28,7 @@ function cardProps(
       icon: presentation.icon,
       kind: presentation.kind,
       operationLabel: presentation.operationLabel,
-      openByDefault: true,
+      openByDefault: presentation.openByDefault,
       riskLabel: presentation.riskLabel,
       riskTone: presentation.riskTone,
       statusLabel: presentation.statusLabel,
@@ -62,7 +62,7 @@ test("renders read previews without generic tool chrome", () => {
       {
         title: "Read package.json",
         toolKind: "read",
-        toolStatus: "completed",
+        toolStatus: "in_progress",
         locations: [{ path: "package.json" }],
         content: [{ type: "content", content: { type: "text", text: "{}" } }]
       },
@@ -87,7 +87,7 @@ test("renders edit tools with shadcn actions and diff affordances", () => {
       {
         title: "Edit README.md",
         toolKind: "edit",
-        toolStatus: "completed",
+        toolStatus: "in_progress",
         locations: [{ path: "README.md" }],
         rawInput: { path: "README.md", line: 12 },
         content: [{ type: "diff", path: "README.md", oldText: "old", newText: "new" }]
@@ -144,7 +144,7 @@ test("renders execute tools as terminal-focused cards", () => {
       {
         title: "Run tests",
         toolKind: "execute",
-        toolStatus: "completed",
+        toolStatus: "in_progress",
         locations: [],
         rawInput: { command: "npm test" },
         content: [{ type: "terminal", terminalId: "term-1", command: "npm test", stdout: "ok" }]
@@ -161,7 +161,7 @@ test("renders execute tools as terminal-focused cards", () => {
   assert.doesNotMatch(html, /tool-card-actions|tool-action-bar/);
 });
 
-test("renders failed tools open with status and inspect actions", () => {
+test("renders failed tools collapsed with status and inspect affordance", () => {
   const html = renderCard(
     cardProps(
       {
@@ -182,12 +182,12 @@ test("renders failed tools open with status and inspect actions", () => {
     )
   );
 
-  assert.match(html, /data-open=""/);
+  assert.doesNotMatch(html, /data-open=""/);
   assert.match(html, /tool-status-failed/);
   assert.match(html, /tool-risk-badge-risk/);
   assert.match(html, /data-slot="hover-card-trigger"/);
-  assert.match(html, /Inspect card/);
-  assert.match(html, /data-action="inspectToolDetails"/);
+  assert.doesNotMatch(html, /Inspect card/);
+  assert.doesNotMatch(html, /data-action="inspectToolDetails"/);
 });
 
 test("renders pending tools with pending status chrome", () => {
@@ -206,6 +206,90 @@ test("renders pending tools with pending status chrome", () => {
   assert.match(html, />pending</);
   assert.match(html, /tool-kind-query/);
   assert.match(html, /data-slot="hover-card-trigger"/);
+});
+
+test("renders permission decisions inside the tool call card", () => {
+  const html = renderCard(
+    cardProps(
+      {
+        title: "Run git log",
+        toolKind: "execute",
+        toolStatus: "pending",
+        locations: [],
+        rawInput: { command: "git log --oneline -10" },
+        content: [{ type: "terminal", terminalId: "term-1", command: "git log --oneline -10" }]
+      },
+      {
+        terminal: true,
+        model: {
+          ...buildToolPresentation({
+            title: "Run git log",
+            toolKind: "execute",
+            toolStatus: "pending",
+            locations: [],
+            rawInput: { command: "git log --oneline -10" },
+            content: [{ type: "terminal", terminalId: "term-1", command: "git log --oneline -10" }]
+          }),
+          statusLabel: "Needs decision",
+          riskLabel: "Needs approval",
+          riskTone: "warning"
+        },
+        contentHtml: '<div class="terminal-transcript">git log --oneline -10</div>',
+        approval: {
+          requestId: "request-1",
+          status: "pending",
+          statusLabel: "Needs decision",
+          tone: "warning",
+          resolved: false,
+          title: "Permission required",
+          resolvedNote: "",
+          impactText: "The agent is asking to run a command that can inspect or change the current task.",
+          actions: [
+            {
+              kind: "approve",
+              optionId: "allow_always",
+              label: "Always allow",
+              description: "Always allow this command.",
+              tone: "warning",
+              disabled: false
+            },
+            {
+              kind: "approve",
+              optionId: "allow",
+              label: "Allow",
+              description: "Allow once.",
+              tone: "warning",
+              disabled: false
+            },
+            {
+              kind: "reject",
+              label: "Reject",
+              description: "Do not allow this action.",
+              tone: "risk",
+              disabled: false
+            }
+          ]
+        }
+      }
+    )
+  );
+
+  assert.match(html, /tool-approval/);
+  assert.match(html, /Always allow/);
+  assert.match(html, /data-action="approve"/);
+  assert.match(html, /data-option-id="allow_always"/);
+  assert.match(html, /data-option-id="allow"/);
+  assert.match(html, /data-action="reject"/);
+  assert.match(html, /terminal-transcript/);
+  assert.match(html, /lucide-shield-check/);
+  assert.match(html, /lucide-check/);
+  assert.match(html, /lucide-circle-x/);
+  assert.doesNotMatch(html, /approval-meta/);
+  assert.doesNotMatch(html, /claude-code/);
+  assert.doesNotMatch(html, /No file scope reported/);
+  assert.doesNotMatch(html, /approval-request-details/);
+  assert.doesNotMatch(html, />Details</);
+  assert.doesNotMatch(html, /data-approval-card/);
 });
 
 test("renders empty tool calls without phantom content wrappers", () => {
@@ -231,7 +315,7 @@ test("renders raw details with shadcn accordion while preserving helper content 
       {
         title: "Fetch docs",
         toolKind: "fetch",
-        toolStatus: "completed",
+        toolStatus: "in_progress",
         locations: [],
         rawInput: { url: "https://example.com/docs" },
         content: []

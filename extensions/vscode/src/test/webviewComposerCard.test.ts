@@ -79,7 +79,8 @@ test("renders the composer through shadcn card, button groups, buttons, and badg
   assert.match(html, /data-slot="collapsible"/);
   assert.match(html, /data-slot="collapsible-trigger"/);
   assert.match(html, /data-slot="collapsible-content"/);
-  assert.match(html, /class="[^"]*composer-context-rail/);
+  assert.doesNotMatch(html, /class="[^"]*composer-context-rail/);
+  assert.doesNotMatch(html, /class="[^"]*composer-utility-row/);
   assert.match(html, /class="[^"]*composer-input/);
   assert.match(html, /class="composer-controls"/);
   assert.match(html, /class="composer-controls-summary"/);
@@ -89,7 +90,7 @@ test("renders the composer through shadcn card, button groups, buttons, and badg
   );
   assert.doesNotMatch(html, /<details class="composer-controls"/);
   assert.doesNotMatch(html, /<summary class="composer-controls-summary"/);
-  assert.match(html, /data-action="insertPromptPreset"/);
+  assert.doesNotMatch(html, /data-action="insertPromptPreset"/);
   assert.match(html, /data-action="attachSelection"/);
   assert.match(html, /data-action="removeAttachment"/);
   assert.match(html, /data-attachment-id="attachment-1"/);
@@ -102,7 +103,7 @@ test("renders the composer through shadcn card, button groups, buttons, and badg
   assert.match(html, /data-action="switchProvider"/);
 });
 
-test("renders blocked composer state with alert semantics and disabled send", () => {
+test("renders blocked composer state with hidden status semantics and disabled send", () => {
   const html = renderComposer(
     baseProps({
       status: {
@@ -123,8 +124,11 @@ test("renders blocked composer state with alert semantics and disabled send", ()
     })
   );
 
-  assert.match(html, /data-slot="alert"/);
-  assert.match(html, /composer-run-waiting/);
+  assert.doesNotMatch(html, /data-slot="alert"/);
+  assert.doesNotMatch(html, /composer-run-waiting/);
+  assert.match(html, /id="composer-status"/);
+  assert.match(html, /role="status"/);
+  assert.match(html, /Permission required/);
   assert.match(html, /aria-invalid="true"/);
   assert.match(html, /disabled=""/);
   assert.match(html, /Resolve the permission request before sending\./);

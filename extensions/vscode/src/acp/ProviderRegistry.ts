@@ -17,15 +17,8 @@ export class ProviderRegistry {
   profiles(): AcpProviderProfile[] {
     const config = getExtensionConfig();
     const builtins: AcpProviderProfile[] = [
-      {
-        id: "claude-code",
-        label: "Claude Code via CrabDB",
-        command: config.crabdbPath,
-        args: ["--workspace", this.workspaceRoot, "agent", "acp", "--provider", "claude-code"],
-        crabdbBacked: true,
-        supportsTaskName: true,
-        supportsFromRef: true
-      }
+      this.crabDbProviderProfile("claude-code", "Claude Code via CrabDB"),
+      this.crabDbProviderProfile("codex", "Codex via CrabDB")
     ];
 
     const custom = config.customProviders.map((provider) => this.customProfile(provider));
@@ -37,15 +30,7 @@ export class ProviderRegistry {
     return (
       this.profiles().find((profile) => profile.id === config.defaultProvider) ??
       this.profiles()[0] ??
-      {
-        id: "claude-code",
-        label: "Claude Code via CrabDB",
-        command: config.crabdbPath,
-        args: ["--workspace", this.workspaceRoot, "agent", "acp", "--provider", "claude-code"],
-        crabdbBacked: true,
-        supportsTaskName: true,
-        supportsFromRef: true
-      }
+      this.crabDbProviderProfile("claude-code", "Claude Code via CrabDB")
     );
   }
 
@@ -71,14 +56,29 @@ export class ProviderRegistry {
   private customProfile(provider: CustomProviderConfig): AcpProviderProfile {
     const command = expandVariables(provider.command, this.workspaceRoot);
     const args = (provider.args ?? []).map((arg) => expandVariables(arg, this.workspaceRoot));
+    const crabdbBacked = command.includes("crabdb") || args.some((arg) => arg.includes("crabdb"));
+    const crabdbAgentAcp = crabdbBacked && args.includes("agent") && args.includes("acp");
     return {
       id: provider.id,
       label: provider.label,
       command,
       args,
-      crabdbBacked: command.includes("crabdb") || args.some((arg) => arg.includes("crabdb")),
-      supportsTaskName: false,
-      supportsFromRef: false
+      crabdbBacked,
+      supportsTaskName: crabdbAgentAcp,
+      supportsFromRef: crabdbAgentAcp
+    };
+  }
+
+  private crabDbProviderProfile(id: string, label: string): AcpProviderProfile {
+    const config = getExtensionConfig();
+    return {
+      id,
+      label,
+      command: config.crabdbPath,
+      args: ["--workspace", this.workspaceRoot, "agent", "acp", "--provider", id],
+      crabdbBacked: true,
+      supportsTaskName: true,
+      supportsFromRef: true
     };
   }
 }

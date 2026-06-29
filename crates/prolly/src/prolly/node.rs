@@ -98,6 +98,39 @@ impl Node {
         self.to_compact_bytes()
     }
 
+    /// Return the exact length of the compact serialized form without allocating it.
+    pub fn encoded_len(&self) -> usize {
+        let mut len = COMPACT_MAGIC.len()
+            + varint_len(COMPACT_VERSION)
+            + varint_len(if self.leaf { 1 } else { 0 })
+            + varint_len(self.level as u64)
+            + varint_len(self.min_chunk_size as u64)
+            + varint_len(self.max_chunk_size as u64)
+            + varint_len(self.chunking_factor as u64)
+            + varint_len(self.hash_seed)
+            + encoding_len(&self.encoding)
+            + varint_len(self.keys.len() as u64);
+
+        let mut previous_key: &[u8] = &[];
+        for (key, val) in self.keys.iter().zip(&self.vals) {
+            let shared = common_prefix_len(previous_key, key);
+            let suffix = &key[shared..];
+            len += varint_len(shared as u64) + varint_len(suffix.len() as u64) + suffix.len();
+
+            if self.leaf {
+                len += varint_len(val.len() as u64) + val.len();
+            } else if val.len() == 32 {
+                len += 1 + val.len();
+            } else {
+                len += 1 + varint_len(val.len() as u64) + val.len();
+            }
+
+            previous_key = key;
+        }
+
+        len
+    }
+
     /// Deserialize from compact bytes, falling back to legacy CBOR.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
         if data.starts_with(COMPACT_MAGIC) {
@@ -113,7 +146,7 @@ impl Node {
     }
 
     fn to_compact_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(COMPACT_MAGIC);
         write_varint(COMPACT_VERSION, &mut out);
         write_varint(if self.leaf { 1 } else { 0 }, &mut out);
@@ -242,12 +275,28 @@ fn write_encoding(encoding: &Encoding, out: &mut Vec<u8>) {
     }
 }
 
+fn encoding_len(encoding: &Encoding) -> usize {
+    match encoding {
+        Encoding::Raw | Encoding::Cbor | Encoding::Json => 1,
+        Encoding::Custom(name) => 1 + varint_len(name.len() as u64) + name.len(),
+    }
+}
+
 fn write_varint(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push(((value as u8) & 0x7f) | 0x80);
         value >>= 7;
     }
     out.push(value as u8);
+}
+
+fn varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        len += 1;
+        value >>= 7;
+    }
+    len
 }
 
 fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
@@ -629,6 +678,79 @@ mod tests {
             compact_bytes.len(),
             legacy_packed_bytes.len()
         );
+    }
+
+    #[test]
+    fn compact_encoded_len_matches_serialized_leaf_len() {
+        let node = Node::builder()
+            .keys(vec![
+                b"crates/prolly/src/a.rs".to_vec(),
+                b"crates/prolly/src/b.rs".to_vec(),
+                b"crates/prolly/src/c.rs".to_vec(),
+            ])
+            .vals(vec![
+                b"value-a".to_vec(),
+                b"value-b".to_vec(),
+                b"value-c".to_vec(),
+            ])
+            .leaf(true)
+            .level(0)
+            .min_chunk_size(16)
+            .max_chunk_size(512)
+            .chunking_factor(256)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build();
+
+        assert_eq!(node.encoded_len(), node.to_bytes().len());
+    }
+
+    #[test]
+    fn compact_encoded_len_matches_serialized_internal_len() {
+        let mut cid_a = [0u8; 32];
+        cid_a[0] = 1;
+        let mut cid_b = [0u8; 32];
+        cid_b[0] = 2;
+        let node = Node::builder()
+            .keys(vec![
+                b"crates/prolly/src/a.rs".to_vec(),
+                b"crates/prolly/src/b.rs".to_vec(),
+                b"crates/prolly/src/c.rs".to_vec(),
+            ])
+            .vals(vec![
+                cid_a.to_vec(),
+                cid_b.to_vec(),
+                b"legacy-child".to_vec(),
+            ])
+            .leaf(false)
+            .level(2)
+            .min_chunk_size(16)
+            .max_chunk_size(512)
+            .chunking_factor(256)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build();
+
+        assert_eq!(node.encoded_len(), node.to_bytes().len());
+    }
+
+    #[test]
+    fn compact_encoded_len_matches_serialized_custom_encoding_len() {
+        let node = Node::builder()
+            .keys(vec![b"a".to_vec(), b"b".to_vec()])
+            .vals(vec![b"1".to_vec(), b"2".to_vec()])
+            .leaf(true)
+            .level(0)
+            .min_chunk_size(2)
+            .max_chunk_size(128)
+            .chunking_factor(64)
+            .hash_seed(42)
+            .encoding(Encoding::Custom(
+                "application/x-crabdb-node-test".to_string(),
+            ))
+            .build();
+
+        assert_eq!(node.encoded_len(), node.to_bytes().len());
     }
 
     #[test]

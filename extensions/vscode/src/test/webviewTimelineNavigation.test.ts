@@ -60,21 +60,20 @@ function baseProps(overrides: Partial<TimelineNavigationProps> = {}): TimelineNa
   };
 }
 
-test("renders transcript toolbar and lane map with shadcn primitives", () => {
+test("renders the transcript toolbar with shadcn primitives", () => {
   const html = renderTimelineNavigation(baseProps());
 
-  assert.match(html, /class="timeline-toolbar"/);
-  assert.match(html, /data-slot="accordion"/);
-  assert.match(html, /data-slot="accordion-item"/);
-  assert.match(html, /data-slot="accordion-trigger"/);
-  assert.match(html, /data-slot="accordion-content"/);
-  assert.match(html, /data-slot="dropdown-menu-trigger"/);
+  assert.match(html, /class="[^"]*timeline-toolbar/);
+  assert.match(html, /data-slot="collapsible"/);
+  assert.match(html, /data-slot="collapsible-trigger"/);
+  assert.match(html, /data-slot="collapsible-content"/);
+  assert.match(html, /data-slot="card"/);
   assert.match(html, /data-slot="button-group"/);
   assert.match(html, /data-slot="button"/);
   assert.match(html, /data-slot="badge"/);
-  assert.match(html, /data-slot="card"/);
-  assert.match(html, /class="[^"]*timeline-filter-menu-trigger/);
-  assert.match(html, /class="[^"]*timeline-filter-menu-label/);
+  assert.match(html, /class="timeline-filter-trigger"/);
+  assert.match(html, /class="timeline-filter-trigger-label"/);
+  assert.match(html, /class="[^"]*timeline-filter-popover/);
   assert.match(html, /class="[^"]*timeline-filter[^"]*active/);
   assert.match(
     html,
@@ -86,22 +85,18 @@ test("renders transcript toolbar and lane map with shadcn primitives", () => {
   assert.match(html, /class="timeline-search-input"/);
   assert.match(html, /defaultValue="schema"|value="schema"/);
   assert.match(html, /data-action="clearTimelineSearch"/);
+  assert.doesNotMatch(html, /data-slot="dropdown-menu-trigger"/);
+  assert.doesNotMatch(html, /Lane map/);
+  assert.doesNotMatch(html, /session-map/);
 });
 
-test("preserves session map selectors and turn navigation links", () => {
+test("keeps lane map content out of the main transcript navigation", () => {
   const html = renderTimelineNavigation(baseProps());
 
-  assert.match(html, /class="[^"]*session-map/);
-  assert.match(html, /class="[^"]*session-map-summary/);
-  assert.match(html, /class="[^"]*session-map-body/);
-  assert.match(html, /class="[^"]*event-chip[^"]*active/);
-  assert.match(html, /data-icon="inline-start"/);
-  assert.doesNotMatch(html, /<span[^>]*class="icon"[^>]*data-icon="inline-start"/);
-  assert.match(html, /class="[^"]*tool-activity[^"]*tool-activity-warning/);
-  assert.match(html, /class="[^"]*tool-activity-metric[^"]*tool-activity-metric-warning/);
-  assert.match(html, /class="[^"]*tool-activity-path[^"]*tool-activity-path-warning/);
-  assert.match(html, /class="session-map-turn"/);
-  assert.match(html, /href="#node-group-turn-1"/);
+  assert.doesNotMatch(html, /class="[^"]*event-chip/);
+  assert.doesNotMatch(html, /class="[^"]*tool-activity/);
+  assert.doesNotMatch(html, /class="session-map-turn"/);
+  assert.doesNotMatch(html, /href="#node-group-turn-1"/);
   assert.doesNotMatch(html, /<details class="session-map"/);
   assert.doesNotMatch(html, /<summary class="session-map-summary"/);
 });
@@ -121,6 +116,6 @@ test("renders empty filtered activity without phantom turn links", () => {
     })
   );
 
-  assert.match(html, /Clear the transcript filter to inspect all tool activity/);
+  assert.doesNotMatch(html, /Clear the transcript filter to inspect all tool activity/);
   assert.doesNotMatch(html, /class="session-map-turn"/);
 });

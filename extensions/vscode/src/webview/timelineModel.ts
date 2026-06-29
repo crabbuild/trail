@@ -57,6 +57,42 @@ export function filterTimelineNodes(nodes: RenderNode[], filter: TimelineFilter,
   });
 }
 
+export function transcriptTimelineNodes(nodes: RenderNode[]): RenderNode[] {
+  return nodes.filter(isTranscriptTimelineNode);
+}
+
+export function sortTimelineNodes(nodes: RenderNode[]): RenderNode[] {
+  return [...nodes].sort((left, right) =>
+    sortOrder(left) - sortOrder(right) || sortTime(left) - sortTime(right)
+  );
+}
+
+function sortOrder(node: RenderNode): number {
+  return Number.isFinite(node.timelineOrder) ? node.timelineOrder! : Infinity;
+}
+
+function sortTime(node: RenderNode): number {
+  const time = Date.parse(node.createdAt || node.updatedAt || "");
+  return Number.isNaN(time) ? Infinity : time;
+}
+
+function isTranscriptTimelineNode(node: RenderNode): boolean {
+  switch (node.kind) {
+    case "commands":
+    case "config":
+    case "mode":
+    case "session":
+    case "usage":
+      return false;
+    case "tool":
+      return !isRoutineInternalTool(node);
+    case "unknown":
+      return false;
+    default:
+      return true;
+  }
+}
+
 export function timelineSearchTokens(query: string): string[] {
   return normalizeTimelineSearchText(query).split(" ").filter(Boolean);
 }
@@ -73,6 +109,9 @@ export function timelineFilterCounts(nodes: RenderNode[]): TimelineCounts {
   for (const node of nodes) {
     const bucket = timelineNodeBucket(node);
     counts[bucket] += 1;
+    if (node.kind === "tool" && node.permission) {
+      counts.approvals += 1;
+    }
   }
   return counts;
 }
@@ -108,6 +147,14 @@ export function buildToolActivitySummary(nodes: RenderNode[], maxPaths = 5): Too
       incrementStatusCounts(node.toolStatus, counts);
       for (const location of node.locations) {
         addActivityPath(paths, location.path, pathToneForTool(model.kind, model.riskTone), model.kind);
+      }
+      if (node.permission) {
+        counts.approvals += 1;
+        counts.risks += 1;
+        incrementStatusCounts(node.permission.status, counts);
+        for (const location of node.locations) {
+          addActivityPath(paths, location.path, "risk", `approval ${model.kind}`);
+        }
       }
       continue;
     }
@@ -152,7 +199,13 @@ export function buildToolActivitySummary(nodes: RenderNode[], maxPaths = 5): Too
 }
 
 export function nodeMatchesTimelineFilter(node: RenderNode, filter: TimelineFilter): boolean {
-  return filter === "all" || timelineNodeBucket(node) === filter;
+  if (filter === "all") {
+    return true;
+  }
+  if (filter === "approvals" && node.kind === "tool" && node.permission) {
+    return true;
+  }
+  return timelineNodeBucket(node) === filter;
 }
 
 export function timelineNodeBucket(node: RenderNode): Exclude<TimelineFilter, "all"> {
@@ -191,8 +244,12 @@ export function timelineNodeSearchText(node: RenderNode): string {
         node.title,
         node.toolKind,
         node.toolStatus,
+        node.permission?.title,
+        node.permission?.requestId,
+        node.permission?.status,
         ...node.locations.map((location) => [location.path, String(location.line || "")]).flat(),
-        ...node.content.flatMap(toolContentText)
+        ...node.content.flatMap(toolContentText),
+        ...(node.permission?.options || []).flatMap((option) => [option.label, option.description, option.optionId])
       );
       break;
     case "diff":
@@ -270,6 +327,14 @@ function contentBlocksText(blocks: ContentBlock[]): string[] {
 
 function normalizeTimelineSearchText(value: string): string {
   return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function isRoutineInternalTool(node: Extract<RenderNode, { kind: "tool" }>): boolean {
+  if (node.toolKind !== "other" || node.locations.length || node.content.length) {
+    return false;
+  }
+  const title = normalizeTimelineSearchText(node.title);
+  return title === "acp prompt turn" || title.startsWith("acp prompt turn (") || title.startsWith("span_started") || title.startsWith("span_ended");
 }
 
 function toolContentText(content: ToolCallContent): string[] {

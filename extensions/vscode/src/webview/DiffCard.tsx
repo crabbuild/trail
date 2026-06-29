@@ -33,6 +33,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastDiffCardPropsJson = new Map<string, string>()
 
 export function DiffCard({ props }: { props: DiffCardProps }) {
   return (
@@ -88,6 +89,12 @@ export function mountDiffCards(options: MountDiffCardsOptions): void {
       }
       mountedRoots.set(nodeId, mounted)
     }
+    const currentJson = JSON.stringify(props)
+    if (currentJson === lastDiffCardPropsJson.get(nodeId)) {
+      activeIds.add(nodeId)
+      return
+    }
+    lastDiffCardPropsJson.set(nodeId, currentJson)
     mounted.root.render(<DiffCard props={props} />)
   })
 
@@ -95,6 +102,7 @@ export function mountDiffCards(options: MountDiffCardsOptions): void {
     if (!activeIds.has(nodeId) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(nodeId)
+      lastDiffCardPropsJson.delete(nodeId)
     }
   })
 }

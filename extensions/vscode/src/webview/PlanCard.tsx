@@ -40,6 +40,7 @@ interface MountedRoot {
 }
 
 const mountedRoots = new Map<string, MountedRoot>()
+const lastPlanCardPropsJson = new Map<string, string>()
 
 export function PlanCard({ props }: { props: PlanCardProps }) {
   return (
@@ -135,6 +136,11 @@ export function mountPlanCards(options: MountPlanCardsOptions): void {
       }
       mountedRoots.set(nodeId, mounted)
     }
+    const propsJson = JSON.stringify(props)
+    if (lastPlanCardPropsJson.get(nodeId) === propsJson) {
+      return
+    }
+    lastPlanCardPropsJson.set(nodeId, propsJson)
     mounted.root.render(<PlanCard props={props} />)
   })
 
@@ -142,6 +148,7 @@ export function mountPlanCards(options: MountPlanCardsOptions): void {
     if (!activeIds.has(nodeId) || !mounted.element.isConnected) {
       mounted.root.unmount()
       mountedRoots.delete(nodeId)
+      lastPlanCardPropsJson.delete(nodeId)
     }
   })
 }

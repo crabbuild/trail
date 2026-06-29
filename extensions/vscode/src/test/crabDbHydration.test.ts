@@ -33,7 +33,7 @@ const view: TaskView = {
           created_at: 2
         }
       ],
-      tool_summaries: ["edited README.md"],
+      tool_summaries: ["ACP prompt turn", "span_ended (completed)", "edited README.md"],
       checkpoint: "ch_123"
     }
   ],
@@ -47,6 +47,8 @@ test("hydrates persisted CrabDB transcript turns into render nodes", () => {
   const nodes = hydrateTaskView(view);
   assert.equal(nodes.filter((node) => node.kind === "message").length, 2);
   assert.equal(nodes.some((node) => node.kind === "tool" && node.title === "edited README.md"), true);
+  assert.equal(nodes.some((node) => node.kind === "tool" && node.title === "ACP prompt turn"), false);
+  assert.equal(nodes.some((node) => node.kind === "tool" && node.title === "span_ended (completed)"), false);
   assert.equal(nodes.some((node) => node.kind === "checkpoint" && node.checkpointId === "ch_123"), true);
   assert.equal(nodes.every((node) => node.source === "crabdb"), true);
 });
@@ -251,6 +253,247 @@ test("hydrates reopened ACP turns by message-added event order around tools", ()
       "checkpoint:"
     ]
   );
+});
+
+test("preserves live transcript order when replacing a completed stream with hydrated nodes", () => {
+  const current: RenderNode[] = [
+    {
+      id: "message:user:anonymous",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-order",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "Count the repo" }],
+      text: "Count the repo",
+      streaming: false
+    },
+    {
+      id: "message:assistant:anonymous",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-order",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "text", text: "I will inspect the repo first." }],
+      text: "I will inspect the repo first.",
+      streaming: false
+    },
+    {
+      id: "tool:find-src",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-order",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      acpToolCallId: "find-src",
+      toolCallId: "find-src",
+      title: "Find src files",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: []
+    },
+    {
+      id: "message:assistant:anonymous:2",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-order",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "text", text: "I will also check file types." }],
+      text: "I will also check file types.",
+      streaming: false
+    },
+    {
+      id: "tool:breakdown",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-order",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      acpToolCallId: "breakdown",
+      toolCallId: "breakdown",
+      title: "Breakdown by file type",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: []
+    },
+    {
+      id: "message:assistant:anonymous:3",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-order",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "text", text: "Here is the summary." }],
+      text: "Here is the summary.",
+      streaming: false
+    }
+  ];
+  const persisted: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-live-order",
+          status: "completed",
+          after_change: "ch_live_order"
+        },
+        messages: [
+          { role: "user", body: "Count the repo", created_at: 0 },
+          { role: "assistant", body: "I will inspect the repo first.", created_at: 0 },
+          { role: "assistant", body: "I will also check file types.", created_at: 0 },
+          { role: "assistant", body: "Here is the summary.", created_at: 0 }
+        ],
+        events: [
+          {
+            event_type: "tool_call",
+            created_at: 0,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "find-src",
+              title: "Find src files",
+              kind: "execute",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "tool_call",
+            created_at: 0,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "breakdown",
+              title: "Breakdown by file type",
+              kind: "execute",
+              status: "completed"
+            }
+          }
+        ],
+        checkpoint: "ch_live_order"
+      }
+    ]
+  };
+
+  const hydrated = hydrateTaskView(persisted);
+  assert.deepEqual(
+    hydrated.slice(0, 6).map((node) => (node.kind === "message" ? `${node.kind}:${node.role}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`)),
+    [
+      "message:user:Count the repo",
+      "tool:find-src",
+      "tool:breakdown",
+      "message:assistant:I will inspect the repo first.",
+      "message:assistant:I will also check file types.",
+      "message:assistant:Here is the summary."
+    ],
+    "this fixture should reproduce the lossy CrabDB fallback order"
+  );
+
+  const merged = mergeHydratedNodes(hydrated, current);
+  assert.deepEqual(
+    merged.slice(0, 6).map((node) => (node.kind === "message" ? `${node.kind}:${node.role}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`)),
+    [
+      "message:user:Count the repo",
+      "message:assistant:I will inspect the repo first.",
+      "tool:find-src",
+      "message:assistant:I will also check file types.",
+      "tool:breakdown",
+      "message:assistant:Here is the summary."
+    ]
+  );
+  assert.deepEqual(merged.slice(0, 6).map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("keeps older hydrated turns before live-order reconciliation for later turns", () => {
+  const earlier: RenderNode = {
+    id: "crabdb-message:turn-1:0",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-1",
+    provider: "provider",
+    source: "crabdb",
+    status: "completed",
+    role: "assistant",
+    content: [{ type: "text", text: "Earlier turn" }],
+    text: "Earlier turn",
+    streaming: false
+  };
+  const activeUser: RenderNode = {
+    id: "crabdb-message:turn-2:0",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-2",
+    provider: "provider",
+    source: "crabdb",
+    status: "completed",
+    role: "user",
+    content: [{ type: "text", text: "Run another check" }],
+    text: "Run another check",
+    streaming: false
+  };
+  const activeAssistant: RenderNode = {
+    id: "crabdb-message:turn-2:1",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-2",
+    provider: "provider",
+    source: "crabdb",
+    status: "completed",
+    role: "assistant",
+    content: [{ type: "text", text: "I will run it." }],
+    text: "I will run it.",
+    streaming: false
+  };
+  const activeTool: RenderNode = {
+    id: "tool:run-check",
+    kind: "tool",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-2",
+    provider: "provider",
+    source: "crabdb",
+    status: "completed",
+    acpToolCallId: "run-check",
+    toolCallId: "run-check",
+    title: "Run check",
+    toolKind: "execute",
+    toolStatus: "completed",
+    locations: [],
+    content: []
+  };
+  const current: RenderNode[] = [
+    { ...activeUser, id: "message:user:anonymous", source: "acp-live" },
+    { ...activeAssistant, id: "message:assistant:anonymous", source: "acp-live" },
+    { ...activeTool, source: "acp-live" }
+  ];
+
+  const merged = mergeHydratedNodes([earlier, activeUser, activeTool, activeAssistant], current);
+
+  assert.deepEqual(
+    merged.slice(0, 4).map((node) => (node.kind === "message" ? node.text : node.kind === "tool" ? node.toolCallId : node.kind)),
+    ["Earlier turn", "Run another check", "I will run it.", "run-check"]
+  );
+  assert.deepEqual(merged.slice(0, 4).map((node) => node.timelineOrder), [1, 2, 3, 4]);
 });
 
 test("hydrates reopened ACP turns by message-added event order around plan updates", () => {

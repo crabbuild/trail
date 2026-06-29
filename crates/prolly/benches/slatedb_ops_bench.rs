@@ -1,9 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use prolly::{append_batch, Config, Error, Mutation, Prolly, Resolver, SlateDbStore, Tree};
+use prolly::{
+    append_batch, BatchApplyResult, BatchApplyStats, BatchOp, BatchWriter, BatchWriterConfig,
+    Config, Error, Mutation, Prolly, Resolver, SlateDbStore, Store, Tree,
+};
 use slatedb::object_store::aws::AmazonS3Builder;
 use slatedb::object_store::path::Path as ObjectPath;
 use slatedb::object_store::{ObjectStore, ObjectStoreExt};
@@ -11,11 +15,237 @@ use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 const DEFAULT_RECORDS: usize = 1_000_000;
 const DEFAULT_CHANGES: usize = 10_000;
 const DEFAULT_BUILD_BATCH: usize = 50_000;
+const DEFAULT_MIN_CHUNK_SIZE: usize = 64;
+const DEFAULT_MAX_CHUNK_SIZE: usize = 512;
+const DEFAULT_CHUNKING_FACTOR: usize = 256;
 
 #[derive(Debug, Default)]
 struct ObjectStats {
     count: usize,
     bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StoreWriteStats {
+    batches: usize,
+    entries: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StoreReadStats {
+    get_calls: usize,
+    get_bytes: usize,
+    batch_get_calls: usize,
+    batch_get_keys: usize,
+    batch_get_bytes: usize,
+    batch_get_ordered_calls: usize,
+    batch_get_ordered_keys: usize,
+    batch_get_ordered_bytes: usize,
+    hint_get_calls: usize,
+    hint_get_bytes: usize,
+}
+
+struct WriteCountingStore<S> {
+    inner: S,
+    write_batches: AtomicUsize,
+    write_entries: AtomicUsize,
+    write_bytes: AtomicUsize,
+    get_calls: AtomicUsize,
+    get_bytes: AtomicUsize,
+    batch_get_calls: AtomicUsize,
+    batch_get_keys: AtomicUsize,
+    batch_get_bytes: AtomicUsize,
+    batch_get_ordered_calls: AtomicUsize,
+    batch_get_ordered_keys: AtomicUsize,
+    batch_get_ordered_bytes: AtomicUsize,
+    hint_get_calls: AtomicUsize,
+    hint_get_bytes: AtomicUsize,
+}
+
+impl<S> WriteCountingStore<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            write_batches: AtomicUsize::new(0),
+            write_entries: AtomicUsize::new(0),
+            write_bytes: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            get_bytes: AtomicUsize::new(0),
+            batch_get_calls: AtomicUsize::new(0),
+            batch_get_keys: AtomicUsize::new(0),
+            batch_get_bytes: AtomicUsize::new(0),
+            batch_get_ordered_calls: AtomicUsize::new(0),
+            batch_get_ordered_keys: AtomicUsize::new(0),
+            batch_get_ordered_bytes: AtomicUsize::new(0),
+            hint_get_calls: AtomicUsize::new(0),
+            hint_get_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset_stats(&self) {
+        self.write_batches.store(0, Ordering::Relaxed);
+        self.write_entries.store(0, Ordering::Relaxed);
+        self.write_bytes.store(0, Ordering::Relaxed);
+        self.get_calls.store(0, Ordering::Relaxed);
+        self.get_bytes.store(0, Ordering::Relaxed);
+        self.batch_get_calls.store(0, Ordering::Relaxed);
+        self.batch_get_keys.store(0, Ordering::Relaxed);
+        self.batch_get_bytes.store(0, Ordering::Relaxed);
+        self.batch_get_ordered_calls.store(0, Ordering::Relaxed);
+        self.batch_get_ordered_keys.store(0, Ordering::Relaxed);
+        self.batch_get_ordered_bytes.store(0, Ordering::Relaxed);
+        self.hint_get_calls.store(0, Ordering::Relaxed);
+        self.hint_get_bytes.store(0, Ordering::Relaxed);
+    }
+
+    fn write_stats(&self) -> StoreWriteStats {
+        StoreWriteStats {
+            batches: self.write_batches.load(Ordering::Relaxed),
+            entries: self.write_entries.load(Ordering::Relaxed),
+            bytes: self.write_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn read_stats(&self) -> StoreReadStats {
+        StoreReadStats {
+            get_calls: self.get_calls.load(Ordering::Relaxed),
+            get_bytes: self.get_bytes.load(Ordering::Relaxed),
+            batch_get_calls: self.batch_get_calls.load(Ordering::Relaxed),
+            batch_get_keys: self.batch_get_keys.load(Ordering::Relaxed),
+            batch_get_bytes: self.batch_get_bytes.load(Ordering::Relaxed),
+            batch_get_ordered_calls: self.batch_get_ordered_calls.load(Ordering::Relaxed),
+            batch_get_ordered_keys: self.batch_get_ordered_keys.load(Ordering::Relaxed),
+            batch_get_ordered_bytes: self.batch_get_ordered_bytes.load(Ordering::Relaxed),
+            hint_get_calls: self.hint_get_calls.load(Ordering::Relaxed),
+            hint_get_bytes: self.hint_get_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn count_write(&self, entries: usize, bytes: usize) {
+        self.write_batches.fetch_add(1, Ordering::Relaxed);
+        self.write_entries.fetch_add(entries, Ordering::Relaxed);
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn count_get(&self, bytes: usize) {
+        self.get_calls.fetch_add(1, Ordering::Relaxed);
+        self.get_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn count_batch_get(&self, keys: usize, bytes: usize) {
+        self.batch_get_calls.fetch_add(1, Ordering::Relaxed);
+        self.batch_get_keys.fetch_add(keys, Ordering::Relaxed);
+        self.batch_get_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn count_batch_get_ordered(&self, keys: usize, bytes: usize) {
+        self.batch_get_ordered_calls.fetch_add(1, Ordering::Relaxed);
+        self.batch_get_ordered_keys
+            .fetch_add(keys, Ordering::Relaxed);
+        self.batch_get_ordered_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn count_hint_get(&self, bytes: usize) {
+        self.hint_get_calls.fetch_add(1, Ordering::Relaxed);
+        self.hint_get_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl<S: Store> Store for WriteCountingStore<S> {
+    type Error = S::Error;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        let value = self.inner.get(key)?;
+        self.count_get(value.as_ref().map_or(0, Vec::len));
+        Ok(value)
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        self.count_write(1, value.len());
+        self.inner.put(key, value)
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<(), Self::Error> {
+        self.inner.delete(key)
+    }
+
+    fn batch(&self, ops: &[BatchOp]) -> Result<(), Self::Error> {
+        let mut entries = 0usize;
+        let mut bytes = 0usize;
+        for op in ops {
+            if let BatchOp::Upsert { value, .. } = op {
+                entries += 1;
+                bytes += value.len();
+            }
+        }
+        self.count_write(entries, bytes);
+        self.inner.batch(ops)
+    }
+
+    fn batch_get(&self, keys: &[&[u8]]) -> Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
+        let values = self.inner.batch_get(keys)?;
+        self.count_batch_get(keys.len(), values.values().map(Vec::len).sum());
+        Ok(values)
+    }
+
+    fn batch_get_ordered(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let values = self.inner.batch_get_ordered(keys)?;
+        self.count_batch_get_ordered(keys.len(), values.iter().flatten().map(Vec::len).sum());
+        Ok(values)
+    }
+
+    fn batch_get_ordered_unique(
+        &self,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+        let values = self.inner.batch_get_ordered_unique(keys)?;
+        self.count_batch_get_ordered(keys.len(), values.iter().flatten().map(Vec::len).sum());
+        Ok(values)
+    }
+
+    fn prefers_batch_reads(&self) -> bool {
+        self.inner.prefers_batch_reads()
+    }
+
+    fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> Result<(), Self::Error> {
+        self.count_write(
+            entries.len(),
+            entries.iter().map(|(_, value)| value.len()).sum(),
+        );
+        self.inner.batch_put(entries)
+    }
+
+    fn supports_hints(&self) -> bool {
+        self.inner.supports_hints()
+    }
+
+    fn get_hint(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        let value = self.inner.get_hint(namespace, key)?;
+        self.count_hint_get(value.as_ref().map_or(0, Vec::len));
+        Ok(value)
+    }
+
+    fn put_hint(&self, namespace: &[u8], key: &[u8], value: &[u8]) -> Result<(), Self::Error> {
+        self.count_write(1, value.len());
+        self.inner.put_hint(namespace, key, value)
+    }
+
+    fn batch_put_with_hint(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.count_write(
+            entries.len() + 1,
+            entries.iter().map(|(_, value)| value.len()).sum::<usize>() + value.len(),
+        );
+        self.inner
+            .batch_put_with_hint(entries, namespace, key, value)
+    }
 }
 
 fn main() {
@@ -35,25 +265,33 @@ fn main() {
     println!("bucket={}", slatedb_bucket());
     println!("records={records}");
     println!("changes={changes}");
-    println!("build_batch={build_batch}");
-    println!("operation,base_records,items,total_ms,items_per_sec,result_count,verified,status");
-
     let config = bench_config();
-    let store = Arc::new(open_store(&path, object_store.clone()));
+    println!("build_batch={build_batch}");
+    println!("min_chunk_size={}", config.min_chunk_size);
+    println!("max_chunk_size={}", config.max_chunk_size);
+    println!("chunking_factor={}", config.chunking_factor);
+    println!(
+        "operation,base_records,items,total_ms,items_per_sec,result_count,store_get_calls,store_get_bytes,store_batch_get_calls,store_batch_get_keys,store_batch_get_bytes,store_batch_get_ordered_calls,store_batch_get_ordered_keys,store_batch_get_ordered_bytes,store_hint_get_calls,store_hint_get_bytes,store_write_batches,store_write_entries,store_write_bytes,batch_input_mutations,batch_effective_mutations,batch_preprocess_input_sorted,batch_affected_leaves,batch_changed_leaves,batch_sparse_leaf_applies,batch_written_nodes,batch_written_bytes,batch_used_append_fast_path,batch_used_batched_route,batch_used_coalesced_rebuild,batch_used_deferred_rebalancing,batch_used_bottom_up_rebuild,batch_cache_written_nodes,verified,status"
+    );
+
+    let store = Arc::new(WriteCountingStore::new(open_store(
+        &path,
+        object_store.clone(),
+    )));
     let prolly = Prolly::new(store.clone(), config.clone());
-    let base = build_base(&prolly, records, build_batch);
+    let base = build_base(&prolly, &store, records, build_batch);
     let stats = object_stats(object_store.clone(), &path);
     println!(
         "object_stats_after_build,count={},bytes={}",
         stats.count, stats.bytes
     );
 
-    measure_row("sample_get", records, 3, || {
+    measure_store_row(&store, "sample_get", records, 3, || {
         let verified = verify_base_samples(&prolly, &base, records);
         (3, verified)
     });
 
-    measure_row("point_get_hot", records, changes, || {
+    measure_store_row(&store, "point_get_hot", records, changes, || {
         let mut found = 0usize;
         for i in 0..changes {
             let idx = i * 97 % records;
@@ -67,7 +305,8 @@ fn main() {
     });
 
     let random_read_indices = random_indices(records, changes, 0x7265_6164);
-    measure_row("point_get_random", records, changes, || {
+    let random_read_keys = keys_for_indices(&random_read_indices);
+    measure_store_row(&store, "point_get_random", records, changes, || {
         let found = random_read_indices
             .iter()
             .filter(|&&idx| {
@@ -77,9 +316,15 @@ fn main() {
             .count();
         (found, found == changes)
     });
+    measure_store_row(&store, "point_get_random_many", records, changes, || {
+        prolly.clear_cache();
+        let values = prolly.get_many(&base, &random_read_keys).unwrap();
+        let found = count_base_values_for_indices(&values, &random_read_indices);
+        (found, found == changes)
+    });
 
     let clustered_read_indices = clustered_indices(records, changes, 8, 0x636c_7573_7465_72);
-    measure_row("point_get_clustered", records, changes, || {
+    measure_store_row(&store, "point_get_clustered", records, changes, || {
         let found = clustered_read_indices
             .iter()
             .filter(|&&idx| {
@@ -90,7 +335,7 @@ fn main() {
         (found, found == changes)
     });
 
-    measure_row("range_scan_window", records, changes, || {
+    measure_store_row(&store, "range_scan_window", records, changes, || {
         let start_idx = records / 3;
         let end_idx = start_idx + changes;
         let count = prolly
@@ -105,7 +350,7 @@ fn main() {
         (count, count == changes)
     });
 
-    measure_row("range_scan_full", records, records, || {
+    measure_store_row(&store, "range_scan_full", records, records, || {
         let count = prolly
             .range(&base, &[], None)
             .unwrap()
@@ -114,160 +359,321 @@ fn main() {
         (count, count == records)
     });
 
+    let batch_writer = BatchWriter::new();
+
     let update_ops = update_mutations(records, changes, "spread-update");
-    let batch_updated = measure_tree_row("batch_update_spread", records, changes, || {
-        prolly.batch(&base, update_ops.clone()).unwrap()
-    });
+    let batch_updated =
+        measure_batch_tree_row(&store, "batch_update_spread", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, update_ops.clone())
+                .unwrap()
+        });
     let verified = verify_updates(&prolly, &batch_updated, changes, "spread-update");
-    println!("verify_batch_update_spread,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_update_spread", records, changes, verified);
 
     let random_update_indices = random_indices(records, changes, 0x7570_6461_7465);
+    let random_update_keys = keys_for_indices(&random_update_indices);
     let random_update_ops = update_mutations_for_indices(&random_update_indices, "random-update");
-    let random_updated = measure_tree_row("batch_update_random", records, changes, || {
-        prolly.batch(&base, random_update_ops.clone()).unwrap()
-    });
+    let random_updated =
+        measure_batch_tree_row(&store, "batch_update_random", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, random_update_ops.clone())
+                .unwrap()
+        });
+    measure_store_row(
+        &store,
+        "point_get_random_updated_default",
+        records,
+        changes,
+        || {
+            let mut found = 0usize;
+            for (i, &idx) in random_update_indices.iter().enumerate() {
+                let expected = format!("random-update-{i:012}");
+                if prolly
+                    .get(&random_updated, &key_for_index(idx))
+                    .unwrap()
+                    .as_deref()
+                    == Some(expected.as_bytes())
+                {
+                    found += 1;
+                }
+            }
+            (found, found == changes)
+        },
+    );
+    measure_store_row(
+        &store,
+        "point_get_random_updated_many_default",
+        records,
+        changes,
+        || {
+            prolly.clear_cache();
+            let values = prolly
+                .get_many(&random_updated, &random_update_keys)
+                .unwrap();
+            let found =
+                count_labeled_values_for_indices(&values, &random_update_indices, "random-update");
+            (found, found == changes)
+        },
+    );
     let verified = verify_updates_for_indices(
         &prolly,
         &random_updated,
         &random_update_indices,
         "random-update",
     );
-    println!("verify_batch_update_random,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_update_random", records, changes, verified);
+
+    let cache_written_writer =
+        BatchWriter::with_config(BatchWriterConfig::new().with_cache_written_nodes(true));
+    let random_updated_cached = measure_batch_tree_row(
+        &store,
+        "batch_update_random_cache_written_nodes",
+        records,
+        changes,
+        || {
+            cache_written_writer
+                .apply_batch_with_stats(&prolly, &base, random_update_ops.clone())
+                .unwrap()
+        },
+    );
+    measure_store_row(
+        &store,
+        "stream_diff_random_update_cache_written_nodes",
+        records,
+        changes,
+        || {
+            let diffs = prolly
+                .stream_diff(&base, &random_updated_cached)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let count = diffs.len();
+            (count, count == changes)
+        },
+    );
+    measure_store_row(
+        &store,
+        "point_get_random_updated_cache_written_nodes",
+        records,
+        changes,
+        || {
+            let mut found = 0usize;
+            for (i, &idx) in random_update_indices.iter().enumerate() {
+                let expected = format!("random-update-{i:012}");
+                if prolly
+                    .get(&random_updated_cached, &key_for_index(idx))
+                    .unwrap()
+                    .as_deref()
+                    == Some(expected.as_bytes())
+                {
+                    found += 1;
+                }
+            }
+            (found, found == changes)
+        },
+    );
+    measure_store_row(
+        &store,
+        "point_get_random_updated_many_cache_written_nodes",
+        records,
+        changes,
+        || {
+            let values = prolly
+                .get_many(&random_updated_cached, &random_update_keys)
+                .unwrap();
+            let found =
+                count_labeled_values_for_indices(&values, &random_update_indices, "random-update");
+            (found, found == changes)
+        },
+    );
+    let verified = verify_updates_for_indices(
+        &prolly,
+        &random_updated_cached,
+        &random_update_indices,
+        "random-update",
+    );
+    print_verify_row(
+        "verify_batch_update_random_cache_written_nodes",
+        records,
+        changes,
+        verified,
+    );
 
     let clustered_update_indices = clustered_indices(records, changes, 8, 0x7570_6461_7465_c1u64);
     let clustered_update_ops =
         update_mutations_for_indices(&clustered_update_indices, "cluster-update");
-    let clustered_updated = measure_tree_row("batch_update_clustered", records, changes, || {
-        prolly.batch(&base, clustered_update_ops.clone()).unwrap()
-    });
+    let clustered_updated =
+        measure_batch_tree_row(&store, "batch_update_clustered", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, clustered_update_ops.clone())
+                .unwrap()
+        });
     let verified = verify_updates_for_indices(
         &prolly,
         &clustered_updated,
         &clustered_update_indices,
         "cluster-update",
     );
-    println!("verify_batch_update_clustered,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_update_clustered", records, changes, verified);
 
     let delete_ops = delete_mutations(records, changes);
-    let batch_deleted = measure_tree_row("batch_delete_spread", records, changes, || {
-        prolly.batch(&base, delete_ops.clone()).unwrap()
-    });
+    let batch_deleted =
+        measure_batch_tree_row(&store, "batch_delete_spread", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, delete_ops.clone())
+                .unwrap()
+        });
     let verified = verify_deletes(&prolly, &batch_deleted, changes);
-    println!("verify_batch_delete_spread,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_delete_spread", records, changes, verified);
 
     let random_delete_indices = random_indices(records, changes, 0x6465_6c65_7465);
     let random_delete_ops = delete_mutations_for_indices(&random_delete_indices);
-    let random_deleted = measure_tree_row("batch_delete_random", records, changes, || {
-        prolly.batch(&base, random_delete_ops.clone()).unwrap()
-    });
+    let random_deleted =
+        measure_batch_tree_row(&store, "batch_delete_random", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, random_delete_ops.clone())
+                .unwrap()
+        });
     let verified = verify_deletes_for_indices(&prolly, &random_deleted, &random_delete_indices);
-    println!("verify_batch_delete_random,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_delete_random", records, changes, verified);
 
     let clustered_delete_indices = clustered_indices(records, changes, 8, 0x6465_6c65_7465_c1u64);
     let clustered_delete_ops = delete_mutations_for_indices(&clustered_delete_indices);
-    let clustered_deleted = measure_tree_row("batch_delete_clustered", records, changes, || {
-        prolly.batch(&base, clustered_delete_ops.clone()).unwrap()
-    });
+    let clustered_deleted =
+        measure_batch_tree_row(&store, "batch_delete_clustered", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, clustered_delete_ops.clone())
+                .unwrap()
+        });
     let verified =
         verify_deletes_for_indices(&prolly, &clustered_deleted, &clustered_delete_indices);
-    println!("verify_batch_delete_clustered,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_delete_clustered", records, changes, verified);
 
     let mixed_ops = mixed_mutations(records, changes, "mixed");
-    let mixed = measure_tree_row("batch_mixed_spread", records, changes, || {
-        prolly.batch(&base, mixed_ops.clone()).unwrap()
+    let mixed = measure_batch_tree_row(&store, "batch_mixed_spread", records, changes, || {
+        batch_writer
+            .apply_batch_with_stats(&prolly, &base, mixed_ops.clone())
+            .unwrap()
     });
     let verified = verify_mixed(&prolly, &mixed, records, changes, "mixed");
-    println!("verify_batch_mixed_spread,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_mixed_spread", records, changes, verified);
 
     let random_mixed_indices = random_indices(records, changes, 0x6d69_7865_64);
     let random_mixed_ops = mixed_mutations_for_indices(&random_mixed_indices, "random-mixed");
-    let random_mixed = measure_tree_row("batch_mixed_random", records, changes, || {
-        prolly.batch(&base, random_mixed_ops.clone()).unwrap()
-    });
+    let random_mixed =
+        measure_batch_tree_row(&store, "batch_mixed_random", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, random_mixed_ops.clone())
+                .unwrap()
+        });
     let verified = verify_mixed_for_indices(
         &prolly,
         &random_mixed,
         &random_mixed_indices,
         "random-mixed",
     );
-    println!("verify_batch_mixed_random,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_mixed_random", records, changes, verified);
 
     let clustered_mixed_indices = clustered_indices(records, changes, 8, 0x6d69_7865_64_c1u64);
     let clustered_mixed_ops =
         mixed_mutations_for_indices(&clustered_mixed_indices, "cluster-mixed");
-    let clustered_mixed = measure_tree_row("batch_mixed_clustered", records, changes, || {
-        prolly.batch(&base, clustered_mixed_ops.clone()).unwrap()
-    });
+    let clustered_mixed =
+        measure_batch_tree_row(&store, "batch_mixed_clustered", records, changes, || {
+            batch_writer
+                .apply_batch_with_stats(&prolly, &base, clustered_mixed_ops.clone())
+                .unwrap()
+        });
     let verified = verify_mixed_for_indices(
         &prolly,
         &clustered_mixed,
         &clustered_mixed_indices,
         "cluster-mixed",
     );
-    println!("verify_batch_mixed_clustered,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_batch_mixed_clustered", records, changes, verified);
 
     let append_ops = append_mutations(records, changes, "append");
-    let appended = measure_tree_row("append_suffix", records, changes, || {
-        append_batch(&prolly, &base, append_ops.clone()).unwrap()
+    let appended = measure_batch_tree_row(&store, "append_suffix", records, changes, || {
+        batch_writer
+            .apply_batch_with_stats(&prolly, &base, append_ops.clone())
+            .unwrap()
     });
     let verified = verify_appends(&prolly, &appended, records, changes, "append");
-    println!("verify_append_suffix,{records},{changes},0.000,0,0,{verified},ok");
+    print_verify_row("verify_append_suffix", records, changes, verified);
 
-    measure_row("diff_identical", records, 1, || {
+    measure_store_row(&store, "diff_identical", records, 1, || {
         let diffs = prolly.diff(&base, &base).unwrap();
         let count = diffs.len();
         (count, count == 0)
     });
 
-    measure_row("diff_sparse_update", records, changes, || {
+    measure_store_row(&store, "diff_sparse_update", records, changes, || {
         let diffs = prolly.diff(&base, &batch_updated).unwrap();
         let count = diffs.len();
         (count, count == changes)
     });
 
-    measure_row("diff_random_update", records, changes, || {
+    measure_store_row(&store, "diff_random_update", records, changes, || {
         let diffs = prolly.diff(&base, &random_updated).unwrap();
         let count = diffs.len();
         (count, count == changes)
     });
 
-    measure_row("diff_clustered_update", records, changes, || {
+    measure_store_row(&store, "diff_clustered_update", records, changes, || {
         let diffs = prolly.diff(&base, &clustered_updated).unwrap();
         let count = diffs.len();
         (count, count == changes)
     });
 
-    measure_row("stream_diff_sparse_update", records, changes, || {
-        let diffs = prolly
-            .stream_diff(&base, &batch_updated)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let count = diffs.len();
-        (count, count == changes)
-    });
+    measure_store_row(
+        &store,
+        "stream_diff_sparse_update",
+        records,
+        changes,
+        || {
+            let diffs = prolly
+                .stream_diff(&base, &batch_updated)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let count = diffs.len();
+            (count, count == changes)
+        },
+    );
 
-    measure_row("stream_diff_random_update", records, changes, || {
-        let diffs = prolly
-            .stream_diff(&base, &random_updated)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let count = diffs.len();
-        (count, count == changes)
-    });
+    measure_store_row(
+        &store,
+        "stream_diff_random_update",
+        records,
+        changes,
+        || {
+            let diffs = prolly
+                .stream_diff(&base, &random_updated)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let count = diffs.len();
+            (count, count == changes)
+        },
+    );
 
-    measure_row("stream_diff_clustered_update", records, changes, || {
-        let diffs = prolly
-            .stream_diff(&base, &clustered_updated)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let count = diffs.len();
-        (count, count == changes)
-    });
+    measure_store_row(
+        &store,
+        "stream_diff_clustered_update",
+        records,
+        changes,
+        || {
+            let diffs = prolly
+                .stream_diff(&base, &clustered_updated)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let count = diffs.len();
+            (count, count == changes)
+        },
+    );
 
-    measure_row("diff_append_suffix", records, changes, || {
+    measure_store_row(&store, "diff_append_suffix", records, changes, || {
         let diffs = prolly.diff(&base, &appended).unwrap();
         let count = diffs.len();
         (count, count == changes)
@@ -281,7 +687,7 @@ fn main() {
             range_changed_mutations(start_idx, end_idx, "range-change"),
         )
         .unwrap();
-    measure_row("range_diff_window", records, changes, || {
+    measure_store_row(&store, "range_diff_window", records, changes, || {
         let diffs = prolly
             .range_diff(
                 &base,
@@ -304,7 +710,8 @@ fn main() {
             update_mutations_for_indices(&cluster_window_indices, "cluster-window"),
         )
         .unwrap();
-    measure_row(
+    measure_store_row(
+        &store,
         "range_diff_clustered_window",
         records,
         cluster_window_len,
@@ -322,7 +729,7 @@ fn main() {
         },
     );
 
-    measure_row("diff_empty_to_full", records, records, || {
+    measure_store_row(&store, "diff_empty_to_full", records, records, || {
         let empty = prolly.create();
         let diffs = prolly.diff(&empty, &base).unwrap();
         let count = diffs.len();
@@ -337,14 +744,20 @@ fn main() {
     let right = prolly
         .batch(&base, update_mutations_for_indices(&right_indices, "right"))
         .unwrap();
-    let merged = measure_tree_row("merge_spread_disjoint", records, changes * 2, || {
-        prolly.merge(&base, &left, &right, None).unwrap()
-    });
+    let merged = measure_tree_row(
+        &store,
+        "merge_spread_disjoint",
+        records,
+        changes * 2,
+        || prolly.merge(&base, &left, &right, None).unwrap(),
+    );
     let verified = verify_updates_for_indices(&prolly, &merged, &left_indices, "left")
         && verify_updates_for_indices(&prolly, &merged, &right_indices, "right");
-    println!(
-        "verify_merge_spread_disjoint,{records},{},0.000,0,0,{verified},ok",
-        changes * 2
+    print_verify_row(
+        "verify_merge_spread_disjoint",
+        records,
+        changes * 2,
+        verified,
     );
 
     let random_left_indices = random_indices_in_range(0, records / 2, changes, 0x6c65_6674);
@@ -362,11 +775,17 @@ fn main() {
             update_mutations_for_indices(&random_right_indices, "random-right"),
         )
         .unwrap();
-    let random_merged = measure_tree_row("merge_random_disjoint", records, changes * 2, || {
-        prolly
-            .merge(&base, &random_left, &random_right, None)
-            .unwrap()
-    });
+    let random_merged = measure_tree_row(
+        &store,
+        "merge_random_disjoint",
+        records,
+        changes * 2,
+        || {
+            prolly
+                .merge(&base, &random_left, &random_right, None)
+                .unwrap()
+        },
+    );
     let verified =
         verify_updates_for_indices(&prolly, &random_merged, &random_left_indices, "random-left")
             && verify_updates_for_indices(
@@ -375,9 +794,11 @@ fn main() {
                 &random_right_indices,
                 "random-right",
             );
-    println!(
-        "verify_merge_random_disjoint,{records},{},0.000,0,0,{verified},ok",
-        changes * 2
+    print_verify_row(
+        "verify_merge_random_disjoint",
+        records,
+        changes * 2,
+        verified,
     );
 
     let clustered_left_indices =
@@ -396,12 +817,17 @@ fn main() {
             update_mutations_for_indices(&clustered_right_indices, "cluster-right"),
         )
         .unwrap();
-    let clustered_merged =
-        measure_tree_row("merge_clustered_disjoint", records, changes * 2, || {
+    let clustered_merged = measure_tree_row(
+        &store,
+        "merge_clustered_disjoint",
+        records,
+        changes * 2,
+        || {
             prolly
                 .merge(&base, &clustered_left, &clustered_right, None)
                 .unwrap()
-        });
+        },
+    );
     let verified = verify_updates_for_indices(
         &prolly,
         &clustered_merged,
@@ -413,9 +839,11 @@ fn main() {
         &clustered_right_indices,
         "cluster-right",
     );
-    println!(
-        "verify_merge_clustered_disjoint,{records},{},0.000,0,0,{verified},ok",
-        changes * 2
+    print_verify_row(
+        "verify_merge_clustered_disjoint",
+        records,
+        changes * 2,
+        verified,
     );
 
     let conflict_count = changes.min(128);
@@ -425,45 +853,75 @@ fn main() {
     let conflict_right = prolly
         .batch(&base, conflict_mutations(conflict_count, "right-conflict"))
         .unwrap();
-    measure_row("merge_conflict_detect", records, conflict_count, || {
-        let detected = matches!(
-            prolly.merge(&base, &conflict_left, &conflict_right, None),
-            Err(Error::Conflict(_))
-        );
-        (1, detected)
-    });
+    measure_store_row(
+        &store,
+        "merge_conflict_detect",
+        records,
+        conflict_count,
+        || {
+            let detected = matches!(
+                prolly.merge(&base, &conflict_left, &conflict_right, None),
+                Err(Error::Conflict(_))
+            );
+            (1, detected)
+        },
+    );
     let resolver: Resolver = Box::new(|conflict| Some(conflict.right.clone()));
-    let resolved = measure_tree_row("merge_conflict_resolved", records, conflict_count, || {
-        prolly
-            .merge(&base, &conflict_left, &conflict_right, Some(resolver))
-            .unwrap()
-    });
+    let resolved = measure_tree_row(
+        &store,
+        "merge_conflict_resolved",
+        records,
+        conflict_count,
+        || {
+            prolly
+                .merge(&base, &conflict_left, &conflict_right, Some(resolver))
+                .unwrap()
+        },
+    );
     let verified = verify_conflict_resolution(&prolly, &resolved, conflict_count);
-    println!("verify_merge_conflict_resolved,{records},{conflict_count},0.000,0,0,{verified},ok");
+    print_verify_row(
+        "verify_merge_conflict_resolved",
+        records,
+        conflict_count,
+        verified,
+    );
 
-    measure_row("stream_diff_sparse_update_cold", records, changes, || {
-        prolly.clear_cache();
-        let diffs = prolly
-            .stream_diff(&base, &batch_updated)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let count = diffs.len();
-        (count, count == changes)
-    });
+    measure_store_row(
+        &store,
+        "stream_diff_sparse_update_cold",
+        records,
+        changes,
+        || {
+            prolly.clear_cache();
+            let diffs = prolly
+                .stream_diff(&base, &batch_updated)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let count = diffs.len();
+            (count, count == changes)
+        },
+    );
 
-    measure_row("stream_diff_random_update_cold", records, changes, || {
-        prolly.clear_cache();
-        let diffs = prolly
-            .stream_diff(&base, &random_updated)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let count = diffs.len();
-        (count, count == changes)
-    });
+    measure_store_row(
+        &store,
+        "stream_diff_random_update_cold",
+        records,
+        changes,
+        || {
+            prolly.clear_cache();
+            let diffs = prolly
+                .stream_diff(&base, &random_updated)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let count = diffs.len();
+            (count, count == changes)
+        },
+    );
 
-    measure_row(
+    measure_store_row(
+        &store,
         "stream_diff_clustered_update_cold",
         records,
         changes,
@@ -500,8 +958,17 @@ fn main() {
     remove_slatedb_prefix(object_store, &path);
 }
 
-fn build_base<S: prolly::Store>(prolly: &Prolly<S>, records: usize, batch_size: usize) -> Tree {
+fn build_base<S>(
+    prolly: &Prolly<Arc<WriteCountingStore<S>>>,
+    store: &WriteCountingStore<S>,
+    records: usize,
+    batch_size: usize,
+) -> Tree
+where
+    S: Store,
+{
     let mut tree = prolly.create();
+    store.reset_stats();
     let start = Instant::now();
     let mut written = 0usize;
     while written < records {
@@ -509,34 +976,112 @@ fn build_base<S: prolly::Store>(prolly: &Prolly<S>, records: usize, batch_size: 
         tree = append_batch(prolly, &tree, base_mutations(written, count)).unwrap();
         written += count;
     }
+    let read_stats = store.read_stats();
+    let write_stats = store.write_stats();
     print_row(
         "build_base_append_batches",
         records,
         records,
         start.elapsed(),
         written,
+        read_stats,
+        write_stats,
+        BatchApplyStats::default(),
         written == records,
         "ok",
     );
     tree
 }
 
-fn measure_tree_row<F>(operation: &str, records: usize, items: usize, f: F) -> Tree
+fn measure_tree_row<S, F>(
+    store: &WriteCountingStore<S>,
+    operation: &str,
+    records: usize,
+    items: usize,
+    f: F,
+) -> Tree
 where
+    S: Store,
     F: FnOnce() -> Tree,
 {
+    store.reset_stats();
     let start = Instant::now();
     let tree = f();
+    let read_stats = store.read_stats();
+    let write_stats = store.write_stats();
     print_row(
         operation,
         records,
         items,
         start.elapsed(),
         items,
+        read_stats,
+        write_stats,
+        BatchApplyStats::default(),
         true,
         "ok",
     );
     tree
+}
+
+fn measure_batch_tree_row<S, F>(
+    store: &WriteCountingStore<S>,
+    operation: &str,
+    records: usize,
+    items: usize,
+    f: F,
+) -> Tree
+where
+    S: Store,
+    F: FnOnce() -> BatchApplyResult,
+{
+    store.reset_stats();
+    let start = Instant::now();
+    let result = f();
+    let read_stats = store.read_stats();
+    let write_stats = store.write_stats();
+    print_row(
+        operation,
+        records,
+        items,
+        start.elapsed(),
+        items,
+        read_stats,
+        write_stats,
+        result.stats,
+        true,
+        "ok",
+    );
+    result.tree
+}
+
+fn measure_store_row<S, F>(
+    store: &WriteCountingStore<S>,
+    operation: &str,
+    records: usize,
+    items: usize,
+    f: F,
+) where
+    S: Store,
+    F: FnOnce() -> (usize, bool),
+{
+    store.reset_stats();
+    let start = Instant::now();
+    let (result_count, verified) = f();
+    let read_stats = store.read_stats();
+    let write_stats = store.write_stats();
+    print_row(
+        operation,
+        records,
+        items,
+        start.elapsed(),
+        result_count,
+        read_stats,
+        write_stats,
+        BatchApplyStats::default(),
+        verified,
+        "ok",
+    );
 }
 
 fn measure_row<F>(operation: &str, records: usize, items: usize, f: F)
@@ -551,6 +1096,24 @@ where
         items,
         start.elapsed(),
         result_count,
+        StoreReadStats::default(),
+        StoreWriteStats::default(),
+        BatchApplyStats::default(),
+        verified,
+        "ok",
+    );
+}
+
+fn print_verify_row(operation: &str, records: usize, items: usize, verified: bool) {
+    print_row(
+        operation,
+        records,
+        items,
+        Duration::ZERO,
+        0,
+        StoreReadStats::default(),
+        StoreWriteStats::default(),
+        BatchApplyStats::default(),
         verified,
         "ok",
     );
@@ -562,6 +1125,9 @@ fn print_row(
     items: usize,
     elapsed: Duration,
     result_count: usize,
+    read_stats: StoreReadStats,
+    write_stats: StoreWriteStats,
+    batch_stats: BatchApplyStats,
     verified: bool,
     status: &str,
 ) {
@@ -572,7 +1138,34 @@ fn print_row(
         0.0
     };
     println!(
-        "{operation},{records},{items},{total_ms:.3},{items_per_sec:.0},{result_count},{verified},{status}"
+        "{operation},{records},{items},{total_ms:.3},{items_per_sec:.0},{result_count},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{verified},{status}",
+        read_stats.get_calls,
+        read_stats.get_bytes,
+        read_stats.batch_get_calls,
+        read_stats.batch_get_keys,
+        read_stats.batch_get_bytes,
+        read_stats.batch_get_ordered_calls,
+        read_stats.batch_get_ordered_keys,
+        read_stats.batch_get_ordered_bytes,
+        read_stats.hint_get_calls,
+        read_stats.hint_get_bytes,
+        write_stats.batches,
+        write_stats.entries,
+        write_stats.bytes,
+        batch_stats.input_mutations,
+        batch_stats.effective_mutations,
+        batch_stats.preprocess_input_sorted,
+        batch_stats.affected_leaves,
+        batch_stats.changed_leaves,
+        batch_stats.sparse_leaf_applies,
+        batch_stats.written_nodes,
+        batch_stats.written_bytes,
+        batch_stats.used_append_fast_path,
+        batch_stats.used_batched_route,
+        batch_stats.used_coalesced_rebuild,
+        batch_stats.used_deferred_rebalancing,
+        batch_stats.used_bottom_up_rebuild,
+        batch_stats.cache_written_nodes
     );
 }
 
@@ -798,6 +1391,33 @@ fn verify_updates_for_indices<S: prolly::Store>(
             .as_deref()
             == Some(format!("{label}-{i:012}").as_bytes())
     })
+}
+
+fn keys_for_indices(indices: &[usize]) -> Vec<Vec<u8>> {
+    indices.iter().map(|&idx| key_for_index(idx)).collect()
+}
+
+fn count_base_values_for_indices(values: &[Option<Vec<u8>>], indices: &[usize]) -> usize {
+    values
+        .iter()
+        .zip(indices)
+        .filter(|(value, idx)| value.as_deref() == Some(value_for_index(**idx).as_slice()))
+        .count()
+}
+
+fn count_labeled_values_for_indices(
+    values: &[Option<Vec<u8>>],
+    indices: &[usize],
+    label: &str,
+) -> usize {
+    let mut found = 0usize;
+    for (i, value) in values.iter().take(indices.len()).enumerate() {
+        let expected = format!("{label}-{i:012}");
+        if value.as_deref() == Some(expected.as_bytes()) {
+            found += 1;
+        }
+    }
+    found
 }
 
 fn verify_deletes<S: prolly::Store>(prolly: &Prolly<S>, tree: &Tree, count: usize) -> bool {
@@ -1074,10 +1694,20 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 fn bench_config() -> Config {
+    let min_chunk_size = env_usize("PROLLY_SLATEDB_OPS_MIN_CHUNK_SIZE")
+        .unwrap_or(DEFAULT_MIN_CHUNK_SIZE)
+        .max(1);
+    let max_chunk_size = env_usize("PROLLY_SLATEDB_OPS_MAX_CHUNK_SIZE")
+        .unwrap_or(DEFAULT_MAX_CHUNK_SIZE)
+        .max(min_chunk_size);
+    let chunking_factor = env_usize("PROLLY_SLATEDB_OPS_CHUNKING_FACTOR")
+        .unwrap_or(DEFAULT_CHUNKING_FACTOR)
+        .clamp(1, u32::MAX as usize) as u32;
+
     Config::builder()
-        .min_chunk_size(64)
-        .max_chunk_size(512)
-        .chunking_factor(256)
+        .min_chunk_size(min_chunk_size)
+        .max_chunk_size(max_chunk_size)
+        .chunking_factor(chunking_factor)
         .hash_seed(0xC0DA)
         .build()
 }

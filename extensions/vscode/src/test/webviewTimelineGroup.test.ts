@@ -19,7 +19,13 @@ function baseProps(overrides: Partial<TimelineGroupCardProps> = {}): TimelineGro
     statusLabel: "Completed",
     laneLabel: "agent-1",
     iconHtml,
-    bodyHtml: '<article class="turn-card" data-node-id="message-1">Message</article>',
+    bodyItems: [
+      {
+        id: "message-1",
+        className: "timeline-group-body-item timeline-group-body-item-message",
+        html: '<article class="turn-card" data-node-id="message-1">Message</article>'
+      }
+    ],
     open: true,
     ...overrides
   };
@@ -35,6 +41,8 @@ test("renders timeline groups with shadcn accordion and badge primitives", () =>
   assert.match(html, /data-slot="badge"/);
   assert.match(html, /class="[^"]*timeline-group-summary/);
   assert.match(html, /class="[^"]*timeline-group-body/);
+  assert.match(html, /data-timeline-group-body-item/);
+  assert.match(html, /data-node-id="message-1"/);
   assert.match(html, /class="turn-card"/);
   assert.match(html, /aria-expanded="true"/);
 });
@@ -46,4 +54,27 @@ test("keeps helper-rendered body selectors without native details markup", () =>
   assert.match(html, /aria-expanded="false"/);
   assert.doesNotMatch(html, /<details/);
   assert.doesNotMatch(html, /<summary/);
+});
+
+test("renders group body as stable keyed node rows", () => {
+  const html = renderTimelineGroup(
+    baseProps({
+      bodyItems: [
+        {
+          id: "message-1",
+          className: "timeline-group-body-item timeline-group-body-item-message",
+          html: '<article class="turn-card message" data-node-id="message-1">Message</article>'
+        },
+        {
+          id: "tool-1",
+          className: "timeline-group-body-item timeline-group-body-item-tool",
+          html: '<article class="turn-card tool" data-node-id="tool-1">Tool</article>'
+        }
+      ]
+    })
+  );
+
+  assert.match(html, /timeline-group-body-item-message/);
+  assert.match(html, /timeline-group-body-item-tool/);
+  assert.match(html, /data-node-id="tool-1"/);
 });
