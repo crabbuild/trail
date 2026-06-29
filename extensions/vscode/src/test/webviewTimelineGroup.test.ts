@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { TimelineGroupCard, type TimelineGroupCardProps } from "../webview/TimelineGroup";
 
 const iconHtml = '<svg class="icon" aria-hidden="true"></svg>';
+const timelineGroupSource = fs.readFileSync(path.join(process.cwd(), "src", "webview", "TimelineGroup.tsx"), "utf8");
 
 function renderTimelineGroup(props: TimelineGroupCardProps): string {
   return renderToStaticMarkup(React.createElement(TimelineGroupCard, { props }));
@@ -23,7 +26,8 @@ function baseProps(overrides: Partial<TimelineGroupCardProps> = {}): TimelineGro
       {
         id: "message-1",
         className: "timeline-group-body-item timeline-group-body-item-message",
-        html: '<article class="turn-card" data-node-id="message-1">Message</article>'
+        html: '<article class="turn-card" data-node-id="message-1">Message</article>',
+        preserveDom: true
       }
     ],
     open: true,
@@ -63,12 +67,14 @@ test("renders group body as stable keyed node rows", () => {
         {
           id: "message-1",
           className: "timeline-group-body-item timeline-group-body-item-message",
-          html: '<article class="turn-card message" data-node-id="message-1">Message</article>'
+          html: '<article class="turn-card message" data-node-id="message-1">Message</article>',
+          preserveDom: true
         },
         {
           id: "tool-1",
           className: "timeline-group-body-item timeline-group-body-item-tool",
-          html: '<article class="turn-card tool" data-node-id="tool-1">Tool</article>'
+          html: '<article class="turn-card tool" data-node-id="tool-1">Tool</article>',
+          preserveDom: true
         }
       ]
     })
@@ -77,4 +83,13 @@ test("renders group body as stable keyed node rows", () => {
   assert.match(html, /timeline-group-body-item-message/);
   assert.match(html, /timeline-group-body-item-tool/);
   assert.match(html, /data-node-id="tool-1"/);
+});
+
+test("preserves mounted node islands across group rerenders", () => {
+  const html = renderTimelineGroup(baseProps());
+
+  assert.match(html, /data-stable-html-slot="message-1"/);
+  assert.match(timelineGroupSource, /React\.memo\([\s\S]*StableHtmlSlot/);
+  assert.match(timelineGroupSource, /previous\.slotId === next\.slotId/);
+  assert.match(timelineGroupSource, /html: item\.preserveDom \? undefined : item\.html/);
 });

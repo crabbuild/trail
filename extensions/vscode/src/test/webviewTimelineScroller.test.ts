@@ -20,7 +20,8 @@ test("renders transcript rows as shadcn message scroller items", () => {
         id: "node-group-turn-1",
         className: "timeline-scroller-row-group",
         scrollAnchor: true,
-        html: '<div id="node-group-turn-1" data-timeline-group-root>Turn</div>'
+        html: '<div id="node-group-turn-1" data-timeline-group-root>Turn</div>',
+        preserveDom: true
       },
       {
         id: "timeline-empty",
@@ -37,6 +38,7 @@ test("renders transcript rows as shadcn message scroller items", () => {
   assert.match(html, /class="[^"]*timeline-scroller-row-group/);
   assert.match(html, /class="[^"]*timeline-scroller-row-empty/);
   assert.match(html, /data-timeline-group-root/);
+  assert.match(html, /data-stable-html-slot="node-group-turn-1"/);
   assert.match(html, /data-empty-state-card-root/);
   assert.doesNotMatch(html, /dangerouslySetInnerHTML/);
 });
@@ -45,6 +47,9 @@ test("configures shadcn message scroller for AI chat transcripts", () => {
   assert.match(timelineScrollerSource, /<MessageScrollerProvider[\s\S]*autoScroll/);
   assert.match(timelineScrollerSource, /defaultScrollPosition="last-anchor"/);
   assert.match(timelineScrollerSource, /scrollPreviousItemPeek=\{TIMELINE_PREVIOUS_ITEM_PEEK\}/);
+  assert.match(timelineScrollerSource, /React\.memo\([\s\S]*StableHtmlSlot/);
+  assert.match(timelineScrollerSource, /previous\.slotId === next\.slotId/);
+  assert.match(timelineScrollerSource, /html: item\.preserveDom \? undefined : item\.html/);
   assert.match(messageScrollerSource, /cn-message-scroller-viewport/);
   assert.match(messageScrollerSource, /\[contain-intrinsic-size:auto_10rem\] \[content-visibility:auto\]/);
 });
