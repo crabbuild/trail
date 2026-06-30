@@ -296,18 +296,20 @@ function canAppendStreamNode(existing: RenderNode, incoming: StreamNode): existi
 }
 
 function mergeLocalStreamNode(existing: StreamNode, incoming: StreamNode): StreamNode {
-  if (existing.kind !== incoming.kind || !isTextOnlyStreamNode(existing) || !isTextOnlyStreamNode(incoming)) {
+  if (existing.kind !== incoming.kind) {
     return incoming;
   }
   const content = mergeStreamContentBlocks(existing.content, incoming.content);
   if (incoming.kind === "message") {
+    const existingMessage = existing as Extract<StreamNode, { kind: "message" }>;
     return {
       ...incoming,
-      createdAt: existing.createdAt,
-      timelineOrder: existing.timelineOrder,
-      acpMessageId: existing.acpMessageId,
+      createdAt: existingMessage.createdAt,
+      timelineOrder: existingMessage.timelineOrder,
+      acpMessageId: existingMessage.acpMessageId,
       content,
-      text: contentBlocksToText(content)
+      text: contentBlocksToText(content),
+      streaming: mergedLocalMessageStreaming(existingMessage, incoming)
     };
   }
   return {
@@ -319,30 +321,54 @@ function mergeLocalStreamNode(existing: StreamNode, incoming: StreamNode): Strea
   };
 }
 
+function mergedLocalMessageStreaming(
+  existing: Extract<StreamNode, { kind: "message" }>,
+  incoming: Extract<StreamNode, { kind: "message" }>
+): boolean {
+  return isActiveRenderStatus(incoming.status) && (existing.streaming || incoming.streaming);
+}
+
 function isTextOnlyStreamNode(node: StreamNode): boolean {
   return node.content.length > 0 && node.content.every((block) => block.type === "text");
 }
 
 function streamContinuationAfterBoundary(existing: RenderNode, incoming: StreamNode): StreamNode | undefined {
-  if (!isStreamNode(existing) || existing.kind !== incoming.kind || !isTextOnlyStreamNode(existing) || !isTextOnlyStreamNode(incoming)) {
+  if (!isStreamNode(existing) || existing.kind !== incoming.kind) {
     return incoming;
   }
-  const existingText = contentBlocksToText(existing.content);
-  const incomingText = contentBlocksToText(incoming.content);
-  if (!incomingText.startsWith(existingText)) {
+  if (isTextOnlyStreamNode(existing) && isTextOnlyStreamNode(incoming)) {
+    const existingText = contentBlocksToText(existing.content);
+    const incomingText = contentBlocksToText(incoming.content);
+    if (!incomingText.startsWith(existingText)) {
+      return incoming;
+    }
+    const suffix = incomingText.slice(existingText.length);
+    if (!suffix) {
+      return undefined;
+    }
+    return streamNodeWithContent(incoming, [{ type: "text", text: suffix }]);
+  }
+
+  if (!contentBlocksStartWith(incoming.content, existing.content)) {
     return incoming;
   }
-  const suffix = incomingText.slice(existingText.length);
-  if (!suffix) {
+  const suffix = incoming.content.slice(existing.content.length);
+  if (!suffix.length) {
     return undefined;
   }
-  const content: ContentBlock[] = [{ type: "text", text: suffix }];
-  return incoming.kind === "message"
-    ? { ...incoming, content, text: suffix }
-    : { ...incoming, content };
+  return streamNodeWithContent(incoming, suffix);
 }
 
 function mergeStreamContentBlocks(previous: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
+  if (!isTextOnlyContentBlocks(previous) || !isTextOnlyContentBlocks(incoming)) {
+    if (contentBlocksStartWith(incoming, previous)) {
+      return mergeAdjacentTextContentBlocks(incoming);
+    }
+    if (contentBlocksStartWith(previous, incoming)) {
+      return mergeAdjacentTextContentBlocks(previous);
+    }
+    return mergeAdjacentTextContentBlocks([...previous, ...incoming]);
+  }
   const previousText = contentBlocksToText(previous);
   const incomingText = contentBlocksToText(incoming);
   if (incomingText.startsWith(previousText)) {
@@ -352,6 +378,27 @@ function mergeStreamContentBlocks(previous: ContentBlock[], incoming: ContentBlo
     return mergeAdjacentTextContentBlocks(previous);
   }
   return mergeAdjacentTextContentBlocks([...previous, ...incoming]);
+}
+
+function isTextOnlyContentBlocks(blocks: ContentBlock[]): boolean {
+  return blocks.length > 0 && blocks.every((block) => block.type === "text");
+}
+
+function contentBlocksStartWith(blocks: ContentBlock[], prefix: ContentBlock[]): boolean {
+  if (prefix.length > blocks.length) {
+    return false;
+  }
+  return prefix.every((block, index) => sameContentBlock(block, blocks[index]!));
+}
+
+function sameContentBlock(left: ContentBlock, right: ContentBlock): boolean {
+  return stableJson(left) === stableJson(right);
+}
+
+function streamNodeWithContent(node: StreamNode, content: ContentBlock[]): StreamNode {
+  return node.kind === "message"
+    ? { ...node, content, text: contentBlocksToText(content) }
+    : { ...node, content };
 }
 
 function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] {
@@ -372,6 +419,25 @@ function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] 
 
 function contentBlocksToText(blocks: ContentBlock[]): string {
   return blocks.map((block) => block.type === "text" ? block.text : `[${block.type || "content"}]`).join("");
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => stableJsonValue(item));
+  }
+  const record = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(record).sort()) {
+    sorted[key] = stableJsonValue(record[key]);
+  }
+  return sorted;
 }
 
 function latestNodeInSameTurn(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {

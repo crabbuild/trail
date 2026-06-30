@@ -407,26 +407,40 @@ function canAppendStreamNode(existing: RenderNode, incoming: StreamNode): existi
 }
 
 function streamContinuationAfterBoundary(existing: RenderNode, incoming: StreamNode): StreamNode | undefined {
-  if (!isStreamNode(existing) || existing.kind !== incoming.kind || !isTextOnlyStreamNode(existing) || !isTextOnlyStreamNode(incoming)) {
+  if (!isStreamNode(existing) || existing.kind !== incoming.kind) {
     return incoming;
   }
-  const existingText = contentBlocksToText(existing.content);
-  const incomingText = contentBlocksToText(incoming.content);
-  if (!incomingText.startsWith(existingText)) {
+  if (isTextOnlyStreamNode(existing) && isTextOnlyStreamNode(incoming)) {
+    const existingText = contentBlocksToText(existing.content);
+    const incomingText = contentBlocksToText(incoming.content);
+    if (!incomingText.startsWith(existingText)) {
+      return incoming;
+    }
+    const suffix = incomingText.slice(existingText.length);
+    if (!suffix) {
+      return undefined;
+    }
+    return streamNodeWithContent(incoming, [{ type: "text", text: suffix }]);
+  }
+
+  if (!contentBlocksStartWith(incoming.content, existing.content)) {
     return incoming;
   }
-  const suffix = incomingText.slice(existingText.length);
-  if (!suffix) {
+  const suffix = incoming.content.slice(existing.content.length);
+  if (!suffix.length) {
     return undefined;
   }
-  const content: ContentBlock[] = [{ type: "text", text: suffix }];
-  return incoming.kind === "message"
-    ? { ...incoming, content, text: suffix }
-    : { ...incoming, content };
+  return streamNodeWithContent(incoming, suffix);
 }
 
 function isTextOnlyStreamNode(node: StreamNode): boolean {
   return node.content.length > 0 && node.content.every((block) => block.type === "text");
+}
+
+function streamNodeWithContent(node: StreamNode, content: ContentBlock[]): StreamNode {
+  return node.kind === "message"
+    ? { ...node, content, text: contentBlocksToText(content) }
+    : { ...node, content };
 }
 
 function latestNodeInSameTurn(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
@@ -728,7 +742,7 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
       timelineOrder: existing.timelineOrder,
       content,
       text: contentBlocksToText(content),
-      streaming: existing.streaming || incoming.streaming
+      streaming: mergedMessageStreaming(existing, incoming)
     };
   }
   if (existing.kind === "thought" && incoming.kind === "thought") {
@@ -762,7 +776,20 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
   return incoming;
 }
 
+function mergedMessageStreaming(existing: MessageNode, incoming: MessageNode): boolean {
+  return isActiveRenderStatus(incoming.status) && (existing.streaming || incoming.streaming);
+}
+
 function mergeStreamContentBlocks(previous: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
+  if (!isTextOnlyContentBlocks(previous) || !isTextOnlyContentBlocks(incoming)) {
+    if (contentBlocksStartWith(incoming, previous)) {
+      return mergeAdjacentTextContentBlocks(incoming);
+    }
+    if (contentBlocksStartWith(previous, incoming)) {
+      return mergeAdjacentTextContentBlocks(previous);
+    }
+    return mergeAdjacentTextContentBlocks([...previous, ...incoming]);
+  }
   const previousText = contentBlocksToText(previous);
   const incomingText = contentBlocksToText(incoming);
   if (incomingText.startsWith(previousText)) {
@@ -772,6 +799,21 @@ function mergeStreamContentBlocks(previous: ContentBlock[], incoming: ContentBlo
     return mergeAdjacentTextContentBlocks(previous);
   }
   return mergeAdjacentTextContentBlocks([...previous, ...incoming]);
+}
+
+function isTextOnlyContentBlocks(blocks: ContentBlock[]): boolean {
+  return blocks.length > 0 && blocks.every((block) => block.type === "text");
+}
+
+function contentBlocksStartWith(blocks: ContentBlock[], prefix: ContentBlock[]): boolean {
+  if (prefix.length > blocks.length) {
+    return false;
+  }
+  return prefix.every((block, index) => sameContentBlock(block, blocks[index]!));
+}
+
+function sameContentBlock(left: ContentBlock, right: ContentBlock): boolean {
+  return stableJson(left) === stableJson(right);
 }
 
 function hasExplicitToolStatus(node: ToolNode): boolean {

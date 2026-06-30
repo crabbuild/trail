@@ -8,6 +8,7 @@ import {
   renderNodeSnapshotPatches,
   sessionControlsToPatches
 } from "../shared/acpRenderReducers";
+import type { ContentBlock } from "../shared/acpTypes";
 import type { RenderNode, RenderReduceContext } from "../shared/renderModel";
 
 const context: RenderReduceContext = {
@@ -99,6 +100,89 @@ test("accepts cumulative streamed assistant chunks without duplicating text", ()
   assert.equal(nodes[0]?.kind, "message");
   assert.equal(nodes[0]?.kind === "message" ? nodes[0].text : undefined, "Hello world");
   assert.deepEqual(nodes[0]?.content[0], { type: "text", text: "Hello world" });
+});
+
+test("marks completed assistant message upserts as no longer streaming", () => {
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "msg-complete-stream",
+        content: {
+          type: "text",
+          text: "Final"
+        }
+      },
+      context
+    )
+  );
+  const previous = nodes[0];
+  assert.equal(previous?.kind, "message");
+  if (previous?.kind !== "message") {
+    throw new Error("expected streaming assistant message");
+  }
+  const completed: typeof previous = {
+    ...previous,
+    status: "completed",
+    streaming: false,
+    content: [{ type: "text", text: "Final answer." }],
+    text: "Final answer."
+  };
+
+  nodes = applyRenderPatches(nodes, [{ type: "upsert", node: completed }]);
+
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected completed assistant message");
+  }
+  assert.equal(node.status, "completed");
+  assert.equal(node.streaming, false);
+  assert.equal(node.text, "Final answer.");
+});
+
+test("keeps distinct non-text assistant chunks with the same display placeholder", () => {
+  const firstImage: ContentBlock = {
+    type: "image",
+    data: "first-image",
+    mimeType: "image/png"
+  };
+  const secondImage: ContentBlock = {
+    type: "image",
+    data: "second-image",
+    mimeType: "image/png"
+  };
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "msg-media",
+        content: firstImage
+      },
+      context
+    )
+  );
+  nodes = applyRenderPatches(
+    nodes,
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "msg-media",
+        content: secondImage
+      },
+      context
+    )
+  );
+
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected media message node");
+  }
+  assert.equal(node.text, "[image][image]");
+  assert.deepEqual(node.content, [firstImage, secondImage]);
 });
 
 test("keeps distinct streamed message ids separate", () => {

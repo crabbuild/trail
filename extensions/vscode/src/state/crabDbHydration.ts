@@ -1,6 +1,6 @@
 import type { TaskView } from "../crabdb/TaskRepository";
-import type { SessionUpdate } from "../shared/acpTypes";
-import { applyRenderPatches, reduceSessionUpdate } from "../shared/acpRenderReducers";
+import type { ContentBlock, SessionUpdate } from "../shared/acpTypes";
+import { applyRenderPatches, contentToText, reduceSessionUpdate } from "../shared/acpRenderReducers";
 import type { MessageNode, RenderNode } from "../shared/renderModel";
 
 export function hydrateTaskView(view: TaskView): RenderNode[] {
@@ -8,7 +8,8 @@ export function hydrateTaskView(view: TaskView): RenderNode[] {
   const task = view.task;
   let nextTimelineOrder = 0;
 
-  view.turns.forEach((turnValue, turnIndex) => {
+  const turns = view.turns.length ? view.turns : fallbackRootTranscriptTurns(view);
+  turns.forEach((turnValue, turnIndex) => {
     const turnNodes: RenderNode[] = [];
     const turnWrapper = asRecord(turnValue);
     const turn = asRecord(turnWrapper.turn);
@@ -17,7 +18,8 @@ export function hydrateTaskView(view: TaskView): RenderNode[] {
     const messages = arrayField(turnWrapper, "messages");
     const events = arrayField(turnWrapper, "events");
     const turnCompletedAt =
-      timestampString(turn.ended_at) || timestampString(turn.updated_at) || timestampString(turnWrapper.ended_at);
+      timestampField(turn, "ended_at", "endedAt", "updated_at", "updatedAt") ||
+      timestampField(turnWrapper, "ended_at", "endedAt", "updated_at", "updatedAt");
 
     turnNodes.push(...hydrateTurnTimeline(messages, events, view, turnId, status));
 
@@ -46,7 +48,7 @@ export function hydrateTaskView(view: TaskView): RenderNode[] {
       });
     });
 
-    const checkpoint = stringField(turnWrapper, "checkpoint") || stringField(turn, "after_change");
+    const checkpoint = stringField(turnWrapper, "checkpoint") || stringField(turn, "after_change") || stringField(turn, "afterChange");
     if (checkpoint) {
       turnNodes.push({
         id: `crabdb-checkpoint:${turnId}`,
@@ -73,9 +75,202 @@ export function hydrateTaskView(view: TaskView): RenderNode[] {
 }
 
 function assignTimelineOrder(nodes: RenderNode[], start: number): RenderNode[] {
-  return nodes.map((node, index) => (
-    node.timelineOrder === undefined ? { ...node, timelineOrder: start + index + 1 } : node
-  ));
+  return nodes.map((node, index) => {
+    const timelineOrder = start + index + 1;
+    return node.timelineOrder === timelineOrder ? node : { ...node, timelineOrder };
+  });
+}
+
+function fallbackRootTranscriptTurns(view: TaskView): unknown[] {
+  if (!view.messages.length && !view.events.length) {
+    return [];
+  }
+  const groups = new Map<string, RootTranscriptTurnGroup>();
+  const messageTurnIds = rootMessageTurnIdQueues(view.events);
+  let nextIndex = 0;
+  for (const message of view.messages) {
+    rootTranscriptTurnGroup(groups, message, nextIndex++, messageTurnIds, true).messages.push(message);
+  }
+  for (const event of view.events) {
+    rootTranscriptTurnGroup(groups, event, nextIndex++, messageTurnIds, false).events.push(event);
+  }
+  const orderedGroups = [...groups.values()].sort((left, right) => left.firstTime - right.firstTime || left.index - right.index);
+  const lastGroup = orderedGroups[orderedGroups.length - 1];
+  return orderedGroups.map((group) => {
+    const checkpoint = group.checkpoint || (group === lastGroup ? view.task.latestCheckpoint : undefined);
+    const turn: Record<string, unknown> = {
+      turn_id: group.turnId,
+      status: view.task.status
+    };
+    if (group.updatedAt || view.task.updatedAt) {
+      turn.updated_at = group.updatedAt || view.task.updatedAt;
+    }
+    if (checkpoint) {
+      turn.after_change = checkpoint;
+    }
+    return {
+      turn,
+      messages: group.messages,
+      events: group.events,
+      ...(checkpoint ? { checkpoint } : {})
+    };
+  });
+}
+
+interface RootTranscriptTurnGroup {
+  turnId: string;
+  messages: unknown[];
+  events: unknown[];
+  firstTime: number;
+  index: number;
+  checkpoint?: string | undefined;
+  updatedAt?: string | undefined;
+}
+
+function rootTranscriptTurnGroup(
+  groups: Map<string, RootTranscriptTurnGroup>,
+  value: unknown,
+  index: number,
+  messageTurnIds: Map<string, RootMessageTurnIdEntry[]>,
+  consumeMessageTurnId: boolean
+): RootTranscriptTurnGroup {
+  const record = asRecord(value);
+  const messageId = recordIdField(record, "message_id") || recordIdField(record, "messageId") || recordIdField(record, "id");
+  const explicitTurnId = stringField(record, "turn_id") || stringField(record, "turnId");
+  const time = rootTranscriptItemTime(record);
+  const eventTurnId = messageId
+    ? rootMessageTurnId(messageTurnIds, messageId, explicitTurnId, consumeMessageTurnId, time)
+    : undefined;
+  const turnId = explicitTurnId || eventTurnId || "turn-1";
+  let group = groups.get(turnId);
+  if (!group) {
+    group = {
+      turnId,
+      messages: [],
+      events: [],
+      firstTime: Number.MAX_SAFE_INTEGER,
+      index
+    };
+    groups.set(turnId, group);
+  }
+  if (time < group.firstTime) {
+    group.firstTime = time;
+  }
+  group.checkpoint ||= rootTranscriptItemCheckpoint(record);
+  group.updatedAt ||= rootTranscriptItemUpdatedAt(record);
+  return group;
+}
+
+interface RootMessageTurnIdEntry {
+  turnId: string;
+  time: number;
+  index: number;
+}
+
+function rootMessageTurnIdQueues(events: unknown[]): Map<string, RootMessageTurnIdEntry[]> {
+  const turnIds = new Map<string, RootMessageTurnIdEntry[]>();
+  let index = 0;
+  for (const eventValue of orderHydrationEvents(events)) {
+    const event = asRecord(eventValue);
+    const eventType = stringField(event, "event_type") || stringField(event, "eventType");
+    if (eventType !== "message_added") {
+      continue;
+    }
+    const messageId = recordIdField(event, "message_id") || recordIdField(event, "messageId");
+    const turnId = stringField(event, "turn_id") || stringField(event, "turnId");
+    if (messageId && turnId) {
+      const queue = turnIds.get(messageId);
+      const entry = { turnId, time: rootTranscriptItemTime(event), index: index++ };
+      if (queue) {
+        queue.push(entry);
+      } else {
+        turnIds.set(messageId, [entry]);
+      }
+    }
+  }
+  return turnIds;
+}
+
+function rootMessageTurnId(
+  messageTurnIds: Map<string, RootMessageTurnIdEntry[]>,
+  messageId: string,
+  explicitTurnId: string | undefined,
+  consume: boolean,
+  messageTime: number
+): string | undefined {
+  const queue = messageTurnIds.get(messageId);
+  if (!queue?.length) {
+    return undefined;
+  }
+  if (!consume) {
+    return queue[0]?.turnId;
+  }
+  if (explicitTurnId) {
+    const index = queue.findIndex((entry) => entry.turnId === explicitTurnId);
+    if (index >= 0) {
+      queue.splice(index, 1);
+    }
+    return explicitTurnId;
+  }
+  const index = rootMessageTurnIdEntryIndex(queue, messageTime);
+  const [entry] = queue.splice(index, 1);
+  return entry?.turnId;
+}
+
+function rootMessageTurnIdEntryIndex(queue: RootMessageTurnIdEntry[], messageTime: number): number {
+  if (!Number.isFinite(messageTime)) {
+    return 0;
+  }
+  const exactIndex = queue.findIndex((entry) => entry.time === messageTime);
+  if (exactIndex >= 0) {
+    return exactIndex;
+  }
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const [index, entry] of queue.entries()) {
+    if (!Number.isFinite(entry.time)) {
+      continue;
+    }
+    const distance = Math.abs(entry.time - messageTime);
+    if (distance < bestDistance || (distance === bestDistance && entry.index < queue[bestIndex]!.index)) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function rootTranscriptItemTime(record: Record<string, unknown>): number {
+  for (const value of [record.created_at, record.createdAt, record.updated_at, record.updatedAt, record.ended_at, record.endedAt]) {
+    const timestamp = timestampString(value);
+    if (!timestamp) {
+      continue;
+    }
+    const millis = Date.parse(timestamp);
+    if (Number.isFinite(millis)) {
+      return millis;
+    }
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function rootTranscriptItemCheckpoint(record: Record<string, unknown>): string | undefined {
+  return (
+    stringField(record, "checkpoint") ||
+    stringField(record, "after_change") ||
+    stringField(record, "afterChange")
+  );
+}
+
+function rootTranscriptItemUpdatedAt(record: Record<string, unknown>): string | undefined {
+  return (
+    timestampString(record.ended_at) ||
+    timestampString(record.endedAt) ||
+    timestampString(record.updated_at) ||
+    timestampString(record.updatedAt) ||
+    timestampString(record.created_at) ||
+    timestampString(record.createdAt)
+  );
 }
 
 function ensureUniqueHydratedNodeIds(nodes: RenderNode[]): RenderNode[] {
@@ -143,6 +338,7 @@ function hydrateTurnTimeline(
   turnId: string,
   status: RenderNode["status"]
 ): RenderNode[] {
+  const orderedEvents = orderHydrationEvents(events);
   const duplicateMessageIds = duplicateIds(messages.map(messageIdFromValue));
   const messageEntries = messages.map((messageValue, messageIndex) =>
     hydrateMessageEntry(messageValue, messageIndex, view, turnId, status, duplicateMessageIds)
@@ -163,14 +359,14 @@ function hydrateTurnTimeline(
   const usedMessageIndexes = new Set<number>();
   let placedMessages = 0;
 
-  for (const eventValue of events) {
+  for (const eventValue of orderedEvents) {
     const event = asRecord(eventValue);
     const eventType = stringField(event, "event_type") || stringField(event, "eventType");
     const messageId = recordIdField(event, "message_id") || recordIdField(event, "messageId");
     if (eventType === "message_added" && messageId) {
-      const entry = takeNextMessageEntry(messagesById, messageId, usedMessageIndexes);
+      const timestamp = timestampField(event, "created_at", "createdAt", "updated_at", "updatedAt");
+      const entry = takeNextMessageEntry(messagesById, messageId, usedMessageIndexes, timestamp);
       if (entry) {
-        const timestamp = timestampString(event.created_at);
         nodes.push({
           ...entry.node,
           createdAt: entry.node.createdAt || timestamp,
@@ -187,7 +383,7 @@ function hydrateTurnTimeline(
   if (placedMessages === 0) {
     return sortHydratedTurnNodes([
       ...messageEntries.map((entry) => entry.node),
-      ...hydrateToolEvents(events, view, turnId, status)
+      ...hydrateToolEvents(orderedEvents, view, turnId, status)
     ]);
   }
 
@@ -195,9 +391,48 @@ function hydrateTurnTimeline(
     .filter((entry) => !usedMessageIndexes.has(entry.index))
     .map((entry) => entry.node);
   if (unplacedMessages.length) {
-    nodes.push(...sortHydratedTurnNodes(unplacedMessages));
+    return insertHydratedUnplacedMessages(nodes, sortHydratedTurnNodes(unplacedMessages));
   }
   return nodes;
+}
+
+function insertHydratedUnplacedMessages(nodes: RenderNode[], messages: RenderNode[]): RenderNode[] {
+  const next = [...nodes];
+  for (const message of messages) {
+    const insertIndex = next.findIndex((candidate) => shouldInsertHydratedNodeBefore(message, candidate));
+    if (insertIndex < 0) {
+      next.push(message);
+    } else {
+      next.splice(insertIndex, 0, message);
+    }
+  }
+  return next;
+}
+
+function shouldInsertHydratedNodeBefore(node: RenderNode, candidate: RenderNode): boolean {
+  const nodeTime = nodeSortTime(node);
+  const candidateTime = nodeSortTime(candidate);
+  if (nodeTime !== candidateTime) {
+    return nodeTime < candidateTime;
+  }
+  const phase = nodeSortPhase(node) - nodeSortPhase(candidate);
+  return phase < 0;
+}
+
+function orderHydrationEvents(events: unknown[]): unknown[] {
+  return events
+    .map((event, index) => ({ event, index }))
+    .sort((left, right) => eventSortTime(left.event) - eventSortTime(right.event) || left.index - right.index)
+    .map((item) => item.event);
+}
+
+function eventSortTime(eventValue: unknown): number {
+  const timestamp = timestampField(asRecord(eventValue), "created_at", "createdAt", "updated_at", "updatedAt");
+  if (!timestamp) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  const millis = Date.parse(timestamp);
+  return Number.isFinite(millis) ? millis : Number.MAX_SAFE_INTEGER;
 }
 
 function hydrateMessageEntry(
@@ -212,8 +447,8 @@ function hydrateMessageEntry(
   const message = asRecord(messageValue);
   const messageId = messageIdFromValue(messageValue);
   const role = stringField(message, "role") === "user" ? "user" : "assistant";
-  const body = stringField(message, "body") || "";
-  const createdAt = timestampString(message.created_at);
+  const content = messageContentBlocks(message);
+  const createdAt = timestampField(message, "created_at", "createdAt", "updated_at", "updatedAt");
   const nodeId = messageId && !duplicateMessageIds.has(messageId)
     ? messageId
     : messageId
@@ -236,26 +471,126 @@ function hydrateMessageEntry(
       raw: messageValue,
       role,
       acpMessageId: messageId,
-      content: [{ type: "text", text: body }],
-      text: body,
+      content,
+      text: content.map(contentToText).join(""),
       streaming: false
     }
   };
 }
 
+function messageContentBlocks(message: Record<string, unknown>): ContentBlock[] {
+  const content = contentBlockArray(message.content);
+  if (content.length) {
+    return content;
+  }
+  return [{ type: "text", text: messageText(message) }];
+}
+
+function messageText(message: Record<string, unknown>): string {
+  return (
+    stringField(message, "body") ||
+    stringField(message, "content") ||
+    stringField(message, "text") ||
+    stringField(message, "content_text") ||
+    stringField(message, "contentText") ||
+    stringField(message, "message") ||
+    ""
+  );
+}
+
+function contentBlockArray(value: unknown): ContentBlock[] {
+  if (!Array.isArray(value)) {
+    const content = contentBlock(value);
+    return content ? [content] : [];
+  }
+  const content: ContentBlock[] = [];
+  for (const item of value) {
+    const block = contentBlock(item);
+    if (block) {
+      content.push(block);
+    }
+  }
+  return content;
+}
+
+function contentBlock(value: unknown): ContentBlock | undefined {
+  if (typeof value === "string") {
+    return { type: "text", text: value };
+  }
+  const record = asRecord(value);
+  if (typeof record.type === "string") {
+    return record as ContentBlock;
+  }
+  const text = stringField(record, "text");
+  return text === undefined ? undefined : { type: "text", text };
+}
+
 function takeNextMessageEntry(
   messagesById: Map<string, HydratedMessageEntry[]>,
   messageId: string,
-  usedMessageIndexes: Set<number>
+  usedMessageIndexes: Set<number>,
+  timestamp?: string | undefined
 ): HydratedMessageEntry | undefined {
   const queue = messagesById.get(messageId);
-  while (queue?.length) {
+  if (!queue?.length) {
+    return undefined;
+  }
+  const matchingIndex = messageEntryMatchIndex(queue, usedMessageIndexes, timestamp);
+  if (matchingIndex >= 0) {
+    const [entry] = queue.splice(matchingIndex, 1);
+    return entry;
+  }
+  while (queue.length) {
     const entry = queue.shift()!;
     if (!usedMessageIndexes.has(entry.index)) {
       return entry;
     }
   }
   return undefined;
+}
+
+function messageEntryMatchIndex(
+  queue: HydratedMessageEntry[],
+  usedMessageIndexes: Set<number>,
+  timestamp?: string | undefined
+): number {
+  if (!timestamp) {
+    return -1;
+  }
+  const target = Date.parse(timestamp);
+  if (!Number.isFinite(target)) {
+    return -1;
+  }
+  let bestIndex = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < queue.length; index += 1) {
+    const entry = queue[index]!;
+    if (usedMessageIndexes.has(entry.index)) {
+      continue;
+    }
+    const entryTime = messageEntryTime(entry);
+    if (entryTime === undefined) {
+      continue;
+    }
+    const distance = Math.abs(entryTime - target);
+    if (distance === 0) {
+      return index;
+    }
+    const bestEntry = bestIndex >= 0 ? queue[bestIndex] : undefined;
+    if (
+      distance < bestDistance ||
+      (distance === bestDistance && (!bestEntry || entry.index < bestEntry.index))
+    ) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function messageEntryTime(entry: HydratedMessageEntry): number | undefined {
+  const millis = Date.parse(entry.node.createdAt || entry.node.updatedAt || "");
+  return Number.isFinite(millis) ? millis : undefined;
 }
 
 function messageIdFromValue(messageValue: unknown): string | undefined {
@@ -346,7 +681,7 @@ function hydrateSessionUpdateEvent(
   if (!update) {
     return nodes;
   }
-  const timestamp = timestampString(event.created_at);
+  const timestamp = timestampField(event, "created_at", "createdAt", "updated_at", "updatedAt");
   const patches = reduceSessionUpdate(update, {
     taskId: task.id,
     lane: task.lane,
@@ -400,22 +735,96 @@ function sessionUpdateFromEvent(event: Record<string, unknown>): SessionUpdate |
     eventType === "acp_available_commands_update" ||
     (typeof eventType === "string" && eventType.startsWith("acp_"))
   ) {
-    return sessionUpdatePayload(payload);
+    return sessionUpdateFromRecords(eventType, payload, event);
   }
   if (eventType === "span_started") {
     const attributes = asRecord(payload.attributes);
-    return sessionUpdatePayload(attributes);
+    return sessionUpdateFromRecords(eventType, attributes, payload, event);
   }
   if (eventType === "span_ended") {
     const result = asRecord(payload.result);
-    return sessionUpdatePayload(result);
+    return sessionUpdateFromRecords(eventType, result, payload, event);
   }
   return undefined;
+}
+
+function sessionUpdateFromRecords(eventType: string | undefined, ...records: Record<string, unknown>[]): SessionUpdate | undefined {
+  for (const record of records) {
+    const update = sessionUpdatePayload(record) || inferredSessionUpdatePayload(eventType, record);
+    if (update) {
+      return update;
+    }
+  }
+  return undefined;
+}
+
+function inferredSessionUpdatePayload(eventType: string | undefined, payload: Record<string, unknown>): SessionUpdate | undefined {
+  if (eventType === "tool_call" || eventType === "tool_call_update") {
+    const toolCallId = toolCallIdFromRecord(payload);
+    return toolCallId ? (toolSessionUpdateRecord(eventType, payload, toolCallId) as SessionUpdate) : undefined;
+  }
+  if (eventType === "span_started") {
+    return inferredSpanStartedToolUpdate(payload);
+  }
+  if (eventType === "span_ended") {
+    return inferredSpanEndedToolUpdate(payload);
+  }
+  if (eventType === "plan" || eventType === "plan_update") {
+    const entries = arrayField(payload, "entries");
+    return entries.length ? ({ ...payload, sessionUpdate: "plan", entries } as SessionUpdate) : undefined;
+  }
+  return undefined;
+}
+
+function inferredSpanStartedToolUpdate(payload: Record<string, unknown>): SessionUpdate | undefined {
+  const attributes = asRecord(payload.attributes);
+  const isToolSpan = stringField(payload, "span_type") === "tool" || Boolean(toolCallIdFromRecord(payload) || toolCallIdFromRecord(attributes));
+  if (!isToolSpan) {
+    return undefined;
+  }
+  const toolCallId = stringField(payload, "span_id") || toolCallIdFromRecord(payload) || toolCallIdFromRecord(attributes);
+  if (!toolCallId) {
+    return undefined;
+  }
+  const update: Record<string, unknown> = {
+    ...attributes,
+    status: stringField(attributes, "status") || stringField(payload, "status") || "in_progress",
+    title: toolTitleFromRecords(attributes, payload),
+    kind: stringField(attributes, "kind") || stringField(attributes, "type") || stringField(payload, "kind") || "other"
+  };
+  return toolSessionUpdateRecord("tool_call", update, toolCallId) as SessionUpdate;
+}
+
+function inferredSpanEndedToolUpdate(payload: Record<string, unknown>): SessionUpdate | undefined {
+  const result = asRecord(payload.result);
+  const toolCallId = toolCallIdFromRecord(result) || toolCallIdFromRecord(payload) || stringField(payload, "span_id");
+  if (!toolCallId) {
+    return undefined;
+  }
+  const update: Record<string, unknown> = {
+    ...result,
+    status: stringField(payload, "status") || stringField(result, "status") || "completed",
+    kind: stringField(result, "kind") || stringField(result, "type") || stringField(payload, "kind") || "other"
+  };
+  const title = toolTitleFromRecords(result, payload);
+  if (title) {
+    update.title = title;
+  }
+  if (update.rawOutput === undefined && update.raw_output === undefined && hasOutputFields(result)) {
+    update.rawOutput = result;
+  }
+  return toolSessionUpdateRecord("tool_call_update", update, toolCallId) as SessionUpdate;
 }
 
 function sessionUpdatePayload(payload: Record<string, unknown>): SessionUpdate | undefined {
   if (!isSessionUpdate(payload)) {
     return undefined;
+  }
+  if (payload.sessionUpdate === "tool_call" || payload.sessionUpdate === "tool_call_update") {
+    const toolCallId = toolCallIdFromRecord(payload);
+    if (toolCallId) {
+      return toolSessionUpdateRecord(payload.sessionUpdate, payload, toolCallId) as SessionUpdate;
+    }
   }
   if (payload.sessionUpdate === "available_commands_update" && !Array.isArray(payload.availableCommands)) {
     const commandNames = arrayField(payload, "command_names").filter((name): name is string => typeof name === "string");
@@ -427,6 +836,73 @@ function sessionUpdatePayload(payload: Record<string, unknown>): SessionUpdate |
   return payload;
 }
 
+function toolSessionUpdateRecord(
+  sessionUpdate: "tool_call" | "tool_call_update",
+  payload: Record<string, unknown>,
+  toolCallId: string
+): Record<string, unknown> {
+  const update: Record<string, unknown> = {
+    ...payload,
+    sessionUpdate,
+    toolCallId
+  };
+  if (sessionUpdate === "tool_call" && !stringField(update, "title")) {
+    update.title = stringField(payload, "title") || stringField(payload, "name") || stringField(payload, "tool") || "Tool call";
+  }
+  copyAliasField(update, payload, "rawInput", "raw_input");
+  copyAliasField(update, payload, "rawOutput", "raw_output");
+  return update;
+}
+
+function toolCallIdFromRecord(record: Record<string, unknown>): string | undefined {
+  return (
+    recordIdField(record, "toolCallId") ||
+    recordIdField(record, "tool_call_id") ||
+    recordIdField(record, "tool_id") ||
+    recordIdField(record, "id")
+  );
+}
+
+function copyAliasField(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+  targetKey: string,
+  aliasKey: string
+): void {
+  if (target[targetKey] === undefined && source[aliasKey] !== undefined) {
+    target[targetKey] = source[aliasKey];
+  }
+}
+
+function toolTitleFromRecords(...records: Record<string, unknown>[]): string | undefined {
+  for (const record of records) {
+    const title =
+      stringField(record, "title") ||
+      stringField(record, "name") ||
+      stringField(record, "tool") ||
+      stringField(record, "command");
+    if (title) {
+      return title;
+    }
+  }
+  return undefined;
+}
+
+function hasOutputFields(record: Record<string, unknown>): boolean {
+  return [
+    "formatted_output",
+    "formattedOutput",
+    "output",
+    "stdout",
+    "stdoutPreview",
+    "stdout_preview",
+    "stderr",
+    "stderrPreview",
+    "stderr_preview",
+    "text"
+  ].some((key) => typeof record[key] === "string");
+}
+
 function isSessionUpdate(value: unknown): value is SessionUpdate {
   return typeof asRecord(value).sessionUpdate === "string";
 }
@@ -434,18 +910,20 @@ function isSessionUpdate(value: unknown): value is SessionUpdate {
 export function mergeHydratedNodes(hydrated: RenderNode[], current: RenderNode[]): RenderNode[] {
   const orderedHydrated = orderHydratedNodesFromCurrent(hydrated, current);
   const hasHydratedTranscript = hydrated.some((node) => node.turnId);
-  const hydratedForEquivalence = orderedHydrated.filter(
-    (node) => !hasMoreCompleteLiveEquivalent(node, current, hasHydratedTranscript)
+  const hydratedForEquivalence = filterHydratedNodesForEquivalence(
+    orderedHydrated,
+    current,
+    hasHydratedTranscript
   );
   const matchedHydratedIds = new Set<string>();
-  const live = current.filter((node) => {
+  const live = current.filter((node, index) => {
     if (node.source === "crabdb") {
       return false;
     }
     if (hasHydratedTranscript && node.kind === "completion" && node.checkpointPending) {
       return false;
     }
-    if (hasHydratedEquivalentNode(node, hydratedForEquivalence, matchedHydratedIds)) {
+    if (hasHydratedEquivalentNode(node, hydratedForEquivalence, matchedHydratedIds, current, index)) {
       return false;
     }
     return ["pending", "in_progress"].includes(node.status) || isPreservableCompletedLiveNode(node, hasHydratedTranscript);
@@ -453,16 +931,40 @@ export function mergeHydratedNodes(hydrated: RenderNode[], current: RenderNode[]
   return reindexTimelineOrder(ensureUniqueMergedNodeIds(orderTimelineScopesFromCurrent([...hydratedForEquivalence, ...live], current)));
 }
 
-function hasMoreCompleteLiveEquivalent(
-  hydratedNode: RenderNode,
+interface CurrentTimelineNodeOrder extends CurrentTimelineOrder {
+  node: RenderNode;
+}
+
+function filterHydratedNodesForEquivalence(
+  hydrated: RenderNode[],
   current: RenderNode[],
   hasHydratedTranscript: boolean
-): boolean {
-  return current.some((node) =>
-    isPreservableCompletedLiveNode(node, hasHydratedTranscript) &&
-    hasOverlappingTimelineKey(node, hydratedNode) &&
-    !hydratedNodeCanReplaceLiveNode(node, hydratedNode)
-  );
+): RenderNode[] {
+  const orderQueues = new Map<string, CurrentTimelineNodeOrder[]>();
+  current.forEach((node, index) => {
+    if (!isPreservableCompletedLiveNode(node, hasHydratedTranscript)) {
+      return;
+    }
+    const order = { index, timelineOrder: node.timelineOrder, node };
+    for (const key of timelineOrderKeys(node)) {
+      const queue = orderQueues.get(key);
+      if (queue) {
+        queue.push(order);
+      } else {
+        orderQueues.set(key, [order]);
+      }
+    }
+  });
+  const usedCurrentIndexes = new Set<number>();
+  return hydrated.filter((hydratedNode) => {
+    const liveOrder = takeTimelineOrder(hydratedNode, orderQueues, usedCurrentIndexes);
+    if (!liveOrder) {
+      return true;
+    }
+    return hydratedNodeCanReplaceLiveNode(liveOrder.node, hydratedNode, {
+      allowMessagePrefixReplacement: canUseMessagePrefixReplacement(liveOrder.node, current, liveOrder.index)
+    });
+  });
 }
 
 function ensureUniqueMergedNodeIds(nodes: RenderNode[]): RenderNode[] {
@@ -544,13 +1046,20 @@ function orderTimelineScopesFromCurrent(nodes: RenderNode[], current: RenderNode
 function hasHydratedEquivalentNode(
   node: RenderNode,
   hydrated: RenderNode[],
-  matchedHydratedIds: Set<string>
+  matchedHydratedIds: Set<string>,
+  current: RenderNode[],
+  currentIndex: number
 ): boolean {
   for (const hydratedNode of hydrated) {
     if (matchedHydratedIds.has(hydratedNode.id)) {
       continue;
     }
-    if (hasOverlappingTimelineKey(node, hydratedNode) && hydratedNodeCanReplaceLiveNode(node, hydratedNode)) {
+    if (
+      hasOverlappingTimelineKey(node, hydratedNode) &&
+      hydratedNodeCanReplaceLiveNode(node, hydratedNode, {
+        allowMessagePrefixReplacement: canUseMessagePrefixReplacement(node, current, currentIndex)
+      })
+    ) {
       matchedHydratedIds.add(hydratedNode.id);
       return true;
     }
@@ -563,7 +1072,15 @@ function hasOverlappingTimelineKey(left: RenderNode, right: RenderNode): boolean
   return timelineOrderKeys(left).some((key) => rightKeys.includes(key));
 }
 
-function hydratedNodeCanReplaceLiveNode(liveNode: RenderNode, hydratedNode: RenderNode): boolean {
+interface MessageReplacementOptions {
+  allowMessagePrefixReplacement?: boolean | undefined;
+}
+
+function hydratedNodeCanReplaceLiveNode(
+  liveNode: RenderNode,
+  hydratedNode: RenderNode,
+  options: MessageReplacementOptions = {}
+): boolean {
   if (liveNode.kind !== hydratedNode.kind) {
     return false;
   }
@@ -571,15 +1088,22 @@ function hydratedNodeCanReplaceLiveNode(liveNode: RenderNode, hydratedNode: Rend
     if (liveNode.role !== hydratedNode.role) {
       return false;
     }
-    return hydratedMessageTextCanReplaceLiveText(liveNode.text, hydratedNode.text);
+    return hydratedMessageTextCanReplaceLiveText(liveNode.text, hydratedNode.text, options);
   }
   return renderCompletenessScore(hydratedNode) >= renderCompletenessScore(liveNode);
 }
 
-function hydratedMessageTextCanReplaceLiveText(liveText: string, hydratedText: string): boolean {
+function hydratedMessageTextCanReplaceLiveText(
+  liveText: string,
+  hydratedText: string,
+  options: MessageReplacementOptions
+): boolean {
   const stableLiveText = stableTimelineText(liveText);
   const stableHydratedText = stableTimelineText(hydratedText);
-  return stableHydratedText === stableLiveText || stableHydratedText.startsWith(stableLiveText);
+  if (stableHydratedText === stableLiveText) {
+    return true;
+  }
+  return options.allowMessagePrefixReplacement !== false && stableHydratedText.startsWith(stableLiveText);
 }
 
 function renderCompletenessScore(node: RenderNode): number {
@@ -665,9 +1189,10 @@ function hydratedTimelineSegments(nodes: RenderNode[]): RenderNode[][] {
 }
 
 function orderHydratedSegmentFromCurrent(segment: RenderNode[], orderQueues: Map<string, CurrentTimelineOrder[]>): RenderNode[] {
+  const usedCurrentIndexes = new Set<number>();
   return segment
     .map((node, index) => {
-      const currentOrder = takeTimelineOrderIndex(node, orderQueues);
+      const currentOrder = takeTimelineOrder(node, orderQueues, usedCurrentIndexes);
       return {
         node: currentOrder?.timelineOrder === undefined ? node : { ...node, timelineOrder: currentOrder.timelineOrder },
         index,
@@ -688,11 +1213,19 @@ function orderHydratedSegmentFromCurrent(segment: RenderNode[], orderQueues: Map
     .map((item) => item.node);
 }
 
-function takeTimelineOrderIndex(node: RenderNode, orderQueues: Map<string, CurrentTimelineOrder[]>): CurrentTimelineOrder | undefined {
+function takeTimelineOrder<T extends CurrentTimelineOrder>(
+  node: RenderNode,
+  orderQueues: Map<string, T[]>,
+  usedCurrentIndexes: Set<number>
+): T | undefined {
   for (const key of timelineOrderKeys(node)) {
     const queue = orderQueues.get(key);
-    const order = queue?.shift();
-    if (order) {
+    while (queue?.length) {
+      const order = queue.shift()!;
+      if (usedCurrentIndexes.has(order.index)) {
+        continue;
+      }
+      usedCurrentIndexes.add(order.index);
       return order;
     }
   }
@@ -703,10 +1236,12 @@ function timelineOrderKeys(node: RenderNode): string[] {
   const scope = timelineScopeKey(node);
   const keys = [`${scope}:id:${node.id}`];
   if (node.kind === "message") {
+    const text = stableTimelineText(node.text);
     if (node.acpMessageId) {
+      keys.push(`${scope}:message-id-text:${node.acpMessageId}:${node.role}:${text}`);
       keys.push(`${scope}:message-id:${node.acpMessageId}`);
     }
-    keys.push(`${scope}:message:${node.role}:${stableTimelineText(node.text)}`);
+    keys.push(`${scope}:message:${node.role}:${text}`);
   } else if (node.kind === "tool") {
     keys.push(`${scope}:tool:${node.toolCallId}`);
     if (node.acpToolCallId) {
@@ -724,8 +1259,32 @@ function timelineScopeKey(node: RenderNode): string {
   return `${node.taskId}:${node.lane}:${node.turnId || ""}`;
 }
 
+function canUseMessagePrefixReplacement(liveNode: RenderNode, current: RenderNode[], currentIndex: number): boolean {
+  if (liveNode.kind !== "message" || !liveNode.acpMessageId) {
+    return true;
+  }
+  return !current.some((candidate, index) =>
+    index > currentIndex &&
+    candidate.kind === "message" &&
+    candidate.source === liveNode.source &&
+    candidate.role === liveNode.role &&
+    candidate.acpMessageId === liveNode.acpMessageId &&
+    timelineScopeKey(candidate) === timelineScopeKey(liveNode)
+  );
+}
+
 function stableTimelineText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function timestampField(record: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const timestamp = timestampString(record[key]);
+    if (timestamp) {
+      return timestamp;
+    }
+  }
+  return undefined;
 }
 
 function renderStatus(status: string | undefined): RenderNode["status"] {
@@ -736,6 +1295,8 @@ function renderStatus(status: string | undefined): RenderNode["status"] {
       return "cancelled";
     case "pending":
       return "pending";
+    case "active":
+    case "in-progress":
     case "in_progress":
     case "running":
       return "in_progress";
@@ -745,11 +1306,36 @@ function renderStatus(status: string | undefined): RenderNode["status"] {
 }
 
 function timestampString(value: unknown): string | undefined {
-  if (typeof value !== "number") {
+  if (typeof value === "number") {
+    return unixTimestampString(value);
+  }
+  if (typeof value !== "string") {
     return undefined;
   }
-  const millis = value > 10_000_000_000 ? value : value * 1000;
-  return new Date(millis).toISOString();
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) {
+    return unixTimestampString(Number(trimmed));
+  }
+  return timestampFromMillis(Date.parse(trimmed));
+}
+
+function unixTimestampString(value: number): string | undefined {
+  if (!Number.isFinite(value)) {
+    return undefined;
+  }
+  const millis = Math.abs(value) > 10_000_000_000 ? value : value * 1000;
+  return timestampFromMillis(millis);
+}
+
+function timestampFromMillis(millis: number): string | undefined {
+  if (!Number.isFinite(millis)) {
+    return undefined;
+  }
+  const date = new Date(millis);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
 
 function arrayField(record: Record<string, unknown>, key: string): unknown[] {

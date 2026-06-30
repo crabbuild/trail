@@ -33,13 +33,15 @@ impl CrabDb {
         )?;
 
         if diff.changes.is_empty() {
+            let mapping =
+                self.insert_git_mapping("import", &branch, &head.change_id, &head.root_id)?;
             return Ok(GitImportReport {
                 branch,
                 operation: None,
                 root_id: head.root_id,
                 imported: built.stats,
                 changed_paths: Vec::new(),
-                mapping: None,
+                mapping,
             });
         }
 

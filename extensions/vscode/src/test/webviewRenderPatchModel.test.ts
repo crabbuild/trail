@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ContentBlock } from "../shared/acpTypes";
 import type { RenderNode, RenderPatch } from "../shared/renderModel";
 import {
   applyRenderPatchesLocally,
@@ -31,6 +32,19 @@ function messageNode(id: string, text: string): Extract<RenderNode, { kind: "mes
     acpMessageId: id.replace(/^message:assistant:/, ""),
     content: [{ type: "text", text }],
     text,
+    streaming: true
+  };
+}
+
+function mediaMessageNode(id: string, content: ContentBlock): Extract<RenderNode, { kind: "message" }> {
+  return {
+    ...base,
+    id,
+    kind: "message",
+    role: "assistant",
+    acpMessageId: id.replace(/^message:assistant:/, ""),
+    content: [content],
+    text: `[${content.type || "content"}]`,
     streaming: true
   };
 }
@@ -139,6 +153,58 @@ test("merges delta streamed message patches locally without losing prior text", 
   }
   assert.equal(node.text, "Hello world");
   assert.deepEqual(node.content, [{ type: "text", text: "Hello world" }]);
+});
+
+test("normalizes completed local message patches out of streaming state", () => {
+  const first = messageNode("message:assistant:one", "Hello ");
+  const completed = {
+    ...messageNode("message:assistant:one", "Hello world"),
+    status: "completed" as const,
+    streaming: true
+  };
+
+  const nodes = applyRenderPatchesLocally([], [
+    { type: "upsert", node: first },
+    { type: "upsert", node: completed }
+  ]);
+
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected message node");
+  }
+  assert.equal(node.status, "completed");
+  assert.equal(node.streaming, false);
+  assert.equal(node.text, "Hello world");
+});
+
+test("keeps distinct non-text message patches with the same display placeholder locally", () => {
+  const firstImage: ContentBlock = {
+    type: "image",
+    data: "first-image",
+    mimeType: "image/png"
+  };
+  const secondImage: ContentBlock = {
+    type: "image",
+    data: "second-image",
+    mimeType: "image/png"
+  };
+  const first = mediaMessageNode("message:assistant:media", firstImage);
+  const second = mediaMessageNode("message:assistant:media", secondImage);
+
+  const nodes = applyRenderPatchesLocally([], [
+    { type: "upsert", node: first },
+    { type: "upsert", node: second }
+  ]);
+
+  assert.deepEqual(nodes.map((node) => node.id), [first.id]);
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected media message node");
+  }
+  assert.equal(node.text, "[image][image]");
+  assert.deepEqual(node.content, [firstImage, secondImage]);
 });
 
 test("merges delta streamed thought patches locally without losing prior text", () => {

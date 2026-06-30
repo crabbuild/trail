@@ -2937,6 +2937,7 @@ impl CrabDb {
             ));
         }
         self.ensure_git_head_matches_root(
+            &target_ref.change_id,
             &target_ref.root_id,
             git_state.head.as_deref(),
             &crab_branch,
@@ -4104,6 +4105,7 @@ impl CrabDb {
 
     fn ensure_git_head_matches_root(
         &self,
+        change_id: &ChangeId,
         root_id: &ObjectId,
         git_head: Option<&str>,
         crab_branch: &str,
@@ -4113,11 +4115,22 @@ impl CrabDb {
                 "agent apply requires a Git HEAD commit before it can fast-forward".to_string(),
             ));
         };
+        if self.git_clean_head_matches_root_mapping(git_head, root_id)? {
+            return Ok(());
+        }
         let files = self.load_root_files(root_id)?;
         let crab_tree = self.git_write_tree(&files)?;
         let git_tree =
             self.git_output(&["rev-parse".to_string(), format!("{git_head}^{{tree}}")])?;
         if crab_tree == git_tree {
+            self.insert_git_mapping_for_state(
+                "verify",
+                crab_branch,
+                change_id,
+                root_id,
+                Some(git_head.to_string()),
+                false,
+            )?;
             return Ok(());
         }
         Err(Error::Git(format!(

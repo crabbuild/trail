@@ -64,6 +64,62 @@ impl CrabDb {
         self.git_write_tree_node(&root)
     }
 
+    pub(crate) fn git_write_tree_from_head_delta(
+        &self,
+        head: &str,
+        patch_left: &BTreeMap<String, FileEntry>,
+        patch_right: &BTreeMap<String, FileEntry>,
+    ) -> Result<String> {
+        let mut changed_paths = BTreeSet::new();
+        changed_paths.extend(patch_left.keys().cloned());
+        changed_paths.extend(patch_right.keys().cloned());
+        if changed_paths.is_empty() {
+            return self.git_output(&["rev-parse".to_string(), format!("{head}^{{tree}}")]);
+        }
+
+        let tmp_dir = self.db_dir.join("tmp");
+        fs::create_dir_all(&tmp_dir)?;
+        let index_path = tmp_dir.join(format!("git-index-{}-{}", std::process::id(), now_ts()));
+
+        let result = (|| {
+            self.git_output_with_index(&["read-tree".to_string(), head.to_string()], &index_path)?;
+            for path in changed_paths {
+                if let Some(entry) = patch_right.get(&path) {
+                    let bytes = self.materialize_entry_bytes(entry)?;
+                    let oid =
+                        self.git_output_with_input(&["hash-object", "-w", "--stdin"], &bytes)?;
+                    let mode = if entry.executable { "100755" } else { "100644" };
+                    self.git_output_with_index(
+                        &[
+                            "update-index".to_string(),
+                            "--add".to_string(),
+                            "--cacheinfo".to_string(),
+                            mode.to_string(),
+                            oid,
+                            path,
+                        ],
+                        &index_path,
+                    )?;
+                } else {
+                    self.git_output_with_index(
+                        &[
+                            "update-index".to_string(),
+                            "--force-remove".to_string(),
+                            "--".to_string(),
+                            path,
+                        ],
+                        &index_path,
+                    )?;
+                }
+            }
+            self.git_output_with_index(&["write-tree".to_string()], &index_path)
+        })();
+
+        let _ = fs::remove_file(&index_path);
+        let _ = fs::remove_file(index_path.with_extension("lock"));
+        result
+    }
+
     pub(crate) fn git_insert_tree_path(
         root: &mut GitTreeNode,
         path: &str,
@@ -141,6 +197,21 @@ impl CrabDb {
             .arg("-C")
             .arg(&self.workspace_root)
             .args(args)
+            .output()
+            .map_err(|err| Error::Git(err.to_string()))?;
+        self.git_checked_output(args, output)
+    }
+
+    pub(crate) fn git_output_with_index(
+        &self,
+        args: &[String],
+        index_path: &Path,
+    ) -> Result<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace_root)
+            .args(args)
+            .env("GIT_INDEX_FILE", index_path)
             .output()
             .map_err(|err| Error::Git(err.to_string()))?;
         self.git_checked_output(args, output)

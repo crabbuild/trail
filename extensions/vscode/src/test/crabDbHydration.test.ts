@@ -54,6 +54,653 @@ test("hydrates persisted CrabDB transcript turns into render nodes", () => {
   assert.equal(nodes.every((node) => node.source === "crabdb"), true);
 });
 
+test("hydrates persisted CrabDB message content blocks when body is absent", () => {
+  const contentView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-content-blocks",
+          status: "completed",
+          after_change: "ch_content_blocks"
+        },
+        messages: [
+          {
+            message_id: "msg-content-user",
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Read the attached context"
+              }
+            ],
+            created_at: 1
+          },
+          {
+            message_id: "msg-content-assistant",
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                text: "The result is ready."
+              },
+              {
+                type: "resource",
+                resource: {
+                  uri: "file:///README.md",
+                  text: "Attached context"
+                }
+              },
+              {
+                type: "image",
+                data: "ignored",
+                mimeType: "image/png"
+              }
+            ],
+            created_at: 2
+          }
+        ],
+        checkpoint: "ch_content_blocks"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(contentView);
+  const assistant = nodes.find((node) => node.kind === "message" && node.role === "assistant");
+
+  assert.equal(assistant?.kind, "message");
+  if (assistant?.kind !== "message") {
+    throw new Error("expected hydrated assistant message");
+  }
+  assert.equal(assistant.text, "The result is ready.Attached context[image]");
+  assert.deepEqual(
+    assistant.content.map((block) => block.type),
+    ["text", "resource", "image"]
+  );
+});
+
+test("hydrates persisted CrabDB message text fields when body is absent", () => {
+  const textView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-text-fields",
+          status: "completed",
+          after_change: "ch_text_fields"
+        },
+        messages: [
+          {
+            message_id: "msg-user-text",
+            role: "user",
+            text: "Review the summary",
+            created_at: 1
+          },
+          {
+            message_id: "msg-assistant-content-text",
+            role: "assistant",
+            contentText: "The summary is ready.",
+            created_at: 2
+          },
+          {
+            message_id: "msg-assistant-message",
+            role: "assistant",
+            message: "No further action needed.",
+            created_at: 3
+          }
+        ],
+        checkpoint: "ch_text_fields"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(textView);
+  const messages = nodes.filter((node) => node.kind === "message");
+
+  assert.deepEqual(
+    messages.map((node) => `${node.role}:${node.text}`),
+    [
+      "user:Review the summary",
+      "assistant:The summary is ready.",
+      "assistant:No further action needed."
+    ]
+  );
+});
+
+test("hydrates persisted CrabDB string content when body is absent", () => {
+  const textView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-string-content",
+          status: "completed",
+          after_change: "ch_string_content"
+        },
+        messages: [
+          {
+            message_id: "msg-string-content",
+            role: "assistant",
+            content: "Rendered from a string content field.",
+            created_at: 1
+          }
+        ],
+        checkpoint: "ch_string_content"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(textView);
+  const assistant = nodes.find((node) => node.kind === "message" && node.role === "assistant");
+
+  assert.equal(assistant?.kind, "message");
+  if (assistant?.kind !== "message") {
+    throw new Error("expected hydrated assistant message");
+  }
+  assert.equal(assistant.text, "Rendered from a string content field.");
+});
+
+test("hydrates persisted CrabDB mixed content arrays when body is absent", () => {
+  const contentView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-mixed-content-array",
+          status: "completed",
+          after_change: "ch_mixed_content_array"
+        },
+        messages: [
+          {
+            message_id: "msg-mixed-content-array",
+            role: "assistant",
+            content: [
+              "Rendered ",
+              {
+                text: "from "
+              },
+              {
+                type: "text",
+                text: "mixed content."
+              }
+            ],
+            created_at: 1
+          }
+        ],
+        checkpoint: "ch_mixed_content_array"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(contentView);
+  const assistant = nodes.find((node) => node.kind === "message" && node.role === "assistant");
+
+  assert.equal(assistant?.kind, "message");
+  if (assistant?.kind !== "message") {
+    throw new Error("expected hydrated assistant message");
+  }
+  assert.equal(assistant.text, "Rendered from mixed content.");
+  assert.deepEqual(
+    assistant.content.map((block) => block.type),
+    ["text", "text", "text"]
+  );
+});
+
+test("hydrates root transcript messages and events when turn wrappers are absent", () => {
+  const rootView: TaskView = {
+    ...view,
+    task: {
+      ...view.task,
+      latestCheckpoint: "ch_root",
+      updatedAt: "2026-06-27T00:00:05.000Z"
+    },
+    turns: [],
+    messages: [
+      {
+        message_id: "msg-user",
+        turn_id: "turn-root",
+        role: "user",
+        body: "Inspect the root transcript",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        message_id: "msg-assistant",
+        turn_id: "turn-root",
+        role: "assistant",
+        body: "The root transcript rendered.",
+        created_at: "2026-06-27T00:00:04.000Z"
+      }
+    ],
+    events: [
+      {
+        event_type: "message_added",
+        turn_id: "turn-root",
+        message_id: "msg-user",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        event_type: "tool_call",
+        turn_id: "turn-root",
+        created_at: "2026-06-27T00:00:02.000Z",
+        payload: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-root",
+          title: "Read root transcript",
+          kind: "read",
+          status: "completed"
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-root",
+        message_id: "msg-assistant",
+        created_at: "2026-06-27T00:00:04.000Z"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(rootView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.kind}:${node.turnId}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:turn-root:user:Inspect the root transcript",
+      "tool:turn-root:Read root transcript",
+      "message:turn-root:assistant:The root transcript rendered.",
+      "checkpoint:turn-root:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4]);
+});
+
+test("keeps separate root transcript turn scopes when wrappers are absent", () => {
+  const rootView: TaskView = {
+    ...view,
+    task: {
+      ...view.task,
+      latestCheckpoint: "ch_beta",
+      updatedAt: "2026-06-27T00:00:06.000Z"
+    },
+    turns: [],
+    messages: [
+      {
+        message_id: "msg-alpha-user",
+        turn_id: "turn-alpha",
+        role: "user",
+        body: "Start the first turn",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        message_id: "msg-alpha-assistant",
+        turn_id: "turn-alpha",
+        role: "assistant",
+        body: "First turn is complete.",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        message_id: "msg-beta-user",
+        turn_id: "turn-beta",
+        role: "user",
+        body: "Start the second turn",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        message_id: "msg-beta-assistant",
+        turn_id: "turn-beta",
+        role: "assistant",
+        body: "Second turn is complete.",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ],
+    events: [
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-alpha-user",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-alpha-assistant",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-beta-user",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        event_type: "tool_call",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:04.000Z",
+        payload: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-beta",
+          title: "Inspect beta",
+          kind: "read",
+          status: "completed"
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-beta-assistant",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(rootView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.kind}:${node.turnId}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:turn-alpha:user:Start the first turn",
+      "message:turn-alpha:assistant:First turn is complete.",
+      "message:turn-beta:user:Start the second turn",
+      "tool:turn-beta:Inspect beta",
+      "message:turn-beta:assistant:Second turn is complete.",
+      "checkpoint:turn-beta:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("uses root message-added events to scope messages without turn ids", () => {
+  const rootView: TaskView = {
+    ...view,
+    task: {
+      ...view.task,
+      latestCheckpoint: "ch_scoped",
+      updatedAt: "2026-06-27T00:00:06.000Z"
+    },
+    turns: [],
+    messages: [
+      {
+        message_id: "msg-alpha-user",
+        role: "user",
+        body: "Start alpha without a message turn id",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        message_id: "msg-alpha-assistant",
+        role: "assistant",
+        body: "Alpha stayed scoped.",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        message_id: "msg-beta-user",
+        role: "user",
+        body: "Start beta without a message turn id",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        message_id: "msg-beta-assistant",
+        role: "assistant",
+        body: "Beta stayed scoped.",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ],
+    events: [
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-alpha-user",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-alpha-assistant",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-beta-user",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        event_type: "tool_call",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:04.000Z",
+        payload: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-beta",
+          title: "Inspect beta",
+          kind: "read",
+          status: "completed"
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-beta-assistant",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(rootView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.kind}:${node.turnId}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:turn-alpha:user:Start alpha without a message turn id",
+      "message:turn-alpha:assistant:Alpha stayed scoped.",
+      "message:turn-beta:user:Start beta without a message turn id",
+      "tool:turn-beta:Inspect beta",
+      "message:turn-beta:assistant:Beta stayed scoped.",
+      "checkpoint:turn-beta:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("uses root message-added event order to scope repeated message ids without turn ids", () => {
+  const rootView: TaskView = {
+    ...view,
+    task: {
+      ...view.task,
+      latestCheckpoint: "ch_repeated_root",
+      updatedAt: "2026-06-27T00:00:06.000Z"
+    },
+    turns: [],
+    messages: [
+      {
+        message_id: "msg-alpha-user",
+        role: "user",
+        body: "Start alpha",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        message_id: "msg-shared",
+        role: "assistant",
+        body: "Alpha answer.",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        message_id: "msg-beta-user",
+        role: "user",
+        body: "Start beta",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        message_id: "msg-shared",
+        role: "assistant",
+        body: "Beta answer.",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ],
+    events: [
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-alpha-user",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-shared",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-beta-user",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        event_type: "tool_call",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:04.000Z",
+        payload: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-beta",
+          title: "Inspect beta",
+          kind: "read",
+          status: "completed"
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-shared",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(rootView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.turnId}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.kind}:${node.turnId}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:turn-alpha:user:msg-alpha-user:Start alpha",
+      "message:turn-alpha:assistant:msg-shared:Alpha answer.",
+      "message:turn-beta:user:msg-beta-user:Start beta",
+      "tool:turn-beta:Inspect beta",
+      "message:turn-beta:assistant:msg-shared:Beta answer.",
+      "checkpoint:turn-beta:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("uses root message timestamps to scope repeated message ids when messages arrive out of order", () => {
+  const rootView: TaskView = {
+    ...view,
+    task: {
+      ...view.task,
+      latestCheckpoint: "ch_repeated_root_out_of_order",
+      updatedAt: "2026-06-27T00:00:06.000Z"
+    },
+    turns: [],
+    messages: [
+      {
+        message_id: "msg-alpha-user",
+        role: "user",
+        body: "Start alpha",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        message_id: "msg-shared",
+        role: "assistant",
+        body: "Beta answer.",
+        created_at: "2026-06-27T00:00:05.000Z"
+      },
+      {
+        message_id: "msg-beta-user",
+        role: "user",
+        body: "Start beta",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        message_id: "msg-shared",
+        role: "assistant",
+        body: "Alpha answer.",
+        created_at: "2026-06-27T00:00:02.000Z"
+      }
+    ],
+    events: [
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-alpha-user",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        message_id: "msg-shared",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-beta-user",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        event_type: "tool_call",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:04.000Z",
+        payload: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-beta",
+          title: "Inspect beta",
+          kind: "read",
+          status: "completed"
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        message_id: "msg-shared",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(rootView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.turnId}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.kind}:${node.turnId}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:turn-alpha:user:msg-alpha-user:Start alpha",
+      "message:turn-alpha:assistant:msg-shared:Alpha answer.",
+      "message:turn-beta:user:msg-beta-user:Start beta",
+      "tool:turn-beta:Inspect beta",
+      "message:turn-beta:assistant:msg-shared:Beta answer.",
+      "checkpoint:turn-beta:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
 test("hydrates persisted tool events into rich tool and terminal nodes", () => {
   const eventView: TaskView = {
     ...view,
@@ -111,6 +758,168 @@ test("hydrates persisted tool events into rich tool and terminal nodes", () => {
   assert.equal(terminal?.kind, "terminal");
   assert.equal(terminal?.command, "npm test");
   assert.equal(terminal?.stdout, "ok");
+});
+
+test("hydrates flattened persisted ACP tool events", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        ...(view.turns[0] as Record<string, unknown>),
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            sessionUpdate: "tool_call",
+            toolCallId: "tool-flat",
+            title: "Run flattened command",
+            kind: "execute",
+            status: "pending",
+            rawInput: {
+              command: "npm run check"
+            }
+          },
+          {
+            event_type: "tool_call_update",
+            created_at: 4,
+            sessionUpdate: "tool_call_update",
+            toolCallId: "tool-flat",
+            status: "completed",
+            content: [
+              {
+                type: "terminal",
+                terminalId: "term-flat",
+                command: "npm run check",
+                status: "exited",
+                stdout: "clean"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+  const tool = nodes.find((node) => node.kind === "tool");
+  const terminal = nodes.find((node) => node.kind === "terminal");
+
+  assert.equal(tool?.kind, "tool");
+  assert.equal(tool?.title, "Run flattened command");
+  assert.equal(tool?.toolStatus, "completed");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.stdout, "clean");
+});
+
+test("infers persisted ACP tool events from event type and snake case payload fields", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        ...(view.turns[0] as Record<string, unknown>),
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            payload: {
+              tool_call_id: "tool-snake",
+              title: "Run snake case command",
+              kind: "execute",
+              status: "pending",
+              raw_input: {
+                command: "npm run check"
+              }
+            }
+          },
+          {
+            event_type: "tool_call_update",
+            created_at: 4,
+            payload: {
+              tool_call_id: "tool-snake",
+              kind: "execute",
+              status: "completed",
+              raw_input: {
+                command: "npm run check"
+              },
+              raw_output: {
+                stdout: "snake clean"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+  const tool = nodes.find((node) => node.kind === "tool");
+  const terminal = nodes.find((node) => node.kind === "terminal");
+
+  assert.equal(tool?.kind, "tool");
+  assert.equal(tool?.title, "Run snake case command");
+  assert.equal(tool?.toolStatus, "completed");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.command, "npm run check");
+  assert.equal(terminal?.stdout, "snake clean");
+});
+
+test("infers persisted tool spans from span events without ACP session updates", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        ...(view.turns[0] as Record<string, unknown>),
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "span_started",
+            created_at: 3,
+            payload: {
+              span_id: "span-tool",
+              span_type: "tool",
+              name: "Run span command",
+              attributes: {
+                kind: "execute",
+                raw_input: {
+                  command: "npm test"
+                }
+              }
+            }
+          },
+          {
+            event_type: "span_ended",
+            created_at: 4,
+            payload: {
+              span_id: "span-tool",
+              status: "completed",
+              result: {
+                kind: "execute",
+                raw_input: {
+                  command: "npm test"
+                },
+                raw_output: {
+                  stdout: "span ok"
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+  const tool = nodes.find((node) => node.kind === "tool");
+  const terminal = nodes.find((node) => node.kind === "terminal");
+
+  assert.equal(tool?.kind, "tool");
+  assert.equal(tool?.title, "Run span command");
+  assert.equal(tool?.toolStatus, "completed");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.command, "npm test");
+  assert.equal(terminal?.stdout, "span ok");
 });
 
 test("orders hydrated turn messages and tools by recorded timeline timestamps", () => {
@@ -256,6 +1065,267 @@ test("hydrates reopened ACP turns by message-added event order around tools", ()
   );
 });
 
+test("weaves unplaced hydrated messages into partial message-added event timelines", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-partial-message-events",
+          status: "completed",
+          after_change: "ch_partial_message_events",
+          ended_at: 6
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Please inspect README",
+            created_at: 1
+          },
+          {
+            message_id: "msg-before",
+            role: "assistant",
+            body: "I will read it first.",
+            created_at: 2
+          },
+          {
+            message_id: "msg-after",
+            role: "assistant",
+            body: "The read is done.",
+            created_at: 5
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            created_at: 1
+          },
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tool-read",
+              title: "Read README.md",
+              kind: "read",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-after",
+            created_at: 5
+          }
+        ],
+        checkpoint: "ch_partial_message_events"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+
+  assert.deepEqual(
+    nodes.map((node) => (node.kind === "message" ? `${node.kind}:${node.role}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.title : ""}`)),
+    [
+      "message:user:Please inspect README",
+      "message:assistant:I will read it first.",
+      "tool:Read README.md",
+      "message:assistant:The read is done.",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5]);
+});
+
+test("hydrates reopened ACP turns by recorded event time when events are returned out of order", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-out-of-order-events",
+          status: "completed",
+          after_change: "ch_out_of_order_events",
+          ended_at: 6
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Please inspect README",
+            created_at: 1
+          },
+          {
+            message_id: "msg-before",
+            role: "assistant",
+            body: "I will read it first.",
+            created_at: 2
+          },
+          {
+            message_id: "msg-after",
+            role: "assistant",
+            body: "The read is done.",
+            created_at: 5
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-after",
+            created_at: 5
+          },
+          {
+            event_type: "tool_call_update",
+            created_at: 4,
+            payload: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tool-read",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            created_at: 1
+          },
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tool-read",
+              title: "Read README.md",
+              kind: "read",
+              status: "pending"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-before",
+            created_at: 2
+          }
+        ],
+        checkpoint: "ch_out_of_order_events"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.role}:${node.text}`
+        : `${node.kind}:${node.kind === "tool" ? `${node.toolCallId}:${node.toolStatus}` : ""}`
+    )),
+    [
+      "message:user:Please inspect README",
+      "message:assistant:I will read it first.",
+      "tool:tool-read:completed",
+      "message:assistant:The read is done.",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5]);
+});
+
+test("hydrates reopened ACP turns by ISO string event time", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-string-timestamps",
+          status: "completed",
+          after_change: "ch_string_timestamps",
+          ended_at: "2026-06-27T00:00:06.000Z"
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Please inspect README",
+            created_at: "2026-06-27T00:00:01.000Z"
+          },
+          {
+            message_id: "msg-before",
+            role: "assistant",
+            body: "I will read it first.",
+            created_at: "2026-06-27T00:00:02.000Z"
+          },
+          {
+            message_id: "msg-after",
+            role: "assistant",
+            body: "The read is done.",
+            created_at: "2026-06-27T00:00:05.000Z"
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-after",
+            created_at: "2026-06-27T00:00:05.000Z"
+          },
+          {
+            event_type: "tool_call_update",
+            created_at: "2026-06-27T00:00:04.000Z",
+            payload: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tool-read",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            created_at: "2026-06-27T00:00:01.000Z"
+          },
+          {
+            event_type: "tool_call",
+            created_at: "2026-06-27T00:00:03.000Z",
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tool-read",
+              title: "Read README.md",
+              kind: "read",
+              status: "pending"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-before",
+            created_at: "2026-06-27T00:00:02.000Z"
+          }
+        ],
+        checkpoint: "ch_string_timestamps"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+  const tool = nodes.find((node) => node.kind === "tool");
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.role}:${node.text}`
+        : `${node.kind}:${node.kind === "tool" ? `${node.toolCallId}:${node.toolStatus}` : ""}`
+    )),
+    [
+      "message:user:Please inspect README",
+      "message:assistant:I will read it first.",
+      "tool:tool-read:completed",
+      "message:assistant:The read is done.",
+      "checkpoint:"
+    ]
+  );
+  assert.equal(nodes[0]?.createdAt, "2026-06-27T00:00:01.000Z");
+  assert.equal(tool?.createdAt, "2026-06-27T00:00:03.000Z");
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5]);
+});
+
 test("hydrates duplicate ACP message ids by consuming message-added events in order", () => {
   const orderedView: TaskView = {
     ...view,
@@ -351,6 +1421,425 @@ test("hydrates duplicate ACP message ids by consuming message-added events in or
       "crabdb-message:turn-duplicate-message-id:msg-shared:2"
     ]
   );
+});
+
+test("hydrates duplicate ACP message ids by event time when message records are out of order", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-duplicate-message-id-out-of-order",
+          status: "completed",
+          after_change: "ch_duplicate_message_id_out_of_order",
+          ended_at: 7
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Run both checks",
+            created_at: 1
+          },
+          {
+            message_id: "msg-shared",
+            role: "assistant",
+            body: "Second check is next.",
+            created_at: 4
+          },
+          {
+            message_id: "msg-shared",
+            role: "assistant",
+            body: "First check is next.",
+            created_at: 2
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            created_at: 1
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-shared",
+            created_at: 2
+          },
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "first-check",
+              title: "First check",
+              kind: "execute",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-shared",
+            created_at: 4
+          },
+          {
+            event_type: "tool_call",
+            created_at: 5,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "second-check",
+              title: "Second check",
+              kind: "execute",
+              status: "completed"
+            }
+          }
+        ],
+        checkpoint: "ch_duplicate_message_id_out_of_order"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+  assert.deepEqual(
+    nodes.map((node) => (node.kind === "message" ? `${node.kind}:${node.role}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`)),
+    [
+      "message:user:Run both checks",
+      "message:assistant:First check is next.",
+      "tool:first-check",
+      "message:assistant:Second check is next.",
+      "tool:second-check",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("hydrates duplicate ACP message ids by camelCase event time", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-camel-case-event-time",
+          status: "completed",
+          after_change: "ch_camel_case_event_time",
+          endedAt: 7
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Run both checks",
+            createdAt: 1
+          },
+          {
+            message_id: "msg-shared",
+            role: "assistant",
+            body: "Second check is next.",
+            createdAt: 4
+          },
+          {
+            message_id: "msg-shared",
+            role: "assistant",
+            body: "First check is next.",
+            createdAt: 2
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-shared",
+            createdAt: 4
+          },
+          {
+            event_type: "tool_call",
+            createdAt: 5,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "second-check",
+              title: "Second check",
+              kind: "execute",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            createdAt: 1
+          },
+          {
+            event_type: "tool_call",
+            createdAt: 3,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "first-check",
+              title: "First check",
+              kind: "execute",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-shared",
+            createdAt: 2
+          }
+        ],
+        checkpoint: "ch_camel_case_event_time"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+
+  assert.deepEqual(
+    nodes.map((node) => (node.kind === "message" ? `${node.kind}:${node.role}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`)),
+    [
+      "message:user:Run both checks",
+      "message:assistant:First check is next.",
+      "tool:first-check",
+      "message:assistant:Second check is next.",
+      "tool:second-check",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("replaces the matching duplicated-message-id continuation from CrabDB hydration", () => {
+  const current: RenderNode[] = [
+    {
+      id: "message:user:msg-user",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-message-id-merge",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "user",
+      acpMessageId: "msg-user",
+      content: [{ type: "text", text: "Run both checks" }],
+      text: "Run both checks",
+      streaming: false,
+      timelineOrder: 1
+    },
+    {
+      id: "message:assistant:msg-shared:1",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-message-id-merge",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-shared",
+      content: [{ type: "text", text: "First check is next." }],
+      text: "First check is next.",
+      streaming: false,
+      timelineOrder: 2
+    },
+    {
+      id: "tool:first-check",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-message-id-merge",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      acpToolCallId: "first-check",
+      toolCallId: "first-check",
+      title: "First check",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      timelineOrder: 3
+    },
+    {
+      id: "message:assistant:msg-shared:2",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-message-id-merge",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-shared",
+      content: [{ type: "text", text: "Second check is" }],
+      text: "Second check is",
+      streaming: false,
+      timelineOrder: 4
+    }
+  ];
+  const persisted: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-duplicate-message-id-merge",
+          status: "completed",
+          after_change: "ch_duplicate_message_id_merge"
+        },
+        messages: [
+          { message_id: "msg-user", role: "user", body: "Run both checks", created_at: 1 },
+          { message_id: "msg-shared", role: "assistant", body: "First check is next.", created_at: 2 },
+          { message_id: "msg-shared", role: "assistant", body: "Second check is next.", created_at: 4 }
+        ],
+        events: [
+          { event_type: "message_added", message_id: "msg-user", created_at: 1 },
+          { event_type: "message_added", message_id: "msg-shared", created_at: 2 },
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "first-check",
+              title: "First check",
+              kind: "execute",
+              status: "completed"
+            }
+          },
+          { event_type: "message_added", message_id: "msg-shared", created_at: 4 }
+        ],
+        checkpoint: "ch_duplicate_message_id_merge"
+      }
+    ]
+  };
+
+  const merged = mergeHydratedNodes(hydrateTaskView(persisted), current);
+
+  assert.deepEqual(
+    merged.slice(0, 5).map((node) => (
+      node.kind === "message"
+        ? `${node.source}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.source}:${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`
+    )),
+    [
+      "crabdb:user:msg-user:Run both checks",
+      "crabdb:assistant:msg-shared:First check is next.",
+      "crabdb:tool:first-check",
+      "crabdb:assistant:msg-shared:Second check is next.",
+      "crabdb:checkpoint:"
+    ]
+  );
+  assert.equal(
+    merged.some((node) => node.kind === "message" && node.source === "acp-live" && node.text === "Second check is"),
+    false
+  );
+  assert.deepEqual(merged.slice(0, 5).map((node) => node.timelineOrder), [1, 2, 3, 4, 5]);
+});
+
+test("keeps split live duplicated-message-id segments when CrabDB hydration is cumulative", () => {
+  const current: RenderNode[] = [
+    {
+      id: "message:assistant:msg-shared:1",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-cumulative-message-id",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-shared",
+      content: [{ type: "text", text: "Before the tool." }],
+      text: "Before the tool.",
+      streaming: false,
+      timelineOrder: 1
+    },
+    {
+      id: "tool:read-context",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-cumulative-message-id",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      acpToolCallId: "read-context",
+      toolCallId: "read-context",
+      title: "Read context",
+      toolKind: "read",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      timelineOrder: 2
+    },
+    {
+      id: "message:assistant:msg-shared:2",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-cumulative-message-id",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-shared",
+      content: [{ type: "text", text: "After the tool." }],
+      text: "After the tool.",
+      streaming: false,
+      timelineOrder: 3
+    }
+  ];
+  const hydrated: RenderNode[] = [
+    {
+      id: "crabdb-message:turn-cumulative-message-id:msg-shared",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-cumulative-message-id",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-shared",
+      content: [{ type: "text", text: "Before the tool. After the tool." }],
+      text: "Before the tool. After the tool.",
+      streaming: false,
+      timelineOrder: 1
+    },
+    {
+      id: "tool:read-context",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-cumulative-message-id",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      acpToolCallId: "read-context",
+      toolCallId: "read-context",
+      title: "Read context",
+      toolKind: "read",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      timelineOrder: 2
+    }
+  ];
+
+  const merged = mergeHydratedNodes(hydrated, current);
+
+  assert.deepEqual(
+    merged.slice(0, 3).map((node) => (
+      node.kind === "message"
+        ? `${node.source}:${node.text}`
+        : `${node.source}:${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`
+    )),
+    [
+      "acp-live:Before the tool.",
+      "crabdb:tool:read-context",
+      "acp-live:After the tool."
+    ]
+  );
+  assert.equal(
+    merged.some((node) => node.kind === "message" && node.source === "crabdb" && node.text === "Before the tool. After the tool."),
+    false
+  );
+  assert.deepEqual(merged.slice(0, 3).map((node) => node.timelineOrder), [1, 2, 3]);
 });
 
 test("hydrates duplicate tool ids across turns with unique render ids", () => {
@@ -1066,6 +2555,79 @@ test("hydrates reopened ACP turns by message-added event order around plan updat
   assert.equal(plan?.kind, "plan");
   if (plan?.kind !== "plan") {
     throw new Error("expected hydrated plan update");
+  }
+  assert.equal(plan.entries[0]?.title, "Inspect files");
+});
+
+test("infers persisted ACP plan events from event type and entries payload", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-plan-inferred",
+          status: "completed",
+          after_change: "ch_plan_inferred",
+          ended_at: 5
+        },
+        messages: [
+          {
+            message_id: "msg-user-plan-inferred",
+            role: "user",
+            body: "Please make a plan",
+            created_at: 1
+          },
+          {
+            message_id: "msg-after-plan-inferred",
+            role: "assistant",
+            body: "Plan is ready.",
+            created_at: 4
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-user-plan-inferred",
+            created_at: 1
+          },
+          {
+            event_type: "plan_update",
+            created_at: 2,
+            payload: {
+              entries: [
+                {
+                  title: "Inspect files",
+                  status: "pending"
+                }
+              ]
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-after-plan-inferred",
+            created_at: 4
+          }
+        ],
+        checkpoint: "ch_plan_inferred"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+
+  assert.deepEqual(
+    nodes.map((node) => (node.kind === "message" ? `${node.role}:${node.text}` : node.kind)),
+    [
+      "user:Please make a plan",
+      "plan",
+      "assistant:Plan is ready.",
+      "checkpoint"
+    ]
+  );
+  const plan = nodes[1];
+  assert.equal(plan?.kind, "plan");
+  if (plan?.kind !== "plan") {
+    throw new Error("expected inferred plan update");
   }
   assert.equal(plan.entries[0]?.title, "Inspect files");
 });

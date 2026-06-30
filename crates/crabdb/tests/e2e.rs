@@ -15060,7 +15060,11 @@ fn git_import_update_records_current_git_tracked_snapshot() {
 
     let no_change = db.git_import_update(Some("main"), None).unwrap();
     assert!(no_change.operation.is_none());
-    assert!(no_change.mapping.is_none());
+    let no_change_mapping = no_change.mapping.as_ref().unwrap();
+    assert_eq!(no_change_mapping.direction, "import");
+    assert_eq!(no_change_mapping.crab_change, imported_change);
+    assert_eq!(no_change_mapping.crab_root, no_change.root_id);
+    assert!(no_change_mapping.git_dirty);
     assert!(no_change.changed_paths.is_empty());
 
     fs::remove_file(temp.path().join("src/lib.rs")).unwrap();
@@ -15092,9 +15096,10 @@ fn git_import_update_records_current_git_tracked_snapshot() {
         .any(|path| path.path == "src/lib.rs"));
 
     let mappings = db.git_mappings(10).unwrap();
-    assert_eq!(mappings.len(), 3);
+    assert_eq!(mappings.len(), 4);
     assert_eq!(mappings[0].crab_change, deleted.operation.unwrap());
     assert_eq!(mappings[1].crab_change, imported_change);
+    assert_eq!(mappings[2].crab_change, imported_change);
 }
 
 #[cfg(unix)]
@@ -15183,6 +15188,71 @@ fn git_export_with_message_creates_commit_object_and_mapping() {
     assert_eq!(mappings[0].direction, "export");
     assert_eq!(mappings[0].git_head.as_deref(), Some(commit));
     assert_eq!(mappings[0].crab_change, exported_change);
+}
+
+#[test]
+fn git_export_uses_clean_head_mapping_for_delta_commit() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "crabdb@example.test"],
+    );
+    run_git(temp.path(), &["config", "user.name", "CrabDB Test"]);
+    fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
+    fs::write(temp.path().join("notes.md"), "alpha\n").unwrap();
+    run_git(temp.path(), &["add", "README.md", "notes.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    let git_head = git_output(temp.path(), &["rev-parse", "HEAD"]);
+
+    let init = CrabDb::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    let mapping = db.git_mappings(1).unwrap().pop().unwrap();
+    assert!(!mapping.git_dirty);
+    assert_eq!(mapping.git_head.as_deref(), Some(git_head.as_str()));
+
+    fs::write(temp.path().join("README.md"), "one\nTWO\n").unwrap();
+    fs::remove_file(temp.path().join("notes.md")).unwrap();
+    let record = db
+        .record(
+            Some("main"),
+            Some("rewrite readme and remove notes".to_string()),
+            Actor::human(),
+            false,
+        )
+        .unwrap();
+    let exported_change = record.operation.unwrap();
+    drop(db);
+    run_git(temp.path(), &["checkout", "--", "README.md", "notes.md"]);
+    assert!(git_output(
+        temp.path(),
+        &["status", "--porcelain", "--untracked-files=no"]
+    )
+    .is_empty());
+
+    let range = format!("{}..{}", init.operation.0, exported_change.0);
+    let exported = run_crabdb_json(
+        temp.path(),
+        &["git", "export", &range, "-m", "Export mapped delta"],
+    );
+    let commit = exported["commit"].as_str().unwrap();
+
+    assert_eq!(exported["parent"], git_head);
+    assert_eq!(
+        git_output(temp.path(), &["show", &format!("{commit}:README.md")]),
+        "one\nTWO"
+    );
+    let missing = Command::new("git")
+        .arg("-C")
+        .arg(temp.path())
+        .args(["show", &format!("{commit}:notes.md")])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
 }
 
 #[test]

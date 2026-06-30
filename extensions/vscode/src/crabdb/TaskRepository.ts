@@ -412,6 +412,12 @@ function normalizeTaskView(report: unknown, selector: string): TaskView {
   const transcript = asRecord(root.transcript);
   const acpSession = asRecord(transcript.acp_session);
   const turns = arrayField(transcript, "turns");
+  const turnMessages = turns.flatMap((turn) => arrayField(asRecord(turn), "messages"));
+  const turnEvents = turns.flatMap((turn) => arrayField(asRecord(turn), "events"));
+  const transcriptMessages = arrayField(transcript, "messages");
+  const transcriptEvents = arrayField(transcript, "events");
+  const rootMessages = transcriptMessages.length ? transcriptMessages : arrayField(root, "messages");
+  const rootEvents = transcriptEvents.length ? transcriptEvents : arrayField(root, "events");
   const review = asRecord(root.review);
   const readiness = asRecord(root.readiness);
   return {
@@ -422,8 +428,8 @@ function normalizeTaskView(report: unknown, selector: string): TaskView {
       workdir: task.workdir || stringField(acpSession, "cwd")
     },
     turns,
-    messages: turns.flatMap((turn) => arrayField(asRecord(turn), "messages")),
-    events: turns.flatMap((turn) => arrayField(asRecord(turn), "events")),
+    messages: turnMessages.length ? turnMessages : rootMessages,
+    events: turnEvents.length ? turnEvents : rootEvents,
     changes: arrayField(root, "changes").concat(arrayField(root, "changed_paths")).concat(arrayField(review, "changed_paths")),
     review: Object.keys(review).length ? review : undefined,
     readiness: Object.keys(readiness).length ? readiness : undefined,

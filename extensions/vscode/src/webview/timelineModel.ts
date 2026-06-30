@@ -64,6 +64,7 @@ export function transcriptTimelineNodes(nodes: RenderNode[]): RenderNode[] {
 export function timelineDisplayNodes(nodes: RenderNode[]): RenderNode[] {
   const visible = transcriptTimelineNodes(nodes);
   const approvalsByTool = approvalsByScopedToolCallId(visible);
+  const mergedApprovalIds = new Set([...approvalsByTool.values()].map((node) => node.id));
   const visibleToolKeys = new Set(
     visible
       .filter((node): node is Extract<RenderNode, { kind: "tool" }> => node.kind === "tool")
@@ -76,7 +77,7 @@ export function timelineDisplayNodes(nodes: RenderNode[]): RenderNode[] {
     }
     if (node.kind === "approval") {
       const key = approvalScopedToolCallKey(node);
-      if (key && visibleToolKeys.has(key)) {
+      if (key && visibleToolKeys.has(key) && mergedApprovalIds.has(node.id)) {
         return [];
       }
       return [approvalAsToolNode(node)];
@@ -98,11 +99,38 @@ function approvalsByScopedToolCallId(nodes: RenderNode[]): Map<string, Extract<R
       continue;
     }
     const key = approvalScopedToolCallKey(node);
-    if (key) {
+    const existing = key ? approvals.get(key) : undefined;
+    if (key && (!existing || shouldMergeApprovalIntoTool(node, existing))) {
       approvals.set(key, node);
     }
   }
   return approvals;
+}
+
+function shouldMergeApprovalIntoTool(
+  candidate: Extract<RenderNode, { kind: "approval" }>,
+  existing: Extract<RenderNode, { kind: "approval" }>
+): boolean {
+  const candidatePriority = approvalMergePriority(candidate);
+  const existingPriority = approvalMergePriority(existing);
+  if (candidatePriority !== existingPriority) {
+    return candidatePriority > existingPriority;
+  }
+  const candidateOrder = sortOrder(candidate);
+  const existingOrder = sortOrder(existing);
+  if (Number.isFinite(candidateOrder) && Number.isFinite(existingOrder) && candidateOrder !== existingOrder) {
+    return candidateOrder > existingOrder;
+  }
+  const candidateTime = sortTime(candidate);
+  const existingTime = sortTime(existing);
+  if (Number.isFinite(candidateTime) && Number.isFinite(existingTime) && candidateTime !== existingTime) {
+    return candidateTime > existingTime;
+  }
+  return true;
+}
+
+function approvalMergePriority(node: Extract<RenderNode, { kind: "approval" }>): number {
+  return node.status === "pending" || node.status === "in_progress" ? 2 : 1;
 }
 
 function approvalScopedToolCallKey(node: Extract<RenderNode, { kind: "approval" }>): string {
@@ -150,6 +178,7 @@ function approvalAsToolNode(node: Extract<RenderNode, { kind: "approval" }>): Ex
     provider: node.provider,
     source: node.source,
     status: node.status,
+    timelineOrder: node.timelineOrder ?? node.tool.timelineOrder,
     createdAt: node.createdAt || node.tool.createdAt,
     updatedAt: node.updatedAt,
     toolStatus,

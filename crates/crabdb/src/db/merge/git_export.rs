@@ -40,11 +40,30 @@ impl CrabDb {
                 "range `{range}` is not an ancestor range"
             )));
         }
-        let files = self.load_root_files(&right_ref.root_id)?;
-        let tree_oid = self.git_write_tree(&files)?;
-        let commit = self.git_commit_tree(&tree_oid, git_state.head.as_deref(), message)?;
         let operation = self.operation(&right_ref.change_id)?;
         let branch = operation.branch.clone();
+        let mut patch_left = BTreeMap::new();
+        let mut patch_right = BTreeMap::new();
+        let _diff = self.diff_root_file_maps(
+            &left_ref.root_id,
+            &right_ref.root_id,
+            &mut patch_left,
+            &mut patch_right,
+        )?;
+        let can_export_delta = git_state
+            .head
+            .as_deref()
+            .filter(|_| !git_state.dirty)
+            .map(|head| self.git_clean_head_matches_root_mapping(head, &left_ref.root_id))
+            .transpose()?
+            .unwrap_or(false);
+        let tree_oid = if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
+            self.git_write_tree_from_head_delta(head, &patch_left, &patch_right)?
+        } else {
+            let files = self.load_root_files(&right_ref.root_id)?;
+            self.git_write_tree(&files)?
+        };
+        let commit = self.git_commit_tree(&tree_oid, git_state.head.as_deref(), message)?;
         let mapping = self.insert_git_mapping_for_state(
             "export",
             &branch,
@@ -103,8 +122,12 @@ impl CrabDb {
         git_dirty: bool,
     ) -> Result<Option<GitMapping>> {
         let created_at = now_ts();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
         let seed = format!(
-            "{direction}:{branch}:{:?}:{}:{}:{created_at}",
+            "{direction}:{branch}:{:?}:{}:{}:{created_at}:{nonce}",
             git_head, change_id.0, root_id.0
         );
         let hash = sha256_hex(seed.as_bytes());
@@ -134,5 +157,23 @@ impl CrabDb {
             crab_root: root_id.clone(),
             created_at,
         }))
+    }
+
+    pub(crate) fn git_clean_head_matches_root_mapping(
+        &self,
+        git_head: &str,
+        root_id: &ObjectId,
+    ) -> Result<bool> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM git_mappings \
+                 WHERE git_head = ?1 AND git_dirty = 0 AND crab_root = ?2 \
+                 LIMIT 1",
+                params![git_head, root_id.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
     }
 }

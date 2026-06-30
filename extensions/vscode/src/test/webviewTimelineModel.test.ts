@@ -220,6 +220,110 @@ test("keeps reused tool approvals visible when their matching tool is absent in 
   assert.equal(displayed[1]?.kind === "tool" ? displayed[1].permission?.requestId : undefined, "approval-later");
 });
 
+test("preserves standalone approval timeline order when converting it to a tool row", () => {
+  const before: RenderNode = {
+    ...base,
+    id: "message:before-approval",
+    kind: "message",
+    role: "assistant",
+    content: [{ type: "text", text: "I need permission." }],
+    text: "I need permission.",
+    streaming: false,
+    timelineOrder: 1
+  };
+  const approval: RenderNode = {
+    ...base,
+    id: "approval:ordered",
+    kind: "approval",
+    requestId: "approval-ordered",
+    title: "Allow command",
+    tool: {
+      ...base,
+      id: "tool:ordered-approval",
+      kind: "tool",
+      toolCallId: "ordered-approval",
+      title: "Run command",
+      toolKind: "execute",
+      toolStatus: "pending",
+      locations: [],
+      content: []
+    },
+    options: [{ optionId: "allow", label: "Allow" }],
+    status: "pending",
+    timelineOrder: 2
+  };
+  const after: RenderNode = {
+    ...base,
+    id: "message:after-approval",
+    kind: "message",
+    role: "assistant",
+    content: [{ type: "text", text: "Permission is pending." }],
+    text: "Permission is pending.",
+    streaming: false,
+    timelineOrder: 3
+  };
+
+  const displayed = timelineDisplayNodes([after, approval, before]);
+  const approvalRow = displayed.find((node) => node.id === "approval:ordered");
+  const ordered = sortTimelineNodes(displayed);
+
+  assert.equal(approvalRow?.timelineOrder, 2);
+  assert.deepEqual(ordered.map((node) => node.id), [
+    "message:before-approval",
+    "approval:ordered",
+    "message:after-approval"
+  ]);
+});
+
+test("keeps extra same-tool approval events visible when one approval is merged into the tool", () => {
+  const tool: RenderNode = {
+    ...base,
+    id: "tool:repeated-approval",
+    kind: "tool",
+    turnId: "turn-approval-repeat",
+    acpSessionId: "session-1",
+    toolCallId: "repeated-approval-tool",
+    title: "Run repeated approval tool",
+    toolKind: "execute",
+    toolStatus: "pending",
+    locations: [],
+    content: [],
+    timelineOrder: 1
+  };
+  const resolvedApproval: RenderNode = {
+    ...base,
+    id: "approval:repeated-resolved",
+    kind: "approval",
+    turnId: "turn-approval-repeat",
+    acpSessionId: "session-1",
+    requestId: "approval-resolved",
+    title: "Resolved approval",
+    tool,
+    options: [{ optionId: "allow", label: "Allow" }],
+    status: "completed",
+    timelineOrder: 2
+  };
+  const pendingApproval: RenderNode = {
+    ...resolvedApproval,
+    id: "approval:repeated-pending",
+    requestId: "approval-pending",
+    title: "Pending approval",
+    status: "pending",
+    timelineOrder: 3
+  };
+
+  const displayed = timelineDisplayNodes([tool, resolvedApproval, pendingApproval]);
+
+  assert.deepEqual(displayed.map((node) => node.id), ["tool:repeated-approval", "approval:repeated-resolved"]);
+  assert.equal(displayed[0]?.kind, "tool");
+  assert.equal(displayed[1]?.kind, "tool");
+  if (displayed[0]?.kind !== "tool" || displayed[1]?.kind !== "tool") {
+    throw new Error("expected merged and standalone approval tool rows");
+  }
+  assert.equal(displayed[0].permission?.requestId, "approval-pending");
+  assert.equal(displayed[1].permission?.requestId, "approval-resolved");
+});
+
 test("removes internal session controls from transcript-visible nodes", () => {
   const providerEvent: RenderNode = {
     ...base,
