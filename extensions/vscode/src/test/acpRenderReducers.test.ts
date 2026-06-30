@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applyRenderPatches,
+  applyRenderPatchesAndCollect,
   reducePermissionRequest,
   reduceSessionUpdate,
+  renderNodeSnapshotPatches,
   sessionControlsToPatches
 } from "../shared/acpRenderReducers";
-import type { RenderReduceContext } from "../shared/renderModel";
+import type { RenderNode, RenderReduceContext } from "../shared/renderModel";
 
 const context: RenderReduceContext = {
   taskId: "task-1",
@@ -96,6 +98,86 @@ test("keeps distinct streamed message ids separate", () => {
   assert.equal(nodes.length, 2);
   assert.equal(nodes[0]?.id, "message:assistant:msg-1");
   assert.equal(nodes[1]?.id, "message:assistant:msg-2");
+});
+
+test("skips snapshot patches for semantically identical render nodes", () => {
+  const node: RenderNode = {
+    id: "message:assistant:stable",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    source: "crabdb",
+    status: "completed",
+    raw: { z: 2, a: 1 },
+    role: "assistant",
+    content: [{ type: "text", text: "Stable" }],
+    text: "Stable",
+    streaming: false,
+    timelineOrder: 1
+  };
+
+  assert.deepEqual(renderNodeSnapshotPatches([node], [{ ...node, raw: { a: 1, z: 2 } }]), []);
+});
+
+test("converts refreshed render snapshots into applicable patches", () => {
+  const liveMessage: RenderNode = {
+    id: "message:assistant:live",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-1",
+    source: "acp-live",
+    status: "completed",
+    role: "assistant",
+    content: [{ type: "text", text: "Done" }],
+    text: "Done",
+    streaming: false,
+    timelineOrder: 1
+  };
+  const tool: RenderNode = {
+    id: "tool:run-tests",
+    kind: "tool",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-1",
+    source: "acp-live",
+    status: "in_progress",
+    toolCallId: "run-tests",
+    title: "Run tests",
+    toolKind: "execute",
+    toolStatus: "in_progress",
+    locations: [],
+    content: [],
+    timelineOrder: 2
+  };
+  const completedTool: RenderNode = {
+    ...tool,
+    source: "crabdb",
+    status: "completed",
+    toolStatus: "completed"
+  };
+  const checkpoint: RenderNode = {
+    id: "crabdb-checkpoint:turn-1",
+    kind: "checkpoint",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-1",
+    source: "crabdb",
+    status: "completed",
+    checkpointId: "ch_1",
+    label: "Checkpoint ch_1",
+    timelineOrder: 3
+  };
+
+  const before = [liveMessage, tool];
+  const next = [completedTool, checkpoint];
+  const patches = renderNodeSnapshotPatches(before, next);
+
+  assert.deepEqual(
+    patches.map((patch) => `${patch.type}:${patch.node?.id || patch.id}`),
+    ["remove:message:assistant:live", "replace:tool:run-tests", "upsert:crabdb-checkpoint:turn-1"]
+  );
+  assert.deepEqual(applyRenderPatches(before, patches), next);
 });
 
 test("keeps anonymous streamed assistant messages in tool-interleaved timeline order", () => {
@@ -463,6 +545,48 @@ test("syncs expanded terminal status from status-only tool updates", () => {
   const tool = nodes.find((node) => node.kind === "tool");
   assert.equal(tool?.kind, "tool");
   assert.equal((tool?.content[0] as Record<string, unknown> | undefined)?.status, "completed");
+});
+
+test("collects actual applied patches while reducing tool-linked terminal changes", () => {
+  let nodes = applyRenderPatches(
+    [],
+    reduceSessionUpdate(
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-terminal-collect",
+        title: "Run git status",
+        kind: "execute",
+        status: "in_progress",
+        content: [
+          {
+            type: "terminal",
+            terminalId: "term-collect",
+            command: ["git", "status", "--short"]
+          }
+        ]
+      },
+      context
+    )
+  );
+
+  const update = reduceSessionUpdate(
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool-terminal-collect",
+      status: "completed"
+    },
+    context
+  );
+  const applied = applyRenderPatchesAndCollect(nodes, update);
+  nodes = applied.nodes;
+
+  assert.deepEqual(
+    applied.patches.map((patch) => patch.node?.id || patch.id).sort(),
+    ["terminal:term-collect", "tool:tool-terminal-collect"].sort()
+  );
+  const terminal = nodes.find((node) => node.kind === "terminal");
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.status, "completed");
 });
 
 test("merges repeated terminal updates without dropping prior command metadata", () => {

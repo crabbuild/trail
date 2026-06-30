@@ -1,14 +1,16 @@
 import * as React from "react"
+import { Accordion as AccordionPrimitive } from "@base-ui/react/accordion"
 import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
+import { ChevronDown, ChevronUp, Copy } from "lucide-react"
 
 import {
   Accordion,
   AccordionContent,
-  AccordionItem,
-  AccordionTrigger
+  AccordionItem
 } from "@/webview/components/ui/accordion"
 import { Badge } from "@/webview/components/ui/badge"
+import { Button } from "@/webview/components/ui/button"
 import { cn } from "@/webview/lib/utils"
 
 export interface TimelineGroupCardProps {
@@ -17,7 +19,7 @@ export interface TimelineGroupCardProps {
   detail: string
   status: string
   statusLabel: string
-  laneLabel: string
+  laneId: string
   iconHtml: string
   bodyItems: TimelineGroupBodyItem[]
   open: boolean
@@ -32,6 +34,7 @@ export interface TimelineGroupBodyItem {
 
 export interface MountTimelineGroupsOptions {
   getProps(id: string): TimelineGroupCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -46,24 +49,50 @@ export function TimelineGroupCard({ props }: { props: TimelineGroupCardProps }) 
   return (
     <Accordion className="timeline-group-accordion" defaultValue={props.open ? [props.id] : undefined}>
       <AccordionItem className="timeline-group-item" value={props.id}>
-        <AccordionTrigger className="timeline-group-summary">
-          <span
-            className="summary-icon"
-            dangerouslySetInnerHTML={{ __html: props.iconHtml }}
-          />
-          <span className="timeline-group-main">
-            <span className="timeline-group-title">{props.label}</span>
-            <span className="timeline-group-detail">{props.detail}</span>
-          </span>
-          <span className="timeline-group-meta">
-            <Badge className={cn("tool-status", `tool-status-${props.status}`)} variant="outline">
-              {props.statusLabel}
-            </Badge>
-            <Badge className="event-chip" variant="outline">
-              {props.laneLabel}
-            </Badge>
-          </span>
-        </AccordionTrigger>
+        <AccordionPrimitive.Header className="timeline-group-header">
+          <AccordionPrimitive.Trigger
+            data-slot="accordion-trigger"
+            className="timeline-group-summary"
+          >
+            <span
+              className="summary-icon timeline-group-icon"
+              dangerouslySetInnerHTML={{ __html: props.iconHtml }}
+            />
+            <span className="timeline-group-main">
+              <span className="timeline-group-title">{props.label}</span>
+              <span className="timeline-group-detail">{props.detail}</span>
+            </span>
+            <span className="timeline-group-meta">
+              <Badge className={cn("tool-status", `tool-status-${props.status}`)} variant="outline">
+                {props.statusLabel}
+              </Badge>
+            </span>
+            <span className="timeline-group-disclosure" aria-hidden="true">
+              <ChevronDown
+                data-slot="accordion-trigger-icon"
+                className="timeline-group-disclosure-down"
+              />
+              <ChevronUp
+                data-slot="accordion-trigger-icon"
+                className="timeline-group-disclosure-up"
+              />
+            </span>
+          </AccordionPrimitive.Trigger>
+          {props.laneId ? (
+            <Button
+              type="button"
+              className="timeline-group-copy-id"
+              data-action="copyTimelineGroupId"
+              data-target={props.laneId}
+              variant="ghost"
+              size="icon-xs"
+              title="Copy ID"
+              aria-label="Copy ID"
+            >
+              <Copy data-icon="inline-start" aria-hidden="true" />
+            </Button>
+          ) : null}
+        </AccordionPrimitive.Header>
         <AccordionContent className="timeline-group-body" keepMounted>
           {props.bodyItems.map((item) => (
             <TimelineGroupBodySlot key={item.id} item={item} />
@@ -82,7 +111,7 @@ function TimelineGroupBodySlot({ item }: { item: TimelineGroupBodyItem }) {
       data-node-id={item.id}
     >
       {item.preserveDom ? (
-        <StableHtmlSlot slotId={item.id} html={item.html} />
+        <StableHtmlSlot shellSignature={stableHtmlShellSignature(item.html)} slotId={item.id} html={item.html} />
       ) : (
         <div className="stable-html-slot" dangerouslySetInnerHTML={{ __html: item.html }} />
       )}
@@ -93,14 +122,30 @@ function TimelineGroupBodySlot({ item }: { item: TimelineGroupBodyItem }) {
 const StableHtmlSlot = React.memo(
   function StableHtmlSlot({
     html,
+    shellSignature: _shellSignature,
     slotId
   }: {
     html: string
+    shellSignature: string
     slotId: string
   }) {
-    return <div className="stable-html-slot" data-stable-html-slot={slotId} dangerouslySetInnerHTML={{ __html: html }} />
+    const rootRef = React.useRef<HTMLDivElement | null>(null)
+    const initialHtml = React.useRef(html)
+
+    React.useLayoutEffect(() => {
+      syncStableHtmlShell(rootRef.current, html)
+    }, [html, _shellSignature])
+
+    return (
+      <div
+        ref={rootRef}
+        className="stable-html-slot"
+        data-stable-html-slot={slotId}
+        dangerouslySetInnerHTML={{ __html: initialHtml.current }}
+      />
+    )
   },
-  (previous, next) => previous.slotId === next.slotId
+  (previous, next) => previous.slotId === next.slotId && previous.shellSignature === next.shellSignature
 )
 
 export function mountTimelineGroups(options: MountTimelineGroupsOptions): void {
@@ -109,6 +154,10 @@ export function mountTimelineGroups(options: MountTimelineGroupsOptions): void {
     document.querySelectorAll<HTMLElement>("[data-timeline-group-root]").forEach((element) => {
       const id = element.dataset.timelineGroupId
       if (!id) {
+        return
+      }
+      if (options.ids && !options.ids.has(id)) {
+        activeIds.add(id)
         return
       }
       const props = options.getProps(id)
@@ -155,14 +204,50 @@ function timelineGroupPropsSignature(props: TimelineGroupCardProps): string {
     detail: props.detail,
     status: props.status,
     statusLabel: props.statusLabel,
-    laneLabel: props.laneLabel,
+    laneId: props.laneId,
     iconHtml: props.iconHtml,
     open: props.open,
     bodyItems: props.bodyItems.map((item) => ({
       id: item.id,
       className: item.className,
       preserveDom: item.preserveDom,
-      html: item.preserveDom ? undefined : item.html
+      html: item.preserveDom ? stableHtmlShellSignature(item.html) : item.html
     }))
   })
+}
+
+function stableHtmlShellSignature(html: string): string {
+  return html.trim().match(/^<([a-z][\w:-]*)(?:\s[^>]*)?>/i)?.[0] ?? html
+}
+
+function syncStableHtmlShell(root: HTMLDivElement | null, html: string): void {
+  if (!root) {
+    return
+  }
+  const next = stableHtmlFirstElement(html)
+  const current = root.firstElementChild
+  if (!next || !current || next.tagName !== current.tagName) {
+    root.innerHTML = html
+    return
+  }
+  syncElementAttributes(current, next)
+}
+
+function stableHtmlFirstElement(html: string): Element | undefined {
+  const template = document.createElement("template")
+  template.innerHTML = html.trim()
+  return template.content.firstElementChild ?? undefined
+}
+
+function syncElementAttributes(current: Element, next: Element): void {
+  for (const attr of Array.from(current.attributes)) {
+    if (!next.hasAttribute(attr.name)) {
+      current.removeAttribute(attr.name)
+    }
+  }
+  for (const attr of Array.from(next.attributes)) {
+    if (current.getAttribute(attr.name) !== attr.value) {
+      current.setAttribute(attr.name, attr.value)
+    }
+  }
 }

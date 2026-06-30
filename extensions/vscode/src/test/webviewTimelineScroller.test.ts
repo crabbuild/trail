@@ -48,8 +48,10 @@ test("configures shadcn message scroller for AI chat transcripts", () => {
   assert.match(timelineScrollerSource, /defaultScrollPosition="last-anchor"/);
   assert.match(timelineScrollerSource, /scrollPreviousItemPeek=\{TIMELINE_PREVIOUS_ITEM_PEEK\}/);
   assert.match(timelineScrollerSource, /React\.memo\([\s\S]*StableHtmlSlot/);
-  assert.match(timelineScrollerSource, /previous\.slotId === next\.slotId/);
-  assert.match(timelineScrollerSource, /html: item\.preserveDom \? undefined : item\.html/);
+  assert.match(timelineScrollerSource, /previous\.slotId === next\.slotId && previous\.shellSignature === next\.shellSignature/);
+  assert.match(timelineScrollerSource, /React\.useLayoutEffect\([\s\S]*syncStableHtmlShell/);
+  assert.match(timelineScrollerSource, /function syncElementAttributes/);
+  assert.match(timelineScrollerSource, /html: item\.preserveDom \? stableHtmlShellSignature\(item\.html\) : item\.html/);
   assert.match(messageScrollerSource, /cn-message-scroller-viewport/);
   assert.match(messageScrollerSource, /\[contain-intrinsic-size:auto_10rem\] \[content-visibility:auto\]/);
 });

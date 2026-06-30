@@ -32,6 +32,7 @@ import {
   approvalDecisionDescription,
   approvalDecisionTone,
   approvalImpactText,
+  approvalActionLabel,
   approvalStateLabel,
   approvalTone,
   type ApprovalDecisionTone
@@ -81,6 +82,8 @@ import type {
   ToolCallCardLocation,
   ToolCallCardProps
 } from "./ToolCallCard";
+import type { ToolCallGroupCardProps } from "./ToolCallGroupCard";
+import { summarizeToolCallGroup } from "./toolCallGroupSummary";
 import type { EmptyStateAction, EmptyStateCardProps } from "./EmptyStateCard";
 import type { ComposerCardProps } from "./ComposerCard";
 import type { EventCardAction, EventCardFact, EventCardProps } from "./EventCard";
@@ -90,9 +93,10 @@ import type { PayloadDisclosureProps } from "./PayloadDisclosure";
 import type { PlanCardProps } from "./PlanCard";
 import type { RawDetailsView } from "./RawDetails";
 import {
-  applyRenderPatchesLocally,
   changedRenderNodes,
-  isLiveNodePatchPayload,
+  applyRenderPatchesLocally,
+  changedRenderNodesFromPatches,
+  isHydratableNodePatchPayload,
   parseBaseRenderRevision,
   parseRenderRevision,
   renderPatchBatchDecision,
@@ -191,11 +195,17 @@ interface PendingDiffPreview {
   path: string;
   oldText: string;
   newText: string;
+  compact?: boolean | undefined;
   patch?: string | undefined;
   additions?: number | undefined;
   deletions?: number | undefined;
   nodeId?: string | undefined;
   title?: string | undefined;
+}
+
+type StreamingMarkdownTarget = HTMLElement & {
+  __crabdbQueueStreamdownText?: ((text: string) => void) | undefined;
+  __crabdbStreamingText?: string | undefined;
 }
 
 const vscode = acquireVsCodeApi();
@@ -208,6 +218,10 @@ const FLOATING_DETAILS_SELECTOR = ".composer-controls,.header-details,.toolbar-c
 const DRAWER_FOCUSABLE_SELECTOR =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),audio[controls],video[controls],[tabindex]:not([tabindex="-1"])';
 const STREAM_RENDER_INTERVAL_MS = 80;
+const CRABDB_STREAMDOWN_UPDATE_EVENT = "crabdb-streamdown-update";
+
+installFrameBatchedResizeObserver();
+
 let highlightModulePromise: Promise<typeof import("./highlight.js")> | undefined;
 let diffModelModulePromise: Promise<typeof import("./diffModel.js")> | undefined;
 let diffEnhancerModulePromise: Promise<typeof import("./diffEnhancer.js")> | undefined;
@@ -234,6 +248,7 @@ let timelineGroupModulePromise: Promise<typeof import("./TimelineGroup.js")> | u
 let timelineNavigationModulePromise: Promise<typeof import("./TimelineNavigation.js")> | undefined;
 let timelineScrollerModulePromise: Promise<typeof import("./TimelineScroller.js")> | undefined;
 let toolCallCardModulePromise: Promise<typeof import("./ToolCallCard.js")> | undefined;
+let toolCallGroupCardModulePromise: Promise<typeof import("./ToolCallGroupCard.js")> | undefined;
 let diffPreviewCounter = 0;
 let diffRenderEpoch = 0;
 let renderEpoch = 0;
@@ -242,7 +257,18 @@ let renderAnimationFrameHandle: number | undefined;
 let renderScheduled = false;
 let lastRenderAt = 0;
 let patchedNodeHydrationFrameHandle: number | undefined;
+let timelineStructureHydrationFrameHandle: number | undefined;
+let chromeHydrationFrameHandle: number | undefined;
 const pendingPatchedNodeIds = new Set<string>();
+let pendingPatchedNodeBottomLock = false;
+let pendingTimelineStructureChromeHydration = false;
+let timelineBottomLockContent: Element | undefined;
+let timelineBottomLockCleanup: (() => void) | undefined;
+let timelineBottomLockFrameHandle: number | undefined;
+let timelineBottomLockObserver: ResizeObserver | undefined;
+let timelineBottomLockPinned = true;
+let timelineBottomLockTimeline: HTMLElement | undefined;
+let timelineBottomLockUserPauseUntil = 0;
 let pendingDiffPreviews: PendingDiffPreview[] = [];
 let composerCardProps: ComposerCardProps | undefined;
 let diffCardProps = new Map<string, DiffCardProps>();
@@ -262,6 +288,7 @@ let timelineGroupProps = new Map<string, TimelineGroupCardProps>();
 let timelineNavigationProps: TimelineNavigationProps | undefined;
 let timelineScrollerProps: TimelineScrollerProps | undefined;
 let toolCallCardProps = new Map<string, ToolCallCardProps>();
+let toolCallGroupCardProps = new Map<string, ToolCallGroupCardProps>();
 let state: WebviewState = {
   nodes: []
 };
@@ -310,6 +337,7 @@ let timelineFilter: TimelineFilter = "all";
 let timelineQuery = "";
 let drawerRestoreFocus: HTMLElement | undefined;
 let renderResyncRequested = false;
+let lastPersistedWebviewStateJson = "";
 const restoredState = vscode.getState() as
   | { composerDraft?: string; composerSendMode?: unknown; reviewVisible?: boolean; timelineFilter?: unknown; timelineQuery?: unknown }
   | undefined;
@@ -329,9 +357,72 @@ if (typeof restoredState?.timelineQuery === "string") {
   timelineQuery = restoredState.timelineQuery;
 }
 
+interface FrameBatchedResizeObserverConstructor {
+  new (callback: ResizeObserverCallback): ResizeObserver;
+  __crabdbFrameBatched?: true | undefined;
+}
+
+function installFrameBatchedResizeObserver(): void {
+  if (typeof ResizeObserver === "undefined") {
+    return;
+  }
+  const NativeResizeObserver = window.ResizeObserver as FrameBatchedResizeObserverConstructor;
+  if (NativeResizeObserver.__crabdbFrameBatched) {
+    return;
+  }
+  class FrameBatchedResizeObserver implements ResizeObserver {
+    private frameHandle: number | undefined;
+    private readonly nativeObserver: ResizeObserver;
+    private readonly pendingEntries = new Map<Element, ResizeObserverEntry>();
+
+    constructor(callback: ResizeObserverCallback) {
+      this.nativeObserver = new NativeResizeObserver((entries) => {
+        for (const entry of entries) {
+          this.pendingEntries.set(entry.target, entry);
+        }
+        if (this.frameHandle !== undefined) {
+          return;
+        }
+        this.frameHandle = window.requestAnimationFrame(() => {
+          this.frameHandle = undefined;
+          const deliveredEntries = [...this.pendingEntries.values()];
+          this.pendingEntries.clear();
+          if (deliveredEntries.length) {
+            callback(deliveredEntries, this);
+          }
+        });
+      });
+    }
+
+    observe(target: Element, options?: ResizeObserverOptions): void {
+      this.nativeObserver.observe(target, options);
+    }
+
+    unobserve(target: Element): void {
+      this.nativeObserver.unobserve(target);
+      this.pendingEntries.delete(target);
+    }
+
+    disconnect(): void {
+      if (this.frameHandle !== undefined) {
+        window.cancelAnimationFrame(this.frameHandle);
+        this.frameHandle = undefined;
+      }
+      this.pendingEntries.clear();
+      this.nativeObserver.disconnect();
+    }
+  }
+  (FrameBatchedResizeObserver as FrameBatchedResizeObserverConstructor).__crabdbFrameBatched = true;
+  window.ResizeObserver = FrameBatchedResizeObserver as unknown as typeof ResizeObserver;
+}
+
 window.addEventListener("message", (event: MessageEvent) => {
   const message = event.data as { type: string; [key: string]: unknown };
   if (message.type === "state") {
+    const previousState = state;
+    const previousChromeSignature = chromeStateSignature(previousState);
+    const previousTimelineSignature = timelineFrameStateSignature(previousState);
+    const beforeNodes = state.nodes;
     const renderRevision = parseRenderRevision(message.renderRevision);
     if (!shouldAcceptRenderRevision(renderRevision, latestRenderRevision)) {
       return;
@@ -359,14 +450,19 @@ window.addEventListener("message", (event: MessageEvent) => {
       capabilities: asCapabilityState(message.capabilities),
       permissionPending: Boolean(message.permissionPending)
     };
+    const changes = changedRenderNodes(new Map(beforeNodes.map((node) => [node.id, node])), state.nodes);
     if (state.permissionPending) {
       announcement = "Permission request pending.";
     } else if (state.sending) {
       announcement = "Prompt running.";
     }
     persistWebviewState();
-
-    scheduleRender();
+    routeRenderChanges({
+      beforeNodes,
+      changes,
+      chromeStateChanged: previousChromeSignature !== chromeStateSignature(state),
+      timelineFrameStateChanged: previousTimelineSignature !== timelineFrameStateSignature(state)
+    });
     return;
   }
 
@@ -478,8 +574,8 @@ document.addEventListener("click", (event) => {
     vscode.postMessage({ type: "openTerminal", nodeId: action.dataset.nodeId });
   } else if (name === "focusToolDiff") {
     focusToolDiff(action);
-  } else if (name === "inspectToolDetails") {
-    inspectToolDetails(action);
+  } else if (name === "copyTimelineGroupId") {
+    void copyTimelineGroupId(action);
   } else if (name === "copyCheckpoint") {
     void copyCheckpoint(action);
   } else if (name === "copyCode") {
@@ -651,8 +747,19 @@ interface RenderPass {
   diffEpoch: number;
 }
 
+interface PatchedTimelineHydrationTargets {
+  groupIds: Set<string>;
+  inlineActionIds: Set<string>;
+  nodeIds: Set<string>;
+  payloadDisclosureIds: Set<string>;
+  toolGroupIds: Set<string>;
+  needsDiffHydration: boolean;
+}
+
 function scheduleRender(): void {
   cancelPatchedNodeHydration();
+  cancelTimelineStructureHydration();
+  cancelChromeHydration();
   if (renderScheduled) {
     return;
   }
@@ -695,32 +802,26 @@ function applyRenderPatchMessage(message: { [key: string]: unknown }): void {
     return;
   }
   const patches = Array.isArray(message.patches) ? (message.patches as RenderPatch[]) : [];
-  if (!patches.length) {
-    return;
-  }
+  const previousState = state;
+  const previousChromeSignature = chromeStateSignature(previousState);
+  const previousTimelineSignature = timelineFrameStateSignature(previousState);
   const beforeNodes = state.nodes;
-  const beforeById = new Map(beforeNodes.map((node) => [node.id, node]));
   const nextNodes = applyRenderPatchesLocally(beforeNodes, patches);
-  const changes = changedRenderNodes(beforeById, nextNodes);
-  state = {
-    ...state,
-    renderRevision,
-    nodes: nextNodes,
-    sending: typeof message.sending === "boolean" ? message.sending : state.sending,
-    permissionPending: typeof message.permissionPending === "boolean" ? message.permissionPending : state.permissionPending
-  };
+  const changes = changedRenderNodesFromPatches(beforeNodes, patches);
+  state = stateWithRenderPatchMetadata(message, renderRevision, nextNodes);
   latestRenderRevision = renderRevision;
   if (state.permissionPending) {
     announcement = "Permission request pending.";
   } else if (state.sending) {
     announcement = "Prompt running.";
   }
-  persistWebviewState();
-  if (canHydratePatchedNodes(patches, changes)) {
-    schedulePatchedNodeHydration(changes.changedNodeIds);
-    return;
-  }
-  scheduleRender();
+  routeRenderChanges({
+    beforeNodes,
+    changes,
+    patches,
+    chromeStateChanged: previousChromeSignature !== chromeStateSignature(state),
+    timelineFrameStateChanged: previousTimelineSignature !== timelineFrameStateSignature(state)
+  });
 }
 
 function requestRenderStateResync(): void {
@@ -734,8 +835,190 @@ function requestRenderStateResync(): void {
   }, 250);
 }
 
+function stateWithRenderPatchMetadata(
+  message: { [key: string]: unknown },
+  renderRevision: number,
+  nodes: RenderNode[]
+): WebviewState {
+  return {
+    ...state,
+    renderRevision,
+    nodes,
+    task: messageHasField(message, "task") ? (message.task as WebviewState["task"]) : state.task,
+    taskView: messageHasField(message, "taskView") ? message.taskView : state.taskView,
+    taskOverlaps: messageHasField(message, "taskOverlaps")
+      ? Array.isArray(message.taskOverlaps)
+        ? (message.taskOverlaps as TaskOverlapView[])
+        : []
+      : state.taskOverlaps,
+    attachments: messageHasField(message, "attachments")
+      ? Array.isArray(message.attachments)
+        ? (message.attachments as WebviewState["attachments"])
+        : []
+      : state.attachments,
+    sending: typeof message.sending === "boolean" ? message.sending : state.sending,
+    provider: typeof message.provider === "string" ? message.provider : state.provider,
+    providerId: typeof message.providerId === "string" ? message.providerId : state.providerId,
+    providers: messageHasField(message, "providers")
+      ? Array.isArray(message.providers)
+        ? (message.providers as WebviewState["providers"])
+        : []
+      : state.providers,
+    acpSessionId: typeof message.acpSessionId === "string" ? message.acpSessionId : state.acpSessionId,
+    persistedAcpSessionId:
+      typeof message.persistedAcpSessionId === "string" ? message.persistedAcpSessionId : state.persistedAcpSessionId,
+    acpStartMode: isAcpStartMode(message.acpStartMode) ? message.acpStartMode : state.acpStartMode,
+    requestedAcpSessionId:
+      typeof message.requestedAcpSessionId === "string" ? message.requestedAcpSessionId : state.requestedAcpSessionId,
+    providerSwitchFrom:
+      typeof message.providerSwitchFrom === "string" ? message.providerSwitchFrom : state.providerSwitchFrom,
+    providerFailure: messageHasField(message, "providerFailure") ? asProviderFailure(message.providerFailure) : state.providerFailure,
+    capabilities: messageHasField(message, "capabilities") ? asCapabilityState(message.capabilities) : state.capabilities,
+    permissionPending: typeof message.permissionPending === "boolean" ? message.permissionPending : state.permissionPending
+  };
+}
+
+function messageHasField(message: { [key: string]: unknown }, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(message, key);
+}
+
+function routeRenderChanges({
+  beforeNodes,
+  changes,
+  chromeStateChanged,
+  patches,
+  timelineFrameStateChanged
+}: {
+  beforeNodes: RenderNode[];
+  changes: RenderPatchChanges;
+  chromeStateChanged: boolean;
+  patches?: RenderPatch[] | undefined;
+  timelineFrameStateChanged: boolean;
+}): void {
+  const visibleChanges = filterRenderPatchChanges(beforeNodes, state.nodes, changes, isTimelineVisibleNode);
+  const hiddenStateChanged = hasRenderPatchChange(beforeNodes, state.nodes, changes, isHiddenChromeNode);
+  const needsChromeHydration = chromeStateChanged || hiddenStateChanged;
+  const localPayloads = patches ? patches.every(isLocallyHydratablePatchPayload) : true;
+
+  if (!existingShellCanHydrate() || renderScheduled) {
+    scheduleRender();
+    return;
+  }
+  if (timelineSearchTokens(timelineQuery).length) {
+    scheduleRender();
+    return;
+  }
+  if (!localPayloads) {
+    scheduleRender();
+    return;
+  }
+
+  if (timelineFrameStateChanged) {
+    scheduleTimelineStructureHydration({ includeChrome: needsChromeHydration });
+    return;
+  }
+  if (hasAnyPatchChanges(visibleChanges)) {
+    if (canHydratePatchedNodes(visibleChanges)) {
+      const immediateStreamingNodeIds = streamingTextDomPatchableNodeIds(visibleChanges);
+      const keepBottomForDeferredNodes =
+        Boolean(immediateStreamingNodeIds.size) && isTimelinePinnedToBottom(document.querySelector<HTMLElement>(".timeline"));
+      if (immediateStreamingNodeIds.size) {
+        applyStreamingTextDomPatchesImmediately(immediateStreamingNodeIds);
+      }
+      const deferredNodeIds = changedNodeIdsWithout(visibleChanges.changedNodeIds, immediateStreamingNodeIds);
+      if (deferredNodeIds.size) {
+        schedulePatchedNodeHydration(deferredNodeIds, { lockBottom: keepBottomForDeferredNodes });
+      }
+      if (needsChromeHydration) {
+        scheduleChromeHydration();
+      }
+      return;
+    }
+    if (canHydrateTimelineStructure(visibleChanges)) {
+      scheduleTimelineStructureHydration({ includeChrome: needsChromeHydration });
+      return;
+    }
+    scheduleRender();
+    return;
+  }
+  if (needsChromeHydration) {
+    scheduleChromeHydration();
+    return;
+  }
+}
+
+function filterRenderPatchChanges(
+  beforeNodes: RenderNode[],
+  nextNodes: RenderNode[],
+  changes: RenderPatchChanges,
+  predicate: (node: RenderNode) => boolean
+): RenderPatchChanges {
+  const beforeById = new Map(beforeNodes.map((node) => [node.id, node]));
+  const nextById = new Map(nextNodes.map((node) => [node.id, node]));
+  const keep = (id: string) => {
+    const node = nextById.get(id) || beforeById.get(id);
+    return node ? predicate(node) : true;
+  };
+  return {
+    changedNodeIds: new Set([...changes.changedNodeIds].filter(keep)),
+    addedNodeIds: new Set([...changes.addedNodeIds].filter(keep)),
+    removedNodeIds: new Set([...changes.removedNodeIds].filter(keep))
+  };
+}
+
+function hasRenderPatchChange(
+  beforeNodes: RenderNode[],
+  nextNodes: RenderNode[],
+  changes: RenderPatchChanges,
+  predicate: (node: RenderNode) => boolean
+): boolean {
+  return hasAnyPatchChanges(filterRenderPatchChanges(beforeNodes, nextNodes, changes, predicate));
+}
+
+function hasAnyPatchChanges(changes: RenderPatchChanges): boolean {
+  return Boolean(changes.changedNodeIds.size || changes.addedNodeIds.size || changes.removedNodeIds.size);
+}
+
+function isTimelineVisibleNode(node: RenderNode): boolean {
+  return !HIDDEN.has(node.kind);
+}
+
+function isHiddenChromeNode(node: RenderNode): boolean {
+  return HIDDEN.has(node.kind);
+}
+
+function isLocallyHydratablePatchPayload(patch: RenderPatch): boolean {
+  return patch.type === "remove" || isHydratableNodePatchPayload(patch) || Boolean(patch.node && isHiddenChromeNode(patch.node));
+}
+
+function chromeStateSignature(snapshot: WebviewState): string {
+  return JSON.stringify({
+    task: snapshot.task,
+    taskView: snapshot.taskView,
+    attachments: snapshot.attachments,
+    sending: snapshot.sending,
+    provider: snapshot.provider,
+    providerId: snapshot.providerId,
+    providers: snapshot.providers,
+    acpSessionId: snapshot.acpSessionId,
+    persistedAcpSessionId: snapshot.persistedAcpSessionId,
+    acpStartMode: snapshot.acpStartMode,
+    requestedAcpSessionId: snapshot.requestedAcpSessionId,
+    providerSwitchFrom: snapshot.providerSwitchFrom,
+    capabilities: snapshot.capabilities,
+    permissionPending: snapshot.permissionPending,
+    hiddenNodes: snapshot.nodes.filter(isHiddenChromeNode)
+  });
+}
+
+function timelineFrameStateSignature(snapshot: WebviewState): string {
+  return JSON.stringify({
+    providerFailure: snapshot.providerFailure,
+    taskOverlaps: snapshot.taskOverlaps
+  });
+}
+
 function canHydratePatchedNodes(
-  patches: RenderPatch[],
   changes: RenderPatchChanges
 ): boolean {
   if (!existingShellCanHydrate() || renderScheduled || state.providerFailure) {
@@ -745,9 +1028,6 @@ function canHydratePatchedNodes(
     return false;
   }
   if (changes.addedNodeIds.size || changes.removedNodeIds.size) {
-    return false;
-  }
-  if (!patches.every(isLiveNodePatchPayload)) {
     return false;
   }
   return [...changes.changedNodeIds].every((id) => {
@@ -764,10 +1044,77 @@ function canHydratePatchedNodes(
   });
 }
 
-function schedulePatchedNodeHydration(nodeIds: Set<string>): void {
+function canApplyStreamingTextDomPatchesImmediately(changes: RenderPatchChanges): boolean {
+  const ids = streamingTextDomPatchableNodeIds(changes);
+  return ids.size > 0 && ids.size === changes.changedNodeIds.size;
+}
+
+function streamingTextDomPatchableNodeIds(changes: RenderPatchChanges): Set<string> {
+  const ids = new Set<string>();
+  if (changes.addedNodeIds.size || changes.removedNodeIds.size) {
+    return ids;
+  }
+  if (!changes.changedNodeIds.size) {
+    return ids;
+  }
+  for (const id of changes.changedNodeIds) {
+    const node = state.nodes.find((candidate) => candidate.id === id);
+    if (!node || (node.kind !== "message" && node.kind !== "thought") || streamingTextForNode(node) === undefined) {
+      continue;
+    }
+    const article = document.getElementById(nodeDomId(id));
+    if (article?.querySelector("[data-streaming-markdown]")) {
+      ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function changedNodeIdsWithout(nodeIds: Set<string>, excludedNodeIds: Set<string>): Set<string> {
+  return new Set([...nodeIds].filter((id) => !excludedNodeIds.has(id)));
+}
+
+function applyStreamingTextDomPatchesImmediately(nodeIds: Set<string>): void {
+  const timeline = document.querySelector<HTMLElement>(".timeline");
+  const restoreBottom = isTimelinePinnedToBottom(timeline);
+  const fallbackNodeIds = new Set<string>();
+  for (const nodeId of nodeIds) {
+    const node = state.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node || !applyStreamingTextDomPatch(node)) {
+      fallbackNodeIds.add(nodeId);
+    }
+  }
+  if (restoreBottom && timeline?.isConnected) {
+    lockTimelineToBottom(timeline);
+  }
+  if (fallbackNodeIds.size) {
+    schedulePatchedNodeHydration(fallbackNodeIds, { lockBottom: restoreBottom });
+  }
+}
+
+function canHydrateTimelineStructure(
+  changes: RenderPatchChanges
+): boolean {
+  if (!existingShellCanHydrate() || renderScheduled || state.providerFailure) {
+    return false;
+  }
+  if (timelineSearchTokens(timelineQuery).length) {
+    return false;
+  }
+  if (!changes.addedNodeIds.size && !changes.removedNodeIds.size) {
+    return false;
+  }
+  return true;
+}
+
+function schedulePatchedNodeHydration(
+  nodeIds: Set<string>,
+  options: { lockBottom?: boolean | undefined } = {}
+): void {
   for (const nodeId of nodeIds) {
     pendingPatchedNodeIds.add(nodeId);
   }
+  pendingPatchedNodeBottomLock ||= Boolean(options.lockBottom);
   if (patchedNodeHydrationFrameHandle !== undefined) {
     return;
   }
@@ -777,20 +1124,158 @@ function schedulePatchedNodeHydration(nodeIds: Set<string>): void {
   });
 }
 
+function scheduleTimelineStructureHydration(options: { includeChrome?: boolean | undefined } = {}): void {
+  pendingTimelineStructureChromeHydration ||= Boolean(options.includeChrome);
+  if (timelineStructureHydrationFrameHandle !== undefined) {
+    return;
+  }
+  timelineStructureHydrationFrameHandle = window.requestAnimationFrame(() => {
+    timelineStructureHydrationFrameHandle = undefined;
+    void hydrateTimelineStructure();
+  });
+}
+
+function scheduleChromeHydration(): void {
+  if (chromeHydrationFrameHandle !== undefined) {
+    return;
+  }
+  chromeHydrationFrameHandle = window.requestAnimationFrame(() => {
+    chromeHydrationFrameHandle = undefined;
+    void hydrateChromeState();
+  });
+}
+
+async function hydrateTimelineStructure(): Promise<void> {
+  if (!existingShellCanHydrate()) {
+    scheduleRender();
+    return;
+  }
+  const includeChrome = pendingTimelineStructureChromeHydration;
+  pendingTimelineStructureChromeHydration = false;
+  const focus = captureRenderFocus();
+  const visibleNodes = visibleTimelineNodes();
+  const pass = prepareRenderProps(visibleNodes);
+  timelineNavigation(visibleNodes);
+  header(state.task);
+  if (includeChrome) {
+    composer();
+    if (reviewVisible) {
+      reviewDrawer(state.task);
+    }
+  }
+  syncLiveAnnouncement();
+  const hydrationTasks: Array<Promise<void>> = [
+    hydrateHeaderBars(),
+    hydrateTimelineNavigation().then(() => {
+      restoreTimelineSearchInput({
+        searchFocused: focus.timelineSearchFocused || pendingTimelineSearchFocus,
+        selectionStart: focus.searchSelectionStart,
+        selectionEnd: focus.searchSelectionEnd
+      });
+      pendingTimelineSearchFocus = false;
+    })
+  ];
+  if (includeChrome) {
+    hydrationTasks.push(
+      hydrateComposerCards().then(() => {
+        restoreComposerInput({
+          composerFocused: focus.composerFocused,
+          selectionStart: focus.selectionStart,
+          selectionEnd: focus.selectionEnd
+        });
+      })
+    );
+    if (reviewVisible) {
+      hydrationTasks.push(hydrateReviewDrawers());
+    }
+  }
+  await Promise.all(hydrationTasks);
+  if (!isCurrentRender(pass.renderEpoch)) {
+    return;
+  }
+  await hydrateTimelineScroller();
+  if (!isCurrentRender(pass.renderEpoch)) {
+    return;
+  }
+  restoreTimelineScrollFromFocus(focus);
+  await hydrateReactIslands();
+  if (!isCurrentRender(pass.renderEpoch)) {
+    return;
+  }
+  restoreTimelineBottomAfterIslandHydration(focus);
+  window.requestAnimationFrame(() => {
+    if (!isCurrentRender(pass.renderEpoch)) {
+      return;
+    }
+    void highlightCodeBlocks();
+    void hydrateDiffPreviews(pass.diffEpoch);
+  });
+}
+
+async function hydrateChromeState(): Promise<void> {
+  if (!existingShellCanHydrate()) {
+    scheduleRender();
+    return;
+  }
+  const focus = captureRenderFocus();
+  const visibleNodes = visibleTimelineNodes();
+  const pass = prepareRenderProps(visibleNodes);
+  timelineNavigation(visibleNodes);
+  header(state.task);
+  composer();
+  if (reviewVisible) {
+    reviewDrawer(state.task);
+  }
+  syncLiveAnnouncement();
+  await Promise.all([
+    hydrateHeaderBars(),
+    hydrateTimelineNavigation().then(() => {
+      restoreTimelineSearchInput({
+        searchFocused: focus.timelineSearchFocused || pendingTimelineSearchFocus,
+        selectionStart: focus.searchSelectionStart,
+        selectionEnd: focus.searchSelectionEnd
+      });
+      pendingTimelineSearchFocus = false;
+    }),
+    hydrateComposerCards().then(() => {
+      restoreComposerInput({
+        composerFocused: focus.composerFocused,
+        selectionStart: focus.selectionStart,
+        selectionEnd: focus.selectionEnd
+      });
+    }),
+    reviewVisible ? hydrateReviewDrawers() : Promise.resolve()
+  ]);
+  if (!isCurrentRender(pass.renderEpoch)) {
+    return;
+  }
+  syncComposerAffordances();
+}
+
 async function hydratePatchedNodes(): Promise<void> {
   if (!pendingPatchedNodeIds.size) {
     return;
   }
   if (!existingShellCanHydrate()) {
     pendingPatchedNodeIds.clear();
+    pendingPatchedNodeBottomLock = false;
     scheduleRender();
     return;
   }
   const nodeIds = [...pendingPatchedNodeIds];
   pendingPatchedNodeIds.clear();
+  const forcePatchedBottomLock = pendingPatchedNodeBottomLock;
+  pendingPatchedNodeBottomLock = false;
   const visibleIds = new Set(visibleTimelineNodes().map((node) => node.id));
   let needsFullRender = false;
   let needsDiffHydration = false;
+  let needsIslandHydration = false;
+  let streamedTextDomPatchApplied = false;
+  const directTargets = emptyPatchedTimelineHydrationTargets();
+  const presentationRefreshNodeIds: string[] = [];
+  const timeline = document.querySelector<HTMLElement>(".timeline");
+  const restorePatchedBottom =
+    (forcePatchedBottomLock && Date.now() >= timelineBottomLockUserPauseUntil) || isTimelinePinnedToBottom(timeline);
   for (const nodeId of nodeIds) {
     if (!visibleIds.has(nodeId)) {
       continue;
@@ -800,7 +1285,10 @@ async function hydratePatchedNodes(): Promise<void> {
       needsFullRender = true;
       continue;
     }
-    const previousDiffPreviewCount = pendingDiffPreviews.length;
+    if (applyStreamingTextDomPatch(node)) {
+      streamedTextDomPatchApplied = true;
+      continue;
+    }
     if (
       node.kind === "message" ||
       node.kind === "thought" ||
@@ -809,8 +1297,13 @@ async function hydratePatchedNodes(): Promise<void> {
       node.kind === "diff" ||
       node.kind === "terminal"
     ) {
-      renderNode(node);
-      needsDiffHydration ||= pendingDiffPreviews.length > previousDiffPreviewCount;
+      if (hydratePatchedNodeIslandDirectly(node, directTargets)) {
+        needsDiffHydration ||= directTargets.needsDiffHydration;
+        needsIslandHydration = true;
+        continue;
+      }
+      presentationRefreshNodeIds.push(nodeId);
+      needsIslandHydration = true;
     } else {
       needsFullRender = true;
     }
@@ -819,20 +1312,399 @@ async function hydratePatchedNodes(): Promise<void> {
     scheduleRender();
     return;
   }
-  await hydrateReactIslands();
+  if (streamedTextDomPatchApplied && restorePatchedBottom && timeline?.isConnected) {
+    lockTimelineToBottom(timeline);
+  }
+  if (!needsIslandHydration) {
+    return;
+  }
+  if (hasPatchedTimelineHydrationTargets(directTargets)) {
+    await hydratePatchedTimelineIslands(directTargets);
+  }
+  if (presentationRefreshNodeIds.length) {
+    const targets = refreshTimelineGroupsForPatchedNodes(presentationRefreshNodeIds);
+    needsDiffHydration ||= targets.needsDiffHydration;
+    await hydratePatchedTimelineIslands(targets);
+  }
+  if (restorePatchedBottom && timeline?.isConnected) {
+    lockTimelineToBottom(timeline);
+  }
   window.requestAnimationFrame(() => {
     void highlightCodeBlocks();
     if (needsDiffHydration) {
-      void hydrateDiffPreviews(++diffRenderEpoch).then(hydrateInlineActions);
+      void hydrateDiffPreviews(++diffRenderEpoch).then(() => hydrateInlineActions());
+    }
+  });
+}
+
+function applyStreamingTextDomPatch(node: RenderNode): boolean {
+  if (node.kind !== "message" && node.kind !== "thought") {
+    return false;
+  }
+  const streamText = streamingTextForNode(node);
+  if (streamText === undefined) {
+    return false;
+  }
+  const article = document.getElementById(nodeDomId(node.id));
+  const streamTarget = article?.querySelector<HTMLElement>("[data-streaming-markdown]");
+  if (!streamTarget) {
+    return false;
+  }
+  renderNode(node);
+  updateStreamingTextTarget(streamTarget, streamText);
+  return true;
+}
+
+function updateStreamingTextTarget(streamTarget: HTMLElement, streamText: string): void {
+  const streamdownTarget = streamTarget as StreamingMarkdownTarget;
+  if (streamTarget.dataset.streamdownMarkdown !== undefined) {
+    if (streamdownTarget.__crabdbStreamingText === streamText) {
+      return;
+    }
+    streamdownTarget.__crabdbStreamingText = streamText;
+    if (streamdownTarget.__crabdbQueueStreamdownText) {
+      streamdownTarget.__crabdbQueueStreamdownText(streamText);
+      return;
+    }
+    streamTarget.dispatchEvent(new CustomEvent(CRABDB_STREAMDOWN_UPDATE_EVENT, { detail: { text: streamText } }));
+    return;
+  }
+  const current = streamTarget.textContent || "";
+  if (current === streamText) {
+    return;
+  }
+  const firstChild = streamTarget.firstChild;
+  if (
+    firstChild &&
+    firstChild.nodeType === Node.TEXT_NODE &&
+    streamTarget.childNodes.length === 1 &&
+    streamText.startsWith(current)
+  ) {
+    (firstChild as Text).appendData(streamText.slice(current.length));
+    return;
+  }
+  streamTarget.textContent = streamText;
+}
+
+function emptyPatchedTimelineHydrationTargets(): PatchedTimelineHydrationTargets {
+  return {
+    groupIds: new Set<string>(),
+    inlineActionIds: new Set<string>(),
+    nodeIds: new Set<string>(),
+    payloadDisclosureIds: new Set<string>(),
+    toolGroupIds: new Set<string>(),
+    needsDiffHydration: false
+  };
+}
+
+function hasPatchedTimelineHydrationTargets(targets: PatchedTimelineHydrationTargets): boolean {
+  return Boolean(
+    targets.groupIds.size ||
+      targets.inlineActionIds.size ||
+      targets.nodeIds.size ||
+      targets.payloadDisclosureIds.size ||
+      targets.toolGroupIds.size ||
+      targets.needsDiffHydration
+  );
+}
+
+function hydratePatchedNodeIslandDirectly(
+  node: RenderNode,
+  targets: PatchedTimelineHydrationTargets
+): boolean {
+  if (!canHydrateMountedNodeIslandDirectly(node)) {
+    return false;
+  }
+  const previousDiffPreviewCount = pendingDiffPreviews.length;
+  const html = renderNode(node);
+  if (!syncNodeShellFromHtml(node, html)) {
+    return false;
+  }
+  targets.nodeIds.add(node.id);
+  collectHelperIslandIdsFromHtml(html, targets);
+  targets.needsDiffHydration ||= pendingDiffPreviews.length > previousDiffPreviewCount;
+  return true;
+}
+
+function canHydrateMountedNodeIslandDirectly(node: RenderNode): boolean {
+  if (!isLiveStatus(node.status) || !canHydrateDirectNodeKind(node)) {
+    return false;
+  }
+  const article = document.getElementById(nodeDomId(node.id));
+  if (!article?.isConnected) {
+    return false;
+  }
+  return Boolean(mountedNodeIslandRoot(article, node));
+}
+
+function canHydrateDirectNodeKind(node: RenderNode): boolean {
+  return (
+    node.kind === "message" ||
+    node.kind === "thought" ||
+    node.kind === "plan" ||
+    node.kind === "tool" ||
+    node.kind === "diff" ||
+    node.kind === "terminal"
+  );
+}
+
+function mountedNodeIslandRoot(article: HTMLElement, node: RenderNode): Element | null {
+  switch (node.kind) {
+    case "message":
+      return article.querySelector("[data-message-card-root]");
+    case "thought":
+      return article.querySelector("[data-thought-card-root]");
+    case "plan":
+      return article.querySelector("[data-plan-card-root]");
+    case "tool":
+      return article.querySelector("[data-tool-call-card-root]");
+    case "diff":
+      return article.querySelector("[data-diff-card-root]");
+    case "terminal":
+      return article.querySelector("[data-terminal-card-root]");
+    default:
+      return null;
+  }
+}
+
+function syncNodeShellFromHtml(node: RenderNode, html: string): boolean {
+  const current = document.getElementById(nodeDomId(node.id));
+  const next = htmlElement(html);
+  if (!current || !next || current.tagName !== next.tagName || current.id !== next.id) {
+    return false;
+  }
+  syncElementAttributes(current, next);
+  return true;
+}
+
+function syncElementAttributes(current: Element, next: Element): void {
+  for (const attr of Array.from(current.attributes)) {
+    if (!next.hasAttribute(attr.name)) {
+      current.removeAttribute(attr.name);
+    }
+  }
+  for (const attr of Array.from(next.attributes)) {
+    if (current.getAttribute(attr.name) !== attr.value) {
+      current.setAttribute(attr.name, attr.value);
+    }
+  }
+}
+
+function isTimelinePinnedToBottom(timeline: HTMLElement | null): boolean {
+  if (!timeline) {
+    return true;
+  }
+  return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 48;
+}
+
+function restoreTimelineScrollFromFocus(focus: RenderFocusSnapshot): void {
+  const timeline = document.querySelector<HTMLElement>(".timeline");
+  if (!timeline) {
+    setTimelineBottomLockPinned(focus.wasPinnedToBottom);
+    return;
+  }
+  installTimelineBottomLock();
+  if (!focus.hadTimeline) {
+    setTimelineBottomLockPinned(true);
+    return;
+  }
+  if (focus.wasPinnedToBottom) {
+    lockTimelineToBottom(timeline);
+    return;
+  }
+  timeline.scrollTop = focus.previousScrollTop;
+  setTimelineBottomLockPinned(false);
+}
+
+function restoreTimelineBottomAfterIslandHydration(focus: RenderFocusSnapshot): void {
+  if (!focus.wasPinnedToBottom) {
+    setTimelineBottomLockPinned(false);
+    return;
+  }
+  const timeline = document.querySelector<HTMLElement>(".timeline");
+  if (timeline) {
+    lockTimelineToBottom(timeline);
+  }
+}
+
+function installTimelineBottomLock(): void {
+  const timeline = document.querySelector<HTMLElement>(".timeline");
+  const content = document.querySelector<HTMLElement>(".timeline-scroller-content");
+  if (!timeline || !content || typeof ResizeObserver === "undefined") {
+    cleanupTimelineBottomLock();
+    return;
+  }
+  if (timelineBottomLockTimeline === timeline && timelineBottomLockContent === content) {
+    return;
+  }
+  cleanupTimelineBottomLock();
+  timelineBottomLockTimeline = timeline;
+  timelineBottomLockContent = content;
+  timelineBottomLockPinned = isTimelinePinnedToBottom(timeline);
+
+  const markUserPause = (): void => {
+    timelineBottomLockUserPauseUntil = Date.now() + 300;
+  };
+  const onWheel = (event: WheelEvent): void => {
+    if (event.deltaY < 0) {
+      markUserPause();
+      timelineBottomLockPinned = false;
+    }
+  };
+  const onPointerDown = (): void => {
+    markUserPause();
+  };
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+      markUserPause();
+      timelineBottomLockPinned = false;
+    }
+  };
+  const onScroll = (): void => {
+    if (isTimelinePinnedToBottom(timeline)) {
+      timelineBottomLockPinned = true;
+      return;
+    }
+    if (Date.now() < timelineBottomLockUserPauseUntil) {
+      timelineBottomLockPinned = false;
+    }
+  };
+
+  timeline.addEventListener("wheel", onWheel, { passive: true });
+  timeline.addEventListener("pointerdown", onPointerDown, { passive: true });
+  timeline.addEventListener("touchstart", onPointerDown, { passive: true });
+  timeline.addEventListener("keydown", onKeyDown);
+  timeline.addEventListener("scroll", onScroll, { passive: true });
+  timelineBottomLockObserver = new ResizeObserver(() => {
+    queueTimelineBottomRestore();
+  });
+  timelineBottomLockObserver.observe(content);
+  timelineBottomLockCleanup = () => {
+    timeline.removeEventListener("wheel", onWheel);
+    timeline.removeEventListener("pointerdown", onPointerDown);
+    timeline.removeEventListener("touchstart", onPointerDown);
+    timeline.removeEventListener("keydown", onKeyDown);
+    timeline.removeEventListener("scroll", onScroll);
+  };
+}
+
+function cleanupTimelineBottomLock(): void {
+  timelineBottomLockObserver?.disconnect();
+  timelineBottomLockObserver = undefined;
+  timelineBottomLockCleanup?.();
+  timelineBottomLockCleanup = undefined;
+  timelineBottomLockTimeline = undefined;
+  timelineBottomLockContent = undefined;
+  if (timelineBottomLockFrameHandle !== undefined) {
+    window.cancelAnimationFrame(timelineBottomLockFrameHandle);
+    timelineBottomLockFrameHandle = undefined;
+  }
+}
+
+function queueTimelineBottomRestore(): void {
+  if (timelineBottomLockFrameHandle !== undefined) {
+    return;
+  }
+  timelineBottomLockFrameHandle = window.requestAnimationFrame(() => {
+    timelineBottomLockFrameHandle = undefined;
+    restoreTimelineBottomFromResizeObserver();
+  });
+}
+
+function restoreTimelineBottomFromResizeObserver(): void {
+  const timeline = timelineBottomLockTimeline;
+  if (!timeline?.isConnected || !timelineBottomLockPinned) {
+    return;
+  }
+  if (Date.now() < timelineBottomLockUserPauseUntil && !isTimelinePinnedToBottom(timeline)) {
+    return;
+  }
+  timeline.scrollTop = timeline.scrollHeight;
+}
+
+function lockTimelineToBottom(timeline: HTMLElement): void {
+  installTimelineBottomLock();
+  setTimelineBottomLockPinned(true);
+  timeline.scrollTop = timeline.scrollHeight;
+}
+
+function setTimelineBottomLockPinned(pinned: boolean): void {
+  timelineBottomLockPinned = pinned;
+}
+
+function refreshTimelineGroupsForPatchedNodes(nodeIds: string[]): PatchedTimelineHydrationTargets {
+  const changedIds = new Set(nodeIds);
+  const groups = timelineGroups(visibleTimelineNodes());
+  const previousDiffPreviewCount = pendingDiffPreviews.length;
+  const groupIds = new Set<string>();
+  const inlineActionIds = new Set<string>();
+  const payloadDisclosureIds = new Set<string>();
+  const toolGroupIds = new Set<string>();
+  groups.forEach((group, index) => {
+    if (group.nodes.some((node) => changedIds.has(node.id))) {
+      const item = renderTimelineGroup(group, index, groups.length);
+      groupIds.add(item.id);
+      collectHelperIslandIdsFromHtml(item.html, { inlineActionIds, payloadDisclosureIds });
+      const props = timelineGroupProps.get(item.id);
+      for (const bodyItem of props?.bodyItems || []) {
+        collectHelperIslandIdsFromHtml(bodyItem.html, { inlineActionIds, payloadDisclosureIds });
+        if (bodyItem.id.startsWith("tool-group:")) {
+          toolGroupIds.add(bodyItem.id);
+        }
+      }
+    }
+  });
+  return {
+    groupIds,
+    inlineActionIds,
+    nodeIds: changedIds,
+    payloadDisclosureIds,
+    toolGroupIds,
+    needsDiffHydration: pendingDiffPreviews.length > previousDiffPreviewCount
+  };
+}
+
+function collectHelperIslandIdsFromHtml(
+  html: string,
+  ids: { inlineActionIds: Set<string>; payloadDisclosureIds: Set<string> }
+): void {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  template.content.querySelectorAll<HTMLElement>("[data-payload-disclosure-id]").forEach((element) => {
+    const id = element.dataset.payloadDisclosureId;
+    if (id) {
+      ids.payloadDisclosureIds.add(id);
+    }
+  });
+  template.content.querySelectorAll<HTMLElement>("[data-inline-actions-id]").forEach((element) => {
+    const id = element.dataset.inlineActionsId;
+    if (id) {
+      ids.inlineActionIds.add(id);
     }
   });
 }
 
 function cancelPatchedNodeHydration(): void {
   pendingPatchedNodeIds.clear();
+  pendingPatchedNodeBottomLock = false;
   if (patchedNodeHydrationFrameHandle !== undefined) {
     window.cancelAnimationFrame(patchedNodeHydrationFrameHandle);
     patchedNodeHydrationFrameHandle = undefined;
+  }
+}
+
+function cancelTimelineStructureHydration(): void {
+  pendingTimelineStructureChromeHydration = false;
+  if (timelineStructureHydrationFrameHandle !== undefined) {
+    window.cancelAnimationFrame(timelineStructureHydrationFrameHandle);
+    timelineStructureHydrationFrameHandle = undefined;
+  }
+}
+
+function cancelChromeHydration(): void {
+  if (chromeHydrationFrameHandle !== undefined) {
+    window.cancelAnimationFrame(chromeHydrationFrameHandle);
+    chromeHydrationFrameHandle = undefined;
   }
 }
 
@@ -884,11 +1756,12 @@ function prepareRenderProps(visibleNodes: RenderNode[]): RenderPass {
   timelineGroupProps = new Map<string, TimelineGroupCardProps>();
   timelineNavigationProps = undefined;
   toolCallCardProps = new Map<string, ToolCallCardProps>();
+  toolCallGroupCardProps = new Map<string, ToolCallGroupCardProps>();
   diffPreviewCounter = 0;
   timelineScrollerProps = {
     items: timelineScrollerItems(visibleNodes)
   };
-  cleanupDiffEnhancements();
+  cleanupDetachedDiffEnhancements();
   return {
     renderEpoch: ++renderEpoch,
     diffEpoch: ++diffRenderEpoch
@@ -910,17 +1783,7 @@ function render(): void {
   const headerHtml = header(task, timelineNavigationHtml);
   const composerHtml = composer();
   const reviewHtml = reviewVisible ? reviewDrawer(task) : "";
-  app.innerHTML = `
-    <section class="shell ${reviewVisible ? "review-open" : ""}">
-      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-live-announcement>${escapeHtml(announcement)}</div>
-      ${headerHtml}
-      <section class="timeline-shell" aria-label="Transcript workspace">
-        <div class="timeline-scroller-root" data-timeline-scroller-root></div>
-      </section>
-      ${composerHtml}
-      ${reviewHtml}
-    </section>
-  `;
+  syncAppShell({ headerHtml, composerHtml, reviewHtml });
   hydrateExistingShell(pass, focus);
 }
 
@@ -943,6 +1806,151 @@ function renderStateUpdate(): void {
     reviewDrawer(task);
   }
   hydrateExistingShell(pass, focus);
+}
+
+function syncAppShell({
+  composerHtml,
+  headerHtml,
+  reviewHtml
+}: {
+  composerHtml: string;
+  headerHtml: string;
+  reviewHtml: string;
+}): void {
+  if (!app) {
+    return;
+  }
+  let shell = app.querySelector<HTMLElement>(":scope > .shell");
+  if (!shell) {
+    app.innerHTML = initialShellHtml({ headerHtml, composerHtml, reviewHtml });
+    return;
+  }
+
+  shell.className = `shell ${reviewVisible ? "review-open" : ""}`.trim();
+  ensureLiveRegion(shell);
+  syncHeaderShell(shell, headerHtml);
+  syncTimelineShell(shell);
+  syncComposerShell(shell, composerHtml);
+  syncReviewShell(shell, reviewHtml);
+}
+
+function initialShellHtml({
+  composerHtml,
+  headerHtml,
+  reviewHtml
+}: {
+  composerHtml: string;
+  headerHtml: string;
+  reviewHtml: string;
+}): string {
+  return `
+    <section class="shell ${reviewVisible ? "review-open" : ""}">
+      <div class="sr-only" role="status" aria-live="polite" aria-atomic="true" data-live-announcement>${escapeHtml(announcement)}</div>
+      ${headerHtml}
+      <section class="timeline-shell" aria-label="Transcript workspace">
+        <div class="timeline-scroller-root" data-timeline-scroller-root></div>
+      </section>
+      ${composerHtml}
+      ${reviewHtml}
+    </section>
+  `;
+}
+
+function ensureLiveRegion(shell: HTMLElement): void {
+  if (shell.querySelector("[data-live-announcement]")) {
+    return;
+  }
+  const liveRegion = document.createElement("div");
+  liveRegion.className = "sr-only";
+  liveRegion.setAttribute("role", "status");
+  liveRegion.setAttribute("aria-live", "polite");
+  liveRegion.setAttribute("aria-atomic", "true");
+  liveRegion.setAttribute("data-live-announcement", "");
+  liveRegion.textContent = announcement;
+  shell.prepend(liveRegion);
+}
+
+function syncHeaderShell(shell: HTMLElement, headerHtml: string): void {
+  let header = shell.querySelector<HTMLElement>(":scope > .chat-header");
+  if (!header) {
+    const nextHeader = htmlElement(headerHtml);
+    if (nextHeader) {
+      shell.insertBefore(nextHeader, shell.querySelector(":scope > .timeline-shell"));
+    }
+    return;
+  }
+
+  if (!header.querySelector("[data-header-bar-root]")) {
+    const headerRoot = document.createElement("div");
+    headerRoot.className = "header-bar-react-root";
+    headerRoot.setAttribute("data-header-bar-root", "");
+    headerRoot.setAttribute("data-header-bar-id", "header");
+    const beforeNavigation = header.querySelector("[data-timeline-navigation-root]");
+    header.insertBefore(headerRoot, beforeNavigation);
+  }
+
+  if (!header.querySelector("[data-timeline-navigation-root]")) {
+    const navigationRoot = htmlElement(headerHtml)?.querySelector<HTMLElement>("[data-timeline-navigation-root]");
+    if (navigationRoot) {
+      header.append(navigationRoot);
+    }
+  }
+}
+
+function syncTimelineShell(shell: HTMLElement): void {
+  let timelineShell = shell.querySelector<HTMLElement>(":scope > .timeline-shell");
+  if (!timelineShell) {
+    timelineShell = document.createElement("section");
+    timelineShell.className = "timeline-shell";
+    timelineShell.setAttribute("aria-label", "Transcript workspace");
+    const composerElement = shell.querySelector(":scope > .composer");
+    shell.insertBefore(timelineShell, composerElement);
+  }
+  if (!timelineShell.querySelector("[data-timeline-scroller-root]")) {
+    const scrollerRoot = document.createElement("div");
+    scrollerRoot.className = "timeline-scroller-root";
+    scrollerRoot.setAttribute("data-timeline-scroller-root", "");
+    timelineShell.append(scrollerRoot);
+  }
+}
+
+function syncComposerShell(shell: HTMLElement, composerHtml: string): void {
+  let composerElement = shell.querySelector<HTMLElement>(":scope > .composer");
+  if (!composerElement) {
+    const nextComposer = htmlElement(composerHtml);
+    if (nextComposer) {
+      shell.insertBefore(nextComposer, shell.querySelector(":scope > .review-drawer"));
+    }
+    return;
+  }
+  if (!composerElement.querySelector("[data-composer-card-root]")) {
+    const composerRoot = document.createElement("div");
+    composerRoot.className = "composer-card-react-root";
+    composerRoot.setAttribute("data-composer-card-root", "");
+    composerRoot.setAttribute("data-composer-id", "composer");
+    composerElement.append(composerRoot);
+  }
+}
+
+function syncReviewShell(shell: HTMLElement, reviewHtml: string): void {
+  const reviewElement = shell.querySelector<HTMLElement>(":scope > .review-drawer");
+  if (!reviewHtml) {
+    reviewElement?.remove();
+    return;
+  }
+  if (!reviewElement) {
+    const nextReview = htmlElement(reviewHtml);
+    if (nextReview) {
+      shell.append(nextReview);
+    }
+  }
+}
+
+function htmlElement(html: string): HTMLElement | undefined {
+  const template = document.createElement("template");
+  template.innerHTML = html.trim();
+  const element = template.content.firstElementChild;
+  return element instanceof HTMLElement ? element : undefined;
 }
 
 function existingShellCanHydrate(): boolean {
@@ -987,14 +1995,12 @@ function hydrateExistingShell(pass: RenderPass, focus: RenderFocusSnapshot): voi
     if (!isCurrentRender(pass.renderEpoch)) {
       return;
     }
-    const timeline = document.querySelector<HTMLElement>(".timeline");
-    if (timeline && focus.hadTimeline) {
-      timeline.scrollTop = focus.wasPinnedToBottom ? timeline.scrollHeight : focus.previousScrollTop;
-    }
+    restoreTimelineScrollFromFocus(focus);
     await hydrateReactIslands();
     if (!isCurrentRender(pass.renderEpoch)) {
       return;
     }
+    restoreTimelineBottomAfterIslandHydration(focus);
     window.requestAnimationFrame(() => {
       if (!isCurrentRender(pass.renderEpoch)) {
         return;
@@ -1010,17 +2016,6 @@ function syncLiveAnnouncement(): void {
   if (liveRegion) {
     liveRegion.textContent = announcement;
   }
-}
-
-function skipLinks(): string {
-  return `
-    <nav class="skip-links" aria-label="Chat landmarks">
-      <a href="#timeline" aria-keyshortcuts="Alt+1">Transcript</a>
-      <a href="#composer" aria-keyshortcuts="Alt+2">Composer</a>
-      ${reviewVisible ? `<a href="#review" aria-keyshortcuts="Alt+3">Review</a>` : `<button data-action="toggleReview" aria-keyshortcuts="Alt+3">Review</button>`}
-      <span aria-hidden="true">Alt+1/2/3</span>
-    </nav>
-  `;
 }
 
 function restoreComposerInput({
@@ -1079,13 +2074,14 @@ async function hydrateTimelineNavigation(): Promise<void> {
   });
 }
 
-async function hydrateToolCallCards(): Promise<void> {
+async function hydrateToolCallCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-tool-call-card-root]")) {
     return;
   }
   toolCallCardModulePromise ??= import("./ToolCallCard.js");
   const module = await toolCallCardModulePromise;
   module.mountToolCallCards({
+    ids: options.ids,
     getProps: (nodeId) => toolCallCardProps.get(nodeId),
     onOpenLocation: ({ path, line }) => {
       vscode.postMessage({
@@ -1097,18 +2093,38 @@ async function hydrateToolCallCards(): Promise<void> {
   });
 }
 
-async function hydrateMessageCards(): Promise<void> {
+async function hydrateToolCallGroupCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
+  if (!document.querySelector("[data-tool-call-group-root]")) {
+    return;
+  }
+  toolCallGroupCardModulePromise ??= import("./ToolCallGroupCard.js");
+  const module = await toolCallGroupCardModulePromise;
+  module.mountToolCallGroupCards({
+    ids: options.ids,
+    getProps: (id) => toolCallGroupCardProps.get(id),
+    onOpenLocation: ({ path, line }) => {
+      vscode.postMessage({
+        type: "openLocation",
+        path,
+        line
+      });
+    }
+  });
+}
+
+async function hydrateMessageCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-message-card-root]")) {
     return;
   }
   messageCardModulePromise ??= import("./MessageCard.js");
   const module = await messageCardModulePromise;
   module.mountMessageCards({
+    ids: options.ids,
     getProps: (nodeId) => messageCardProps.get(nodeId)
   });
 }
 
-async function hydratePayloadDisclosures(): Promise<void> {
+async function hydratePayloadDisclosures(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-payload-disclosure-root]")) {
     payloadDisclosureModulePromise?.then((module) => module.cleanupDetachedPayloadDisclosures()).catch(() => undefined);
     return;
@@ -1116,16 +2132,18 @@ async function hydratePayloadDisclosures(): Promise<void> {
   payloadDisclosureModulePromise ??= import("./PayloadDisclosure.js");
   const module = await payloadDisclosureModulePromise;
   module.mountPayloadDisclosures({
+    ids: options.ids,
     getProps: (id) => payloadDisclosureProps.get(id)
   });
   window.requestAnimationFrame(() => {
     module.mountPayloadDisclosures({
+      ids: options.ids,
       getProps: (id) => payloadDisclosureProps.get(id)
     });
   });
 }
 
-async function hydrateInlineActions(): Promise<void> {
+async function hydrateInlineActions(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-inline-actions-root]")) {
     inlineActionsModulePromise?.then((module) => module.cleanupDetachedInlineActions()).catch(() => undefined);
     return;
@@ -1133,22 +2151,25 @@ async function hydrateInlineActions(): Promise<void> {
   inlineActionsModulePromise ??= import("./InlineActions.js");
   const module = await inlineActionsModulePromise;
   module.mountInlineActions({
+    ids: options.ids,
     getProps: (id) => inlineActionsProps.get(id)
   });
   window.requestAnimationFrame(() => {
     module.mountInlineActions({
+      ids: options.ids,
       getProps: (id) => inlineActionsProps.get(id)
     });
   });
 }
 
-async function hydratePlanCards(): Promise<void> {
+async function hydratePlanCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-plan-card-root]")) {
     return;
   }
   planCardModulePromise ??= import("./PlanCard.js");
   const module = await planCardModulePromise;
   module.mountPlanCards({
+    ids: options.ids,
     getProps: (nodeId) => planCardProps.get(nodeId)
   });
 }
@@ -1164,13 +2185,14 @@ async function hydrateEmptyStateCards(): Promise<void> {
   });
 }
 
-async function hydrateDiffCards(): Promise<void> {
+async function hydrateDiffCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-diff-card-root]")) {
     return;
   }
   diffCardModulePromise ??= import("./DiffCard.js");
   const module = await diffCardModulePromise;
   module.mountDiffCards({
+    ids: options.ids,
     getProps: (nodeId) => diffCardProps.get(nodeId)
   });
 }
@@ -1186,35 +2208,38 @@ async function hydrateEventCards(): Promise<void> {
   });
 }
 
-async function hydrateTerminalCards(): Promise<void> {
+async function hydrateTerminalCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-terminal-card-root]")) {
     return;
   }
   terminalCardModulePromise ??= import("./TerminalCard.js");
   const module = await terminalCardModulePromise;
   module.mountTerminalCards({
+    ids: options.ids,
     getProps: (nodeId) => terminalCardProps.get(nodeId)
   });
 }
 
-async function hydrateThoughtCards(): Promise<void> {
+async function hydrateThoughtCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-thought-card-root]")) {
     return;
   }
   thoughtCardModulePromise ??= import("./ThoughtCard.js");
   const module = await thoughtCardModulePromise;
   module.mountThoughtCards({
+    ids: options.ids,
     getProps: (nodeId) => thoughtCardProps.get(nodeId)
   });
 }
 
-async function hydrateTimelineGroups(): Promise<void> {
+async function hydrateTimelineGroups(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-timeline-group-root]")) {
     return;
   }
   timelineGroupModulePromise ??= import("./TimelineGroup.js");
   const module = await timelineGroupModulePromise;
   module.mountTimelineGroups({
+    ids: options.ids,
     getProps: (id) => timelineGroupProps.get(id)
   });
 }
@@ -1264,10 +2289,64 @@ async function hydrateReactIslands(): Promise<void> {
     hydrateReviewDrawers(),
     hydrateTerminalCards(),
     hydrateThoughtCards(),
-    hydrateToolCallCards()
+    hydrateToolCallCards(),
+    hydrateToolCallGroupCards()
   ]);
   await hydratePayloadDisclosures();
   await hydrateInlineActions();
+}
+
+async function hydratePatchedTimelineIslands(targets: PatchedTimelineHydrationTargets): Promise<void> {
+  await hydrateTimelineGroups({ ids: targets.groupIds });
+  await Promise.all([
+    hydrateDiffCards({ ids: targets.nodeIds }),
+    hydrateMessageCards({ ids: targets.nodeIds }),
+    hydratePlanCards({ ids: targets.nodeIds }),
+    hydrateTerminalCards({ ids: targets.nodeIds }),
+    hydrateThoughtCards({ ids: targets.nodeIds }),
+    hydrateToolCallCards({ ids: targets.nodeIds }),
+    hydrateToolCallGroupCards({ ids: targets.toolGroupIds })
+  ]);
+  collectPatchedTimelinePayloadDisclosureIds(targets);
+  await hydratePayloadDisclosures({ ids: targets.payloadDisclosureIds });
+  collectPatchedTimelineInlineActionIds(targets);
+  await hydrateInlineActions({ ids: targets.inlineActionIds });
+}
+
+function collectPatchedTimelinePayloadDisclosureIds(targets: PatchedTimelineHydrationTargets): void {
+  for (const scope of patchedTimelineHydrationScopes(targets)) {
+    scope.querySelectorAll<HTMLElement>("[data-payload-disclosure-id]").forEach((element) => {
+      const id = element.dataset.payloadDisclosureId;
+      if (id) {
+        targets.payloadDisclosureIds.add(id);
+      }
+    });
+  }
+}
+
+function collectPatchedTimelineInlineActionIds(targets: PatchedTimelineHydrationTargets): void {
+  for (const scope of patchedTimelineHydrationScopes(targets)) {
+    scope.querySelectorAll<HTMLElement>("[data-inline-actions-id]").forEach((element) => {
+      const id = element.dataset.inlineActionsId;
+      if (id) {
+        targets.inlineActionIds.add(id);
+      }
+    });
+  }
+}
+
+function patchedTimelineHydrationScopes(targets: PatchedTimelineHydrationTargets): HTMLElement[] {
+  const scopes = new Set<HTMLElement>();
+  const addScope = (id: string): void => {
+    const element = document.getElementById(id);
+    if (element) {
+      scopes.add(element);
+    }
+  };
+  targets.groupIds.forEach(addScope);
+  targets.nodeIds.forEach((id) => addScope(nodeDomId(id)));
+  targets.toolGroupIds.forEach((id) => addScope(nodeDomId(id)));
+  return [...scopes];
 }
 
 function providerFailureBanner(failure: NonNullable<WebviewState["providerFailure"]>): string {
@@ -1427,7 +2506,6 @@ function header(task: WebviewState["task"], timelineNavigationHtml = ""): string
   };
   return `
     <header class="chat-header">
-      ${skipLinks()}
       <div class="header-bar-react-root" data-header-bar-root data-header-bar-id="header"></div>
       ${timelineNavigationHtml}
     </header>
@@ -1583,10 +2661,9 @@ function emptyTimeline(): string {
       ? "Resolve the pending tool request, then continue from the preserved transcript."
       : "Message the agent or attach editor context. CrabDB will record checkpoints, tool evidence, and review state.",
     actions: [
-      emptyStateAction(blocked ? "focusReview" : "focusComposer", blocked ? "Open review" : "Start in composer", blocked ? "review" : "message", "primary", running),
+      emptyStateAction(blocked ? "focusReview" : "focusComposer", blocked ? "Open review" : "Write a message", blocked ? "review" : "message", "primary", running),
       emptyStateAction("attachSelection", "Attach selection", "selection", "secondary", blocked || running),
-      emptyStateAction("attachFile", "Attach file", "file", "secondary", blocked || running),
-      emptyStateAction("openSettings", "Settings", "settings", "secondary", false)
+      emptyStateAction("attachFile", "Attach file", "file", "secondary", blocked || running)
     ]
   });
   return `<div class="empty-state-root" data-empty-state-card-root data-empty-state-id="${id}"></div>`;
@@ -1655,19 +2732,14 @@ function renderTimeline(nodes: RenderNode[]): TimelineScrollerItemView[] {
 function renderTimelineGroup(group: TimelineGroup, index: number, total: number): TimelineScrollerItemView {
   const open = shouldOpenTimelineGroup(group, index, total);
   const id = timelineGroupDomId(group);
-  const bodyItems = group.nodes.map((node) => ({
-    id: node.id,
-    className: `timeline-group-body-item timeline-group-body-item-${escapeClass(node.kind)}`,
-    html: renderNode(node),
-    preserveDom: true
-  }));
+  const bodyItems = renderTimelineGroupBodyItems(group.nodes);
   timelineGroupProps.set(id, {
     id,
     label: group.label,
     detail: group.detail,
     status: group.status,
     statusLabel: toolStatusLabel(group.status),
-    laneLabel: shortLabel(group.lane),
+    laneId: group.lane,
     iconHtml: iconSvg(group.turnId ? "turn" : "session"),
     bodyItems,
     open
@@ -1679,6 +2751,86 @@ function renderTimelineGroup(group: TimelineGroup, index: number, total: number)
     preserveDom: true,
     html: `<div id="${id}" class="timeline-group" data-timeline-group-root data-timeline-group-id="${escapeHtml(id)}"></div>`
   };
+}
+
+function renderTimelineGroupBodyItems(nodes: RenderNode[]): TimelineGroupCardProps["bodyItems"] {
+  const items: TimelineGroupCardProps["bodyItems"] = [];
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (!node) {
+      continue;
+    }
+    if (isInlineToolDiffNode(nodes, node)) {
+      continue;
+    }
+    const toolRun = collectGroupableToolRun(nodes, index);
+    if (toolRun.length >= 2) {
+      items.push(toolCallGroupBodyItem(toolRun));
+      index += toolRun.length - 1;
+      continue;
+    }
+    items.push({
+      id: node.id,
+      className: `timeline-group-body-item timeline-group-body-item-${escapeClass(node.kind)}`,
+      html: renderNode(node),
+      preserveDom: true
+    });
+  }
+  return items;
+}
+
+function isInlineToolDiffNode(nodes: RenderNode[], node: RenderNode): boolean {
+  if (node.kind !== "diff" || !node.acpToolCallId) {
+    return false;
+  }
+  const nodePath = comparableDiffPath(node.path);
+  return nodes.some((candidate) => {
+    if (candidate.kind !== "tool" || candidate.toolCallId !== node.acpToolCallId) {
+      return false;
+    }
+    return candidate.content.some((item) => {
+      const record = asRecord(item);
+      if (record.type !== "diff") {
+        return false;
+      }
+      const recordPath = comparableDiffPath(String(record.path || "unknown"));
+      return recordPath === nodePath || recordPath.endsWith(`/${nodePath}`) || nodePath.endsWith(`/${recordPath}`);
+    });
+  });
+}
+
+function comparableDiffPath(path: string): string {
+  return path.replace(/^file:\/\//i, "").replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+}
+
+function collectGroupableToolRun(nodes: RenderNode[], startIndex: number): ToolNodeView[] {
+  if (!shouldGroupCompletedToolCalls()) {
+    return [];
+  }
+  const run: ToolNodeView[] = [];
+  for (let index = startIndex; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (!isGroupableToolNode(node)) {
+      break;
+    }
+    run.push(node);
+  }
+  return run;
+}
+
+function shouldGroupCompletedToolCalls(): boolean {
+  return timelineFilter === "all" && timelineSearchTokens(timelineQuery).length === 0;
+}
+
+function isGroupableToolNode(node: RenderNode | undefined): node is ToolNodeView {
+  if (!node || node.kind !== "tool") {
+    return false;
+  }
+  if (node.permission?.status === "pending" || node.permission?.status === "in_progress") {
+    return false;
+  }
+  const status = toolDisplayStatus(node);
+  return status !== "pending" && status !== "in_progress";
 }
 
 function timelineGroupDomId(group: TimelineGroup): string {
@@ -1812,11 +2964,14 @@ function renderNode(node: RenderNode): string {
 
 function messageNode(node: Extract<RenderNode, { kind: "message" }>): string {
   const isSticky = node.role === "user" && node.id === lastUserMessageNodeId;
+  const streamText = streamingTextForNode(node);
   messageCardProps.set(node.id, {
     nodeId: node.id,
     role: node.role,
     streaming: node.streaming,
-    contentHtml: renderContentBlocks(node.content),
+    contentHtml: streamText !== undefined ? "" : renderContentBlocks(node.content),
+    contentMode: streamText !== undefined ? "stream-text" : "html",
+    contentText: streamText,
     isSticky
   });
   return `
@@ -1856,13 +3011,16 @@ function planNode(node: Extract<RenderNode, { kind: "plan" }>): string {
 function thoughtNode(node: Extract<RenderNode, { kind: "thought" }>): string {
   const text = contentBlocksToPlainText(node.content);
   const statusLabel = node.status === "pending" || node.status === "in_progress" ? "live" : node.status === "completed" ? "done" : node.status;
+  const streamText = streamingTextForNode(node);
   thoughtCardProps.set(node.id, {
     nodeId: node.id,
     title: "Thinking",
     detail: text ? shortLabel(text) : "Agent reasoning update",
     statusLabel,
     iconHtml: iconSvg("message"),
-    contentHtml: node.content.length ? renderContentBlocks(node.content) : "",
+    contentHtml: streamText !== undefined ? "" : node.content.length ? renderContentBlocks(node.content) : "",
+    contentMode: streamText !== undefined ? "stream-text" : "html",
+    contentText: streamText,
     emptyText: "No thought content reported."
   });
   return `
@@ -1873,10 +3031,80 @@ function thoughtNode(node: Extract<RenderNode, { kind: "thought" }>): string {
   `;
 }
 
+function isLiveStatus(status: RenderNode["status"]): boolean {
+  return status === "pending" || status === "in_progress";
+}
+
+function streamingTextForNode(
+  node: Extract<RenderNode, { kind: "message" }> | Extract<RenderNode, { kind: "thought" }>
+): string | undefined {
+  if (!isLiveStatus(node.status)) {
+    return undefined;
+  }
+  if (node.kind === "message" && !node.streaming) {
+    return undefined;
+  }
+  return textOnlyContent(node.content);
+}
+
+function textOnlyContent(blocks: unknown[]): string | undefined {
+  if (!blocks.length || !blocks.every((block) => asRecord(block).type === "text")) {
+    return undefined;
+  }
+  return blocks.map((block) => String(asRecord(block).text || "")).join("");
+}
+
 type ToolNodeView = Extract<RenderNode, { kind: "tool" }>;
 type ApprovalNodeView = Extract<RenderNode, { kind: "approval" }>;
 
+function toolCallGroupBodyItem(nodes: ToolNodeView[]): TimelineGroupCardProps["bodyItems"][number] {
+  const id = toolCallGroupId(nodes);
+  const props = toolCallGroupPropsFromNodes(id, nodes);
+  toolCallGroupCardProps.set(id, props);
+  return {
+    id,
+    className: "timeline-group-body-item timeline-group-body-item-tool-group",
+    html: `<article id="${nodeDomId(id)}" class="turn-card tool-call-group" data-tool-call-count="${nodes.length}"><div class="rail"></div><div class="tool-call-group-react-root" data-tool-call-group-root data-tool-call-group-id="${escapeHtml(id)}"></div></article>`,
+    preserveDom: true
+  };
+}
+
+function toolCallGroupId(nodes: ToolNodeView[]): string {
+  return `tool-group:${nodes[0]?.id || "empty"}`;
+}
+
+function toolCallGroupPropsFromNodes(id: string, nodes: ToolNodeView[]): ToolCallGroupCardProps {
+  const items = nodes.map(toolCallCardPropsFromNode);
+  const status = combinedToolCallStatus(items.map((item) => item.status));
+  const summary = summarizeToolCallGroup(items);
+  return {
+    id,
+    title: summary.title,
+    detail: summary.detail,
+    status,
+    statusLabel: toolStatusLabel(status),
+    items
+  };
+}
+
+function combinedToolCallStatus(statuses: string[]): string {
+  const priority: Record<string, number> = {
+    failed: 5,
+    cancelled: 4,
+    pending: 3,
+    in_progress: 3,
+    completed: 1
+  };
+  return statuses.reduce((current, next) => (priority[next] || 0) > (priority[current] || 0) ? next : current, "completed");
+}
+
 function toolNode(node: ToolNodeView): string {
+  const props = toolCallCardPropsFromNode(node);
+  toolCallCardProps.set(node.id, props);
+  return toolNodeShell(node, props);
+}
+
+function toolCallCardPropsFromNode(node: ToolNodeView): ToolCallCardProps {
   const model = buildToolPresentation({
     title: node.title,
     toolKind: node.toolKind,
@@ -1894,17 +3122,15 @@ function toolNode(node: ToolNodeView): string {
   const title = terminal ? "Bash" : model.title;
   const subtitle = terminal ? terminalToolIntent(node, model) : model.summary;
   const readPreview = model.kind === "read" && node.content.some((content) => renderedToolContentType(content) === "text");
+  const renderGenericEmptyState = !node.permission && model.kind !== "edit" && model.kind !== "think";
   const contentHtml = terminal
     ? terminalToolPreview(node, model)
     : node.content.length
       ? node.content.map((item) => renderToolContent(item, node, model.kind)).join("")
-      : node.permission
-        ? ""
-        : `<p class="muted tool-empty-state">${escapeHtml(model.emptyText)}</p>`;
-  const rawDetails = !terminal && (node.rawInput || node.rawOutput)
-    ? rawDetailsView(`${node.id}-raw`, { input: node.rawInput, output: node.rawOutput })
-    : undefined;
-  toolCallCardProps.set(node.id, {
+      : renderGenericEmptyState
+        ? `<p class="muted tool-empty-state">${escapeHtml(model.emptyText)}</p>`
+        : "";
+  return {
     nodeId: node.id,
     rawToolKind: node.toolKind,
     title,
@@ -1918,10 +3144,12 @@ function toolNode(node: ToolNodeView): string {
     actions: model.actions,
     locations: node.locations.map(toolCallCardLocation),
     contentHtml,
-    rawDetails,
     approval
-  });
-  return `<article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(model.kind)} tool-risk-${escapeClass(cardModel.riskTone)}${approval ? " tool-permission" : ""}${terminal ? " terminal-tool" : ""}" data-raw-tool-kind="${escapeHtml(node.toolKind)}"><div class="rail"></div><div class="tool-call-react-root" data-tool-call-card-root data-tool-node-id="${escapeHtml(node.id)}"></div></article>`;
+  };
+}
+
+function toolNodeShell(node: ToolNodeView, props: ToolCallCardProps): string {
+  return `<article id="${nodeDomId(node.id)}" class="turn-card tool tool-${escapeClass(props.model.kind)} tool-risk-${escapeClass(props.model.riskTone)}${props.approval ? " tool-permission" : ""}${props.terminal ? " terminal-tool" : ""}" data-raw-tool-kind="${escapeHtml(node.toolKind)}"><div class="rail"></div><div class="tool-call-react-root" data-tool-call-card-root data-tool-node-id="${escapeHtml(node.id)}"></div></article>`;
 }
 
 function toolDisplayStatus(node: ToolNodeView): string {
@@ -1971,7 +3199,11 @@ function toolApprovalProps(
   const resolved = permission.status !== "pending";
   const locationCount = (node.locations || []).length;
   const tone = approvalTone({ status: permission.status, toolKind: model.kind });
-  const decisionOptions = resolved ? [] : permission.options.filter((option) => !isRejectPermissionOption(option));
+  const decisionOptions = resolved
+    ? []
+    : permission.options
+        .filter((option) => !isRejectPermissionOption(option))
+        .sort((a, b) => approvalOptionSafetyRank(a) - approvalOptionSafetyRank(b));
   const resolvedNote =
     permission.status === "completed"
       ? "Allowed."
@@ -2110,15 +3342,24 @@ function isRejectPermissionOption(option: { optionId: string; label: string }): 
   return /\b(reject|deny|decline|cancel|refuse|disallow)\b/.test(value);
 }
 
+function approvalOptionSafetyRank(option: { optionId: string; label: string }): number {
+  const value = `${option.optionId} ${option.label}`.toLowerCase();
+  if (/\b(always|forever|persist)\b/.test(value)) {
+    return 1;
+  }
+  if (/\b(allow|approve|once)\b/.test(value)) {
+    return 0;
+  }
+  return 2;
+}
+
 function approvalOptionAction(
   option: { optionId: string; label: string; description?: string | undefined },
   status: string,
   toolKind: ToolPresentation["kind"]
 ): ToolCallApprovalAction {
   const rawLabel = String(option.label || option.optionId || "Allow").trim();
-  const value = `${rawLabel} ${option.optionId}`.toLowerCase();
-  const allows = value.includes("allow") || value.includes("approve");
-  const label = allows ? (value.includes("always") ? "Always allow" : "Allow") : shortLabel(rawLabel || option.optionId);
+  const label = approvalActionLabel(rawLabel, option.optionId);
   const description = String(option.description || rawLabel || "").trim() || approvalDecisionDescription(toolKind);
   const tone = approvalDecisionTone({ status, toolKind });
   return {
@@ -2524,7 +3765,8 @@ function renderToolContent(content: unknown, tool?: ToolNodeView, effectiveKind?
       path,
       oldText,
       newText,
-      title: "Tool diff"
+      title: "Tool diff",
+      compact: effectiveKind === "edit"
     });
   }
   if (type === "terminal") {
@@ -2924,6 +4166,10 @@ async function copyCheckpoint(action: HTMLElement): Promise<void> {
   await copyTextToClipboard(action.dataset.target || "", "checkpoint id", "Copied checkpoint id.");
 }
 
+async function copyTimelineGroupId(action: HTMLElement): Promise<void> {
+  await copyTextToClipboard(action.dataset.target || "", "turn id", "Copied turn ID.");
+}
+
 function focusToolDiff(action: HTMLElement): void {
   const card = action.closest<HTMLElement>(".tool-card");
   if (!card) {
@@ -2936,23 +4182,6 @@ function focusToolDiff(action: HTMLElement): void {
   diff.setAttribute("tabindex", "-1");
   diff.scrollIntoView({ block: "nearest", inline: "nearest" });
   diff.focus();
-}
-
-function inspectToolDetails(action: HTMLElement): void {
-  const card = action.closest<HTMLElement>(".tool-card");
-  if (!card) {
-    return;
-  }
-  const rawSummary = card.querySelector<HTMLElement>(".raw-summary");
-  if (rawSummary) {
-    rawSummary.scrollIntoView({ block: "nearest", inline: "nearest" });
-    rawSummary.focus();
-    return;
-  }
-  const fallback = card.querySelector<HTMLElement>(".tool-content, .tool-evidence-strip, .tool-summary");
-  fallback?.setAttribute("tabindex", "-1");
-  fallback?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  fallback?.focus();
 }
 
 async function copyTextToClipboard(text: string, label: string, successMessage: string): Promise<void> {
@@ -3777,7 +5006,7 @@ function mountJsonDrawer(drawer: HTMLElement): void {
   document.body.append(drawer);
   drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus();
   window.requestAnimationFrame(() => {
-    void hydratePayloadDisclosures().then(hydrateInlineActions);
+    void hydratePayloadDisclosures().then(() => hydrateInlineActions());
   });
 }
 
@@ -3800,7 +5029,7 @@ function mountResultDrawer(props: ResultDrawerProps): void {
       onClose: () => closeJsonDrawer()
     });
     window.requestAnimationFrame(() => {
-      void hydratePayloadDisclosures().then(hydrateInlineActions);
+      void hydratePayloadDisclosures().then(() => hydrateInlineActions());
     });
   }).catch(() => undefined);
 }
@@ -3916,9 +5145,9 @@ function openDiffReviewDrawer(result: unknown): void {
       mountJsonDrawer(drawer);
       selectDiffReviewFile(rendered.firstPath);
       void hydratePayloadDisclosures()
-        .then(hydrateInlineActions)
+        .then(() => hydrateInlineActions())
         .then(() => drawer.querySelector<HTMLElement>("[data-action='closeDrawer']")?.focus());
-      void hydrateDiffPreviews(++diffRenderEpoch).then(hydrateInlineActions);
+      void hydrateDiffPreviews(++diffRenderEpoch).then(() => hydrateInlineActions());
     })
     .catch(() => {
       pendingDiffPreviews = [];
@@ -4396,6 +5625,7 @@ function diffPreview({
   path,
   oldText,
   newText,
+  compact,
   patch,
   additions,
   deletions,
@@ -4405,6 +5635,7 @@ function diffPreview({
   path: string;
   oldText: string;
   newText: string;
+  compact?: boolean | undefined;
   patch?: string | undefined;
   additions?: number | undefined;
   deletions?: number | undefined;
@@ -4414,15 +5645,15 @@ function diffPreview({
   const id = `diff-preview-${++diffPreviewCounter}`;
   const language = languageForResource(path, "text/plain");
   const stats = diffStats(oldText, newText);
-  pendingDiffPreviews.push({ id, path, oldText, newText, patch, additions, deletions, nodeId, title });
+  pendingDiffPreviews.push({ id, path, oldText, newText, compact, patch, additions, deletions, nodeId, title });
   return `
-    <section class="diff-preview diff-preview-loading" data-diff-preview-id="${escapeHtml(id)}" aria-busy="true" aria-label="${escapeHtml(title || "Diff preview")} for ${escapeHtml(path)}">
-      ${diffPreviewToolbar({ path, language, nodeId, additions: undefined, deletions: undefined, loading: true })}
-      <div class="diff-preview-meta">
+    <section class="diff-preview diff-preview-loading${compact ? " diff-preview-compact" : ""}" data-diff-preview-id="${escapeHtml(id)}" aria-busy="true" aria-label="${escapeHtml(title || "Diff preview")} for ${escapeHtml(path)}">
+      ${compact ? "" : diffPreviewToolbar({ path, language, nodeId, additions: undefined, deletions: undefined, loading: true })}
+      ${compact ? "" : `<div class="diff-preview-meta">
         <span>${stats.oldLineCount} before</span>
         <span>${stats.newLineCount} after</span>
         <span>preparing structured diff</span>
-      </div>
+      </div>`}
       <div class="diff-loading" role="status">
         <span class="diff-loading-bar" aria-hidden="true"></span>
         <span>Preparing structured diff preview...</span>
@@ -4796,8 +6027,8 @@ function getDiffReviewDrawerModule(): Promise<typeof import("./diffReviewDrawer.
   return diffReviewDrawerModulePromise;
 }
 
-function cleanupDiffEnhancements(): void {
-  diffEnhancerModule?.cleanupDiffEnhancements();
+function cleanupDetachedDiffEnhancements(): void {
+  diffEnhancerModule?.cleanupDetachedEnhancements?.();
 }
 
 function renderPatchDiffPreview(
@@ -4807,8 +6038,21 @@ function renderPatchDiffPreview(
 ): string {
   const patch = preview.patch || "";
   const truncated = truncateText(patch, MAX_RAW_JSON_CHARS);
+  const fallbackHtml = preview.compact
+    ? `
+      <div class="diff-fallback diff-fallback-compact" aria-label="Raw patch fallback">
+        <pre class="code diff-compact-code" data-highlight-language="diff" tabindex="0">${escapeHtml(truncated.text)}</pre>
+        ${truncated.truncated ? `<p class="muted">Patch truncated at ${MAX_RAW_JSON_CHARS} chars.</p>` : ""}
+      </div>
+    `
+    : `
+      <div class="diff-fallback" aria-label="Raw patch fallback">
+        ${codeBlock(truncated.text, { language: "diff", title: "Patch", copyLabel: "Copy patch" })}
+        ${truncated.truncated ? `<p class="muted">Patch truncated at ${MAX_RAW_JSON_CHARS} chars.</p>` : ""}
+      </div>
+    `;
   return `
-    ${diffPreviewToolbar({
+    ${preview.compact ? "" : diffPreviewToolbar({
       path: preview.path,
       language,
       nodeId: preview.nodeId,
@@ -4816,16 +6060,13 @@ function renderPatchDiffPreview(
       deletions: stats.deletions,
       loading: false
     })}
-    <div class="diff-preview-meta">
+    ${preview.compact ? "" : `<div class="diff-preview-meta">
       <span>patch</span>
       <span>+${stats.additions}</span>
       <span>-${stats.deletions}</span>
-    </div>
-    <div class="diffs-mount" data-diffs-mode="patch" data-diffs-path="${escapeHtml(preview.path)}" data-diffs-language="${escapeHtml(language)}" role="region" aria-label="${escapeHtml(preview.title || "Diff")}"></div>
-    <div class="diff-fallback" aria-label="Raw patch fallback">
-      ${codeBlock(truncated.text, { language: "diff", title: "Patch", copyLabel: "Copy patch" })}
-      ${truncated.truncated ? `<p class="muted">Patch truncated at ${MAX_RAW_JSON_CHARS} chars.</p>` : ""}
-    </div>
+    </div>`}
+    <div class="diffs-mount" data-diffs-mode="patch" data-diffs-compact="${preview.compact ? "true" : "false"}" data-diffs-path="${escapeHtml(preview.path)}" data-diffs-language="${escapeHtml(language)}" role="region" aria-label="${escapeHtml(preview.title || "Diff")}"></div>
+    ${fallbackHtml}
     <template class="diff-patch-source">${escapeHtml(patch)}</template>
     <template class="diff-source">${escapeHtml(patch)}</template>
   `;
@@ -4892,7 +6133,7 @@ async function hydrateDiffPreviews(epoch: number): Promise<void> {
 
 function renderHydratedDiffPreview(preview: PendingDiffPreview, model: DiffModel, language: string): string {
   return `
-    ${diffPreviewToolbar({
+    ${preview.compact ? "" : diffPreviewToolbar({
       path: preview.path,
       language,
       nodeId: preview.nodeId,
@@ -4900,17 +6141,17 @@ function renderHydratedDiffPreview(preview: PendingDiffPreview, model: DiffModel
       deletions: model.deletions,
       loading: false
     })}
-    <div class="diff-preview-meta">
+    ${preview.compact ? "" : `<div class="diff-preview-meta">
       <span>${escapeHtml(model.kind)}</span>
       <span>${model.oldLineCount} before</span>
       <span>${model.newLineCount} after</span>
       ${model.omittedRows > 0 ? `<span>${model.omittedRows} unchanged hidden</span>` : ""}
       ${model.tooLarge ? `<span>large preview</span>` : ""}
-    </div>
+    </div>`}
     ${
       model.tooLarge
         ? ""
-        : `<div class="diffs-mount" data-diffs-path="${escapeHtml(preview.path)}" data-diffs-language="${escapeHtml(language)}" role="region" aria-label="${escapeHtml(preview.title || "Diff")}"></div>`
+        : `<div class="diffs-mount" data-diffs-compact="${preview.compact ? "true" : "false"}" data-diffs-path="${escapeHtml(preview.path)}" data-diffs-language="${escapeHtml(language)}" role="region" aria-label="${escapeHtml(preview.title || "Diff")}"></div>`
     }
     <div class="diff-fallback" aria-label="Structured diff fallback">
       ${renderDiffGrid(model)}
@@ -4924,7 +6165,7 @@ function renderHydratedDiffPreview(preview: PendingDiffPreview, model: DiffModel
 function renderDiffPreviewError(preview: PendingDiffPreview): string {
   const language = languageForResource(preview.path, "text/plain");
   return `
-    ${diffPreviewToolbar({ path: preview.path, language, nodeId: preview.nodeId, loading: false })}
+    ${preview.compact ? "" : diffPreviewToolbar({ path: preview.path, language, nodeId: preview.nodeId, loading: false })}
     <div class="diff-loading" role="status">
       <span>Diff preview failed. Raw before/after content is still available.</span>
     </div>
@@ -5203,7 +6444,13 @@ function lucideAttrs(attrs: Record<string, string | number | undefined>): string
 }
 
 function persistWebviewState(): void {
-  vscode.setState({ composerDraft, composerSendMode, reviewVisible, timelineFilter, timelineQuery });
+  const snapshot = { composerDraft, composerSendMode, reviewVisible, timelineFilter, timelineQuery };
+  const json = JSON.stringify(snapshot);
+  if (json === lastPersistedWebviewStateJson) {
+    return;
+  }
+  lastPersistedWebviewStateJson = json;
+  vscode.setState(snapshot);
 }
 
 function isComposerSendMode(value: unknown): value is ComposerSendMode {

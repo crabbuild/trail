@@ -14,6 +14,7 @@ mod lanes;
 mod lifecycle;
 mod line_changes;
 mod manifest;
+mod memory;
 mod objects;
 mod patches;
 mod query;

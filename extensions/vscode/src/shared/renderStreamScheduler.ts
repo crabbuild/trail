@@ -72,7 +72,7 @@ export class RenderStreamScheduler {
   }
 
   flush(): void {
-    this.clearTimer();
+    this.clearTimers();
     const patches = [...this.queue.values(), ...this.componentQueue.values()];
     this.queue.clear();
     this.componentQueue.clear();
@@ -80,7 +80,7 @@ export class RenderStreamScheduler {
   }
 
   dispose(): void {
-    this.clearTimer();
+    this.clearTimers();
     this.queue.clear();
     this.componentQueue.clear();
   }
@@ -123,8 +123,7 @@ export class RenderStreamScheduler {
       return;
     }
     this.timer = setTimeout(() => {
-      this.timer = undefined;
-      this.flush();
+      this.flushStream();
     }, this.flushMs);
   }
 
@@ -133,10 +132,7 @@ export class RenderStreamScheduler {
       return;
     }
     this.componentTimer = setTimeout(() => {
-      this.componentTimer = undefined;
-      const patches = [...this.componentQueue.values()];
-      this.componentQueue.clear();
-      this.emit(patches);
+      this.flushComponents();
     }, this.componentFlushMs);
   }
 
@@ -149,11 +145,33 @@ export class RenderStreamScheduler {
     this.send(patches);
   }
 
-  private clearTimer(): void {
+  private flushStream(): void {
+    this.clearStreamTimer();
+    const patches = [...this.queue.values()];
+    this.queue.clear();
+    this.emit(patches);
+  }
+
+  private flushComponents(): void {
+    this.clearComponentTimer();
+    const patches = [...this.componentQueue.values()];
+    this.componentQueue.clear();
+    this.emit(patches);
+  }
+
+  private clearTimers(): void {
+    this.clearStreamTimer();
+    this.clearComponentTimer();
+  }
+
+  private clearStreamTimer(): void {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+  }
+
+  private clearComponentTimer(): void {
     if (this.componentTimer) {
       clearTimeout(this.componentTimer);
       this.componentTimer = undefined;

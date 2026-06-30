@@ -4,6 +4,8 @@ import type { RenderNode, RenderPatch } from "../shared/renderModel";
 import {
   applyRenderPatchesLocally,
   changedRenderNodes,
+  changedRenderNodesFromPatches,
+  isHydratableNodePatchPayload,
   isLiveNodePatchPayload,
   isStreamingTextPatchPayload,
   parseBaseRenderRevision,
@@ -106,6 +108,36 @@ test("reports changed, added, and removed render nodes", () => {
   assert.deepEqual([...changes.removedNodeIds], [removed.id]);
 });
 
+test("reports patch changes without scanning the rendered node array", () => {
+  const existing = messageNode("message:assistant:one", "Hello");
+  const removed = messageNode("message:assistant:removed", "Gone");
+  const updated = messageNode("message:assistant:one", "Hello world");
+  const added = messageNode("message:assistant:added", "New");
+
+  const changes = changedRenderNodesFromPatches([existing, removed], [
+    { type: "upsert", node: updated },
+    { type: "upsert", node: added },
+    { type: "remove", id: removed.id }
+  ]);
+
+  assert.deepEqual([...changes.changedNodeIds].sort(), [added.id, existing.id].sort());
+  assert.deepEqual([...changes.addedNodeIds], [added.id]);
+  assert.deepEqual([...changes.removedNodeIds], [removed.id]);
+});
+
+test("cancels transient add/remove pairs in patch-derived changes", () => {
+  const transient = messageNode("message:assistant:temp", "Temp");
+
+  const changes = changedRenderNodesFromPatches([], [
+    { type: "upsert", node: transient },
+    { type: "remove", id: transient.id }
+  ]);
+
+  assert.deepEqual([...changes.changedNodeIds], []);
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.removedNodeIds], []);
+});
+
 test("identifies streaming text patch payloads narrowly", () => {
   assert.equal(isStreamingTextPatchPayload({ type: "upsert", node: messageNode("message:assistant:one", "Hi") }), true);
   assert.equal(
@@ -135,5 +167,52 @@ test("identifies live node patch payloads for local hydration", () => {
       }
     }),
     false
+  );
+});
+
+test("allows existing presentation node completion patches to hydrate locally", () => {
+  assert.equal(
+    isHydratableNodePatchPayload({
+      type: "upsert",
+      node: {
+        ...messageNode("message:assistant:done", "Done"),
+        status: "completed",
+        streaming: false
+      }
+    }),
+    true
+  );
+  assert.equal(
+    isHydratableNodePatchPayload({
+      type: "upsert",
+      node: {
+        ...base,
+        id: "thought:done",
+        kind: "thought",
+        status: "completed",
+        content: [{ type: "text", text: "Done thinking" }],
+        ephemeral: true
+      }
+    }),
+    true
+  );
+  assert.equal(isHydratableNodePatchPayload({ type: "upsert", node: terminalNode("completed") }), true);
+  assert.equal(
+    isHydratableNodePatchPayload({
+      type: "upsert",
+      node: {
+        ...base,
+        id: "tool:done",
+        kind: "tool",
+        status: "completed",
+        toolCallId: "done",
+        title: "Read README",
+        toolKind: "read",
+        toolStatus: "completed",
+        locations: [],
+        content: []
+      }
+    }),
+    true
   );
 });

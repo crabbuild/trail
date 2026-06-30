@@ -30,6 +30,7 @@ test("keeps completed edit diffs collapsed while marking them as workspace chang
     toolKind: "edit",
     toolStatus: "completed",
     locations: [{ path: "README.md" }],
+    rawInput: { path: "README.md", oldString: "old" },
     content: [{ type: "diff", path: "README.md", oldText: "old", newText: "new" }]
   });
 
@@ -39,8 +40,46 @@ test("keeps completed edit diffs collapsed while marking them as workspace chang
   assert.equal(model.summary, "1 diff in README.md");
   assert.equal(model.actions[0]?.kind, "focusDiff");
   assert.equal(model.actions[0]?.tone, "primary");
+  assert.deepEqual(
+    model.actions.map((action) => action.kind),
+    ["focusDiff", "openLocation"]
+  );
   assert.equal(model.actions.find((action) => action.kind === "openLocation")?.path, "README.md");
   assert.equal(model.stats.some((stat) => stat.label === "state"), false);
+});
+
+test("describes edit tools without previews as lifecycle work", () => {
+  const running = buildToolPresentation({
+    title: "Edit",
+    toolKind: "edit",
+    toolStatus: "in_progress",
+    locations: [],
+    content: []
+  });
+  const completed = buildToolPresentation({
+    title: "Edit",
+    toolKind: "edit",
+    toolStatus: "completed",
+    locations: [],
+    content: []
+  });
+  const failed = buildToolPresentation({
+    title: "Edit",
+    toolKind: "edit",
+    toolStatus: "failed",
+    locations: [],
+    rawInput: { path: "README.md" },
+    content: []
+  });
+
+  assert.equal(running.summary, "Preparing workspace change");
+  assert.equal(completed.summary, "Workspace change");
+  assert.equal(failed.summary, "README.md");
+  assert.equal(running.emptyText, "No diff preview available for this edit.");
+  assert.deepEqual(
+    failed.actions.map((action) => action.kind),
+    ["openLocation"]
+  );
 });
 
 test("keeps command tools focused on rendered terminal output", () => {
@@ -61,7 +100,26 @@ test("keeps command tools focused on rendered terminal output", () => {
   assert.equal(model.actions.length, 0);
 });
 
-test("keeps failed and destructive tools collapsed after completion", () => {
+test("keeps think tools focused on the note content", () => {
+  const model = buildToolPresentation({
+    title: "Find extension API surface",
+    toolKind: "think",
+    toolStatus: "pending",
+    locations: [],
+    rawInput: { prompt: "Find exported API surface" },
+    rawOutput: { ok: true },
+    content: [{ type: "content", content: { type: "text", text: "Search extension entry points." } }]
+  });
+
+  assert.equal(model.operationLabel, "Think");
+  assert.equal(model.kind, "think");
+  assert.equal(model.summary, "Thinking");
+  assert.equal(model.riskTone, "ok");
+  assert.equal(model.stats.length, 0);
+  assert.equal(model.actions.length, 0);
+});
+
+test("keeps failed and destructive tools collapsed without details actions", () => {
   const failed = buildToolPresentation({
     title: "Delete generated file",
     toolKind: "delete",
@@ -74,8 +132,10 @@ test("keeps failed and destructive tools collapsed after completion", () => {
   assert.equal(failed.riskLabel, "Needs inspection");
   assert.equal(failed.openByDefault, false);
   assert.equal(failed.statusLabel, "failed");
-  assert.equal(failed.actions[0]?.kind, "inspectDetails");
-  assert.equal(failed.actions[0]?.tone, "primary");
+  assert.deepEqual(
+    failed.actions.map((action) => action.kind),
+    ["openLocation"]
+  );
 });
 
 test("uses CrabDB-specific empty text for persisted tool events", () => {
@@ -108,7 +168,7 @@ test("redacts and truncates raw input facts", () => {
   assert.ok(fact);
   assert.ok(fact.value.length <= 110);
   assert.doesNotMatch(fact.value, /secret/);
-  assert.equal(model.actions.find((action) => action.kind === "inspectDetails")?.tone, "default");
+  assert.equal(model.actions.length, 0);
 });
 
 test("redacts command summaries without generic copy affordances", () => {

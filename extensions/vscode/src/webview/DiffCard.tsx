@@ -25,6 +25,7 @@ export interface DiffCardProps {
 
 export interface MountDiffCardsOptions {
   getProps(nodeId: string): DiffCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -73,6 +74,10 @@ export function mountDiffCards(options: MountDiffCardsOptions): void {
   document.querySelectorAll<HTMLElement>("[data-diff-card-root]").forEach((element) => {
     const nodeId = element.dataset.diffNodeId
     if (!nodeId) {
+      return
+    }
+    if (options.ids && !options.ids.has(nodeId)) {
+      activeIds.add(nodeId)
       return
     }
     const props = options.getProps(nodeId)

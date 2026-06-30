@@ -32,6 +32,7 @@ export interface PlanCardProps {
 
 export interface MountPlanCardsOptions {
   getProps(nodeId: string): PlanCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -120,6 +121,10 @@ export function mountPlanCards(options: MountPlanCardsOptions): void {
   document.querySelectorAll<HTMLElement>("[data-plan-card-root]").forEach((element) => {
     const nodeId = element.dataset.planNodeId
     if (!nodeId) {
+      return
+    }
+    if (options.ids && !options.ids.has(nodeId)) {
+      activeIds.add(nodeId)
       return
     }
     const props = options.getProps(nodeId)

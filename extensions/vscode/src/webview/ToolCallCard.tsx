@@ -6,10 +6,12 @@ import {
   Check,
   CircleAlert,
   CircleX,
+  Clock3,
   Diff,
   ExternalLink,
   FileDiff,
   FileText,
+  LoaderCircle,
   PanelRightOpen,
   Search,
   Settings,
@@ -23,15 +25,6 @@ import {
 import { Button } from "@/webview/components/ui/button"
 import { ButtonGroup } from "@/webview/components/ui/button-group"
 import { Badge } from "@/webview/components/ui/badge"
-import {
-  Breadcrumb,
-  BreadcrumbEllipsis,
-  BreadcrumbItem,
-  BreadcrumbLink,
-  BreadcrumbList,
-  BreadcrumbPage,
-  BreadcrumbSeparator
-} from "@/webview/components/ui/breadcrumb"
 import { Card, CardContent } from "@/webview/components/ui/card"
 import {
   Collapsible,
@@ -39,22 +32,11 @@ import {
   CollapsibleTrigger
 } from "@/webview/components/ui/collapsible"
 import {
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuGroup,
-  ContextMenuItem,
-  ContextMenuLabel,
-  ContextMenuTrigger
-} from "@/webview/components/ui/context-menu"
-import {
   HoverCard,
   HoverCardContent,
   HoverCardTrigger
 } from "@/webview/components/ui/hover-card"
-import { Separator } from "@/webview/components/ui/separator"
 import { cn } from "@/webview/lib/utils"
-import { InlineActions, type InlineAction, type InlineActionTone } from "./InlineActions"
-import { RawDetails, type RawDetailsView } from "./RawDetails"
 import type {
   ToolAction,
   ToolFact,
@@ -114,7 +96,6 @@ export interface ToolCallCardProps {
   actions: ToolAction[]
   locations: ToolCallCardLocation[]
   contentHtml: string
-  rawDetails?: RawDetailsView | undefined
   approval?: ToolCallApprovalProps | undefined
 }
 
@@ -124,6 +105,7 @@ export interface ToolCallCardCallbacks {
 
 export interface MountToolCallCardsOptions extends ToolCallCardCallbacks {
   getProps(nodeId: string): ToolCallCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -148,75 +130,70 @@ const ICONS: Record<string, LucideIcon> = {
   tool: Wrench
 }
 
+type EditLifecycleState = "approval" | "pending" | "running" | "ready" | "complete" | "recorded" | "failed" | "cancelled"
+
+interface EditLifecycleView {
+  state: EditLifecycleState
+  title: string
+  detail: string
+}
+
+const EDIT_LIFECYCLE_ICONS: Record<EditLifecycleState, LucideIcon> = {
+  approval: ShieldCheck,
+  pending: LoaderCircle,
+  running: LoaderCircle,
+  ready: Diff,
+  complete: Check,
+  recorded: Check,
+  failed: CircleAlert,
+  cancelled: CircleX
+}
+
 export function ToolCallCard({
-  props,
-  callbacks
+  props
 }: {
   props: ToolCallCardProps
   callbacks: ToolCallCardCallbacks
 }) {
-  const isActive = props.status === "in_progress" || props.status === "pending"
+  const shouldShowEditReceipt =
+    props.model.kind === "edit" &&
+    props.status === "completed" &&
+    !props.contentHtml.trim()
+  const isActive =
+    props.status === "in_progress" || props.status === "pending" || shouldShowEditReceipt
   const [open, setOpen] = React.useState(isActive)
-  const [rawOpen, setRawOpen] = React.useState(Boolean(props.rawDetails?.defaultOpen))
-  const cardRef = React.useRef<HTMLDivElement>(null)
   const Icon = ICONS[props.model.icon] ?? Wrench
-  const compactMeta = props.terminal && props.status === "completed"
+  const readPermissionTarget = props.model.kind === "read" && props.approval ? toolTargetLabel(props) : ""
+  const displayTitle = readPermissionTarget ? `Read ${readPermissionTarget}` : props.title
+  const compactMeta = (props.terminal && props.status === "completed") || props.model.kind === "think" || Boolean(readPermissionTarget)
+  const pendingApproval = Boolean(props.approval && !props.approval.resolved)
 
   React.useEffect(() => {
     setOpen(isActive)
   }, [isActive, props.nodeId])
 
-  React.useEffect(() => {
-    setRawOpen(Boolean(props.rawDetails?.defaultOpen))
-  }, [props.rawDetails?.defaultOpen, props.rawDetails?.id])
-
-  const handleAction = React.useCallback(
-    (action: ToolAction, event: React.MouseEvent<HTMLElement>) => {
-      event.preventDefault()
-      event.stopPropagation()
-      if (action.kind === "openLocation") {
-        callbacks.onOpenLocation({ path: action.path, line: action.line })
-        return
-      }
-      setOpen(true)
-      if (action.kind === "inspectDetails") {
-        setRawOpen(true)
-      }
-      window.requestAnimationFrame(() => {
-        if (action.kind === "focusDiff") {
-          focusToolDiff(cardRef.current)
-          return
-        }
-        inspectToolDetails(cardRef.current)
-      })
-    },
-    [callbacks]
-  )
-
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
-      <ToolContextMenu actions={props.actions} onAction={handleAction}>
-        <Card
-          ref={cardRef}
-          size="sm"
-          data-tool-card=""
-          data-open={open ? "" : undefined}
-          className={cn(
-            "card-body tool-card relative gap-0 overflow-hidden rounded-md border border-border bg-card py-0 text-card-foreground shadow-none ring-0",
-            `tool-tone-${props.model.tone}`,
-            open ? "is-open" : ""
-          )}
-        >
+      <Card
+        size="sm"
+        data-tool-card=""
+        data-open={open ? "" : undefined}
+        className={cn(
+          "card-body tool-card relative gap-0 overflow-hidden rounded-md border border-border bg-card py-0 text-card-foreground shadow-none ring-0",
+          `tool-tone-${props.model.tone}`,
+          open ? "is-open" : ""
+        )}
+      >
           <CollapsibleTrigger
             className="tool-summary grid w-full grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-2 border-0 bg-transparent px-3 py-2 text-left hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-            aria-label={`${open ? "Collapse" : "Expand"} ${props.title}`}
+            aria-label={`${open ? "Collapse" : "Expand"} ${displayTitle}`}
           >
             <span className="summary-icon tool-summary-icon inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
               <Icon data-icon="inline-start" aria-hidden="true" />
             </span>
             <span className="tool-summary-main min-w-0">
               <span className="tool-title block truncate text-sm font-medium">
-                {props.title}
+                {displayTitle}
               </span>
               <span className="tool-subtitle block truncate text-xs text-muted-foreground">
                 {props.subtitle}
@@ -240,93 +217,228 @@ export function ToolCallCard({
               )}
             >
               {props.approval ? (
-                <ToolApprovalPanel approval={props.approval} />
+                <ToolApprovalPanel
+                  approval={props.approval}
+                  editTarget={props.model.kind === "edit" ? toolTargetLabel(props) || "Workspace edit" : undefined}
+                  readTarget={readPermissionTarget || undefined}
+                />
               ) : null}
-              {props.terminal ? (
+              {pendingApproval ? null : props.terminal ? (
                 <HtmlBlock html={props.contentHtml} />
               ) : (
-                <ToolDetail
-                  props={props}
-                  rawOpen={rawOpen}
-                  setRawOpen={setRawOpen}
-                  onAction={handleAction}
-                />
+                <ToolDetail props={props} />
               )}
             </CardContent>
           </CollapsibleContent>
         </Card>
-      </ToolContextMenu>
     </Collapsible>
   )
 }
 
 function ToolDetail({
-  props,
-  rawOpen,
-  setRawOpen,
-  onAction
+  props
 }: {
   props: ToolCallCardProps
-  rawOpen: boolean
-  setRawOpen(open: boolean): void
-  onAction(action: ToolAction, event: React.MouseEvent<HTMLElement>): void
 }) {
+  const isEdit = props.model.kind === "edit"
+  const isThink = props.model.kind === "think"
+  const editLifecycle = editLifecycleForTool(props)
+  if (isEdit || isThink) {
+    return (
+      <>
+        {editLifecycle ? <ToolEditLifecycle lifecycle={editLifecycle} /> : null}
+        {props.contentHtml ? (
+          <div
+            className={cn("tool-content", isEdit ? "edit-tool-content" : "think-tool-content")}
+            dangerouslySetInnerHTML={{ __html: props.contentHtml }}
+          />
+        ) : null}
+      </>
+    )
+  }
+
   return (
     <>
-      {props.readPreview ? null : (
-        <>
-          <ToolActionBar actions={props.actions} onAction={onAction} />
-          <ToolEvidenceStrip stats={props.stats} />
-          <ToolFacts facts={props.facts} />
-          <ToolLocations locations={props.locations} />
-        </>
-      )}
+      {editLifecycle ? <ToolEditLifecycle lifecycle={editLifecycle} /> : null}
       {props.contentHtml ? (
         <div
           className="tool-content"
           dangerouslySetInnerHTML={{ __html: props.contentHtml }}
         />
       ) : null}
-      {props.rawDetails ? (
-        <RawDetails
-          details={props.rawDetails}
-          open={rawOpen}
-          onOpenChange={setRawOpen}
-        />
-      ) : null}
     </>
   )
 }
 
-function ToolApprovalPanel({ approval }: { approval: ToolCallApprovalProps }) {
+function ToolEditLifecycle({ lifecycle }: { lifecycle: EditLifecycleView }) {
+  const Icon = EDIT_LIFECYCLE_ICONS[lifecycle.state]
+  const active = lifecycle.state === "approval" || lifecycle.state === "pending" || lifecycle.state === "running"
+  const loading = lifecycle.state === "pending" || lifecycle.state === "running"
+  return (
+    <section
+      className={cn("edit-lifecycle", `edit-lifecycle-${lifecycle.state}`)}
+      data-edit-lifecycle-state={lifecycle.state}
+      aria-label="Edit status"
+      role={active ? "status" : undefined}
+    >
+      <Icon
+        className={cn("edit-lifecycle-icon", loading ? "edit-lifecycle-loading-icon" : "")}
+        aria-hidden="true"
+      />
+      <span className="edit-lifecycle-copy">
+        <strong>{lifecycle.title}</strong>
+        <span>{lifecycle.detail}</span>
+      </span>
+    </section>
+  )
+}
+
+function editLifecycleForTool(props: ToolCallCardProps): EditLifecycleView | undefined {
+  if (props.model.kind !== "edit") {
+    return undefined
+  }
+
+  const hasPreview = Boolean(props.contentHtml.trim())
+  const target = toolTargetLabel(props)
+  const targetPhrase = target ? `for ${target}` : "for the workspace"
+
+  if (props.approval && !props.approval.resolved) {
+    return undefined
+  }
+
+  if (props.status === "failed") {
+    return {
+      state: "failed",
+      title: "Edit failed",
+      detail: `The edit ${targetPhrase} did not finish.`
+    }
+  }
+
+  if (props.status === "cancelled") {
+    return {
+      state: "cancelled",
+      title: "Edit cancelled",
+      detail: "The edit stopped before changes were applied."
+    }
+  }
+
+  if (props.status === "completed" && hasPreview) {
+    return {
+      state: "complete",
+      title: "Finished editing",
+      detail: `Changes ${targetPhrase} are ready below.`
+    }
+  }
+
+  if (props.status === "completed") {
+    return {
+      state: "recorded",
+      title: "Edit complete",
+      detail: target
+        ? `No diff preview was returned for ${target}.`
+        : "No diff preview was returned."
+    }
+  }
+
+  if (hasPreview) {
+    return {
+      state: "ready",
+      title: "Review changes",
+      detail: `Diff preview ${targetPhrase} is ready below.`
+    }
+  }
+
+  if (props.status === "pending") {
+    return {
+      state: "pending",
+      title: "Preparing edit",
+      detail: `Generating changes ${targetPhrase}.`
+    }
+  }
+
+  return {
+    state: "running",
+    title: "Preparing edit",
+    detail: `Generating changes ${targetPhrase}.`
+  }
+}
+
+function toolTargetLabel(props: ToolCallCardProps): string {
+  const locationPath = props.locations.find((location) => location.path)?.path
+  const factPath = props.facts.find((fact) => fact.label === "Path")?.value
+  const subtitlePath = props.subtitle.match(/\bin\s+(.+)$/)?.[1]
+  const titlePath = props.title.match(/[^\s()'"]+\.(?:css|go|html?|jsx?|jsonc?|lock|mdx?|mjs|[mc]?ts|py|rs|sh|text|tsx?|txt|xml|ya?ml)\b/i)?.[0]
+  return compactEditTargetLabel(String(locationPath || factPath || subtitlePath || titlePath || "").trim())
+}
+
+function compactEditTargetLabel(value: string): string {
+  if (!value) {
+    return ""
+  }
+  const normalized = value.replace(/^file:\/\//i, "").replace(/\\/g, "/")
+  const parts = normalized.split("/").filter(Boolean)
+  if (!parts.length) {
+    return value
+  }
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
+    return parts[parts.length - 1] || value
+  }
+  return parts.length > 2 ? parts.slice(-2).join("/") : normalized
+}
+
+function ToolApprovalPanel({
+  approval,
+  editTarget,
+  readTarget
+}: {
+  approval: ToolCallApprovalProps
+  editTarget?: string | undefined
+  readTarget?: string | undefined
+}) {
+  const ApprovalIcon = approvalPanelIcon(approval)
+  const isEdit = typeof editTarget === "string"
+  const isRead = typeof readTarget === "string"
+  const title = isEdit
+    ? approval.resolved
+      ? "Edit decision recorded"
+      : "Approve edit?"
+    : isRead
+      ? approval.resolved
+        ? "Read decision recorded"
+        : "Allow read?"
+    : approval.resolved
+      ? "Permission decided"
+      : approval.title
+  const detail = isEdit
+    ? approval.resolved
+      ? approval.resolvedNote
+      : editTarget || "Workspace edit"
+    : isRead
+      ? approval.resolved
+        ? approval.resolvedNote
+        : readTarget || "Workspace file"
+    : approval.resolved
+      ? approval.resolvedNote
+      : approval.impactText
   return (
     <section
       className={cn(
         "tool-approval",
+        isEdit ? "tool-approval-edit" : "",
+        isRead ? "tool-approval-read" : "",
         `approval-tone-${approval.tone}`,
         approval.resolved ? "tool-approval-resolved" : ""
       )}
       aria-label="Permission request"
     >
-      <div className="tool-approval-copy">
-        <div className="tool-approval-title-row">
+      <div className="tool-approval-heading">
+        <ApprovalIcon className="tool-approval-icon" aria-hidden="true" />
+        <div className="tool-approval-copy">
           <span className="tool-approval-title">
-            {approval.resolved ? "Permission decided" : approval.title}
+            {title}
           </span>
-          {approval.resolved ? null : (
-            <Badge
-              className={cn("tool-status", `tool-status-${approval.status}`)}
-              variant="outline"
-            >
-              {approval.statusLabel}
-            </Badge>
-          )}
+          <p className={approval.resolved ? "approval-resolved-note" : "approval-impact"}>{detail}</p>
         </div>
-        {approval.resolved ? (
-          <p className="approval-resolved-note">{approval.resolvedNote}</p>
-        ) : (
-          <p className="approval-impact">{approval.impactText}</p>
-        )}
       </div>
       {approval.resolved ? null : <ToolApprovalDecision approval={approval} />}
     </section>
@@ -368,7 +480,8 @@ function ToolApprovalButton({
   requestId: string
 }) {
   const isReject = action.kind === "reject"
-  const variant = isReject || action.tone === "risk" ? "destructive" : action.tone === "primary" ? "default" : "outline"
+  const isPrimaryApprove = isPrimaryApprovalAction(action)
+  const variant = isReject || action.tone === "risk" ? "destructive" : isPrimaryApprove ? "default" : "outline"
   const ApprovalIcon = approvalActionIcon(action)
   return (
     <Button
@@ -384,7 +497,7 @@ function ToolApprovalButton({
       className={cn(
         isReject ? "danger approval-reject" : "approval-option",
         isReject ? "" : `approval-option-${action.tone}`,
-        action.tone === "primary" ? "primary" : ""
+        isPrimaryApprove ? "primary" : ""
       )}
     >
       <ApprovalIcon data-icon="inline-start" aria-hidden="true" />
@@ -393,6 +506,16 @@ function ToolApprovalButton({
       </span>
     </Button>
   )
+}
+
+function approvalPanelIcon(approval: ToolCallApprovalProps): LucideIcon {
+  if (approval.status === "completed") {
+    return Check
+  }
+  if (approval.status === "cancelled" || approval.status === "failed") {
+    return CircleX
+  }
+  return ShieldCheck
 }
 
 function approvalActionIcon(action: ToolCallApprovalAction): LucideIcon {
@@ -404,6 +527,14 @@ function approvalActionIcon(action: ToolCallApprovalAction): LucideIcon {
     return ShieldCheck
   }
   return Check
+}
+
+function isPrimaryApprovalAction(action: ToolCallApprovalAction): boolean {
+  if (action.kind !== "approve" || action.tone === "risk") {
+    return false
+  }
+  const value = `${action.label} ${action.optionId ?? ""}`.toLowerCase()
+  return !/\b(always|forever|persist)\b/.test(value)
 }
 
 function ToolSummaryMeta({
@@ -423,9 +554,11 @@ function ToolSummaryMeta({
           label={model.statusLabel}
           description={toolStatusDescription(status, model.statusLabel)}
         >
-          <Badge className={cn("tool-status min-w-0 max-w-full truncate", `tool-status-${status}`)} variant="outline">
-            {model.statusLabel}
-          </Badge>
+          <ToolMetaIconBadge
+            className={cn("tool-status", `tool-status-${status}`)}
+            icon={statusIcon(status, model.statusLabel)}
+            label={model.statusLabel}
+          />
         </ToolMetaHover>
       </span>
     )
@@ -438,9 +571,11 @@ function ToolSummaryMeta({
         label={model.operationLabel}
         description={toolOperationDescription(model)}
       >
-        <Badge className={cn("tool-kind min-w-0 max-w-full truncate", `tool-kind-${model.tone}`)} variant="outline">
-          {model.operationLabel}
-        </Badge>
+        <ToolMetaIconBadge
+          className={cn("tool-kind", `tool-kind-${model.tone}`)}
+          icon={operationIcon(model)}
+          label={model.operationLabel}
+        />
       </ToolMetaHover>
       {model.riskTone === "ok" ? null : (
         <ToolMetaHover
@@ -448,12 +583,12 @@ function ToolSummaryMeta({
           label={model.riskLabel}
           description={toolRiskDescription(model.riskTone, model.riskLabel)}
         >
-          <Badge
-            className={cn("tool-risk-badge min-w-0 max-w-full truncate", `tool-risk-badge-${model.riskTone}`)}
+          <ToolMetaIconBadge
+            className={cn("tool-risk-badge", `tool-risk-badge-${model.riskTone}`)}
+            icon={riskIcon(model.riskTone, model.riskLabel)}
+            label={model.riskLabel}
             variant={model.riskTone === "risk" ? "destructive" : "secondary"}
-          >
-            {riskShortLabel(model.riskLabel)}
-          </Badge>
+          />
         </ToolMetaHover>
       )}
       {status === "completed" ? null : (
@@ -462,12 +597,37 @@ function ToolSummaryMeta({
           label={model.statusLabel}
           description={toolStatusDescription(status, model.statusLabel)}
         >
-          <Badge className={cn("tool-status min-w-0 max-w-full truncate", `tool-status-${status}`)} variant="outline">
-            {model.statusLabel}
-          </Badge>
+          <ToolMetaIconBadge
+            className={cn("tool-status", `tool-status-${status}`)}
+            icon={statusIcon(status, model.statusLabel)}
+            label={model.statusLabel}
+          />
         </ToolMetaHover>
       )}
     </span>
+  )
+}
+
+function ToolMetaIconBadge({
+  className,
+  icon: Icon,
+  label,
+  variant = "outline"
+}: {
+  className: string
+  icon: LucideIcon
+  label: string
+  variant?: React.ComponentProps<typeof Badge>["variant"]
+}) {
+  return (
+    <Badge
+      aria-label={label}
+      className={cn("tool-meta-icon-badge", className)}
+      title={label}
+      variant={variant}
+    >
+      <Icon data-icon="inline-start" aria-hidden="true" />
+    </Badge>
   )
 }
 
@@ -503,286 +663,38 @@ function ToolMetaHover({
   )
 }
 
-function ToolActionBar({
-  actions,
-  onAction
-}: {
-  actions: ToolAction[]
-  onAction(action: ToolAction, event: React.MouseEvent<HTMLElement>): void
-}) {
-  if (!actions.length) {
-    return null
-  }
-  return (
-    <InlineActions
-      props={{
-        id: "tool-card-actions",
-        className: "tool-card-actions",
-        ariaLabel: "Tool actions",
-        actions: actions.map((action, index) => toolInlineAction(action, index)),
-        onAction: (inlineAction, event) => {
-          const index = inlineAction.data?.["tool-action-index"]
-          const action = typeof index === "string" ? actions[Number.parseInt(index, 10)] : undefined
-          if (action) {
-            onAction(action, event)
-          }
-        }
-      }}
-    />
-  )
-}
-
-function toolInlineAction(action: ToolAction, index: number): InlineAction {
-  const Icon = ICONS[actionIcon(action.kind)] ?? Wrench
-  return {
-    action: toolActionDomName(action.kind),
-    label: action.label,
-    tone: toolActionTone(action.tone),
-    ariaLabel: `${action.label}. ${action.description}`,
-    tooltip: action.description,
-    icon: <Icon data-icon="inline-start" aria-hidden="true" />,
-    className: "tool-card-action",
-    data: {
-      "tool-action-index": String(index),
-      path: action.path,
-      line: typeof action.line === "number" ? String(action.line) : undefined
-    }
-  }
-}
-
-function toolActionTone(tone: ToolAction["tone"]): InlineActionTone {
-  if (tone === "primary" || tone === "danger") {
-    return tone
-  }
-  return "default"
-}
-
-function ToolContextMenu({
-  actions,
-  children,
-  onAction
-}: {
-  actions: ToolAction[]
-  children: React.ReactNode
-  onAction(action: ToolAction, event: React.MouseEvent<HTMLElement>): void
-}) {
-  if (!actions.length) {
-    return <>{children}</>
-  }
-  return (
-    <ContextMenu>
-      <ContextMenuTrigger
-        className="tool-context-trigger select-text"
-        render={<div />}
-      >
-        {children}
-      </ContextMenuTrigger>
-      <ContextMenuContent className="tool-context-menu" side="right" align="start">
-        <ContextMenuGroup>
-          <ContextMenuLabel>Tool actions</ContextMenuLabel>
-          {actions.map((action, index) => {
-            const Icon = ICONS[actionIcon(action.kind)] ?? Wrench
-            return (
-              <ContextMenuItem
-                key={`${action.kind}-${action.path ?? ""}-${index}`}
-                className="tool-context-menu-item"
-                data-action={toolActionDomName(action.kind)}
-                data-path={action.path}
-                data-line={action.line}
-                variant={action.tone === "danger" ? "destructive" : "default"}
-                onClick={(event) => onAction(action, event)}
-              >
-                <Icon aria-hidden="true" />
-                <span>{action.label}</span>
-              </ContextMenuItem>
-            )
-          })}
-        </ContextMenuGroup>
-      </ContextMenuContent>
-    </ContextMenu>
-  )
-}
-
-function ToolEvidenceStrip({ stats }: { stats: ToolStat[] }) {
-  if (!stats.length) {
-    return null
-  }
-  return (
-    <div className="tool-evidence-strip flex flex-wrap gap-1" aria-label="Tool evidence">
-      {stats.map((stat) => (
-        <Badge
-          key={`${stat.label}-${stat.value}`}
-          className={cn(
-            "tool-stat min-w-0 max-w-full items-baseline gap-1",
-            `tool-stat-${stat.tone}`
-          )}
-          variant="outline"
-        >
-          <b className="font-mono tabular-nums">{stat.value}</b>
-          <span className="truncate text-muted-foreground">{stat.label}</span>
-        </Badge>
-      ))}
-    </div>
-  )
-}
-
-function ToolFacts({ facts }: { facts: ToolFact[] }) {
-  if (!facts.length) {
-    return null
-  }
-  return (
-    <div className="tool-facts flex flex-wrap gap-1" aria-label="Tool facts">
-      {facts.map((fact) => (
-        <Badge
-          key={`${fact.label}-${fact.value}`}
-          className="tool-fact min-w-0 max-w-full items-baseline gap-1"
-          variant="secondary"
-        >
-          <span className="tool-fact-label truncate text-muted-foreground">
-            {fact.label}
-          </span>
-          <Separator className="tool-fact-separator" orientation="vertical" />
-          <span className="tool-fact-value min-w-0 overflow-auto font-mono text-xs">
-            {fact.value}
-          </span>
-        </Badge>
-      ))}
-    </div>
-  )
-}
-
-function ToolLocations({ locations }: { locations: ToolCallCardLocation[] }) {
-  if (!locations.length) {
-    return null
-  }
-  return (
-    <div className="tool-locations flex flex-wrap gap-1" aria-label="Tool locations">
-      {locations.map((location, index) => (
-        <ToolLocationBreadcrumb
-          key={`${location.path}-${location.line ?? ""}-${index}`}
-          location={location}
-        />
-      ))}
-    </div>
-  )
-}
-
-function ToolLocationBreadcrumb({ location }: { location: ToolCallCardLocation }) {
-  const crumb = locationBreadcrumb(location.path)
-  const lineLabel = typeof location.line === "number" ? `:${location.line}` : ""
-
-  return (
-    <Breadcrumb
-      className="resource-chip tool-location-breadcrumb min-w-0 max-w-full justify-start"
-      aria-label={`Tool location ${location.path}${lineLabel}`}
-    >
-      <BreadcrumbList className="tool-location-breadcrumb-list flex-nowrap gap-1 text-xs">
-        {crumb.collapsed ? (
-          <>
-            <BreadcrumbItem className="min-w-0">
-              <BreadcrumbEllipsis className="tool-location-ellipsis" />
-            </BreadcrumbItem>
-            <BreadcrumbSeparator className="tool-location-separator" />
-          </>
-        ) : null}
-        {crumb.parts.map((part, index) => {
-          const last = index === crumb.parts.length - 1
-          return (
-            <React.Fragment key={`${part}-${index}`}>
-              {index > 0 ? <BreadcrumbSeparator className="tool-location-separator" /> : null}
-              <BreadcrumbItem className="min-w-0">
-                {last ? (
-                  <BreadcrumbPage className="tool-location-page truncate">
-                    {part}
-                  </BreadcrumbPage>
-                ) : (
-                  <BreadcrumbLink
-                    className="tool-location-segment truncate"
-                    render={<span />}
-                  >
-                    {part}
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </React.Fragment>
-          )
-        })}
-        {lineLabel ? (
-          <>
-            <BreadcrumbSeparator className="tool-location-separator" />
-            <BreadcrumbItem className="min-w-0">
-              <Badge className="tool-location-line" variant="secondary">
-                {lineLabel}
-              </Badge>
-            </BreadcrumbItem>
-          </>
-        ) : null}
-      </BreadcrumbList>
-    </Breadcrumb>
-  )
-}
-
 function HtmlBlock({ html }: { html: string }) {
   return <div dangerouslySetInnerHTML={{ __html: html }} />
 }
 
-function focusToolDiff(card: HTMLElement | null): void {
-  const diff = card?.querySelector<HTMLElement>(".diff-preview")
-  if (!diff) {
-    return
-  }
-  diff.setAttribute("tabindex", "-1")
-  diff.scrollIntoView({ block: "nearest", inline: "nearest" })
-  diff.focus()
+function operationIcon(model: ToolCardModel): LucideIcon {
+  return ICONS[model.icon] ?? Wrench
 }
 
-function inspectToolDetails(card: HTMLElement | null): void {
-  const rawSummary = card?.querySelector<HTMLElement>(".raw-summary")
-  if (rawSummary) {
-    rawSummary.scrollIntoView({ block: "nearest", inline: "nearest" })
-    rawSummary.focus()
-    return
+function riskIcon(tone: ToolCardModel["riskTone"], label: string): LucideIcon {
+  if (tone === "risk") {
+    return CircleAlert
   }
-  const fallback = card?.querySelector<HTMLElement>(
-    ".tool-content, .tool-evidence-strip, .tool-summary"
-  )
-  fallback?.setAttribute("tabindex", "-1")
-  fallback?.scrollIntoView({ block: "nearest", inline: "nearest" })
-  fallback?.focus()
+  if (/approval/i.test(label)) {
+    return ShieldCheck
+  }
+  return CircleAlert
 }
 
-function actionIcon(kind: ToolAction["kind"]): string {
-  switch (kind) {
-    case "openLocation":
-      return "open"
-    case "focusDiff":
-      return "diff"
-    case "inspectDetails":
-      return "diagnostics"
-    default:
-      return "tool"
+function statusIcon(status: string, label: string): LucideIcon {
+  if (status === "completed") {
+    return Check
   }
-}
-
-function toolActionDomName(kind: ToolAction["kind"]): string {
-  switch (kind) {
-    case "focusDiff":
-      return "focusToolDiff"
-    case "inspectDetails":
-      return "inspectToolDetails"
-    default:
-      return kind
+  if (status === "failed" || status === "cancelled") {
+    return CircleX
   }
-}
-
-function riskShortLabel(label: string): string {
-  if (label === "Workspace change") {
-    return "change"
+  if (/decision|approval/i.test(label)) {
+    return CircleAlert
   }
-  if (label === "Needs inspection") {
-    return "inspect"
+  if (status === "pending" || status === "in_progress") {
+    return Clock3
   }
-  return label.toLowerCase()
+  return CircleAlert
 }
 
 function toolOperationDescription(model: ToolCardModel): string {
@@ -820,23 +732,11 @@ function toolStatusDescription(status: string, label: string): string {
     case "in_progress":
       return "The tool call is still running."
     case "failed":
-      return "The tool call failed; inspect details for redacted input and output."
+      return "The tool call failed."
     case "cancelled":
       return "The tool call was cancelled before completion."
     default:
       return `The current tool status is ${label}.`
-  }
-}
-
-function locationBreadcrumb(path: string): { collapsed: boolean; parts: string[] } {
-  const normalized = path.replace(/\\/g, "/")
-  const parts = normalized.split("/").filter(Boolean)
-  if (!parts.length) {
-    return { collapsed: false, parts: [path] }
-  }
-  return {
-    collapsed: parts.length > 2,
-    parts: parts.slice(-2)
   }
 }
 
@@ -845,6 +745,10 @@ export function mountToolCallCards(options: MountToolCallCardsOptions): void {
   document.querySelectorAll<HTMLElement>("[data-tool-call-card-root]").forEach((element) => {
     const nodeId = element.dataset.toolNodeId
     if (!nodeId) {
+      return
+    }
+    if (options.ids && !options.ids.has(nodeId)) {
+      activeIds.add(nodeId)
       return
     }
     const props = options.getProps(nodeId)

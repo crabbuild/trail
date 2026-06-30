@@ -8,17 +8,21 @@ import {
   MessageGroup
 } from "@/webview/components/ui/message"
 import { cn } from "@/webview/lib/utils"
+import { StreamdownMarkdown } from "./StreamdownMarkdown"
 
 export interface MessageCardProps {
   nodeId: string
   role: "user" | "assistant"
   streaming: boolean
   contentHtml: string
+  contentMode?: "html" | "stream-text" | undefined
+  contentText?: string | undefined
   isSticky?: boolean
 }
 
 export interface MountMessageCardsOptions {
   getProps(nodeId: string): MessageCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -50,10 +54,14 @@ export function MessageCard({ props }: { props: MessageCardProps }) {
             isUser && "transcript-message-content-user"
           )}
         >
-          <div
-            className="markdown"
-            dangerouslySetInnerHTML={{ __html: props.contentHtml }}
-          />
+          {props.contentMode === "stream-text" ? (
+            <StreamdownMarkdown streaming={props.streaming} text={props.contentText || ""} />
+          ) : (
+            <div
+              className="markdown"
+              dangerouslySetInnerHTML={{ __html: props.contentHtml }}
+            />
+          )}
           {props.streaming ? (
             <span className="sr-only" role="status">Streaming response</span>
           ) : null}
@@ -68,6 +76,10 @@ export function mountMessageCards(options: MountMessageCardsOptions): void {
   document.querySelectorAll<HTMLElement>("[data-message-card-root]").forEach((element) => {
     const nodeId = element.dataset.messageNodeId
     if (!nodeId) {
+      return
+    }
+    if (options.ids && !options.ids.has(nodeId)) {
+      activeIds.add(nodeId)
       return
     }
     const props = options.getProps(nodeId)

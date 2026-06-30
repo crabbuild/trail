@@ -48,11 +48,19 @@ test("renders streaming state without visible badge chrome", () => {
     nodeId: "message-3",
     role: "assistant",
     streaming: true,
-    contentHtml: "<p>Working</p>"
+    contentHtml: "",
+    contentMode: "stream-text",
+    contentText: "Working **smoothly**\n\n- Checking context"
   });
 
   assert.match(html, /role="status"/);
   assert.match(html, /Streaming response/);
+  assert.match(html, /data-streaming-markdown/);
+  assert.match(html, /streamdown-markdown/);
+  assert.match(html, /data-streamdown-markdown/);
+  assert.match(html, /data-streamdown="strong"[^>]*>smoothly</);
+  assert.match(html, /data-streamdown="unordered-list"/);
+  assert.doesNotMatch(html, /Working \*\*smoothly\*\*/);
   assert.doesNotMatch(html, /data-slot="badge"/);
   assert.doesNotMatch(html, /data-slot="spinner"/);
   assert.doesNotMatch(html, />streaming</);

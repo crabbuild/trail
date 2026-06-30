@@ -63,7 +63,7 @@ export function EmptyStateCard({ props }: { props: EmptyStateCardProps }) {
         <EmptyTitle>{props.title}</EmptyTitle>
         <EmptyDescription>{props.description}</EmptyDescription>
       </EmptyHeader>
-      <EmptyContent className="empty-actions" aria-label="Suggested next actions">
+      <EmptyContent className="mx-auto empty-actions" aria-label="Suggested next actions">
         {props.actions.map((action) => (
           <Button
             key={action.action}

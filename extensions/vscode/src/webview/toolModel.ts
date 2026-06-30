@@ -3,7 +3,7 @@ import { redactString } from "../shared/securityRedaction";
 
 export type ToolTone = "default" | "file" | "change" | "query" | "terminal" | "risk";
 export type ToolRiskTone = "ok" | "warning" | "risk";
-export type ToolActionKind = "openLocation" | "focusDiff" | "inspectDetails";
+export type ToolActionKind = "openLocation" | "focusDiff";
 export type ToolActionTone = "primary" | "default" | "danger";
 
 export interface ToolFact {
@@ -89,10 +89,7 @@ export function buildToolPresentation(input: ToolPresentationInput): ToolPresent
     stats: toolStats(input, kind, content),
     facts,
     actions: toolActions(input, kind, content, risk.riskTone),
-    emptyText:
-      input.source === "crabdb"
-        ? "CrabDB persisted this tool event without rendered output."
-        : "No rendered output for tool call."
+    emptyText: toolEmptyText(input.source, kind)
   };
 }
 
@@ -163,6 +160,9 @@ function toolSummary(
   if (kind === "execute" && command) {
     return command;
   }
+  if (kind === "think") {
+    return input.toolStatus === "completed" ? "Thought" : "Thinking";
+  }
   if (content.diffBlocks > 0 && path) {
     return `${countSummary(content.diffBlocks, "diff")} in ${shortLabel(path)}${pathSuffix}`;
   }
@@ -190,7 +190,25 @@ function toolSummary(
   if (content.contentBlocks > 0) {
     return countSummary(content.contentBlocks, "output");
   }
+  if (kind === "edit") {
+    if (input.toolStatus === "failed") {
+      return "Edit needs inspection";
+    }
+    if (input.toolStatus === "completed") {
+      return "Workspace change";
+    }
+    return "Preparing workspace change";
+  }
   return toolVisual(kind).operationLabel;
+}
+
+function toolEmptyText(source: string | undefined, kind: ToolKind): string {
+  if (kind === "edit") {
+    return "No diff preview available for this edit.";
+  }
+  return source === "crabdb"
+    ? "CrabDB persisted this tool event without rendered output."
+    : "No rendered output for tool call.";
 }
 
 function effectiveToolKind(input: ToolPresentationInput, content: ReturnType<typeof contentCounts>): ToolKind {
@@ -273,6 +291,9 @@ function openByDefault(status: ToolCallStatus): boolean {
 }
 
 function toolStats(input: ToolPresentationInput, kind: ToolKind, content: ReturnType<typeof contentCounts>): ToolStat[] {
+  if (kind === "think") {
+    return [];
+  }
   const stats: ToolStat[] = [];
   const locationCount = input.locations.length || (inputLocation(input.rawInput) ? 1 : 0);
   if (locationCount) {
@@ -360,19 +381,11 @@ function toolActions(
   content: ReturnType<typeof contentCounts>,
   riskTone: ToolRiskTone
 ): ToolAction[] {
+  if (kind === "think") {
+    return [];
+  }
   const actions: ToolAction[] = [];
   const location = firstLocation(input.locations) || inputLocation(input.rawInput);
-  const hasDetails = Boolean(input.rawInput && Object.keys(input.rawInput).length) || Boolean(input.rawOutput && Object.keys(input.rawOutput).length);
-  const isCommand = kind === "execute";
-
-  if (!isCommand && (input.toolStatus === "failed" || input.toolStatus === "cancelled")) {
-    actions.push({
-      kind: "inspectDetails",
-      label: hasDetails ? "Inspect details" : "Inspect card",
-      description: hasDetails ? "Open redacted failure details." : "Show available failure evidence.",
-      tone: "primary"
-    });
-  }
 
   if (content.diffBlocks) {
     actions.push({
@@ -391,15 +404,6 @@ function toolActions(
       tone: "default",
       path: location.path,
       line: location.line
-    });
-  }
-
-  if (hasDetails && !isCommand && !actions.some((action) => action.kind === "inspectDetails")) {
-    actions.push({
-      kind: "inspectDetails",
-      label: "Inspect details",
-      description: "Open redacted input and output.",
-      tone: "default"
     });
   }
 

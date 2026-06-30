@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import {
@@ -19,6 +20,7 @@ export interface PayloadDisclosureProps {
 
 export interface MountPayloadDisclosuresOptions {
   getProps(id: string): PayloadDisclosureProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -57,6 +59,10 @@ export function mountPayloadDisclosures(options: MountPayloadDisclosuresOptions)
     if (!id) {
       return
     }
+    if (options.ids && !options.ids.has(id)) {
+      activeIds.add(id)
+      return
+    }
     const props = options.getProps(id)
     if (!props) {
       return
@@ -76,7 +82,9 @@ export function mountPayloadDisclosures(options: MountPayloadDisclosuresOptions)
       }
       mountedRoots.set(id, mounted)
     }
-    mounted.root.render(<PayloadDisclosure props={props} />)
+    flushSync(() => {
+      mounted.root.render(<PayloadDisclosure props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, id) => {

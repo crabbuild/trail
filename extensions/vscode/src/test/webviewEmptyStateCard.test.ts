@@ -20,8 +20,9 @@ test("renders ready transcript empty states with shadcn Empty and Button parts",
     title: "Ready for a CrabDB turn",
     description: "Message the agent.",
     actions: [
-      { action: "focusComposer", label: "Start in composer", iconHtml, tone: "primary", disabled: false },
-      { action: "openSettings", label: "Settings", iconHtml, tone: "secondary", disabled: false }
+      { action: "focusComposer", label: "Write a message", iconHtml, tone: "primary", disabled: false },
+      { action: "attachSelection", label: "Attach selection", iconHtml, tone: "secondary", disabled: false },
+      { action: "attachFile", label: "Attach file", iconHtml, tone: "secondary", disabled: false }
     ]
   });
 
@@ -36,8 +37,14 @@ test("renders ready transcript empty states with shadcn Empty and Button parts",
   assert.match(html, /Ready for a CrabDB turn/);
   assert.match(html, /data-slot="button"/);
   assert.match(html, /data-action="focusComposer"/);
+  assert.match(html, /Write a message/);
+  assert.match(html, /data-action="attachSelection"/);
+  assert.match(html, /data-action="attachFile"/);
   assert.match(html, /empty-action-primary/);
   assert.match(html, /data-icon="inline-start"/);
+  assert.doesNotMatch(html, /Start in composer/);
+  assert.doesNotMatch(html, /data-action="openSettings"/);
+  assert.doesNotMatch(html, /Settings/);
   assert.doesNotMatch(html, /card-chrome/);
   assert.doesNotMatch(html, /class="tool-icon"[\s\S]*data-action="focusComposer"/);
 });

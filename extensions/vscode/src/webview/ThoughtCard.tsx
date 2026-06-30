@@ -9,6 +9,7 @@ import {
 } from "@/webview/components/ui/accordion"
 import { Badge } from "@/webview/components/ui/badge"
 import { Card, CardContent } from "@/webview/components/ui/card"
+import { StreamdownMarkdown } from "./StreamdownMarkdown"
 
 export interface ThoughtCardProps {
   nodeId: string
@@ -17,11 +18,14 @@ export interface ThoughtCardProps {
   statusLabel: string
   iconHtml: string
   contentHtml: string
+  contentMode?: "html" | "stream-text" | undefined
+  contentText?: string | undefined
   emptyText: string
 }
 
 export interface MountThoughtCardsOptions {
   getProps(nodeId: string): ThoughtCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -56,7 +60,9 @@ export function ThoughtCard({ props }: { props: ThoughtCardProps }) {
               </Badge>
             </AccordionTrigger>
             <AccordionContent className="thought-panel" keepMounted>
-              {props.contentHtml ? (
+              {props.contentMode === "stream-text" ? (
+                <StreamdownMarkdown className="event-content" streaming text={props.contentText || ""} />
+              ) : props.contentHtml ? (
                 <div
                   className="markdown event-content"
                   dangerouslySetInnerHTML={{ __html: props.contentHtml }}
@@ -77,6 +83,10 @@ export function mountThoughtCards(options: MountThoughtCardsOptions): void {
   document.querySelectorAll<HTMLElement>("[data-thought-card-root]").forEach((element) => {
     const nodeId = element.dataset.thoughtNodeId
     if (!nodeId) {
+      return
+    }
+    if (options.ids && !options.ids.has(nodeId)) {
+      activeIds.add(nodeId)
       return
     }
     const props = options.getProps(nodeId)

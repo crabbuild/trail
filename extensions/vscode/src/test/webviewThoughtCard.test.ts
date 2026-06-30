@@ -52,3 +52,19 @@ test("renders empty thought content without legacy details markup", () => {
   assert.doesNotMatch(html, /<details/);
   assert.doesNotMatch(html, /<summary/);
 });
+
+test("renders streaming thought text through stable Streamdown markdown", () => {
+  const html = renderThought(
+    baseProps({
+      contentHtml: "",
+      contentMode: "stream-text",
+      contentText: "Reading files\nChecking context"
+    })
+  );
+
+  assert.match(html, /data-streaming-markdown/);
+  assert.match(html, /data-streamdown-markdown/);
+  assert.match(html, /streamdown-markdown/);
+  assert.match(html, /Reading files/);
+  assert.match(html, /Checking context/);
+});

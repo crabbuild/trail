@@ -29,8 +29,8 @@ test("summarizes approval scope and impact", () => {
   assert.equal(approvalScopeLabel(1, "lane-a"), "1 affected location");
   assert.equal(approvalScopeLabel(3, "lane-a"), "3 affected locations");
   assert.equal(approvalScopeLabel(0, "lane-a"), "Lane lane-a");
-  assert.equal(approvalImpactText("edit", 2), "The agent is asking to edit 2 affected locations.");
-  assert.equal(approvalImpactText("execute", 0), "The agent is asking to run a command that can inspect or change the current task.");
+  assert.equal(approvalImpactText("edit", 2), "Edit 2 affected locations.");
+  assert.equal(approvalImpactText("execute", 0), "Run a command in the current task.");
 });
 
 test("classifies approval decision buttons by tool risk", () => {

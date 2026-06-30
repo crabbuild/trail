@@ -50,6 +50,7 @@ await esbuild.build({
     "src/test/webviewTimelineScroller.test.ts",
     "src/test/webviewTerminalModel.test.ts",
     "src/test/webviewThoughtCard.test.ts",
+    "src/test/webviewToolCallGroupCard.test.ts",
     "src/test/webviewTimelineModel.test.ts",
     "src/test/webviewToolCallCard.test.ts",
     "src/test/webviewToolModel.test.ts",

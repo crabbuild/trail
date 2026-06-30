@@ -67,6 +67,37 @@ export function changedRenderNodes(beforeById: Map<string, RenderNode>, nextNode
   return { changedNodeIds, addedNodeIds, removedNodeIds };
 }
 
+export function changedRenderNodesFromPatches(nodes: RenderNode[], patches: RenderPatch[]): RenderPatchChanges {
+  const knownIds = new Set(nodes.map((node) => node.id));
+  const changedNodeIds = new Set<string>();
+  const addedNodeIds = new Set<string>();
+  const removedNodeIds = new Set<string>();
+
+  for (const patch of patches) {
+    if ((patch.type === "append" || patch.type === "replace" || patch.type === "upsert") && patch.node) {
+      const id = patch.node.id;
+      if (!knownIds.has(id)) {
+        addedNodeIds.add(id);
+      }
+      knownIds.add(id);
+      removedNodeIds.delete(id);
+      changedNodeIds.add(id);
+      continue;
+    }
+    if (patch.type === "remove" && patch.id) {
+      if (addedNodeIds.has(patch.id)) {
+        addedNodeIds.delete(patch.id);
+        changedNodeIds.delete(patch.id);
+      } else if (knownIds.has(patch.id)) {
+        removedNodeIds.add(patch.id);
+      }
+      knownIds.delete(patch.id);
+    }
+  }
+
+  return { changedNodeIds, addedNodeIds, removedNodeIds };
+}
+
 export function isStreamingTextPatchPayload(patch: RenderPatch): boolean {
   const node = patch.node;
   if (patch.type !== "upsert" || !node || node.source !== "acp-live") {
@@ -93,4 +124,26 @@ export function isLiveNodePatchPayload(patch: RenderPatch): boolean {
     return isStreamingTextPatchPayload(patch);
   }
   return node.kind === "plan" || node.kind === "tool" || node.kind === "diff" || node.kind === "terminal";
+}
+
+export function isHydratableNodePatchPayload(patch: RenderPatch): boolean {
+  const node = patch.node;
+  if ((patch.type !== "upsert" && patch.type !== "replace") || !node) {
+    return false;
+  }
+  if (isLiveNodePatchPayload(patch)) {
+    return true;
+  }
+  return (
+    node.kind === "message" ||
+    node.kind === "thought" ||
+    node.kind === "plan" ||
+    node.kind === "tool" ||
+    node.kind === "diff" ||
+    node.kind === "terminal" ||
+    node.kind === "approval" ||
+    node.kind === "checkpoint" ||
+    node.kind === "completion" ||
+    node.kind === "resource"
+  );
 }

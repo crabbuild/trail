@@ -20,7 +20,7 @@ function baseProps(overrides: Partial<TimelineGroupCardProps> = {}): TimelineGro
     detail: "1 message / 1 tool",
     status: "completed",
     statusLabel: "Completed",
-    laneLabel: "agent-1",
+    laneId: "agent-claude-code-679549e33f6c",
     iconHtml,
     bodyItems: [
       {
@@ -44,11 +44,16 @@ test("renders timeline groups with shadcn accordion and badge primitives", () =>
   assert.match(html, /data-slot="accordion-content"/);
   assert.match(html, /data-slot="badge"/);
   assert.match(html, /class="[^"]*timeline-group-summary/);
+  assert.match(html, /class="[^"]*timeline-group-copy-id/);
+  assert.match(html, /data-action="copyTimelineGroupId"/);
+  assert.match(html, /data-target="agent-claude-code-679549e33f6c"/);
+  assert.match(html, /aria-label="Copy ID"/);
   assert.match(html, /class="[^"]*timeline-group-body/);
   assert.match(html, /data-timeline-group-body-item/);
   assert.match(html, /data-node-id="message-1"/);
   assert.match(html, /class="turn-card"/);
   assert.match(html, /aria-expanded="true"/);
+  assert.doesNotMatch(html, />agent-claude-code-679549e33f6c</);
 });
 
 test("keeps helper-rendered body selectors without native details markup", () => {
@@ -90,6 +95,8 @@ test("preserves mounted node islands across group rerenders", () => {
 
   assert.match(html, /data-stable-html-slot="message-1"/);
   assert.match(timelineGroupSource, /React\.memo\([\s\S]*StableHtmlSlot/);
-  assert.match(timelineGroupSource, /previous\.slotId === next\.slotId/);
-  assert.match(timelineGroupSource, /html: item\.preserveDom \? undefined : item\.html/);
+  assert.match(timelineGroupSource, /previous\.slotId === next\.slotId && previous\.shellSignature === next\.shellSignature/);
+  assert.match(timelineGroupSource, /React\.useLayoutEffect\([\s\S]*syncStableHtmlShell/);
+  assert.match(timelineGroupSource, /function syncElementAttributes/);
+  assert.match(timelineGroupSource, /html: item\.preserveDom \? stableHtmlShellSignature\(item\.html\) : item\.html/);
 });

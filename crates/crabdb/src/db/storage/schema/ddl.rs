@@ -336,6 +336,75 @@ impl CrabDb {
                 last_seen_scan INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS memory_items (
+                memory_ord INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL UNIQUE,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT,
+                title TEXT,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source_ref TEXT,
+                source_change TEXT,
+                source_root TEXT,
+                metadata_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS memory_items_scope_idx ON memory_items(scope_type, scope_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS memory_items_kind_idx ON memory_items(kind, status, updated_at);
+            CREATE INDEX IF NOT EXISTS memory_items_path_idx ON memory_items(path, status, updated_at);
+            CREATE INDEX IF NOT EXISTS memory_items_source_change_idx ON memory_items(source_change, updated_at);
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+                memory_id TEXT PRIMARY KEY REFERENCES memory_items(memory_id) ON DELETE CASCADE,
+                memory_ord INTEGER NOT NULL UNIQUE,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dims INTEGER NOT NULL,
+                embedding BLOB NOT NULL,
+                embedding_hash TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS memory_embeddings_model_idx ON memory_embeddings(provider, model, dims);
+            CREATE TABLE IF NOT EXISTS memory_embedding_indexes (
+                index_id TEXT PRIMARY KEY,
+                backend TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dims INTEGER NOT NULL,
+                table_name TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(backend, provider, model, dims)
+            );
+            CREATE TABLE IF NOT EXISTS memory_revisions (
+                revision_id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                operation TEXT NOT NULL,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT,
+                title TEXT,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source_ref TEXT,
+                source_change TEXT,
+                source_root TEXT,
+                metadata_json TEXT NOT NULL,
+                embedding_hash TEXT,
+                actor_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(memory_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS memory_revisions_memory_idx ON memory_revisions(memory_id, version);
+            CREATE INDEX IF NOT EXISTS memory_revisions_source_change_idx ON memory_revisions(source_change, created_at);
             ",
         )?;
         ensure_column(&self.conn, "conflict_sets", "details_json", "TEXT")?;

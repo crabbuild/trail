@@ -155,6 +155,26 @@ test("coalesces configured live component patches by node id", () => {
   assert.equal(scheduler.stats().coalesced, 1);
 });
 
+test("keeps component coalescing independent from token flushes", async () => {
+  const batches: RenderPatch[][] = [];
+  const scheduler = new RenderStreamScheduler((patches) => batches.push(patches), {
+    flushMs: 0,
+    componentFlushMs: 10_000,
+    shouldCoalescePatch: (patch) => patch.node?.kind === "terminal"
+  });
+
+  scheduler.push([terminalPatch("component one")]);
+  scheduler.push([messagePatch("token")]);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0]?.[0]?.node?.kind, "message");
+
+  scheduler.flush();
+  assert.equal(batches.length, 2);
+  assert.equal(batches[1]?.[0]?.node?.kind, "terminal");
+});
+
 test("dispose drops queued stream patches without emitting stale output", () => {
   const batches: RenderPatch[][] = [];
   const scheduler = new RenderStreamScheduler((patches) => batches.push(patches), { flushMs: 10_000 });

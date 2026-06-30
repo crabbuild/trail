@@ -90,14 +90,6 @@ export function ApprovalCard({ props }: { props: ApprovalCardProps }) {
           <span className="event-title">{props.title}</span>
           <span className="event-detail">{props.detail}</span>
         </span>
-        {props.resolved ? null : (
-          <Badge
-            className={cn("tool-status", `tool-status-${props.status}`)}
-            variant="outline"
-          >
-            {props.statusLabel}
-          </Badge>
-        )}
       </CardHeader>
       <CardContent className="approval-card-content">
         {props.resolved ? (
@@ -105,8 +97,6 @@ export function ApprovalCard({ props }: { props: ApprovalCardProps }) {
         ) : (
           <>
             <p className="approval-impact">{props.impactText}</p>
-            <ApprovalMeta meta={props.meta} />
-            <HtmlBlock html={props.locationsHtml} />
             <ApprovalDisclosures disclosures={[props.preview].filter(Boolean) as ApprovalCardDisclosure[]} />
             <ApprovalDecision props={props} />
           </>
@@ -114,24 +104,6 @@ export function ApprovalCard({ props }: { props: ApprovalCardProps }) {
         <ApprovalDisclosures disclosures={[props.requestDetails]} />
       </CardContent>
     </Card>
-  )
-}
-
-function ApprovalMeta({ meta }: { meta: ApprovalCardMeta[] }) {
-  if (!meta.length) {
-    return null
-  }
-  return (
-    <div className="approval-meta" aria-label="Permission request summary">
-      {meta.map((item, index) => (
-        <span key={`${item.label}-${index}`}>
-          {item.iconHtml ? (
-            <span dangerouslySetInnerHTML={{ __html: item.iconHtml }} />
-          ) : null}
-          {item.label}
-        </span>
-      ))}
-    </div>
   )
 }
 
@@ -199,7 +171,8 @@ function ApprovalButton({
   requestId: string
 }) {
   const isReject = action.kind === "reject"
-  const variant = isReject || action.tone === "risk" ? "destructive" : action.tone === "primary" ? "default" : "outline"
+  const isPrimaryApprove = isPrimaryApprovalAction(action)
+  const variant = isReject || action.tone === "risk" ? "destructive" : isPrimaryApprove ? "default" : "outline"
   return (
     <Button
       type="button"
@@ -214,7 +187,7 @@ function ApprovalButton({
       className={cn(
         isReject ? "danger approval-reject" : "approval-option",
         isReject ? "" : `approval-option-${action.tone}`,
-        action.tone === "primary" ? "primary" : ""
+        isPrimaryApprove ? "primary" : ""
       )}
     >
       <span
@@ -228,8 +201,12 @@ function ApprovalButton({
   )
 }
 
-function HtmlBlock({ html }: { html: string }) {
-  return html ? <div dangerouslySetInnerHTML={{ __html: html }} /> : null
+function isPrimaryApprovalAction(action: ApprovalCardAction): boolean {
+  if (action.kind !== "approve" || action.tone === "risk") {
+    return false
+  }
+  const value = `${action.label} ${action.optionId ?? ""}`.toLowerCase()
+  return !/\b(always|forever|persist)\b/.test(value)
 }
 
 export function mountApprovalCards(options: MountApprovalCardsOptions): void {

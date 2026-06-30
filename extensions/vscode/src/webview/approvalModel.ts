@@ -48,19 +48,19 @@ export function approvalImpactText(toolKind: string, locationCount: number): str
   const scope = locationCount > 0 ? approvalScopeLabel(locationCount, "") : "the current task";
   switch (toolKind) {
     case "execute":
-      return `The agent is asking to run a command that can inspect or change ${scope}.`;
+      return `Run a command in ${scope}.`;
     case "delete":
-      return `The agent is asking to delete content in ${scope}.`;
+      return `Delete content in ${scope}.`;
     case "edit":
-      return `The agent is asking to edit ${scope}.`;
+      return `Edit ${scope}.`;
     case "move":
-      return `The agent is asking to move or rename content in ${scope}.`;
+      return `Move or rename content in ${scope}.`;
     case "read":
-      return `The agent is asking to read ${scope}.`;
+      return `Read ${scope}.`;
     case "fetch":
-      return "The agent is asking to fetch external context before continuing.";
+      return "Fetch external context.";
     default:
-      return `The agent is asking to continue with a ${toolKind || "tool"} action.`;
+      return `Continue with a ${toolKind || "tool"} action.`;
   }
 }
 

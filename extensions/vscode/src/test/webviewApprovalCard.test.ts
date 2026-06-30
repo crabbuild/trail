@@ -80,7 +80,6 @@ test("renders pending approvals with compact shadcn card badge and decision butt
   assert.match(html, /data-slot="accordion-trigger"/);
   assert.match(html, /data-slot="accordion-content"/);
   assert.match(html, /data-slot="badge"/);
-  assert.match(html, /tool-status-pending/);
   assert.match(html, /data-slot="button"/);
   assert.match(html, /data-action="approve"/);
   assert.match(html, /data-option-id="allow"/);
@@ -90,6 +89,9 @@ test("renders pending approvals with compact shadcn card badge and decision butt
   assert.match(html, /approval-request-details/);
   assert.match(html, /approval-tool-content/);
   assert.match(html, /approval-request-content/);
+  assert.doesNotMatch(html, /approval-meta/);
+  assert.doesNotMatch(html, /approval-locations/);
+  assert.doesNotMatch(html, /tool-status-pending/);
   assert.doesNotMatch(html, /class="icon" data-icon="inline-start"/);
   assert.doesNotMatch(html, /data-slot="alert"/);
   assert.doesNotMatch(html, /<details class="approval-preview/);

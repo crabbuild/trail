@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import { Button } from "@/webview/components/ui/button"
@@ -39,6 +40,7 @@ export interface InlineActionsProps {
 
 export interface MountInlineActionsOptions {
   getProps(id: string): InlineActionsProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -152,6 +154,10 @@ export function mountInlineActions(options: MountInlineActionsOptions): void {
     if (!id) {
       return
     }
+    if (options.ids && !options.ids.has(id)) {
+      activeIds.add(id)
+      return
+    }
     const props = options.getProps(id)
     if (!props) {
       return
@@ -171,7 +177,9 @@ export function mountInlineActions(options: MountInlineActionsOptions): void {
       }
       mountedRoots.set(id, mounted)
     }
-    mounted.root.render(<InlineActions props={props} />)
+    flushSync(() => {
+      mounted.root.render(<InlineActions props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, id) => {

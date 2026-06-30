@@ -43,6 +43,7 @@ export interface TerminalCardProps {
 
 export interface MountTerminalCardsOptions {
   getProps(nodeId: string): TerminalCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -200,6 +201,10 @@ export function mountTerminalCards(options: MountTerminalCardsOptions): void {
   document.querySelectorAll<HTMLElement>("[data-terminal-card-root]").forEach((element) => {
     const nodeId = element.dataset.terminalNodeId
     if (!nodeId) {
+      return
+    }
+    if (options.ids && !options.ids.has(nodeId)) {
+      activeIds.add(nodeId)
       return
     }
     const props = options.getProps(nodeId)

@@ -38,7 +38,9 @@ const builds = [
     outdir: "dist/webview",
     platform: "browser",
     format: "esm",
+    minifyIdentifiers: true,
     minifySyntax: true,
+    minifyWhitespace: true,
     splitting: true,
     entryNames: "[name]",
     chunkNames: "chunks/[name]-[hash]"

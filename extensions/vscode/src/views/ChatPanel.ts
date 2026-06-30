@@ -12,9 +12,10 @@ import {
 } from "../model/VsCodePromptAttachments";
 import type { RequestPermissionParams, SessionUpdate } from "../shared/acpTypes";
 import {
-  applyRenderPatches,
+  applyRenderPatchesAndCollect,
   reducePermissionRequest,
   reduceSessionUpdate,
+  renderNodeSnapshotPatches,
   sessionControlsToPatches
 } from "../shared/acpRenderReducers";
 import { promptCompletionNode } from "../shared/promptCompletion";
@@ -54,6 +55,11 @@ interface ProviderFailureState {
   detail?: string | undefined;
   code?: number | null | undefined;
   occurredAt: string;
+}
+
+interface RefreshOptions {
+  claimLatestTask?: boolean | undefined;
+  transport?: "state" | "patch" | undefined;
 }
 
 const MAX_TEXT_PREVIEW_CHARS = 120_000;
@@ -105,7 +111,7 @@ export class ChatPanel {
         this.attachments.push(attachment);
       }
     }
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
   }
 
   private nodes: RenderNode[] = [];
@@ -155,9 +161,10 @@ export class ChatPanel {
     await this.refresh();
   }
 
-  private async refresh(options: { claimLatestTask?: boolean | undefined } = {}): Promise<void> {
+  private async refresh(options: RefreshOptions = {}): Promise<void> {
     this.streamScheduler.flush();
     let listedTasks: AgentTask[] | undefined;
+    let nextNodes = this.nodes;
     if (!this.task && options.claimLatestTask) {
       try {
         listedTasks = await this.repository.listTasks();
@@ -176,7 +183,7 @@ export class ChatPanel {
         if (!this.acpSessionId && this.task.acpSessionId) {
           this.acpSessionId = this.task.acpSessionId;
         }
-        this.nodes = mergeHydratedNodes(hydrateTaskView(this.taskView), this.nodes);
+        nextNodes = mergeHydratedNodes(hydrateTaskView(this.taskView), this.nodes);
       } catch (error) {
         this.post({
           type: "error",
@@ -185,6 +192,11 @@ export class ChatPanel {
       }
     }
     await this.refreshTaskOverlaps(listedTasks);
+    if (options.transport === "patch") {
+      this.applyAndPostRenderPatches(renderNodeSnapshotPatches(this.nodes, nextNodes), { force: true });
+      return;
+    }
+    this.nodes = nextNodes;
     this.postState();
   }
 
@@ -204,7 +216,7 @@ export class ChatPanel {
           const index = this.attachments.findIndex((attachment) => attachment.id === message.attachmentId);
           if (index >= 0) {
             this.attachments.splice(index, 1);
-            this.postState();
+            this.applyAndPostRenderPatches([], { force: true });
           }
         }
         break;
@@ -406,7 +418,6 @@ export class ChatPanel {
     }
     if (this.sending || this.hasPendingApproval()) {
       this.post({ type: "status", message: "Finish the current turn or permission request before switching providers." });
-      this.postState();
       return;
     }
     const next = new ProviderRegistry(this.repository.workspaceRoot)
@@ -414,7 +425,6 @@ export class ChatPanel {
       .find((profile) => profile.id === providerId);
     if (!next) {
       this.post({ type: "error", message: `Provider ${providerId} is not configured.` });
-      this.postState();
       return;
     }
     const previous = this.provider.label;
@@ -429,7 +439,7 @@ export class ChatPanel {
     this.forceCheckpointFollowUp = true;
     this.providerFailure = undefined;
     this.post({ type: "status", message: `Switched provider to ${next.label}. The next prompt starts from the current CrabDB checkpoint.` });
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
   }
 
   private async pickAuthMethod(methods: AcpAuthMethod[]): Promise<string | undefined> {
@@ -483,10 +493,11 @@ export class ChatPanel {
       return;
     }
     this.sending = true;
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
 
     const lane = this.task?.lane || "new-task";
     this.currentTurnId = `turn-${Date.now()}`;
+    let clearedAttachments = false;
 
     try {
       if (!this.acp) {
@@ -528,7 +539,7 @@ export class ChatPanel {
           this.forceCheckpointFollowUp = false;
           this.providerFailure = undefined;
           this.capabilities = session.capabilities;
-          this.nodes = applyRenderPatches(this.nodes, sessionControlsToPatches(session.session, this.renderContext()));
+          this.applyAndPostRenderPatches(sessionControlsToPatches(session.session, this.renderContext()), { force: true });
           if (session.requestedSessionId && session.startMode === "new") {
             this.post({
               type: "status",
@@ -539,7 +550,6 @@ export class ChatPanel {
           } else if (session.startMode === "resume") {
             this.post({ type: "status", message: "Resumed the existing ACP session." });
           }
-          this.postState();
         } catch (error) {
           client.dispose();
           if (this.acp === client) {
@@ -558,7 +568,7 @@ export class ChatPanel {
           })
         )
       ];
-      this.nodes = applyRenderPatches(this.nodes, [
+      this.applyAndPostRenderPatches([
         {
           type: "upsert",
           node: {
@@ -579,20 +589,27 @@ export class ChatPanel {
           }
         }
       ]);
-      this.postState();
 
       await this.acp.prompt(content);
+      if (this.attachments.length) {
+        this.attachments.splice(0);
+        clearedAttachments = true;
+      }
       await this.refresh({
-        claimLatestTask: this.provider.crabdbBacked && !this.task
+        claimLatestTask: this.provider.crabdbBacked && !this.task,
+        transport: "patch"
       });
-      this.attachments.splice(0);
+      clearedAttachments = false;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.markProviderFailure("The agent turn failed before completion.", message);
       this.post({ type: "error", message });
     } finally {
+      const shouldRefreshChrome = this.sending || clearedAttachments;
       this.sending = false;
-      this.postState();
+      if (shouldRefreshChrome) {
+        this.applyAndPostRenderPatches([], { force: true });
+      }
     }
   }
 
@@ -602,10 +619,9 @@ export class ChatPanel {
 
   private handlePermission(requestId: string, params: RequestPermissionParams): void {
     this.streamScheduler.flush();
-    this.nodes = applyRenderPatches(this.nodes, reducePermissionRequest(requestId, params, this.renderContext()));
+    this.applyAndPostRenderPatches(reducePermissionRequest(requestId, params, this.renderContext()), { force: true });
     const title = params.toolCall.title || params.toolCall.kind || "tool call";
     vscode.window.showWarningMessage(`Agent permission required: ${title}`);
-    this.postState();
   }
 
   private async ensureCrabDbWorkspaceInitialized(): Promise<boolean> {
@@ -637,7 +653,7 @@ export class ChatPanel {
       detail: `${message} Run the "CrabDB: Initialize Workspace" command, then retry the prompt.`,
       occurredAt: new Date().toISOString()
     };
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
     return false;
   }
 
@@ -648,7 +664,7 @@ export class ChatPanel {
       this.resolveApprovals(cancelledRequests, "cancelled");
       return;
     }
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
   }
 
   private resolveApproval(requestId: string, status: ApprovalStatus): void {
@@ -659,7 +675,7 @@ export class ChatPanel {
     this.streamScheduler.flush();
     const requestSet = new Set(requestIds);
     const updatedAt = new Date().toISOString();
-    this.nodes = this.nodes.map((node) =>
+    const nextNodes = this.nodes.map((node): RenderNode =>
       node.kind === "approval" && requestSet.has(node.requestId)
         ? {
             ...node,
@@ -668,7 +684,7 @@ export class ChatPanel {
           }
         : node
     );
-    this.postState();
+    this.applyAndPostRenderPatches(renderNodeSnapshotPatches(this.nodes, nextNodes), { force: true });
   }
 
   private hasPendingApproval(): boolean {
@@ -679,14 +695,47 @@ export class ChatPanel {
     this.streamScheduler.flush();
     this.providerFailure = undefined;
     const completion = promptCompletionNode(response, this.renderContext());
-    this.nodes = this.finalizeCurrentTurn(completion.status);
-    this.nodes = applyRenderPatches(this.nodes, [
+    this.sending = false;
+    this.applyAndPostRenderPatches([
+      ...this.finalizeCurrentTurnPatches(completion.status),
       {
         type: "upsert",
         node: completion
       }
     ]);
-    this.postState();
+  }
+
+  private finalizeCurrentTurnPatches(status: RenderNode["status"]): RenderPatch[] {
+    const turnId = this.currentTurnId;
+    if (!turnId) {
+      return [];
+    }
+    const nodeStatus = status === "pending" ? "completed" : status;
+    const patches: RenderPatch[] = [];
+    for (const node of this.nodes) {
+      if (node.turnId !== turnId || node.source !== "acp-live") {
+        continue;
+      }
+      if (node.kind === "message" && (node.status !== nodeStatus || node.streaming)) {
+        patches.push({
+          type: "replace",
+          node: {
+            ...node,
+            status: nodeStatus,
+            streaming: false
+          }
+        });
+      } else if (node.kind === "thought" && node.status !== nodeStatus) {
+        patches.push({
+          type: "replace",
+          node: {
+            ...node,
+            status: nodeStatus
+          }
+        });
+      }
+    }
+    return patches;
   }
 
   private finalizeCurrentTurn(status: RenderNode["status"]): RenderNode[] {
@@ -726,7 +775,7 @@ export class ChatPanel {
     }
     this.acp = undefined;
     this.post({ type: "status", message });
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
   }
 
   private recordAcpStderr(line: string): void {
@@ -756,7 +805,7 @@ export class ChatPanel {
       code,
       occurredAt
     };
-    this.nodes = this.finalizeCurrentTurn("failed").map((node) =>
+    const nextNodes = this.finalizeCurrentTurn("failed").map((node): RenderNode =>
       node.kind === "approval" && node.status === "pending"
         ? {
             ...node,
@@ -769,7 +818,7 @@ export class ChatPanel {
     this.acp?.dispose();
     this.acp = undefined;
     this.forceCheckpointFollowUp = true;
-    this.postState();
+    this.applyAndPostRenderPatches(renderNodeSnapshotPatches(this.nodes, nextNodes), { force: true });
   }
 
   private startFollowUpFromFailure(): void {
@@ -779,7 +828,7 @@ export class ChatPanel {
     this.forceCheckpointFollowUp = true;
     this.providerFailure = undefined;
     this.post({ type: "status", message: "The next prompt will start a follow-up from the latest CrabDB checkpoint." });
-    this.postState();
+    this.applyAndPostRenderPatches([], { force: true });
   }
 
   private async openNodeDiff(nodeId: string | undefined): Promise<void> {
@@ -958,8 +1007,13 @@ export class ChatPanel {
     try {
       const result = await this.acp.setMode(modeId);
       const patches = sessionControlsToPatches(result, this.renderContext());
-      this.nodes = patches.length ? applyRenderPatches(this.nodes, patches) : this.updateCurrentMode(modeId);
-      this.postState();
+      if (patches.length) {
+        this.applyAndPostRenderPatches(patches, { force: true });
+      } else {
+        this.applyAndPostRenderPatches(renderNodeSnapshotPatches(this.nodes, this.updateCurrentMode(modeId)), {
+          force: true
+        });
+      }
     } catch (error) {
       this.post({ type: "error", message: error instanceof Error ? error.message : String(error) });
     }
@@ -977,8 +1031,7 @@ export class ChatPanel {
     }
     try {
       const result = await this.acp.setConfigOption(configId, value);
-      this.nodes = applyRenderPatches(this.nodes, sessionControlsToPatches(result, this.renderContext()));
-      this.postState();
+      this.applyAndPostRenderPatches(sessionControlsToPatches(result, this.renderContext()), { force: true });
     } catch (error) {
       this.post({ type: "error", message: error instanceof Error ? error.message : String(error) });
     }
@@ -1000,26 +1053,17 @@ export class ChatPanel {
     }, 50);
   }
 
-  private applyAndPostRenderPatches(patches: RenderPatch[]): void {
-    if (!patches.length) {
+  private applyAndPostRenderPatches(
+    patches: RenderPatch[],
+    options: { force?: boolean | undefined } = {}
+  ): void {
+    if (!patches.length && !options.force) {
       return;
     }
-    const beforeById = new Map(this.nodes.map((node) => [node.id, node]));
-    const nextNodes = applyRenderPatches(this.nodes, patches);
-    const nextIds = new Set(nextNodes.map((node) => node.id));
-    const appliedPatches: RenderPatch[] = [];
-    for (const node of nextNodes) {
-      if (beforeById.get(node.id) !== node) {
-        appliedPatches.push({ type: "upsert", node });
-      }
-    }
-    for (const id of beforeById.keys()) {
-      if (!nextIds.has(id)) {
-        appliedPatches.push({ type: "remove", id });
-      }
-    }
-    this.nodes = nextNodes;
-    if (!appliedPatches.length) {
+    const applied = applyRenderPatchesAndCollect(this.nodes, patches);
+    this.nodes = applied.nodes;
+    const appliedPatches = applied.patches;
+    if (!appliedPatches.length && !options.force) {
       return;
     }
     const baseRenderRevision = this.renderRevision;
@@ -1028,9 +1072,40 @@ export class ChatPanel {
       baseRenderRevision,
       renderRevision: this.nextRenderRevision(),
       patches: appliedPatches,
+      ...this.renderPatchStateFields({ includeChrome: Boolean(options.force) })
+    });
+  }
+
+  private renderPatchStateFields(options: { includeChrome?: boolean | undefined } = {}): Record<string, unknown> {
+    const stateFields: Record<string, unknown> = {
       sending: this.sending,
       permissionPending: this.hasPendingApproval()
-    });
+    };
+    if (!options.includeChrome) {
+      return stateFields;
+    }
+    return {
+      ...stateFields,
+      task: this.task,
+      taskView: this.taskView,
+      taskOverlaps: this.taskOverlaps,
+      attachments: this.attachments,
+      provider: this.provider.label,
+      providerId: this.provider.id,
+      providers: new ProviderRegistry(this.repository.workspaceRoot).profiles().map((profile) => ({
+        id: profile.id,
+        label: profile.label,
+        crabdbBacked: profile.crabdbBacked,
+        supportsFromRef: profile.supportsFromRef
+      })),
+      acpSessionId: this.acpSessionId,
+      persistedAcpSessionId: this.task?.acpSessionId,
+      acpStartMode: this.acpStartMode,
+      requestedAcpSessionId: this.requestedAcpSessionId,
+      providerSwitchFrom: this.providerSwitchFrom,
+      providerFailure: this.providerFailure,
+      capabilities: this.capabilities
+    };
   }
 
   private canCoalesceRenderPatch(patch: RenderPatch): boolean {

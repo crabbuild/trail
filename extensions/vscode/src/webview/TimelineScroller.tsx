@@ -61,7 +61,7 @@ export function TimelineScroller({ props }: { props: TimelineScrollerProps }) {
                 className={cn("timeline-scroller-row", item.className)}
               >
                 {item.preserveDom ? (
-                  <StableHtmlSlot slotId={item.id} html={item.html} />
+                  <StableHtmlSlot shellSignature={stableHtmlShellSignature(item.html)} slotId={item.id} html={item.html} />
                 ) : (
                   <div className="stable-html-slot" dangerouslySetInnerHTML={{ __html: item.html }} />
                 )}
@@ -78,14 +78,30 @@ export function TimelineScroller({ props }: { props: TimelineScrollerProps }) {
 const StableHtmlSlot = React.memo(
   function StableHtmlSlot({
     html,
+    shellSignature: _shellSignature,
     slotId
   }: {
     html: string
+    shellSignature: string
     slotId: string
   }) {
-    return <div className="stable-html-slot" data-stable-html-slot={slotId} dangerouslySetInnerHTML={{ __html: html }} />
+    const rootRef = React.useRef<HTMLDivElement | null>(null)
+    const initialHtml = React.useRef(html)
+
+    React.useLayoutEffect(() => {
+      syncStableHtmlShell(rootRef.current, html)
+    }, [html, _shellSignature])
+
+    return (
+      <div
+        ref={rootRef}
+        className="stable-html-slot"
+        data-stable-html-slot={slotId}
+        dangerouslySetInnerHTML={{ __html: initialHtml.current }}
+      />
+    )
   },
-  (previous, next) => previous.slotId === next.slotId
+  (previous, next) => previous.slotId === next.slotId && previous.shellSignature === next.shellSignature
 )
 
 export function mountTimelineScroller(element: HTMLElement, props: TimelineScrollerProps): void {
@@ -118,9 +134,45 @@ function timelineScrollerPropsSignature(props: TimelineScrollerProps): string {
       className: item.className,
       scrollAnchor: item.scrollAnchor,
       preserveDom: item.preserveDom,
-      html: item.preserveDom ? undefined : item.html
+      html: item.preserveDom ? stableHtmlShellSignature(item.html) : item.html
     }))
   })
+}
+
+function stableHtmlShellSignature(html: string): string {
+  return html.trim().match(/^<([a-z][\w:-]*)(?:\s[^>]*)?>/i)?.[0] ?? html
+}
+
+function syncStableHtmlShell(root: HTMLDivElement | null, html: string): void {
+  if (!root) {
+    return
+  }
+  const next = stableHtmlFirstElement(html)
+  const current = root.firstElementChild
+  if (!next || !current || next.tagName !== current.tagName) {
+    root.innerHTML = html
+    return
+  }
+  syncElementAttributes(current, next)
+}
+
+function stableHtmlFirstElement(html: string): Element | undefined {
+  const template = document.createElement("template")
+  template.innerHTML = html.trim()
+  return template.content.firstElementChild ?? undefined
+}
+
+function syncElementAttributes(current: Element, next: Element): void {
+  for (const attr of Array.from(current.attributes)) {
+    if (!next.hasAttribute(attr.name)) {
+      current.removeAttribute(attr.name)
+    }
+  }
+  for (const attr of Array.from(next.attributes)) {
+    if (current.getAttribute(attr.name) !== attr.value) {
+      current.setAttribute(attr.name, attr.value)
+    }
+  }
 }
 
 export function cleanupTimelineScroller(): void {

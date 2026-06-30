@@ -22,13 +22,13 @@ serde_json.workspace = true
 sha2.workspace = true
 slatedb.workspace = true
 similar.workspace = true
+sqlite-vec.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 unicode-normalization.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
-sqlite-vec.workspace = true
 tempfile.workspace = true
 
 [lints]

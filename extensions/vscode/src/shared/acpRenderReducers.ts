@@ -38,6 +38,11 @@ export interface AcpUpdateRenderer<TUpdate extends SessionUpdate = SessionUpdate
   reduce(update: TUpdate, context: RenderReduceContext): RenderPatch[];
 }
 
+export interface AppliedRenderPatches {
+  nodes: RenderNode[];
+  patches: RenderPatch[];
+}
+
 export function reduceSessionUpdate(
   update: SessionUpdate,
   context: RenderReduceContext
@@ -86,8 +91,36 @@ export function reducePermissionRequest(
 }
 
 export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]): RenderNode[] {
+  return applyRenderPatchesAndCollect(nodes, patches).nodes;
+}
+
+export function renderNodeSnapshotPatches(before: RenderNode[], next: RenderNode[]): RenderPatch[] {
+  const beforeById = new Map(before.map((node) => [node.id, node]));
+  const nextIds = new Set(next.map((node) => node.id));
+  const patches: RenderPatch[] = [];
+
+  for (const node of before) {
+    if (!nextIds.has(node.id)) {
+      patches.push({ type: "remove", id: node.id });
+    }
+  }
+
+  for (const node of next) {
+    const previous = beforeById.get(node.id);
+    if (!previous) {
+      patches.push({ type: "upsert", node });
+    } else if (!sameRenderNodeSnapshot(previous, node)) {
+      patches.push({ type: "replace", node });
+    }
+  }
+
+  return patches;
+}
+
+export function applyRenderPatchesAndCollect(nodes: RenderNode[], patches: RenderPatch[]): AppliedRenderPatches {
   let next = [...nodes];
   let nextTimelineOrder = maxTimelineOrder(next);
+  const appliedPatches: RenderPatch[] = [];
   for (const patch of patches) {
     const patchNode = patch.node ? normalizePatchNodeForTimeline(next, patch) : undefined;
     if (patch.type === "append" && patchNode) {
@@ -97,13 +130,16 @@ export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]):
       });
       nextTimelineOrder = Math.max(nextTimelineOrder, ordered.timelineOrder ?? 0);
       next.push(ordered);
+      appliedPatches.push({ type: "upsert", node: ordered });
       continue;
     }
     if ((patch.type === "replace" || patch.type === "upsert") && patchNode) {
       const index = next.findIndex((node) => node.id === patchNode.id);
       let appliedNode: RenderNode | undefined;
+      let existingNode: RenderNode | undefined;
       if (index >= 0) {
         const existing = next[index]!;
+        existingNode = existing;
         const orderedPatchNode = preserveTimelineOrder(patchNode, existing);
         next[index] = patch.type === "upsert" ? mergeRenderNode(existing, orderedPatchNode) : orderedPatchNode;
         appliedNode = next[index];
@@ -116,16 +152,51 @@ export function applyRenderPatches(nodes: RenderNode[], patches: RenderPatch[]):
         next.push(ordered);
         appliedNode = ordered;
       }
+      if (appliedNode && appliedNode !== existingNode) {
+        appliedPatches.push({ type: "upsert", node: appliedNode });
+      }
       if (appliedNode?.kind === "tool") {
-        next = syncExpandedTerminalNodes(next, appliedNode);
+        const synced = syncExpandedTerminalNodesAndCollect(next, appliedNode);
+        next = synced.nodes;
+        appliedPatches.push(...synced.patches);
       }
       continue;
     }
     if (patch.type === "remove" && patch.id) {
+      const beforeLength = next.length;
       next = next.filter((node) => node.id !== patch.id);
+      if (next.length !== beforeLength) {
+        appliedPatches.push({ type: "remove", id: patch.id });
+      }
     }
   }
-  return next;
+  return { nodes: next, patches: appliedPatches };
+}
+
+function sameRenderNodeSnapshot(left: RenderNode, right: RenderNode): boolean {
+  if (left === right) {
+    return true;
+  }
+  return stableJson(left) === stableJson(right);
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => stableJsonValue(item));
+  }
+  const record = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(record).sort()) {
+    sorted[key] = stableJsonValue(record[key]);
+  }
+  return sorted;
 }
 
 function maxTimelineOrder(nodes: RenderNode[]): number {
@@ -893,8 +964,9 @@ function expandToolContent(tool: ToolNode, context: RenderReduceContext): Render
   return patches;
 }
 
-function syncExpandedTerminalNodes(nodes: RenderNode[], tool: ToolNode): RenderNode[] {
+function syncExpandedTerminalNodesAndCollect(nodes: RenderNode[], tool: ToolNode): AppliedRenderPatches {
   let changed = false;
+  const patches: RenderPatch[] = [];
   const next = nodes.map((node) => {
     if (node.kind !== "terminal" || node.acpToolCallId !== tool.toolCallId) {
       return node;
@@ -904,14 +976,16 @@ function syncExpandedTerminalNodes(nodes: RenderNode[], tool: ToolNode): RenderN
       return node;
     }
     changed = true;
-    return {
+    const updated: RenderNode = {
       ...node,
       status: tool.status,
       terminalStatus,
       updatedAt: tool.updatedAt
     };
+    patches.push({ type: "upsert", node: updated });
+    return updated;
   });
-  return changed ? next : nodes;
+  return { nodes: changed ? next : nodes, patches };
 }
 
 function syncTerminalStatusFromTool(current: string | undefined, next: string | undefined): string | undefined {

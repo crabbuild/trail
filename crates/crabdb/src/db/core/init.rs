@@ -252,6 +252,7 @@ impl CrabDb {
     ) -> Result<Self> {
         fs::create_dir_all(db_dir.join("index"))?;
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
+        register_sqlite_vec_extension()?;
         let store = open_prolly_store(&config, &sqlite_path)?;
         let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
