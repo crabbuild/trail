@@ -258,7 +258,7 @@ function ToolbarCapabilities({
           dangerouslySetInnerHTML={{ __html: iconHtml }}
         />
         <span className="sr-only">CrabDB capabilities</span>
-        <b>{toolbar.capabilitySummary}</b>
+        <b className="sr-only">{toolbar.capabilitySummary}</b>
       </CollapsibleTrigger>
       <CollapsibleContent keepMounted>
         <Card className="toolbar-capability-grid" size="sm" aria-label="CrabDB capability matrix">
@@ -302,10 +302,11 @@ function ToolbarCapabilityGroup({
             size="sm"
             className={cn("toolbar-capability", capability.enabled ? "on" : "off")}
             data-capability={capability.id}
+            title={capability.detail}
             aria-label={`${capability.label}: ${capability.enabled ? "ready" : "unavailable"}`}
           >
             <strong>{capability.label}</strong>
-            <small>{capability.detail}</small>
+            <small className="sr-only">{capability.detail}</small>
           </Card>
         ))}
       </div>
@@ -330,18 +331,19 @@ function ToolbarActionButton({
         action.tone === "danger" ? "danger" : ""
       )}
       data-action={action.action}
+      data-toolbar-icon-only="true"
       title={action.detail}
       aria-label={`${action.label}. ${action.detail}`}
       aria-disabled={action.disabled ? "true" : undefined}
       disabled={action.disabled}
       variant={variant}
-      size="sm"
+      size="icon-sm"
     >
       <span
         data-icon="inline-start"
         dangerouslySetInnerHTML={{ __html: iconHtml }}
       />
-      <span>{action.label}</span>
+      <span className="sr-only">{action.label}</span>
     </Button>
   )
 }
@@ -375,16 +377,18 @@ function CapabilityActionButton({ action }: { action: HeaderIconAction }) {
     <Button
       type="button"
       data-action={action.action}
+      data-toolbar-icon-only="true"
       title={action.label}
+      aria-label={action.label}
       disabled={action.disabled}
       variant="outline"
-      size="sm"
+      size="icon-sm"
     >
       <span
         data-icon="inline-start"
         dangerouslySetInnerHTML={{ __html: action.iconHtml }}
       />
-      <span>{action.label}</span>
+      <span className="sr-only">{action.label}</span>
     </Button>
   )
 }

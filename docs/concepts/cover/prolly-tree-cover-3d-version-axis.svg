@@ -1,0 +1,341 @@
+<svg viewBox="0 0 1600 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Prolly Trees cover with a 3D version axis</title>
+  <desc id="desc">A 5:2 blog cover showing Prolly trees as content-addressed ordered indexes. Three version slices sit on a diagonal time axis; each slice has its own root CID and small B+tree-like hierarchy, while green bridges show structurally shared subtrees across versions.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.6" opacity="0.72"/>
+    </pattern>
+    <radialGradient id="glow" cx="70%" cy="43%" r="62%">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.22"/>
+      <stop offset="42%" stop-color="#7c3aed" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#020617" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="3.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="bridgeGlow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#34d399"/>
+    </marker>
+    <marker id="arrow-violet" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#fbbf24"/>
+    </marker>
+    <marker id="arrow-slate" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', Menlo, monospace; letter-spacing: 0; }
+      .title { fill: #f8fafc; font-size: 57px; font-weight: 800; }
+      .subtitle { fill: #a7b6ce; font-size: 21px; font-weight: 700; }
+      .h2 { fill: #dbeafe; font-size: 14px; font-weight: 800; }
+      .h3 { fill: #f8fafc; font-size: 10.5px; font-weight: 800; }
+      .body { fill: #aebbd0; font-size: 9px; font-weight: 500; }
+      .tiny { fill: #94a3b8; font-size: 7.3px; font-weight: 500; }
+      .micro { fill: #94a3b8; font-size: 6.5px; font-weight: 600; }
+      .mask { fill: #0f172a; }
+      .panel-cyan { fill: #082f49; fill-opacity: 0.48; stroke: #22d3ee; stroke-width: 1.6; }
+      .panel-green { fill: #064e3b; fill-opacity: 0.48; stroke: #34d399; stroke-width: 1.6; }
+      .panel-violet { fill: #2e1065; fill-opacity: 0.52; stroke: #a78bfa; stroke-width: 1.6; }
+      .panel-amber { fill: #451a03; fill-opacity: 0.42; stroke: #fbbf24; stroke-width: 1.5; }
+      .panel-slate { fill: #1e293b; fill-opacity: 0.54; stroke: #94a3b8; stroke-width: 1.3; }
+      .line { fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+      .thin { fill: none; stroke-width: 1.15; stroke-linecap: round; stroke-linejoin: round; }
+      .dash { stroke-dasharray: 7 7; }
+      .cyan { stroke: #22d3ee; }
+      .green { stroke: #34d399; }
+      .violet { stroke: #a78bfa; }
+      .amber { stroke: #fbbf24; }
+      .slate { stroke: #94a3b8; }
+      .chip-text { fill: #dbeafe; font-size: 7.5px; font-weight: 700; text-anchor: middle; }
+      .slot { fill: #172554; fill-opacity: 0.6; stroke: #a78bfa; stroke-width: 0.8; }
+      .slot-green { fill: #064e3b; fill-opacity: 0.6; stroke: #34d399; stroke-width: 0.8; }
+      .slot-cyan { fill: #082f49; fill-opacity: 0.7; stroke: #22d3ee; stroke-width: 0.8; }
+      .slot-text { fill: #dbeafe; font-size: 6.8px; font-weight: 800; text-anchor: middle; }
+      .dim { opacity: 0.72; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="640" fill="#020617"/>
+  <rect width="1600" height="640" fill="#0f172a"/>
+  <rect width="1600" height="640" fill="url(#grid)"/>
+  <rect width="1600" height="640" fill="url(#glow)"/>
+
+  <!-- ambient hex motif -->
+  <g opacity="0.23">
+    <path d="M1470 54 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+    <path d="M1520 54 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+    <path d="M1570 54 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+    <path d="M1520 112 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+  </g>
+
+  <!-- Left editorial column -->
+  <text x="50" y="84" class="title">Prolly Trees</text>
+  <text x="54" y="126" class="subtitle">Content-addressed ordered indexes</text>
+  <text x="54" y="154" class="subtitle">for versioned data</text>
+
+  <g transform="translate(56,224)">
+    <rect class="mask" width="410" height="174" rx="14"/>
+    <rect class="panel-cyan" width="410" height="174" rx="14"/>
+    <text x="28" y="35" class="h3">What it is</text>
+    <g transform="translate(28,58)">
+      <rect class="panel-violet" width="166" height="30" rx="15"/>
+      <text x="83" y="19" class="chip-text">B+tree-like shape</text>
+      <rect class="panel-green" x="188" width="166" height="30" rx="15"/>
+      <text x="271" y="19" class="chip-text">Merkle identity</text>
+      <rect class="panel-cyan" y="44" width="166" height="30" rx="15"/>
+      <text x="83" y="63" class="chip-text">ordered key/value map</text>
+      <rect class="panel-amber" x="188" y="44" width="166" height="30" rx="15"/>
+      <text x="271" y="63" class="chip-text">content-defined chunks</text>
+    </g>
+    <line x1="28" y1="144" x2="382" y2="144" stroke="#22d3ee" stroke-opacity="0.25"/>
+    <text x="28" y="160" class="body">Leaves store data; internal slots route to child CIDs.</text>
+  </g>
+
+  <g transform="translate(56,424)">
+    <rect class="mask" width="410" height="92" rx="14"/>
+    <rect class="panel-slate" width="410" height="92" rx="14"/>
+    <text x="30" y="39" fill="#e2e8f0" font-size="24" font-weight="800">same CID</text>
+    <text x="208" y="39" fill="#a7b6ce" font-size="17" font-weight="800">= same subtree</text>
+    <text x="30" y="68" class="body">Version roots are tiny handles over a shared node space.</text>
+  </g>
+
+  <g transform="translate(56,540)">
+    <rect class="mask" width="410" height="56" rx="12"/>
+    <rect class="panel-green" width="410" height="56" rx="12"/>
+    <text x="28" y="24" class="body" fill="#d1fae5">Use cases: snapshots, diff, merge, sync, audit history</text>
+    <text x="28" y="42" class="tiny">Cheap history comes from root CIDs plus structural sharing.</text>
+  </g>
+
+  <!-- Main 3D version diagram -->
+  <g>
+    <rect x="500" y="40" width="1050" height="556" rx="22" fill="none" stroke="#64748b" stroke-width="1.2" stroke-dasharray="7 7" opacity="0.62"/>
+    <text x="530" y="74" class="h2">Version axis: roots move through time, subtrees persist by CID</text>
+    <text x="530" y="96" class="body">Each slice has its own root CID; green bridges are identical child CIDs reused across versions.</text>
+  </g>
+
+  <!-- 3D axes -->
+  <g opacity="0.9">
+    <path class="line cyan" d="M566 536 H1454" marker-end="url(#arrow-cyan)" opacity="0.72"/>
+    <path class="line cyan" d="M566 536 V214" marker-end="url(#arrow-cyan)" opacity="0.62"/>
+    <path class="line amber dash" d="M640 160 C840 144 1064 124 1292 106" marker-end="url(#arrow-amber)" opacity="0.82"/>
+    <text x="1450" y="558" class="tiny" text-anchor="end">key range</text>
+    <text x="548" y="222" class="tiny" text-anchor="end">tree level</text>
+    <text x="1030" y="111" fill="#fbbf24" font-size="8" font-weight="800">version / time</text>
+  </g>
+
+  <!-- version slice backplates -->
+  <g opacity="0.72">
+    <path d="M548 150 H766 L816 192 H598 Z" fill="#082f49" fill-opacity="0.24" stroke="#22d3ee" stroke-width="1.2"/>
+    <path d="M548 150 V472 L598 514 V192 Z" fill="#082f49" fill-opacity="0.12" stroke="#22d3ee" stroke-width="0.7" opacity="0.65"/>
+    <path d="M598 192 H816 V514 H598 Z" fill="#082f49" fill-opacity="0.08" stroke="#22d3ee" stroke-width="0.7" opacity="0.5"/>
+
+    <path d="M864 126 H1082 L1132 168 H914 Z" fill="#064e3b" fill-opacity="0.24" stroke="#34d399" stroke-width="1.2"/>
+    <path d="M864 126 V448 L914 490 V168 Z" fill="#064e3b" fill-opacity="0.12" stroke="#34d399" stroke-width="0.7" opacity="0.65"/>
+    <path d="M914 168 H1132 V490 H914 Z" fill="#064e3b" fill-opacity="0.08" stroke="#34d399" stroke-width="0.7" opacity="0.5"/>
+
+    <path d="M1180 102 H1398 L1448 144 H1230 Z" fill="#2e1065" fill-opacity="0.28" stroke="#a78bfa" stroke-width="1.2"/>
+    <path d="M1180 102 V424 L1230 466 V144 Z" fill="#2e1065" fill-opacity="0.14" stroke="#a78bfa" stroke-width="0.7" opacity="0.65"/>
+    <path d="M1230 144 H1448 V466 H1230 Z" fill="#2e1065" fill-opacity="0.09" stroke="#a78bfa" stroke-width="0.7" opacity="0.5"/>
+  </g>
+
+  <!-- cross-version structural-sharing bridges, drawn before nodes -->
+  <g filter="url(#bridgeGlow)">
+    <!-- S_left bridge spans all versions -->
+    <path d="M612 330 C738 318 902 304 980 306 C1076 308 1160 286 1244 274" fill="none" stroke="#34d399" stroke-width="12" stroke-opacity="0.19" stroke-linecap="round"/>
+    <path d="M612 330 C738 318 902 304 980 306 C1076 308 1160 286 1244 274" fill="none" stroke="#34d399" stroke-width="2.6" stroke-opacity="0.9" stroke-linecap="round"/>
+    <!-- M_new bridge spans v2->v3 -->
+    <path d="M1002 330 C1080 312 1194 298 1318 292" fill="none" stroke="#34d399" stroke-width="10" stroke-opacity="0.18" stroke-linecap="round"/>
+    <path d="M1002 330 C1080 312 1194 298 1318 292" fill="none" stroke="#34d399" stroke-width="2.2" stroke-opacity="0.85" stroke-linecap="round"/>
+    <!-- S_right bridge spans v1->v2 -->
+    <path d="M738 330 C842 334 962 338 1068 330" fill="none" stroke="#34d399" stroke-width="10" stroke-opacity="0.16" stroke-linecap="round"/>
+    <path d="M738 330 C842 334 962 338 1068 330" fill="none" stroke="#34d399" stroke-width="2.1" stroke-opacity="0.8" stroke-linecap="round"/>
+  </g>
+  <text x="1098" y="254" fill="#bbf7d0" font-size="8" font-weight="800">green bridges = same CID across version slices</text>
+
+  <!-- v1 mini tree -->
+  <g transform="translate(548,150)" class="dim">
+    <text x="28" y="-10" fill="#22d3ee" font-size="14" font-weight="800">v1</text>
+    <rect class="mask" x="58" y="28" width="142" height="54" rx="10"/>
+    <rect class="panel-cyan" x="58" y="28" width="142" height="54" rx="10"/>
+    <text x="129" y="50" class="h3" text-anchor="middle">root CID A</text>
+    <text x="129" y="68" class="tiny" text-anchor="middle">a8f3...7c9d</text>
+    <path class="line amber" d="M129 82 V112" marker-end="url(#arrow-amber)"/>
+
+    <rect class="mask" x="44" y="112" width="170" height="58" rx="9"/>
+    <rect class="panel-violet" x="44" y="112" width="170" height="58" rx="9"/>
+    <text x="129" y="135" class="h3" text-anchor="middle">Root internal A</text>
+    <line x1="44" y1="145" x2="214" y2="145" stroke="#a78bfa" stroke-opacity="0.4"/>
+    <rect class="slot" x="51" y="151" width="48" height="15" rx="4"/><text x="75" y="162" class="slot-text">S_left</text>
+    <rect class="slot" x="105" y="151" width="48" height="15" rx="4"/><text x="129" y="162" class="slot-text">M_old</text>
+    <rect class="slot" x="159" y="151" width="48" height="15" rx="4"/><text x="183" y="162" class="slot-text">S_right</text>
+
+    <path class="thin green" d="M75 170 V214" marker-end="url(#arrow-green)"/>
+    <path class="thin violet" d="M129 170 V214" marker-end="url(#arrow-violet)"/>
+    <path class="thin green" d="M183 170 V214" marker-end="url(#arrow-green)"/>
+
+    <rect class="mask" x="22" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="22" y="214" width="74" height="47" rx="8"/>
+    <text x="59" y="235" class="h3" text-anchor="middle">S_left</text>
+    <text x="59" y="252" class="micro" text-anchor="middle">CID 11aa</text>
+    <rect class="mask" x="100" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-violet" x="100" y="214" width="74" height="47" rx="8"/>
+    <text x="137" y="235" class="h3" text-anchor="middle">M_old</text>
+    <text x="137" y="252" class="micro" text-anchor="middle">v1 only</text>
+    <rect class="mask" x="178" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="178" y="214" width="74" height="47" rx="8"/>
+    <text x="215" y="235" class="h3" text-anchor="middle">S_right</text>
+    <text x="215" y="252" class="micro" text-anchor="middle">CID 44dd</text>
+
+    <path class="thin cyan" d="M59 261 V294" marker-end="url(#arrow-cyan)"/>
+    <path class="thin violet" d="M137 261 V294" marker-end="url(#arrow-violet)"/>
+    <path class="thin cyan" d="M215 261 V294" marker-end="url(#arrow-cyan)"/>
+    <rect class="mask" x="22" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="22" y="294" width="74" height="40" rx="7"/>
+    <text x="59" y="316" class="h3" text-anchor="middle">leaf</text>
+    <text x="59" y="329" class="micro" text-anchor="middle">[a,m)</text>
+    <rect class="mask" x="100" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot" x="100" y="294" width="74" height="40" rx="7"/>
+    <text x="137" y="316" class="h3" text-anchor="middle">old</text>
+    <text x="137" y="329" class="micro" text-anchor="middle">[m,t)</text>
+    <rect class="mask" x="178" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="178" y="294" width="74" height="40" rx="7"/>
+    <text x="215" y="316" class="h3" text-anchor="middle">leaf</text>
+    <text x="215" y="329" class="micro" text-anchor="middle">[t,end)</text>
+  </g>
+
+  <!-- v2 mini tree -->
+  <g transform="translate(864,126)">
+    <text x="28" y="-10" fill="#34d399" font-size="14" font-weight="800">v2</text>
+    <rect class="mask" x="58" y="28" width="142" height="54" rx="10"/>
+    <rect class="panel-green" x="58" y="28" width="142" height="54" rx="10"/>
+    <text x="129" y="50" class="h3" text-anchor="middle">root CID B</text>
+    <text x="129" y="68" class="tiny" text-anchor="middle">d4c8...b7a1</text>
+    <path class="line amber" d="M129 82 V112" marker-end="url(#arrow-amber)"/>
+
+    <rect class="mask" x="44" y="112" width="170" height="58" rx="9"/>
+    <rect class="panel-green" x="44" y="112" width="170" height="58" rx="9"/>
+    <text x="129" y="135" class="h3" text-anchor="middle">Root internal B</text>
+    <line x1="44" y1="145" x2="214" y2="145" stroke="#34d399" stroke-opacity="0.4"/>
+    <rect class="slot-green" x="51" y="151" width="48" height="15" rx="4"/><text x="75" y="162" class="slot-text">S_left</text>
+    <rect class="slot-green" x="105" y="151" width="48" height="15" rx="4"/><text x="129" y="162" class="slot-text">M_new</text>
+    <rect class="slot-green" x="159" y="151" width="48" height="15" rx="4"/><text x="183" y="162" class="slot-text">S_right</text>
+
+    <path class="thin green" d="M75 170 V214" marker-end="url(#arrow-green)"/>
+    <path class="thin green" d="M129 170 V214" marker-end="url(#arrow-green)"/>
+    <path class="thin green" d="M183 170 V214" marker-end="url(#arrow-green)"/>
+
+    <rect class="mask" x="22" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="22" y="214" width="74" height="47" rx="8"/>
+    <text x="59" y="235" class="h3" text-anchor="middle">S_left</text>
+    <text x="59" y="252" class="micro" text-anchor="middle">same CID</text>
+    <rect class="mask" x="100" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="100" y="214" width="74" height="47" rx="8"/>
+    <text x="137" y="235" class="h3" text-anchor="middle">M_new</text>
+    <text x="137" y="252" class="micro" text-anchor="middle">CID 33cc</text>
+    <rect class="mask" x="178" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="178" y="214" width="74" height="47" rx="8"/>
+    <text x="215" y="235" class="h3" text-anchor="middle">S_right</text>
+    <text x="215" y="252" class="micro" text-anchor="middle">same CID</text>
+
+    <path class="thin cyan" d="M59 261 V294" marker-end="url(#arrow-cyan)"/>
+    <path class="thin cyan" d="M137 261 V294" marker-end="url(#arrow-cyan)"/>
+    <path class="thin cyan" d="M215 261 V294" marker-end="url(#arrow-cyan)"/>
+    <rect class="mask" x="22" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="22" y="294" width="74" height="40" rx="7"/>
+    <text x="59" y="316" class="h3" text-anchor="middle">leaf</text>
+    <text x="59" y="329" class="micro" text-anchor="middle">[a,m)</text>
+    <rect class="mask" x="100" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="100" y="294" width="74" height="40" rx="7"/>
+    <text x="137" y="316" class="h3" text-anchor="middle">new</text>
+    <text x="137" y="329" class="micro" text-anchor="middle">[m,t)</text>
+    <rect class="mask" x="178" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="178" y="294" width="74" height="40" rx="7"/>
+    <text x="215" y="316" class="h3" text-anchor="middle">leaf</text>
+    <text x="215" y="329" class="micro" text-anchor="middle">[t,end)</text>
+  </g>
+
+  <!-- v3 mini tree -->
+  <g transform="translate(1180,102)">
+    <text x="28" y="-10" fill="#a78bfa" font-size="14" font-weight="800">v3</text>
+    <rect class="mask" x="58" y="28" width="142" height="54" rx="10"/>
+    <rect class="panel-violet" x="58" y="28" width="142" height="54" rx="10"/>
+    <text x="129" y="50" class="h3" text-anchor="middle">root CID C</text>
+    <text x="129" y="68" class="tiny" text-anchor="middle">9f1a...e3b2</text>
+    <path class="line amber" d="M129 82 V112" marker-end="url(#arrow-amber)"/>
+
+    <rect class="mask" x="44" y="112" width="170" height="58" rx="9"/>
+    <rect class="panel-violet" x="44" y="112" width="170" height="58" rx="9"/>
+    <text x="129" y="135" class="h3" text-anchor="middle">Root internal C</text>
+    <line x1="44" y1="145" x2="214" y2="145" stroke="#a78bfa" stroke-opacity="0.4"/>
+    <rect class="slot" x="51" y="151" width="48" height="15" rx="4"/><text x="75" y="162" class="slot-text">S_left</text>
+    <rect class="slot-green" x="105" y="151" width="48" height="15" rx="4"/><text x="129" y="162" class="slot-text">M_new</text>
+    <rect class="slot" x="159" y="151" width="48" height="15" rx="4"/><text x="183" y="162" class="slot-text">R_delta</text>
+
+    <path class="thin green" d="M75 170 V214" marker-end="url(#arrow-green)"/>
+    <path class="thin green" d="M129 170 V214" marker-end="url(#arrow-green)"/>
+    <path class="thin violet" d="M183 170 V214" marker-end="url(#arrow-violet)"/>
+
+    <rect class="mask" x="22" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="22" y="214" width="74" height="47" rx="8"/>
+    <text x="59" y="235" class="h3" text-anchor="middle">S_left</text>
+    <text x="59" y="252" class="micro" text-anchor="middle">same CID</text>
+    <rect class="mask" x="100" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-green" x="100" y="214" width="74" height="47" rx="8"/>
+    <text x="137" y="235" class="h3" text-anchor="middle">M_new</text>
+    <text x="137" y="252" class="micro" text-anchor="middle">same CID</text>
+    <rect class="mask" x="178" y="214" width="74" height="47" rx="8"/>
+    <rect class="panel-violet" x="178" y="214" width="74" height="47" rx="8"/>
+    <text x="215" y="235" class="h3" text-anchor="middle">R_delta</text>
+    <text x="215" y="252" class="micro" text-anchor="middle">v3 only</text>
+
+    <path class="thin cyan" d="M59 261 V294" marker-end="url(#arrow-cyan)"/>
+    <path class="thin cyan" d="M137 261 V294" marker-end="url(#arrow-cyan)"/>
+    <path class="thin violet" d="M215 261 V294" marker-end="url(#arrow-violet)"/>
+    <rect class="mask" x="22" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="22" y="294" width="74" height="40" rx="7"/>
+    <text x="59" y="316" class="h3" text-anchor="middle">leaf</text>
+    <text x="59" y="329" class="micro" text-anchor="middle">[a,m)</text>
+    <rect class="mask" x="100" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot-cyan" x="100" y="294" width="74" height="40" rx="7"/>
+    <text x="137" y="316" class="h3" text-anchor="middle">new</text>
+    <text x="137" y="329" class="micro" text-anchor="middle">[m,t)</text>
+    <rect class="mask" x="178" y="294" width="74" height="40" rx="7"/>
+    <rect class="slot" x="178" y="294" width="74" height="40" rx="7"/>
+    <text x="215" y="316" class="h3" text-anchor="middle">delta</text>
+    <text x="215" y="329" class="micro" text-anchor="middle">[t,end)</text>
+  </g>
+
+  <!-- explanation legend -->
+  <g transform="translate(540,546)">
+    <rect x="0" y="-20" width="950" height="54" rx="12" fill="#020617" fill-opacity="0.42" stroke="#64748b" stroke-opacity="0.65"/>
+    <circle cx="24" cy="7" r="5" fill="#34d399"/>
+    <text x="38" y="10" fill="#cbd5e1" font-size="8" font-weight="700">same CID shared across versions</text>
+    <circle cx="258" cy="7" r="5" fill="#a78bfa"/>
+    <text x="272" y="10" fill="#cbd5e1" font-size="8" font-weight="700">changed subtree gets a new CID</text>
+    <circle cx="502" cy="7" r="5" fill="#fbbf24"/>
+    <text x="516" y="10" fill="#cbd5e1" font-size="8" font-weight="700">root CID is the version handle</text>
+    <text x="770" y="10" fill="#94a3b8" font-size="8" font-weight="700">levels: root -> internal -> leaves</text>
+  </g>
+
+  <g transform="translate(500,606)">
+    <rect class="mask" width="1050" height="28" rx="10"/>
+    <rect width="1050" height="28" rx="10" fill="#1e293b" fill-opacity="0.52" stroke="#64748b" stroke-width="1"/>
+    <text x="525" y="19" fill="#cbd5e1" font-size="8.6" font-weight="600" text-anchor="middle">A Prolly tree versions ordered data by moving only the root handle while unchanged subtrees remain shared by content ID.</text>
+  </g>
+</svg>

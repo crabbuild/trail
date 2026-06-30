@@ -385,3 +385,54 @@ test("prefers nested concrete tool names over generic provider wrappers", () => 
   assert.equal(model.operationLabel, "Edit");
   assert.equal(model.riskLabel, "Workspace change");
 });
+
+test("classifies KiloCode background process tools as process cards", () => {
+  const model = buildToolPresentation({
+    title: "background_process",
+    toolKind: "other",
+    toolStatus: "completed",
+    locations: [],
+    rawInput: {
+      name: "background_process",
+      input: {
+        action: "start",
+        command: "npm run dev --token secret",
+        description: "Start local dev server"
+      }
+    },
+    rawOutput: { id: "dev-server", status: "running" },
+    content: []
+  });
+
+  assert.equal(model.kind, "background_process");
+  assert.equal(model.operationLabel, "Process");
+  assert.equal(model.icon, "process");
+  assert.equal(model.riskLabel, "Background process");
+  assert.equal(model.openByDefault, true);
+  assert.match(model.summary, /\[REDACTED\]/);
+});
+
+test("classifies KiloCode task tools as delegated agent cards", () => {
+  const model = buildToolPresentation({
+    title: "task",
+    toolKind: "other",
+    toolStatus: "pending",
+    locations: [],
+    rawInput: {
+      toolName: "task",
+      input: {
+        subagent_type: "reviewer",
+        description: "Inspect the tool-call UI"
+      }
+    },
+    content: []
+  });
+
+  assert.equal(model.kind, "task");
+  assert.equal(model.operationLabel, "Agent");
+  assert.equal(model.icon, "task");
+  assert.equal(model.tone, "agent");
+  assert.equal(model.riskLabel, "Delegated agent");
+  assert.equal(model.summary, "reviewer: Inspect the tool-call UI");
+  assert.equal(model.openByDefault, true);
+});

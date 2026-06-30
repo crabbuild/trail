@@ -1,5 +1,5 @@
 import type { ContentBlock } from "./acpTypes";
-import type { MessageNode, RenderNode, RenderPatch, ThoughtNode } from "./renderModel";
+import type { MessageNode, RenderNode, RenderPatch, TerminalNode, ThoughtNode, ToolNode } from "./renderModel";
 
 export interface RenderStreamSchedulerOptions {
   flushMs?: number;
@@ -91,7 +91,7 @@ export class RenderStreamScheduler {
 
   private pushStreamPatch(patch: RenderPatch & { node: StreamNode }): void {
     this.counters.received += 1;
-    const key = patch.node.id;
+    const key = renderPatchCoalesceKey(patch) ?? patch.node.id;
 
     const previous = this.queue.get(key);
     if (previous) {
@@ -103,7 +103,7 @@ export class RenderStreamScheduler {
 
   private pushComponentPatch(patch: RenderPatch): void {
     this.counters.received += 1;
-    const key = patch.node?.id;
+    const key = renderPatchCoalesceKey(patch);
     if (!key) {
       this.flush();
       this.emit([patch]);
@@ -114,7 +114,7 @@ export class RenderStreamScheduler {
     if (previous) {
       this.counters.coalesced += 1;
     }
-    this.componentQueue.set(key, patch);
+    this.componentQueue.set(key, mergeComponentPatch(previous, patch));
     this.scheduleComponent();
   }
 
@@ -196,12 +196,28 @@ function isStreamTextNode(node: RenderNode): node is StreamNode {
   return node.content.length > 0 && node.content.every((block) => block.type === "text");
 }
 
+function renderPatchCoalesceKey(patch: RenderPatch): string | undefined {
+  const node = patch.node;
+  if (!node) {
+    return undefined;
+  }
+  return [
+    node.id,
+    node.kind,
+    node.taskId,
+    node.lane,
+    node.turnId || "",
+    node.acpSessionId || "",
+    node.source
+  ].join("\u0000");
+}
+
 function mergeStreamPatch(previous: RenderPatch | undefined, incoming: RenderPatch): RenderPatch {
   if (!previous?.node || !incoming.node || previous.node.kind !== incoming.node.kind) {
     return incoming;
   }
   if (incoming.node.kind === "message" && previous.node.kind === "message") {
-    const content = mergeAdjacentTextContentBlocks([...previous.node.content, ...incoming.node.content]);
+    const content = mergeStreamTextContent(previous.node.content, incoming.node.content);
     return {
       ...incoming,
       node: {
@@ -219,11 +235,70 @@ function mergeStreamPatch(previous: RenderPatch | undefined, incoming: RenderPat
       node: {
         ...incoming.node,
         createdAt: previous.node.createdAt,
-        content: mergeAdjacentTextContentBlocks([...previous.node.content, ...incoming.node.content])
+        content: mergeStreamTextContent(previous.node.content, incoming.node.content)
       }
     };
   }
   return incoming;
+}
+
+function mergeComponentPatch(previous: RenderPatch | undefined, incoming: RenderPatch): RenderPatch {
+  if (!previous?.node || !incoming.node || previous.node.kind !== incoming.node.kind) {
+    return incoming;
+  }
+  if (previous.node.kind === "terminal" && incoming.node.kind === "terminal") {
+    return {
+      ...incoming,
+      node: mergeTerminalComponentPatch(previous.node, incoming.node)
+    };
+  }
+  if (previous.node.kind === "tool" && incoming.node.kind === "tool") {
+    return {
+      ...incoming,
+      node: mergeToolComponentPatch(previous.node, incoming.node)
+    };
+  }
+  return incoming;
+}
+
+function mergeTerminalComponentPatch(previous: TerminalNode, incoming: TerminalNode): TerminalNode {
+  const merged: TerminalNode = {
+    ...incoming,
+    createdAt: previous.createdAt ?? incoming.createdAt,
+  };
+  assignOptional(merged, "title", incoming.title ?? previous.title);
+  assignOptional(merged, "command", incoming.command ?? previous.command);
+  assignOptional(merged, "cwd", incoming.cwd ?? previous.cwd);
+  assignOptional(merged, "terminalStatus", incoming.terminalStatus ?? previous.terminalStatus);
+  assignOptional(merged, "exitCode", incoming.exitCode ?? previous.exitCode);
+  assignOptional(merged, "elapsedMs", incoming.elapsedMs ?? previous.elapsedMs);
+  assignOptional(merged, "output", incoming.output ?? previous.output);
+  assignOptional(merged, "stdout", incoming.stdout ?? previous.stdout);
+  assignOptional(merged, "stderr", incoming.stderr ?? previous.stderr);
+  return merged;
+}
+
+function assignOptional<TObject extends object, TKey extends keyof TObject>(
+  target: TObject,
+  key: TKey,
+  value: TObject[TKey] | undefined
+): void {
+  if (value !== undefined) {
+    target[key] = value;
+  }
+}
+
+function mergeToolComponentPatch(previous: ToolNode, incoming: ToolNode): ToolNode {
+  return {
+    ...incoming,
+    createdAt: previous.createdAt ?? incoming.createdAt,
+    title: incoming.title && incoming.title !== "Tool call" ? incoming.title : previous.title,
+    toolKind: incoming.toolKind !== "other" ? incoming.toolKind : previous.toolKind,
+    locations: incoming.locations.length ? incoming.locations : previous.locations,
+    content: incoming.content.length ? incoming.content : previous.content,
+    rawInput: incoming.rawInput ?? previous.rawInput,
+    rawOutput: incoming.rawOutput ?? previous.rawOutput
+  };
 }
 
 function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] {
@@ -240,6 +315,22 @@ function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] 
     merged.push(block);
   }
   return merged;
+}
+
+function mergeStreamTextContent(previous: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
+  const previousText = textContentBlocksToText(previous);
+  const incomingText = textContentBlocksToText(incoming);
+  if (incomingText.startsWith(previousText)) {
+    return mergeAdjacentTextContentBlocks(incoming);
+  }
+  if (previousText.startsWith(incomingText)) {
+    return mergeAdjacentTextContentBlocks(previous);
+  }
+  return mergeAdjacentTextContentBlocks([...previous, ...incoming]);
+}
+
+function textContentBlocksToText(blocks: ContentBlock[]): string {
+  return blocks.map(contentToText).join("");
 }
 
 function contentToText(content: ContentBlock): string {

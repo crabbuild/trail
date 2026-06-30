@@ -70,7 +70,7 @@ function TimelineToolbar({ props }: { props: TimelineNavigationProps }) {
         ref={disclosure.triggerRef}
       >
         <ListFilterIcon data-icon="inline-start" aria-hidden="true" />
-        <span className="timeline-filter-trigger-copy">
+        <span className="timeline-filter-trigger-copy sr-only">
           <span className="timeline-filter-trigger-label">Filter</span>
           <span className="timeline-filter-trigger-detail">{props.visibleCount} shown</span>
         </span>

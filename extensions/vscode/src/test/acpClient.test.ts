@@ -495,6 +495,43 @@ test("AcpClient authenticates and retries active session requests when required"
   }
 });
 
+test("AcpClient leaves prompt requests unbounded so approvals can wait indefinitely", async () => {
+  const provider: AcpProviderProfile = {
+    id: "stub",
+    label: "Stub ACP",
+    command: process.execPath,
+    args: [],
+    crabdbBacked: true,
+    supportsTaskName: false,
+    supportsFromRef: false
+  };
+  const client = new AcpClient(process.cwd(), provider, testOutput());
+  const calls: Array<{ method: string; timeoutMs: number | null | undefined }> = [];
+  const internals = client as unknown as {
+    sessionId?: string;
+    rpc: {
+      request<T>(method: string, params?: unknown, timeoutMs?: number | null): Promise<T>;
+    };
+  };
+  internals.sessionId = "unbounded-session";
+  internals.rpc.request = async <T>(
+    method: string,
+    _params?: unknown,
+    timeoutMs?: number | null
+  ): Promise<T> => {
+    calls.push({ method, timeoutMs });
+    if (method === "session/prompt") {
+      return { stopReason: "end_turn" } as T;
+    }
+    throw new Error(`unexpected request ${method}`);
+  };
+
+  const response = await client.prompt("wait for approval");
+
+  assert.deepEqual(response, { stopReason: "end_turn" });
+  assert.deepEqual(calls, [{ method: "session/prompt", timeoutMs: null }]);
+});
+
 test("AcpClient forwards stderr and exit signal diagnostics", async () => {
   const { client, cleanup } = clientForLifecycleStub(exitSignalStubSource());
   const stderrLines: string[] = [];

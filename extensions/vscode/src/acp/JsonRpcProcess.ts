@@ -31,6 +31,8 @@ export interface JsonRpcProcessEvents {
   exit: [code: number | null, signal: NodeJS.Signals | null];
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
+
 export declare interface JsonRpcProcess {
   on<K extends keyof JsonRpcProcessEvents>(event: K, listener: (...args: JsonRpcProcessEvents[K]) => void): this;
   emit<K extends keyof JsonRpcProcessEvents>(event: K, ...args: JsonRpcProcessEvents[K]): boolean;
@@ -44,7 +46,7 @@ export class JsonRpcProcess extends EventEmitter {
     {
       resolve(value: unknown): void;
       reject(error: Error): void;
-      timeout: NodeJS.Timeout;
+      timeout: NodeJS.Timeout | undefined;
     }
   >();
 
@@ -80,14 +82,17 @@ export class JsonRpcProcess extends EventEmitter {
     });
   }
 
-  request<T>(method: string, params?: unknown, timeoutMs = 120000): Promise<T> {
+  request<T>(method: string, params?: unknown, timeoutMs: number | null = DEFAULT_REQUEST_TIMEOUT_MS): Promise<T> {
     const id = this.nextId++;
     this.write({ jsonrpc: "2.0", id, method, params });
     return new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pending.delete(String(id));
-        reject(new Error(`ACP request timed out: ${method}`));
-      }, timeoutMs);
+      const timeout =
+        timeoutMs === null
+          ? undefined
+          : setTimeout(() => {
+              this.pending.delete(String(id));
+              reject(new Error(`ACP request timed out: ${method}`));
+            }, timeoutMs);
       this.pending.set(String(id), {
         resolve: (value) => resolve(value as T),
         reject,
@@ -148,7 +153,9 @@ export class JsonRpcProcess extends EventEmitter {
       if (!pending) {
         return;
       }
-      clearTimeout(pending.timeout);
+      if (pending.timeout) {
+        clearTimeout(pending.timeout);
+      }
       this.pending.delete(key);
       if (message.error) {
         pending.reject(
@@ -169,7 +176,9 @@ export class JsonRpcProcess extends EventEmitter {
 
   private rejectAll(error: Error): void {
     for (const pending of this.pending.values()) {
-      clearTimeout(pending.timeout);
+      if (pending.timeout) {
+        clearTimeout(pending.timeout);
+      }
       pending.reject(error);
     }
     this.pending.clear();

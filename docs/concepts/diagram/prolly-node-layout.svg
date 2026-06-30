@@ -1,0 +1,263 @@
+<svg viewBox="0 0 1440 840" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace; }
+    .title { fill: #f8fafc; font-size: 18px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 9.5px; }
+    .band-label { font-size: 9px; font-weight: 700; }
+    .node-title { fill: #f8fafc; font-size: 11px; font-weight: 700; }
+    .node-meta { fill: #cbd5e1; font-size: 8px; }
+    .slot-label { fill: #f8fafc; font-size: 7.6px; font-weight: 700; }
+    .slot-range { fill: #cbd5e1; font-size: 7px; }
+    .key-text { fill: #0f172a; font-size: 16px; font-weight: 700; }
+    .key-caption { fill: #93c5fd; font-size: 6.8px; }
+    .leaf-text { fill: #e2e8f0; font-size: 7.2px; }
+    .note { fill: #cbd5e1; font-size: 8px; }
+    .muted { fill: #94a3b8; font-size: 7.6px; }
+    .root-link { fill: none; stroke: #a78bfa; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-violet); }
+    .leaf-link { fill: none; stroke: #22d3ee; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-cyan); }
+    .guide { fill: none; stroke: #334155; stroke-width: 0.8; stroke-dasharray: 4,4; }
+    .port { fill: #dbeafe; stroke: #93c5fd; stroke-width: 1; }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow-violet" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/>
+    </marker>
+  </defs>
+
+  <rect width="1440" height="840" fill="#0f172a"/>
+  <rect width="1440" height="840" fill="url(#grid)"/>
+
+  <text x="34" y="38" class="title">Prolly Tree Levels and Child Order</text>
+  <text x="34" y="58" class="subtitle">B+tree-style rendering: separator values split routing slots; child pointers leave from the slots between values.</text>
+
+  <rect x="34" y="86" width="1372" height="154" rx="12" fill="none" stroke="#a78bfa" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="52" y="108" fill="#a78bfa" class="band-label">Root level 2: highest level in this example</text>
+
+  <rect x="34" y="280" width="1372" height="158" rx="12" fill="none" stroke="#a78bfa" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="52" y="292" fill="#a78bfa" class="band-label">Internal level 1: slot count equals internal value count plus one</text>
+
+  <rect x="34" y="490" width="1372" height="178" rx="12" fill="none" stroke="#22d3ee" stroke-width="1" stroke-dasharray="8,4"/>
+  <text x="52" y="512" fill="#22d3ee" class="band-label">Leaf level 0: sorted application key/value entries, no child pointers</text>
+
+  <path class="root-link" d="M 580 226 C 580 242 562 250 530 255 L 215 255 C 205 255 200 262 200 272 L 200 312"/>
+  <path class="root-link" d="M 720 226 C 720 246 696 256 674 267 C 658 275 650 286 650 302 L 650 312"/>
+  <path class="root-link" d="M 860 226 C 860 242 880 250 912 255 L 1175 255 C 1185 255 1190 262 1190 272 L 1190 312"/>
+
+  <path class="leaf-link" d="M 130 410 L 130 454 C 130 464 130 464 130 536"/>
+  <path class="leaf-link" d="M 270 410 L 270 454 C 270 464 270 464 270 536"/>
+
+  <path class="leaf-link" d="M 450 410 L 450 454 C 450 464 450 464 450 536"/>
+  <path class="leaf-link" d="M 590 410 L 590 454 C 590 464 590 464 590 536"/>
+  <path class="leaf-link" d="M 730 410 L 730 454 C 730 464 730 464 730 536"/>
+  <path class="leaf-link" d="M 870 410 L 870 454 C 870 464 870 464 870 536"/>
+
+  <path class="leaf-link" d="M 1050 410 L 1050 454 C 1050 464 1050 464 1050 536"/>
+  <path class="leaf-link" d="M 1190 410 L 1190 454 C 1190 464 1190 464 1190 536"/>
+  <path class="leaf-link" d="M 1330 410 L 1330 454 C 1330 464 1330 464 1330 536"/>
+
+  <line x1="130" y1="658" x2="1330" y2="658" class="guide"/>
+  <text x="1360" y="661" class="muted">same depth</text>
+
+  <g transform="translate(510,126)">
+    <rect width="420" height="100" rx="7" fill="#0f172a"/>
+    <rect width="420" height="100" rx="7" fill="rgba(76,29,149,0.44)" stroke="#a78bfa" stroke-width="1.6"/>
+    <text x="210" y="22" class="node-title" text-anchor="middle">Root internal node</text>
+    <text x="210" y="37" class="node-meta" text-anchor="middle">level = 2, leaf = false, root CID points here</text>
+    <line x1="0" y1="44" x2="420" y2="44" stroke="#a78bfa" stroke-opacity="0.55"/>
+
+    <text x="70" y="62" class="slot-label" text-anchor="middle">P0</text>
+    <text x="70" y="76" class="slot-range" text-anchor="middle">[a,m)</text>
+    <text x="210" y="62" class="slot-label" text-anchor="middle">P1</text>
+    <text x="210" y="76" class="slot-range" text-anchor="middle">[m,t)</text>
+    <text x="350" y="62" class="slot-label" text-anchor="middle">P2</text>
+    <text x="350" y="76" class="slot-range" text-anchor="middle">[t,end)</text>
+
+    <rect x="120" y="54" width="50" height="31" rx="6" fill="#dbeafe"/>
+    <text x="145" y="75" class="key-text" text-anchor="middle">m</text>
+    <text x="145" y="94" class="key-caption" text-anchor="middle">value</text>
+
+    <rect x="260" y="54" width="50" height="31" rx="6" fill="#dbeafe"/>
+    <text x="285" y="75" class="key-text" text-anchor="middle">t</text>
+    <text x="285" y="94" class="key-caption" text-anchor="middle">value</text>
+
+    <circle cx="70" cy="100" r="5" class="port"/>
+    <circle cx="210" cy="100" r="5" class="port"/>
+    <circle cx="350" cy="100" r="5" class="port"/>
+  </g>
+
+  <g transform="translate(70,314)">
+    <rect width="260" height="96" rx="7" fill="#0f172a"/>
+    <rect width="260" height="96" rx="7" fill="rgba(76,29,149,0.44)" stroke="#a78bfa" stroke-width="1.6"/>
+    <text x="130" y="22" class="node-title" text-anchor="middle">Internal node A</text>
+    <text x="130" y="37" class="node-meta" text-anchor="middle">2 slots, 1 internal value, level = 1</text>
+    <line x1="0" y1="44" x2="260" y2="44" stroke="#a78bfa" stroke-opacity="0.55"/>
+
+    <text x="60" y="63" class="slot-label" text-anchor="middle">P0</text>
+    <text x="60" y="77" class="slot-range" text-anchor="middle">[a,g)</text>
+    <text x="200" y="63" class="slot-label" text-anchor="middle">P1</text>
+    <text x="200" y="77" class="slot-range" text-anchor="middle">[g,m)</text>
+
+    <rect x="106" y="55" width="48" height="30" rx="6" fill="#dbeafe"/>
+    <text x="130" y="75" class="key-text" text-anchor="middle">g</text>
+
+    <circle cx="60" cy="96" r="5" class="port"/>
+    <circle cx="200" cy="96" r="5" class="port"/>
+  </g>
+
+  <g transform="translate(370,314)">
+    <rect width="560" height="96" rx="7" fill="#0f172a"/>
+    <rect width="560" height="96" rx="7" fill="rgba(76,29,149,0.44)" stroke="#a78bfa" stroke-width="1.6"/>
+    <text x="280" y="22" class="node-title" text-anchor="middle">Internal node M</text>
+    <text x="280" y="37" class="node-meta" text-anchor="middle">4 slots, 3 internal values, level = 1</text>
+    <line x1="0" y1="44" x2="560" y2="44" stroke="#a78bfa" stroke-opacity="0.55"/>
+
+    <text x="80" y="63" class="slot-label" text-anchor="middle">P0</text>
+    <text x="80" y="77" class="slot-range" text-anchor="middle">[m,n)</text>
+    <text x="220" y="63" class="slot-label" text-anchor="middle">P1</text>
+    <text x="220" y="77" class="slot-range" text-anchor="middle">[n,q)</text>
+    <text x="360" y="63" class="slot-label" text-anchor="middle">P2</text>
+    <text x="360" y="77" class="slot-range" text-anchor="middle">[q,s)</text>
+    <text x="500" y="63" class="slot-label" text-anchor="middle">P3</text>
+    <text x="500" y="77" class="slot-range" text-anchor="middle">[s,t)</text>
+
+    <rect x="116" y="55" width="48" height="30" rx="6" fill="#dbeafe"/>
+    <text x="140" y="75" class="key-text" text-anchor="middle">n</text>
+    <rect x="256" y="55" width="48" height="30" rx="6" fill="#dbeafe"/>
+    <text x="280" y="75" class="key-text" text-anchor="middle">q</text>
+    <rect x="396" y="55" width="48" height="30" rx="6" fill="#dbeafe"/>
+    <text x="420" y="75" class="key-text" text-anchor="middle">s</text>
+
+    <circle cx="80" cy="96" r="5" class="port"/>
+    <circle cx="220" cy="96" r="5" class="port"/>
+    <circle cx="360" cy="96" r="5" class="port"/>
+    <circle cx="500" cy="96" r="5" class="port"/>
+  </g>
+
+  <g transform="translate(990,314)">
+    <rect width="400" height="96" rx="7" fill="#0f172a"/>
+    <rect width="400" height="96" rx="7" fill="rgba(76,29,149,0.44)" stroke="#a78bfa" stroke-width="1.6"/>
+    <text x="200" y="22" class="node-title" text-anchor="middle">Internal node T</text>
+    <text x="200" y="37" class="node-meta" text-anchor="middle">3 slots, 2 internal values, level = 1</text>
+    <line x1="0" y1="44" x2="400" y2="44" stroke="#a78bfa" stroke-opacity="0.55"/>
+
+    <text x="60" y="63" class="slot-label" text-anchor="middle">P0</text>
+    <text x="60" y="77" class="slot-range" text-anchor="middle">[t,x)</text>
+    <text x="200" y="63" class="slot-label" text-anchor="middle">P1</text>
+    <text x="200" y="77" class="slot-range" text-anchor="middle">[x,z)</text>
+    <text x="340" y="63" class="slot-label" text-anchor="middle">P2</text>
+    <text x="340" y="77" class="slot-range" text-anchor="middle">[z,end)</text>
+
+    <rect x="116" y="55" width="48" height="30" rx="6" fill="#dbeafe"/>
+    <text x="140" y="75" class="key-text" text-anchor="middle">x</text>
+    <rect x="256" y="55" width="48" height="30" rx="6" fill="#dbeafe"/>
+    <text x="280" y="75" class="key-text" text-anchor="middle">z</text>
+
+    <circle cx="60" cy="96" r="5" class="port"/>
+    <circle cx="200" cy="96" r="5" class="port"/>
+    <circle cx="340" cy="96" r="5" class="port"/>
+  </g>
+
+  <g transform="translate(70,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L0 [a,g)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">a -&gt; value_a</text>
+    <text x="12" y="76" class="leaf-text">c -&gt; value_c</text>
+    <text x="12" y="94" class="leaf-text">f -&gt; value_f</text>
+  </g>
+
+  <g transform="translate(210,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L1 [g,m)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">g -&gt; value_g</text>
+    <text x="12" y="76" class="leaf-text">j -&gt; value_j</text>
+    <text x="12" y="94" class="leaf-text">l -&gt; value_l</text>
+  </g>
+
+  <g transform="translate(390,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L2 [m,n)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">m -&gt; value_m</text>
+  </g>
+
+  <g transform="translate(530,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L3 [n,q)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">n -&gt; value_n</text>
+    <text x="12" y="76" class="leaf-text">p -&gt; value_p</text>
+  </g>
+
+  <g transform="translate(670,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L4 [q,s)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">q -&gt; value_q</text>
+    <text x="12" y="76" class="leaf-text">r -&gt; value_r</text>
+  </g>
+
+  <g transform="translate(810,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L5 [s,t)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">s -&gt; value_s</text>
+  </g>
+
+  <g transform="translate(990,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L6 [t,x)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">t -&gt; value_t</text>
+    <text x="12" y="76" class="leaf-text">u -&gt; value_u</text>
+  </g>
+
+  <g transform="translate(1130,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L7 [x,z)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">x -&gt; value_x</text>
+    <text x="12" y="76" class="leaf-text">y -&gt; value_y</text>
+  </g>
+
+  <g transform="translate(1270,536)">
+    <rect width="120" height="112" rx="6" fill="#0f172a"/>
+    <rect width="120" height="112" rx="6" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1.55"/>
+    <text x="60" y="22" class="node-title" text-anchor="middle">L8 [z,end)</text>
+    <line x1="0" y1="36" x2="120" y2="36" stroke="#22d3ee" stroke-opacity="0.55"/>
+    <text x="12" y="58" class="leaf-text">z -&gt; value_z</text>
+  </g>
+
+  <g transform="translate(72,700)">
+    <rect width="628" height="82" rx="8" fill="#0f172a"/>
+    <rect width="628" height="82" rx="8" fill="rgba(76,29,149,0.32)" stroke="#a78bfa" stroke-width="1.1"/>
+    <text x="18" y="24" class="note">Routing slot convention</text>
+    <text x="18" y="43" class="muted">Visual slots are intervals between boundary values, like a B+tree drawing.</text>
+    <text x="18" y="59" class="muted">Level-1 fanout: A = 2 slots / 1 value, M = 4 slots / 3 values, T = 3 slots / 2 values.</text>
+    <text x="18" y="75" class="muted">CrabDB stores child intervals as start-key/CID pairs in parallel arrays.</text>
+  </g>
+
+  <g transform="translate(730,700)">
+    <rect width="638" height="82" rx="8" fill="#0f172a"/>
+    <rect width="638" height="82" rx="8" fill="rgba(8,51,68,0.32)" stroke="#22d3ee" stroke-width="1.1"/>
+    <text x="18" y="24" class="note">Level numbering</text>
+    <text x="18" y="43" class="muted">Leaves are always level 0.</text>
+    <text x="18" y="59" class="muted">Parents of leaves are level 1; each higher parent increments the level.</text>
+    <text x="18" y="75" class="muted">The root is level N, where N is the tree height above the leaves.</text>
+  </g>
+</svg>

@@ -210,7 +210,12 @@ pub(super) struct AgentCommand {
 
 #[derive(Args)]
 pub(super) struct AgentSetupArgs {
-    #[arg(long, default_value = "claude-code")]
+    #[arg(
+        long,
+        default_value = "claude-code",
+        value_name = "PROVIDER",
+        help = "Provider profile: claude-code, codex, cursor, gemini, aider, opencode"
+    )]
     pub(super) provider: String,
     #[arg(long, default_value = "vscode")]
     pub(super) editor: String,
@@ -218,7 +223,12 @@ pub(super) struct AgentSetupArgs {
 
 #[derive(Args)]
 pub(super) struct AgentAcpArgs {
-    #[arg(long, default_value = "claude-code")]
+    #[arg(
+        long,
+        default_value = "claude-code",
+        value_name = "PROVIDER",
+        help = "ACP provider profile: claude-code, codex, cursor"
+    )]
     pub(super) provider: String,
     #[arg(long)]
     pub(super) name: Option<String>,
@@ -232,7 +242,12 @@ pub(super) struct AgentAcpArgs {
 
 #[derive(Args)]
 pub(super) struct AgentStartArgs {
-    #[arg(long, default_value = "claude-code")]
+    #[arg(
+        long,
+        default_value = "claude-code",
+        value_name = "PROVIDER",
+        help = "Terminal provider profile: claude-code, codex, cursor, gemini, aider, opencode"
+    )]
     pub(super) provider: String,
     #[arg(long)]
     pub(super) name: Option<String>,
@@ -252,7 +267,11 @@ pub(super) struct AgentContinueArgs {
         help = "Agent task, lane, session, ACP session, or latest"
     )]
     pub(super) selector: String,
-    #[arg(long, help = "Override the provider for the follow-up task")]
+    #[arg(
+        long,
+        value_name = "PROVIDER",
+        help = "Override the provider for the follow-up task"
+    )]
     pub(super) provider: Option<String>,
     #[arg(long, help = "Optional human label for the follow-up task")]
     pub(super) name: Option<String>,

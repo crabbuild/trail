@@ -99,6 +99,10 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
             available: true,
             relay_command: args.relay_command.clone(),
             notes: vec!["using caller-supplied ACP relay command".to_string()],
+            supports_acp: true,
+            supports_mcp: false,
+            supports_terminal: false,
+            default_terminal_command: None,
         },
         Err(err) => return Err(err),
     };

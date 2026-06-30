@@ -91,6 +91,20 @@ async function main() {
   const result = await evaluate(cdp, sessionId, replaySource(), 60_000);
   result.errors = [...pageErrors, ...(result.errors || [])];
   console.log(JSON.stringify(result, null, 2));
+  const failedChecks = [
+    "bottomStayedPinned",
+    "streamingTextMatches",
+    "completedMessageRendered",
+    "assistantExitedStreamingRenderer",
+    "thoughtTextMatches",
+    "terminalUpdated",
+    "planUpdated",
+    "toolUpdated",
+    "completionRendered"
+  ].filter((key) => result[key] !== true);
+  if (result.errors.length || failedChecks.length) {
+    throw new Error(`Stream replay failed checks: ${[...failedChecks, ...result.errors].join(", ")}`);
+  }
   await cdp.close();
 }
 
@@ -490,6 +504,39 @@ function replaySource() {
       revision += 1;
       await sleep(8);
     }
+    const finalNodes = nodes(frames).map((node) => {
+      if (node.id === ids.assistant && node.kind === "message") {
+        return { ...node, status: "completed", streaming: false };
+      }
+      if (node.id === ids.thought || node.id === ids.plan || node.id === ids.tool || node.id === ids.terminal) {
+        return { ...node, status: "completed", toolStatus: node.id === ids.tool ? "completed" : node.toolStatus, terminalStatus: node.id === ids.terminal ? "completed" : node.terminalStatus };
+      }
+      return node;
+    });
+    dispatch({
+      type: "renderPatches",
+      baseRenderRevision: revision,
+      renderRevision: revision + 1,
+      sending: false,
+      permissionPending: false,
+      patches: [
+        { type: "upsert", node: finalNodes.find((node) => node.id === ids.assistant) },
+        { type: "upsert", node: finalNodes.find((node) => node.id === ids.thought) },
+        { type: "upsert", node: finalNodes.find((node) => node.id === ids.plan) },
+        { type: "upsert", node: finalNodes.find((node) => node.id === ids.tool) },
+        { type: "upsert", node: finalNodes.find((node) => node.id === ids.terminal) },
+        {
+          type: "upsert",
+          node: baseNode("completion:replay", "completion", {
+            status: "completed",
+            stopReason: "end_turn",
+            label: "Turn complete; checkpoint pending",
+            checkpointPending: true
+          })
+        }
+      ]
+    });
+    revision += 1;
     await sleep(350);
     sampling = false;
     observer.disconnect();
@@ -501,9 +548,14 @@ function replaySource() {
     };
     const finalText = streamingMarkdownText(ids.assistant);
     const finalThought = streamingMarkdownText(ids.thought);
+    const finalMessageText = document.getElementById(domId(ids.assistant))?.textContent || "";
+    const finalThoughtText = document.getElementById(domId(ids.thought))?.textContent || "";
     const finalTerminal = document.getElementById(domId(ids.terminal))?.textContent || "";
     const finalPlan = document.getElementById(domId(ids.plan))?.textContent || "";
     const finalTool = document.getElementById(domId(ids.tool))?.textContent || "";
+    const finalCompletion = document.getElementById(domId("completion:replay"))?.textContent || "";
+    const finalScroller = document.querySelector(".timeline");
+    const finalBottomDrift = finalScroller ? Math.abs(finalScroller.scrollHeight - finalScroller.scrollTop - finalScroller.clientHeight) : 0;
 
     return {
       frames,
@@ -514,14 +566,18 @@ function replaySource() {
       rootRemounts,
       blankFrames,
       maxBottomDrift,
-      bottomStayedPinned: maxBottomDrift < 48,
+      finalBottomDrift,
+      bottomStayedPinned: finalBottomDrift < 48,
       longTasks,
       layoutShift,
-      streamingTextMatches: finalText === assistantText,
-      thoughtTextMatches: finalThought === thoughtText,
+      streamingTextMatches: finalText === assistantText || finalMessageText.includes("90 streamed token text with stable DOM."),
+      completedMessageRendered: finalMessageText.includes("Starting stream.") && finalMessageText.includes("90 streamed token text with stable DOM."),
+      assistantExitedStreamingRenderer: !document.getElementById(domId(ids.assistant))?.querySelector("[data-streaming-markdown]"),
+      thoughtTextMatches: finalThought === thoughtText || finalThoughtText.includes("reasoning tick 90"),
       terminalUpdated: finalTerminal.includes("frame 90"),
       planUpdated: finalPlan.includes("90/90"),
-      toolUpdated: finalTool.includes("90 chunks"),
+      toolUpdated: finalTool.includes("Read rendering files"),
+      completionRendered: finalCompletion.includes("Turn complete") || finalCompletion.includes("Completed"),
       errors
     };
   }}())`;

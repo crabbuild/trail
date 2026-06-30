@@ -78,6 +78,7 @@ function InlineActionButton({
   action: InlineAction
   onAction?: ((action: InlineAction, event: React.MouseEvent<HTMLButtonElement>) => void) | undefined
 }) {
+  const iconOnly = action.iconOnly ?? Boolean(action.icon || action.iconHtml)
   const button = (
     <Button
       type="button"
@@ -86,12 +87,12 @@ function InlineActionButton({
         action.className
       )}
       data-action={action.action}
-      data-inline-icon-only={action.iconOnly ? "true" : undefined}
+      data-inline-icon-only={iconOnly ? "true" : undefined}
       disabled={action.disabled}
       title={action.title ?? (action.tooltip ? undefined : action.label)}
       aria-label={action.ariaLabel ?? action.label}
       variant={inlineActionVariant(action.tone)}
-      size={action.iconOnly ? "icon-sm" : "sm"}
+      size={iconOnly ? "icon-sm" : "sm"}
       onClick={onAction ? (event) => onAction(action, event) : undefined}
       {...inlineActionDataAttributes(action.data)}
     >
@@ -102,8 +103,8 @@ function InlineActionButton({
           dangerouslySetInnerHTML={{ __html: action.iconHtml }}
         />
       ) : null}
-      {action.iconOnly ? <span className="sr-only">{action.label}</span> : <span>{action.label}</span>}
-      {!action.iconOnly && action.detail ? <small>{action.detail}</small> : null}
+      {iconOnly ? <span className="sr-only">{action.label}</span> : <span>{action.label}</span>}
+      {!iconOnly && action.detail ? <small>{action.detail}</small> : null}
     </Button>
   )
 

@@ -19,6 +19,10 @@ pub(crate) fn render_acp_profiles(
                 "missing"
             };
             println!("{} ({status})", profile.agent);
+            println!(
+                "  capabilities: acp={} mcp={} terminal={}",
+                profile.supports_acp, profile.supports_mcp, profile.supports_terminal
+            );
             println!("  {}", shell_join(&profile.relay_command));
             for note in &profile.notes {
                 println!("  note: {note}");

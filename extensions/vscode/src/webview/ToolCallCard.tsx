@@ -2,6 +2,7 @@ import * as React from "react"
 import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 import {
+  Bot,
   ChevronDown,
   Check,
   CircleAlert,
@@ -82,6 +83,20 @@ export interface ToolCallApprovalProps {
   actions: ToolCallApprovalAction[]
 }
 
+export interface ToolCallStructuredRow {
+  label: string
+  value: string
+}
+
+export interface ToolCallStructuredDetails {
+  kind: "background_process" | "task"
+  title: string
+  description?: string | undefined
+  rows: ToolCallStructuredRow[]
+  output?: string | undefined
+  outputLabel?: string | undefined
+}
+
 export interface ToolCallCardProps {
   nodeId: string
   rawToolKind: string
@@ -97,6 +112,7 @@ export interface ToolCallCardProps {
   locations: ToolCallCardLocation[]
   contentHtml: string
   approval?: ToolCallApprovalProps | undefined
+  details?: ToolCallStructuredDetails | undefined
 }
 
 export interface ToolCallCardCallbacks {
@@ -123,9 +139,11 @@ const ICONS: Record<string, LucideIcon> = {
   diff: Diff,
   file: FileText,
   open: ExternalLink,
+  process: Terminal,
   review: PanelRightOpen,
   search: Search,
   settings: Settings,
+  task: Bot,
   terminal: Terminal,
   tool: Wrench
 }
@@ -159,8 +177,7 @@ export function ToolCallCard({
     props.model.kind === "edit" &&
     props.status === "completed" &&
     !props.contentHtml.trim()
-  const isActive =
-    props.status === "in_progress" || props.status === "pending" || shouldShowEditReceipt
+  const isActive = props.model.openByDefault || shouldShowEditReceipt
   const [open, setOpen] = React.useState(isActive)
   const Icon = ICONS[props.model.icon] ?? Wrench
   const readPermissionTarget = props.model.kind === "read" && props.approval ? toolTargetLabel(props) : ""
@@ -259,6 +276,7 @@ function ToolDetail({
 
   return (
     <>
+      {props.details ? <ToolStructuredDetails details={props.details} /> : null}
       {editLifecycle ? <ToolEditLifecycle lifecycle={editLifecycle} /> : null}
       {props.contentHtml ? (
         <div
@@ -267,6 +285,41 @@ function ToolDetail({
         />
       ) : null}
     </>
+  )
+}
+
+function ToolStructuredDetails({ details }: { details: ToolCallStructuredDetails }) {
+  const Icon = details.kind === "task" ? Bot : Terminal
+  const hasOutput = Boolean(details.output?.trim())
+  return (
+    <section
+      className={cn("tool-structured-details", `tool-structured-${details.kind}`)}
+      aria-label={details.title}
+    >
+      <div className="tool-structured-heading">
+        <Icon className="tool-structured-icon" aria-hidden="true" />
+        <span className="tool-structured-copy">
+          <strong>{details.title}</strong>
+          {details.description ? <span>{details.description}</span> : null}
+        </span>
+      </div>
+      {details.rows.length ? (
+        <dl className="tool-structured-fields">
+          {details.rows.map((row) => (
+            <div className="tool-structured-field" key={`${row.label}:${row.value}`}>
+              <dt>{row.label}</dt>
+              <dd>{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {hasOutput ? (
+        <div className="tool-structured-output-block">
+          <span className="tool-structured-output-label">{details.outputLabel || "Output"}</span>
+          <pre className="tool-structured-output" tabIndex={0}>{details.output}</pre>
+        </div>
+      ) : null}
+    </section>
   )
 }
 
@@ -707,6 +760,8 @@ function toolOperationDescription(model: ToolCardModel): string {
       return "This tool searches or fetches information for the agent."
     case "terminal":
       return "This tool runs a command and reports terminal output."
+    case "agent":
+      return "This tool delegates work to another agent context."
     case "risk":
       return "This tool needs extra attention before you trust the result."
     default:

@@ -41,9 +41,9 @@ Starts the MCP stdio server.
 
 ```text
 crabdb agent
-crabdb agent setup [--provider <claude-code|codex>] [--editor vscode|zed|generic]
-crabdb agent acp --provider <claude-code|codex> [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
-crabdb agent start --provider claude-code [--name <NAME>] [--from <REF>] [-- <COMMAND>...]
+crabdb agent setup [--provider <claude-code|codex|cursor|gemini|aider|opencode>] [--editor vscode|zed|generic]
+crabdb agent acp --provider <claude-code|codex|cursor> [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
+crabdb agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> [--name <NAME>] [--from <REF>] [-- <COMMAND>...]
 crabdb agent continue [latest|<TASK_OR_LANE_OR_SESSION>] [--provider <PROVIDER>] [--name <NAME>] [-- <COMMAND>...]
 crabdb agent follow-up [latest|<TASK_OR_LANE_OR_SESSION>] [--provider <PROVIDER>] [--name <NAME>] [-- <COMMAND>...]
 crabdb agent ask [--selector latest|<TASK_OR_LANE_OR_SESSION>] <QUESTION>...
@@ -135,7 +135,7 @@ crabdb agent ship [latest|<TASK_OR_LANE_OR_SESSION>] [--dry-run] [-m <MESSAGE>] 
 crabdb agent undo [latest|<TASK_OR_LANE_OR_SESSION>] [--last-turn|--turn <N_OR_TURN_ID>|--prompt <TEXT>|--last-operation]
 crabdb agent undo-last [latest|<TASK_OR_LANE_OR_SESSION>] [--last-turn|--turn <N_OR_TURN_ID>|--prompt <TEXT>|--last-operation]
 crabdb agent rewind [latest|<TASK_OR_LANE_OR_SESSION>] --to <CHECKPOINT|before-last-turn|turn:N|before-turn:N|prompt:TEXT|before-prompt:TEXT|before-last-operation>
-crabdb agent doctor --provider <claude-code|codex>
+crabdb agent doctor --provider <claude-code|codex|cursor|gemini|aider|opencode>
 ```
 
 `agent` is the task-oriented workflow for coding agents. It creates fresh lanes
@@ -143,11 +143,18 @@ by default, resolves `latest`, records dirty lane workdirs before apply, checks
 that the current Git tree matches CrabDB's internal apply base, creates a Git
 commit, and fast-forwards only when safe.
 
-`crabdb agent setup` defaults to Claude Code plus VS Code. Use
-`--provider codex` for Codex, and use `--editor zed` or `--editor generic`
-when you want another tested snippet. The setup report includes the editor
-snippet plus copyable next commands for doctor, the task inbox, and the action
-palette.
+`crabdb agent setup` defaults to Claude Code plus VS Code. ACP-capable
+providers (`claude-code`, `codex`, and `cursor`) print editor configuration for
+fresh agent lanes. Terminal-first providers (`gemini`, `aider`, and
+`opencode`) print a `crabdb agent start` launcher instead; pass an explicit
+command after `--` for any other CLI agent. The setup report includes the mode,
+capabilities, snippet, and copyable next commands for doctor, terminal launch,
+the task inbox, and the action palette.
+
+Use MCP as the shared context-tool bridge where the native provider supports it:
+register `crabdb mcp` in Claude Code, Codex, Cursor, or Gemini, while still
+using `crabdb agent start` when you want CrabDB to isolate and checkpoint a
+terminal run.
 
 Run bare `crabdb agent` when you are not sure what to do next. It opens the
 agent inbox home view, groups tasks by what needs attention, shows new

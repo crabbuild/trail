@@ -268,7 +268,7 @@ impl CrabDb {
     }
 
     pub fn agent_setup_report(&self, provider: &str, editor: &str) -> Result<AgentSetupReport> {
-        let profile = crate::acp::acp_provider_profile(provider)?;
+        let profile = crate::acp::agent_provider_profile(provider)?;
         let editor = match editor {
             "generic" | "vscode" | "zed" => editor,
             other => {
@@ -277,44 +277,72 @@ impl CrabDb {
                 )))
             }
         };
-        let command = vec![
+        let mode = if profile.supports_acp {
+            "acp"
+        } else {
+            "terminal"
+        };
+        let mut command = vec![
             "crabdb".to_string(),
             "--workspace".to_string(),
             self.workspace_root.to_string_lossy().to_string(),
             "agent".to_string(),
-            "acp".to_string(),
-            "--provider".to_string(),
-            profile.agent.clone(),
         ];
-        let snippet = agent_editor_snippet(editor, &profile.agent, &command);
+        if profile.supports_acp {
+            command.push("acp".to_string());
+        } else {
+            command.push("start".to_string());
+        }
+        command.push("--provider".to_string());
+        command.push(profile.agent.clone());
+        let mcp_command = vec![
+            "crabdb".to_string(),
+            "--workspace".to_string(),
+            self.workspace_root.to_string_lossy().to_string(),
+            "mcp".to_string(),
+        ];
+        let snippet = if profile.supports_acp {
+            agent_editor_snippet(editor, &profile.agent, &command)
+        } else {
+            agent_terminal_setup_snippet(&profile, &command, &mcp_command)
+        };
+        let mut suggestions = vec![StatusSuggestion {
+            command: format!("crabdb agent doctor --provider {}", profile.agent),
+            reason: "verify the workspace and provider before the first agent session".to_string(),
+        }];
+        if profile.supports_terminal {
+            suggestions.push(StatusSuggestion {
+                command: format!("crabdb agent start --provider {}", profile.agent),
+                reason: "launch a fresh materialized task lane with this provider".to_string(),
+            });
+        }
+        suggestions.extend([
+            StatusSuggestion {
+                command: "crabdb agent".to_string(),
+                reason: "after one prompt, show the task inbox and next useful action".to_string(),
+            },
+            StatusSuggestion {
+                command: "crabdb agent action".to_string(),
+                reason: "show runnable setup, review, validation, apply, and recovery actions"
+                    .to_string(),
+            },
+        ]);
         Ok(AgentSetupReport {
             provider: profile.agent,
             editor: editor.to_string(),
+            mode: mode.to_string(),
             command,
             snippet,
             detected: profile.available,
+            supports_acp: profile.supports_acp,
+            supports_mcp: profile.supports_mcp,
+            supports_terminal: profile.supports_terminal,
             warnings: if profile.available {
                 Vec::new()
             } else {
                 profile.notes
             },
-            suggestions: vec![
-                StatusSuggestion {
-                    command: format!("crabdb agent doctor --provider {provider}"),
-                    reason: "verify the workspace and provider before the first editor session"
-                        .to_string(),
-                },
-                StatusSuggestion {
-                    command: "crabdb agent".to_string(),
-                    reason: "after one prompt, show the task inbox and next useful action"
-                        .to_string(),
-                },
-                StatusSuggestion {
-                    command: "crabdb agent action".to_string(),
-                    reason: "show runnable setup, review, validation, apply, and recovery actions"
-                        .to_string(),
-                },
-            ],
+            suggestions,
         })
     }
 
@@ -5173,11 +5201,38 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             false,
         ),
         agent_static_action(
+            "setup_cursor_vscode",
+            "Set up VS Code for Cursor",
+            "setup",
+            "crabdb agent setup --provider cursor",
+            "print a copyable Cursor ACP editor config that creates fresh task lanes automatically",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "doctor_cursor",
+            "Check Cursor",
+            "doctor",
+            "crabdb agent doctor --provider cursor",
+            "verify CrabDB workspace readiness and provider availability",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
             "start_terminal_task",
             "Start terminal task",
             "start",
             "crabdb agent start --provider claude-code",
             "launch a fresh materialized terminal task when you are not using an editor",
+            "open_world",
+            true,
+        ),
+        agent_static_action(
+            "start_gemini_task",
+            "Start Gemini task",
+            "start",
+            "crabdb agent start --provider gemini",
+            "launch Gemini CLI in a fresh materialized CrabDB task lane",
             "open_world",
             true,
         ),
@@ -11903,10 +11958,38 @@ fn agent_editor_snippet(editor: &str, provider: &str, command: &[String]) -> Str
     }
 }
 
+fn agent_terminal_setup_snippet(
+    profile: &AcpProviderProfile,
+    command: &[String],
+    mcp_command: &[String],
+) -> String {
+    let mut snippet = format!(
+        "Terminal command:\n{}\n\nCrabDB MCP server command:\n{}",
+        shell_join(command),
+        shell_join(mcp_command)
+    );
+    if profile.supports_mcp {
+        snippet.push_str(&format!(
+            "\n\nRegister the MCP command in {} if you want direct CrabDB context tools inside the agent.",
+            profile.display_name
+        ));
+    } else {
+        snippet.push_str(&format!(
+            "\n\n{} is configured here as a terminal agent; use the terminal command to run it in an isolated CrabDB task lane.",
+            profile.display_name
+        ));
+    }
+    snippet
+}
+
 fn provider_display_name(provider: &str) -> String {
     match provider {
         "claude-code" | "claude" => "Claude Code".to_string(),
         "codex" | "codex-cli" | "openai-codex" => "Codex".to_string(),
+        "cursor" | "cursor-agent" => "Cursor".to_string(),
+        "gemini" | "gemini-cli" => "Gemini CLI".to_string(),
+        "aider" => "Aider".to_string(),
+        "opencode" | "open-code" => "OpenCode".to_string(),
         other => other.to_string(),
     }
 }

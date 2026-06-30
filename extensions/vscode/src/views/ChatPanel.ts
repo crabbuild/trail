@@ -19,6 +19,7 @@ import {
   sessionControlsToPatches
 } from "../shared/acpRenderReducers";
 import { promptCompletionNode } from "../shared/promptCompletion";
+import { finalizeAcpLiveTurnNodes, finalizeAcpLiveTurnPatches } from "../shared/renderFinalization";
 import type { RenderNode, RenderPatch, RenderReduceContext } from "../shared/renderModel";
 import { RenderStreamScheduler } from "../shared/renderStreamScheduler";
 import { redactedJson, redactString } from "../shared/securityRedaction";
@@ -697,7 +698,7 @@ export class ChatPanel {
     const completion = promptCompletionNode(response, this.renderContext());
     this.sending = false;
     this.applyAndPostRenderPatches([
-      ...this.finalizeCurrentTurnPatches(completion.status),
+      ...this.finalizeCurrentTurnPatches(completion.status, completion.updatedAt),
       {
         type: "upsert",
         node: completion
@@ -705,64 +706,12 @@ export class ChatPanel {
     ]);
   }
 
-  private finalizeCurrentTurnPatches(status: RenderNode["status"]): RenderPatch[] {
-    const turnId = this.currentTurnId;
-    if (!turnId) {
-      return [];
-    }
-    const nodeStatus = status === "pending" ? "completed" : status;
-    const patches: RenderPatch[] = [];
-    for (const node of this.nodes) {
-      if (node.turnId !== turnId || node.source !== "acp-live") {
-        continue;
-      }
-      if (node.kind === "message" && (node.status !== nodeStatus || node.streaming)) {
-        patches.push({
-          type: "replace",
-          node: {
-            ...node,
-            status: nodeStatus,
-            streaming: false
-          }
-        });
-      } else if (node.kind === "thought" && node.status !== nodeStatus) {
-        patches.push({
-          type: "replace",
-          node: {
-            ...node,
-            status: nodeStatus
-          }
-        });
-      }
-    }
-    return patches;
+  private finalizeCurrentTurnPatches(status: RenderNode["status"], updatedAt?: string | undefined): RenderPatch[] {
+    return finalizeAcpLiveTurnPatches(this.nodes, this.currentTurnId, status, updatedAt);
   }
 
-  private finalizeCurrentTurn(status: RenderNode["status"]): RenderNode[] {
-    const turnId = this.currentTurnId;
-    if (!turnId) {
-      return this.nodes;
-    }
-    const nodeStatus = status === "pending" ? "completed" : status;
-    return this.nodes.map((node) => {
-      if (node.turnId !== turnId || node.source !== "acp-live") {
-        return node;
-      }
-      if (node.kind === "message") {
-        return {
-          ...node,
-          status: nodeStatus,
-          streaming: false
-        };
-      }
-      if (node.kind === "thought") {
-        return {
-          ...node,
-          status: nodeStatus
-        };
-      }
-      return node;
-    });
+  private finalizeCurrentTurn(status: RenderNode["status"], updatedAt?: string | undefined): RenderNode[] {
+    return finalizeAcpLiveTurnNodes(this.nodes, this.currentTurnId, status, updatedAt);
   }
 
   private handleAcpExit(code: number | null, signal: NodeJS.Signals | null): void {
@@ -805,7 +754,7 @@ export class ChatPanel {
       code,
       occurredAt
     };
-    const nextNodes = this.finalizeCurrentTurn("failed").map((node): RenderNode =>
+    const nextNodes = this.finalizeCurrentTurn("failed", occurredAt).map((node): RenderNode =>
       node.kind === "approval" && node.status === "pending"
         ? {
             ...node,
@@ -1119,7 +1068,7 @@ export class ChatPanel {
     if (node.source !== "acp-live" || (node.status !== "pending" && node.status !== "in_progress")) {
       return false;
     }
-    return this.nodes.some((existing) => existing.id === node.id);
+    return this.nodes.some((existing) => sameCoalescableRenderScope(existing, node));
   }
 
   private stateMessage(): unknown {
@@ -1367,6 +1316,18 @@ function stableAttachmentId(...parts: string[]): string {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function sameCoalescableRenderScope(existing: RenderNode, incoming: RenderNode): boolean {
+  return (
+    existing.id === incoming.id &&
+    existing.kind === incoming.kind &&
+    existing.taskId === incoming.taskId &&
+    existing.lane === incoming.lane &&
+    existing.turnId === incoming.turnId &&
+    existing.acpSessionId === incoming.acpSessionId &&
+    existing.source === incoming.source
+  );
 }
 
 function uniqueStrings(values: string[]): string[] {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { TaskView } from "../crabdb/TaskRepository";
 import { hydrateTaskView, mergeHydratedNodes } from "../state/crabDbHydration";
+import { applyRenderPatches, renderNodeSnapshotPatches } from "../shared/acpRenderReducers";
 import type { RenderNode } from "../shared/renderModel";
 
 const view: TaskView = {
@@ -255,6 +256,190 @@ test("hydrates reopened ACP turns by message-added event order around tools", ()
   );
 });
 
+test("hydrates duplicate ACP message ids by consuming message-added events in order", () => {
+  const orderedView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-duplicate-message-id",
+          status: "completed",
+          after_change: "ch_duplicate_message_id",
+          ended_at: 7
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Run both checks",
+            created_at: 1
+          },
+          {
+            message_id: "msg-shared",
+            role: "assistant",
+            body: "First check is next.",
+            created_at: 2
+          },
+          {
+            message_id: "msg-shared",
+            role: "assistant",
+            body: "Second check is next.",
+            created_at: 4
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            created_at: 1
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-shared",
+            created_at: 2
+          },
+          {
+            event_type: "tool_call",
+            created_at: 3,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "first-check",
+              title: "First check",
+              kind: "execute",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-shared",
+            created_at: 4
+          },
+          {
+            event_type: "tool_call",
+            created_at: 5,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "second-check",
+              title: "Second check",
+              kind: "execute",
+              status: "completed"
+            }
+          }
+        ],
+        checkpoint: "ch_duplicate_message_id"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(orderedView);
+  assert.deepEqual(
+    nodes.map((node) => (node.kind === "message" ? `${node.kind}:${node.role}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`)),
+    [
+      "message:user:Run both checks",
+      "message:assistant:First check is next.",
+      "tool:first-check",
+      "message:assistant:Second check is next.",
+      "tool:second-check",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(
+    nodes.filter((node) => node.kind === "message").map((node) => node.id),
+    [
+      "crabdb-message:turn-duplicate-message-id:msg-user",
+      "crabdb-message:turn-duplicate-message-id:msg-shared:1",
+      "crabdb-message:turn-duplicate-message-id:msg-shared:2"
+    ]
+  );
+});
+
+test("hydrates duplicate tool ids across turns with unique render ids", () => {
+  const duplicateToolView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-tool-a",
+          status: "completed",
+          after_change: "ch_tool_a",
+          ended_at: 3
+        },
+        messages: [],
+        events: [
+          {
+            event_type: "tool_call",
+            created_at: 1,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "shared-tool",
+              title: "Run shared tool A",
+              kind: "execute",
+              status: "completed",
+              content: [
+                {
+                  type: "terminal",
+                  terminalId: "shared-terminal",
+                  stdout: "A"
+                }
+              ]
+            }
+          }
+        ],
+        checkpoint: "ch_tool_a"
+      },
+      {
+        turn: {
+          turn_id: "turn-tool-b",
+          status: "completed",
+          after_change: "ch_tool_b",
+          ended_at: 6
+        },
+        messages: [],
+        events: [
+          {
+            event_type: "tool_call",
+            created_at: 4,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "shared-tool",
+              title: "Run shared tool B",
+              kind: "execute",
+              status: "completed",
+              content: [
+                {
+                  type: "terminal",
+                  terminalId: "shared-terminal",
+                  stdout: "B"
+                }
+              ]
+            }
+          }
+        ],
+        checkpoint: "ch_tool_b"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(duplicateToolView);
+  assert.equal(new Set(nodes.map((node) => node.id)).size, nodes.length);
+  const tools = nodes.filter((node): node is Extract<RenderNode, { kind: "tool" }> => node.kind === "tool");
+  assert.deepEqual(
+    tools.map((node) => [node.id, node.turnId, node.title]),
+    [
+      ["tool:shared-tool", "turn-tool-a", "Run shared tool A"],
+      ["tool:shared-tool:turn-tool-b:crabdb", "turn-tool-b", "Run shared tool B"]
+    ]
+  );
+  const terminals = nodes.filter((node): node is Extract<RenderNode, { kind: "terminal" }> => node.kind === "terminal");
+  assert.deepEqual(
+    terminals.map((node) => [node.id, node.turnId, node.stdout]),
+    [
+      ["terminal:shared-tool:shared-terminal", "turn-tool-a", "A"],
+      ["terminal:shared-tool:shared-terminal:turn-tool-b:crabdb", "turn-tool-b", "B"]
+    ]
+  );
+});
+
 test("preserves live transcript order when replacing a completed stream with hydrated nodes", () => {
   const current: RenderNode[] = [
     {
@@ -419,6 +604,315 @@ test("preserves live transcript order when replacing a completed stream with hyd
     ]
   );
   assert.deepEqual(merged.slice(0, 6).map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("uses message ids to reconcile repeated assistant text around tools", () => {
+  const current: RenderNode[] = [
+    {
+      id: "message:user:msg-user",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-text",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "user",
+      acpMessageId: "msg-user",
+      content: [{ type: "text", text: "Repeat the status" }],
+      text: "Repeat the status",
+      streaming: false,
+      timelineOrder: 1
+    },
+    {
+      id: "message:assistant:msg-before",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-text",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-before",
+      content: [{ type: "text", text: "Done." }],
+      text: "Done.",
+      streaming: false,
+      timelineOrder: 2
+    },
+    {
+      id: "tool:repeat-check",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-text",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      acpToolCallId: "repeat-check",
+      toolCallId: "repeat-check",
+      title: "Repeat check",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      timelineOrder: 3
+    },
+    {
+      id: "message:assistant:msg-after",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-duplicate-text",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-after",
+      content: [{ type: "text", text: "Done." }],
+      text: "Done.",
+      streaming: false,
+      timelineOrder: 4
+    }
+  ];
+  const persisted: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-duplicate-text",
+          status: "completed",
+          after_change: "ch_duplicate_text"
+        },
+        messages: [
+          { message_id: "msg-user", role: "user", body: "Repeat the status", created_at: 0 },
+          { message_id: "msg-after", role: "assistant", body: "Done.", created_at: 0 },
+          { message_id: "msg-before", role: "assistant", body: "Done.", created_at: 0 }
+        ],
+        events: [
+          {
+            event_type: "tool_call",
+            created_at: 0,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "repeat-check",
+              title: "Repeat check",
+              kind: "execute",
+              status: "completed"
+            }
+          }
+        ],
+        checkpoint: "ch_duplicate_text"
+      }
+    ]
+  };
+
+  const hydrated = hydrateTaskView(persisted);
+  assert.deepEqual(
+    hydrated.filter((node) => node.kind === "message").map((node) => node.acpMessageId),
+    ["msg-user", "msg-after", "msg-before"]
+  );
+
+  const merged = mergeHydratedNodes(hydrated, current);
+  assert.deepEqual(
+    merged.slice(0, 4).map((node) =>
+      node.kind === "message" ? `${node.role}:${node.acpMessageId}:${node.text}` : `${node.kind}:${node.kind === "tool" ? node.toolCallId : ""}`
+    ),
+    [
+      "user:msg-user:Repeat the status",
+      "assistant:msg-before:Done.",
+      "tool:repeat-check",
+      "assistant:msg-after:Done."
+    ]
+  );
+  assert.deepEqual(merged.slice(0, 4).map((node) => node.timelineOrder), [1, 2, 3, 4]);
+});
+
+test("keeps completed live assistant text until CrabDB hydration contains an equivalent message", () => {
+  const current: RenderNode[] = [
+    {
+      id: "message:user:turn-partial",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-partial",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "Summarize the repo" }],
+      text: "Summarize the repo",
+      streaming: false,
+      timelineOrder: 1
+    },
+    {
+      id: "message:assistant:turn-partial",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-partial",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "text", text: "The repo contains a VS Code extension." }],
+      text: "The repo contains a VS Code extension.",
+      streaming: false,
+      timelineOrder: 2
+    }
+  ];
+  const partialView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-partial",
+          status: "completed",
+          after_change: "ch_partial"
+        },
+        messages: [
+          {
+            message_id: "msg-user",
+            role: "user",
+            body: "Summarize the repo",
+            created_at: 1
+          }
+        ],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-user",
+            created_at: 1
+          }
+        ],
+        checkpoint: "ch_partial"
+      }
+    ]
+  };
+
+  const merged = mergeHydratedNodes(hydrateTaskView(partialView), current);
+
+  assert.deepEqual(
+    merged.map((node) => (node.kind === "message" ? `${node.source}:${node.role}:${node.text}` : `${node.source}:${node.kind}`)),
+    [
+      "crabdb:user:Summarize the repo",
+      "acp-live:assistant:The repo contains a VS Code extension.",
+      "crabdb:checkpoint"
+    ]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1, 2, 3]);
+});
+
+test("keeps richer completed live assistant text when hydrated message is truncated", () => {
+  const hydrated: RenderNode = {
+    id: "crabdb-message:turn-truncated:msg-1",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-truncated",
+    source: "crabdb",
+    status: "completed",
+    role: "assistant",
+    acpMessageId: "msg-1",
+    content: [{ type: "text", text: "The result is" }],
+    text: "The result is",
+    streaming: false,
+    timelineOrder: 1
+  };
+  const live: RenderNode = {
+    ...hydrated,
+    id: "message:assistant:msg-1",
+    source: "acp-live",
+    content: [{ type: "text", text: "The result is fully rendered." }],
+    text: "The result is fully rendered.",
+    timelineOrder: 1
+  };
+
+  const merged = mergeHydratedNodes([hydrated], [live]);
+
+  assert.deepEqual(
+    merged.map((node) => (node.kind === "message" ? `${node.source}:${node.text}` : `${node.source}:${node.kind}`)),
+    ["acp-live:The result is fully rendered."]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1]);
+});
+
+test("keeps completed live assistant text when hydrated message body diverges", () => {
+  const hydrated: RenderNode = {
+    id: "crabdb-message:turn-divergent:msg-1",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-divergent",
+    source: "crabdb",
+    status: "completed",
+    role: "assistant",
+    acpMessageId: "msg-1",
+    content: [{ type: "text", text: "A different persisted answer with more words." }],
+    text: "A different persisted answer with more words.",
+    streaming: false,
+    timelineOrder: 1
+  };
+  const live: RenderNode = {
+    ...hydrated,
+    id: "message:assistant:msg-1",
+    source: "acp-live",
+    content: [{ type: "text", text: "The live final answer." }],
+    text: "The live final answer.",
+    timelineOrder: 1
+  };
+
+  const merged = mergeHydratedNodes([hydrated], [live]);
+
+  assert.deepEqual(
+    merged.map((node) => (node.kind === "message" ? `${node.source}:${node.text}` : `${node.source}:${node.kind}`)),
+    ["acp-live:The live final answer."]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1]);
+});
+
+test("keeps richer completed live tool details when hydrated tool is sparse", () => {
+  const hydrated: RenderNode = {
+    id: "tool:rich-tool",
+    kind: "tool",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-rich-tool",
+    source: "crabdb",
+    status: "completed",
+    acpToolCallId: "rich-tool",
+    toolCallId: "rich-tool",
+    title: "Tool call",
+    toolKind: "other",
+    toolStatus: "completed",
+    locations: [],
+    content: [],
+    timelineOrder: 1
+  };
+  const live: RenderNode = {
+    ...hydrated,
+    source: "acp-live",
+    title: "Run npm test",
+    toolKind: "execute",
+    locations: [{ path: "package.json" }],
+    content: [
+      {
+        type: "terminal",
+        terminalId: "term-1",
+        command: "npm test",
+        stdout: "passing\n"
+      }
+    ],
+    timelineOrder: 1
+  };
+
+  const merged = mergeHydratedNodes([hydrated], [live]);
+
+  assert.deepEqual(
+    merged.map((node) => (node.kind === "tool" ? `${node.source}:${node.title}:${node.content.length}` : `${node.source}:${node.kind}`)),
+    ["acp-live:Run npm test:1"]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1]);
 });
 
 test("keeps older hydrated turns before live-order reconciliation for later turns", () => {
@@ -701,6 +1195,51 @@ test("keeps in-progress live nodes when merging hydrated state", () => {
 
   const merged = mergeHydratedNodes(hydrateTaskView(view), [live]);
   assert.equal(merged.some((node) => node.id === live.id), true);
+});
+
+test("keeps in-progress live tools when older hydrated turns reuse provider ids", () => {
+  const hydrated: RenderNode = {
+    id: "tool:shared-provider-id",
+    kind: "tool",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-1",
+    provider: "provider",
+    source: "crabdb",
+    status: "completed",
+    acpToolCallId: "shared-provider-id",
+    toolCallId: "shared-provider-id",
+    title: "Old read",
+    toolKind: "read",
+    toolStatus: "completed",
+    locations: [],
+    content: [],
+    timelineOrder: 1
+  };
+  const live: RenderNode = {
+    ...hydrated,
+    turnId: "turn-2",
+    source: "acp-live",
+    status: "in_progress",
+    title: "Current read",
+    toolStatus: "in_progress",
+    timelineOrder: 2
+  };
+
+  const merged = mergeHydratedNodes([hydrated], [live]);
+
+  assert.deepEqual(
+    merged.map((node) => `${node.source}:${node.kind === "tool" ? node.title : node.kind}:${node.id}`),
+    [
+      "crabdb:Old read:tool:shared-provider-id",
+      "acp-live:Current read:tool:shared-provider-id:turn-2:acp-live"
+    ]
+  );
+  assert.equal(new Set(merged.map((node) => node.id)).size, merged.length);
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1, 2]);
+
+  const patches = renderNodeSnapshotPatches([live], merged);
+  assert.deepEqual(applyRenderPatches([live], patches), merged);
 });
 
 test("drops checkpoint-pending completion placeholders after CrabDB hydration", () => {

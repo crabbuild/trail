@@ -1436,6 +1436,13 @@ fn handle_agent_empty_action(
                 editor: "vscode".to_string(),
             },
         ),
+        "setup_cursor_vscode" => handle_agent_setup(
+            ctx,
+            AgentSetupArgs {
+                provider: "cursor".to_string(),
+                editor: "vscode".to_string(),
+            },
+        ),
         "doctor_claude_code" => handle_agent_doctor(
             ctx,
             AgentDoctorArgs {
@@ -1448,10 +1455,25 @@ fn handle_agent_empty_action(
                 provider: "codex".to_string(),
             },
         ),
+        "doctor_cursor" => handle_agent_doctor(
+            ctx,
+            AgentDoctorArgs {
+                provider: "cursor".to_string(),
+            },
+        ),
         "start_terminal_task" => handle_agent_start(
             ctx,
             AgentStartArgs {
                 provider: "claude-code".to_string(),
+                name: None,
+                from: None,
+                command: Vec::new(),
+            },
+        ),
+        "start_gemini_task" => handle_agent_start(
+            ctx,
+            AgentStartArgs {
+                provider: "gemini".to_string(),
                 name: None,
                 from: None,
                 command: Vec::new(),
@@ -2021,6 +2043,7 @@ fn handle_agent_undo(ctx: &RuntimeContext, args: AgentUndoArgs) -> Result<()> {
 fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()> {
     let mut checks = Vec::new();
     let mut status = "ok";
+    let mut workspace_ok = true;
     match open_db(ctx) {
         Ok(_) => checks.push(serde_json::json!({
             "name": "workspace",
@@ -2029,6 +2052,7 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
         })),
         Err(err) => {
             status = "failed";
+            workspace_ok = false;
             checks.push(serde_json::json!({
                 "name": "workspace",
                 "status": "failed",
@@ -2036,39 +2060,124 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
             }));
         }
     }
-    let profile = crabdb::acp::acp_provider_profile(&args.provider)?;
-    if profile.available {
-        checks.push(serde_json::json!({
-            "name": "provider",
-            "status": "ok",
-            "message": format!("{} profile available", profile.agent)
-        }));
+    let profile = crabdb::acp::agent_provider_profile(&args.provider)?;
+    checks.push(serde_json::json!({
+        "name": "provider",
+        "status": "ok",
+        "message": format!("{} profile loaded", profile.agent)
+    }));
+
+    let mut launch_ok = false;
+    if profile.supports_acp {
+        if profile.available {
+            launch_ok = true;
+            checks.push(serde_json::json!({
+                "name": "acp",
+                "status": "ok",
+                "message": profile.notes.join("; ")
+            }));
+        } else {
+            checks.push(serde_json::json!({
+                "name": "acp",
+                "status": "warning",
+                "message": profile.notes.join("; ")
+            }));
+        }
     } else {
-        status = "failed";
         checks.push(serde_json::json!({
-            "name": "provider",
-            "status": "failed",
-            "message": profile.notes.join("; ")
+            "name": "acp",
+            "status": "skipped",
+            "message": "provider does not advertise an ACP entrypoint; use terminal mode"
         }));
     }
-    let setup_command = if args.provider == "claude-code" {
+
+    if let Some(command) = &profile.default_terminal_command {
+        let launcher = command
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&profile.agent);
+        if command_available(launcher) {
+            launch_ok = true;
+            checks.push(serde_json::json!({
+                "name": "terminal",
+                "status": "ok",
+                "message": format!("default terminal command `{}` is available", command.join(" "))
+            }));
+        } else {
+            checks.push(serde_json::json!({
+                "name": "terminal",
+                "status": "warning",
+                "message": format!("default terminal command `{}` was not found on PATH", command.join(" "))
+            }));
+        }
+    } else {
+        checks.push(serde_json::json!({
+            "name": "terminal",
+            "status": "skipped",
+            "message": "provider does not define a default terminal command"
+        }));
+    }
+
+    if profile.supports_mcp {
+        checks.push(serde_json::json!({
+            "name": "mcp",
+            "status": "ok",
+            "message": "CrabDB exposes `crabdb mcp` for provider-side context tools"
+        }));
+    } else {
+        checks.push(serde_json::json!({
+            "name": "mcp",
+            "status": "skipped",
+            "message": "no built-in MCP setup note for this provider"
+        }));
+    }
+
+    if workspace_ok && !launch_ok {
+        status = "failed";
+    }
+    let setup_command = if profile.agent == "claude-code" {
         "crabdb agent setup".to_string()
     } else {
         format!(
             "crabdb agent setup --provider {} --editor vscode",
-            args.provider
+            profile.agent
         )
     };
+    let mut suggestions = vec![serde_json::json!({
+        "command": setup_command,
+        "reason": "print the recommended CrabDB setup for this provider"
+    })];
+    if profile.supports_terminal {
+        suggestions.push(serde_json::json!({
+            "command": format!("crabdb agent start --provider {}", profile.agent),
+            "reason": "launch a fresh materialized task lane from the terminal"
+        }));
+    }
+    if profile.supports_acp {
+        suggestions.push(serde_json::json!({
+            "command": format!("crabdb acp doctor --agent {}", profile.agent),
+            "reason": "check the lower-level ACP relay command"
+        }));
+    }
+    if profile.supports_mcp {
+        suggestions.push(serde_json::json!({
+            "command": "crabdb mcp",
+            "reason": "stdio MCP server command to register in the native agent"
+        }));
+    }
     let report = serde_json::json!({
         "status": status,
         "provider": profile.agent,
+        "display_name": profile.display_name,
+        "capabilities": {
+            "acp": profile.supports_acp,
+            "mcp": profile.supports_mcp,
+            "terminal": profile.supports_terminal
+        },
+        "relay_command": profile.relay_command,
+        "default_terminal_command": profile.default_terminal_command,
         "checks": checks,
-        "suggestions": [
-            {
-                "command": setup_command,
-                "reason": "configure an ACP editor with fresh agent lanes"
-            }
-        ]
+        "suggestions": suggestions
     });
     if ctx.json {
         return render_json(&report);
@@ -2102,10 +2211,15 @@ fn default_acp_upstream_command(provider: &str, _lane: &str) -> Result<Vec<Strin
 }
 
 fn default_terminal_agent_command(provider: &str) -> Result<Vec<String>> {
-    match provider {
-        "claude-code" | "claude" => Ok(vec!["claude".to_string()]),
-        other => Err(Error::InvalidInput(format!(
-            "unsupported terminal agent provider `{other}`; supported providers: claude-code"
-        ))),
+    crabdb::acp::terminal_agent_command(provider)
+}
+
+fn command_available(command: &str) -> bool {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return std::path::Path::new(command).is_file();
     }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
 }

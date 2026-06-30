@@ -1,0 +1,94 @@
+<svg viewBox="0 0 960 680" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace; }
+    .title { fill: #f8fafc; font-size: 16px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 9px; }
+    .label { fill: #f8fafc; font-size: 11px; font-weight: 600; }
+    .small { fill: #94a3b8; font-size: 8.5px; }
+    .tiny { fill: #cbd5e1; font-size: 7.5px; }
+    .arrow { fill: none; stroke: #64748b; stroke-width: 1.5; marker-end: url(#arrow); }
+    .arrow-blue { fill: none; stroke: #60a5fa; stroke-width: 1.8; marker-end: url(#arrow-blue); }
+    .arrow-green { fill: none; stroke: #34d399; stroke-width: 1.6; marker-end: url(#arrow-green); }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="680" fill="#0f172a"/>
+  <rect width="960" height="680" fill="url(#grid)"/>
+
+  <text x="30" y="34" class="title">Immutable Write Path</text>
+  <text x="30" y="52" class="subtitle">A put/delete rewrites the touched leaf and ancestor path, then returns a new root handle.</text>
+
+  <rect x="325" y="80" width="310" height="54" rx="25" fill="#0f172a"/>
+  <rect x="325" y="80" width="310" height="54" rx="25" fill="rgba(59,130,246,0.3)" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="480" y="103" class="label" text-anchor="middle">put/delete(tree, key)</text>
+  <text x="480" y="119" class="small" text-anchor="middle">input tree remains valid</text>
+
+  <path class="arrow-blue" d="M 480 134 L 480 170"/>
+
+  <rect x="325" y="170" width="310" height="58" rx="6" fill="#0f172a"/>
+  <rect x="325" y="170" width="310" height="58" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="480" y="195" class="label" text-anchor="middle">Find root-to-leaf path</text>
+  <text x="480" y="211" class="small" text-anchor="middle">binary search internal node keys</text>
+
+  <path class="arrow-blue" d="M 480 228 L 480 265"/>
+
+  <rect x="325" y="265" width="310" height="58" rx="6" fill="#0f172a"/>
+  <rect x="325" y="265" width="310" height="58" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="480" y="290" class="label" text-anchor="middle">Clone and edit target leaf</text>
+  <text x="480" y="306" class="small" text-anchor="middle">insert, update, or remove key</text>
+
+  <path class="arrow-blue" d="M 480 323 L 480 360"/>
+
+  <rect x="325" y="360" width="310" height="58" rx="6" fill="#0f172a"/>
+  <rect x="325" y="360" width="310" height="58" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="480" y="385" class="label" text-anchor="middle">Rebalance changed path</text>
+  <text x="480" y="401" class="small" text-anchor="middle">split, merge, or propagate</text>
+
+  <path class="arrow-blue" d="M 480 418 L 480 455"/>
+
+  <rect x="325" y="455" width="310" height="58" rx="6" fill="#0f172a"/>
+  <rect x="325" y="455" width="310" height="58" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="480" y="480" class="label" text-anchor="middle">Serialize changed nodes</text>
+  <text x="480" y="496" class="small" text-anchor="middle">CID = SHA-256(node bytes)</text>
+
+  <path class="arrow-blue" d="M 480 513 L 480 550"/>
+
+  <rect x="325" y="550" width="310" height="58" rx="6" fill="#0f172a"/>
+  <rect x="325" y="550" width="310" height="58" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="480" y="575" class="label" text-anchor="middle">Batch write to Store</text>
+  <text x="480" y="591" class="small" text-anchor="middle">new CID bytes -&gt; node bytes</text>
+
+  <path class="arrow-green" d="M 635 389 C 760 389, 760 146, 635 146"/>
+  <rect x="675" y="178" width="230" height="105" rx="8" fill="#0f172a"/>
+  <rect x="675" y="178" width="230" height="105" rx="8" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+  <text x="790" y="203" class="label" text-anchor="middle">Untouched subtrees</text>
+  <text x="790" y="223" class="small" text-anchor="middle">keep the same CID</text>
+  <text x="790" y="240" class="small" text-anchor="middle">and are shared by</text>
+  <text x="790" y="257" class="small" text-anchor="middle">old and new roots</text>
+
+  <path class="arrow-green" d="M 325 579 C 205 579, 205 145, 325 145"/>
+  <rect x="55" y="300" width="230" height="118" rx="8" fill="#0f172a"/>
+  <rect x="55" y="300" width="230" height="118" rx="8" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1"/>
+  <text x="170" y="326" class="label" text-anchor="middle">Persistent result</text>
+  <text x="170" y="348" class="small" text-anchor="middle">old Tree root still points</text>
+  <text x="170" y="365" class="small" text-anchor="middle">to old reachable nodes</text>
+  <text x="170" y="388" class="small" text-anchor="middle">new Tree root points to</text>
+  <text x="170" y="405" class="small" text-anchor="middle">rewritten path + shares</text>
+
+  <rect x="325" y="630" width="310" height="34" rx="17" fill="#0f172a"/>
+  <rect x="325" y="630" width="310" height="34" rx="17" fill="rgba(59,130,246,0.3)" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="480" y="652" class="label" text-anchor="middle">return new Tree { root: new_cid }</text>
+</svg>

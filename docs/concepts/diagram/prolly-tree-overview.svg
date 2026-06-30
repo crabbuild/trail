@@ -1,0 +1,197 @@
+<svg viewBox="0 0 1500 940" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace; }
+    .title { fill: #f8fafc; font-size: 21px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 10px; }
+    .section-title { fill: #f8fafc; font-size: 12px; font-weight: 700; }
+    .label { fill: #f8fafc; font-size: 10px; font-weight: 700; }
+    .small { fill: #cbd5e1; font-size: 8px; }
+    .tiny { fill: #94a3b8; font-size: 7.2px; }
+    .micro { fill: #cbd5e1; font-size: 6.8px; }
+    .pill { fill: #e2e8f0; font-size: 7.2px; font-weight: 700; }
+    .arrow { fill: none; stroke: #64748b; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow); }
+    .arrow-cyan { fill: none; stroke: #22d3ee; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-cyan); }
+    .arrow-green { fill: none; stroke: #34d399; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-green); }
+    .arrow-violet { fill: none; stroke: #a78bfa; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-violet); }
+    .arrow-amber { fill: none; stroke: #fbbf24; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-amber); }
+    .merge-rail { fill: none; stroke: #fbbf24; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; stroke-opacity: 0.85; }
+    .link { fill: none; stroke: #475569; stroke-width: 1.1; stroke-dasharray: 5,4; stroke-linecap: round; stroke-linejoin: round; }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/>
+    </marker>
+    <marker id="arrow-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24"/>
+    </marker>
+  </defs>
+
+  <rect width="1500" height="940" fill="#0f172a"/>
+  <rect width="1500" height="940" fill="url(#grid)"/>
+
+  <text x="36" y="42" class="title">Prolly Tree at a Glance</text>
+  <text x="36" y="64" class="subtitle">A content-addressed, B+tree-like ordered index for snapshots, branching, diff, merge, and sync.</text>
+
+  <rect x="552" y="108" width="396" height="248" rx="12" fill="#0f172a"/>
+  <rect x="552" y="108" width="396" height="248" rx="12" fill="rgba(76,29,149,0.36)" stroke="#a78bfa" stroke-width="1.6"/>
+  <text x="750" y="139" class="section-title" text-anchor="middle">PROLLY TREE</text>
+  <text x="750" y="158" class="small" text-anchor="middle">probabilistic + Merkle + ordered index</text>
+  <text x="750" y="179" class="tiny" text-anchor="middle">same sorted data + same config -&gt; same root CID</text>
+
+  <rect x="693" y="203" width="114" height="42" rx="6" fill="#0f172a"/>
+  <rect x="693" y="203" width="114" height="42" rx="6" fill="rgba(76,29,149,0.46)" stroke="#a78bfa" stroke-width="1.2"/>
+  <text x="750" y="221" class="label" text-anchor="middle">Root CID</text>
+  <text x="750" y="236" class="tiny" text-anchor="middle">hash(root bytes)</text>
+
+  <path class="arrow-violet" d="M 750 245 L 750 268"/>
+  <rect x="620" y="268" width="260" height="36" rx="6" fill="#0f172a"/>
+  <rect x="620" y="268" width="260" height="36" rx="6" fill="rgba(76,29,149,0.38)" stroke="#a78bfa" stroke-width="1"/>
+  <text x="750" y="291" class="small" text-anchor="middle">Internal nodes: sorted routing keys + child CIDs</text>
+
+  <path class="arrow-cyan" d="M 678 304 L 678 326"/>
+  <path class="arrow-cyan" d="M 750 304 L 750 326"/>
+  <path class="arrow-cyan" d="M 822 304 L 822 326"/>
+  <rect x="605" y="326" width="84" height="24" rx="5" fill="#0f172a"/>
+  <rect x="605" y="326" width="84" height="24" rx="5" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="647" y="342" class="micro" text-anchor="middle">leaf [a,g)</text>
+  <rect x="708" y="326" width="84" height="24" rx="5" fill="#0f172a"/>
+  <rect x="708" y="326" width="84" height="24" rx="5" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="750" y="342" class="micro" text-anchor="middle">leaf [g,m)</text>
+  <rect x="811" y="326" width="84" height="24" rx="5" fill="#0f172a"/>
+  <rect x="811" y="326" width="84" height="24" rx="5" fill="rgba(8,51,68,0.45)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="853" y="342" class="micro" text-anchor="middle">leaf [m,end)</text>
+
+  <rect x="58" y="116" width="350" height="190" rx="12" fill="#0f172a"/>
+  <rect x="58" y="116" width="350" height="190" rx="12" fill="rgba(8,51,68,0.36)" stroke="#22d3ee" stroke-width="1.4"/>
+  <text x="82" y="144" class="section-title">What It Is</text>
+  <rect x="86" y="166" width="132" height="28" rx="14" fill="rgba(8,51,68,0.56)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="152" y="184" class="pill" text-anchor="middle">ordered key/value map</text>
+  <rect x="238" y="166" width="122" height="28" rx="14" fill="rgba(76,29,149,0.46)" stroke="#a78bfa" stroke-width="1"/>
+  <text x="299" y="184" class="pill" text-anchor="middle">B+tree shape</text>
+  <rect x="86" y="206" width="118" height="28" rx="14" fill="rgba(6,78,59,0.46)" stroke="#34d399" stroke-width="1"/>
+  <text x="145" y="224" class="pill" text-anchor="middle">Merkle identity</text>
+  <rect x="224" y="206" width="136" height="28" rx="14" fill="rgba(120,53,15,0.34)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="292" y="224" class="pill" text-anchor="middle">content chunks</text>
+  <text x="86" y="258" class="small">Leaves hold sorted user values.</text>
+  <text x="86" y="276" class="small">Internal nodes route by key spans.</text>
+  <text x="86" y="294" class="small">Every node is addressed by its hash.</text>
+
+  <rect x="58" y="354" width="350" height="206" rx="12" fill="#0f172a"/>
+  <rect x="58" y="354" width="350" height="206" rx="12" fill="rgba(6,78,59,0.34)" stroke="#34d399" stroke-width="1.4"/>
+  <text x="82" y="382" class="section-title">How It Works</text>
+  <rect x="88" y="408" width="80" height="42" rx="6" fill="#0f172a"/>
+  <rect x="88" y="408" width="80" height="42" rx="6" fill="rgba(8,51,68,0.42)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="128" y="426" class="small" text-anchor="middle">sorted</text>
+  <text x="128" y="440" class="tiny" text-anchor="middle">entries</text>
+  <path class="arrow-green" d="M 168 429 L 212 429"/>
+  <rect x="212" y="408" width="92" height="42" rx="6" fill="#0f172a"/>
+  <rect x="212" y="408" width="92" height="42" rx="6" fill="rgba(120,53,15,0.34)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="258" y="426" class="small" text-anchor="middle">hash</text>
+  <text x="258" y="440" class="tiny" text-anchor="middle">boundaries</text>
+  <path class="arrow-green" d="M 304 429 L 348 429"/>
+  <rect x="348" y="408" width="40" height="42" rx="6" fill="#0f172a"/>
+  <rect x="348" y="408" width="40" height="42" rx="6" fill="rgba(76,29,149,0.42)" stroke="#a78bfa" stroke-width="1"/>
+  <text x="368" y="434" class="small" text-anchor="middle">CID</text>
+  <text x="88" y="482" class="small">1. Sort keys lexicographically.</text>
+  <text x="88" y="501" class="small">2. Split chunks using deterministic hashing.</text>
+  <text x="88" y="520" class="small">3. Hash serialized nodes into content IDs.</text>
+  <text x="88" y="539" class="small">4. Keep unchanged subtrees by CID.</text>
+
+  <rect x="58" y="608" width="350" height="210" rx="12" fill="#0f172a"/>
+  <rect x="58" y="608" width="350" height="210" rx="12" fill="rgba(59,130,246,0.26)" stroke="#60a5fa" stroke-width="1.4"/>
+  <text x="82" y="636" class="section-title">What It Does</text>
+  <text x="92" y="670" class="label">Point lookup</text>
+  <text x="238" y="670" class="small">O(log n) by key span</text>
+  <text x="92" y="701" class="label">Range scan</text>
+  <text x="238" y="701" class="small">ordered leaf traversal</text>
+  <text x="92" y="732" class="label">Diff</text>
+  <text x="238" y="732" class="small">skip equal CIDs</text>
+  <text x="92" y="763" class="label">Merge</text>
+  <text x="238" y="763" class="small">compare changed spans</text>
+  <text x="92" y="794" class="label">Snapshot</text>
+  <text x="238" y="794" class="small">new root, old root valid</text>
+
+  <rect x="1092" y="116" width="350" height="196" rx="12" fill="#0f172a"/>
+  <rect x="1092" y="116" width="350" height="196" rx="12" fill="rgba(120,53,15,0.28)" stroke="#fbbf24" stroke-width="1.4"/>
+  <text x="1116" y="144" class="section-title">Key Properties</text>
+  <text x="1120" y="178" class="label">Deterministic shape</text>
+  <text x="1120" y="195" class="small">not insertion-order dependent</text>
+  <text x="1120" y="226" class="label">Content-addressed nodes</text>
+  <text x="1120" y="243" class="small">CID = hash(serialized node)</text>
+  <text x="1120" y="274" class="label">Structural sharing</text>
+  <text x="1120" y="291" class="small">versions reuse unchanged subtrees</text>
+
+  <rect x="1092" y="354" width="350" height="206" rx="12" fill="#0f172a"/>
+  <rect x="1092" y="354" width="350" height="206" rx="12" fill="rgba(136,19,55,0.26)" stroke="#fb7185" stroke-width="1.4"/>
+  <text x="1116" y="382" class="section-title">Why It Matters</text>
+  <text x="1120" y="418" class="label">Cheap history</text>
+  <text x="1120" y="435" class="small">snapshots are small root handles</text>
+  <text x="1120" y="466" class="label">Fast comparison</text>
+  <text x="1120" y="483" class="small">equal root or child CID means equal data</text>
+  <text x="1120" y="514" class="label">Replica convergence</text>
+  <text x="1120" y="531" class="small">same data independently builds same tree</text>
+
+  <rect x="1092" y="608" width="350" height="210" rx="12" fill="#0f172a"/>
+  <rect x="1092" y="608" width="350" height="210" rx="12" fill="rgba(8,51,68,0.34)" stroke="#22d3ee" stroke-width="1.4"/>
+  <text x="1116" y="636" class="section-title">Use Cases</text>
+  <text x="1120" y="672" class="label">Versioned databases</text>
+  <text x="1120" y="689" class="small">branchable table/index roots</text>
+  <text x="1120" y="720" class="label">Local-first sync</text>
+  <text x="1120" y="737" class="small">diff and merge by changed spans</text>
+  <text x="1120" y="768" class="label">Content stores</text>
+  <text x="1120" y="785" class="small">dedupe, audit history, provenance</text>
+
+  <rect x="505" y="434" width="490" height="286" rx="12" fill="#0f172a"/>
+  <rect x="505" y="434" width="490" height="286" rx="12" fill="rgba(30,41,59,0.56)" stroke="#94a3b8" stroke-width="1.2"/>
+  <text x="750" y="463" class="section-title" text-anchor="middle">Mental Model</text>
+  <text x="750" y="486" class="small" text-anchor="middle">Think: Git-like content identity + B+tree-like ordered access</text>
+
+  <rect x="556" y="520" width="116" height="56" rx="7" fill="#0f172a"/>
+  <rect x="556" y="520" width="116" height="56" rx="7" fill="rgba(8,51,68,0.44)" stroke="#22d3ee" stroke-width="1"/>
+  <text x="614" y="544" class="label" text-anchor="middle">read path</text>
+  <text x="614" y="562" class="tiny" text-anchor="middle">get / range</text>
+
+  <rect x="692" y="520" width="116" height="56" rx="7" fill="#0f172a"/>
+  <rect x="692" y="520" width="116" height="56" rx="7" fill="rgba(6,78,59,0.44)" stroke="#34d399" stroke-width="1"/>
+  <text x="750" y="544" class="label" text-anchor="middle">write path</text>
+  <text x="750" y="562" class="tiny" text-anchor="middle">copy changed path</text>
+
+  <rect x="828" y="520" width="116" height="56" rx="7" fill="#0f172a"/>
+  <rect x="828" y="520" width="116" height="56" rx="7" fill="rgba(76,29,149,0.44)" stroke="#a78bfa" stroke-width="1"/>
+  <text x="886" y="544" class="label" text-anchor="middle">diff path</text>
+  <text x="886" y="562" class="tiny" text-anchor="middle">prune equal CIDs</text>
+
+  <path class="arrow-cyan" d="M 614 576 L 614 604"/>
+  <path class="arrow-green" d="M 750 576 L 750 604"/>
+  <path class="arrow-violet" d="M 886 576 L 886 604"/>
+  <path class="merge-rail" d="M 614 614 L 886 614"/>
+  <circle cx="750" cy="614" r="4.5" fill="#fbbf24"/>
+  <path class="arrow-amber" d="M 750 619 L 750 640"/>
+  <rect x="630" y="650" width="240" height="50" rx="7" fill="#0f172a"/>
+  <rect x="630" y="650" width="240" height="50" rx="7" fill="rgba(120,53,15,0.26)" stroke="#fbbf24" stroke-width="1"/>
+  <text x="750" y="671" class="label" text-anchor="middle">small durable root</text>
+  <text x="750" y="688" class="tiny" text-anchor="middle">points into shared node graph</text>
+
+  <path class="link" d="M 408 212 L 552 218"/>
+  <path class="link" d="M 408 455 L 552 328"/>
+  <path class="link" d="M 408 713 L 505 650"/>
+  <path class="link" d="M 948 218 L 1092 214"/>
+  <path class="link" d="M 948 328 L 1092 454"/>
+  <path class="link" d="M 995 650 L 1092 712"/>
+
+  <rect x="250" y="862" width="1000" height="42" rx="10" fill="#0f172a"/>
+  <rect x="250" y="862" width="1000" height="42" rx="10" fill="rgba(30,41,59,0.58)" stroke="#94a3b8" stroke-width="1"/>
+  <text x="750" y="887" class="small" text-anchor="middle">Core promise: stable content-defined structure makes ordered data cheap to version, compare, merge, replicate, and audit.</text>
+</svg>

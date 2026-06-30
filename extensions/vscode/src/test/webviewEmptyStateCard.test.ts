@@ -38,10 +38,13 @@ test("renders ready transcript empty states with shadcn Empty and Button parts",
   assert.match(html, /data-slot="button"/);
   assert.match(html, /data-action="focusComposer"/);
   assert.match(html, /Write a message/);
+  assert.match(html, /empty-action-label/);
   assert.match(html, /data-action="attachSelection"/);
   assert.match(html, /data-action="attachFile"/);
   assert.match(html, /empty-action-primary/);
   assert.match(html, /data-icon="inline-start"/);
+  assert.doesNotMatch(html, /data-empty-icon-only/);
+  assert.doesNotMatch(html, /sr-only/);
   assert.doesNotMatch(html, /Start in composer/);
   assert.doesNotMatch(html, /data-action="openSettings"/);
   assert.doesNotMatch(html, /Settings/);

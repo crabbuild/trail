@@ -99,8 +99,10 @@ test("renders completed tool calls as one minimal shadcn collapsible summary", (
   assert.match(html, /data-tool-call-group=""/);
   assert.match(html, /Read a file and searched code/);
   assert.match(html, /aria-label="Expand Read a file and searched code\. 2 tool calls: Read 1 \/ Search 1"/);
-  assert.match(html, /bg-muted\/10/);
-  assert.match(html, /hover:bg-muted\/20/);
+  assert.match(html, /bg-card/);
+  assert.match(html, /bg-transparent/);
+  assert.match(html, /hover:bg-muted\/60/);
+  assert.doesNotMatch(html, /bg-muted\/10|hover:bg-muted\/20/);
   assert.doesNotMatch(html, /Completed tool calls/);
   assert.doesNotMatch(html, /tool-group-preview-item/);
   assert.doesNotMatch(html, /data-slot="badge"/);

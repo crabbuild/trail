@@ -44,6 +44,10 @@ pub struct AcpProviderProfile {
     pub available: bool,
     pub relay_command: Vec<String>,
     pub notes: Vec<String>,
+    pub supports_acp: bool,
+    pub supports_mcp: bool,
+    pub supports_terminal: bool,
+    pub default_terminal_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1202,9 +1206,13 @@ pub struct AgentFinishReport {
 pub struct AgentSetupReport {
     pub provider: String,
     pub editor: String,
+    pub mode: String,
     pub command: Vec<String>,
     pub snippet: String,
     pub detected: bool,
+    pub supports_acp: bool,
+    pub supports_mcp: bool,
+    pub supports_terminal: bool,
     pub warnings: Vec<String>,
     pub suggestions: Vec<StatusSuggestion>,
 }

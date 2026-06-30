@@ -10,6 +10,11 @@ pub(crate) fn render_agent_setup(report: &AgentSetupReport, json: bool, quiet: b
     if !quiet {
         println!("Agent setup: {}", report.provider);
         println!("Editor: {}", report.editor);
+        println!("Mode: {}", report.mode);
+        println!(
+            "Capabilities: acp={} mcp={} terminal={}",
+            report.supports_acp, report.supports_mcp, report.supports_terminal
+        );
         println!("Detected: {}", if report.detected { "yes" } else { "no" });
         println!("Command:");
         println!("  {}", shell_join(&report.command));
@@ -22,7 +27,13 @@ pub(crate) fn render_agent_setup(report: &AgentSetupReport, json: bool, quiet: b
         println!("Snippet:");
         println!("{}", report.snippet);
         println!("Next steps:");
-        println!("  Paste the snippet into your editor's ACP custom-agent settings.");
+        if report.mode == "acp" {
+            println!("  Paste the snippet into your editor's ACP custom-agent settings.");
+        } else if report.supports_mcp {
+            println!("  Run the terminal command, and register the MCP command in the native agent if you want CrabDB context tools.");
+        } else {
+            println!("  Run the terminal command to launch a fresh CrabDB task lane.");
+        }
         for suggestion in &report.suggestions {
             println!("  {}", suggestion.command);
             println!("  {}", suggestion.reason);
@@ -430,11 +441,38 @@ pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             false,
         ),
         agent_static_action(
+            "setup_cursor_vscode",
+            "Set up VS Code for Cursor",
+            "setup",
+            "crabdb agent setup --provider cursor",
+            "print a copyable Cursor ACP editor config that creates fresh task lanes automatically",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
+            "doctor_cursor",
+            "Check Cursor",
+            "doctor",
+            "crabdb agent doctor --provider cursor",
+            "verify CrabDB workspace readiness and provider availability",
+            "read_only",
+            false,
+        ),
+        agent_static_action(
             "start_terminal_task",
             "Start terminal task",
             "start",
             "crabdb agent start --provider claude-code",
             "launch a fresh materialized terminal task when you are not using an editor",
+            "open_world",
+            true,
+        ),
+        agent_static_action(
+            "start_gemini_task",
+            "Start Gemini task",
+            "start",
+            "crabdb agent start --provider gemini",
+            "launch Gemini CLI in a fresh materialized CrabDB task lane",
             "open_world",
             true,
         ),

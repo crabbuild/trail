@@ -34,39 +34,41 @@ pub struct AcpRelayOptions {
 }
 
 pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
-    match agent {
-        "claude-code" | "claude" => {
-            let relay_command = npx_adapter_relay_command("claude-code", CLAUDE_ACP_ADAPTER);
-            let npx_available = command_in_path("npx");
+    match canonical_acp_agent(agent) {
+        Some("claude-code") => Ok(npx_acp_profile(
+            "claude-code",
+            "Claude Code",
+            CLAUDE_ACP_ADAPTER,
+            "uses the Claude ACP adapter through npx",
+            Some(vec!["claude".to_string()]),
+        )),
+        Some("codex") => Ok(npx_acp_profile(
+            "codex",
+            "Codex",
+            CODEX_ACP_ADAPTER,
+            "uses the Codex ACP adapter through npx",
+            Some(vec!["codex".to_string()]),
+        )),
+        Some("cursor") => {
+            let available = command_in_path("agent");
             Ok(AcpProviderProfile {
-                agent: "claude-code".to_string(),
-                display_name: "Claude Code".to_string(),
-                available: npx_available,
-                relay_command,
-                notes: if npx_available {
-                    vec!["uses the Claude ACP adapter through npx".to_string()]
+                agent: "cursor".to_string(),
+                display_name: "Cursor".to_string(),
+                available,
+                relay_command: cursor_acp_relay_command(),
+                notes: if available {
+                    vec!["uses the Cursor CLI ACP server through `agent acp`".to_string()]
                 } else {
-                    vec!["`npx` was not found on PATH".to_string()]
+                    vec!["`agent` was not found on PATH".to_string()]
                 },
+                supports_acp: true,
+                supports_mcp: true,
+                supports_terminal: true,
+                default_terminal_command: Some(vec!["agent".to_string()]),
             })
         }
-        "codex" | "codex-cli" | "openai-codex" => {
-            let relay_command = npx_adapter_relay_command("codex", CODEX_ACP_ADAPTER);
-            let npx_available = command_in_path("npx");
-            Ok(AcpProviderProfile {
-                agent: "codex".to_string(),
-                display_name: "Codex".to_string(),
-                available: npx_available,
-                relay_command,
-                notes: if npx_available {
-                    vec!["uses the Codex ACP adapter through npx".to_string()]
-                } else {
-                    vec!["`npx` was not found on PATH".to_string()]
-                },
-            })
-        }
-        other => Err(Error::InvalidInput(format!(
-            "unsupported ACP agent `{other}`; supported agents: {}; use `crabdb acp relay -- <COMMAND>...` for another ACP-compatible agent",
+        _ => Err(Error::InvalidInput(format!(
+            "unsupported ACP agent `{agent}`; supported agents: {}; use `crabdb acp relay -- <COMMAND>...` for another ACP-compatible agent",
             supported_acp_agents().join(", ")
         ))),
     }
@@ -77,6 +79,56 @@ pub fn acp_provider_profiles() -> Vec<AcpProviderProfile> {
         .into_iter()
         .filter_map(|agent| acp_provider_profile(agent).ok())
         .collect()
+}
+
+pub fn agent_provider_profile(provider: &str) -> Result<AcpProviderProfile> {
+    if let Ok(profile) = acp_provider_profile(provider) {
+        return Ok(profile);
+    }
+    match canonical_agent_provider(provider) {
+        Some("gemini") => Ok(terminal_provider_profile(
+            "gemini",
+            "Gemini CLI",
+            vec!["gemini".to_string()],
+            true,
+            "runs Gemini CLI in a CrabDB materialized task lane",
+        )),
+        Some("aider") => Ok(terminal_provider_profile(
+            "aider",
+            "Aider",
+            vec!["aider".to_string()],
+            false,
+            "runs Aider in a CrabDB materialized task lane",
+        )),
+        Some("opencode") => Ok(terminal_provider_profile(
+            "opencode",
+            "OpenCode",
+            vec!["opencode".to_string()],
+            false,
+            "runs OpenCode in a CrabDB materialized task lane",
+        )),
+        _ => Err(Error::InvalidInput(format!(
+            "unsupported agent provider `{provider}`; supported providers: {}. You can still pass an explicit command after `--` to `crabdb agent start` or `crabdb agent acp`.",
+            supported_agent_providers().join(", ")
+        ))),
+    }
+}
+
+pub fn agent_provider_profiles() -> Vec<AcpProviderProfile> {
+    supported_agent_providers()
+        .into_iter()
+        .filter_map(|agent| agent_provider_profile(agent).ok())
+        .collect()
+}
+
+pub fn terminal_agent_command(provider: &str) -> Result<Vec<String>> {
+    agent_provider_profile(provider)?
+        .default_terminal_command
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "provider `{provider}` does not define a default terminal command; pass one after `--`"
+            ))
+        })
 }
 
 pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<AcpInstallReport> {
@@ -106,7 +158,91 @@ pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<Ac
 }
 
 fn supported_acp_agents() -> Vec<&'static str> {
-    vec!["claude-code", "codex"]
+    vec!["claude-code", "codex", "cursor"]
+}
+
+fn supported_agent_providers() -> Vec<&'static str> {
+    vec![
+        "claude-code",
+        "codex",
+        "cursor",
+        "gemini",
+        "aider",
+        "opencode",
+    ]
+}
+
+fn canonical_acp_agent(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude-code" | "claude" => Some("claude-code"),
+        "codex" | "codex-cli" | "openai-codex" => Some("codex"),
+        "cursor" | "cursor-agent" => Some("cursor"),
+        _ => None,
+    }
+}
+
+fn canonical_agent_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "gemini" | "gemini-cli" => Some("gemini"),
+        "aider" => Some("aider"),
+        "opencode" | "open-code" => Some("opencode"),
+        other => canonical_acp_agent(other),
+    }
+}
+
+fn npx_acp_profile(
+    provider: &str,
+    display_name: &str,
+    adapter: &str,
+    available_note: &str,
+    terminal_command: Option<Vec<String>>,
+) -> AcpProviderProfile {
+    let relay_command = npx_adapter_relay_command(provider, adapter);
+    let available = command_in_path("npx");
+    AcpProviderProfile {
+        agent: provider.to_string(),
+        display_name: display_name.to_string(),
+        available,
+        relay_command,
+        notes: if available {
+            vec![available_note.to_string()]
+        } else {
+            vec!["`npx` was not found on PATH".to_string()]
+        },
+        supports_acp: true,
+        supports_mcp: true,
+        supports_terminal: terminal_command.is_some(),
+        default_terminal_command: terminal_command,
+    }
+}
+
+fn terminal_provider_profile(
+    provider: &str,
+    display_name: &str,
+    terminal_command: Vec<String>,
+    supports_mcp: bool,
+    available_note: &str,
+) -> AcpProviderProfile {
+    let launcher = terminal_command
+        .first()
+        .map(String::as_str)
+        .unwrap_or(provider);
+    let available = command_in_path(launcher);
+    AcpProviderProfile {
+        agent: provider.to_string(),
+        display_name: display_name.to_string(),
+        available,
+        relay_command: Vec::new(),
+        notes: if available {
+            vec![available_note.to_string()]
+        } else {
+            vec![format!("`{launcher}` was not found on PATH")]
+        },
+        supports_acp: false,
+        supports_mcp,
+        supports_terminal: true,
+        default_terminal_command: Some(terminal_command),
+    }
 }
 
 fn npx_adapter_relay_command(provider: &str, adapter: &str) -> Vec<String> {
@@ -121,6 +257,20 @@ fn npx_adapter_relay_command(provider: &str, adapter: &str) -> Vec<String> {
         "npx".to_string(),
         "-y".to_string(),
         adapter.to_string(),
+    ]
+}
+
+fn cursor_acp_relay_command() -> Vec<String> {
+    vec![
+        "crabdb".to_string(),
+        "acp".to_string(),
+        "relay".to_string(),
+        "--provider".to_string(),
+        "cursor".to_string(),
+        "--materialize".to_string(),
+        "--".to_string(),
+        "agent".to_string(),
+        "acp".to_string(),
     ]
 }
 
@@ -1994,6 +2144,35 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0]["name"], "crabdb");
         assert_eq!(servers[0]["args"], serde_json::json!(["mcp"]));
+    }
+
+    #[test]
+    fn provider_profiles_cover_acp_and_terminal_modes() {
+        let cursor = acp_provider_profile("cursor").unwrap();
+        assert_eq!(cursor.agent, "cursor");
+        assert!(cursor.supports_acp);
+        assert!(cursor.supports_mcp);
+        assert!(cursor.supports_terminal);
+        let separator = cursor
+            .relay_command
+            .iter()
+            .position(|part| part == "--")
+            .unwrap();
+        assert_eq!(
+            cursor.relay_command[separator + 1..],
+            ["agent".to_string(), "acp".to_string()]
+        );
+
+        let gemini = agent_provider_profile("gemini-cli").unwrap();
+        assert_eq!(gemini.agent, "gemini");
+        assert!(!gemini.supports_acp);
+        assert!(gemini.supports_mcp);
+        assert!(gemini.supports_terminal);
+        assert!(gemini.relay_command.is_empty());
+        assert_eq!(
+            terminal_agent_command("opencode").unwrap(),
+            vec!["opencode".to_string()]
+        );
     }
 
     #[test]

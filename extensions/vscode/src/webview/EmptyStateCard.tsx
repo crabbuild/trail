@@ -70,6 +70,7 @@ export function EmptyStateCard({ props }: { props: EmptyStateCardProps }) {
             type="button"
             data-action={action.action}
             title={action.label}
+            aria-label={action.label}
             disabled={action.disabled}
             variant={action.tone === "primary" ? "default" : "outline"}
             size="sm"
@@ -79,7 +80,7 @@ export function EmptyStateCard({ props }: { props: EmptyStateCardProps }) {
               data-icon="inline-start"
               dangerouslySetInnerHTML={{ __html: action.iconHtml }}
             />
-            <span>
+            <span className="empty-action-label">
               <b>{action.label}</b>
             </span>
           </Button>

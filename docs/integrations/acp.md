@@ -4,15 +4,34 @@ CrabDB can sit between an ACP-capable editor and a real ACP coding agent. The
 relay is neutral: Claude Code, Codex, or another ACP agent remains the real
 agent, while CrabDB records lanes, turns, transcripts, events, and checkpoints.
 
-## Built-In ACP Providers
+## Provider Modes
+
+CrabDB now treats code-agent integration as three complementary paths:
+
+- **ACP relay**: best capture path. CrabDB creates a fresh lane per prompt
+  session, injects its MCP server into the ACP initialize params, and records
+  turns/tool events as they stream through the relay.
+- **MCP server**: context-tool path. Register `crabdb mcp` in the native agent
+  when the agent supports MCP so it can inspect CrabDB state directly.
+- **Terminal task**: universal CLI path. `crabdb agent start --provider <NAME>`
+  creates a materialized task lane, runs the provider command there, and records
+  the final checkpoint when the process exits.
+
+## Built-In Providers
 
 CrabDB ships provider profiles for:
 
 - `claude-code`, via `@agentclientprotocol/claude-agent-acp`
 - `codex`, via `@agentclientprotocol/codex-acp`
+- `cursor`, via the Cursor CLI `agent acp` server
+- `gemini`, terminal mode with MCP setup notes
+- `aider`, terminal mode
+- `opencode`, terminal mode
 
 Any other ACP-compatible agent can still be used by passing its upstream ACP
 command after `--` to `crabdb agent acp` or `crabdb acp relay`.
+Any terminal agent can be used by passing its command after `--` to
+`crabdb agent start`.
 
 ## Quickstart
 
@@ -27,6 +46,8 @@ Check the agent setup:
 ```sh
 crabdb agent doctor --provider claude-code
 crabdb agent doctor --provider codex
+crabdb agent doctor --provider cursor
+crabdb agent doctor --provider gemini
 ```
 
 Print editor configuration that creates a fresh CrabDB task lane for each ACP
@@ -97,6 +118,21 @@ The lower-level Codex ACP profile uses:
 
 ```sh
 crabdb acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
+```
+
+The lower-level Cursor ACP profile uses:
+
+```sh
+crabdb acp relay --provider cursor --materialize -- agent acp
+```
+
+Terminal-first agents use fresh materialized task lanes:
+
+```sh
+crabdb agent start --provider gemini
+crabdb agent start --provider aider
+crabdb agent start --provider opencode
+crabdb agent start --provider custom -- my-agent --flag
 ```
 
 For a full operator and automation-agent runbook, including real Claude Code

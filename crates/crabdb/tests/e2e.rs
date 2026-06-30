@@ -774,6 +774,13 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .unwrap()
         .iter()
         .any(|profile| profile["agent"] == "codex"));
+    assert!(profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|profile| profile["agent"] == "cursor"
+            && profile["supports_acp"] == true
+            && profile["supports_terminal"] == true));
     assert!(!profiles
         .as_array()
         .unwrap()
@@ -884,6 +891,25 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         "crabdb"
     );
 
+    let cursor_install = run_crabdb_json(
+        temp.path(),
+        &[
+            "acp",
+            "install",
+            "--agent",
+            "cursor",
+            "--editor",
+            "generic",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(cursor_install["agent"], "cursor");
+    assert!(cursor_install["relay_command"]
+        .as_array()
+        .unwrap()
+        .windows(2)
+        .any(|parts| parts[0] == "agent" && parts[1] == "acp"));
+
     let demo = run_crabdb_json(temp.path(), &["demo", "acp", "--agent", "claude-code"]);
     assert_eq!(demo["agent"], "claude-code");
     assert!(demo["relay_command"]
@@ -903,6 +929,9 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     let default_setup = run_crabdb_json(temp.path(), &["agent", "setup"]);
     assert_eq!(default_setup["provider"], "claude-code");
     assert_eq!(default_setup["editor"], "vscode");
+    assert_eq!(default_setup["mode"], "acp");
+    assert_eq!(default_setup["supports_acp"], true);
+    assert_eq!(default_setup["supports_terminal"], true);
     assert!(default_setup["snippet"]
         .as_str()
         .unwrap()
@@ -949,6 +978,62 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_str()
         .unwrap()
         .contains("CrabDB Codex"));
+
+    let cursor_setup = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "setup",
+            "--provider",
+            "cursor",
+            "--editor",
+            "vscode",
+        ],
+    );
+    assert_eq!(cursor_setup["provider"], "cursor");
+    assert_eq!(cursor_setup["mode"], "acp");
+    assert!(cursor_setup["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("CrabDB Cursor"));
+
+    let gemini_setup = run_crabdb_json(
+        temp.path(),
+        &[
+            "agent",
+            "setup",
+            "--provider",
+            "gemini",
+            "--editor",
+            "generic",
+        ],
+    );
+    assert_eq!(gemini_setup["provider"], "gemini");
+    assert_eq!(gemini_setup["mode"], "terminal");
+    assert_eq!(gemini_setup["supports_acp"], false);
+    assert_eq!(gemini_setup["supports_mcp"], true);
+    assert!(gemini_setup["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| part == "start"));
+    assert!(gemini_setup["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("Terminal command:"));
+    assert!(gemini_setup["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("CrabDB MCP server command:"));
+    let gemini_doctor = run_crabdb_json(temp.path(), &["agent", "doctor", "--provider", "gemini"]);
+    assert_eq!(gemini_doctor["provider"], "gemini");
+    assert_eq!(gemini_doctor["capabilities"]["terminal"], true);
+    assert_eq!(gemini_doctor["capabilities"]["mcp"], true);
+    assert!(gemini_doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["name"] == "acp" && check["status"] == "skipped"));
 
     let setup = run_crabdb_json(
         temp.path(),
@@ -1018,8 +1103,20 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_array()
         .unwrap()
         .iter()
+        .any(|action| action["id"] == "setup_cursor_vscode"
+            && action["command"] == "crabdb agent setup --provider cursor"));
+    assert!(empty_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|action| action["id"] == "start_terminal_task"
             && action["requires_confirmation"] == true));
+    assert!(empty_actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action["id"] == "start_gemini_task"
+            && action["command"] == "crabdb agent start --provider gemini"));
     let empty_ask_actions = run_crabdb_json(temp.path(), &["agent", "ask", "show", "actions"]);
     assert_eq!(empty_ask_actions["status"], "empty");
     assert!(empty_ask_actions["task"].is_null());

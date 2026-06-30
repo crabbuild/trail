@@ -1,0 +1,100 @@
+<svg viewBox="0 0 900 800" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace; }
+    .title { fill: #f8fafc; font-size: 16px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 9px; }
+    .label { fill: #f8fafc; font-size: 11px; font-weight: 600; }
+    .small { fill: #94a3b8; font-size: 8.5px; }
+    .tiny { fill: #cbd5e1; font-size: 7.5px; }
+    .yes { fill: #34d399; font-size: 8px; font-weight: 600; }
+    .no { fill: #fb7185; font-size: 8px; font-weight: 600; }
+    .arrow { fill: none; stroke: #64748b; stroke-width: 1.5; marker-end: url(#arrow); }
+    .arrow-hot { fill: none; stroke: #60a5fa; stroke-width: 1.8; marker-end: url(#arrow-blue); }
+    .arrow-stop { fill: none; stroke: #fb7185; stroke-width: 1.5; marker-end: url(#arrow-rose); }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="800" fill="#0f172a"/>
+  <rect width="900" height="800" fill="url(#grid)"/>
+
+  <text x="30" y="34" class="title">Content-Defined Boundary Predicate</text>
+  <text x="30" y="52" class="subtitle">CrabDB's prolly chunks split only after min size, always at max size, otherwise by deterministic entry hash.</text>
+
+  <rect x="330" y="86" width="240" height="54" rx="25" fill="#0f172a"/>
+  <rect x="330" y="86" width="240" height="54" rx="25" fill="rgba(59,130,246,0.3)" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="450" y="109" class="label" text-anchor="middle">Candidate entry</text>
+  <text x="450" y="125" class="small" text-anchor="middle">key || value, count in chunk</text>
+
+  <path class="arrow-hot" d="M 450 140 L 450 185"/>
+
+  <g transform="translate(450 225)">
+    <polygon points="0,-45 75,0 0,45 -75,0" fill="#0f172a"/>
+    <polygon points="0,-45 75,0 0,45 -75,0" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text y="-4" class="label" text-anchor="middle">count &lt;</text>
+    <text y="12" class="label" text-anchor="middle">min_chunk?</text>
+  </g>
+
+  <path class="arrow-stop" d="M 375 225 L 185 225 L 185 305"/>
+  <text x="300" y="216" class="no">Yes</text>
+  <rect x="70" y="305" width="230" height="62" rx="6" fill="#0f172a"/>
+  <rect x="70" y="305" width="230" height="62" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+  <text x="185" y="330" class="label" text-anchor="middle">Do not split</text>
+  <text x="185" y="346" class="small" text-anchor="middle">avoid tiny chunks</text>
+
+  <path class="arrow-hot" d="M 450 270 L 450 320"/>
+  <text x="462" y="294" class="yes">No</text>
+
+  <g transform="translate(450 365)">
+    <polygon points="0,-45 75,0 0,45 -75,0" fill="#0f172a"/>
+    <polygon points="0,-45 75,0 0,45 -75,0" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text y="-4" class="label" text-anchor="middle">count &gt;=</text>
+    <text y="12" class="label" text-anchor="middle">max_chunk?</text>
+  </g>
+
+  <path class="arrow-hot" d="M 525 365 L 710 365 L 710 445"/>
+  <text x="594" y="356" class="yes">Yes</text>
+  <rect x="595" y="445" width="230" height="62" rx="6" fill="#0f172a"/>
+  <rect x="595" y="445" width="230" height="62" rx="6" fill="rgba(59,130,246,0.3)" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="710" y="470" class="label" text-anchor="middle">Force split</text>
+  <text x="710" y="486" class="small" text-anchor="middle">bound worst-case node size</text>
+
+  <path class="arrow-hot" d="M 450 410 L 450 455"/>
+  <text x="462" y="433" class="yes">No</text>
+
+  <rect x="330" y="455" width="240" height="62" rx="6" fill="#0f172a"/>
+  <rect x="330" y="455" width="240" height="62" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="450" y="480" class="label" text-anchor="middle">xxHash64(seed)</text>
+  <text x="450" y="496" class="small" text-anchor="middle">hash key || value</text>
+
+  <path class="arrow-hot" d="M 450 517 L 450 548"/>
+
+  <g transform="translate(450 605)">
+    <polygon points="0,-56 110,0 0,56 -110,0" fill="#0f172a"/>
+    <polygon points="0,-56 110,0 0,56 -110,0" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+    <text y="-10" class="label" text-anchor="middle">lower32 &lt;=</text>
+    <text y="6" class="label" text-anchor="middle">u32::MAX /</text>
+    <text y="22" class="label" text-anchor="middle">chunking_factor?</text>
+  </g>
+
+  <path class="arrow-hot" d="M 560 605 L 710 605 L 710 507"/>
+  <text x="610" y="596" class="yes">Yes</text>
+  <path class="arrow-stop" d="M 340 605 L 185 605 L 185 367"/>
+  <text x="288" y="596" class="no">No</text>
+
+  <rect x="78" y="720" width="744" height="40" rx="8" fill="#0f172a"/>
+  <rect x="78" y="720" width="744" height="40" rx="8" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+  <text x="450" y="744" class="small" text-anchor="middle">Deterministic probability, not runtime randomness: the same entry and config produce the same boundary decision.</text>
+</svg>

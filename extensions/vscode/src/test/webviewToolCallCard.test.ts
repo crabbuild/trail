@@ -388,6 +388,94 @@ test("renders execute tools as terminal-focused cards", () => {
   assert.doesNotMatch(html, /tool-card-actions|tool-action-bar/);
 });
 
+test("renders KiloCode background process tools as structured process panels", () => {
+  const html = renderCard(
+    cardProps(
+      {
+        title: "background_process",
+        toolKind: "other",
+        toolStatus: "completed",
+        locations: [],
+        rawInput: {
+          name: "background_process",
+          input: {
+            action: "start",
+            command: "npm run dev",
+            description: "Start local dev server"
+          }
+        },
+        content: []
+      },
+      {
+        details: {
+          kind: "background_process",
+          title: "Start background process",
+          description: "Start local dev server",
+          rows: [
+            { label: "Command", value: "npm run dev" },
+            { label: "Process id", value: "dev-server" },
+            { label: "Status", value: "running" }
+          ],
+          output: "Listening on :5173",
+          outputLabel: "Output"
+        }
+      }
+    )
+  );
+
+  assert.match(html, /data-open=""/);
+  assert.match(html, /tool-structured-background_process/);
+  assert.match(html, /Start background process/);
+  assert.match(html, /Start local dev server/);
+  assert.match(html, /Command/);
+  assert.match(html, /npm run dev/);
+  assert.match(html, /Process id/);
+  assert.match(html, /Listening on :5173/);
+  assert.doesNotMatch(html, /raw-accordion|tool-facts|tool-card-actions/);
+});
+
+test("renders KiloCode task tools as delegated agent panels", () => {
+  const html = renderCard(
+    cardProps(
+      {
+        title: "task",
+        toolKind: "other",
+        toolStatus: "pending",
+        locations: [],
+        rawInput: {
+          toolName: "task",
+          input: {
+            subagent_type: "reviewer",
+            description: "Inspect the tool-call UI"
+          }
+        },
+        content: []
+      },
+      {
+        details: {
+          kind: "task",
+          title: "Agent task (reviewer)",
+          description: "Inspect the tool-call UI",
+          rows: [
+            { label: "Agent", value: "reviewer" },
+            { label: "Status", value: "pending" }
+          ],
+          output: "No issues found.",
+          outputLabel: "Result"
+        }
+      }
+    )
+  );
+
+  assert.match(html, /tool-structured-task/);
+  assert.match(html, /Agent task \(reviewer\)/);
+  assert.match(html, /Inspect the tool-call UI/);
+  assert.match(html, /No issues found/);
+  assert.match(html, /tool-kind-agent/);
+  assert.match(html, /tool-risk-badge-warning/);
+  assert.doesNotMatch(html, /raw-accordion|tool-facts|tool-card-actions/);
+});
+
 test("renders failed tools collapsed with status icons only", () => {
   const html = renderCard(
     cardProps({

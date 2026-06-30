@@ -1,7 +1,8 @@
 import type { ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind } from "../shared/acpTypes";
 import { redactString } from "../shared/securityRedaction";
 
-export type ToolTone = "default" | "file" | "change" | "query" | "terminal" | "risk";
+export type ToolPresentationKind = ToolKind | "background_process" | "task";
+export type ToolTone = "default" | "file" | "change" | "query" | "terminal" | "risk" | "agent";
 export type ToolRiskTone = "ok" | "warning" | "risk";
 export type ToolActionKind = "openLocation" | "focusDiff";
 export type ToolActionTone = "primary" | "default" | "danger";
@@ -38,7 +39,7 @@ export interface ToolPresentationInput {
 }
 
 export interface ToolPresentation {
-  kind: ToolKind;
+  kind: ToolPresentationKind;
   title: string;
   operationLabel: string;
   summary: string;
@@ -65,6 +66,11 @@ const URL_KEYS = keyList("url uri href");
 const CWD_KEYS = keyList("cwd workingDirectory working_directory");
 const LINE_KEYS = keyList("line lineNumber line_number startLine start_line");
 const COMMAND_KEYS = keyList("command commandLine command_line");
+const ACTION_KEYS = keyList("action operation mode");
+const DESCRIPTION_KEYS = keyList("description prompt task taskDescription task_description");
+const SUBAGENT_KEYS = keyList("subagent_type subagentType agent agentType agent_type type");
+const PROCESS_ID_KEYS = keyList("id processId processID process_id pid");
+const PROCESS_STATUS_KEYS = keyList("status state");
 const MAX_ARGUMENT_JSON_CHARS = 20_000;
 const GENERIC_TOOL_SIGNALS = new Set(["tool", "toolcall", "toolcallupdate", "calltool", "functioncall", "sessionupdate"]);
 
@@ -85,7 +91,7 @@ export function buildToolPresentation(input: ToolPresentationInput): ToolPresent
     riskTone: risk.riskTone,
     riskLabel: risk.riskLabel,
     statusLabel,
-    openByDefault: openByDefault(input.toolStatus),
+    openByDefault: openByDefault(input.toolStatus, kind),
     stats: toolStats(input, kind, content),
     facts,
     actions: toolActions(input, kind, content, risk.riskTone),
@@ -118,8 +124,12 @@ export function toolStatusLabel(status: string): string {
   }
 }
 
-function toolVisual(kind: ToolKind): Pick<ToolPresentation, "operationLabel" | "icon" | "tone"> {
+function toolVisual(kind: ToolPresentationKind): Pick<ToolPresentation, "operationLabel" | "icon" | "tone"> {
   switch (kind) {
+    case "background_process":
+      return { operationLabel: "Process", icon: "process", tone: "terminal" };
+    case "task":
+      return { operationLabel: "Agent", icon: "task", tone: "agent" };
     case "read":
       return { operationLabel: "Read", icon: "file", tone: "file" };
     case "edit":
@@ -145,7 +155,7 @@ function toolVisual(kind: ToolKind): Pick<ToolPresentation, "operationLabel" | "
 
 function toolSummary(
   input: ToolPresentationInput,
-  kind: ToolKind,
+  kind: ToolPresentationKind,
   content: ReturnType<typeof contentCounts>,
   facts: ToolFact[]
 ): string {
@@ -155,8 +165,26 @@ function toolSummary(
   const query = factValue(facts, "Query");
   const resource = factValue(facts, "Resource");
   const command = factValue(facts, "Command") || redactedCommand(input);
+  const action = factValue(facts, "Action");
+  const description = factValue(facts, "Description");
+  const agent = factValue(facts, "Agent");
+  const process = factValue(facts, "Process");
+  const processStatus = factValue(facts, "Process status");
   const pathSuffix = input.locations.length > 1 ? ` +${formatCount(input.locations.length - 1)}` : "";
 
+  if (kind === "background_process") {
+    if (command) {
+      return command;
+    }
+    const processParts = [action, processStatus, process].filter(Boolean);
+    return processParts.length ? processParts.join(" · ") : "Background process";
+  }
+  if (kind === "task") {
+    if (description && agent) {
+      return `${agent}: ${description}`;
+    }
+    return description || agent || (input.toolStatus === "completed" ? "Agent task" : "Delegating to agent");
+  }
   if (kind === "execute" && command) {
     return command;
   }
@@ -202,7 +230,7 @@ function toolSummary(
   return toolVisual(kind).operationLabel;
 }
 
-function toolEmptyText(source: string | undefined, kind: ToolKind): string {
+function toolEmptyText(source: string | undefined, kind: ToolPresentationKind): string {
   if (kind === "edit") {
     return "No diff preview available for this edit.";
   }
@@ -211,12 +239,22 @@ function toolEmptyText(source: string | undefined, kind: ToolKind): string {
     : "No rendered output for tool call.";
 }
 
-function effectiveToolKind(input: ToolPresentationInput, content: ReturnType<typeof contentCounts>): ToolKind {
+function effectiveToolKind(input: ToolPresentationInput, content: ReturnType<typeof contentCounts>): ToolPresentationKind {
   if (input.toolKind !== "other") {
     return input.toolKind;
   }
   const signal = normalizedToolSignal(input);
   const raw = toolArgumentRecord(input.rawInput);
+  if (toolSignalMatches(signal, BACKGROUND_PROCESS_TOOL_SIGNALS)) {
+    return "background_process";
+  }
+  if (
+    toolSignalMatches(signal, TASK_TOOL_SIGNALS) ||
+    stringChoice(raw, SUBAGENT_KEYS) ||
+    (toolSignalMatches(signal, AGENT_TOOL_SIGNALS) && stringChoice(raw, DESCRIPTION_KEYS))
+  ) {
+    return "task";
+  }
   if (terminalCommand(raw) || content.terminalBlocks || toolSignalMatches(signal, EXECUTE_TOOL_SIGNALS)) {
     return "execute";
   }
@@ -246,6 +284,9 @@ function effectiveToolKind(input: ToolPresentationInput, content: ReturnType<typ
 }
 
 const EXECUTE_TOOL_SIGNALS = ["bash", "shell", "terminal", "command", "execute", "exec", "run"];
+const BACKGROUND_PROCESS_TOOL_SIGNALS = ["backgroundprocess"];
+const TASK_TOOL_SIGNALS = ["task", "subagent"];
+const AGENT_TOOL_SIGNALS = ["agent", "delegate"];
 const DELETE_TOOL_SIGNALS = ["delete", "remove", "unlink", "rm"];
 const MOVE_TOOL_SIGNALS = ["move", "rename", "mv"];
 const EDIT_TOOL_SIGNALS = ["edit", "write", "create", "patch", "applypatch", "replace", "insert", "updatefile", "strreplace", "multiedit"];
@@ -270,7 +311,7 @@ function toolSignalMatches(signal: string, choices: string[]): boolean {
   return Boolean(signal) && choices.some((choice) => signal.includes(choice));
 }
 
-function toolRisk(kind: ToolKind, status: ToolCallStatus, content: ReturnType<typeof contentCounts>): { riskTone: ToolRiskTone; riskLabel: string } {
+function toolRisk(kind: ToolPresentationKind, status: ToolCallStatus, content: ReturnType<typeof contentCounts>): { riskTone: ToolRiskTone; riskLabel: string } {
   if (status === "failed" || status === "cancelled") {
     return { riskTone: "risk", riskLabel: "Needs inspection" };
   }
@@ -280,17 +321,23 @@ function toolRisk(kind: ToolKind, status: ToolCallStatus, content: ReturnType<ty
   if (kind === "execute") {
     return { riskTone: content.terminalBlocks ? "warning" : "risk", riskLabel: "Command" };
   }
+  if (kind === "background_process") {
+    return { riskTone: "warning", riskLabel: "Background process" };
+  }
+  if (kind === "task") {
+    return { riskTone: "warning", riskLabel: "Delegated agent" };
+  }
   if (kind === "edit" || kind === "move") {
     return { riskTone: "warning", riskLabel: "Workspace change" };
   }
   return { riskTone: "ok", riskLabel: "Read-only" };
 }
 
-function openByDefault(status: ToolCallStatus): boolean {
-  return status === "in_progress" || status === "pending";
+function openByDefault(status: ToolCallStatus, kind: ToolPresentationKind): boolean {
+  return status === "in_progress" || status === "pending" || (kind === "background_process" && status === "completed");
 }
 
-function toolStats(input: ToolPresentationInput, kind: ToolKind, content: ReturnType<typeof contentCounts>): ToolStat[] {
+function toolStats(input: ToolPresentationInput, kind: ToolPresentationKind, content: ReturnType<typeof contentCounts>): ToolStat[] {
   if (kind === "think") {
     return [];
   }
@@ -347,7 +394,21 @@ function toolInputFacts(rawInput: Record<string, unknown> | undefined): ToolFact
   const query = stringChoice(input, QUERY_KEYS);
   const url = stringChoice(input, URL_KEYS);
   const cwd = stringChoice(input, CWD_KEYS);
+  const action = stringChoice(input, ACTION_KEYS);
+  const description = stringChoice(input, DESCRIPTION_KEYS);
+  const agent = stringChoice(input, SUBAGENT_KEYS);
+  const process = stringChoice(input, PROCESS_ID_KEYS);
+  const processStatus = stringChoice(input, PROCESS_STATUS_KEYS);
   const line = numberChoice(input, LINE_KEYS);
+  if (action) {
+    facts.push({ label: "Action", value: action });
+  }
+  if (agent) {
+    facts.push({ label: "Agent", value: agent });
+  }
+  if (description) {
+    facts.push({ label: "Description", value: description });
+  }
   if (path) {
     facts.push({ label: "Path", value: path });
   }
@@ -366,6 +427,12 @@ function toolInputFacts(rawInput: Record<string, unknown> | undefined): ToolFact
   if (cwd) {
     facts.push({ label: "Cwd", value: cwd });
   }
+  if (process) {
+    facts.push({ label: "Process", value: process });
+  }
+  if (processStatus) {
+    facts.push({ label: "Process status", value: processStatus });
+  }
   if (typeof line === "number") {
     facts.push({ label: "Line", value: String(line) });
   }
@@ -377,7 +444,7 @@ function toolInputFacts(rawInput: Record<string, unknown> | undefined): ToolFact
 
 function toolActions(
   input: ToolPresentationInput,
-  kind: ToolKind,
+  kind: ToolPresentationKind,
   content: ReturnType<typeof contentCounts>,
   riskTone: ToolRiskTone
 ): ToolAction[] {

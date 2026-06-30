@@ -5,6 +5,7 @@ import {
   filterTimelineNodes,
   isTimelineFilter,
   sortTimelineNodes,
+  timelineDisplayNodes,
   transcriptTimelineNodes,
   timelineFilterCounts,
   timelineNodeBucket,
@@ -132,9 +133,107 @@ test("counts approval-gated tools without rendering a separate approval row", ()
   assert.deepEqual(filterTimelineNodes([permissionTool], "approvals", "always allow").map((node) => node.id), ["tool:permission"]);
 });
 
+test("merges approval rows into tools only within the same render scope", () => {
+  const oldTool: RenderNode = {
+    ...base,
+    id: "tool:shared-old",
+    kind: "tool",
+    turnId: "turn-1",
+    acpSessionId: "session-1",
+    toolCallId: "shared-tool",
+    title: "Old command",
+    toolKind: "execute",
+    toolStatus: "completed",
+    locations: [],
+    content: []
+  };
+  const currentTool: RenderNode = {
+    ...oldTool,
+    id: "tool:shared-current",
+    turnId: "turn-2",
+    title: "Current command",
+    toolStatus: "pending"
+  };
+  const currentApproval: RenderNode = {
+    ...base,
+    id: "approval:shared-current",
+    kind: "approval",
+    turnId: "turn-2",
+    acpSessionId: "session-1",
+    requestId: "approval-current",
+    title: "Allow current command",
+    tool: currentTool,
+    options: [{ optionId: "allow", label: "Allow" }],
+    status: "pending"
+  };
+
+  const displayed = timelineDisplayNodes([oldTool, currentTool, currentApproval]);
+
+  assert.deepEqual(displayed.map((node) => node.id), ["tool:shared-old", "tool:shared-current"]);
+  assert.equal(displayed[0]?.kind, "tool");
+  assert.equal(displayed[1]?.kind, "tool");
+  if (displayed[0]?.kind !== "tool" || displayed[1]?.kind !== "tool") {
+    throw new Error("expected tool display nodes");
+  }
+  assert.equal(displayed[0].permission, undefined);
+  assert.equal(displayed[1].permission?.requestId, "approval-current");
+});
+
+test("keeps reused tool approvals visible when their matching tool is absent in that scope", () => {
+  const oldTool: RenderNode = {
+    ...base,
+    id: "tool:shared-old",
+    kind: "tool",
+    turnId: "turn-1",
+    acpSessionId: "session-1",
+    toolCallId: "shared-tool",
+    title: "Old command",
+    toolKind: "execute",
+    toolStatus: "completed",
+    locations: [],
+    content: []
+  };
+  const laterApprovalTool: Extract<RenderNode, { kind: "tool" }> = {
+    ...oldTool,
+    id: "tool:shared-later",
+    turnId: "turn-2",
+    title: "Later command",
+    toolStatus: "pending"
+  };
+  const laterApproval: RenderNode = {
+    ...base,
+    id: "approval:shared-later",
+    kind: "approval",
+    turnId: "turn-2",
+    acpSessionId: "session-1",
+    requestId: "approval-later",
+    title: "Allow later command",
+    tool: laterApprovalTool,
+    options: [{ optionId: "allow", label: "Allow" }],
+    status: "pending"
+  };
+
+  const displayed = timelineDisplayNodes([oldTool, laterApproval]);
+
+  assert.deepEqual(displayed.map((node) => node.id), ["tool:shared-old", "approval:shared-later"]);
+  assert.equal(displayed[0]?.kind === "tool" ? displayed[0].permission : undefined, undefined);
+  assert.equal(displayed[1]?.kind === "tool" ? displayed[1].permission?.requestId : undefined, "approval-later");
+});
+
 test("removes internal session controls from transcript-visible nodes", () => {
+  const providerEvent: RenderNode = {
+    ...base,
+    id: "unknown:provider-event",
+    kind: "unknown",
+    label: "Unsupported ACP update: custom_progress",
+    payload: {
+      sessionUpdate: "custom_progress",
+      detail: "Provider-specific event"
+    }
+  };
   const internalNodes: RenderNode[] = [
     ...nodes,
+    providerEvent,
     {
       ...base,
       id: "commands:1",
@@ -167,7 +266,9 @@ test("removes internal session controls from transcript-visible nodes", () => {
     }
   ];
 
-  assert.deepEqual(transcriptTimelineNodes(internalNodes).map((node) => node.id), nodes.map((node) => node.id));
+  assert.deepEqual(transcriptTimelineNodes(internalNodes).map((node) => node.id), [...nodes.map((node) => node.id), providerEvent.id]);
+  assert.equal(timelineNodeBucket(providerEvent), "events");
+  assert.deepEqual(filterTimelineNodes(transcriptTimelineNodes(internalNodes), "events", "custom_progress").map((node) => node.id), [providerEvent.id]);
 });
 
 test("sorts transcript nodes by durable stream order before timestamps", () => {
@@ -225,6 +326,34 @@ test("sorts transcript nodes by durable stream order before timestamps", () => {
     "tool:late-created-missing-time",
     "message:assistant:after"
   ]);
+});
+
+test("sorts by updated time when created time is malformed", () => {
+  const ordered = sortTimelineNodes([
+    {
+      ...base,
+      id: "message:assistant:bad-created",
+      kind: "message",
+      createdAt: "not-a-date",
+      updatedAt: "2026-06-27T00:00:02.000Z",
+      role: "assistant",
+      content: [{ type: "text", text: "Recovered timestamp" }],
+      text: "Recovered timestamp",
+      streaming: false
+    },
+    {
+      ...base,
+      id: "message:assistant:later",
+      kind: "message",
+      createdAt: "2026-06-27T00:00:03.000Z",
+      role: "assistant",
+      content: [{ type: "text", text: "Later timestamp" }],
+      text: "Later timestamp",
+      streaming: false
+    }
+  ]);
+
+  assert.deepEqual(ordered.map((node) => node.id), ["message:assistant:bad-created", "message:assistant:later"]);
 });
 
 test("filters timeline nodes by group and search query", () => {

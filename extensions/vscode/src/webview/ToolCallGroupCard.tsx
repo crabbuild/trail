@@ -1,7 +1,7 @@
 import * as React from "react"
 import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
-import { ChevronDown, Wrench } from "lucide-react"
+import { Check, ChevronDown, CircleAlert, CircleX, Clock3, Wrench, type LucideIcon } from "lucide-react"
 
 import { Card, CardContent } from "@/webview/components/ui/card"
 import {
@@ -45,7 +45,13 @@ export function ToolCallGroupCard({
   callbacks: ToolCallCardCallbacks
   props: ToolCallGroupCardProps
 }) {
-  const [open, setOpen] = React.useState(false)
+  const active = props.status === "pending" || props.status === "in_progress"
+  const [open, setOpen] = React.useState(active)
+  const StatusIcon = groupStatusIcon(props.status)
+
+  React.useEffect(() => {
+    setOpen(active)
+  }, [active, props.id])
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
@@ -54,22 +60,30 @@ export function ToolCallGroupCard({
         data-tool-call-group=""
         data-open={open ? "" : undefined}
         className={cn(
-          "card-body tool-group-card relative gap-0 overflow-hidden rounded-md border border-transparent bg-muted/10 py-0 text-muted-foreground shadow-none ring-0",
+          "card-body tool-group-card relative gap-0 overflow-hidden rounded-md border border-border bg-card py-0 text-card-foreground shadow-none ring-0",
           `tool-group-${props.status}`,
           open ? "is-open" : ""
         )}
       >
         <CollapsibleTrigger
-          className="tool-group-summary grid w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 border-0 px-2 py-1.5 text-left bg-muted/10 hover:bg-muted/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          className="tool-group-summary grid w-full grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-2 border-0 bg-transparent px-2 py-1.5 text-left hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           aria-label={`${open ? "Collapse" : "Expand"} ${props.title}. ${props.detail}`}
         >
-          <span className="summary-icon tool-summary-icon inline-flex size-5 shrink-0 items-center justify-center text-muted-foreground">
+          <span className="summary-icon tool-summary-icon inline-flex size-6 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
             <Wrench data-icon="ml-2 inline-start" aria-hidden="true" />
           </span>
           <span className="tool-group-main min-w-0">
-            <span className="tool-title block truncate text-sm font-normal text-muted-foreground">
+            <span className="tool-title block truncate text-sm font-medium text-card-foreground">
               {props.title}
             </span>
+          </span>
+          <span
+            className={cn("tool-group-status", `tool-group-status-${props.status}`)}
+            aria-label={`${props.items.length} ${props.items.length === 1 ? "tool call" : "tool calls"}, ${props.statusLabel}`}
+            title={`${props.items.length} ${props.items.length === 1 ? "tool call" : "tool calls"} · ${props.statusLabel}`}
+          >
+            <span className="tool-group-count">{props.items.length}</span>
+            <StatusIcon aria-hidden="true" />
           </span>
           <ChevronDown
             aria-hidden="true"
@@ -93,6 +107,22 @@ export function ToolCallGroupCard({
       </Card>
     </Collapsible>
   )
+}
+
+function groupStatusIcon(status: string): LucideIcon {
+  if (status === "completed") {
+    return Check
+  }
+  if (status === "failed") {
+    return CircleAlert
+  }
+  if (status === "cancelled") {
+    return CircleX
+  }
+  if (status === "pending" || status === "in_progress") {
+    return Clock3
+  }
+  return Wrench
 }
 
 export function mountToolCallGroupCards(options: MountToolCallGroupCardsOptions): void {

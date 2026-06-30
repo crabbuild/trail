@@ -98,6 +98,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   const mainBundleSource = fs.readFileSync(mainScript, "utf8");
   const webviewSource = fs.readFileSync(path.join(root, "src", "webview", "main.ts"), "utf8");
   const mainSource = sourceWithJsFunctionSignatures(webviewSource);
+  const approvalCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ApprovalCard.tsx"), "utf8");
   const composerCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ComposerCard.tsx"), "utf8");
   const composerModelSourceTs = fs.readFileSync(path.join(root, "src", "webview", "composerModel.ts"), "utf8");
   const diffCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "DiffCard.tsx"), "utf8");
@@ -119,6 +120,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   const terminalCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "TerminalCard.tsx"), "utf8");
   const thoughtCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ThoughtCard.tsx"), "utf8");
   const timelineGroupSourceTs = fs.readFileSync(path.join(root, "src", "webview", "TimelineGroup.tsx"), "utf8");
+  const timelineModelSourceTs = fs.readFileSync(path.join(root, "src", "webview", "timelineModel.ts"), "utf8");
   const timelineNavigationSourceTs = fs.readFileSync(path.join(root, "src", "webview", "TimelineNavigation.tsx"), "utf8");
   const inlineActionsSourceTs = fs.readFileSync(path.join(root, "src", "webview", "InlineActions.tsx"), "utf8");
   const timelineScrollerSourceTs = fs.readFileSync(path.join(root, "src", "webview", "TimelineScroller.tsx"), "utf8");
@@ -182,20 +184,28 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(toolCallCardSourceTs, /import \{ Button \} from "@\/webview\/components\/ui\/button"/, "tool card should render permission decisions with shadcn button components");
   assert.match(toolCallCardSourceTs, /ButtonGroup className="approval-option-list"/, "tool card should keep approval options grouped inside the tool call");
   assert.match(toolCallCardSourceTs, /ShieldCheck[\s\S]*CircleX|CircleX[\s\S]*ShieldCheck/, "tool card approval actions should use lucide React icons instead of injected SVG strings");
+  assert.match(approvalCardSourceTs, /variant=\{variant\}[\s\S]*size="sm"[\s\S]*className="approval-decision-copy"/, "approval card decision buttons should keep visible short labels next to icons");
+  assert.match(toolCallCardSourceTs, /variant=\{variant\}[\s\S]*size="sm"[\s\S]*className="approval-decision-copy"/, "tool approval buttons should keep visible short labels next to icons");
+  assert.doesNotMatch(`${approvalCardSourceTs}\n${toolCallCardSourceTs}`, /data-approval-icon-only|approval-decision-copy sr-only/, "important approval decisions should not collapse into icon-only controls");
   assert.doesNotMatch(toolCallCardSourceTs, /from "@\/webview\/components\/ui\/alert"/, "tool card should not import alert chrome for compact permission prompts");
   assert.match(sourceWithSharedChunks(toolCallGroupCardSource), /createRoot/, "lazy grouped tool island should mount with React");
   assert.match(toolCallGroupCardSourceTs, /import \{[\s\S]*Collapsible,[\s\S]*CollapsibleContent,[\s\S]*CollapsibleTrigger[\s\S]*\} from "@\/webview\/components\/ui\/collapsible"/, "grouped tool island should render collapsed summaries with shadcn collapsible components");
   assert.match(toolCallGroupCardSourceTs, /<ToolCallCard[\s\S]*props=\{item\}[\s\S]*callbacks=\{callbacks\}/, "expanded grouped tools should reuse the single tool card renderer");
-  assert.match(toolCallGroupCardSourceTs, /bg-muted\/10/, "collapsed grouped tool summaries should use a quiet background");
-  assert.match(toolCallGroupCardSourceTs, /hover:bg-muted\/20/, "collapsed grouped tool summaries should keep hover feedback subtle");
+  assert.match(toolCallGroupCardSourceTs, /bg-card/, "collapsed grouped tool summaries should use the same light card baseline as tool calls");
+  assert.match(toolCallGroupCardSourceTs, /hover:bg-muted\/60/, "collapsed grouped tool summaries should keep hover feedback aligned with tool calls");
+  assert.doesNotMatch(toolCallGroupCardSourceTs, /bg-muted\/10|hover:bg-muted\/20/, "grouped tool summaries should not use the old gray strip treatment");
   assert.doesNotMatch(toolCallGroupCardSourceTs, /from "@\/webview\/components\/ui\/badge"|tool-group-preview|tool-group-meta/, "collapsed grouped tool summaries should avoid badges and per-tool previews");
   assert.match(sourceWithSharedChunks(toolCallGroupCardSource), /data-tool-call-group/, "lazy grouped tool island should preserve grouped tool DOM affordances");
   assert.match(webviewSource, /summarizeToolCallGroup\(items\)[\s\S]*title: summary\.title[\s\S]*detail: summary\.detail/, "grouped tool summaries should describe completed activity instead of showing only a tool-call count");
   assert.match(webviewSource, /function renderTimelineGroupBodyItems\(nodes: RenderNode\[\]\): TimelineGroupCardProps\["bodyItems"\][\s\S]*collectGroupableToolRun\(nodes, index\)[\s\S]*toolCallGroupBodyItem\(toolRun\)/, "timeline groups should coalesce adjacent finished tool calls into one body item");
   assert.match(webviewSource, /function shouldGroupCompletedToolCalls\(\): boolean \{[\s\S]*timelineFilter === "all" && timelineSearchTokens\(timelineQuery\)\.length === 0/s, "tool grouping should stay disabled during transcript filtering and search");
   assert.match(webviewSource, /function isGroupableToolNode\(node: RenderNode \| undefined\): node is ToolNodeView \{[\s\S]*node\.permission\?\.status === "pending"[\s\S]*return status !== "pending" && status !== "in_progress"/, "tool grouping should leave pending and running tool calls visible as individual cards");
+  assert.match(webviewSource, /function timelineGroups\(nodes: RenderNode\[\]\): TimelineGroup\[\] \{[\s\S]*const segmentCounts = new Map<string, number>\(\)[\s\S]*let group = groups\[groups\.length - 1\][\s\S]*group\?\.baseKey !== baseKey[\s\S]*segment-\$\{segmentCount\}/, "timeline grouping should preserve sorted contiguous segments instead of merging repeated turn ids upward");
+  assert.doesNotMatch(webviewSource.match(/function timelineGroups\(nodes: RenderNode\[\]\): TimelineGroup\[\] \{[\s\S]*?\n}\n\nfunction timelineGroupDetail/)?.[0] || "", /byKey\.get|byKey\.set/, "timeline grouping should not bucket repeated turn ids into their first visual group");
   assert.match(webviewSource, /function approvalNode\(node:[\s\S]*return toolNode\(approvalAsToolNode\(node\)\)/, "orphan approval nodes should render through the tool call card");
-  assert.match(webviewSource, /permissionFromApproval\(approval\)/, "matched approval nodes should attach to existing tool nodes");
+  assert.match(webviewSource, /function chatNodes\(nodes: RenderNode\[\]\): RenderNode\[\]\s*\{[\s\S]*return timelineDisplayNodes\(nodes\);[\s\S]*\}/, "chat transcript nodes should use the shared timeline display model");
+  assert.match(timelineModelSourceTs, /function scopedToolCallKey\([\s\S]*node\.taskId[\s\S]*node\.lane[\s\S]*node\.turnId[\s\S]*node\.acpSessionId[\s\S]*node\.source[\s\S]*node\.toolCallId/, "matched approval nodes should scope reused tool ids before attaching to existing tool nodes");
+  assert.match(timelineModelSourceTs, /function timelineDisplayNodes\(nodes: RenderNode\[\]\): RenderNode\[\] \{[\s\S]*approvalsByTool\.get\(scopedToolCallKey\(node\)\)[\s\S]*permissionFromApproval\(approval\)[\s\S]*approvalScopedToolCallKey\(node\)[\s\S]*visibleToolKeys\.has\(key\)/, "matched approval nodes should attach through the scoped timeline display model");
   assert.match(composerCardSource, /createRoot/, "lazy composer island should mount with React");
   assert.match(composerCardSource, /data-composer-card/, "lazy composer island should preserve composer DOM affordances");
   assert.doesNotMatch(composerCardSourceTs, /from "@\/webview\/components\/ui\/alert"/, "composer island should not import alert chrome for running state");
@@ -374,7 +384,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(inlineActionsSourceTs, /data-inline-actions-root/, "inline actions island should preserve helper placeholder roots");
   assert.match(inlineActionsSourceTs, /ids\?: ReadonlySet<string> \| undefined[\s\S]*options\.ids && !options\.ids\.has\(id\)[\s\S]*activeIds\.add\(id\)[\s\S]*flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<InlineActions/, "inline actions hydration should be filterable and preserve untouched mounted roots");
   assert.match(inlineActionsSourceTs, /onAction\?: \(\(action: InlineAction, event: React\.MouseEvent<HTMLButtonElement>\) => void\)/, "inline actions should support local React callbacks for tool-card action rails");
-  assert.match(inlineActionsSourceTs, /data-inline-icon-only=\{action\.iconOnly \? "true" : undefined\}/, "inline action icon-only buttons should expose a scoped shadcn layout hook");
+  assert.match(inlineActionsSourceTs, /const iconOnly = action\.iconOnly \?\? Boolean\(action\.icon \|\| action\.iconHtml\)[\s\S]*data-inline-icon-only=\{iconOnly \? "true" : undefined\}/, "inline action icon-first buttons should expose a scoped shadcn layout hook");
   assert.match(inlineActionsSourceTs, /\{action\.icon \? action\.icon : null\}/, "inline actions should accept React-owned icons for lazy islands");
   assert.match(inlineActionsSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: action\.iconHtml \}\}/, "inline action icons should use shadcn data-icon hooks");
   assert.doesNotMatch(inlineActionsSourceTs, /icon-button icon-only/, "inline action icon buttons should not use retired icon-button styling");
@@ -472,10 +482,10 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
     /body\.vscode-high-contrast,[\s\S]*body\.vscode-high-contrast-light\s*{[^}]*--surface-canvas: var\(--surface\)[^}]*--border-quiet: var\(--border\)/s,
     "webview surfaces should keep high-contrast themes border-driven"
   );
-  assert.match(
+  assert.doesNotMatch(
     mainStyleSource,
-    /\.transcript-message-assistant \.transcript-message-content:has\(\[role="status"\]\):{1,2}after\s*{[^}]*background: color-mix\(in srgb, var\(--crabdb-lane\) 48%, transparent\)[^}]*pointer-events: none/s,
-    "streaming assistant messages should expose a static non-flickering live affordance"
+    /\.transcript-message-assistant \.transcript-message-content:has\(\[role="status"\]\):{1,2}after\s*{/,
+    "streaming assistant messages should keep the accessible status marker without drawing a visible live bar"
   );
   assert.doesNotMatch(
     mainStyleSource,
@@ -535,8 +545,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(mainStyleSource, /\.skip-links/, "retired visible landmark strip styles should be removed from the toolbar");
   assert.match(
     mainStyleSource,
-    /\.toolbar-capabilities-trigger\s*{[^}]*display: inline-grid[^}]*grid-template-columns: auto minmax\(0, 1fr\) auto/s,
-    "toolbar capabilities should reserve space for label and disclosure"
+    /\.toolbar-capabilities-trigger\s*{[^}]*display: inline-grid[^}]*place-items: center[^}]*width: 32px[^}]*max-width: 32px/s,
+    "toolbar capabilities should render as a compact icon-first trigger"
   );
   assert.match(
     mainStyleSource,
@@ -545,13 +555,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capabilities-trigger:{1,2}after\s*{[^}]*transform: rotate\(45deg\)/s,
-    "toolbar capabilities should expose a visible disclosure chevron"
+    /\.toolbar-capabilities-trigger:{1,2}after\s*{[^}]*content: none/s,
+    "toolbar capabilities should not add a visible disclosure chevron next to the icon"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capabilities-trigger\[aria-expanded="true"\]:{1,2}after\s*{[^}]*transform: rotate\(225deg\)/s,
-    "open toolbar capabilities should rotate the disclosure chevron"
+    /\.toolbar-capabilities-trigger\[aria-expanded="true"\]:{1,2}after\s*{[^}]*content: none/s,
+    "open toolbar capabilities should keep the icon trigger visually minimal"
   );
   assert.match(
     mainStyleSource,
@@ -560,8 +570,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-list\s*{[^}]*display: grid[^}]*grid-template-columns: repeat\(2, minmax\(160px, 1fr\)\)[^}]*min-width: 0/s,
-    "toolbar capability groups should use a compact responsive card grid"
+    /\.toolbar-capability-list\s*{[^}]*display: grid[^}]*grid-template-columns: repeat\(auto-fit, minmax\(104px, 1fr\)\)[^}]*min-width: 0/s,
+    "toolbar capability groups should use a compact responsive icon-era card grid"
   );
   assert.match(
     mainStyleSource,
@@ -580,13 +590,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-actions button\s*{[^}]*flex: 1 1 min\(148px, 100%\)[^}]*min-width: 0[^}]*overflow: hidden[^}]*transition:[^}]*transform (?:80ms|\.08s) ease-out/s,
-    "toolbar capability action buttons should flex, truncate, and keep polished pressed feedback"
+    /\.toolbar-capability-actions button\s*{[^}]*flex: 0 0 30px[^}]*width: 30px[^}]*overflow: hidden[^}]*transition:[^}]*transform (?:80ms|\.08s) ease-out/s,
+    "toolbar capability action buttons should render as fixed icon controls with pressed feedback"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-actions button:{1,2}before\s*{[^}]*content: ""[^}]*flex: 0 0 3px[^}]*height: 18px[^}]*background: var\(--border-subtle\)/s,
-    "toolbar capability action buttons should expose compact typed meters without extra markup"
+    /\.toolbar-capability-actions button:{1,2}before\s*{[^}]*content: none/s,
+    "toolbar capability action buttons should avoid extra meter chrome"
   );
   assert.match(
     mainStyleSource,
@@ -595,12 +605,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-actions button\[data-action="?toggleReview"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 8%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?toggleReview"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)/s,
+    /\.toolbar-capability-actions button\[data-action="?toggleReview"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 8%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?toggleReview"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-review\)/s,
     "toolbar review capability action should carry review-gate semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-actions button\[data-action="?openSettings"?\]\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 7%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?openSettings"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-provider\)/s,
+    /\.toolbar-capability-actions button\[data-action="?openSettings"?\]\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 7%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?openSettings"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-provider\)/s,
     "toolbar settings capability action should carry provider/config semantics"
   );
   assert.match(
@@ -625,8 +635,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.header-action-group \.toolbar-action-button\s*{[^}]*max-width: min\(240px, 100%\)/s,
-    "top toolbar primary actions should stay bounded in narrow panes"
+    /\.header-action-group \.toolbar-action-button\s*{[^}]*max-width: 100%/s,
+    "top toolbar primary actions should stay bounded as icon controls"
   );
   assert.match(
     mainStyleSource,
@@ -665,8 +675,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button:{1,2}before\s*{[^}]*content: ""[^}]*flex: 0 0 3px[^}]*height: 18px[^}]*background: var\(--border-subtle\)/s,
-    "top toolbar primary actions should expose compact typed meters without extra DOM"
+    /\.toolbar-action-button:{1,2}before\s*{[^}]*content: none/s,
+    "top toolbar primary actions should avoid extra meter chrome"
   );
   assert.match(
     mainStyleSource,
@@ -680,12 +690,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button\[data-action="?focusComposer"?\]:{1,2}before,[\s\S]*\.toolbar-action-button\[data-action="?refresh"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-lane\)/s,
-    "compose and refresh toolbar actions should carry a lane action meter"
+    /\.toolbar-action-button\[data-action="?focusComposer"?\] \[data-icon="inline-start"\],[\s\S]*\.toolbar-action-button\[data-action="?refresh"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-lane\)/s,
+    "compose and refresh toolbar actions should carry a lane icon accent"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button\[data-action="?cancel"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-risk\)[^}]*\}[\s\S]*\.toolbar-action-button\[data-action="?cancel"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-risk\)/s,
+    /\.toolbar-action-button\[data-action="?cancel"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-risk\)/s,
     "cancel toolbar actions should keep a distinct risk accent"
   );
   assert.match(
@@ -715,7 +725,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability\s*{[^}]*position: relative[^}]*padding: 8px 8px 8px 14px/s,
+    /\.toolbar-capability\s*{[^}]*position: relative[^}]*padding: 7px 8px 7px 14px/s,
     "toolbar capability cards should reserve room for semantic status meters"
   );
   assert.match(
@@ -1013,7 +1023,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.composer button\[data-composer-icon-only="true"\]\.send-button\s*{[^}]*background: var\(--vscode-button-background\)/s,
+    /\.composer button\[data-composer-icon-only="true"\]\.send-button\s*{[^}]*color: var\(--button-primary-fg\)[^}]*background: var\(--button-primary-bg\)/s,
     "composer send control should keep primary button treatment"
   );
   assert.match(
@@ -1380,13 +1390,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.review-action-list button\s*{[^}]*max-width: 100%[^}]*overflow: hidden/s,
+    /\.review-action-list button\s*{[^}]*flex: 0 0 32px[^}]*max-width: 32px[^}]*overflow: hidden/s,
     "review action buttons should not widen the review rail"
   );
   assert.match(
     mainStyleSource,
-    /button\.review-primary-action\s*{[^}]*position: relative[^}]*overflow: hidden[^}]*padding-inline-start: 12px/s,
-    "primary review actions should expose a stable command accent without shifting copy"
+    /button\.review-primary-action\s*{[^}]*position: relative[^}]*width: 38px[^}]*height: 38px[^}]*overflow: hidden/s,
+    "primary review actions should expose a stable icon-first command surface"
   );
   assert.match(
     mainSource,
@@ -1402,38 +1412,38 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /button\.review-primary-action:{1,2}before\s*{[^}]*content: ""[^}]*inset-inline-start: 5px[^}]*width: 3px[^}]*background: currentColor/s,
-    "primary review actions should render a compact accent without extra DOM"
+    /button\.review-primary-action:{1,2}before\s*{[^}]*content: none/s,
+    "primary review actions should avoid extra accent DOM"
   );
   assert.match(
     mainStyleSource,
-    /\.review-primary-row > button > \.icon,\s*\.review-action-list button > \.icon\s*{[^}]*width: 23px[^}]*height: 23px[^}]*border-radius: var\(--radius-control\)/s,
-    "review action icons should render as compact command capsules"
+    /button\[data-review-icon-only="true"\] \[data-icon="inline-start"\] > \.icon\s*{[^}]*width: 15px[^}]*height: 15px/s,
+    "review action icons should render as compact command glyphs"
   );
   assert.match(
     mainStyleSource,
-    /\.review-action-list button\s*{[^}]*position: relative[^}]*padding-inline-start: 13px/s,
-    "review action buttons should reserve logical space for typed action accents"
+    /\.review-action-list button\s*{[^}]*position: relative[^}]*width: 32px[^}]*padding: 0/s,
+    "review action buttons should reserve stable icon geometry"
   );
   assert.match(
     mainStyleSource,
-    /\.review-action-list button:{1,2}before\s*{[^}]*content: ""[^}]*inset-inline-start: 5px[^}]*width: 3px[^}]*background: var\(--border-subtle\)/s,
-    "review action buttons should render typed accents without extra DOM"
+    /\.review-action-list button:{1,2}before\s*{[^}]*content: none/s,
+    "review action buttons should avoid extra accent chrome"
   );
   assert.match(
     mainStyleSource,
-    /\.review-action-list button\[data-action="?openDiff"?\]:{1,2}before,[\s\S]*\.review-action-list button\[data-action="?focusTranscript"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-provider\)/s,
-    "review inspect actions should carry a provider/evidence accent"
+    /\.review-action-list\s*{[^}]*display: flex[^}]*flex-wrap: wrap/s,
+    "review inspect actions should stay in a compact wrapping icon rail"
   );
   assert.match(
     mainStyleSource,
-    /\.review-action-list button\[data-action="?runTests"?\]:{1,2}before,[\s\S]*\.review-action-list button\[data-action="?queueMerge"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-lane\)/s,
-    "review validate actions should carry a lane/workflow accent"
+    /\.review-action-list button\s*{[^}]*display: inline-grid[^}]*place-items: center/s,
+    "review validate actions should stay icon-first in the rail"
   );
   assert.match(
     mainStyleSource,
-    /\.review-action-list button\[data-action="?rewind"?\]:{1,2}before,[\s\S]*\.review-action-list button\[data-action="?removeTask"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-risk\)/s,
-    "review recovery actions should keep a distinct risk accent"
+    /\.review-action-list button:disabled\s*{[^}]*opacity: 0\.58/s,
+    "review recovery actions should still expose disabled state"
   );
   assert.match(
     mainStyleSource,
@@ -1442,7 +1452,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /@media \(forced-colors: active\)\s*{[\s\S]*\.review-primary-row > button > \.icon,[\s\S]*\.review-action-list button > \.icon\s*{[^}]*color: CanvasText[^}]*background: Canvas[\s\S]*button\.review-primary-action\.primary > \.icon,[\s\S]*\.review-action-list button\.primary > \.icon\s*{[^}]*border-color: HighlightText[^}]*color: HighlightText[^}]*background: Highlight/s,
+    /@media \(forced-colors: active\)\s*{[\s\S]*button\[data-review-icon-only="true"\] \[data-icon="inline-start"\] > \.icon\s*{[^}]*color: CanvasText[^}]*background: Canvas[\s\S]*button\.review-primary-action\.primary \[data-icon="inline-start"\] > \.icon,[\s\S]*\.review-action-list button\.primary \[data-icon="inline-start"\] > \.icon\s*{[^}]*color: HighlightText[^}]*background: Highlight/s,
     "review action icon capsules should remain legible in forced-colors mode"
   );
   assert.doesNotMatch(mainStyleSource, /--state-checkpoint-border/, "review applied state should not use an undefined checkpoint border token");
@@ -1764,8 +1774,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /button\.approval-option\.primary\s*{[^}]*color: var\(--vscode-button-foreground\)[^}]*background: var\(--vscode-button-background\)/s,
-    "the one-time approve action should keep the native VS Code primary button fill"
+    /button\.approval-option\.primary\s*{[^}]*color: var\(--button-primary-fg\)[^}]*background: var\(--button-primary-bg\)/s,
+    "the one-time approve action should keep the CrabDB primary button fill"
   );
   assert.match(
     mainStyleSource,
@@ -1794,8 +1804,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /@media \(max-width: 640px\)\s*{[\s\S]*\.approval-decision,\s*\.approval-option-list\s*{[^}]*align-items: stretch[^}]*flex-direction: column/s,
-    "static narrow approval gates should not clip the reject action"
+    /@media \(max-width: 640px\)\s*{[\s\S]*\.approval-decision,\s*\.approval-option-list\s*{[^}]*align-items: center[^}]*flex-direction: row/s,
+    "static narrow approval gates should keep compact decision icons reachable"
   );
   assert.match(
     mainStyleSource,
@@ -2324,8 +2334,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.timeline-filter-trigger\s*{[^}]*grid-template-columns: auto minmax\(0, 1fr\) auto auto[^}]*max-width: min\(220px, 100%\)/s,
-    "timeline filter toolbar trigger should keep icon label count and disclosure bounded"
+    /\.timeline-filter-trigger\s*{[^}]*grid-template-columns: auto auto auto[^}]*justify-content: center[^}]*max-width: 100%/s,
+    "timeline filter toolbar trigger should keep icon count and disclosure bounded"
   );
   assert.match(
     mainStyleSource,
@@ -2539,8 +2549,13 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.tool-call-group \.tool-group-card\.card-body\s*{[^}]*border-color: color-mix\(in srgb, var\(--border-subtle\) 28%, transparent\)[^}]*background: color-mix\(in srgb, var\(--surface-bubble\) 14%, transparent\)[^}]*box-shadow: none[^}]*\}[\s\S]*\.tool-call-group \.tool-group-card\.card-body\.is-open,[\s\S]*\.tool-call-group \.tool-group-card\.card-body\[data-open\]\s*{[^}]*background: color-mix\(in srgb, var\(--surface-bubble\) 22%, transparent\)/s,
-    "grouped tool-call surfaces should stay extremely faint while preserving their card structure"
+    /\.tool-call-group \.tool-group-card\.card-body\s*{[^}]*border-color: transparent[^}]*background: transparent[^}]*box-shadow: none[^}]*overflow: visible[^}]*\}[\s\S]*\.tool-call-group \.tool-group-summary\s*{[^}]*min-height: 36px[^}]*border: 1px solid color-mix\(in srgb, var\(--border-subtle\) 48%, transparent\)[^}]*background: color-mix\(in srgb, var\(--surface\) 94%, var\(--surface-raised\)\)/s,
+    "grouped tool-call surfaces should use the same light summary treatment as individual tool calls"
+  );
+  assert.match(
+    mainStyleSource,
+    /\.tool-call-group \.tool-group-card\.card-body\.is-open > \.tool-group-summary,[\s\S]*\.tool-call-group \.tool-group-card\.card-body\[data-open\] > \.tool-group-summary\s*{[^}]*border-end-start-radius: 0[^}]*background: color-mix\(in srgb, var\(--surface\) 92%, var\(--surface-raised\)\)[^}]*\}[\s\S]*\.tool-call-group \.tool-group-content\s*{[^}]*border: 1px solid color-mix\(in srgb, var\(--border-subtle\) 52%, transparent\)[^}]*background: color-mix\(in srgb, var\(--surface\) 96%, transparent\)/s,
+    "expanded grouped tool calls should connect a light summary to a light content panel"
   );
   assert.doesNotMatch(
     mainStyleSource,
@@ -2959,24 +2974,25 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.empty-actions\s*{[^}]*display: grid[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)[^}]*width: min\(420px, 100%\)[^}]*max-height: min\(164px, 34vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "empty-state action groups should stay focused on the primary action and two context actions"
+    /\.empty-actions\s*{[^}]*display: flex[^}]*flex-wrap: wrap[^}]*width: fit-content[^}]*max-height: min\(164px, 34vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
+    "empty-state action groups should stay focused as compact descriptive actions"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action\s*{[^}]*grid-template-columns: auto minmax\(0, max-content\)[^}]*justify-content: center[^}]*min-width: 0[^}]*overflow: hidden/s,
-    "empty-state actions should keep centered icon and label columns bounded"
+    /button\.empty-action\s*{[^}]*display: inline-flex[^}]*gap: 6px[^}]*max-width: min\(220px, 100%\)[^}]*overflow: hidden/s,
+    "empty-state actions should render icon and text while staying bounded"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action\s*{[^}]*padding: 7px 10px[^}]*transition:[^}]*transform (?:80ms|\.08s) ease-out/s,
+    /button\.empty-action\s*{[^}]*padding: 0 10px[^}]*transition:[^}]*transform (?:80ms|\.08s) ease-out/s,
     "empty-state actions should keep compact command geometry and pressed feedback"
   );
   assert.match(
     mainStyleSource,
-    /button\.empty-action-primary\s*{[^}]*grid-column: 1 \/ -1[^}]*background: var\(--vscode-button-background\)/s,
+    /button\.empty-action-primary\s*{[^}]*height: 34px[^}]*background: var\(--button-primary-bg\)[^}]*padding-inline: 12px/s,
     "empty-state primary actions should carry clear primary treatment"
   );
+  assert.doesNotMatch(emptyStateCardSourceTs, /data-empty-icon-only|className="sr-only"/, "welcome actions should show descriptive button text instead of icon-only labels");
   assert.match(mainSource, /blocked \? "Open review" : "Write a message"/, "ready welcome primary action should avoid composer jargon");
   assert.match(
     mainSource,
@@ -2986,7 +3002,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(mainSource, /Start in composer|emptyStateAction\("openSettings", "Settings"/, "ready welcome should remove confusing composer copy and settings action");
   assert.match(
     mainStyleSource,
-    /\.empty-action span:last-child,[\s\S]*\.empty-action b\s*{[^}]*overflow: hidden[^}]*text-overflow: ellipsis[^}]*white-space: nowrap/s,
+    /\.empty-action \.empty-action-label,[\s\S]*\.empty-action b\s*{[^}]*overflow: hidden[^}]*text-overflow: ellipsis[^}]*white-space: nowrap/s,
     "empty-state action labels should truncate before widening the surface"
   );
   assert.match(
@@ -3041,8 +3057,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /@media \(max-width: 640px\)\s*{[\s\S]*\.empty-state\s*{[^}]*grid-template-columns: minmax\(0, 1fr\)[\s\S]*\.empty-actions\s*{[^}]*justify-self: stretch[^}]*width: 100%[^}]*max-height: none/s,
-    "empty transcript states should stack actions comfortably in narrow panes"
+    /@media \(max-width: 640px\)\s*{[\s\S]*\.empty-state\s*{[^}]*grid-template-columns: minmax\(0, 1fr\)[\s\S]*\.empty-actions\s*{[^}]*justify-content: center/s,
+    "empty transcript states should keep compact actions centered in narrow panes"
   );
   assert.match(
     mainStyleSource,
@@ -3097,18 +3113,38 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.code-frame\s*{[^}]*display: grid[^}]*overflow: hidden[^}]*border: 1px solid var\(--border-subtle\)[^}]*border-radius: var\(--radius-card\)[^}]*background: var\(--vscode-textCodeBlock-background\)/s,
+    /\.streamdown-markdown \[data-streamdown="code-block"\]\s*{[^}]*margin-block: 8px[^}]*border: 1px solid var\(--border-subtle\)[^}]*border-radius: var\(--radius-control\)[^}]*background: var\(--vscode-textCodeBlock-background\)/s,
+    "streaming markdown code blocks should use the same compact frame language as static previews"
+  );
+  assert.match(
+    mainStyleSource,
+    /\.streamdown-markdown \[data-streamdown="code-block-body"\],[\s\S]*max-height: min\(320px, 42vh\)[^}]*overflow: auto/s,
+    "streaming markdown code blocks should cap their scroll body instead of filling the transcript"
+  );
+  assert.match(
+    mainStyleSource,
+    /\.code-frame\s*{[^}]*display: grid[^}]*overflow: hidden[^}]*border: 1px solid var\(--border-subtle\)[^}]*border-radius: var\(--radius-control\)[^}]*background: var\(--vscode-textCodeBlock-background\)/s,
     "code previews should render inside a stable editor-like frame"
   );
   assert.match(
     mainStyleSource,
-    /\.code-tools\s*{[^}]*display: grid[^}]*grid-template-columns: minmax\(0, 1fr\) auto auto[^}]*min-height: 34px[^}]*border-bottom: 1px solid var\(--border-subtle\)/s,
-    "code preview toolbars should reserve room for title, language, and the shadcn action rail"
+    /\.code-tools\s*{[^}]*display: grid[^}]*grid-template-columns: minmax\(0, 1fr\) auto auto[^}]*min-height: 28px[^}]*border-bottom: 1px solid var\(--border-subtle\)/s,
+    "code preview toolbars should stay tight while reserving room for title, language, and actions"
   );
   assert.match(
     webviewSource,
     /function codeBlock\([\s\S]*const codeActions = inlineActions\(\{[\s\S]*className: "code-actions"[\s\S]*action: "copyCode"[\s\S]*action: "openLocation"[\s\S]*action: "openTextPreview"[\s\S]*\$\{codeActions\}/,
     "code preview toolbar actions should render through the shadcn inline actions island"
+  );
+  assert.match(
+    webviewSource,
+    /codeBlock\(code, \{ language: language \|\| "plaintext", title: "Code" \}\)/,
+    "message code blocks should use a short toolbar title"
+  );
+  assert.match(
+    webviewSource,
+    /const languageLabel = language === "plaintext" \? "text" : language[\s\S]*<span class="code-language">\$\{escapeHtml\(languageLabel\)\}<\/span>/,
+    "plain text code blocks should show a compact language chip"
   );
   assert.doesNotMatch(
     webviewSource,
@@ -3117,12 +3153,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.code-actions\s*{[^}]*display: inline-flex[^}]*width: fit-content[^}]*max-height: none[^}]*border-color: transparent[^}]*background: transparent/s,
+    /\.code-tools \.code-actions\s*{[^}]*display: inline-flex[^}]*flex-wrap: nowrap[^}]*width: auto[^}]*max-height: none[^}]*border-color: transparent[^}]*background: transparent/s,
     "code preview action rails should keep shadcn inline actions compact in the toolbar"
   );
   assert.match(
     mainStyleSource,
-    /\.code-actions button:{1,2}before\s*{[^}]*content: none[^}]*display: none/s,
+    /\.code-tools \.code-actions button:{1,2}before\s*{[^}]*content: none[^}]*display: none/s,
     "code preview icon-only shadcn buttons should suppress inline action meter decoration"
   );
   assert.match(
@@ -3137,7 +3173,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.code-frame > \.code\s*{[^}]*max-height: min\(380px, 46vh\)[^}]*margin: 0[^}]*border: 0[^}]*border-radius: 0[^}]*background: transparent/s,
+    /\.code-frame > \.code\s*{[^}]*max-height: min\(320px, 42vh\)[^}]*margin: 0[^}]*border: 0[^}]*border-radius: 0[^}]*background: transparent/s,
     "framed code previews should avoid nested boxes around the scroll body"
   );
   assert.match(
@@ -3162,8 +3198,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /@media \(max-width: 640px\)\s*{[\s\S]*\.code-tools\s*{[^}]*grid-template-columns: minmax\(0, 1fr\) auto auto[\s\S]*\.code-language\s*{[^}]*grid-column: 1 \/ -1[^}]*justify-self: start[^}]*max-width: 100%/s,
-    "code preview toolbars should stack language chips cleanly in narrow panes"
+    /@media \(max-width: 640px\)\s*{[\s\S]*\.code-tools\s*{[^}]*grid-template-columns: minmax\(0, 1fr\) auto auto[\s\S]*\.code-language\s*{[^}]*grid-column: auto[^}]*justify-self: end[^}]*max-width: min\(76px, 24vw\)/s,
+    "code preview toolbars should keep language chips inline in narrow panes"
   );
   assert.match(
     mainSource,
@@ -3578,7 +3614,7 @@ test("webview streaming state updates refresh existing islands instead of tearin
   );
   assert.match(
     source,
-    /if \(canHydratePatchedNodes\(visibleChanges\)\) \{[\s\S]*const immediateStreamingNodeIds = streamingTextDomPatchableNodeIds\(visibleChanges\)[\s\S]*const keepBottomForDeferredNodes =[\s\S]*isTimelinePinnedToBottom\(document\.querySelector<HTMLElement>\("\.timeline"\)\)[\s\S]*applyStreamingTextDomPatchesImmediately\(immediateStreamingNodeIds\)[\s\S]*const deferredNodeIds = changedNodeIdsWithout\(visibleChanges\.changedNodeIds, immediateStreamingNodeIds\)[\s\S]*schedulePatchedNodeHydration\(deferredNodeIds, \{ lockBottom: keepBottomForDeferredNodes \}\)/,
+    /if \(canHydratePatchedNodes\(visibleChanges\)\) \{[\s\S]*const immediateStreamingNodeIds = streamingTextDomPatchableNodeIds\(visibleChanges\)[\s\S]*const keepBottomForDeferredNodes =[\s\S]*shouldKeepTimelinePinnedToBottom\(document\.querySelector<HTMLElement>\("\.timeline"\)\)[\s\S]*applyStreamingTextDomPatchesImmediately\(immediateStreamingNodeIds\)[\s\S]*const deferredNodeIds = changedNodeIdsWithout\(visibleChanges\.changedNodeIds, immediateStreamingNodeIds\)[\s\S]*schedulePatchedNodeHydration\(deferredNodeIds, \{ lockBottom: keepBottomForDeferredNodes \}\)/,
     "mixed streaming batches should update mounted Streamdown text immediately and defer only component islands"
   );
   assert.match(
@@ -3632,14 +3668,29 @@ test("webview streaming state updates refresh existing islands instead of tearin
 	    /function updateStreamingTextTarget\(streamTarget: HTMLElement, streamText: string\): void \{[\s\S]*dataset\.streamdownMarkdown !== undefined[\s\S]*__crabdbQueueStreamdownText\(streamText\)[\s\S]*dispatchEvent\(new CustomEvent\(CRABDB_STREAMDOWN_UPDATE_EVENT[\s\S]*streamText\.startsWith\(current\)[\s\S]*\(firstChild as Text\)\.appendData\(streamText\.slice\(current\.length\)\)[\s\S]*streamTarget\.textContent = streamText/,
 	    "streaming DOM fast path should queue mounted Streamdown updates and keep text-node append as a fallback"
 	  );
-	  assert.match(
-	    source,
-	    /const timeline = document\.querySelector<HTMLElement>\("\.timeline"\);[\s\S]*const forcePatchedBottomLock = pendingPatchedNodeBottomLock[\s\S]*const restorePatchedBottom =[\s\S]*forcePatchedBottomLock[\s\S]*isTimelinePinnedToBottom\(timeline\)[\s\S]*if \(streamedTextDomPatchApplied && restorePatchedBottom && timeline\?\.isConnected\) \{[\s\S]*timeline\.scrollTop = timeline\.scrollHeight/,
-	    "streaming DOM fast path should keep bottom-pinned transcripts anchored without invoking full scroller hydration"
-	  );
-	  assert.match(
-	    source,
-	    /let timelineBottomLockFrameHandle: number \| undefined[\s\S]*let timelineBottomLockObserver: ResizeObserver \| undefined[\s\S]*function installTimelineBottomLock\(\): void \{[\s\S]*new ResizeObserver\(\(\) => \{[\s\S]*queueTimelineBottomRestore\(\)/,
+		  assert.match(
+		    source,
+		    /const timeline = document\.querySelector<HTMLElement>\("\.timeline"\);[\s\S]*const forcePatchedBottomLock = pendingPatchedNodeBottomLock[\s\S]*const restorePatchedBottom =[\s\S]*forcePatchedBottomLock[\s\S]*shouldKeepTimelinePinnedToBottom\(timeline\)[\s\S]*if \(streamedTextDomPatchApplied && restorePatchedBottom && timeline\?\.isConnected\) \{[\s\S]*timeline\.scrollTop = timeline\.scrollHeight/,
+		    "streaming DOM fast path should keep bottom-pinned transcripts anchored without invoking full scroller hydration"
+		  );
+		  assert.match(
+		    source,
+		    /function shouldKeepTimelinePinnedToBottom\(timeline: HTMLElement \| null\): boolean \{[\s\S]*isTimelinePinnedToBottom\(timeline\)[\s\S]*timelineBottomLockPinned && Date\.now\(\) >= timelineBottomLockUserPauseUntil/,
+		    "bottom restore decisions should honor the internal bottom lock during transient layout drift"
+		  );
+		  assert.match(
+		    source,
+		    /function captureRenderFocus\(\): RenderFocusSnapshot \{[\s\S]*const oldTimeline = document\.querySelector<HTMLElement>\("\.timeline"\);[\s\S]*const wasPinnedToBottom = shouldKeepTimelinePinnedToBottom\(oldTimeline\)/,
+		    "structural hydration should preserve bottom intent from the bottom lock, not just instantaneous scroll distance"
+		  );
+		  assert.match(
+		    source,
+		    /if \(restorePatchedBottom && timeline\?\.isConnected\) \{[\s\S]*lockTimelineToBottom\(timeline\);\s*queueTimelineBottomRestore\(\);/,
+		    "deferred component hydration should queue a bottom restore after React islands resize"
+		  );
+		  assert.match(
+		    source,
+		    /let timelineBottomLockFrameHandle: number \| undefined[\s\S]*let timelineBottomLockObserver: ResizeObserver \| undefined[\s\S]*function installTimelineBottomLock\(\): void \{[\s\S]*new ResizeObserver\(\(\) => \{[\s\S]*queueTimelineBottomRestore\(\)/,
 	    "timeline should install a queued ResizeObserver bottom lock for DOM-only streaming growth"
 	  );
 	  assert.doesNotMatch(
@@ -3693,8 +3744,18 @@ test("extension host streams applied patches without rescanning the transcript",
     "host patch sender should not diff every transcript node on each streaming tick"
   );
   assert.match(
+    source,
+    /function sameCoalescableRenderScope\(existing: RenderNode, incoming: RenderNode\): boolean \{[\s\S]*existing\.id === incoming\.id[\s\S]*existing\.turnId === incoming\.turnId[\s\S]*existing\.acpSessionId === incoming\.acpSessionId[\s\S]*existing\.source === incoming\.source/,
+    "host component coalescing should require the same render scope, not only a reused node id"
+  );
+  assert.match(
+    source,
+    /return this\.nodes\.some\(\(existing\) => sameCoalescableRenderScope\(existing, node\)\);/,
+    "host component coalescing should not treat reused ids from another turn as in-place updates"
+  );
+  assert.match(
     completionHandler,
-    /this\.sending = false;[\s\S]*this\.applyAndPostRenderPatches\(\[[\s\S]*this\.finalizeCurrentTurnPatches\(completion\.status\)[\s\S]*node: completion/,
+    /this\.sending = false;[\s\S]*this\.applyAndPostRenderPatches\(\[[\s\S]*this\.finalizeCurrentTurnPatches\(completion\.status,\s*completion\.updatedAt\)[\s\S]*node: completion/,
     "prompt completion should stream final node changes as render patches instead of posting a full state refresh"
   );
   assert.match(

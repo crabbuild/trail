@@ -31,7 +31,7 @@ import type {
   ToolNode
 } from "./renderModel";
 
-type AnonymousStreamNode = MessageNode | ThoughtNode;
+type StreamNode = MessageNode | ThoughtNode;
 
 export interface AcpUpdateRenderer<TUpdate extends SessionUpdate = SessionUpdate> {
   match(update: SessionUpdate): update is TUpdate;
@@ -121,9 +121,11 @@ export function applyRenderPatchesAndCollect(nodes: RenderNode[], patches: Rende
   let next = [...nodes];
   let nextTimelineOrder = maxTimelineOrder(next);
   const appliedPatches: RenderPatch[] = [];
+  const normalizedIdsByRawId = new Map<string, string[]>();
   for (const patch of patches) {
     const patchNode = patch.node ? normalizePatchNodeForTimeline(next, patch) : undefined;
     if (patch.type === "append" && patchNode) {
+      const rawPatchId = patch.node?.id;
       const ordered = ensureTimelineOrder(patchNode, () => {
         nextTimelineOrder += 1;
         return nextTimelineOrder;
@@ -131,9 +133,17 @@ export function applyRenderPatchesAndCollect(nodes: RenderNode[], patches: Rende
       nextTimelineOrder = Math.max(nextTimelineOrder, ordered.timelineOrder ?? 0);
       next.push(ordered);
       appliedPatches.push({ type: "upsert", node: ordered });
+      if (rawPatchId) {
+        trackNormalizedPatchId(normalizedIdsByRawId, rawPatchId, ordered.id);
+      }
+      const movedFinalMarkers = moveTurnFinalMarkersAfterNode(next, ordered, nextTimelineOrder);
+      next = movedFinalMarkers.nodes;
+      nextTimelineOrder = movedFinalMarkers.nextTimelineOrder;
+      appliedPatches.push(...movedFinalMarkers.patches);
       continue;
     }
     if ((patch.type === "replace" || patch.type === "upsert") && patchNode) {
+      const rawPatchId = patch.node?.id;
       const index = next.findIndex((node) => node.id === patchNode.id);
       let appliedNode: RenderNode | undefined;
       let existingNode: RenderNode | undefined;
@@ -154,23 +164,117 @@ export function applyRenderPatchesAndCollect(nodes: RenderNode[], patches: Rende
       }
       if (appliedNode && appliedNode !== existingNode) {
         appliedPatches.push({ type: "upsert", node: appliedNode });
+        if (rawPatchId) {
+          trackNormalizedPatchId(normalizedIdsByRawId, rawPatchId, appliedNode.id);
+        }
       }
       if (appliedNode?.kind === "tool") {
         const synced = syncExpandedTerminalNodesAndCollect(next, appliedNode);
         next = synced.nodes;
         appliedPatches.push(...synced.patches);
       }
+      if (appliedNode) {
+        const movedFinalMarkers = moveTurnFinalMarkersAfterNode(next, appliedNode, nextTimelineOrder);
+        next = movedFinalMarkers.nodes;
+        nextTimelineOrder = movedFinalMarkers.nextTimelineOrder;
+        appliedPatches.push(...movedFinalMarkers.patches);
+      }
       continue;
     }
     if (patch.type === "remove" && patch.id) {
+      const removeId = consumeNormalizedPatchId(normalizedIdsByRawId, patch.id) || patch.id;
       const beforeLength = next.length;
-      next = next.filter((node) => node.id !== patch.id);
+      next = next.filter((node) => node.id !== removeId);
       if (next.length !== beforeLength) {
-        appliedPatches.push({ type: "remove", id: patch.id });
+        appliedPatches.push({ type: "remove", id: removeId });
       }
     }
   }
   return { nodes: next, patches: appliedPatches };
+}
+
+function moveTurnFinalMarkersAfterNode(
+  nodes: RenderNode[],
+  node: RenderNode,
+  currentTimelineOrder: number
+): { nodes: RenderNode[]; patches: RenderPatch[]; nextTimelineOrder: number } {
+  if (!node.turnId || isTurnFinalMarker(node)) {
+    return { nodes, patches: [], nextTimelineOrder: currentTimelineOrder };
+  }
+  const nodeIndex = nodes.findIndex((candidate) => candidate.id === node.id);
+  if (nodeIndex < 0) {
+    return { nodes, patches: [], nextTimelineOrder: currentTimelineOrder };
+  }
+  let nextTimelineOrder = currentTimelineOrder;
+  const kept: RenderNode[] = [];
+  const moved: RenderNode[] = [];
+  const patches: RenderPatch[] = [];
+  nodes.forEach((candidate, index) => {
+    if (
+      candidate.id !== node.id &&
+      isTurnFinalMarker(candidate) &&
+      sameTurnFinalMarkerScope(candidate, node) &&
+      shouldMoveTurnFinalMarkerAfterNode(candidate, index, node, nodeIndex)
+    ) {
+      nextTimelineOrder += 1;
+      const movedNode = {
+        ...candidate,
+        timelineOrder: nextTimelineOrder
+      } as RenderNode;
+      moved.push(movedNode);
+      patches.push({ type: "upsert", node: movedNode });
+      return;
+    }
+    kept.push(candidate);
+  });
+  return patches.length
+    ? { nodes: [...kept, ...moved], patches, nextTimelineOrder }
+    : { nodes, patches, nextTimelineOrder };
+}
+
+function shouldMoveTurnFinalMarkerAfterNode(
+  marker: RenderNode,
+  markerIndex: number,
+  node: RenderNode,
+  nodeIndex: number
+): boolean {
+  if (markerIndex < nodeIndex) {
+    return true;
+  }
+  const markerOrder = Number.isFinite(marker.timelineOrder) ? marker.timelineOrder! : markerIndex + 1;
+  const nodeOrder = Number.isFinite(node.timelineOrder) ? node.timelineOrder! : nodeIndex + 1;
+  return markerOrder <= nodeOrder;
+}
+
+function isTurnFinalMarker(node: RenderNode): boolean {
+  return node.kind === "completion" || node.kind === "checkpoint";
+}
+
+function sameTurnFinalMarkerScope(marker: RenderNode, node: RenderNode): boolean {
+  return (
+    marker.taskId === node.taskId &&
+    marker.lane === node.lane &&
+    marker.turnId !== undefined &&
+    marker.turnId === node.turnId
+  );
+}
+
+function trackNormalizedPatchId(target: Map<string, string[]>, rawId: string, normalizedId: string): void {
+  if (rawId === normalizedId) {
+    return;
+  }
+  const ids = target.get(rawId) || [];
+  ids.push(normalizedId);
+  target.set(rawId, ids);
+}
+
+function consumeNormalizedPatchId(target: Map<string, string[]>, rawId: string): string | undefined {
+  const ids = target.get(rawId);
+  const normalizedId = ids?.pop();
+  if (!ids?.length) {
+    target.delete(rawId);
+  }
+  return normalizedId;
 }
 
 function sameRenderNodeSnapshot(left: RenderNode, right: RenderNode): boolean {
@@ -217,46 +321,112 @@ function preserveTimelineOrder<TNode extends RenderNode>(incoming: TNode, existi
 
 function normalizePatchNodeForTimeline(nodes: RenderNode[], patch: RenderPatch): RenderNode | undefined {
   const node = patch.node;
-  if (!node || patch.type !== "upsert" || !isAnonymousStreamNode(node)) {
+  if (!node) {
     return node;
   }
-  const appendable = latestNodeInSameTurn(nodes, node);
-  if (appendable && canAppendAnonymousStreamNode(appendable, node)) {
+  if (patch.type === "append") {
+    return normalizeAppendNodeForTimeline(nodes, node);
+  }
+  if (patch.type !== "upsert") {
+    return node;
+  }
+  if (isStreamNode(node)) {
+    const existingIndex = nodes.findIndex((candidate) => candidate.id === node.id);
+    const existing = existingIndex >= 0 ? nodes[existingIndex] : undefined;
+    if (existing && sameTimelineScope(existing, node)) {
+      if (!hasNonStreamTimelineBoundaryAfter(nodes, existingIndex, node)) {
+        return node;
+      }
+      const continuation = streamContinuationAfterBoundary(existing, node);
+      if (!continuation) {
+        return undefined;
+      }
+      const appendableContinuation = latestNodeInSameTurn(nodes, continuation);
+      if (appendableContinuation && appendableContinuation !== existing && canAppendStreamNode(appendableContinuation, continuation)) {
+        return streamNodeWithTimelineIdentity(continuation, appendableContinuation);
+      }
+      return {
+        ...continuation,
+        id: nextStreamNodeId(nodes, continuation)
+      };
+    }
+    const appendable = latestNodeInSameTurn(nodes, node);
+    if (appendable && canAppendStreamNode(appendable, node)) {
+      return streamNodeWithTimelineIdentity(node, appendable);
+    }
+    if (existingIndex < 0) {
+      return node;
+    }
     return {
       ...node,
-      id: appendable.id,
-      createdAt: appendable.createdAt,
-      timelineOrder: appendable.timelineOrder,
-      acpMessageId: appendable.acpMessageId
+      id: nextStreamNodeId(nodes, node)
+    };
+  }
+  return normalizeCollidingUpsertNode(nodes, node);
+}
+
+function streamNodeWithTimelineIdentity(node: StreamNode, existing: StreamNode): StreamNode {
+  return {
+    ...node,
+    id: existing.id,
+    createdAt: existing.createdAt,
+    timelineOrder: existing.timelineOrder,
+    acpMessageId: existing.acpMessageId
+  };
+}
+
+function normalizeAppendNodeForTimeline<TNode extends RenderNode>(nodes: RenderNode[], node: TNode): TNode {
+  if (!nodes.some((candidate) => candidate.id === node.id)) {
+    return node;
+  }
+  if (isStreamNode(node)) {
+    return {
+      ...node,
+      id: nextStreamNodeId(nodes, node)
     };
   }
   return {
     ...node,
-    id: nextAnonymousStreamNodeId(nodes, node)
+    id: nextScopedCollisionNodeId(nodes, node)
   };
 }
 
-function isAnonymousStreamNode(node: RenderNode): node is AnonymousStreamNode {
-  return isAnonymousMessageNode(node) || isAnonymousThoughtNode(node);
+function isStreamNode(node: RenderNode): node is StreamNode {
+  return node.kind === "message" || node.kind === "thought";
 }
 
-function isAnonymousMessageNode(node: RenderNode): node is MessageNode {
-  return node.kind === "message" && !node.acpMessageId && node.id.startsWith(`message:${node.role}:anonymous`);
-}
-
-function isAnonymousThoughtNode(node: RenderNode): node is ThoughtNode {
-  return (
-    node.kind === "thought" &&
-    !node.acpMessageId &&
-    (node.id === "thought:current" || node.id.startsWith("thought:anonymous"))
-  );
-}
-
-function canAppendAnonymousStreamNode(existing: RenderNode, incoming: AnonymousStreamNode): existing is AnonymousStreamNode {
+function canAppendStreamNode(existing: RenderNode, incoming: StreamNode): existing is StreamNode {
   if (incoming.kind === "message") {
-    return isAnonymousMessageNode(existing) && existing.role === incoming.role;
+    return (
+      existing.kind === "message" &&
+      existing.role === incoming.role &&
+      existing.acpMessageId === incoming.acpMessageId
+    );
   }
-  return isAnonymousThoughtNode(existing);
+  return existing.kind === "thought" && existing.acpMessageId === incoming.acpMessageId;
+}
+
+function streamContinuationAfterBoundary(existing: RenderNode, incoming: StreamNode): StreamNode | undefined {
+  if (!isStreamNode(existing) || existing.kind !== incoming.kind || !isTextOnlyStreamNode(existing) || !isTextOnlyStreamNode(incoming)) {
+    return incoming;
+  }
+  const existingText = contentBlocksToText(existing.content);
+  const incomingText = contentBlocksToText(incoming.content);
+  if (!incomingText.startsWith(existingText)) {
+    return incoming;
+  }
+  const suffix = incomingText.slice(existingText.length);
+  if (!suffix) {
+    return undefined;
+  }
+  const content: ContentBlock[] = [{ type: "text", text: suffix }];
+  return incoming.kind === "message"
+    ? { ...incoming, content, text: suffix }
+    : { ...incoming, content };
+}
+
+function isTextOnlyStreamNode(node: StreamNode): boolean {
+  return node.content.length > 0 && node.content.every((block) => block.type === "text");
 }
 
 function latestNodeInSameTurn(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
@@ -269,6 +439,29 @@ function latestNodeInSameTurn(nodes: RenderNode[], node: RenderNode): RenderNode
   return undefined;
 }
 
+function hasNonStreamTimelineBoundaryAfter(nodes: RenderNode[], index: number, node: RenderNode): boolean {
+  for (let nextIndex = index + 1; nextIndex < nodes.length; nextIndex += 1) {
+    const candidate = nodes[nextIndex];
+    if (candidate && sameTimelineScope(candidate, node) && isFinalNonStreamBoundary(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isFinalNonStreamBoundary(node: RenderNode): boolean {
+  if (isStreamNode(node)) {
+    return false;
+  }
+  if (node.kind === "tool") {
+    return isFinalRenderStatus(node.status) || isFinalRenderStatus(node.toolStatus);
+  }
+  if (node.kind === "terminal") {
+    return isFinalRenderStatus(node.status) || isFinalRenderStatus(node.terminalStatus);
+  }
+  return isFinalRenderStatus(node.status);
+}
+
 function sameTimelineScope(left: RenderNode, right: RenderNode): boolean {
   return (
     left.taskId === right.taskId &&
@@ -279,8 +472,148 @@ function sameTimelineScope(left: RenderNode, right: RenderNode): boolean {
   );
 }
 
-function nextAnonymousStreamNodeId(nodes: RenderNode[], node: AnonymousStreamNode): string {
-  const base = node.kind === "message" ? `message:${node.role}:anonymous` : "thought:anonymous";
+function normalizeCollidingUpsertNode<TNode extends RenderNode>(nodes: RenderNode[], node: TNode): TNode {
+  const existingIndex = nodes.findIndex((candidate) => candidate.id === node.id);
+  const existingById = existingIndex >= 0 ? nodes[existingIndex] : undefined;
+  if (!existingById || canUpdateExistingNodeById(nodes, existingIndex, node)) {
+    return node;
+  }
+  const semanticMatch = findSameSemanticNode(nodes, node);
+  if (semanticMatch) {
+    return {
+      ...node,
+      id: semanticMatch.id,
+      createdAt: semanticMatch.createdAt,
+      timelineOrder: semanticMatch.timelineOrder
+    };
+  }
+  return {
+    ...node,
+    id: nextScopedCollisionNodeId(nodes, node)
+  };
+}
+
+function canUpdateExistingNodeById(nodes: RenderNode[], existingIndex: number, incoming: RenderNode): boolean {
+  const existing = nodes[existingIndex];
+  if (!existing) {
+    return false;
+  }
+  if (existing.kind !== incoming.kind) {
+    return false;
+  }
+  if (sameTimelineScope(existing, incoming)) {
+    return (
+      !hasExternalTimelineBoundaryAfter(nodes, existingIndex, incoming) ||
+      canUpdateAfterExternalBoundary(existing, incoming)
+    );
+  }
+  const existingKey = semanticNodeKey(existing);
+  return existingKey !== undefined && existingKey === semanticNodeKey(incoming);
+}
+
+function hasExternalTimelineBoundaryAfter(nodes: RenderNode[], index: number, node: RenderNode): boolean {
+  for (let nextIndex = index + 1; nextIndex < nodes.length; nextIndex += 1) {
+    const candidate = nodes[nextIndex];
+    if (!candidate || !sameTimelineScope(candidate, node) || isSameToolFamilyNode(candidate, node)) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function isSameToolFamilyNode(candidate: RenderNode, node: RenderNode): boolean {
+  const toolCallId = node.kind === "tool" ? node.toolCallId : node.acpToolCallId;
+  if (!toolCallId) {
+    return false;
+  }
+  return candidate.acpToolCallId === toolCallId && (candidate.kind === "terminal" || candidate.kind === "diff");
+}
+
+function canUpdateAfterExternalBoundary(existing: RenderNode, incoming: RenderNode): boolean {
+  if (isActiveRenderStatus(existing.status)) {
+    return true;
+  }
+  if (existing.kind === "tool" && incoming.kind === "tool") {
+    return rawSessionUpdate(incoming) === "tool_call_update";
+  }
+  if (existing.kind === "terminal" && incoming.kind === "terminal") {
+    return isActiveRenderStatus(existing.terminalStatus);
+  }
+  return incoming.kind !== "tool" && incoming.kind !== "terminal" && incoming.kind !== "diff";
+}
+
+function rawSessionUpdate(node: RenderNode): string | undefined {
+  const raw = node.raw;
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const value = (raw as { sessionUpdate?: unknown }).sessionUpdate;
+  return typeof value === "string" ? value : undefined;
+}
+
+function findSameSemanticNode(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
+  const key = semanticNodeKey(node);
+  if (!key) {
+    return undefined;
+  }
+  return nodes.find((candidate) => candidate.id !== node.id && semanticNodeKey(candidate) === key);
+}
+
+function semanticNodeKey(node: RenderNode): string | undefined {
+  const scope = `${node.taskId}\u0000${node.lane}\u0000${node.turnId || ""}\u0000${node.acpSessionId || ""}\u0000${node.source}`;
+  switch (node.kind) {
+    case "tool":
+      return `${scope}\u0000tool\u0000${node.acpToolCallId || node.toolCallId}`;
+    case "terminal":
+      return `${scope}\u0000terminal\u0000${node.acpToolCallId || ""}\u0000${node.terminalId}`;
+    case "diff":
+      return `${scope}\u0000diff\u0000${node.acpToolCallId || ""}\u0000${node.path}`;
+    case "approval":
+      return `${scope}\u0000approval\u0000${node.requestId}`;
+    case "plan":
+      return `${scope}\u0000plan`;
+    case "resource":
+      return `${scope}\u0000resource\u0000${node.id}`;
+    default:
+      return undefined;
+  }
+}
+
+function nextScopedCollisionNodeId(nodes: RenderNode[], node: RenderNode): string {
+  const used = new Set(nodes.map((candidate) => candidate.id));
+  const suffix = scopedCollisionSuffix(node);
+  const base = suffix ? `${node.id}:${suffix}` : node.id;
+  if (!used.has(base)) {
+    return base;
+  }
+  for (let sequence = 2; sequence < Number.MAX_SAFE_INTEGER; sequence += 1) {
+    const id = `${base}:${sequence}`;
+    if (!used.has(id)) {
+      return id;
+    }
+  }
+  return `${base}:${Date.now()}`;
+}
+
+function scopedCollisionSuffix(node: RenderNode): string {
+  return sanitizeIdSegment(
+    [node.turnId, node.acpSessionId, node.source].filter(Boolean).join(":") ||
+      `${node.taskId}:${node.lane}`
+  );
+}
+
+function sanitizeIdSegment(value: string): string {
+  return value
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function nextStreamNodeId(nodes: RenderNode[], node: StreamNode): string {
+  const base = node.kind === "message"
+    ? `message:${node.role}:${node.acpMessageId || "anonymous"}`
+    : `thought:${node.acpMessageId || "anonymous"}`;
   const used = new Set(nodes.map((candidate) => candidate.id));
   if (!used.has(base)) {
     return base;
@@ -388,7 +721,7 @@ function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] 
 
 function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode {
   if (existing.kind === "message" && incoming.kind === "message") {
-    const content = mergeAdjacentTextContentBlocks([...existing.content, ...incoming.content]);
+    const content = mergeStreamContentBlocks(existing.content, incoming.content);
     return {
       ...incoming,
       createdAt: existing.createdAt,
@@ -399,7 +732,7 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
     };
   }
   if (existing.kind === "thought" && incoming.kind === "thought") {
-    const content = mergeAdjacentTextContentBlocks([...existing.content, ...incoming.content]);
+    const content = mergeStreamContentBlocks(existing.content, incoming.content);
     return {
       ...incoming,
       createdAt: existing.createdAt,
@@ -427,6 +760,18 @@ function mergeRenderNode(existing: RenderNode, incoming: RenderNode): RenderNode
     return mergeTerminalNode(existing, incoming);
   }
   return incoming;
+}
+
+function mergeStreamContentBlocks(previous: ContentBlock[], incoming: ContentBlock[]): ContentBlock[] {
+  const previousText = contentBlocksToText(previous);
+  const incomingText = contentBlocksToText(incoming);
+  if (incomingText.startsWith(previousText)) {
+    return mergeAdjacentTextContentBlocks(incoming);
+  }
+  if (previousText.startsWith(incomingText)) {
+    return mergeAdjacentTextContentBlocks(previous);
+  }
+  return mergeAdjacentTextContentBlocks([...previous, ...incoming]);
 }
 
 function hasExplicitToolStatus(node: ToolNode): boolean {
@@ -626,7 +971,7 @@ const toolCallPatchRenderer: AcpUpdateRenderer<ToolCallPatchUpdate> = {
     if (update._meta) {
       base._meta = update._meta;
     }
-    return expandToolContent(toolNodeFromCall(base, context), context);
+    return expandToolContent({ ...toolNodeFromCall(base, context), raw: update }, context);
   }
 };
 
@@ -934,7 +1279,7 @@ function expandToolContent(tool: ToolNode, context: RenderReduceContext): Render
       patches.push({
         type: "upsert",
         node: {
-          id: `terminal:${terminalId}`,
+          id: terminalNodeId(tool.toolCallId, terminalId),
           kind: "terminal",
           taskId: context.taskId,
           lane: context.lane,
@@ -964,11 +1309,15 @@ function expandToolContent(tool: ToolNode, context: RenderReduceContext): Render
   return patches;
 }
 
+function terminalNodeId(toolCallId: string, terminalId: string): string {
+  return `terminal:${toolCallId}:${terminalId}`;
+}
+
 function syncExpandedTerminalNodesAndCollect(nodes: RenderNode[], tool: ToolNode): AppliedRenderPatches {
   let changed = false;
   const patches: RenderPatch[] = [];
   const next = nodes.map((node) => {
-    if (node.kind !== "terminal" || node.acpToolCallId !== tool.toolCallId) {
+    if (node.kind !== "terminal" || !terminalBelongsToToolScope(node, tool)) {
       return node;
     }
     const terminalStatus = syncTerminalStatusFromTool(node.terminalStatus, tool.toolStatus);
@@ -986,6 +1335,19 @@ function syncExpandedTerminalNodesAndCollect(nodes: RenderNode[], tool: ToolNode
     return updated;
   });
   return { nodes: changed ? next : nodes, patches };
+}
+
+function terminalBelongsToToolScope(terminal: TerminalNode, tool: ToolNode): boolean {
+  if (terminal.acpToolCallId !== tool.toolCallId || !sameTimelineScope(terminal, tool)) {
+    return false;
+  }
+  const suffix = scopedToolNodeSuffix(tool);
+  return suffix ? terminal.id.endsWith(`:${suffix}`) : true;
+}
+
+function scopedToolNodeSuffix(tool: ToolNode): string | undefined {
+  const base = `tool:${tool.toolCallId}:`;
+  return tool.id.startsWith(base) ? tool.id.slice(base.length) : undefined;
 }
 
 function syncTerminalStatusFromTool(current: string | undefined, next: string | undefined): string | undefined {

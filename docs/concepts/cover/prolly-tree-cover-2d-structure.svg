@@ -1,0 +1,339 @@
+<svg viewBox="0 0 1600 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Prolly Trees cover with multi-root structural sharing</title>
+  <desc id="desc">A 5:2 technical blog cover explaining Prolly trees as content-addressed ordered indexes. The diagram shows three version root CIDs, their root internal nodes, and a shared content-addressed node graph with internal nodes and leaves.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.6" opacity="0.7"/>
+    </pattern>
+    <radialGradient id="glow" cx="70%" cy="44%" r="60%">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.22"/>
+      <stop offset="43%" stop-color="#7c3aed" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#020617" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3.2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#34d399"/>
+    </marker>
+    <marker id="arrow-violet" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#fbbf24"/>
+    </marker>
+    <marker id="arrow-slate" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', Menlo, monospace; letter-spacing: 0; }
+      .title { fill: #f8fafc; font-size: 57px; font-weight: 800; }
+      .subtitle { fill: #a7b6ce; font-size: 21px; font-weight: 700; }
+      .h2 { fill: #dbeafe; font-size: 14px; font-weight: 800; }
+      .h3 { fill: #f8fafc; font-size: 12px; font-weight: 800; }
+      .body { fill: #aebbd0; font-size: 9px; font-weight: 500; }
+      .tiny { fill: #94a3b8; font-size: 7.5px; font-weight: 500; }
+      .micro { fill: #94a3b8; font-size: 6.8px; font-weight: 600; }
+      .mask { fill: #0f172a; }
+      .panel-cyan { fill: #082f49; fill-opacity: 0.48; stroke: #22d3ee; stroke-width: 1.6; }
+      .panel-green { fill: #064e3b; fill-opacity: 0.48; stroke: #34d399; stroke-width: 1.6; }
+      .panel-violet { fill: #2e1065; fill-opacity: 0.52; stroke: #a78bfa; stroke-width: 1.6; }
+      .panel-amber { fill: #451a03; fill-opacity: 0.42; stroke: #fbbf24; stroke-width: 1.5; }
+      .panel-slate { fill: #1e293b; fill-opacity: 0.54; stroke: #94a3b8; stroke-width: 1.3; }
+      .line { fill: none; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+      .thin { fill: none; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
+      .dash { stroke-dasharray: 7 7; }
+      .cyan { stroke: #22d3ee; }
+      .green { stroke: #34d399; }
+      .violet { stroke: #a78bfa; }
+      .amber { stroke: #fbbf24; }
+      .slate { stroke: #94a3b8; }
+      .chip-text { fill: #dbeafe; font-size: 7.5px; font-weight: 700; text-anchor: middle; }
+      .slot-text { fill: #e0f2fe; font-size: 7.4px; font-weight: 800; text-anchor: middle; }
+      .cell-text { fill: #aebbd0; font-size: 7px; font-weight: 600; text-anchor: middle; }
+      .legend { fill: #cbd5e1; font-size: 8px; font-weight: 600; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="640" fill="#020617"/>
+  <rect width="1600" height="640" fill="#0f172a"/>
+  <rect width="1600" height="640" fill="url(#grid)"/>
+  <rect width="1600" height="640" fill="url(#glow)"/>
+
+  <!-- ambient motifs -->
+  <g opacity="0.24">
+    <path d="M1470 54 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+    <path d="M1520 54 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+    <path d="M1570 54 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+    <path d="M1520 112 h34 l18 29 -18 29 h-34 l-18 -29 Z" fill="none" stroke="#38bdf8" stroke-width="2"/>
+  </g>
+
+  <!-- Left editorial column -->
+  <text x="50" y="84" class="title">Prolly Trees</text>
+  <text x="54" y="126" class="subtitle">Content-addressed ordered indexes</text>
+  <text x="54" y="154" class="subtitle">for versioned data</text>
+
+  <g transform="translate(56,224)">
+    <rect class="mask" width="410" height="174" rx="14"/>
+    <rect class="panel-cyan" width="410" height="174" rx="14"/>
+    <text x="28" y="35" class="h3">What it is</text>
+
+    <g transform="translate(28,58)">
+      <rect class="panel-violet" width="166" height="30" rx="15"/>
+      <text x="83" y="19" class="chip-text">B+tree-like shape</text>
+      <rect class="panel-green" x="188" width="166" height="30" rx="15"/>
+      <text x="271" y="19" class="chip-text">Merkle identity</text>
+      <rect class="panel-cyan" y="44" width="166" height="30" rx="15"/>
+      <text x="83" y="63" class="chip-text">ordered key/value map</text>
+      <rect class="panel-amber" x="188" y="44" width="166" height="30" rx="15"/>
+      <text x="271" y="63" class="chip-text">content-defined chunks</text>
+    </g>
+
+    <line x1="28" y1="144" x2="382" y2="144" stroke="#22d3ee" stroke-opacity="0.25"/>
+    <text x="28" y="160" class="body">Leaves store user data; internal slots route to child CIDs.</text>
+  </g>
+
+  <g transform="translate(56,424)">
+    <rect class="mask" width="410" height="92" rx="14"/>
+    <rect class="panel-slate" width="410" height="92" rx="14"/>
+    <text x="30" y="39" fill="#e2e8f0" font-size="24" font-weight="800">same CID</text>
+    <text x="208" y="39" fill="#a7b6ce" font-size="17" font-weight="800">= same subtree</text>
+    <text x="30" y="68" class="body">A version is a small root handle over a shared node graph.</text>
+  </g>
+
+  <g transform="translate(56,540)">
+    <rect class="mask" width="410" height="56" rx="12"/>
+    <rect class="panel-green" width="410" height="56" rx="12"/>
+    <text x="28" y="24" class="body" fill="#d1fae5">Use cases: snapshots, diff, merge, sync, audit history</text>
+    <text x="28" y="42" class="tiny">Cheap history comes from root CIDs plus structural sharing.</text>
+  </g>
+
+  <!-- Main structural diagram -->
+  <g>
+    <rect x="500" y="40" width="1050" height="556" rx="22" fill="none" stroke="#64748b" stroke-width="1.2" stroke-dasharray="7 7" opacity="0.62"/>
+    <text x="530" y="74" class="h2">Each version root points to a tree root</text>
+    <text x="530" y="96" class="body">The node graph below is content-addressed: unchanged child CIDs are one shared physical subtree.</text>
+  </g>
+
+  <!-- Version lineage and root CID cards -->
+  <g opacity="0.88">
+    <path class="thin slate dash" d="M755 146 H920" marker-end="url(#arrow-slate)"/>
+    <path class="thin slate dash" d="M1110 146 H1276" marker-end="url(#arrow-slate)"/>
+    <text x="1016" y="129" class="micro" text-anchor="middle">version DAG lineage</text>
+  </g>
+
+  <g transform="translate(548,116)" filter="url(#softGlow)">
+    <rect class="mask" width="208" height="60" rx="12"/>
+    <rect class="panel-cyan" width="208" height="60" rx="12"/>
+    <text x="104" y="25" class="h3" text-anchor="middle">v1 root CID</text>
+    <text x="104" y="44" class="body" text-anchor="middle">a8f3...7c9d</text>
+  </g>
+  <g transform="translate(920,116)" filter="url(#softGlow)">
+    <rect class="mask" width="208" height="60" rx="12"/>
+    <rect class="panel-green" width="208" height="60" rx="12"/>
+    <text x="104" y="25" class="h3" text-anchor="middle">v2 root CID</text>
+    <text x="104" y="44" class="body" text-anchor="middle">d4c8...b7a1</text>
+  </g>
+  <g transform="translate(1278,116)" filter="url(#softGlow)">
+    <rect class="mask" width="208" height="60" rx="12"/>
+    <rect class="panel-violet" width="208" height="60" rx="12"/>
+    <text x="104" y="25" class="h3" text-anchor="middle">v3 root CID</text>
+    <text x="104" y="44" class="body" text-anchor="middle">9f1a...e3b2</text>
+  </g>
+
+  <!-- CID to root node arrows -->
+  <path class="line amber" d="M652 176 V212" marker-end="url(#arrow-amber)"/>
+  <path class="line amber" d="M1024 176 V212" marker-end="url(#arrow-amber)"/>
+  <path class="line amber" d="M1382 176 V212" marker-end="url(#arrow-amber)"/>
+
+  <!-- Root internal nodes: each root has its own root CID and slots -->
+  <g transform="translate(548,212)">
+    <rect class="mask" width="208" height="92" rx="10"/>
+    <rect class="panel-violet" width="208" height="92" rx="10"/>
+    <text x="104" y="22" class="h3" text-anchor="middle">Root internal A</text>
+    <text x="104" y="38" class="tiny" text-anchor="middle">level 2, leaf=false</text>
+    <line x1="0" y1="47" x2="208" y2="47" stroke="#a78bfa" stroke-opacity="0.42"/>
+    <line x1="69" y1="47" x2="69" y2="92" stroke="#a78bfa" stroke-opacity="0.35"/>
+    <line x1="139" y1="47" x2="139" y2="92" stroke="#a78bfa" stroke-opacity="0.35"/>
+    <text x="34" y="62" class="slot-text">P0</text>
+    <text x="104" y="62" class="slot-text">P1</text>
+    <text x="174" y="62" class="slot-text">P2</text>
+    <text x="34" y="78" class="cell-text">S_left</text>
+    <text x="104" y="78" class="cell-text">M_old</text>
+    <text x="174" y="78" class="cell-text">S_right</text>
+  </g>
+
+  <g transform="translate(920,212)">
+    <rect class="mask" width="208" height="92" rx="10"/>
+    <rect class="panel-green" width="208" height="92" rx="10"/>
+    <text x="104" y="22" class="h3" text-anchor="middle">Root internal B</text>
+    <text x="104" y="38" class="tiny" text-anchor="middle">level 2, leaf=false</text>
+    <line x1="0" y1="47" x2="208" y2="47" stroke="#34d399" stroke-opacity="0.42"/>
+    <line x1="69" y1="47" x2="69" y2="92" stroke="#34d399" stroke-opacity="0.35"/>
+    <line x1="139" y1="47" x2="139" y2="92" stroke="#34d399" stroke-opacity="0.35"/>
+    <text x="34" y="62" class="slot-text">P0</text>
+    <text x="104" y="62" class="slot-text">P1</text>
+    <text x="174" y="62" class="slot-text">P2</text>
+    <text x="34" y="78" class="cell-text">S_left</text>
+    <text x="104" y="78" class="cell-text">M_new</text>
+    <text x="174" y="78" class="cell-text">S_right</text>
+  </g>
+
+  <g transform="translate(1278,212)">
+    <rect class="mask" width="208" height="92" rx="10"/>
+    <rect class="panel-violet" width="208" height="92" rx="10"/>
+    <text x="104" y="22" class="h3" text-anchor="middle">Root internal C</text>
+    <text x="104" y="38" class="tiny" text-anchor="middle">level 2, leaf=false</text>
+    <line x1="0" y1="47" x2="208" y2="47" stroke="#a78bfa" stroke-opacity="0.42"/>
+    <line x1="69" y1="47" x2="69" y2="92" stroke="#a78bfa" stroke-opacity="0.35"/>
+    <line x1="139" y1="47" x2="139" y2="92" stroke="#a78bfa" stroke-opacity="0.35"/>
+    <text x="34" y="62" class="slot-text">P0</text>
+    <text x="104" y="62" class="slot-text">P1</text>
+    <text x="174" y="62" class="slot-text">P2</text>
+    <text x="34" y="78" class="cell-text">S_left</text>
+    <text x="104" y="78" class="cell-text">M_new</text>
+    <text x="174" y="78" class="cell-text">R_delta</text>
+  </g>
+
+  <!-- Shared content-addressed graph boundary -->
+  <g>
+    <rect x="530" y="326" width="990" height="236" rx="16" fill="#020617" fill-opacity="0.16" stroke="#334155" stroke-width="1"/>
+    <rect x="684" y="334" width="396" height="22" rx="8" fill="#0f172a" fill-opacity="0.88"/>
+    <text x="882" y="349" fill="#bbf7d0" font-size="11" font-weight="800" text-anchor="middle">Shared content-addressed node graph</text>
+    <text x="546" y="374" class="micro">internal level 1</text>
+    <text x="546" y="474" class="micro">leaf level 0</text>
+  </g>
+
+  <!-- Minimal root-to-child reference arrows: only one per distinct child node, slot tables show the rest -->
+  <path class="thin green" d="M582 304 V360 H620 V390" marker-end="url(#arrow-green)" opacity="0.92"/>
+  <path class="thin violet" d="M652 304 V360 H808 V400" marker-end="url(#arrow-violet)" opacity="0.88"/>
+  <path class="thin green" d="M1024 304 V390" marker-end="url(#arrow-green)" opacity="0.92"/>
+  <path class="thin green" d="M1094 304 V360 H1242 V390" marker-end="url(#arrow-green)" opacity="0.92"/>
+  <path class="thin violet" d="M1452 304 V360 H1436 V400" marker-end="url(#arrow-violet)" opacity="0.88"/>
+  <text x="1218" y="316" class="micro">root slot names match child CID names below</text>
+
+  <!-- Internal node layer -->
+  <g transform="translate(556,390)">
+    <rect class="mask" width="176" height="66" rx="10"/>
+    <rect class="panel-green" width="176" height="66" rx="10"/>
+    <text x="88" y="21" class="h3" text-anchor="middle">S_left</text>
+    <text x="88" y="39" fill="#bbf7d0" font-size="8" font-weight="800" text-anchor="middle">A.P0 + B.P0 + C.P0</text>
+    <text x="88" y="56" class="tiny" text-anchor="middle">CID 11aa...  range [a,m)</text>
+  </g>
+
+  <g transform="translate(760,400)">
+    <rect class="mask" width="142" height="56" rx="10"/>
+    <rect class="panel-violet" width="142" height="56" rx="10"/>
+    <text x="71" y="20" class="h3" text-anchor="middle">M_old</text>
+    <text x="71" y="37" class="tiny" text-anchor="middle">A.P1 only</text>
+    <text x="71" y="51" class="tiny" text-anchor="middle">range [m,t)</text>
+  </g>
+
+  <g transform="translate(936,390)">
+    <rect class="mask" width="176" height="66" rx="10"/>
+    <rect class="panel-green" width="176" height="66" rx="10"/>
+    <text x="88" y="21" class="h3" text-anchor="middle">M_new</text>
+    <text x="88" y="39" fill="#bbf7d0" font-size="8" font-weight="800" text-anchor="middle">B.P1 + C.P1</text>
+    <text x="88" y="56" class="tiny" text-anchor="middle">CID 33cc...  range [m,t)</text>
+  </g>
+
+  <g transform="translate(1140,390)">
+    <rect class="mask" width="176" height="66" rx="10"/>
+    <rect class="panel-green" width="176" height="66" rx="10"/>
+    <text x="88" y="21" class="h3" text-anchor="middle">S_right</text>
+    <text x="88" y="39" fill="#bbf7d0" font-size="8" font-weight="800" text-anchor="middle">A.P2 + B.P2</text>
+    <text x="88" y="56" class="tiny" text-anchor="middle">CID 44dd...  range [t,end)</text>
+  </g>
+
+  <g transform="translate(1360,400)">
+    <rect class="mask" width="142" height="56" rx="10"/>
+    <rect class="panel-violet" width="142" height="56" rx="10"/>
+    <text x="71" y="20" class="h3" text-anchor="middle">R_delta</text>
+    <text x="71" y="37" class="tiny" text-anchor="middle">C.P2 only</text>
+    <text x="71" y="51" class="tiny" text-anchor="middle">range [t,end)</text>
+  </g>
+
+  <!-- Internal-to-leaf arrows -->
+  <path class="thin green" d="M600 456 V480" marker-end="url(#arrow-green)"/>
+  <path class="thin green" d="M688 456 V480" marker-end="url(#arrow-green)"/>
+  <path class="thin violet" d="M831 456 V480" marker-end="url(#arrow-violet)"/>
+  <path class="thin green" d="M1024 456 V480" marker-end="url(#arrow-green)"/>
+  <path class="thin green" d="M1184 456 V480" marker-end="url(#arrow-green)"/>
+  <path class="thin green" d="M1272 456 V480" marker-end="url(#arrow-green)"/>
+  <path class="thin violet" d="M1431 456 V480" marker-end="url(#arrow-violet)"/>
+
+  <!-- Leaf layer -->
+  <g transform="translate(548,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-cyan" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">Leaf [a,g)</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">key/value data</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">level 0</text>
+  </g>
+  <g transform="translate(664,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-cyan" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">Leaf [g,m)</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">key/value data</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">level 0</text>
+  </g>
+  <g transform="translate(782,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-violet" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">Old leaf</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">v1 span</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">changed later</text>
+  </g>
+  <g transform="translate(972,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-cyan" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">New leaf</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">v2/v3 span</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">shared CID</text>
+  </g>
+  <g transform="translate(1132,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-cyan" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">Leaf [t,x)</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">unchanged</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">shared CID</text>
+  </g>
+  <g transform="translate(1248,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-cyan" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">Leaf [x,z)</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">unchanged</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">shared CID</text>
+  </g>
+  <g transform="translate(1379,482)">
+    <rect class="mask" width="104" height="58" rx="8"/>
+    <rect class="panel-violet" width="104" height="58" rx="8"/>
+    <text x="52" y="20" class="h3" text-anchor="middle">Delta leaf</text>
+    <text x="52" y="37" class="tiny" text-anchor="middle">v3 update</text>
+    <text x="52" y="50" class="micro" text-anchor="middle">new CID</text>
+  </g>
+
+  <!-- Legend and footer -->
+  <g transform="translate(552,546)">
+    <circle cx="8" cy="8" r="5" fill="#34d399"/>
+    <text x="20" y="11" class="legend">shared subtree</text>
+    <circle cx="142" cy="8" r="5" fill="#a78bfa"/>
+    <text x="154" y="11" class="legend">changed subtree</text>
+    <circle cx="286" cy="8" r="5" fill="#fbbf24"/>
+    <text x="298" y="11" class="legend">root CID points to root node</text>
+    <text x="640" y="11" class="legend">Leaves are level 0; parents increment upward; root is the highest level.</text>
+  </g>
+
+  <g transform="translate(500,606)">
+    <rect class="mask" width="1050" height="28" rx="10"/>
+    <rect width="1050" height="28" rx="10" fill="#1e293b" fill-opacity="0.52" stroke="#64748b" stroke-width="1"/>
+    <text x="525" y="19" fill="#cbd5e1" font-size="8.6" font-weight="600" text-anchor="middle">Git-like idea: every version has a root handle; unchanged serialized nodes keep the same CID and are shared by content.</text>
+  </g>
+</svg>

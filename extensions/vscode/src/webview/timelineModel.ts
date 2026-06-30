@@ -1,5 +1,5 @@
 import type { ContentBlock, ToolCallContent } from "../shared/acpTypes";
-import type { RenderNode } from "../shared/renderModel";
+import type { RenderNode, ToolPermissionRequest } from "../shared/renderModel";
 import { buildToolPresentation } from "./toolModel";
 
 export const TIMELINE_FILTERS = [
@@ -61,10 +61,120 @@ export function transcriptTimelineNodes(nodes: RenderNode[]): RenderNode[] {
   return nodes.filter(isTranscriptTimelineNode);
 }
 
+export function timelineDisplayNodes(nodes: RenderNode[]): RenderNode[] {
+  const visible = transcriptTimelineNodes(nodes);
+  const approvalsByTool = approvalsByScopedToolCallId(visible);
+  const visibleToolKeys = new Set(
+    visible
+      .filter((node): node is Extract<RenderNode, { kind: "tool" }> => node.kind === "tool")
+      .map(scopedToolCallKey)
+  );
+  return visible.flatMap<RenderNode>((node) => {
+    if (node.kind === "tool") {
+      const approval = approvalsByTool.get(scopedToolCallKey(node));
+      return [approval ? { ...node, permission: permissionFromApproval(approval) } : node];
+    }
+    if (node.kind === "approval") {
+      const key = approvalScopedToolCallKey(node);
+      if (key && visibleToolKeys.has(key)) {
+        return [];
+      }
+      return [approvalAsToolNode(node)];
+    }
+    return [node];
+  });
+}
+
 export function sortTimelineNodes(nodes: RenderNode[]): RenderNode[] {
   return [...nodes].sort((left, right) =>
     sortOrder(left) - sortOrder(right) || sortTime(left) - sortTime(right)
   );
+}
+
+function approvalsByScopedToolCallId(nodes: RenderNode[]): Map<string, Extract<RenderNode, { kind: "approval" }>> {
+  const approvals = new Map<string, Extract<RenderNode, { kind: "approval" }>>();
+  for (const node of nodes) {
+    if (node.kind !== "approval") {
+      continue;
+    }
+    const key = approvalScopedToolCallKey(node);
+    if (key) {
+      approvals.set(key, node);
+    }
+  }
+  return approvals;
+}
+
+function approvalScopedToolCallKey(node: Extract<RenderNode, { kind: "approval" }>): string {
+  return scopedToolCallKey({
+    taskId: node.taskId,
+    lane: node.lane,
+    turnId: node.turnId,
+    acpSessionId: node.acpSessionId,
+    source: node.source,
+    toolCallId: node.tool.toolCallId
+  });
+}
+
+function scopedToolCallKey(node: {
+  taskId: string;
+  lane: string;
+  turnId?: string | undefined;
+  acpSessionId?: string | undefined;
+  source: RenderNode["source"];
+  toolCallId: string;
+}): string {
+  return [
+    node.taskId,
+    node.lane,
+    node.turnId || "",
+    node.acpSessionId || "",
+    node.source,
+    node.toolCallId
+  ].join("\u0000");
+}
+
+function approvalAsToolNode(node: Extract<RenderNode, { kind: "approval" }>): Extract<RenderNode, { kind: "tool" }> {
+  const permission = permissionFromApproval(node);
+  const toolStatus =
+    node.status === "cancelled" || node.status === "failed"
+      ? node.status
+      : node.tool.toolStatus;
+  return {
+    ...node.tool,
+    id: node.id,
+    taskId: node.taskId,
+    lane: node.lane,
+    turnId: node.turnId,
+    acpSessionId: node.acpSessionId,
+    provider: node.provider,
+    source: node.source,
+    status: node.status,
+    createdAt: node.createdAt || node.tool.createdAt,
+    updatedAt: node.updatedAt,
+    toolStatus,
+    permission
+  };
+}
+
+function permissionFromApproval(node: Extract<RenderNode, { kind: "approval" }>): ToolPermissionRequest {
+  const permission: ToolPermissionRequest = {
+    requestId: node.requestId,
+    title: node.title,
+    status: node.status,
+    options: node.options,
+    raw: node.raw
+  };
+  if (node.provider) {
+    permission.provider = node.provider;
+  }
+  if (node.createdAt) {
+    permission.createdAt = node.createdAt;
+  }
+  if (node.updatedAt) {
+    permission.updatedAt = node.updatedAt;
+  }
+  return permission;
 }
 
 function sortOrder(node: RenderNode): number {
@@ -72,8 +182,16 @@ function sortOrder(node: RenderNode): number {
 }
 
 function sortTime(node: RenderNode): number {
-  const time = Date.parse(node.createdAt || node.updatedAt || "");
-  return Number.isNaN(time) ? Infinity : time;
+  for (const value of [node.createdAt, node.updatedAt]) {
+    if (!value) {
+      continue;
+    }
+    const time = Date.parse(value);
+    if (!Number.isNaN(time)) {
+      return time;
+    }
+  }
+  return Infinity;
 }
 
 function isTranscriptTimelineNode(node: RenderNode): boolean {
@@ -87,7 +205,7 @@ function isTranscriptTimelineNode(node: RenderNode): boolean {
     case "tool":
       return !isRoutineInternalTool(node);
     case "unknown":
-      return false;
+      return !isRoutineInternalUnknown(node);
     default:
       return true;
   }
@@ -335,6 +453,11 @@ function isRoutineInternalTool(node: Extract<RenderNode, { kind: "tool" }>): boo
   }
   const title = normalizeTimelineSearchText(node.title);
   return title === "acp prompt turn" || title.startsWith("acp prompt turn (") || title.startsWith("span_started") || title.startsWith("span_ended");
+}
+
+function isRoutineInternalUnknown(node: Extract<RenderNode, { kind: "unknown" }>): boolean {
+  const label = normalizeTimelineSearchText(node.label);
+  return label === "span_started" || label === "span_ended" || label.startsWith("span_started (") || label.startsWith("span_ended (");
 }
 
 function toolContentText(content: ToolCallContent): string[] {

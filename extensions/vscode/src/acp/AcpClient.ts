@@ -220,7 +220,7 @@ export class AcpClient {
   private async requestWithAuthRetry<T>(
     method: string,
     params: unknown,
-    timeoutMs?: number
+    timeoutMs?: number | null
   ): Promise<T> {
     try {
       return await this.rpc.request<T>(method, params, timeoutMs);
@@ -265,7 +265,7 @@ export class AcpClient {
         sessionId: this.sessionId,
         prompt
       },
-      10 * 60 * 1000
+      null
     );
     this.listeners?.completed(response);
     return response;

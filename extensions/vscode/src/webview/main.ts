@@ -57,6 +57,7 @@ import {
   isTimelineFilter,
   sortTimelineNodes,
   TIMELINE_FILTERS,
+  timelineDisplayNodes,
   timelineSearchTokens,
   timelineFilterCounts,
   type TimelineFilter
@@ -80,7 +81,8 @@ import type {
   ToolCallApprovalAction,
   ToolCallApprovalProps,
   ToolCallCardLocation,
-  ToolCallCardProps
+  ToolCallCardProps,
+  ToolCallStructuredDetails
 } from "./ToolCallCard";
 import type { ToolCallGroupCardProps } from "./ToolCallGroupCard";
 import { summarizeToolCallGroup } from "./toolCallGroupSummary";
@@ -96,6 +98,7 @@ import {
   changedRenderNodes,
   applyRenderPatchesLocally,
   changedRenderNodesFromPatches,
+  hasTimelineStructuralChange,
   isHydratableNodePatchPayload,
   parseBaseRenderRevision,
   parseRenderRevision,
@@ -300,7 +303,7 @@ let payloadDisclosureCounter = 0;
 let inlineActionsCounter = 0;
 type ComposerSendMode = "fast" | "draft";
 const COMPOSER_SEND_MODES = new Set<ComposerSendMode>(["fast", "draft"]);
-const HIDDEN = new Set<RenderNode["kind"]>(["commands", "config", "mode", "session", "unknown", "usage"]);
+const HIDDEN = new Set<RenderNode["kind"]>(["commands", "config", "mode", "session", "usage"]);
 const COMPOSER_PROMPT_PRESETS: Array<{ id: string; label: string; detail: string; text: string; icon: IconName }> = [
   {
     id: "implement",
@@ -918,10 +921,15 @@ function routeRenderChanges({
     return;
   }
   if (hasAnyPatchChanges(visibleChanges)) {
+    if (hasTimelineStructuralChange(beforeNodes, state.nodes, visibleChanges)) {
+      scheduleTimelineStructureHydration({ includeChrome: needsChromeHydration });
+      return;
+    }
     if (canHydratePatchedNodes(visibleChanges)) {
       const immediateStreamingNodeIds = streamingTextDomPatchableNodeIds(visibleChanges);
       const keepBottomForDeferredNodes =
-        Boolean(immediateStreamingNodeIds.size) && isTimelinePinnedToBottom(document.querySelector<HTMLElement>(".timeline"));
+        Boolean(immediateStreamingNodeIds.size) &&
+        shouldKeepTimelinePinnedToBottom(document.querySelector<HTMLElement>(".timeline"));
       if (immediateStreamingNodeIds.size) {
         applyStreamingTextDomPatchesImmediately(immediateStreamingNodeIds);
       }
@@ -980,11 +988,19 @@ function hasAnyPatchChanges(changes: RenderPatchChanges): boolean {
 }
 
 function isTimelineVisibleNode(node: RenderNode): boolean {
-  return !HIDDEN.has(node.kind);
+  return !HIDDEN.has(node.kind) && !isRoutineInternalUnknownNode(node);
 }
 
 function isHiddenChromeNode(node: RenderNode): boolean {
   return HIDDEN.has(node.kind);
+}
+
+function isRoutineInternalUnknownNode(node: RenderNode): boolean {
+  if (node.kind !== "unknown") {
+    return false;
+  }
+  const label = String(node.label || "").replace(/\s+/g, " ").trim().toLowerCase();
+  return label === "span_started" || label === "span_ended" || label.startsWith("span_started (") || label.startsWith("span_ended (");
 }
 
 function isLocallyHydratablePatchPayload(patch: RenderPatch): boolean {
@@ -1076,7 +1092,7 @@ function changedNodeIdsWithout(nodeIds: Set<string>, excludedNodeIds: Set<string
 
 function applyStreamingTextDomPatchesImmediately(nodeIds: Set<string>): void {
   const timeline = document.querySelector<HTMLElement>(".timeline");
-  const restoreBottom = isTimelinePinnedToBottom(timeline);
+  const restoreBottom = shouldKeepTimelinePinnedToBottom(timeline);
   const fallbackNodeIds = new Set<string>();
   for (const nodeId of nodeIds) {
     const node = state.nodes.find((candidate) => candidate.id === nodeId);
@@ -1086,6 +1102,7 @@ function applyStreamingTextDomPatchesImmediately(nodeIds: Set<string>): void {
   }
   if (restoreBottom && timeline?.isConnected) {
     lockTimelineToBottom(timeline);
+    queueTimelineBottomRestore();
   }
   if (fallbackNodeIds.size) {
     schedulePatchedNodeHydration(fallbackNodeIds, { lockBottom: restoreBottom });
@@ -1275,7 +1292,8 @@ async function hydratePatchedNodes(): Promise<void> {
   const presentationRefreshNodeIds: string[] = [];
   const timeline = document.querySelector<HTMLElement>(".timeline");
   const restorePatchedBottom =
-    (forcePatchedBottomLock && Date.now() >= timelineBottomLockUserPauseUntil) || isTimelinePinnedToBottom(timeline);
+    (forcePatchedBottomLock && Date.now() >= timelineBottomLockUserPauseUntil) ||
+    shouldKeepTimelinePinnedToBottom(timeline);
   for (const nodeId of nodeIds) {
     if (!visibleIds.has(nodeId)) {
       continue;
@@ -1314,6 +1332,7 @@ async function hydratePatchedNodes(): Promise<void> {
   }
   if (streamedTextDomPatchApplied && restorePatchedBottom && timeline?.isConnected) {
     lockTimelineToBottom(timeline);
+    queueTimelineBottomRestore();
   }
   if (!needsIslandHydration) {
     return;
@@ -1328,6 +1347,7 @@ async function hydratePatchedNodes(): Promise<void> {
   }
   if (restorePatchedBottom && timeline?.isConnected) {
     lockTimelineToBottom(timeline);
+    queueTimelineBottomRestore();
   }
   window.requestAnimationFrame(() => {
     void highlightCodeBlocks();
@@ -1497,6 +1517,13 @@ function isTimelinePinnedToBottom(timeline: HTMLElement | null): boolean {
   return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 48;
 }
 
+function shouldKeepTimelinePinnedToBottom(timeline: HTMLElement | null): boolean {
+  if (isTimelinePinnedToBottom(timeline)) {
+    return true;
+  }
+  return timelineBottomLockPinned && Date.now() >= timelineBottomLockUserPauseUntil;
+}
+
 function restoreTimelineScrollFromFocus(focus: RenderFocusSnapshot): void {
   const timeline = document.querySelector<HTMLElement>(".timeline");
   if (!timeline) {
@@ -1510,6 +1537,7 @@ function restoreTimelineScrollFromFocus(focus: RenderFocusSnapshot): void {
   }
   if (focus.wasPinnedToBottom) {
     lockTimelineToBottom(timeline);
+    queueTimelineBottomRestore();
     return;
   }
   timeline.scrollTop = focus.previousScrollTop;
@@ -1524,6 +1552,7 @@ function restoreTimelineBottomAfterIslandHydration(focus: RenderFocusSnapshot): 
   const timeline = document.querySelector<HTMLElement>(".timeline");
   if (timeline) {
     lockTimelineToBottom(timeline);
+    queueTimelineBottomRestore();
   }
 }
 
@@ -1718,9 +1747,7 @@ function captureRenderFocus(): RenderFocusSnapshot {
   const searchSelectionEnd = timelineSearchFocused ? active?.selectionEnd : undefined;
   const oldTimeline = document.querySelector<HTMLElement>(".timeline");
   const hadTimeline = Boolean(oldTimeline);
-  const wasPinnedToBottom = oldTimeline
-    ? oldTimeline.scrollHeight - oldTimeline.scrollTop - oldTimeline.clientHeight < 48
-    : true;
+  const wasPinnedToBottom = shouldKeepTimelinePinnedToBottom(oldTimeline);
   const previousScrollTop = oldTimeline?.scrollTop ?? 0;
 
   return {
@@ -2711,6 +2738,7 @@ function emptyStateAction(name: string, label: string, icon: IconName, tone: "pr
 
 interface TimelineGroup {
   key: string;
+  baseKey: string;
   label: string;
   detail: string;
   turnId?: string | undefined;
@@ -2839,13 +2867,17 @@ function timelineGroupDomId(group: TimelineGroup): string {
 
 function timelineGroups(nodes: RenderNode[]): TimelineGroup[] {
   const groups: TimelineGroup[] = [];
-  const byKey = new Map<string, TimelineGroup>();
+  const segmentCounts = new Map<string, number>();
   for (const node of nodes) {
-    const key = node.turnId ? `turn:${node.turnId}` : "session";
-    let group = byKey.get(key);
-    if (!group) {
+    const baseKey = node.turnId ? `turn:${node.turnId}` : "session";
+    let group = groups[groups.length - 1];
+    if (group?.baseKey !== baseKey) {
+      const segmentCount = (segmentCounts.get(baseKey) || 0) + 1;
+      segmentCounts.set(baseKey, segmentCount);
+      const key = segmentCount === 1 ? baseKey : `${baseKey}:segment-${segmentCount}`;
       group = {
         key,
+        baseKey,
         label: "",
         detail: "",
         turnId: node.turnId,
@@ -2855,7 +2887,6 @@ function timelineGroups(nodes: RenderNode[]): TimelineGroup[] {
         index: groups.length,
         nodes: []
       };
-      byKey.set(key, group);
       groups.push(group);
     }
     group.nodes.push(node);
@@ -3122,7 +3153,8 @@ function toolCallCardPropsFromNode(node: ToolNodeView): ToolCallCardProps {
   const title = terminal ? "Bash" : model.title;
   const subtitle = terminal ? terminalToolIntent(node, model) : model.summary;
   const readPreview = model.kind === "read" && node.content.some((content) => renderedToolContentType(content) === "text");
-  const renderGenericEmptyState = !node.permission && model.kind !== "edit" && model.kind !== "think";
+  const details = toolStructuredDetails(node, model);
+  const renderGenericEmptyState = !node.permission && !details && model.kind !== "edit" && model.kind !== "think";
   const contentHtml = terminal
     ? terminalToolPreview(node, model)
     : node.content.length
@@ -3144,8 +3176,208 @@ function toolCallCardPropsFromNode(node: ToolNodeView): ToolCallCardProps {
     actions: model.actions,
     locations: node.locations.map(toolCallCardLocation),
     contentHtml,
-    approval
+    approval,
+    details
   };
+}
+
+const BACKGROUND_PROCESS_STRUCTURED_KEYS = new Set(["id", "status", "pid", "cwd", "command", "last_output"]);
+const BACKGROUND_PROCESS_LABEL: Record<string, string> = {
+  command: "Command",
+  cwd: "Cwd",
+  id: "Process id",
+  last_output: "Last output",
+  pid: "PID",
+  status: "Status"
+};
+const BACKGROUND_PROCESS_TITLE: Record<string, string> = {
+  list: "List background processes",
+  logs: "View background logs",
+  restart: "Restart background process",
+  start: "Start background process",
+  status: "Check background process",
+  stop: "Stop background process"
+};
+
+function toolStructuredDetails(
+  node: ToolNodeView,
+  model: ToolPresentation
+): ToolCallStructuredDetails | undefined {
+  if (model.kind === "background_process") {
+    return backgroundProcessDetails(node);
+  }
+  if (model.kind === "task") {
+    return taskToolDetails(node, model);
+  }
+  return undefined;
+}
+
+function backgroundProcessDetails(node: ToolNodeView): ToolCallStructuredDetails | undefined {
+  const input = toolArgumentRecord(asRecord(node.rawInput));
+  const output = asRecord(node.rawOutput);
+  const action = textValue(input.action) || "status";
+  const parsedOutput = backgroundProcessStructuredOutput(toolOutputText(node, output));
+  const rows: ToolCallStructuredDetails["rows"] = [];
+  const command = terminalCommand(input) || terminalCommand(output) || findStructuredRowValue(parsedOutput.rows, "Command");
+  const processId =
+    textValue(output.id) ||
+    textValue(output.processID) ||
+    textValue(output.processId) ||
+    textValue(output.process_id) ||
+    textValue(input.id) ||
+    textValue(input.processID) ||
+    textValue(input.processId) ||
+    textValue(input.process_id);
+  const status = textValue(output.status) || textValue(output.state) || textValue(input.status) || textValue(input.state);
+  const pid = textValue(output.pid) || textValue(input.pid);
+  const cwd =
+    textValue(output.cwd) ||
+    textValue(output.workingDirectory) ||
+    textValue(output.working_directory) ||
+    textValue(input.cwd) ||
+    textValue(input.workingDirectory) ||
+    textValue(input.working_directory);
+  const workdir = cwd ? undefined : textValue(input.workdir);
+  const ready = asRecord(input.ready);
+
+  addStructuredRow(rows, "Command", command);
+  addStructuredRow(rows, "Description", textValue(input.description));
+  addStructuredRow(rows, "Process id", processId);
+  addStructuredRow(rows, "Status", status);
+  addStructuredRow(rows, "PID", pid);
+  addStructuredRow(rows, "Cwd", cwd);
+  addStructuredRow(rows, "Workdir", workdir);
+  addStructuredRow(rows, "Ports", textValue(ready.port));
+  for (const row of parsedOutput.rows) {
+    addStructuredRow(rows, row.label, row.value);
+  }
+
+  const details: ToolCallStructuredDetails = {
+    kind: "background_process",
+    title: BACKGROUND_PROCESS_TITLE[action] || "Background process",
+    description: textValue(input.description),
+    rows,
+    output: parsedOutput.output,
+    outputLabel: "Output"
+  };
+  return rows.length || details.output ? details : undefined;
+}
+
+function taskToolDetails(node: ToolNodeView, model: ToolPresentation): ToolCallStructuredDetails | undefined {
+  const input = toolArgumentRecord(asRecord(node.rawInput));
+  const output = asRecord(node.rawOutput);
+  const agent = textValue(input.subagent_type) || textValue(input.subagentType) || textValue(input.agent) || textValue(input.type);
+  const description = textValue(input.description) || textValue(input.prompt);
+  const sessionId =
+    textValue(asRecord(node.rawInput)._sessionId) ||
+    textValue(input.sessionId) ||
+    textValue(input.sessionID) ||
+    textValue(output.sessionId) ||
+    textValue(output.sessionID);
+  const result = taskResultText(output, node.content.length ? [] : terminalContentTexts(node.content));
+  const rows: ToolCallStructuredDetails["rows"] = [];
+
+  addStructuredRow(rows, "Agent", agent);
+  addStructuredRow(rows, "Session", sessionId);
+  addStructuredRow(rows, "Status", model.statusLabel);
+
+  return {
+    kind: "task",
+    title: agent ? `Agent task (${agent})` : "Delegated agent task",
+    description,
+    rows,
+    output: result,
+    outputLabel: "Result"
+  };
+}
+
+function backgroundProcessStructuredOutput(value: string | undefined): {
+  rows: ToolCallStructuredDetails["rows"];
+  output?: string | undefined;
+} {
+  if (!value) {
+    return { rows: [] };
+  }
+  const rows: ToolCallStructuredDetails["rows"] = [];
+  const rest: string[] = [];
+  for (const line of value.trimEnd().split("\n")) {
+    const match = line.match(/^([a-z_]+):\s*(.*)$/);
+    const key = match?.[1];
+    if (!key || !BACKGROUND_PROCESS_STRUCTURED_KEYS.has(key)) {
+      rest.push(line);
+      continue;
+    }
+    addStructuredRow(rows, BACKGROUND_PROCESS_LABEL[key] || key, match?.[2] || "");
+  }
+  return {
+    rows,
+    output: compactStructuredOutput(rest.join("\n"))
+  };
+}
+
+function taskResultText(output: Record<string, unknown>, contentTexts: string[]): string | undefined {
+  const candidates = [
+    textValue(output.result),
+    textValue(output.output),
+    textValue(output.text),
+    ...contentTexts
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    const match = /<task_result>\s*([\s\S]*?)\s*<\/task_result>/i.exec(candidate);
+    return compactStructuredOutput((match?.[1] || candidate).trim());
+  }
+  return undefined;
+}
+
+function toolOutputText(node: ToolNodeView, rawOutput: Record<string, unknown>): string | undefined {
+  return (
+    textValue(rawOutput.output) ||
+    textValue(rawOutput.stdout) ||
+    textValue(rawOutput.stderr) ||
+    textValue(rawOutput.last_output) ||
+    textValue(rawOutput.lastOutput) ||
+    terminalContentTexts(node.content).join("\n")
+  );
+}
+
+function findStructuredRowValue(rows: ToolCallStructuredDetails["rows"], label: string): string | undefined {
+  return rows.find((row) => row.label === label)?.value;
+}
+
+function addStructuredRow(rows: ToolCallStructuredDetails["rows"], label: string, value: string | undefined): void {
+  const text = compactStructuredValue(value);
+  if (!text || rows.some((row) => row.label === label)) {
+    return;
+  }
+  rows.push({ label, value: text });
+}
+
+function compactStructuredValue(value: string | undefined): string | undefined {
+  const text = value?.trim();
+  return text ? redactString(shortLabel(text)) : undefined;
+}
+
+function compactStructuredOutput(value: string | undefined): string | undefined {
+  const text = value?.trimEnd();
+  if (!text?.trim()) {
+    return undefined;
+  }
+  const redacted = redactString(text);
+  if (redacted.length <= 4_000) {
+    return redacted;
+  }
+  return `${redacted.slice(0, 2_000)}\n...\n${redacted.slice(-1_800)}`;
+}
+
+function textValue(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? text : undefined;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return undefined;
 }
 
 function toolNodeShell(node: ToolNodeView, props: ToolCallCardProps): string {
@@ -5587,7 +5819,7 @@ function markdownText(text: string): string {
     return markdownModule.renderMarkdown(text, {
       maxChars: MAX_TEXT_CHARS,
       renderCodeBlock: (code, language) =>
-        codeBlock(code, { language: language || "plaintext", title: "Message code block" })
+        codeBlock(code, { language: language || "plaintext", title: "Code" })
     });
   }
   void loadMarkdownRenderer();
@@ -5845,6 +6077,7 @@ function codeBlock(
   } = {}
 ): string {
   const language = cleanLanguage(options.language || "plaintext");
+  const languageLabel = language === "plaintext" ? "text" : language;
   const title = shortLabel(options.title || "Preview");
   const copyLabel = options.copyLabel || "Copy";
   const openPath = String(options.openPath || "").trim();
@@ -5885,7 +6118,7 @@ function codeBlock(
     <div class="code-frame">
       <div class="code-tools">
         <span class="code-title"><span>${escapeHtml(title)}</span>${options.meta ? `<small>${escapeHtml(options.meta)}</small>` : ""}</span>
-        <span class="code-language">${escapeHtml(language)}</span>
+        <span class="code-language">${escapeHtml(languageLabel)}</span>
         ${codeActions}
       </div>
       <pre class="code" data-highlight-language="${escapeHtml(language)}" aria-label="${escapeHtml(`${title} source preview`)}" tabindex="0">${escapeHtml(text)}</pre>
@@ -6527,45 +6760,7 @@ function visibleTimelineNodes(): RenderNode[] {
 }
 
 function chatNodes(nodes: RenderNode[]): RenderNode[] {
-  const visible = nodes.filter((node) => !HIDDEN.has(node.kind));
-  const approvalsByTool = approvalsByToolCallId(visible);
-  const visibleToolIds = new Set(
-    visible
-      .filter((node): node is ToolNodeView => node.kind === "tool")
-      .map((node) => node.toolCallId)
-  );
-  return visible.flatMap<RenderNode>((node) => {
-    if (node.kind === "tool") {
-      const approval = approvalsByTool.get(node.toolCallId);
-      return [approval ? { ...node, permission: permissionFromApproval(approval) } : node];
-    }
-    if (node.kind === "approval") {
-      const toolCallId = approvalToolCallId(node);
-      if (toolCallId && visibleToolIds.has(toolCallId)) {
-        return [];
-      }
-      return [approvalAsToolNode(node)];
-    }
-    return [node];
-  });
-}
-
-function approvalsByToolCallId(nodes: RenderNode[]): Map<string, ApprovalNodeView> {
-  const approvals = new Map<string, ApprovalNodeView>();
-  for (const node of nodes) {
-    if (node.kind !== "approval") {
-      continue;
-    }
-    const toolCallId = approvalToolCallId(node);
-    if (toolCallId) {
-      approvals.set(toolCallId, node);
-    }
-  }
-  return approvals;
-}
-
-function approvalToolCallId(node: ApprovalNodeView): string {
-  return node.tool.toolCallId;
+  return timelineDisplayNodes(nodes);
 }
 
 function currentConfigOptions(): Array<Record<string, unknown>> {

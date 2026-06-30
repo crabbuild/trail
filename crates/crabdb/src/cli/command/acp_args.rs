@@ -24,7 +24,12 @@ pub(super) struct AcpCommand {
 
 #[derive(Args)]
 pub(super) struct AcpInstallArgs {
-    #[arg(long, default_value = "claude-code")]
+    #[arg(
+        long,
+        default_value = "claude-code",
+        value_name = "AGENT",
+        help = "ACP provider profile: claude-code, codex, cursor"
+    )]
     pub(super) agent: String,
     #[arg(long, default_value = "generic")]
     pub(super) editor: String,
@@ -36,7 +41,12 @@ pub(super) struct AcpInstallArgs {
 
 #[derive(Args)]
 pub(super) struct AcpDoctorArgs {
-    #[arg(long, default_value = "claude-code")]
+    #[arg(
+        long,
+        default_value = "claude-code",
+        value_name = "AGENT",
+        help = "ACP provider profile: claude-code, codex, cursor"
+    )]
     pub(super) agent: String,
     #[arg(long = "relay-command", num_args = 1.., allow_hyphen_values = true)]
     pub(super) relay_command: Vec<String>,

@@ -230,16 +230,18 @@ function ReviewActionButton({
         `review-action-${action.tone}`
       )}
       data-action={action.action}
+      data-review-icon-only="true"
       title={title}
+      aria-label={`${action.label}. ${title}`}
       disabled={action.disabled}
       variant={variant}
-      size={primary ? "lg" : "sm"}
+      size={primary ? "icon-lg" : "icon-sm"}
     >
       <span
         data-icon="inline-start"
         dangerouslySetInnerHTML={{ __html: iconHtml }}
       />
-      <span className="review-action-copy">
+      <span className="review-action-copy sr-only">
         <span>{action.label}</span>
         <small>{action.description}</small>
       </span>

@@ -95,8 +95,8 @@ test("preserves mounted node islands across group rerenders", () => {
 
   assert.match(html, /data-stable-html-slot="message-1"/);
   assert.match(timelineGroupSource, /React\.memo\([\s\S]*StableHtmlSlot/);
-  assert.match(timelineGroupSource, /previous\.slotId === next\.slotId && previous\.shellSignature === next\.shellSignature/);
+  assert.match(timelineGroupSource, /previous\.slotId === next\.slotId[\s\S]*previous\.shellSignature === next\.shellSignature[\s\S]*previous\.html === next\.html/);
   assert.match(timelineGroupSource, /React\.useLayoutEffect\([\s\S]*syncStableHtmlShell/);
   assert.match(timelineGroupSource, /function syncElementAttributes/);
-  assert.match(timelineGroupSource, /html: item\.preserveDom \? stableHtmlShellSignature\(item\.html\) : item\.html/);
+  assert.match(timelineGroupSource, /html: item\.html/);
 });

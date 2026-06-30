@@ -145,7 +145,10 @@ const StableHtmlSlot = React.memo(
       />
     )
   },
-  (previous, next) => previous.slotId === next.slotId && previous.shellSignature === next.shellSignature
+  (previous, next) =>
+    previous.slotId === next.slotId &&
+    previous.shellSignature === next.shellSignature &&
+    previous.html === next.html
 )
 
 export function mountTimelineGroups(options: MountTimelineGroupsOptions): void {
@@ -211,7 +214,7 @@ function timelineGroupPropsSignature(props: TimelineGroupCardProps): string {
       id: item.id,
       className: item.className,
       preserveDom: item.preserveDom,
-      html: item.preserveDom ? stableHtmlShellSignature(item.html) : item.html
+      html: item.html
     }))
   })
 }
