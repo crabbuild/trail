@@ -73,6 +73,7 @@ fn run(cli: Cli) -> Result<()> {
         branch,
         json,
         quiet: cli.quiet,
+        color: !cli.no_color && std::env::var_os("NO_COLOR").is_none(),
         format,
     };
     let command = cli.command;

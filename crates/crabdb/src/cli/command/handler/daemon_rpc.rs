@@ -55,7 +55,7 @@ pub(super) fn try_handle_daemon_command(
         Command::Diff(args) => {
             let path = diff_path(args)?;
             let summary: DiffSummary = client.get_json(&path)?;
-            render_diff(&summary, ctx.json, ctx.quiet, args.stat)?;
+            render_diff(&summary, ctx.json, ctx.quiet, args.stat, ctx.color)?;
             Ok(true)
         }
         Command::Record(args) => {
@@ -375,7 +375,15 @@ fn handle_lane_command(
             }
             let path = append_query(&format!("/v1/lanes/{}/diff", args.name), params);
             let summary: DiffSummary = client.get_json(&path)?;
-            render_diff(&summary, ctx.json, ctx.quiet, false)?;
+            let title = format!("Lane diff: {}", args.name);
+            render_diff_with_title(
+                &summary,
+                ctx.json,
+                ctx.quiet,
+                args.stat,
+                ctx.color,
+                Some(&title),
+            )?;
             Ok(true)
         }
         LaneSubcommand::Timeline(args) => {

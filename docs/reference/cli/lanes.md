@@ -53,6 +53,7 @@ or editor work.
 ```sh
 crabdb lane record feature-docs -m "Draft lane docs"
 crabdb lane review feature-docs
+crabdb lane diff feature-docs --stat
 crabdb lane diff feature-docs --patch
 crabdb lane readiness feature-docs
 ```
@@ -278,7 +279,7 @@ against a manifest before replacing the visible workdir.
 crabdb lane apply-patch <NAME> --patch <FILE> \
   [--allow-ignored] [--allow-stale]
 
-crabdb lane diff <NAME> [--patch] [--show-line-ids]
+crabdb lane diff <NAME> [--stat] [--patch] [--show-line-ids]
 crabdb lane timeline <NAME> [--limit <N>]
 crabdb lane rewind <NAME> --to <CHANGE|ROOT|REF> \
   [--record-current] [--sync-workdir]
@@ -289,9 +290,13 @@ Timeline default limit: 30.
 | Command | Use it when |
 | --- | --- |
 | `apply-patch` | Apply a structured patch directly to the lane branch. |
-| `diff` | Compare the lane head against its base. |
+| `diff` | Compare the lane head against its base. Use `--stat` for a copyable total and `--patch` for unified patches. |
 | `timeline` | Inspect operations recorded on the lane. |
 | `rewind` | Move the lane back to a known change, root, or ref. |
+
+`lane diff --patch` prints a Git-style unified diff. In an interactive
+terminal, CrabDB colorizes patch headers, hunks, additions, and deletions by
+default. Pass the global `--no-color` flag, or set `NO_COLOR=1`, for plain text.
 
 `lane rewind` records a `LaneRewind` operation. With `--record-current`, CrabDB
 first records dirty materialized workdir edits when possible and preserves the

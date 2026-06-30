@@ -6,6 +6,7 @@ pub(super) struct RuntimeContext {
     pub(super) branch: Option<String>,
     pub(super) json: bool,
     pub(super) quiet: bool,
+    pub(super) color: bool,
     pub(super) format: OutputFormat,
 }
 

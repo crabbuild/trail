@@ -292,6 +292,8 @@ pub(super) struct LaneDiffArgs {
     pub(super) name: String,
     #[arg(long)]
     pub(super) patch: bool,
+    #[arg(long)]
+    pub(super) stat: bool,
     #[arg(long = "show-line-ids")]
     pub(super) show_line_ids: bool,
 }

@@ -184,7 +184,15 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
         LaneSubcommand::Diff(args) => {
             let db = open_db(ctx)?;
             let summary = db.diff_lane_with_options(&args.name, args.patch, args.show_line_ids)?;
-            render_diff(&summary, ctx.json, ctx.quiet, false)
+            let title = format!("Lane diff: {}", args.name);
+            render_diff_with_title(
+                &summary,
+                ctx.json,
+                ctx.quiet,
+                args.stat,
+                ctx.color,
+                Some(&title),
+            )
         }
         LaneSubcommand::Timeline(args) => {
             let db = open_db(ctx)?;

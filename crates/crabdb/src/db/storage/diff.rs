@@ -10,13 +10,6 @@ impl CrabDb {
         patches: bool,
         include_line_changes: bool,
     ) -> Result<DiffSummary> {
-        if !patches && !include_line_changes {
-            return Ok(DiffSummary {
-                from,
-                to,
-                files: self.diff_root_file_summaries(left_root_id, right_root_id)?,
-            });
-        }
         let mut patch_left = BTreeMap::new();
         let mut patch_right = BTreeMap::new();
         let mut diff = self.diff_root_file_maps(
@@ -47,13 +40,6 @@ impl CrabDb {
         patches: bool,
         include_line_changes: bool,
     ) -> Result<DiffSummary> {
-        if !patches && !include_line_changes {
-            return Ok(DiffSummary {
-                from,
-                to,
-                files: diff_file_map_summaries(left, right),
-            });
-        }
         let mut diff = self.diff_file_maps(left, right)?;
         if include_line_changes {
             attach_line_changes(&diff.changes, &mut diff.summaries);
@@ -179,123 +165,5 @@ impl CrabDb {
         });
         let summaries = summarize_file_changes(&changes);
         Ok(RootDiff { changes, summaries })
-    }
-}
-
-fn diff_file_map_summaries(
-    left: &BTreeMap<String, FileEntry>,
-    right: &BTreeMap<String, FileEntry>,
-) -> Vec<FileDiffSummary> {
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
-    let mut changed = Vec::new();
-    let mut removed_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
-    for (path, entry) in left {
-        match right.get(path) {
-            Some(new_entry)
-                if entry.content_hash != new_entry.content_hash
-                    || entry.executable != new_entry.executable
-                    || entry.kind != new_entry.kind =>
-            {
-                changed.push((path.clone(), entry.clone(), new_entry.clone()));
-            }
-            Some(_) => {}
-            None => {
-                removed_by_hash
-                    .entry(entry.content_hash.clone())
-                    .or_default()
-                    .push((path.clone(), entry.clone()));
-                removed.push((path.clone(), entry.clone()));
-            }
-        }
-    }
-    for (path, entry) in right {
-        if !left.contains_key(path) {
-            added.push((path.clone(), entry.clone()));
-        }
-    }
-
-    let mut consumed_removed = HashSet::new();
-    let mut summaries = Vec::new();
-    for (path, new_entry) in added {
-        let rename = removed_by_hash
-            .get(&new_entry.content_hash)
-            .and_then(|candidates| {
-                candidates.iter().find(|(old_path, old_entry)| {
-                    !consumed_removed.contains(old_path) && old_entry.file_id == new_entry.file_id
-                })
-            });
-        if let Some((old_path, old_entry)) = rename {
-            consumed_removed.insert(old_path.clone());
-            summaries.push(summary_without_line_counts(
-                path,
-                Some(old_path.clone()),
-                FileChangeKind::Renamed,
-                Some(old_entry.content_hash.clone()),
-                Some(new_entry.content_hash),
-            ));
-        } else {
-            summaries.push(summary_without_line_counts(
-                path,
-                None,
-                FileChangeKind::Added,
-                None,
-                Some(new_entry.content_hash),
-            ));
-        }
-    }
-
-    for (path, old_entry) in removed {
-        if consumed_removed.contains(&path) {
-            continue;
-        }
-        summaries.push(summary_without_line_counts(
-            path,
-            None,
-            FileChangeKind::Deleted,
-            Some(old_entry.content_hash),
-            None,
-        ));
-    }
-
-    for (path, old_entry, new_entry) in changed {
-        let kind = if old_entry.kind != new_entry.kind {
-            FileChangeKind::TypeChanged
-        } else {
-            FileChangeKind::Modified
-        };
-        summaries.push(summary_without_line_counts(
-            path,
-            None,
-            kind,
-            Some(old_entry.content_hash),
-            Some(new_entry.content_hash),
-        ));
-    }
-    summaries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.old_path.cmp(&right.old_path))
-    });
-    summaries
-}
-
-fn summary_without_line_counts(
-    path: String,
-    old_path: Option<String>,
-    kind: FileChangeKind,
-    before_hash: Option<String>,
-    after_hash: Option<String>,
-) -> FileDiffSummary {
-    FileDiffSummary {
-        path,
-        old_path,
-        kind,
-        before_hash,
-        after_hash,
-        additions: 0,
-        deletions: 0,
-        line_changes: Vec::new(),
-        patch: None,
     }
 }

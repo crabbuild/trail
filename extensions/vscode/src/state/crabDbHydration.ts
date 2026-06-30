@@ -176,7 +176,7 @@ function rootMessageTurnIdQueues(events: unknown[]): Map<string, RootMessageTurn
     if (eventType !== "message_added") {
       continue;
     }
-    const messageId = recordIdField(event, "message_id") || recordIdField(event, "messageId");
+    const messageId = messageAddedEventMessageId(event);
     const turnId = stringField(event, "turn_id") || stringField(event, "turnId");
     if (messageId && turnId) {
       const queue = turnIds.get(messageId);
@@ -358,14 +358,15 @@ function hydrateTurnTimeline(
   let nodes: RenderNode[] = [];
   const usedMessageIndexes = new Set<number>();
   let placedMessages = 0;
+  let fallbackMessageIndex = messageEntries.length;
 
   for (const eventValue of orderedEvents) {
     const event = asRecord(eventValue);
     const eventType = stringField(event, "event_type") || stringField(event, "eventType");
-    const messageId = recordIdField(event, "message_id") || recordIdField(event, "messageId");
-    if (eventType === "message_added" && messageId) {
+    if (eventType === "message_added") {
+      const messageId = messageAddedEventMessageId(event);
       const timestamp = timestampField(event, "created_at", "createdAt", "updated_at", "updatedAt");
-      const entry = takeNextMessageEntry(messagesById, messageId, usedMessageIndexes, timestamp);
+      const entry = messageId ? takeNextMessageEntry(messagesById, messageId, usedMessageIndexes, timestamp) : undefined;
       if (entry) {
         nodes.push({
           ...entry.node,
@@ -374,6 +375,24 @@ function hydrateTurnTimeline(
         });
         usedMessageIndexes.add(entry.index);
         placedMessages += 1;
+      } else {
+        const fallback = hydrateMessageAddedEventEntry(
+          event,
+          fallbackMessageIndex,
+          view,
+          turnId,
+          status,
+          duplicateMessageIds
+        );
+        if (fallback) {
+          fallbackMessageIndex += 1;
+          nodes.push({
+            ...fallback.node,
+            createdAt: fallback.node.createdAt || timestamp,
+            updatedAt: timestamp || fallback.node.updatedAt
+          });
+          placedMessages += 1;
+        }
       }
       continue;
     }
@@ -478,6 +497,78 @@ function hydrateMessageEntry(
   };
 }
 
+function messageAddedEventMessageId(event: Record<string, unknown>): string | undefined {
+  const payload = asRecord(event.payload);
+  const nestedMessage = asRecord(payload.message);
+  return (
+    recordIdField(event, "message_id") ||
+    recordIdField(event, "messageId") ||
+    recordIdField(event, "id") ||
+    recordIdField(payload, "message_id") ||
+    recordIdField(payload, "messageId") ||
+    recordIdField(payload, "id") ||
+    recordIdField(nestedMessage, "message_id") ||
+    recordIdField(nestedMessage, "messageId") ||
+    recordIdField(nestedMessage, "id")
+  );
+}
+
+function hydrateMessageAddedEventEntry(
+  event: Record<string, unknown>,
+  messageIndex: number,
+  view: TaskView,
+  turnId: string,
+  status: RenderNode["status"],
+  duplicateMessageIds: Set<string>
+): HydratedMessageEntry | undefined {
+  const message = messageRecordFromMessageAddedEvent(event);
+  return message ? hydrateMessageEntry(message, messageIndex, view, turnId, status, duplicateMessageIds) : undefined;
+}
+
+function messageRecordFromMessageAddedEvent(event: Record<string, unknown>): Record<string, unknown> | undefined {
+  const payload = asRecord(event.payload);
+  const nestedMessage = asRecord(payload.message);
+  const message: Record<string, unknown> = Object.keys(nestedMessage).length ? { ...nestedMessage } : { ...payload };
+  copyFieldIfPresent(message, event, "message_id");
+  copyFieldIfPresent(message, event, "messageId");
+  copyFieldIfPresent(message, event, "id");
+  copyFieldIfPresent(message, payload, "message_id");
+  copyFieldIfPresent(message, payload, "messageId");
+  copyFieldIfPresent(message, payload, "id");
+  copyFieldIfPresent(message, event, "role");
+  copyFieldIfPresent(message, event, "created_at");
+  copyFieldIfPresent(message, event, "createdAt");
+  copyFieldIfPresent(message, event, "updated_at");
+  copyFieldIfPresent(message, event, "updatedAt");
+  copyFieldIfPresent(message, payload, "role");
+  copyFieldIfPresent(message, payload, "created_at");
+  copyFieldIfPresent(message, payload, "createdAt");
+  copyFieldIfPresent(message, payload, "updated_at");
+  copyFieldIfPresent(message, payload, "updatedAt");
+  copyFieldIfPresent(message, event, "content");
+  copyFieldIfPresent(message, event, "body");
+  copyFieldIfPresent(message, event, "text");
+  copyFieldIfPresent(message, event, "content_text");
+  copyFieldIfPresent(message, event, "contentText");
+  copyFieldIfPresent(message, event, "message");
+  copyFieldIfPresent(message, payload, "content");
+  copyFieldIfPresent(message, payload, "body");
+  copyFieldIfPresent(message, payload, "text");
+  copyFieldIfPresent(message, payload, "content_text");
+  copyFieldIfPresent(message, payload, "contentText");
+  return hasRenderableMessageContent(message) ? message : undefined;
+}
+
+function copyFieldIfPresent(target: Record<string, unknown>, source: Record<string, unknown>, key: string): void {
+  if (target[key] === undefined && source[key] !== undefined) {
+    target[key] = source[key];
+  }
+}
+
+function hasRenderableMessageContent(message: Record<string, unknown>): boolean {
+  return contentBlockArray(message.content).length > 0 || messageText(message) !== "";
+}
+
 function messageContentBlocks(message: Record<string, unknown>): ContentBlock[] {
   const content = contentBlockArray(message.content);
   if (content.length) {
@@ -518,6 +609,12 @@ function contentBlock(value: unknown): ContentBlock | undefined {
     return { type: "text", text: value };
   }
   const record = asRecord(value);
+  if (record.type === "text" && typeof record.text !== "string") {
+    const text = stringField(record, "content") || stringField(record, "value");
+    if (text !== undefined) {
+      return { ...record, type: "text", text };
+    }
+  }
   if (typeof record.type === "string") {
     return record as ContentBlock;
   }
@@ -726,16 +823,12 @@ function isOpenStatus(status: string): boolean {
 function sessionUpdateFromEvent(event: Record<string, unknown>): SessionUpdate | undefined {
   const eventType = stringField(event, "event_type") || stringField(event, "eventType");
   const payload = asRecord(event.payload);
+  const updateKind = sessionUpdateKindFromEventType(eventType);
   if (
-    eventType === "tool_call" ||
-    eventType === "tool_call_update" ||
-    eventType === "plan_update" ||
-    eventType === "plan" ||
-    eventType === "available_commands_update" ||
-    eventType === "acp_available_commands_update" ||
+    isHydratableSessionUpdateEventType(updateKind) ||
     (typeof eventType === "string" && eventType.startsWith("acp_"))
   ) {
-    return sessionUpdateFromRecords(eventType, payload, event);
+    return sessionUpdateFromRecords(updateKind, payload, event);
   }
   if (eventType === "span_started") {
     const attributes = asRecord(payload.attributes);
@@ -746,6 +839,33 @@ function sessionUpdateFromEvent(event: Record<string, unknown>): SessionUpdate |
     return sessionUpdateFromRecords(eventType, result, payload, event);
   }
   return undefined;
+}
+
+function sessionUpdateKindFromEventType(eventType: string | undefined): string | undefined {
+  if (!eventType) {
+    return undefined;
+  }
+  return eventType.startsWith("acp_") ? eventType.slice("acp_".length) : eventType;
+}
+
+function isHydratableSessionUpdateEventType(eventType: string | undefined): boolean {
+  switch (eventType) {
+    case "user_message_chunk":
+    case "agent_message_chunk":
+    case "agent_thought_chunk":
+    case "tool_call":
+    case "tool_call_update":
+    case "plan":
+    case "plan_update":
+    case "available_commands_update":
+    case "current_mode_update":
+    case "config_option_update":
+    case "session_info_update":
+    case "usage_update":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function sessionUpdateFromRecords(eventType: string | undefined, ...records: Record<string, unknown>[]): SessionUpdate | undefined {
@@ -759,17 +879,21 @@ function sessionUpdateFromRecords(eventType: string | undefined, ...records: Rec
 }
 
 function inferredSessionUpdatePayload(eventType: string | undefined, payload: Record<string, unknown>): SessionUpdate | undefined {
-  if (eventType === "tool_call" || eventType === "tool_call_update") {
-    const toolCallId = toolCallIdFromRecord(payload);
-    return toolCallId ? (toolSessionUpdateRecord(eventType, payload, toolCallId) as SessionUpdate) : undefined;
+  const updateKind = sessionUpdateKindFromEventType(eventType);
+  if (isMessageChunkSessionUpdate(updateKind)) {
+    return messageChunkSessionUpdateRecord(updateKind, payload);
   }
-  if (eventType === "span_started") {
+  if (updateKind === "tool_call" || updateKind === "tool_call_update") {
+    const toolCallId = toolCallIdFromRecord(payload);
+    return toolCallId ? (toolSessionUpdateRecord(updateKind, payload, toolCallId) as SessionUpdate) : undefined;
+  }
+  if (updateKind === "span_started") {
     return inferredSpanStartedToolUpdate(payload);
   }
-  if (eventType === "span_ended") {
+  if (updateKind === "span_ended") {
     return inferredSpanEndedToolUpdate(payload);
   }
-  if (eventType === "plan" || eventType === "plan_update") {
+  if (updateKind === "plan" || updateKind === "plan_update") {
     const entries = arrayField(payload, "entries");
     return entries.length ? ({ ...payload, sessionUpdate: "plan", entries } as SessionUpdate) : undefined;
   }
@@ -820,6 +944,9 @@ function sessionUpdatePayload(payload: Record<string, unknown>): SessionUpdate |
   if (!isSessionUpdate(payload)) {
     return undefined;
   }
+  if (isMessageChunkSessionUpdate(payload.sessionUpdate)) {
+    return messageChunkSessionUpdateRecord(payload.sessionUpdate, payload);
+  }
   if (payload.sessionUpdate === "tool_call" || payload.sessionUpdate === "tool_call_update") {
     const toolCallId = toolCallIdFromRecord(payload);
     if (toolCallId) {
@@ -834,6 +961,51 @@ function sessionUpdatePayload(payload: Record<string, unknown>): SessionUpdate |
     } as SessionUpdate;
   }
   return payload;
+}
+
+type MessageChunkSessionUpdate = "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk";
+
+function isMessageChunkSessionUpdate(value: unknown): value is MessageChunkSessionUpdate {
+  return value === "user_message_chunk" || value === "agent_message_chunk" || value === "agent_thought_chunk";
+}
+
+function messageChunkSessionUpdateRecord(
+  sessionUpdate: MessageChunkSessionUpdate,
+  payload: Record<string, unknown>
+): SessionUpdate | undefined {
+  const content = messageChunkContentBlock(payload);
+  if (!content) {
+    return undefined;
+  }
+  const update: Record<string, unknown> = {
+    ...payload,
+    sessionUpdate,
+    content
+  };
+  const messageId = messageChunkIdFromRecord(payload);
+  if (messageId) {
+    update.messageId = messageId;
+  }
+  return update as SessionUpdate;
+}
+
+function messageChunkContentBlock(payload: Record<string, unknown>): ContentBlock | undefined {
+  const content = contentBlock(payload.content);
+  if (content) {
+    return content;
+  }
+  const text =
+    stringField(payload, "text") ||
+    stringField(payload, "body") ||
+    stringField(payload, "message") ||
+    stringField(payload, "content_text") ||
+    stringField(payload, "contentText") ||
+    stringField(payload, "value");
+  return text === undefined ? undefined : { type: "text", text };
+}
+
+function messageChunkIdFromRecord(record: Record<string, unknown>): string | undefined {
+  return recordIdField(record, "messageId") || recordIdField(record, "message_id");
 }
 
 function toolSessionUpdateRecord(

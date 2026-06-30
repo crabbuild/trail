@@ -246,6 +246,48 @@ test("hydrates persisted CrabDB mixed content arrays when body is absent", () =>
   );
 });
 
+test("hydrates persisted CrabDB text content blocks with aliased text fields", () => {
+  const contentView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-text-block-aliases",
+          status: "completed",
+          after_change: "ch_text_block_aliases"
+        },
+        messages: [
+          {
+            message_id: "msg-text-block-aliases",
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                content: "Rendered from content. "
+              },
+              {
+                type: "text",
+                value: "Rendered from value."
+              }
+            ],
+            created_at: 1
+          }
+        ],
+        checkpoint: "ch_text_block_aliases"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(contentView);
+  const assistant = nodes.find((node) => node.kind === "message" && node.role === "assistant");
+
+  assert.equal(assistant?.kind, "message");
+  if (assistant?.kind !== "message") {
+    throw new Error("expected hydrated assistant message");
+  }
+  assert.equal(assistant.text, "Rendered from content. Rendered from value.");
+});
+
 test("hydrates root transcript messages and events when turn wrappers are absent", () => {
   const rootView: TaskView = {
     ...view,
@@ -505,6 +547,117 @@ test("uses root message-added events to scope messages without turn ids", () => 
       "message:turn-beta:user:Start beta without a message turn id",
       "tool:turn-beta:Inspect beta",
       "message:turn-beta:assistant:Beta stayed scoped.",
+      "checkpoint:turn-beta:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5, 6]);
+});
+
+test("uses nested root message-added event ids to scope messages without turn ids", () => {
+  const rootView: TaskView = {
+    ...view,
+    task: {
+      ...view.task,
+      latestCheckpoint: "ch_nested_scoped",
+      updatedAt: "2026-06-27T00:00:06.000Z"
+    },
+    turns: [],
+    messages: [
+      {
+        message_id: "msg-alpha-user",
+        role: "user",
+        body: "Start alpha from nested scope",
+        created_at: "2026-06-27T00:00:01.000Z"
+      },
+      {
+        message_id: "msg-alpha-assistant",
+        role: "assistant",
+        body: "Alpha nested scope stayed correct.",
+        created_at: "2026-06-27T00:00:02.000Z"
+      },
+      {
+        message_id: "msg-beta-user",
+        role: "user",
+        body: "Start beta from nested scope",
+        created_at: "2026-06-27T00:00:03.000Z"
+      },
+      {
+        message_id: "msg-beta-assistant",
+        role: "assistant",
+        body: "Beta nested scope stayed correct.",
+        created_at: "2026-06-27T00:00:05.000Z"
+      }
+    ],
+    events: [
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        created_at: "2026-06-27T00:00:01.000Z",
+        payload: {
+          message: {
+            message_id: "msg-alpha-user"
+          }
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-alpha",
+        created_at: "2026-06-27T00:00:02.000Z",
+        payload: {
+          message: {
+            id: "msg-alpha-assistant"
+          }
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:03.000Z",
+        payload: {
+          message: {
+            messageId: "msg-beta-user"
+          }
+        }
+      },
+      {
+        event_type: "tool_call",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:04.000Z",
+        payload: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-beta",
+          title: "Inspect beta",
+          kind: "read",
+          status: "completed"
+        }
+      },
+      {
+        event_type: "message_added",
+        turn_id: "turn-beta",
+        created_at: "2026-06-27T00:00:05.000Z",
+        payload: {
+          message: {
+            id: "msg-beta-assistant"
+          }
+        }
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(rootView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.turnId}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.kind}:${node.turnId}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:turn-alpha:user:msg-alpha-user:Start alpha from nested scope",
+      "message:turn-alpha:assistant:msg-alpha-assistant:Alpha nested scope stayed correct.",
+      "message:turn-beta:user:msg-beta-user:Start beta from nested scope",
+      "tool:turn-beta:Inspect beta",
+      "message:turn-beta:assistant:msg-beta-assistant:Beta nested scope stayed correct.",
       "checkpoint:turn-beta:"
     ]
   );
@@ -920,6 +1073,291 @@ test("infers persisted tool spans from span events without ACP session updates",
   assert.equal(terminal?.kind, "terminal");
   assert.equal(terminal?.command, "npm test");
   assert.equal(terminal?.stdout, "span ok");
+});
+
+test("hydrates persisted ACP message and thought events without message rows", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-acp-message-events",
+          status: "completed",
+          after_change: "ch_acp_message_events",
+          ended_at: 6
+        },
+        messages: [],
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "acp_user_message_chunk",
+            created_at: 1,
+            payload: {
+              message_id: "msg-user-event",
+              content: "Please inspect the event transcript"
+            }
+          },
+          {
+            event_type: "tool_call",
+            created_at: 2,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tool-event",
+              title: "Read event log",
+              kind: "read",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "agent_thought_chunk",
+            created_at: 3,
+            message_id: "thought-event",
+            content: {
+              type: "text",
+              text: "Checking persisted events"
+            }
+          },
+          {
+            event_type: "agent_message_chunk",
+            created_at: 4,
+            message_id: "msg-assistant-event",
+            content: {
+              type: "text",
+              value: "The persisted events rendered."
+            }
+          }
+        ],
+        checkpoint: "ch_acp_message_events"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.role}:${node.acpMessageId}:${node.text}`
+        : node.kind === "thought"
+          ? `${node.kind}:${node.acpMessageId}:${node.content.map((block) => block.type === "text" ? block.text : block.type).join("")}`
+          : `${node.kind}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:user:msg-user-event:Please inspect the event transcript",
+      "tool:Read event log",
+      "thought:thought-event:Checking persisted events",
+      "message:assistant:msg-assistant-event:The persisted events rendered.",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4, 5]);
+});
+
+test("hydrates message-added payloads when message rows are missing", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-message-added-payloads",
+          status: "completed",
+          after_change: "ch_message_added_payloads",
+          ended_at: 4
+        },
+        messages: [],
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "message_added",
+            message_id: "msg-event-user",
+            created_at: 1,
+            payload: {
+              role: "user",
+              body: "Render the user payload"
+            }
+          },
+          {
+            event_type: "tool_call",
+            created_at: 2,
+            payload: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tool-message-added",
+              title: "Inspect payloads",
+              kind: "read",
+              status: "completed"
+            }
+          },
+          {
+            event_type: "message_added",
+            message_id: "msg-event-assistant",
+            created_at: 3,
+            payload: {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  content: "Rendered from the event payload."
+                }
+              ]
+            }
+          }
+        ],
+        checkpoint: "ch_message_added_payloads"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.kind}:${node.kind === "tool" ? node.title : ""}`
+    )),
+    [
+      "message:user:msg-event-user:Render the user payload",
+      "tool:Inspect payloads",
+      "message:assistant:msg-event-assistant:Rendered from the event payload.",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3, 4]);
+});
+
+test("hydrates nested message-added payloads when message rows are missing", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-nested-message-added-payloads",
+          status: "completed",
+          after_change: "ch_nested_message_added_payloads",
+          ended_at: 3
+        },
+        messages: [],
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "message_added",
+            created_at: 1,
+            payload: {
+              message: {
+                message_id: "msg-nested-user",
+                role: "user",
+                text: "Render the nested user payload"
+              }
+            }
+          },
+          {
+            event_type: "message_added",
+            created_at: 2,
+            payload: {
+              message: {
+                id: "msg-nested-assistant",
+                role: "assistant",
+                content: {
+                  type: "text",
+                  value: "Render the nested assistant payload"
+                }
+              }
+            }
+          }
+        ],
+        checkpoint: "ch_nested_message_added_payloads"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.kind}:`
+    )),
+    [
+      "message:user:msg-nested-user:Render the nested user payload",
+      "message:assistant:msg-nested-assistant:Render the nested assistant payload",
+      "checkpoint:"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3]);
+});
+
+test("uses nested message-added ids to match existing message rows", () => {
+  const eventView: TaskView = {
+    ...view,
+    turns: [
+      {
+        turn: {
+          turn_id: "turn-nested-message-added-row-match",
+          status: "completed",
+          after_change: "ch_nested_message_added_row_match",
+          ended_at: 3
+        },
+        messages: [
+          {
+            message_id: "msg-nested-row-user",
+            role: "user",
+            body: "Use the canonical row for the user",
+            created_at: 1
+          },
+          {
+            message_id: "msg-nested-row-assistant",
+            role: "assistant",
+            body: "Use the canonical row for the assistant",
+            created_at: 2
+          }
+        ],
+        tool_summaries: [],
+        events: [
+          {
+            event_type: "message_added",
+            created_at: 1,
+            payload: {
+              message: {
+                message_id: "msg-nested-row-user",
+                role: "user",
+                text: "Stale nested user payload"
+              }
+            }
+          },
+          {
+            event_type: "message_added",
+            created_at: 2,
+            payload: {
+              message: {
+                id: "msg-nested-row-assistant",
+                role: "assistant",
+                text: "Stale nested assistant payload"
+              }
+            }
+          }
+        ],
+        checkpoint: "ch_nested_message_added_row_match"
+      }
+    ]
+  };
+
+  const nodes = hydrateTaskView(eventView);
+
+  assert.deepEqual(
+    nodes.map((node) => (
+      node.kind === "message"
+        ? `${node.kind}:${node.role}:${node.acpMessageId}:${node.text}`
+        : `${node.kind}:`
+    )),
+    [
+      "message:user:msg-nested-row-user:Use the canonical row for the user",
+      "message:assistant:msg-nested-row-assistant:Use the canonical row for the assistant",
+      "checkpoint:"
+    ]
+  );
+  assert.equal(nodes.filter((node) => node.kind === "message").length, 2);
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3]);
 });
 
 test("orders hydrated turn messages and tools by recorded timeline timestamps", () => {

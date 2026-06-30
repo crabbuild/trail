@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use super::super::DiffArgs;
@@ -46,32 +47,51 @@ pub(crate) fn render_diff(
     json: bool,
     quiet: bool,
     stat: bool,
+    color: bool,
+) -> Result<()> {
+    render_diff_with_title(summary, json, quiet, stat, color, None)
+}
+
+pub(crate) fn render_diff_with_title(
+    summary: &DiffSummary,
+    json: bool,
+    quiet: bool,
+    stat: bool,
+    color: bool,
+    title: Option<&str>,
 ) -> Result<()> {
     if json {
         return render_json(summary);
     }
     if !quiet {
-        println!("Diff {}..{}", summary.from, summary.to);
-        let mut total_additions = 0;
-        let mut total_deletions = 0;
+        let total_additions: u64 = summary.files.iter().map(|file| file.additions).sum();
+        let total_deletions: u64 = summary.files.iter().map(|file| file.deletions).sum();
+        println!("{}", title.unwrap_or("Diff"));
+        println!("  from: {}", summary.from);
+        println!("  to:   {}", summary.to);
+        if summary.files.is_empty() {
+            println!("  No file changes");
+            return Ok(());
+        }
+        println!(
+            "  {} file(s) changed, +{} -{}",
+            summary.files.len(),
+            total_additions,
+            total_deletions
+        );
+        println!();
+
         for file in &summary.files {
-            total_additions += file.additions;
-            total_deletions += file.deletions;
-            println!(
-                "  {:?} {} (+{} -{})",
-                file.kind, file.path, file.additions, file.deletions
-            );
-            for line in &file.line_changes {
-                println!(
-                    "    {:?} {} old={} new={}",
-                    line.kind,
-                    format_line_id(&line.line_id),
-                    format_optional_line_number(line.old_line_number),
-                    format_optional_line_number(line.new_line_number)
-                );
-            }
+            println!("  {}", format_file_diff_line(file));
+            print_line_change_summary(file);
             if let Some(patch) = &file.patch {
-                print!("{patch}");
+                if !patch.starts_with('\n') {
+                    println!();
+                }
+                print_patch(patch, color && std::io::stdout().is_terminal());
+                if !patch.ends_with('\n') {
+                    println!();
+                }
             }
         }
         if stat {
@@ -84,6 +104,140 @@ pub(crate) fn render_diff(
         }
     }
     Ok(())
+}
+
+fn print_patch(patch: &str, color: bool) {
+    if !color {
+        print!("{patch}");
+        return;
+    }
+    for line in patch.split_inclusive('\n') {
+        print!("{}", color_patch_line(line));
+    }
+}
+
+fn color_patch_line(line: &str) -> String {
+    let color = if line.starts_with("@@") {
+        Some("\x1b[36m")
+    } else if line.starts_with("diff --git")
+        || line.starts_with("diff --crabdb")
+        || line.starts_with("index ")
+    {
+        Some("\x1b[1m")
+    } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+        Some("\x1b[1m")
+    } else if line.starts_with('+') {
+        Some("\x1b[32m")
+    } else if line.starts_with('-') {
+        Some("\x1b[31m")
+    } else {
+        None
+    };
+    match color {
+        Some(color) => format!("{color}{line}\x1b[0m"),
+        None => line.to_string(),
+    }
+}
+
+fn format_file_diff_line(file: &FileDiffSummary) -> String {
+    let path = file
+        .old_path
+        .as_ref()
+        .map(|old_path| format!("{old_path} -> {}", file.path))
+        .unwrap_or_else(|| file.path.clone());
+    format!(
+        "{} {:<11} {} {}",
+        file_change_marker(&file.kind),
+        file_change_label(&file.kind),
+        path,
+        format_change_stat(file.additions, file.deletions)
+    )
+}
+
+fn file_change_marker(kind: &FileChangeKind) -> &'static str {
+    match kind {
+        FileChangeKind::Added => "A",
+        FileChangeKind::Modified => "M",
+        FileChangeKind::Deleted => "D",
+        FileChangeKind::Renamed => "R",
+        FileChangeKind::TypeChanged => "T",
+    }
+}
+
+fn file_change_label(kind: &FileChangeKind) -> &'static str {
+    match kind {
+        FileChangeKind::Added => "added",
+        FileChangeKind::Modified => "modified",
+        FileChangeKind::Deleted => "deleted",
+        FileChangeKind::Renamed => "renamed",
+        FileChangeKind::TypeChanged => "type-changed",
+    }
+}
+
+fn format_change_stat(additions: u64, deletions: u64) -> String {
+    let bar = format_change_bar(additions, deletions);
+    if bar.is_empty() {
+        format!("(+{additions} -{deletions})")
+    } else {
+        format!("(+{additions} -{deletions}) {bar}")
+    }
+}
+
+fn format_change_bar(additions: u64, deletions: u64) -> String {
+    let total = additions + deletions;
+    if total == 0 {
+        return String::new();
+    }
+    let width = total.min(24) as usize;
+    let mut plus = ((additions * width as u64) + total - 1) / total;
+    if additions == 0 {
+        plus = 0;
+    }
+    let minus = width.saturating_sub(plus as usize);
+    format!("{}{}", "+".repeat(plus as usize), "-".repeat(minus))
+}
+
+fn print_line_change_summary(file: &FileDiffSummary) {
+    if file.line_changes.is_empty() {
+        return;
+    }
+    let mut added = 0_u64;
+    let mut modified = 0_u64;
+    let mut deleted = 0_u64;
+    let mut moved = 0_u64;
+    for line in &file.line_changes {
+        match &line.kind {
+            LineChangeKind::Added => added += 1,
+            LineChangeKind::Modified => modified += 1,
+            LineChangeKind::Deleted => deleted += 1,
+            LineChangeKind::Moved => moved += 1,
+        }
+    }
+    println!("    lines: +{added} ~{modified} -{deleted} moved {moved}");
+    for line in file.line_changes.iter().take(8) {
+        println!(
+            "      {} {} old={} new={}",
+            line_change_marker(&line.kind),
+            format_line_id(&line.line_id),
+            format_optional_line_number(line.old_line_number),
+            format_optional_line_number(line.new_line_number)
+        );
+    }
+    if file.line_changes.len() > 8 {
+        println!(
+            "      ... {} more line changes",
+            file.line_changes.len() - 8
+        );
+    }
+}
+
+fn line_change_marker(kind: &LineChangeKind) -> &'static str {
+    match kind {
+        LineChangeKind::Added => "+",
+        LineChangeKind::Modified => "~",
+        LineChangeKind::Deleted => "-",
+        LineChangeKind::Moved => ">",
+    }
 }
 
 fn format_line_id(line_id: &crabdb::LineId) -> String {

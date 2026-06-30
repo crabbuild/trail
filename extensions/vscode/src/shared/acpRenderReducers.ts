@@ -694,8 +694,9 @@ export function sessionControlsToPatches(session: unknown, context: RenderReduce
 
 export function contentToText(content: ContentBlock): string {
   const record = content as Record<string, unknown>;
-  if (content.type === "text" && typeof record.text === "string") {
-    return record.text;
+  const text = textContentValue(content);
+  if (text !== undefined) {
+    return text;
   }
   if (content.type === "resource_link" && typeof record.name === "string") {
     return typeof record.title === "string" ? `${record.title} (${record.name})` : record.name;
@@ -713,6 +714,14 @@ export function contentToText(content: ContentBlock): string {
   return `[${content.type || "content"}]`;
 }
 
+function textContentValue(content: ContentBlock): string | undefined {
+  if (content.type !== "text") {
+    return undefined;
+  }
+  const record = content as Record<string, unknown>;
+  return stringField(record, "text") || stringField(record, "content") || stringField(record, "value");
+}
+
 function contentBlocksToText(blocks: ContentBlock[]): string {
   return blocks.map(contentToText).join("");
 }
@@ -722,9 +731,15 @@ function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] 
   for (const block of blocks) {
     const previous = merged[merged.length - 1];
     if (previous?.type === "text" && block.type === "text") {
+      const previousText = textContentValue(previous);
+      const blockText = textContentValue(block);
+      if (previousText === undefined || blockText === undefined) {
+        merged.push(block);
+        continue;
+      }
       merged[merged.length - 1] = {
         ...previous,
-        text: `${previous.text}${block.text}`
+        text: `${previousText}${blockText}`
       };
       continue;
     }

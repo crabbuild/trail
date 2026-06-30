@@ -16416,6 +16416,48 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
 }
 
 #[test]
+fn lane_diff_cli_renders_scannable_overview() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("docs")).unwrap();
+    fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
+    CrabDb::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    db.spawn_lane("doc-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "edits": [
+            {"op": "write", "path": "README.md", "content": "hello\nlane\nworld\n"},
+            {"op": "write", "path": "docs/guide.md", "content": "# Guide\n"}
+        ]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "doc-bot", patch).unwrap();
+    drop(db);
+
+    let output = Command::new(crabdb_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["lane", "diff", "doc-bot", "--stat"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lane diff failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Lane diff: doc-bot"));
+    assert!(stdout.contains("from:"));
+    assert!(stdout.contains("to:"));
+    assert!(stdout.contains("2 file(s) changed, +2 -0"));
+    assert!(stdout.contains("M modified    README.md (+1 -0) +"));
+    assert!(stdout.contains("A added       docs/guide.md (+1 -0) +"));
+    assert!(stdout.contains("2 files changed, 2 additions, 0 deletions"));
+}
+
+#[test]
 fn lane_refresh_preview_reports_target_changes_and_conflicts_without_mutating() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("docs")).unwrap();

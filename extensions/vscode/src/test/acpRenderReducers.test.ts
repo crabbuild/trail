@@ -71,6 +71,39 @@ test("aggregates streamed assistant chunks by message id", () => {
   assert.deepEqual(nodes[0]?.content[0], { type: "text", text: "Hello world" });
 });
 
+test("aggregates streamed assistant text chunks with aliased text fields", () => {
+  const first = reduceSessionUpdate(
+    {
+      sessionUpdate: "agent_message_chunk",
+      messageId: "msg-text-alias",
+      content: {
+        type: "text",
+        content: "Hello "
+      }
+    },
+    context
+  );
+  const second = reduceSessionUpdate(
+    {
+      sessionUpdate: "agent_message_chunk",
+      messageId: "msg-text-alias",
+      content: {
+        type: "text",
+        value: "world"
+      }
+    },
+    context
+  );
+
+  const nodes = applyRenderPatches(applyRenderPatches([], first), second);
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0]?.kind, "message");
+  assert.equal(nodes[0]?.kind === "message" ? nodes[0].text : undefined, "Hello world");
+  assert.equal(nodes[0]?.content.length, 1);
+  assert.equal(nodes[0]?.content[0]?.type, "text");
+  assert.equal((nodes[0]?.content[0] as { text?: string } | undefined)?.text, "Hello world");
+});
+
 test("accepts cumulative streamed assistant chunks without duplicating text", () => {
   const first = reduceSessionUpdate(
     {

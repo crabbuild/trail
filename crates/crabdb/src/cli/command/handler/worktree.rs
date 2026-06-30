@@ -60,7 +60,7 @@ pub(super) fn handle_watch_command(ctx: &RuntimeContext, args: WatchArgs) -> Res
 pub(super) fn handle_diff_command(ctx: &RuntimeContext, args: DiffArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let summary = diff_from_args(&mut db, &args)?;
-    render_diff(&summary, ctx.json, ctx.quiet, args.stat)
+    render_diff(&summary, ctx.json, ctx.quiet, args.stat, ctx.color)
 }
 
 pub(super) fn handle_checkout_command(ctx: &RuntimeContext, args: CheckoutArgs) -> Result<()> {
