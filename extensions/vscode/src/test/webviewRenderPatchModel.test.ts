@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ContentBlock } from "../shared/acpTypes";
+import { applyRenderPatchesAndCollect } from "../shared/acpRenderReducers";
 import type { RenderNode, RenderPatch } from "../shared/renderModel";
 import {
   applyRenderPatchesLocally,
@@ -88,6 +89,42 @@ function toolNode(id = "tool:read", turnId = "turn-1"): Extract<RenderNode, { ki
   };
 }
 
+function approvalNode(toolCallId: string, title: string): Extract<RenderNode, { kind: "approval" }> {
+  const tool = {
+    ...toolNode(`tool:${toolCallId}`, "turn-1"),
+    toolCallId,
+    acpToolCallId: toolCallId,
+    title
+  };
+  return {
+    ...base,
+    id: "approval:shared-request",
+    kind: "approval",
+    turnId: "turn-1",
+    acpToolCallId: toolCallId,
+    requestId: "shared-request",
+    title,
+    tool,
+    options: [{ optionId: "allow", label: "Allow" }]
+  };
+}
+
+function unknownNode(
+  id: string,
+  payload: unknown,
+  label = "Unsupported ACP update: provider_extra"
+): Extract<RenderNode, { kind: "unknown" }> {
+  return {
+    ...base,
+    id,
+    kind: "unknown",
+    turnId: "turn-1",
+    label,
+    payload,
+    status: "completed"
+  };
+}
+
 test("accepts only newer render revisions", () => {
   assert.equal(parseRenderRevision(1), 1);
   assert.equal(parseRenderRevision(0), undefined);
@@ -136,6 +173,58 @@ test("applies normalized render patches without reducer-side merging", () => {
   assert.equal(node.text, "Hello world");
 });
 
+test("replaces same-id live nodes with hydrated nodes without duplicating", () => {
+  const live = {
+    ...messageNode("message:assistant:msg-hydrated", "Hydrated answer"),
+    turnId: "turn-1",
+    source: "acp-live" as const,
+    status: "completed" as const,
+    streaming: false
+  };
+  const hydrated = {
+    ...live,
+    source: "crabdb" as const
+  };
+
+  const nodes = applyRenderPatchesLocally([live], [{ type: "replace", node: hydrated }]);
+  const changes = changedRenderNodesFromPatches([live], [{ type: "replace", node: hydrated }]);
+
+  assert.deepEqual(nodes.map((node) => `${node.id}:${node.source}`), ["message:assistant:msg-hydrated:crabdb"]);
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.removedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-hydrated"]);
+  assert.equal(hasTimelineStructuralChange([live], nodes, changes), true);
+});
+
+test("reconciles cross-source hydrated message replacements by message identity locally", () => {
+  const live = {
+    ...messageNode("message:assistant:msg-hydrated-cross-source", "Hydrated answer"),
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    status: "completed" as const,
+    streaming: false,
+    timelineOrder: 1
+  };
+  const hydrated = {
+    ...live,
+    id: "crabdb-message:turn-1:msg-hydrated-cross-source",
+    source: "crabdb" as const,
+    timelineOrder: 4,
+    updatedAt: "2026-06-27T00:01:00.000Z"
+  };
+
+  const nodes = applyRenderPatchesLocally([live], [{ type: "replace", node: hydrated }]);
+  const changes = changedRenderNodesFromPatches([live], [{ type: "replace", node: hydrated }]);
+
+  assert.deepEqual(nodes.map((node) => `${node.id}:${node.source}`), [
+    "message:assistant:msg-hydrated-cross-source:crabdb"
+  ]);
+  assert.equal(nodes[0]?.timelineOrder, 1);
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.removedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-hydrated-cross-source"]);
+});
+
 test("merges delta streamed message patches locally without losing prior text", () => {
   const first = messageNode("message:assistant:one", "Hello ");
   const second = messageNode("message:assistant:one", "world");
@@ -153,6 +242,112 @@ test("merges delta streamed message patches locally without losing prior text", 
   }
   assert.equal(node.text, "Hello world");
   assert.deepEqual(node.content, [{ type: "text", text: "Hello world" }]);
+});
+
+test("promotes anonymous streamed message patches locally when ids arrive late", () => {
+  const first = {
+    ...messageNode("message:assistant:anonymous", "Hello "),
+    acpMessageId: undefined
+  };
+  const second = {
+    ...messageNode("message:assistant:msg-promoted", "world"),
+    acpMessageId: "msg-promoted"
+  };
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: second }]);
+  const changes = changedRenderNodesFromPatches([first], [{ type: "upsert", node: second }]);
+
+  const message = nodes.find((node): node is Extract<RenderNode, { kind: "message" }> => node.kind === "message");
+  assert.deepEqual(nodes.map((node) => node.id), ["message:assistant:anonymous"]);
+  assert.equal(message?.acpMessageId, "msg-promoted");
+  assert.equal(message?.text, "Hello world");
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:anonymous"]);
+});
+
+test("promotes streamed message session scope locally when session ids arrive late", () => {
+  const first = {
+    ...messageNode("message:assistant:msg-session-promoted", "Hello "),
+    turnId: "turn-1"
+  };
+  const second = {
+    ...messageNode("message:assistant:msg-session-promoted", "world"),
+    turnId: "turn-1",
+    acpSessionId: "sess-1"
+  };
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: second }]);
+  const changes = changedRenderNodesFromPatches([first], [{ type: "upsert", node: second }]);
+
+  const message = nodes.find((node): node is Extract<RenderNode, { kind: "message" }> => node.kind === "message");
+  assert.deepEqual(nodes.map((node) => node.id), ["message:assistant:msg-session-promoted"]);
+  assert.equal(message?.acpSessionId, "sess-1");
+  assert.equal(message?.text, "Hello world");
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-session-promoted"]);
+});
+
+test("keeps streamed message scope locally when later chunks omit session and provider", () => {
+  const first = {
+    ...messageNode("message:assistant:msg-scope-preserved", "Hello "),
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    provider: "test-provider"
+  };
+  const second = {
+    ...messageNode("message:assistant:msg-scope-preserved", "world"),
+    turnId: "turn-1"
+  };
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: second }]);
+  const message = nodes.find((node): node is Extract<RenderNode, { kind: "message" }> => node.kind === "message");
+
+  assert.deepEqual(nodes.map((node) => node.id), ["message:assistant:msg-scope-preserved"]);
+  assert.equal(message?.acpSessionId, "sess-1");
+  assert.equal(message?.provider, "test-provider");
+  assert.equal(message?.text, "Hello world");
+});
+
+test("keeps streamed message id locally when later chunks omit it", () => {
+  const first = {
+    ...messageNode("message:assistant:msg-id-preserved", "Hello "),
+    turnId: "turn-1",
+    acpMessageId: "msg-id-preserved"
+  };
+  const second = {
+    ...messageNode("message:assistant:msg-id-preserved", "world"),
+    turnId: "turn-1",
+    acpMessageId: undefined
+  };
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: second }]);
+  const message = nodes.find((node): node is Extract<RenderNode, { kind: "message" }> => node.kind === "message");
+
+  assert.equal(message?.acpMessageId, "msg-id-preserved");
+  assert.equal(message?.text, "Hello world");
+});
+
+test("merges empty and aliased local text blocks without placeholder corruption", () => {
+  const first = {
+    ...messageNode("message:assistant:empty-alias", ""),
+    content: [{ type: "text", text: "" }]
+  };
+  const second = {
+    ...messageNode("message:assistant:empty-alias", "Rendered after empty text."),
+    content: [{ type: "text", value: "Rendered after empty text." } as ContentBlock]
+  };
+
+  const nodes = applyRenderPatchesLocally([], [
+    { type: "upsert", node: first },
+    { type: "upsert", node: second }
+  ]);
+
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected message node");
+  }
+  assert.equal(node.text, "Rendered after empty text.");
 });
 
 test("normalizes completed local message patches out of streaming state", () => {
@@ -176,6 +371,26 @@ test("normalizes completed local message patches out of streaming state", () => 
   assert.equal(node.status, "completed");
   assert.equal(node.streaming, false);
   assert.equal(node.text, "Hello world");
+});
+
+test("keeps completed local message lifecycle after late active chunks", () => {
+  const completed = {
+    ...messageNode("message:assistant:one", "Final"),
+    status: "completed" as const,
+    streaming: false
+  };
+  const late = messageNode("message:assistant:one", "Final answer.");
+
+  const nodes = applyRenderPatchesLocally([completed], [{ type: "upsert", node: late }]);
+
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected message node");
+  }
+  assert.equal(node.status, "completed");
+  assert.equal(node.streaming, false);
+  assert.equal(node.text, "Final answer.");
 });
 
 test("keeps distinct non-text message patches with the same display placeholder locally", () => {
@@ -207,6 +422,67 @@ test("keeps distinct non-text message patches with the same display placeholder 
   assert.deepEqual(node.content, [firstImage, secondImage]);
 });
 
+test("preserves rich content text summaries when merging local message patches", () => {
+  const resourceLink: ContentBlock = {
+    type: "resource_link",
+    uri: "file:///workspace/README.md",
+    name: "README.md",
+    title: "Context file"
+  };
+  const first = {
+    ...messageNode("message:assistant:rich", "Rendered with context.Context file (README.md)"),
+    content: [
+      { type: "text", text: "Rendered with context." },
+      resourceLink
+    ]
+  };
+  const second = messageNode("message:assistant:rich", " More");
+
+  const nodes = applyRenderPatchesLocally([], [
+    { type: "upsert", node: first },
+    { type: "upsert", node: second }
+  ]);
+
+  const node = nodes[0];
+  assert.equal(node?.kind, "message");
+  if (node?.kind !== "message") {
+    throw new Error("expected message node");
+  }
+  assert.equal(node.text, "Rendered with context.Context file (README.md) More");
+  assert.deepEqual(node.content, [
+    { type: "text", text: "Rendered with context." },
+    resourceLink,
+    { type: "text", text: " More" }
+  ]);
+});
+
+test("appends explicit terminal stdout deltas in local patches", () => {
+  const first: RenderNode = {
+    ...base,
+    id: "terminal:stream",
+    kind: "terminal",
+    turnId: "turn-1",
+    terminalId: "stream",
+    command: "npm test",
+    stdout: "line 1\n"
+  };
+  const delta = {
+    ...first,
+    command: undefined,
+    stdout: undefined
+  } as Extract<RenderNode, { kind: "terminal" }> & { stdoutDelta?: string };
+  delta.stdoutDelta = "line 2\n";
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: delta }]);
+  const changes = changedRenderNodesFromPatches([first], [{ type: "upsert", node: delta }]);
+  const terminal = nodes.find((node) => node.kind === "terminal");
+
+  assert.equal(terminal?.kind, "terminal");
+  assert.equal(terminal?.command, "npm test");
+  assert.equal(terminal?.stdout, "line 1\nline 2\n");
+  assert.deepEqual([...changes.changedNodeIds], ["terminal:stream"]);
+});
+
 test("merges delta streamed thought patches locally without losing prior text", () => {
   const first = thoughtNode("thought:one", "Inspect");
   const second = thoughtNode("thought:one", " files");
@@ -222,6 +498,53 @@ test("merges delta streamed thought patches locally without losing prior text", 
   if (node?.kind !== "thought") {
     throw new Error("expected thought node");
   }
+  assert.deepEqual(node.content, [{ type: "text", text: "Inspect files" }]);
+});
+
+test("keeps streamed thought scope locally when later chunks omit session and provider", () => {
+  const first = {
+    ...thoughtNode("thought:scope-preserved", "Inspect"),
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    provider: "test-provider"
+  };
+  const second = {
+    ...thoughtNode("thought:scope-preserved", " files"),
+    turnId: "turn-1"
+  };
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: second }]);
+  const node = nodes[0];
+
+  assert.equal(node?.kind, "thought");
+  if (node?.kind !== "thought") {
+    throw new Error("expected thought node");
+  }
+  assert.equal(node.acpSessionId, "sess-1");
+  assert.equal(node.provider, "test-provider");
+  assert.deepEqual(node.content, [{ type: "text", text: "Inspect files" }]);
+});
+
+test("keeps streamed thought id locally when later chunks omit it", () => {
+  const first = {
+    ...thoughtNode("thought:id-preserved", "Inspect"),
+    turnId: "turn-1",
+    acpMessageId: "id-preserved"
+  };
+  const second = {
+    ...thoughtNode("thought:id-preserved", " files"),
+    turnId: "turn-1",
+    acpMessageId: undefined
+  };
+
+  const nodes = applyRenderPatchesLocally([first], [{ type: "upsert", node: second }]);
+  const node = nodes[0];
+
+  assert.equal(node?.kind, "thought");
+  if (node?.kind !== "thought") {
+    throw new Error("expected thought node");
+  }
+  assert.equal(node.acpMessageId, "id-preserved");
   assert.deepEqual(node.content, [{ type: "text", text: "Inspect files" }]);
 });
 
@@ -241,6 +564,25 @@ test("preserves existing local timeline nodes when a patch reuses an id in anoth
   assert.equal(nodes[1]?.turnId, "turn-2");
   assert.deepEqual([...changes.addedNodeIds], ["tool:read:turn-2:acp-live"]);
   assert.deepEqual([...changes.changedNodeIds], ["tool:read:turn-2:acp-live"]);
+});
+
+test("preserves existing local approval nodes when a provider reuses request ids across tools", () => {
+  const existing = approvalNode("tool-a", "Run first command");
+  const incoming = approvalNode("tool-b", "Run second command");
+
+  const nodes = applyRenderPatchesLocally([existing], [{ type: "upsert", node: incoming }]);
+  const changes = changedRenderNodesFromPatches([existing], [{ type: "upsert", node: incoming }]);
+
+  assert.deepEqual(
+    nodes.map((node) => node.id),
+    ["approval:shared-request", "approval:shared-request:turn-1:acp-live"]
+  );
+  assert.deepEqual(
+    nodes.map((node) => node.kind === "approval" ? node.tool.toolCallId : undefined),
+    ["tool-a", "tool-b"]
+  );
+  assert.deepEqual([...changes.addedNodeIds], ["approval:shared-request:turn-1:acp-live"]);
+  assert.deepEqual([...changes.changedNodeIds], ["approval:shared-request:turn-1:acp-live"]);
 });
 
 test("normalizes appended duplicate ids into distinct local timeline nodes", () => {
@@ -274,6 +616,37 @@ test("cancels normalized duplicate additions without removing existing local nod
   assert.deepEqual([...changes.addedNodeIds], []);
   assert.deepEqual([...changes.changedNodeIds], []);
   assert.deepEqual([...changes.removedNodeIds], []);
+});
+
+test("normalizes replacement patches that reuse message ids across local turns", () => {
+  const existing = {
+    ...messageNode("message:assistant:replace-dup", "First turn"),
+    turnId: "turn-1",
+    acpMessageId: "replace-dup",
+    status: "completed" as const,
+    streaming: false,
+    timelineOrder: 1
+  };
+  const incoming = {
+    ...existing,
+    turnId: "turn-2",
+    content: [{ type: "text", text: "Second turn" } as ContentBlock],
+    text: "Second turn",
+    timelineOrder: undefined
+  };
+
+  const nodes = applyRenderPatchesLocally([existing], [{ type: "replace", node: incoming }]);
+  const changes = changedRenderNodesFromPatches([existing], [{ type: "replace", node: incoming }]);
+
+  assert.deepEqual(
+    nodes.map((node) => node.id),
+    ["message:assistant:replace-dup", "message:assistant:replace-dup:2"]
+  );
+  assert.equal(nodes[0], existing);
+  assert.equal(nodes[1]?.kind === "message" ? nodes[1].turnId : undefined, "turn-2");
+  assert.equal(nodes[1]?.kind === "message" ? nodes[1].text : undefined, "Second turn");
+  assert.deepEqual([...changes.addedNodeIds], ["message:assistant:replace-dup:2"]);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:replace-dup:2"]);
 });
 
 test("keeps reused completed tool ids distinct after later local timeline nodes", () => {
@@ -330,6 +703,140 @@ test("keeps late local tool updates attached after later timeline nodes", () => 
   assert.deepEqual([...changes.changedNodeIds], ["tool:read"]);
 });
 
+test("syncs local expanded terminal status from parent tool patches", () => {
+  const tool: Extract<RenderNode, { kind: "tool" }> = {
+    ...toolNode("tool:run-tests", "turn-1"),
+    toolCallId: "run-tests",
+    acpToolCallId: "run-tests",
+    status: "in_progress",
+    toolStatus: "in_progress",
+    content: [
+      {
+        type: "terminal",
+        terminalId: "term-1",
+        status: "running",
+        stdout: "running"
+      }
+    ]
+  };
+  const terminal: Extract<RenderNode, { kind: "terminal" }> = {
+    ...base,
+    id: "terminal:run-tests:term-1",
+    kind: "terminal",
+    turnId: "turn-1",
+    acpToolCallId: "run-tests",
+    terminalId: "term-1",
+    status: "in_progress",
+    terminalStatus: "running",
+    stdout: "running"
+  };
+  const completed: Extract<RenderNode, { kind: "tool" }> = {
+    ...tool,
+    status: "completed",
+    toolStatus: "completed",
+    content: [
+      {
+        type: "terminal",
+        terminalId: "term-1",
+        status: "completed",
+        stdout: "running"
+      }
+    ]
+  };
+
+  const nodes = applyRenderPatchesLocally([tool, terminal], [{ type: "upsert", node: completed }]);
+  const changes = changedRenderNodesFromPatches([tool, terminal], [{ type: "upsert", node: completed }]);
+
+  const syncedTerminal = nodes.find((node) => node.kind === "terminal");
+  assert.equal(syncedTerminal?.kind, "terminal");
+  if (syncedTerminal?.kind !== "terminal") {
+    throw new Error("expected synced terminal node");
+  }
+  assert.equal(syncedTerminal.status, "completed");
+  assert.equal(syncedTerminal.terminalStatus, "completed");
+  assert.deepEqual([...changes.changedNodeIds].sort(), ["terminal:run-tests:term-1", "tool:run-tests"].sort());
+});
+
+test("syncs local expanded terminal status from parent tool ACP id aliases", () => {
+  const tool: Extract<RenderNode, { kind: "tool" }> = {
+    ...toolNode("tool:display-tool", "turn-1"),
+    toolCallId: "display-tool",
+    acpToolCallId: "provider-tool",
+    status: "in_progress",
+    toolStatus: "in_progress"
+  };
+  const terminal: Extract<RenderNode, { kind: "terminal" }> = {
+    ...base,
+    id: "terminal:provider-tool:term-alias",
+    kind: "terminal",
+    turnId: "turn-1",
+    acpToolCallId: "provider-tool",
+    terminalId: "term-alias",
+    status: "in_progress",
+    terminalStatus: "running",
+    stdout: "running"
+  };
+  const completed: Extract<RenderNode, { kind: "tool" }> = {
+    ...tool,
+    status: "completed",
+    toolStatus: "completed"
+  };
+
+  const nodes = applyRenderPatchesLocally([tool, terminal], [{ type: "upsert", node: completed }]);
+  const changes = changedRenderNodesFromPatches([tool, terminal], [{ type: "upsert", node: completed }]);
+  const syncedTerminal = nodes.find((node) => node.kind === "terminal");
+
+  assert.equal(syncedTerminal?.kind, "terminal");
+  assert.equal(syncedTerminal?.status, "completed");
+  assert.equal(syncedTerminal?.terminalStatus, "completed");
+  assert.deepEqual([...changes.changedNodeIds].sort(), ["terminal:provider-tool:term-alias", "tool:display-tool"].sort());
+});
+
+test("syncs local expanded diff status from parent tool patches", () => {
+  const tool: Extract<RenderNode, { kind: "tool" }> = {
+    ...toolNode("tool:edit-readme", "turn-1"),
+    toolCallId: "edit-readme",
+    acpToolCallId: "edit-readme",
+    status: "in_progress",
+    toolStatus: "in_progress",
+    content: [
+      {
+        type: "diff",
+        path: "README.md",
+        oldText: "before",
+        newText: "after"
+      }
+    ]
+  };
+  const diff: Extract<RenderNode, { kind: "diff" }> = {
+    ...base,
+    id: "diff:edit-readme:README.md",
+    kind: "diff",
+    turnId: "turn-1",
+    acpToolCallId: "edit-readme",
+    status: "in_progress",
+    path: "README.md",
+    oldText: "before",
+    newText: "after"
+  };
+  const completed: Extract<RenderNode, { kind: "tool" }> = {
+    ...tool,
+    status: "completed",
+    toolStatus: "completed"
+  };
+
+  const nodes = applyRenderPatchesLocally([tool, diff], [{ type: "upsert", node: completed }]);
+  const changes = changedRenderNodesFromPatches([tool, diff], [{ type: "upsert", node: completed }]);
+
+  const syncedDiff = nodes.find((node) => node.kind === "diff");
+  assert.equal(syncedDiff?.kind, "diff");
+  if (syncedDiff?.kind !== "diff") {
+    throw new Error("expected synced diff node");
+  }
+  assert.equal(syncedDiff.status, "completed");
+  assert.deepEqual([...changes.changedNodeIds].sort(), ["diff:edit-readme:README.md", "tool:edit-readme"].sort());
+});
+
 test("keeps repeated assistant message ids after tool boundaries as separate local nodes", () => {
   const first = {
     ...messageNode("message:assistant:msg-1", "Before tool"),
@@ -355,6 +862,91 @@ test("keeps repeated assistant message ids after tool boundaries as separate loc
   assert.equal(nodes[2]?.kind === "message" ? nodes[2].text : undefined, "After tool");
   assert.deepEqual([...changes.addedNodeIds], ["message:assistant:msg-1:2"]);
   assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-1:2"]);
+});
+
+test("keeps repeated assistant message ids after active tool boundaries as separate local nodes", () => {
+  const first = {
+    ...messageNode("message:assistant:msg-active-boundary", "Before active tool. "),
+    turnId: "turn-1",
+    acpMessageId: "msg-active-boundary"
+  };
+  const tool = {
+    ...toolNode("tool:active-boundary", "turn-1"),
+    status: "in_progress" as const,
+    toolStatus: "in_progress" as const,
+    toolCallId: "active-boundary",
+    acpToolCallId: "active-boundary"
+  };
+  const continuation = {
+    ...messageNode("message:assistant:msg-active-boundary", "Before active tool. After active tool."),
+    turnId: "turn-1",
+    acpMessageId: "msg-active-boundary"
+  };
+
+  const nodes = applyRenderPatchesLocally([first, tool], [{ type: "upsert", node: continuation }]);
+  const changes = changedRenderNodesFromPatches([first, tool], [{ type: "upsert", node: continuation }]);
+
+  assert.deepEqual(
+    nodes.map((node) => node.id),
+    ["message:assistant:msg-active-boundary", "tool:active-boundary", "message:assistant:msg-active-boundary:2"]
+  );
+  assert.equal(nodes[0]?.kind === "message" ? nodes[0].text : undefined, "Before active tool. ");
+  assert.equal(nodes[2]?.kind === "message" ? nodes[2].text : undefined, "After active tool.");
+  assert.deepEqual([...changes.addedNodeIds], ["message:assistant:msg-active-boundary:2"]);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-active-boundary:2"]);
+});
+
+test("keeps same-batch active tool refreshes from splitting local repeated message streams", () => {
+  const first = {
+    ...messageNode("message:assistant:msg-active-same-batch", "Before active same-batch tool. "),
+    turnId: "turn-1",
+    acpMessageId: "msg-active-same-batch"
+  };
+  const tool = {
+    ...toolNode("tool:active-same-batch", "turn-1"),
+    status: "in_progress" as const,
+    toolStatus: "in_progress" as const,
+    toolCallId: "active-same-batch",
+    acpToolCallId: "active-same-batch"
+  };
+  const continuation = {
+    ...messageNode(
+      "message:assistant:msg-active-same-batch",
+      "Before active same-batch tool. Still before active same-batch tool."
+    ),
+    turnId: "turn-1",
+    acpMessageId: "msg-active-same-batch"
+  };
+  const refreshedTool = {
+    ...tool,
+    title: "Read refreshed same-batch tool"
+  };
+
+  const nodes = applyRenderPatchesLocally(
+    [first, tool],
+    [
+      { type: "upsert", node: continuation },
+      { type: "upsert", node: refreshedTool }
+    ]
+  );
+  const changes = changedRenderNodesFromPatches(
+    [first, tool],
+    [
+      { type: "upsert", node: continuation },
+      { type: "upsert", node: refreshedTool }
+    ]
+  );
+
+  assert.deepEqual(
+    nodes.map((node) => node.id),
+    ["message:assistant:msg-active-same-batch", "tool:active-same-batch"]
+  );
+  assert.equal(
+    nodes[0]?.kind === "message" ? nodes[0].text : undefined,
+    "Before active same-batch tool. Still before active same-batch tool."
+  );
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds].sort(), ["message:assistant:msg-active-same-batch", "tool:active-same-batch"].sort());
 });
 
 test("trims cumulative repeated assistant snapshots after local tool boundaries", () => {
@@ -453,6 +1045,54 @@ test("keeps local turn completion after late repeated assistant chunks", () => {
   assert.deepEqual([...changes.changedNodeIds].sort(), ["completion:turn-1", "message:assistant:msg-late-completion:2"].sort());
 });
 
+test("applies host-normalized late assistant continuation patches without losing final order", () => {
+  const first = {
+    ...messageNode("message:assistant:msg-host-late-completion", "Before completion. "),
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    acpMessageId: "msg-host-late-completion",
+    timelineOrder: 1
+  };
+  const tool = {
+    ...toolNode("tool:tool-before-host-late-completion", "turn-1"),
+    acpSessionId: "sess-1",
+    toolCallId: "tool-before-host-late-completion",
+    acpToolCallId: "tool-before-host-late-completion",
+    timelineOrder: 2
+  };
+  const completion: RenderNode = {
+    ...base,
+    id: "completion:turn-1",
+    kind: "completion",
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    status: "pending",
+    stopReason: "end_turn",
+    label: "Turn complete; checkpoint pending",
+    checkpointPending: true,
+    timelineOrder: 3
+  };
+  const late = {
+    ...messageNode("message:assistant:msg-host-late-completion", "Before completion. Final answer."),
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    acpMessageId: "msg-host-late-completion",
+    timelineOrder: 4
+  };
+  const before = [first, tool, completion];
+
+  const applied = applyRenderPatchesAndCollect(before, [{ type: "upsert", node: late }]);
+  const webviewNodes = applyRenderPatchesLocally(before, applied.patches);
+
+  assert.deepEqual(
+    applied.patches.map((patch) => patch.node?.id || patch.id),
+    ["message:assistant:msg-host-late-completion:2", "completion:turn-1"]
+  );
+  assert.deepEqual(webviewNodes, applied.nodes);
+  assert.equal(webviewNodes[2]?.kind === "message" ? webviewNodes[2].text : undefined, "Final answer.");
+  assert.equal((webviewNodes[3]?.timelineOrder ?? 0) > (webviewNodes[2]?.timelineOrder ?? 0), true);
+});
+
 test("keeps local hydrated checkpoints after late live assistant chunks", () => {
   const first = {
     ...messageNode("message:assistant:msg-late-hydrated", "Before checkpoint. "),
@@ -504,6 +1144,101 @@ test("keeps local hydrated checkpoints after late live assistant chunks", () => 
   assert.equal((nodes[3]?.timelineOrder ?? 0) > (nodes[2]?.timelineOrder ?? 0), true);
   assert.deepEqual([...changes.addedNodeIds], ["message:assistant:msg-late-hydrated:2"]);
   assert.deepEqual([...changes.changedNodeIds].sort(), ["crabdb-checkpoint:turn-1", "message:assistant:msg-late-hydrated:2"].sort());
+});
+
+test("keeps reused unknown provider event ids distinct after timeline boundaries", () => {
+  const first = {
+    ...unknownNode("unknown:provider-event", { sessionUpdate: "provider_extra", value: "first" }),
+    timelineOrder: 1
+  };
+  const boundary = {
+    ...messageNode("message:assistant:after-unknown-boundary", "After event."),
+    turnId: "turn-1",
+    timelineOrder: 2
+  };
+  const second = {
+    ...unknownNode("unknown:provider-event", { sessionUpdate: "provider_extra", value: "second" }),
+    timelineOrder: 3
+  };
+
+  const nodes = applyRenderPatchesLocally([first, boundary], [{ type: "upsert", node: second }]);
+  const changes = changedRenderNodesFromPatches([first, boundary], [{ type: "upsert", node: second }]);
+
+  const unknowns = nodes.filter((node): node is Extract<RenderNode, { kind: "unknown" }> => node.kind === "unknown");
+  assert.equal(unknowns.length, 2);
+  assert.deepEqual(unknowns.map((node) => node.payload), [
+    { sessionUpdate: "provider_extra", value: "first" },
+    { sessionUpdate: "provider_extra", value: "second" }
+  ]);
+  assert.notEqual(unknowns[0]?.id, unknowns[1]?.id);
+  assert.deepEqual([...changes.addedNodeIds], [unknowns[1]!.id]);
+  assert.deepEqual([...changes.changedNodeIds], [unknowns[1]!.id]);
+});
+
+test("reconciles refreshed unknown provider events by stable payload identity", () => {
+  const existing = {
+    ...unknownNode("unknown:provider-event-live", { detail: "same event", sessionUpdate: "provider_extra" }),
+    timelineOrder: 1,
+    createdAt: "2026-06-27T00:00:00.000Z"
+  };
+  const refreshed = {
+    ...unknownNode("unknown:provider-event-hydrated", { sessionUpdate: "provider_extra", detail: "same event" }),
+    timelineOrder: 5,
+    createdAt: "2026-06-27T00:01:00.000Z"
+  };
+
+  const nodes = applyRenderPatchesLocally([existing], [{ type: "replace", node: refreshed }]);
+  const changes = changedRenderNodesFromPatches([existing], [{ type: "replace", node: refreshed }]);
+
+  assert.deepEqual(nodes.map((node) => node.id), ["unknown:provider-event-live"]);
+  assert.equal(nodes[0]?.timelineOrder, 1);
+  assert.equal(nodes[0]?.createdAt, "2026-06-27T00:00:00.000Z");
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.removedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds], ["unknown:provider-event-live"]);
+});
+
+test("does not move local turn completion behind late nodes from another ACP session", () => {
+  const first = {
+    ...messageNode("message:assistant:session-one", "First session done."),
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    status: "completed" as const,
+    streaming: false,
+    timelineOrder: 1
+  };
+  const completion: RenderNode = {
+    ...base,
+    id: "completion:turn-1",
+    kind: "completion",
+    turnId: "turn-1",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    status: "pending",
+    stopReason: "end_turn",
+    label: "Turn complete; checkpoint pending",
+    checkpointPending: true,
+    timelineOrder: 2
+  };
+  const lateOtherSession = {
+    ...messageNode("message:assistant:session-two", "Second session late chunk."),
+    turnId: "turn-1",
+    acpSessionId: "sess-2",
+    provider: "test-provider",
+    timelineOrder: 3
+  };
+
+  const nodes = applyRenderPatchesLocally([first, completion], [{ type: "upsert", node: lateOtherSession }]);
+  const changes = changedRenderNodesFromPatches([first, completion], [{ type: "upsert", node: lateOtherSession }]);
+
+  assert.deepEqual(nodes.map((node) => node.id), [
+    "message:assistant:session-one",
+    "completion:turn-1",
+    "message:assistant:session-two"
+  ]);
+  assert.equal((nodes[1]?.timelineOrder ?? 0) < (nodes[2]?.timelineOrder ?? 0), true);
+  assert.deepEqual([...changes.changedNodeIds], ["message:assistant:session-two"]);
 });
 
 test("keeps anonymous assistant chunks after tool boundaries as separate local nodes", () => {
@@ -681,6 +1416,20 @@ test("allows existing presentation node completion patches to hydrate locally", 
     true
   );
   assert.equal(isHydratableNodePatchPayload({ type: "upsert", node: terminalNode("completed") }), true);
+  assert.equal(
+    isHydratableNodePatchPayload({
+      type: "upsert",
+      node: {
+        ...base,
+        id: "unknown:provider-event",
+        kind: "unknown",
+        status: "completed",
+        label: "Provider progress",
+        payload: { sessionUpdate: "custom_progress" }
+      }
+    }),
+    true
+  );
   assert.equal(
     isHydratableNodePatchPayload({
       type: "upsert",

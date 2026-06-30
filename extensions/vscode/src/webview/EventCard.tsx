@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import {
@@ -15,6 +16,7 @@ import { cn } from "@/webview/lib/utils"
 import { InlineActions, type InlineActionTone } from "./InlineActions"
 import { RawDetails, type RawDetailsView } from "./RawDetails"
 import type { EventActionTone, EventTone } from "./eventModel"
+import { useSyncedAccordionValue } from "./syncedAccordionState"
 
 export interface EventCardFact {
   label: string
@@ -57,6 +59,7 @@ export interface EventCardProps {
 
 export interface MountEventCardsOptions {
   getProps(nodeId: string): EventCardProps | undefined
+  ids?: ReadonlySet<string> | undefined
 }
 
 interface MountedRoot {
@@ -115,10 +118,13 @@ function CheckpointSeparator({
   props: EventCardProps
   hasBody: boolean
 }) {
+  const [openValue, setOpenValue] = useSyncedAccordionValue(eventCardOpenValue(props))
+
   return (
     <Accordion
       className="checkpoint-separator"
-      defaultValue={props.defaultOpen ? [props.nodeId] : undefined}
+      value={openValue}
+      onValueChange={setOpenValue}
       data-event-card=""
     >
       <AccordionItem className="checkpoint-separator-item" value={props.nodeId}>
@@ -148,6 +154,10 @@ function CheckpointSeparator({
       </AccordionItem>
     </Accordion>
   )
+}
+
+function eventCardOpenValue(props: EventCardProps): string[] {
+  return props.defaultOpen ? [props.nodeId] : []
 }
 
 function EventCardBody({ props }: { props: EventCardProps }) {
@@ -270,6 +280,13 @@ export function mountEventCards(options: MountEventCardsOptions): void {
     if (!nodeId) {
       return
     }
+    if (options.ids && !options.ids.has(nodeId)) {
+      const mounted = mountedRoots.get(nodeId)
+      if (mounted?.element === element && element.isConnected) {
+        activeIds.add(nodeId)
+      }
+      return
+    }
     const props = options.getProps(nodeId)
     if (!props) {
       return
@@ -289,7 +306,9 @@ export function mountEventCards(options: MountEventCardsOptions): void {
       return
     }
     lastEventCardPropsJson.set(nodeId, currentJson)
-    mounted.root.render(<EventCard props={props} />)
+    flushSync(() => {
+      mounted.root.render(<EventCard props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, nodeId) => {

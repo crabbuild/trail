@@ -2943,6 +2943,7 @@ impl CrabDb {
             &crab_branch,
         )?;
 
+        let _overlay_mount = self.maybe_mount_overlay_cow_workdir_for_lane(&lane)?;
         let would_record = self.lane_workdir_dirty(&lane)?;
         if dry_run && would_record {
             let view = self.agent_task_view(&lane)?;
@@ -4115,7 +4116,7 @@ impl CrabDb {
                 "agent apply requires a Git HEAD commit before it can fast-forward".to_string(),
             ));
         };
-        if self.git_clean_head_matches_root_mapping(git_head, root_id)? {
+        if self.ensure_git_clean_head_root_mapping(crab_branch, change_id, root_id, git_head)? {
             return Ok(());
         }
         let files = self.load_root_files(root_id)?;

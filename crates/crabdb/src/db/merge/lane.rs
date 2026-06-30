@@ -290,15 +290,19 @@ impl CrabDb {
         if !workdir_path.is_dir() {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
-        let cached_manifest =
-            match self.cached_workdir_manifest_status(&workdir_path, &head.root_id)? {
-                CachedWorkdirManifestStatus::Clean => return Ok(Some(Vec::new())),
-                CachedWorkdirManifestStatus::Dirty {
-                    disk_manifest,
-                    candidate_paths,
-                } => Some((disk_manifest, candidate_paths)),
-                CachedWorkdirManifestStatus::Missing => None,
-            };
+        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(branch)?;
+        let cached_manifest = match self.lane_cached_workdir_manifest_status(
+            &workdir_path,
+            overlay_manifest_path.as_deref(),
+            &head.root_id,
+        )? {
+            CachedWorkdirManifestStatus::Clean => return Ok(Some(Vec::new())),
+            CachedWorkdirManifestStatus::Dirty {
+                disk_manifest,
+                candidate_paths,
+            } => Some((disk_manifest, candidate_paths)),
+            CachedWorkdirManifestStatus::Missing => None,
+        };
         let disk_files;
         let (disk_manifest, candidate_paths) = if let Some(cached_manifest) = cached_manifest {
             cached_manifest

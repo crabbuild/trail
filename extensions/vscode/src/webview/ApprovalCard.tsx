@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import {
@@ -13,6 +14,7 @@ import { ButtonGroup } from "@/webview/components/ui/button-group"
 import { Card, CardContent, CardHeader } from "@/webview/components/ui/card"
 import { cn } from "@/webview/lib/utils"
 import type { ApprovalDecisionTone, ApprovalTone } from "./approvalModel"
+import { useSyncedAccordionValue } from "./syncedAccordionState"
 
 export interface ApprovalCardAction {
   kind: "approve" | "reject"
@@ -108,12 +110,14 @@ export function ApprovalCard({ props }: { props: ApprovalCardProps }) {
 }
 
 function ApprovalDisclosures({ disclosures }: { disclosures: ApprovalCardDisclosure[] }) {
+  const [openValues, setOpenValues] = useSyncedAccordionValue(approvalDisclosureOpenValues(disclosures))
+
   if (!disclosures.length) {
     return null
   }
-  const defaultValue = disclosures.filter((disclosure) => disclosure.defaultOpen).map((disclosure) => disclosure.id)
+
   return (
-    <Accordion className="approval-disclosures" defaultValue={defaultValue.length ? defaultValue : undefined}>
+    <Accordion className="approval-disclosures" value={openValues} onValueChange={setOpenValues}>
       {disclosures.map((disclosure) => (
         <AccordionItem
           key={disclosure.id}
@@ -138,6 +142,10 @@ function ApprovalDisclosures({ disclosures }: { disclosures: ApprovalCardDisclos
       ))}
     </Accordion>
   )
+}
+
+function approvalDisclosureOpenValues(disclosures: ApprovalCardDisclosure[]): string[] {
+  return disclosures.filter((disclosure) => disclosure.defaultOpen).map((disclosure) => disclosure.id)
 }
 
 function ApprovalDecision({ props }: { props: ApprovalCardProps }) {
@@ -235,7 +243,9 @@ export function mountApprovalCards(options: MountApprovalCardsOptions): void {
       }
       mountedRoots.set(nodeId, mounted)
     }
-    mounted.root.render(<ApprovalCard props={props} />)
+    flushSync(() => {
+      mounted.root.render(<ApprovalCard props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, nodeId) => {

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ApprovalCard, type ApprovalCardProps } from "../webview/ApprovalCard";
 
 const iconHtml = '<svg class="icon" aria-hidden="true"></svg>';
+const approvalCardSource = fs.readFileSync(path.join(process.cwd(), "src", "webview", "ApprovalCard.tsx"), "utf8");
 
 function renderApproval(props: ApprovalCardProps): string {
   return renderToStaticMarkup(React.createElement(ApprovalCard, { props }));
@@ -76,6 +79,10 @@ test("renders pending approvals with compact shadcn card badge and decision butt
   assert.match(html, /data-slot="card"/);
   assert.match(html, /approval-impact/);
   assert.match(html, /data-slot="accordion"/);
+  assert.match(approvalCardSource, /import \{ useSyncedAccordionValue \} from "\.\/syncedAccordionState"/);
+  assert.match(approvalCardSource, /useSyncedAccordionValue\(approvalDisclosureOpenValues\(disclosures\)\)/);
+  assert.match(approvalCardSource, /<Accordion className="approval-disclosures" value=\{openValues\} onValueChange=\{setOpenValues\}>/);
+  assert.doesNotMatch(approvalCardSource, /defaultValue=\{defaultValue/);
   assert.match(html, /data-slot="accordion-item"/);
   assert.match(html, /data-slot="accordion-trigger"/);
   assert.match(html, /data-slot="accordion-content"/);

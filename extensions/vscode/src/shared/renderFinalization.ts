@@ -76,6 +76,7 @@ function finalizeAcpLiveTurnNode(
     }
     case "diff":
     case "resource":
+    case "unknown":
       if (!isActiveStatus(node.status)) {
         return node;
       }
@@ -178,6 +179,9 @@ function finalizeToolTerminalContent(content: ToolCallContent[], toolStatus: Too
     };
     if (typeof record.terminalStatus === "string") {
       updated.terminalStatus = toolStatus;
+    }
+    if (typeof record.state === "string") {
+      updated.state = toolStatus;
     }
     return updated as ToolCallContent;
   });

@@ -128,6 +128,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   const toolCallGroupCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "ToolCallGroupCard.tsx"), "utf8");
   const tailwindSource = fs.readFileSync(path.join(root, "src", "webview", "tailwind.css"), "utf8");
   assert.doesNotMatch(mainBundleSource, /import\("\.\/chunks\/ApprovalCard-[A-Z0-9]+\.js"\)/, "main bundle should not dynamically import a separate approval card island");
+  assert.match(approvalCardSourceTs, /import \{ flushSync \} from "react-dom"/, "approval card island should commit permission rows synchronously when mounted");
+  assert.match(approvalCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<ApprovalCard/, "approval card island should avoid blank permission frames");
   assert.match(mainBundleSource, /import\("\.\/chunks\/ComposerCard-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the React composer island");
   assert.match(mainBundleSource, /import\("\.\/chunks\/DiffCard-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the React diff card island");
   assert.match(mainBundleSource, /import\("\.\/chunks\/highlight-[A-Z0-9]+\.js"\)/, "main bundle should dynamically import the highlighter chunk");
@@ -200,12 +202,30 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(webviewSource, /function renderTimelineGroupBodyItems\(nodes: RenderNode\[\]\): TimelineGroupCardProps\["bodyItems"\][\s\S]*collectGroupableToolRun\(nodes, index\)[\s\S]*toolCallGroupBodyItem\(toolRun\)/, "timeline groups should coalesce adjacent finished tool calls into one body item");
   assert.match(webviewSource, /function shouldGroupCompletedToolCalls\(\): boolean \{[\s\S]*timelineFilter === "all" && timelineSearchTokens\(timelineQuery\)\.length === 0/s, "tool grouping should stay disabled during transcript filtering and search");
   assert.match(webviewSource, /function isGroupableToolNode\(node: RenderNode \| undefined\): node is ToolNodeView \{[\s\S]*node\.permission\?\.status === "pending"[\s\S]*return status !== "pending" && status !== "in_progress"/, "tool grouping should leave pending and running tool calls visible as individual cards");
-  assert.match(webviewSource, /function timelineGroups\(nodes: RenderNode\[\]\): TimelineGroup\[\] \{[\s\S]*const segmentCounts = new Map<string, number>\(\)[\s\S]*let group = groups\[groups\.length - 1\][\s\S]*group\?\.baseKey !== baseKey[\s\S]*segment-\$\{segmentCount\}/, "timeline grouping should preserve sorted contiguous segments instead of merging repeated turn ids upward");
-  assert.doesNotMatch(webviewSource.match(/function timelineGroups\(nodes: RenderNode\[\]\): TimelineGroup\[\] \{[\s\S]*?\n}\n\nfunction timelineGroupDetail/)?.[0] || "", /byKey\.get|byKey\.set/, "timeline grouping should not bucket repeated turn ids into their first visual group");
+  assert.match(webviewSource, /function timelineGroups\(nodes: RenderNode\[\]\): TimelineGroup\[\] \{[\s\S]*buildTimelineConversationGroups\(nodes\)\.map/, "timeline grouping should use the shared conversation grouping model");
+  assert.match(timelineModelSourceTs, /export function buildTimelineConversationGroups\(nodes: RenderNode\[\]\): TimelineConversationGroup\[\] \{[\s\S]*const segmentCounts = new Map<string, number>\(\)[\s\S]*const groupByUserMessages = nodes\.some\(isTimelineUserMessageNode\)[\s\S]*currentConversationBaseKey = `turn:\$\{currentConversationTurnId\}`[\s\S]*timelineConversationGroupScope/, "timeline grouping should start visible turns from user prompt boundaries");
+  assert.match(timelineModelSourceTs, /function timelineConversationGroupScope\([\s\S]*groupByUserMessages[\s\S]*currentConversationBaseKey[\s\S]*baseKey: "session"[\s\S]*node\.turnId \? \{ baseKey: `turn:\$\{node\.turnId\}`/, "timeline grouping should fall back to raw turn scopes when no user prompt is visible");
+  assert.doesNotMatch(timelineModelSourceTs.match(/export function buildTimelineConversationGroups\(nodes: RenderNode\[\]\): TimelineConversationGroup\[\] \{[\s\S]*?\n}\n\nfunction timelineConversationGroupScope/)?.[0] || "", /byKey\.get|byKey\.set/, "timeline grouping should not bucket repeated turn ids into their first visual group");
+  assert.match(
+    webviewSource,
+    /function renderTimeline\(nodes: RenderNode\[\]\): TimelineScrollerItemView\[\][\s\S]*renderTimelineGroup\(group, index, groups\.length, groups\)[\s\S]*function renderTimelineGroup\(group: TimelineGroup, index: number, total: number, groups: TimelineGroup\[\]\): TimelineScrollerItemView \{[\s\S]*shouldOpenTimelineGroup\(group, index, total, groups\)/,
+    "full timeline renders should pass all groups into timeline open-state selection"
+  );
+  assert.match(
+    webviewSource,
+    /function refreshTimelineGroupsForPatchedNodes\(nodeIds: string\[\]\): PatchedTimelineHydrationTargets \{[\s\S]*const groups = timelineGroups\(visibleTimelineNodes\(\)\)[\s\S]*renderTimelineGroup\(group, index, groups\.length, groups\)/,
+    "patched timeline group refreshes should preserve the full open-state context"
+  );
+  assert.match(
+    webviewSource,
+    /function shouldOpenTimelineGroup\(group: TimelineGroup, index: number, total: number, groups: TimelineGroup\[\]\): boolean \{[\s\S]*index === total - 1 \|\| isLatestTurnGroup\(group, index, groups\)[\s\S]*function isLatestTurnGroup\(group: TimelineGroup, index: number, groups: TimelineGroup\[\]\): boolean \{[\s\S]*!group\.turnId[\s\S]*for \(let nextIndex = index \+ 1; nextIndex < groups\.length; nextIndex \+= 1\)[\s\S]*groups\[nextIndex\]\?\.turnId[\s\S]*return true/,
+    "latest completed turn groups should stay open even when later session task updates trail them"
+  );
   assert.match(webviewSource, /function approvalNode\(node:[\s\S]*return toolNode\(approvalAsToolNode\(node\)\)/, "orphan approval nodes should render through the tool call card");
   assert.match(webviewSource, /function chatNodes\(nodes: RenderNode\[\]\): RenderNode\[\]\s*\{[\s\S]*return timelineDisplayNodes\(nodes\);[\s\S]*\}/, "chat transcript nodes should use the shared timeline display model");
   assert.match(timelineModelSourceTs, /function scopedToolCallKey\([\s\S]*node\.taskId[\s\S]*node\.lane[\s\S]*node\.turnId[\s\S]*node\.acpSessionId[\s\S]*node\.source[\s\S]*node\.toolCallId/, "matched approval nodes should scope reused tool ids before attaching to existing tool nodes");
-  assert.match(timelineModelSourceTs, /function timelineDisplayNodes\(nodes: RenderNode\[\]\): RenderNode\[\] \{[\s\S]*approvalsByTool\.get\(scopedToolCallKey\(node\)\)[\s\S]*permissionFromApproval\(approval\)[\s\S]*approvalScopedToolCallKey\(node\)[\s\S]*visibleToolKeys\.has\(key\)/, "matched approval nodes should attach through the scoped timeline display model");
+  assert.match(timelineModelSourceTs, /function timelineDisplayNodes\(nodes: RenderNode\[\]\): RenderNode\[\] \{[\s\S]*flatMap\(scopedToolCallKeysForTool\)[\s\S]*approvalForTool\(approvalsByTool, node\)[\s\S]*toolWithApproval\(node, approval\)[\s\S]*scopedToolCallKeysForApproval\(node\)[\s\S]*visibleToolKeys\.has\(key\)/, "matched approval nodes should attach through scoped tool id aliases");
+  assert.match(timelineModelSourceTs, /function toolWithApproval\([\s\S]*timelineOrder: earliestTimelineOrder\(tool\.timelineOrder, approval\.timelineOrder\)[\s\S]*createdAt: earliestTimestamp\(tool\.createdAt, approval\.createdAt\)[\s\S]*permission: permissionFromApproval\(approval\)/, "folded approval tool rows should keep the earliest lifecycle ordering metadata");
   assert.match(composerCardSource, /createRoot/, "lazy composer island should mount with React");
   assert.match(composerCardSource, /data-composer-card/, "lazy composer island should preserve composer DOM affordances");
   assert.doesNotMatch(composerCardSourceTs, /from "@\/webview\/components\/ui\/alert"/, "composer island should not import alert chrome for running state");
@@ -224,6 +244,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(composerCardSourceTs, /className="icon"[\s\S]{0,120}data-icon="inline-start"/, "composer button icons should not carry retired manual icon sizing classes");
   assert.doesNotMatch(composerCardSourceTs, /className="icon"[\s\S]{0,120}dangerouslySetInnerHTML=\{\{ __html: props\.settingsIconHtml \}\}/, "composer floating controls trigger should not carry retired manual icon sizing classes");
   assert.match(diffCardSource, /createRoot/, "lazy diff card island should mount with React");
+  assert.match(diffCardSourceTs, /import \{ flushSync \} from "react-dom"/, "lazy diff card island should commit diff rows synchronously");
+  assert.match(diffCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<DiffCard/, "lazy diff card island should avoid blank diff frames");
   assert.match(diffCardSource, /data-diff-card/, "lazy diff card island should preserve diff-card DOM affordances");
   assert.match(diffCardSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "diff card island should render file diffs with shadcn accordion components");
   assert.match(diffCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "diff card island should render file diff stats with shadcn badges");
@@ -247,6 +269,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(emptyStateCardSourceTs, /card-chrome/, "empty state island should not depend on retired card chrome");
   assert.doesNotMatch(emptyStateCardSourceTs, /className="tool-icon"[\s\S]{0,120}dangerouslySetInnerHTML=\{\{ __html: action\.iconHtml \}\}/, "empty state action icons should not carry retired manual icon sizing classes");
   assert.match(eventCardSource, /createRoot/, "lazy event card island should mount with React");
+  assert.match(eventCardSourceTs, /import \{ flushSync \} from "react-dom"/, "lazy event card island should commit completion and checkpoint rows synchronously");
+  assert.match(eventCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<EventCard/, "lazy event card island should avoid blank final event frames");
   assert.match(eventCardSource, /data-event-card/, "lazy event card island should preserve event-card DOM affordances");
   assert.match(eventCardSourceTs, /import \{ Alert, AlertDescription, AlertTitle \} from "@\/webview\/components\/ui\/alert"/, "event card island should render callouts with shadcn alert components");
   assert.match(eventCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "event card island should render event facts and status with shadcn badges");
@@ -298,6 +322,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(payloadDisclosureSourceTs, /ids\?: ReadonlySet<string> \| undefined[\s\S]*options\.ids && !options\.ids\.has\(id\)[\s\S]*activeIds\.add\(id\)[\s\S]*flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<PayloadDisclosure/, "payload disclosure hydration should be filterable and preserve untouched mounted roots");
   assert.doesNotMatch(payloadDisclosureSourceTs, /<details|<summary/, "payload disclosure island should not render native details markup");
   assert.match(planCardSource, /createRoot/, "lazy plan card island should mount with React");
+  assert.match(planCardSourceTs, /import \{ flushSync \} from "react-dom"/, "lazy plan card island should commit plan updates synchronously");
+  assert.match(planCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<PlanCard/, "lazy plan card island should avoid blank plan frames");
   assert.match(planCardSource, /data-plan-card/, "lazy plan card island should preserve plan-card DOM affordances");
   assert.match(planCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "plan card island should render statuses with shadcn badges");
   assert.match(planCardSourceTs, /import \{[\s\S]*Card,[\s\S]*CardAction,[\s\S]*CardContent,[\s\S]*CardDescription,[\s\S]*CardHeader,[\s\S]*CardTitle[\s\S]*\} from "@\/webview\/components\/ui\/card"/, "plan card island should render the plan surface with full shadcn card composition");
@@ -330,6 +356,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(reviewDrawerSourceTs, /<span[\s\S]*data-icon="inline-start"[\s\S]*dangerouslySetInnerHTML=\{\{ __html: iconHtml \}\}/, "review action icons should use shadcn data-icon hooks");
   assert.doesNotMatch(reviewDrawerSourceTs, /className="icon"[\s\S]{0,120}data-icon="inline-start"/, "review action icons should not carry retired manual icon sizing classes");
   assert.match(terminalCardSource, /createRoot/, "lazy terminal card island should mount with React");
+  assert.match(terminalCardSourceTs, /import \{ flushSync \} from "react-dom"/, "lazy terminal card island should commit terminal updates synchronously");
+  assert.match(terminalCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<TerminalCard/, "lazy terminal card island should avoid blank terminal frames");
   assert.match(terminalCardSource, /data-terminal-card/, "lazy terminal card island should preserve terminal-card DOM affordances");
   assert.match(terminalCardSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "terminal card island should render output sections with shadcn accordion components");
   assert.match(terminalCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "terminal card island should render terminal status with shadcn badges");
@@ -346,6 +374,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(thoughtCardSourceTs, /import \{[\s\S]*Accordion,[\s\S]*AccordionContent,[\s\S]*AccordionItem,[\s\S]*AccordionTrigger[\s\S]*\} from "@\/webview\/components\/ui\/accordion"/, "thought card island should render reasoning details with shadcn accordion components");
   assert.match(thoughtCardSourceTs, /import \{ Badge \} from "@\/webview\/components\/ui\/badge"/, "thought card island should render reasoning status with shadcn badges");
   assert.match(thoughtCardSourceTs, /import \{ Card, CardContent \} from "@\/webview\/components\/ui\/card"/, "thought card island should render the reasoning surface with shadcn cards");
+  assert.match(thoughtCardSourceTs, /import \{ flushSync \} from "react-dom"/, "lazy thought card island should commit streaming updates synchronously");
+  assert.match(thoughtCardSourceTs, /flushSync\(\(\) => \{[\s\S]*mounted\.root\.render\(<ThoughtCard/, "lazy thought card island should avoid blank reasoning frames while streaming");
   assert.match(thoughtCardSourceTs, /import \{ StreamdownMarkdown \} from "\.\/StreamdownMarkdown"/, "streaming thought cards should share the live Streamdown markdown island");
   assert.match(thoughtCardSourceTs, /props\.contentMode === "stream-text"[\s\S]*<StreamdownMarkdown[\s\S]*className="event-content"[\s\S]*text=\{props\.contentText \|\| ""\}/, "streaming thought cards should render live markdown without replacing the thought shell");
   assert.match(webviewSource, /function thoughtNode\(node:[\s\S]*const streamText = streamingTextForNode\(node\)[\s\S]*thoughtCardProps\.set/, "webview should route live text-only thoughts through the streaming text renderer");
@@ -2883,9 +2913,9 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
     "diff nodes should render through the lazy shadcn diff card island while preserving diff preview helpers"
   );
   assert.match(
-    webviewSource,
-    /function renderTimelineGroupBodyItems\(nodes: RenderNode\[\]\): TimelineGroupCardProps\["bodyItems"\][\s\S]*isInlineToolDiffNode\(nodes, node\)[\s\S]*continue[\s\S]*function isInlineToolDiffNode[\s\S]*comparableDiffPath/,
-    "timeline groups should skip duplicate diff cards when the edit tool already renders the same inline diff"
+    `${webviewSource}\n${timelineModelSourceTs}`,
+    /function renderTimelineGroupBodyItems\(nodes: RenderNode\[\]\): TimelineGroupCardProps\["bodyItems"\][\s\S]*isInlineToolDiffNode\(nodes, node\)[\s\S]*continue[\s\S]*export function isInlineToolDiffNode\(nodes: RenderNode\[\], node: RenderNode\): boolean \{[\s\S]*sameTimelineRenderScope\(candidate, node\)[\s\S]*candidate\.acpToolCallId[\s\S]*comparableDiffPath/,
+    "timeline groups should skip duplicate diff cards through scoped provider tool id aliases"
   );
   assert.doesNotMatch(
     webviewSource,
@@ -3519,6 +3549,7 @@ test("webview initializes icon registry before startup render", () => {
 
 test("webview streaming state updates refresh existing islands instead of tearing down the shell", () => {
   const source = fs.readFileSync(path.join(root, "src", "webview", "main.ts"), "utf8");
+  const eventCardSourceTs = fs.readFileSync(path.join(root, "src", "webview", "EventCard.tsx"), "utf8");
   const stateHandler = source.match(/if \(message\.type === "state"\) \{[\s\S]*?\n  \}\n\n  if \(message\.type === "error"\)/)?.[0] || "";
 
   assert.match(source, /const STREAM_RENDER_INTERVAL_MS = \d+;/, "state updates should define a bounded streaming render cadence");
@@ -3564,6 +3595,21 @@ test("webview streaming state updates refresh existing islands instead of tearin
   );
   assert.match(
     source,
+    /function hydratePatchedNodes\(\): Promise<void> \{[\s\S]*let needsTimelineChromeHydration = false[\s\S]*if \(!node\) \{[\s\S]*state\.nodes\.some\(\(candidate\) => candidate\.id === nodeId\)[\s\S]*needsTimelineChromeHydration = true[\s\S]*await hydrateTimelineChromeForPatchedNodes\(visibleNodes\)/,
+    "patched hidden timeline nodes should still refresh header and transcript navigation while filters are active"
+  );
+  assert.match(
+    source,
+    /async function hydrateTimelineChromeForPatchedNodes\(visibleNodes: RenderNode\[\]\): Promise<void> \{[\s\S]*timelineNavigation\(visibleNodes\)[\s\S]*header\(state\.task\)[\s\S]*Promise\.all\(\[hydrateHeaderBars\(\), hydrateTimelineNavigation\(\)\]\)/,
+    "filtered patched-node chrome refresh should recompute navigation and header props before hydrating them"
+  );
+  assert.match(
+    source,
+    /function isPatchedTimelineCardNode\(node: RenderNode\): boolean \{[\s\S]*node\.kind === "approval"[\s\S]*node\.kind === "checkpoint"[\s\S]*node\.kind === "completion"[\s\S]*node\.kind === "resource"[\s\S]*node\.kind === "unknown"/,
+    "approval, checkpoint, completion, resource, and unknown event patch updates should refresh mounted timeline cards instead of forcing full transcript renders"
+  );
+  assert.match(
+    source,
     /function hydratePatchedNodeIslandDirectly\([\s\S]*renderNode\(node\)[\s\S]*syncNodeShellFromHtml\(node, html\)[\s\S]*targets\.nodeIds\.add\(node\.id\)[\s\S]*collectHelperIslandIdsFromHtml\(html, targets\)/,
     "direct component hydration should refresh node props and shell attributes without replacing the group body"
   );
@@ -3581,6 +3627,21 @@ test("webview streaming state updates refresh existing islands instead of tearin
     source,
     /async function hydratePatchedTimelineIslands\(targets: PatchedTimelineHydrationTargets\): Promise<void> \{[\s\S]*hydrateTimelineGroups\(\{ ids: targets\.groupIds \}\)[\s\S]*hydrateMessageCards\(\{ ids: targets\.nodeIds \}\)[\s\S]*hydrateToolCallGroupCards\(\{ ids: targets\.toolGroupIds \}\)[\s\S]*hydratePayloadDisclosures\(\{ ids: targets\.payloadDisclosureIds \}\)[\s\S]*hydrateInlineActions\(\{ ids: targets\.inlineActionIds \}\)/,
     "component status patches should hydrate only affected timeline groups, node islands, and helper islands"
+  );
+  assert.match(
+    source,
+    /async function hydratePatchedTimelineIslands\(targets: PatchedTimelineHydrationTargets\): Promise<void> \{[\s\S]*hydrateEventCards\(\{ ids: targets\.nodeIds \}\)/,
+    "checkpoint, completion, resource, and other event-card patches should hydrate affected event islands only"
+  );
+  assert.match(
+    source,
+    /function mountedNodeIslandRoot\(article: HTMLElement, node: RenderNode\): Element \| null \{[\s\S]*case "approval":[\s\S]*querySelector\("\[data-tool-call-card-root\]"\)[\s\S]*case "checkpoint":[\s\S]*case "completion":[\s\S]*case "resource":[\s\S]*case "unknown":[\s\S]*querySelector\("\[data-event-card-root\]"\)/,
+    "direct patched-node hydration should find approval tool-card roots and all event-card roots"
+  );
+  assert.match(
+    eventCardSourceTs,
+    /ids\?: ReadonlySet<string> \| undefined[\s\S]*options\.ids && !options\.ids\.has\(nodeId\)[\s\S]*activeIds\.add\(nodeId\)/,
+    "event-card hydration should support scoped patched-node refresh without unmounting untouched event cards"
   );
   assert.match(
     source,
@@ -3754,6 +3815,21 @@ test("extension host streams applied patches without rescanning the transcript",
     "host component coalescing should not treat reused ids from another turn as in-place updates"
   );
   assert.match(
+    source,
+    /update: \(update, sessionId\) => this\.handleAcpUpdate\(update, sessionId\)/,
+    "ACP update notifications should keep the outer session id available for render context"
+  );
+  assert.match(
+    source,
+    /private handleAcpUpdate\(update: SessionUpdate, sessionId\?: string \| undefined\): void \{[\s\S]*if \(sessionId && !this\.acpSessionId\)[\s\S]*this\.streamScheduler\.push\(reduceSessionUpdate\(update, this\.renderContext\(undefined, sessionId \|\| this\.acpSessionId\)\)\)/,
+    "live ACP updates should render with the provider session id even before session startup bookkeeping finishes"
+  );
+  assert.match(
+    source,
+    /private renderContext\(lane = this\.task\?\.lane \|\| "new-task", acpSessionId = this\.acpSessionId\): RenderReduceContext/,
+    "render context should allow an update-scoped ACP session id override"
+  );
+  assert.match(
     completionHandler,
     /this\.sending = false;[\s\S]*this\.applyAndPostRenderPatches\(\[[\s\S]*this\.finalizeCurrentTurnPatches\(completion\.status,\s*completion\.updatedAt\)[\s\S]*node: completion/,
     "prompt completion should stream final node changes as render patches instead of posting a full state refresh"
@@ -3780,7 +3856,7 @@ test("extension host streams applied patches without rescanning the transcript",
   );
   assert.match(
     source,
-    /this\.applyAndPostRenderPatches\(reducePermissionRequest\(requestId, params, this\.renderContext\(\)\), \{ force: true \}\)/,
+    /private handlePermission\(requestId: string, params: RequestPermissionParams\): void \{[\s\S]*if \(params\.sessionId && !this\.acpSessionId\)[\s\S]*reducePermissionRequest\(requestId, params, this\.renderContext\(undefined, params\.sessionId \|\| this\.acpSessionId\)\)/,
     "permission requests should hydrate through render patches instead of full transcript state"
   );
   assert.match(

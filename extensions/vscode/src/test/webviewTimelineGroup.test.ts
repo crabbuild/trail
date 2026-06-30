@@ -39,6 +39,10 @@ test("renders timeline groups with shadcn accordion and badge primitives", () =>
   const html = renderTimelineGroup(baseProps());
 
   assert.match(html, /data-slot="accordion"/);
+  assert.match(timelineGroupSource, /import \{ useSyncedAccordionValue \} from "\.\/syncedAccordionState"/);
+  assert.match(timelineGroupSource, /useSyncedAccordionValue\(timelineGroupOpenValue\(props\)\)/);
+  assert.match(timelineGroupSource, /<Accordion className="timeline-group-accordion" value=\{openValue\} onValueChange=\{setOpenValue\}>/);
+  assert.doesNotMatch(timelineGroupSource, /defaultValue=\{props\.open/);
   assert.match(html, /data-slot="accordion-item"/);
   assert.match(html, /data-slot="accordion-trigger"/);
   assert.match(html, /data-slot="accordion-content"/);

@@ -14,8 +14,10 @@ CrabDB now treats code-agent integration as three complementary paths:
 - **MCP server**: context-tool path. Register `crabdb mcp` in the native agent
   when the agent supports MCP so it can inspect CrabDB state directly.
 - **Terminal task**: universal CLI path. `crabdb agent start --provider <NAME>`
-  creates a materialized task lane, runs the provider command there, and records
-  the final checkpoint when the process exits.
+  creates a task lane workdir, runs the provider command there, and records the
+  final checkpoint when the process exits. Use `--workdir-mode overlay-cow` to
+  mount a transparent COW view for large repositories instead of creating a full
+  copied workdir.
 
 ## Built-In Providers
 
@@ -126,7 +128,7 @@ The lower-level Cursor ACP profile uses:
 crabdb acp relay --provider cursor --materialize -- agent acp
 ```
 
-Terminal-first agents use fresh materialized task lanes:
+Terminal-first agents use fresh task lanes:
 
 ```sh
 crabdb agent start --provider gemini
@@ -134,6 +136,17 @@ crabdb agent start --provider aider
 crabdb agent start --provider opencode
 crabdb agent start --provider custom -- my-agent --flag
 ```
+
+For large repositories, terminal agents can use the overlay COW workdir mode:
+
+```sh
+crabdb agent start --provider codex --workdir-mode overlay-cow
+crabdb agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+```
+
+The overlay mount is held only while the terminal process runs and while CrabDB
+records the checkpoint afterward. On macOS it requires macFUSE; on Linux it
+requires FUSE access such as `/dev/fuse`.
 
 For a full operator and automation-agent runbook, including real Claude Code
 edit verification and ACP permission responses, see

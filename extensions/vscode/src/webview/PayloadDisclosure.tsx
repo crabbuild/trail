@@ -9,6 +9,7 @@ import {
   AccordionTrigger
 } from "@/webview/components/ui/accordion"
 import { cn } from "@/webview/lib/utils"
+import { useSyncedAccordionValue } from "./syncedAccordionState"
 
 export interface PayloadDisclosureProps {
   id: string
@@ -32,10 +33,13 @@ const mountedRoots = new Map<string, MountedRoot>()
 const lastPayloadDisclosurePropsJson = new Map<string, string>()
 
 export function PayloadDisclosure({ props }: { props: PayloadDisclosureProps }) {
+  const [openValue, setOpenValue] = useSyncedAccordionValue(payloadDisclosureOpenValue(props))
+
   return (
     <Accordion
       className={cn(props.className, "payload-disclosure")}
-      defaultValue={props.defaultOpen ? [props.id] : undefined}
+      value={openValue}
+      onValueChange={setOpenValue}
     >
       <AccordionItem className="payload-disclosure-item" value={props.id}>
         <AccordionTrigger className={cn("payload-summary", `${props.className}-summary`)}>
@@ -50,6 +54,10 @@ export function PayloadDisclosure({ props }: { props: PayloadDisclosureProps }) 
       </AccordionItem>
     </Accordion>
   )
+}
+
+function payloadDisclosureOpenValue(props: PayloadDisclosureProps): string[] {
+  return props.defaultOpen ? [props.id] : []
 }
 
 export function mountPayloadDisclosures(options: MountPayloadDisclosuresOptions): void {

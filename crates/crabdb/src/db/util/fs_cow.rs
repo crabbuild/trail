@@ -390,16 +390,16 @@ fn clear_cloned_xattrs(_path: &Path) -> std::io::Result<bool> {
     )
 ))]
 fn cow_clone_unavailable(err: rustix::io::Errno) -> bool {
-    matches!(
-        err,
-        rustix::io::Errno::NOTSUP
-            | rustix::io::Errno::OPNOTSUPP
-            | rustix::io::Errno::NOSYS
-            | rustix::io::Errno::XDEV
-            | rustix::io::Errno::INVAL
-            | rustix::io::Errno::PERM
-            | rustix::io::Errno::ACCESS
-    )
+    err == rustix::io::Errno::NOTSUP
+        || err == rustix::io::Errno::OPNOTSUPP
+        || matches!(
+            err,
+            rustix::io::Errno::NOSYS
+                | rustix::io::Errno::XDEV
+                | rustix::io::Errno::INVAL
+                | rustix::io::Errno::PERM
+                | rustix::io::Errno::ACCESS
+        )
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ import {
 import { Badge } from "@/webview/components/ui/badge"
 import { Button } from "@/webview/components/ui/button"
 import { cn } from "@/webview/lib/utils"
+import { useSyncedAccordionValue } from "./syncedAccordionState"
 
 export interface TimelineGroupCardProps {
   id: string
@@ -46,8 +47,10 @@ const mountedRoots = new Map<string, MountedRoot>()
 const lastTimelineGroupPropsJson = new Map<string, string>()
 
 export function TimelineGroupCard({ props }: { props: TimelineGroupCardProps }) {
+  const [openValue, setOpenValue] = useSyncedAccordionValue(timelineGroupOpenValue(props))
+
   return (
-    <Accordion className="timeline-group-accordion" defaultValue={props.open ? [props.id] : undefined}>
+    <Accordion className="timeline-group-accordion" value={openValue} onValueChange={setOpenValue}>
       <AccordionItem className="timeline-group-item" value={props.id}>
         <AccordionPrimitive.Header className="timeline-group-header">
           <AccordionPrimitive.Trigger
@@ -101,6 +104,10 @@ export function TimelineGroupCard({ props }: { props: TimelineGroupCardProps }) 
       </AccordionItem>
     </Accordion>
   )
+}
+
+function timelineGroupOpenValue(props: TimelineGroupCardProps): string[] {
+  return props.open ? [props.id] : []
 }
 
 function TimelineGroupBodySlot({ item }: { item: TimelineGroupBodyItem }) {

@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import {
@@ -113,7 +114,9 @@ export function mountThoughtCards(options: MountThoughtCardsOptions): void {
       }
       mountedRoots.set(nodeId, mounted)
     }
-    mounted.root.render(<ThoughtCard props={props} />)
+    flushSync(() => {
+      mounted.root.render(<ThoughtCard props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, nodeId) => {

@@ -7,7 +7,7 @@ pub(super) enum AgentSubcommand {
     /// Run a stable ACP entrypoint that creates a fresh CrabDB lane per task.
     #[command(hide = true)]
     Acp(AgentAcpArgs),
-    /// Create a fresh materialized task lane and launch a terminal agent.
+    /// Create a fresh task lane and launch a terminal agent.
     Start(AgentStartArgs),
     /// Continue from an existing agent task checkpoint in a fresh task lane.
     #[command(visible_alias = "follow-up")]
@@ -107,7 +107,7 @@ pub(super) enum AgentSubcommand {
     /// Run a command in the agent task workdir and record an eval gate.
     #[command(hide = true)]
     Eval(AgentGateArgs),
-    /// Print the materialized workdir for an agent task.
+    /// Print the filesystem workdir for an agent task.
     #[command(hide = true)]
     Workdir(AgentSelectorArgs),
     /// List recorded agent tasks.
@@ -256,6 +256,13 @@ pub(super) struct AgentStartArgs {
         help = "Start the fresh task from this CrabDB ref, task, lane, or checkpoint"
     )]
     pub(super) from: Option<String>,
+    #[arg(
+        long = "workdir-mode",
+        value_parser = ["full-cow", "overlay-cow"],
+        default_value = "full-cow",
+        help = "Filesystem view for the terminal agent task"
+    )]
+    pub(super) workdir_mode: String,
     #[arg(last = true, num_args = 0..)]
     pub(super) command: Vec<String>,
 }
@@ -275,6 +282,13 @@ pub(super) struct AgentContinueArgs {
     pub(super) provider: Option<String>,
     #[arg(long, help = "Optional human label for the follow-up task")]
     pub(super) name: Option<String>,
+    #[arg(
+        long = "workdir-mode",
+        value_parser = ["full-cow", "overlay-cow"],
+        default_value = "full-cow",
+        help = "Filesystem view for the terminal follow-up task"
+    )]
+    pub(super) workdir_mode: String,
     #[arg(last = true, num_args = 0..)]
     pub(super) command: Vec<String>,
 }

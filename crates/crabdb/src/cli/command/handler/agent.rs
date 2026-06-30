@@ -1,6 +1,8 @@
 use super::*;
 use crate::cli::command::render::render_agent_timeline;
-use crabdb::{AgentContinueReport, AgentReviewAction, AgentRunReport, StatusSuggestion};
+use crabdb::{
+    AgentContinueReport, AgentReviewAction, AgentRunReport, LaneWorkdirMode, StatusSuggestion,
+};
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) -> Result<()> {
@@ -113,7 +115,16 @@ fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
 fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let lane = db.fresh_agent_lane_name(&args.provider, args.name.as_deref());
-    let report = run_terminal_agent_task(ctx, db, lane, args.provider, args.from, args.command)?;
+    let workdir_mode = parse_agent_terminal_workdir_mode(&args.workdir_mode)?;
+    let report = run_terminal_agent_task(
+        ctx,
+        db,
+        lane,
+        args.provider,
+        args.from,
+        workdir_mode,
+        args.command,
+    )?;
     render_agent_run(&report, ctx.json, ctx.quiet)
 }
 
@@ -134,12 +145,14 @@ fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Resul
         .unwrap_or_else(|| format!("{} follow-up", source.task.title));
     let lane = db.fresh_agent_lane_name(&provider, Some(&name));
     let source_task = source.task.clone();
+    let workdir_mode = parse_agent_terminal_workdir_mode(&args.workdir_mode)?;
     let run = run_terminal_agent_task(
         ctx,
         db,
         lane,
         provider,
         Some(from_change.0.clone()),
+        workdir_mode,
         args.command,
     )?;
     let mut suggestions = vec![StatusSuggestion {
@@ -171,12 +184,27 @@ fn run_terminal_agent_task(
     lane: String,
     provider: String,
     from: Option<String>,
+    workdir_mode: LaneWorkdirMode,
     command: Vec<String>,
 ) -> Result<AgentRunReport> {
-    let spawn = db.spawn_lane(&lane, from.as_deref(), true, Some(provider.clone()), None)?;
+    let spawn = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        &lane,
+        from.as_deref(),
+        workdir_mode.clone(),
+        Some(provider.clone()),
+        None,
+        None,
+        &[],
+        false,
+    )?;
     let workdir = spawn.workdir.clone().ok_or_else(|| {
-        Error::InvalidInput("agent start requires a materialized lane workdir".to_string())
+        Error::InvalidInput("agent start requires a filesystem lane workdir".to_string())
     })?;
+    let overlay_mount = if workdir_mode == LaneWorkdirMode::OverlayCow {
+        Some(db.mount_overlay_cow_workdir_for_lane(&lane)?)
+    } else {
+        None
+    };
     let session = db
         .start_lane_session(&lane, Some(format!("Agent terminal {}", provider)), None)?
         .session;
@@ -188,6 +216,7 @@ fn run_terminal_agent_task(
             "provider": provider,
             "workdir": workdir,
             "mode": "terminal",
+            "workdir_mode": workdir_mode.as_str(),
             "from": from
         })),
     )?;
@@ -260,7 +289,16 @@ fn run_terminal_agent_task(
         recorded: Some(recorded),
         status: status.to_string(),
     };
+    drop(overlay_mount);
     Ok(report)
+}
+
+fn parse_agent_terminal_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
+    LaneWorkdirMode::parse(value).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "unknown terminal agent workdir mode `{value}`; expected full-cow or overlay-cow"
+        ))
+    })
 }
 
 fn push_agent_cli_suggestion(
@@ -1467,6 +1505,7 @@ fn handle_agent_empty_action(
                 provider: "claude-code".to_string(),
                 name: None,
                 from: None,
+                workdir_mode: "full-cow".to_string(),
                 command: Vec::new(),
             },
         ),
@@ -1476,6 +1515,7 @@ fn handle_agent_empty_action(
                 provider: "gemini".to_string(),
                 name: None,
                 from: None,
+                workdir_mode: "full-cow".to_string(),
                 command: Vec::new(),
             },
         ),

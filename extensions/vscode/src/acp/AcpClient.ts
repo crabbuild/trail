@@ -19,7 +19,7 @@ const MAX_READ_TEXT_FILE_CHARS = 1024 * 1024;
 const ACP_PROTOCOL_VERSION = 1;
 
 export interface AcpClientEvents {
-  update(update: SessionUpdate): void;
+  update(update: SessionUpdate, sessionId?: string | undefined): void;
   permission(requestId: string, params: RequestPermissionParams): void;
   completed(response: unknown): void;
   error(error: Error): void;
@@ -192,7 +192,8 @@ export class AcpClient {
       return normalizeLoadedSession(existingSessionId, response);
     }
 
-    return this.rpc.request<NewSessionResponse>("session/new", base);
+    const response = await this.rpc.request<NewSessionResponse>("session/new", base);
+    return normalizeNewSessionResponse(response);
   }
 
   private async startSessionWithAuth(
@@ -332,16 +333,17 @@ export class AcpClient {
   private handleNotification(message: JsonRpcMessage): void {
     if (message.method === "session/update") {
       const params = asRecord(message.params);
-      const update = params.update as SessionUpdate | undefined;
+      const update = sessionUpdateFromNotificationParams(params);
+      const sessionId = sessionIdFromRecord(params);
       if (update) {
-        this.listeners?.update(update);
+        this.listeners?.update(update, sessionId);
       }
     }
   }
 
   private handleRequest(message: JsonRpcMessage): void {
     if (message.method === "session/request_permission") {
-      const params = message.params as RequestPermissionParams;
+      const params = normalizeRequestPermissionParams(message.params, this.sessionId);
       const requestId = String(message.id);
       this.pendingPermissionRequests.set(requestId, message.id);
       this.listeners?.permission(requestId, params);
@@ -393,15 +395,117 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+function asPlainRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function sessionIdFromRecord(record: Record<string, unknown>, fallback?: string | undefined): string | undefined {
+  return stringField(record, "sessionId") || stringField(record, "session_id") || fallback;
+}
+
+function sessionUpdateFromNotificationParams(params: Record<string, unknown>): SessionUpdate | undefined {
+  const explicit = firstRecord(params.update, params.sessionUpdate, params.session_update);
+  if (Object.keys(explicit).length) {
+    return normalizeSessionUpdatePayload(explicit);
+  }
+  return stringField(params, "sessionUpdate") || stringField(params, "session_update")
+    ? normalizeSessionUpdatePayload(params)
+    : undefined;
+}
+
+function normalizeSessionUpdatePayload(record: Record<string, unknown>): SessionUpdate {
+  const sessionUpdate = stringField(record, "sessionUpdate") || stringField(record, "session_update");
+  return sessionUpdate
+    ? ({ ...record, sessionUpdate } as SessionUpdate)
+    : (record as SessionUpdate);
+}
+
 function supportsSessionCapability(capabilities: AgentCapabilities, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(capabilities.sessionCapabilities, key);
 }
 
 function normalizeLoadedSession(sessionId: string, response: Partial<NewSessionResponse> | null): NewSessionResponse {
+  return normalizeNewSessionResponse(response, sessionId);
+}
+
+function normalizeNewSessionResponse(
+  response: Partial<NewSessionResponse> | null,
+  fallbackSessionId?: string | undefined
+): NewSessionResponse {
+  const record = asPlainRecord(response);
+  const sessionId = sessionIdFromRecord(record, fallbackSessionId);
+  if (!sessionId) {
+    throw new Error("ACP session response did not include a session id.");
+  }
   return {
-    ...(response && typeof response === "object" ? response : {}),
+    ...record,
     sessionId
+  } as NewSessionResponse;
+}
+
+function normalizeRequestPermissionParams(
+  params: unknown,
+  fallbackSessionId?: string | undefined
+): RequestPermissionParams {
+  const record = asPlainRecord(params);
+  return {
+    ...record,
+    sessionId: sessionIdFromRecord(record, fallbackSessionId) || "",
+    toolCall: normalizePermissionToolCall(record),
+    options: normalizePermissionOptions(record.options)
   };
+}
+
+function normalizePermissionToolCall(record: Record<string, unknown>): RequestPermissionParams["toolCall"] {
+  const toolCall = firstRecord(record.toolCall, record.tool_call);
+  const toolCallId = stringField(toolCall, "toolCallId") || stringField(toolCall, "tool_call_id") || stringField(toolCall, "id");
+  return {
+    ...toolCall,
+    sessionUpdate: "tool_call",
+    toolCallId: toolCallId || "unknown",
+    title: stringField(toolCall, "title") || stringField(toolCall, "name") || "Tool call"
+  } as RequestPermissionParams["toolCall"];
+}
+
+function normalizePermissionOptions(value: unknown): RequestPermissionParams["options"] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((option, index) => {
+    const record = asPlainRecord(option);
+    const normalized: RequestPermissionParams["options"][number] = {
+      ...record,
+      optionId: stringField(record, "optionId") || stringField(record, "option_id") || stringField(record, "id") || `option-${index + 1}`
+    };
+    const name = stringField(record, "name") || stringField(record, "label");
+    if (name) {
+      normalized.name = name;
+    }
+    const kind = stringField(record, "kind");
+    if (kind) {
+      normalized.kind = kind;
+    }
+    const description = stringField(record, "description");
+    if (description) {
+      normalized.description = description;
+    }
+    return normalized;
+  });
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> {
+  for (const value of values) {
+    const record = asPlainRecord(value);
+    if (Object.keys(record).length) {
+      return record;
+    }
+  }
+  return {};
 }
 
 function ensureSupportedProtocolVersion(initialize: unknown): void {

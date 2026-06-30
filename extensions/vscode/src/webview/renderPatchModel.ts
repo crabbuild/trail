@@ -1,5 +1,6 @@
 import type { ContentBlock } from "../shared/acpTypes";
 import type { RenderNode, RenderPatch } from "../shared/renderModel";
+import { textContentValue } from "./contentTextModel";
 
 export interface RenderPatchChanges {
   changedNodeIds: Set<string>;
@@ -68,18 +69,22 @@ function applyRenderPatchesLocallyAndCollect(
   const removedNodeIds = new Set<string>();
   const normalizedIdsByRawId = new Map<string, string[]>();
 
-  for (const patch of patches) {
+  for (let patchIndex = 0; patchIndex < patches.length; patchIndex += 1) {
+    const patch = patches[patchIndex]!;
     if ((patch.type === "append" || patch.type === "replace" || patch.type === "upsert") && patch.node) {
-      const node = normalizePatchNodeForLocalTimeline(next, patch.node, patch.type);
+      const node = normalizePatchNodeForLocalTimeline(next, patch.node, patch.type, laterPatchNodes(patches, patchIndex));
       if (!node) {
         continue;
       }
       const id = node.id;
       const index = patch.type === "append" ? -1 : next.findIndex((candidate) => candidate.id === id);
+      let appliedNode: RenderNode;
       if (index >= 0) {
         next[index] = mergeLocalPatchNode(next[index]!, node, patch.type);
+        appliedNode = next[index]!;
       } else {
         next.push(node);
+        appliedNode = node;
       }
       if (!knownIds.has(id)) {
         addedNodeIds.add(id);
@@ -88,7 +93,14 @@ function applyRenderPatchesLocallyAndCollect(
       removedNodeIds.delete(id);
       changedNodeIds.add(id);
       trackNormalizedPatchId(normalizedIdsByRawId, patch.node.id, id);
-      const movedFinalMarkers = moveLocalTurnFinalMarkersAfterNode(next, node);
+      if (appliedNode.kind === "tool") {
+        const synced = syncLocalExpandedToolChildNodes(next, appliedNode);
+        next = synced.nodes;
+        for (const syncedId of synced.changedNodeIds) {
+          changedNodeIds.add(syncedId);
+        }
+      }
+      const movedFinalMarkers = moveLocalTurnFinalMarkersAfterNode(next, appliedNode);
       next = movedFinalMarkers.nodes;
       for (const movedId of movedFinalMarkers.changedNodeIds) {
         changedNodeIds.add(movedId);
@@ -113,6 +125,123 @@ function applyRenderPatchesLocallyAndCollect(
   }
 
   return { nodes: next, changes: { changedNodeIds, addedNodeIds, removedNodeIds } };
+}
+
+type LocalExpandedToolChildNode = Extract<RenderNode, { kind: "diff" | "terminal" }>;
+
+function syncLocalExpandedToolChildNodes(
+  nodes: RenderNode[],
+  tool: Extract<RenderNode, { kind: "tool" }>
+): { nodes: RenderNode[]; changedNodeIds: string[] } {
+  let changed = false;
+  const changedNodeIds: string[] = [];
+  const next = nodes.map((node) => {
+    if (!isLocalExpandedToolChildNode(node) || !localChildBelongsToToolScope(node, tool)) {
+      return node;
+    }
+    const updated = syncLocalExpandedToolChildNode(node, tool);
+    if (updated === node) {
+      return node;
+    }
+    changed = true;
+    changedNodeIds.push(node.id);
+    return updated;
+  });
+  return changed ? { nodes: next, changedNodeIds } : { nodes, changedNodeIds: [] };
+}
+
+function isLocalExpandedToolChildNode(node: RenderNode): node is LocalExpandedToolChildNode {
+  return node.kind === "diff" || node.kind === "terminal";
+}
+
+function syncLocalExpandedToolChildNode(
+  node: LocalExpandedToolChildNode,
+  tool: Extract<RenderNode, { kind: "tool" }>
+): LocalExpandedToolChildNode {
+  if (node.kind === "terminal") {
+    const terminalStatus = syncTerminalStatusFromTool(node.terminalStatus, tool.toolStatus);
+    if (node.status === tool.status && node.terminalStatus === terminalStatus) {
+      return node;
+    }
+    return {
+      ...node,
+      status: tool.status,
+      terminalStatus,
+      updatedAt: tool.updatedAt
+    };
+  }
+  if (node.status === tool.status) {
+    return node;
+  }
+  return {
+    ...node,
+    status: tool.status,
+    updatedAt: tool.updatedAt
+  };
+}
+
+function localChildBelongsToToolScope(
+  child: LocalExpandedToolChildNode,
+  tool: Extract<RenderNode, { kind: "tool" }>
+): boolean {
+  if (!localChildMatchesToolCallId(child, tool) || !sameTimelineScope(child, tool)) {
+    return false;
+  }
+  const suffix = scopedToolNodeSuffix(tool);
+  return suffix ? child.id.endsWith(`:${suffix}`) : true;
+}
+
+function localChildMatchesToolCallId(
+  child: LocalExpandedToolChildNode,
+  tool: Extract<RenderNode, { kind: "tool" }>
+): boolean {
+  return child.acpToolCallId === tool.toolCallId || child.acpToolCallId === tool.acpToolCallId;
+}
+
+function scopedToolNodeSuffix(tool: Extract<RenderNode, { kind: "tool" }>): string | undefined {
+  const base = `tool:${tool.toolCallId}:`;
+  return tool.id.startsWith(base) ? tool.id.slice(base.length) : undefined;
+}
+
+function syncTerminalStatusFromTool(current: string | undefined, next: string | undefined): string | undefined {
+  if (!next || current === next || !shouldAdoptToolTerminalStatus(current)) {
+    return current;
+  }
+  return next;
+}
+
+function shouldAdoptToolTerminalStatus(current: string | undefined): boolean {
+  if (!current) {
+    return true;
+  }
+  return isToolLikeStatus(current);
+}
+
+function isToolLikeStatus(status: string | undefined): boolean {
+  switch (normalizeStatus(status)) {
+    case "pending":
+    case "in-progress":
+    case "running":
+    case "completed":
+    case "succeeded":
+    case "success":
+    case "passed":
+    case "failed":
+    case "error":
+    case "cancelled":
+    case "canceled":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function normalizeStatus(status: string | undefined): string {
+  return String(status || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function moveLocalTurnFinalMarkersAfterNode(
@@ -180,15 +309,108 @@ function sameTurnFinalMarkerScope(marker: RenderNode, node: RenderNode): boolean
     marker.taskId === node.taskId &&
     marker.lane === node.lane &&
     marker.turnId !== undefined &&
-    marker.turnId === node.turnId
+    marker.turnId === node.turnId &&
+    compatibleFinalMarkerScopeValue(marker.acpSessionId, node.acpSessionId) &&
+    compatibleFinalMarkerScopeValue(marker.provider, node.provider)
   );
 }
 
+function compatibleFinalMarkerScopeValue(left: string | undefined, right: string | undefined): boolean {
+  return left === right || left === undefined || right === undefined;
+}
+
 function mergeLocalPatchNode(existing: RenderNode, incoming: RenderNode, patchType: RenderPatch["type"]): RenderNode {
-  if (patchType !== "upsert" || !isStreamNode(existing) || !isStreamNode(incoming) || !sameTimelineScope(existing, incoming)) {
+  if (
+    patchType === "upsert" &&
+    existing.kind === "terminal" &&
+    incoming.kind === "terminal" &&
+    sameTimelineScope(existing, incoming) &&
+    existing.terminalId === incoming.terminalId
+  ) {
+    return mergeLocalTerminalNode(existing, incoming);
+  }
+  if (
+    patchType !== "upsert" ||
+    !isStreamNode(existing) ||
+    !isStreamNode(incoming) ||
+    !compatibleStreamTimelineScope(existing, incoming)
+  ) {
     return incoming;
   }
   return mergeLocalStreamNode(existing, incoming);
+}
+
+function mergeLocalTerminalNode(
+  existing: Extract<RenderNode, { kind: "terminal" }>,
+  incoming: Extract<RenderNode, { kind: "terminal" }>
+): Extract<RenderNode, { kind: "terminal" }> {
+  const preserveFinalStatus = isFinalRenderStatus(existing.status) && isActiveRenderStatus(incoming.status);
+  const merged: Extract<RenderNode, { kind: "terminal" }> = {
+    ...incoming,
+    createdAt: existing.createdAt,
+    timelineOrder: existing.timelineOrder,
+    status: preserveFinalStatus ? existing.status : incoming.status,
+    terminalStatus: localTerminalStatusForMerge(existing, incoming, preserveFinalStatus),
+    exitCode: incoming.exitCode ?? existing.exitCode,
+    elapsedMs: incoming.elapsedMs ?? existing.elapsedMs,
+    output: mergeTerminalText(existing.output, incoming.output, incoming, ["outputDelta", "output_delta"]),
+    stdout: mergeTerminalText(existing.stdout, incoming.stdout, incoming, ["stdoutDelta", "stdout_delta"]),
+    stderr: mergeTerminalText(existing.stderr, incoming.stderr, incoming, ["stderrDelta", "stderr_delta"])
+  };
+  const title = incoming.title ?? existing.title;
+  if (title !== undefined) {
+    merged.title = title;
+  }
+  const command = incoming.command ?? existing.command;
+  if (command !== undefined) {
+    merged.command = command;
+  }
+  const cwd = incoming.cwd ?? existing.cwd;
+  if (cwd !== undefined) {
+    merged.cwd = cwd;
+  }
+  return merged;
+}
+
+function localTerminalStatusForMerge(
+  existing: Extract<RenderNode, { kind: "terminal" }>,
+  incoming: Extract<RenderNode, { kind: "terminal" }>,
+  preserveFinalStatus: boolean
+): string | undefined {
+  if (!incoming.terminalStatus) {
+    return existing.terminalStatus;
+  }
+  if (preserveFinalStatus && isToolLikeStatus(incoming.terminalStatus)) {
+    return existing.terminalStatus;
+  }
+  return incoming.terminalStatus;
+}
+
+function mergeTerminalText(
+  existing: string | undefined,
+  incoming: string | undefined,
+  incomingSource: unknown,
+  deltaKeys: string[]
+): string | undefined {
+  const delta = terminalDeltaText(incomingSource, deltaKeys);
+  if (delta !== undefined) {
+    return `${existing || ""}${delta}`;
+  }
+  return incoming ?? existing;
+}
+
+function terminalDeltaText(source: unknown, deltaKeys: string[]): string | undefined {
+  const sourceRecord = asRecord(source);
+  const rawRecord = asRecord(sourceRecord.raw);
+  for (const record of [rawRecord, sourceRecord]) {
+    for (const key of deltaKeys) {
+      const value = stringField(record, key);
+      if (value !== undefined) {
+        return value;
+      }
+    }
+  }
+  return undefined;
 }
 
 function trackNormalizedPatchId(target: Map<string, string[]>, rawId: string, normalizedId: string): void {
@@ -212,16 +434,21 @@ function consumeNormalizedPatchId(target: Map<string, string[]>, rawId: string):
 function normalizePatchNodeForLocalTimeline(
   nodes: RenderNode[],
   node: RenderNode,
-  patchType: RenderPatch["type"]
+  patchType: RenderPatch["type"],
+  laterBatchNodes: RenderNode[]
 ): RenderNode | undefined {
+  const laterBatchNodeIds = new Set(laterBatchNodes.map((candidate) => candidate.id));
   if (patchType === "append") {
     return normalizeAppendedLocalNode(nodes, node);
+  }
+  if (patchType === "replace") {
+    return normalizeReplacementLocalNode(nodes, node, laterBatchNodes);
   }
   if (patchType === "upsert" && isStreamNode(node)) {
     const existingIndex = nodes.findIndex((candidate) => candidate.id === node.id);
     const existing = existingIndex >= 0 ? nodes[existingIndex] : undefined;
-    if (existing && sameTimelineScope(existing, node)) {
-      if (!hasNonStreamTimelineBoundaryAfter(nodes, existingIndex, node)) {
+    if (existing && compatibleStreamTimelineScope(existing, node)) {
+      if (!hasNonStreamTimelineBoundaryAfter(nodes, existingIndex, node, laterBatchNodeIds)) {
         return node;
       }
       const continuation = streamContinuationAfterBoundary(existing, node);
@@ -252,13 +479,53 @@ function normalizePatchNodeForLocalTimeline(
   return normalizeCollidingLocalNode(nodes, node);
 }
 
+function normalizeReplacementLocalNode(nodes: RenderNode[], node: RenderNode, laterBatchNodes: RenderNode[]): RenderNode {
+  const existingById = nodes.find((candidate) => candidate.id === node.id);
+  if (!existingById) {
+    const semanticMatch = findSameReplacementNode(nodes, node);
+    return semanticMatch
+      ? {
+          ...node,
+          id: semanticMatch.id,
+          createdAt: semanticMatch.createdAt,
+          timelineOrder: semanticMatch.timelineOrder
+        }
+      : node;
+  }
+  if (
+    canReplaceExistingNodeById(existingById, node) ||
+    hasLaterReplacementMoveTarget(existingById, laterBatchNodes)
+  ) {
+    return node;
+  }
+  if (isStreamNode(node)) {
+    return {
+      ...node,
+      id: nextStreamNodeId(nodes, node)
+    };
+  }
+  const semanticMatch = findSameReplacementNode(nodes, node);
+  if (semanticMatch) {
+    return {
+      ...node,
+      id: semanticMatch.id,
+      createdAt: semanticMatch.createdAt,
+      timelineOrder: semanticMatch.timelineOrder
+    };
+  }
+  return {
+    ...node,
+    id: nextScopedCollisionNodeId(nodes, node)
+  };
+}
+
 function streamNodeWithTimelineIdentity(node: StreamNode, existing: StreamNode): StreamNode {
   return {
     ...node,
     id: existing.id,
     createdAt: existing.createdAt,
     timelineOrder: existing.timelineOrder,
-    acpMessageId: existing.acpMessageId
+    acpMessageId: existing.acpMessageId || node.acpMessageId
   };
 }
 
@@ -278,6 +545,17 @@ function normalizeAppendedLocalNode(nodes: RenderNode[], node: RenderNode): Rend
   };
 }
 
+function laterPatchNodes(patches: RenderPatch[], patchIndex: number): RenderNode[] {
+  const nodes: RenderNode[] = [];
+  for (let index = patchIndex + 1; index < patches.length; index += 1) {
+    const node = patches[index]?.node;
+    if (node) {
+      nodes.push(node);
+    }
+  }
+  return nodes;
+}
+
 type StreamNode = Extract<RenderNode, { kind: "message" | "thought" }>;
 
 function isStreamNode(node: RenderNode): node is StreamNode {
@@ -289,10 +567,14 @@ function canAppendStreamNode(existing: RenderNode, incoming: StreamNode): existi
     return (
       existing.kind === "message" &&
       existing.role === incoming.role &&
-      existing.acpMessageId === incoming.acpMessageId
+      compatibleStreamMessageIds(existing.acpMessageId, incoming.acpMessageId)
     );
   }
-  return existing.kind === "thought" && existing.acpMessageId === incoming.acpMessageId;
+  return existing.kind === "thought" && compatibleStreamMessageIds(existing.acpMessageId, incoming.acpMessageId);
+}
+
+function compatibleStreamMessageIds(existingId: string | undefined, incomingId: string | undefined): boolean {
+  return existingId === incomingId || existingId === undefined || incomingId === undefined;
 }
 
 function mergeLocalStreamNode(existing: StreamNode, incoming: StreamNode): StreamNode {
@@ -300,32 +582,44 @@ function mergeLocalStreamNode(existing: StreamNode, incoming: StreamNode): Strea
     return incoming;
   }
   const content = mergeStreamContentBlocks(existing.content, incoming.content);
+  const status = mergedLocalStreamStatus(existing, incoming);
   if (incoming.kind === "message") {
     const existingMessage = existing as Extract<StreamNode, { kind: "message" }>;
     return {
       ...incoming,
+      status,
       createdAt: existingMessage.createdAt,
       timelineOrder: existingMessage.timelineOrder,
-      acpMessageId: existingMessage.acpMessageId,
+      acpSessionId: incoming.acpSessionId || existingMessage.acpSessionId,
+      provider: incoming.provider || existingMessage.provider,
+      acpMessageId: existingMessage.acpMessageId || incoming.acpMessageId,
       content,
       text: contentBlocksToText(content),
-      streaming: mergedLocalMessageStreaming(existingMessage, incoming)
+      streaming: mergedLocalMessageStreaming(existingMessage, incoming, status)
     };
   }
   return {
     ...incoming,
+    status,
     createdAt: existing.createdAt,
     timelineOrder: existing.timelineOrder,
-    acpMessageId: existing.acpMessageId,
+    acpSessionId: incoming.acpSessionId || existing.acpSessionId,
+    provider: incoming.provider || existing.provider,
+    acpMessageId: existing.acpMessageId || incoming.acpMessageId,
     content
   };
 }
 
+function mergedLocalStreamStatus(existing: StreamNode, incoming: StreamNode): RenderNode["status"] {
+  return isFinalRenderStatus(existing.status) && isActiveRenderStatus(incoming.status) ? existing.status : incoming.status;
+}
+
 function mergedLocalMessageStreaming(
   existing: Extract<StreamNode, { kind: "message" }>,
-  incoming: Extract<StreamNode, { kind: "message" }>
+  incoming: Extract<StreamNode, { kind: "message" }>,
+  status: RenderNode["status"]
 ): boolean {
-  return isActiveRenderStatus(incoming.status) && (existing.streaming || incoming.streaming);
+  return isActiveRenderStatus(status) && (existing.streaming || incoming.streaming);
 }
 
 function isTextOnlyStreamNode(node: StreamNode): boolean {
@@ -406,9 +700,15 @@ function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] 
   for (const block of blocks) {
     const previous = merged[merged.length - 1];
     if (previous?.type === "text" && block.type === "text") {
+      const previousText = textContentValue(previous);
+      const blockText = textContentValue(block);
+      if (previousText === undefined || blockText === undefined) {
+        merged.push(block);
+        continue;
+      }
       merged[merged.length - 1] = {
         ...previous,
-        text: `${previous.text}${block.text}`
+        text: `${previousText}${blockText}`
       };
       continue;
     }
@@ -418,7 +718,38 @@ function mergeAdjacentTextContentBlocks(blocks: ContentBlock[]): ContentBlock[] 
 }
 
 function contentBlocksToText(blocks: ContentBlock[]): string {
-  return blocks.map((block) => block.type === "text" ? block.text : `[${block.type || "content"}]`).join("");
+  return blocks.map(contentBlockToText).join("");
+}
+
+function contentBlockToText(content: ContentBlock): string {
+  const record = content as Record<string, unknown>;
+  const text = textContentValue(content);
+  if (text !== undefined) {
+    return text;
+  }
+  if (content.type === "resource_link" && typeof record.name === "string") {
+    return typeof record.title === "string" ? `${record.title} (${record.name})` : record.name;
+  }
+  const resource = record.resource as Record<string, unknown> | undefined;
+  if (content.type === "resource" && resource && typeof resource.text === "string") {
+    return resource.text;
+  }
+  if (content.type === "image") {
+    return "[image]";
+  }
+  if (content.type === "audio") {
+    return "[audio]";
+  }
+  return `[${content.type || "content"}]`;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
 function stableJson(value: unknown): string {
@@ -443,34 +774,47 @@ function stableJsonValue(value: unknown): unknown {
 function latestNodeInSameTurn(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const candidate = nodes[index];
-    if (candidate && sameTimelineScope(candidate, node)) {
+    if (candidate && compatibleStreamTimelineScope(candidate, node)) {
       return candidate;
     }
   }
   return undefined;
 }
 
-function hasNonStreamTimelineBoundaryAfter(nodes: RenderNode[], index: number, node: RenderNode): boolean {
+function hasNonStreamTimelineBoundaryAfter(
+  nodes: RenderNode[],
+  index: number,
+  node: RenderNode,
+  ignoredBoundaryIds: Set<string>
+): boolean {
   for (let nextIndex = index + 1; nextIndex < nodes.length; nextIndex += 1) {
     const candidate = nodes[nextIndex];
-    if (candidate && sameTimelineScope(candidate, node) && isFinalNonStreamBoundary(candidate)) {
+    if (
+      candidate &&
+      !ignoredBoundaryIds.has(candidate.id) &&
+      compatibleStreamTimelineScope(candidate, node) &&
+      isNonStreamTimelineBoundary(candidate)
+    ) {
       return true;
     }
   }
   return false;
 }
 
-function isFinalNonStreamBoundary(node: RenderNode): boolean {
+function isNonStreamTimelineBoundary(node: RenderNode): boolean {
   if (isStreamNode(node)) {
     return false;
   }
-  if (node.kind === "tool") {
-    return isFinalRenderStatus(node.status) || isFinalRenderStatus(node.toolStatus);
+  switch (node.kind) {
+    case "commands":
+    case "config":
+    case "mode":
+    case "session":
+    case "usage":
+      return false;
+    default:
+      return true;
   }
-  if (node.kind === "terminal") {
-    return isFinalRenderStatus(node.status) || isFinalRenderStatus(node.terminalStatus);
-  }
-  return isFinalRenderStatus(node.status);
 }
 
 function normalizeCollidingLocalNode(nodeList: RenderNode[], node: RenderNode): RenderNode {
@@ -503,6 +847,9 @@ function canUpdateExistingNodeById(nodes: RenderNode[], existingIndex: number, i
     return false;
   }
   if (sameTimelineScope(existing, incoming)) {
+    if (!sameSemanticNodeWhenKnown(existing, incoming)) {
+      return false;
+    }
     return (
       !hasExternalTimelineBoundaryAfter(nodes, existingIndex, incoming) ||
       canUpdateAfterExternalBoundary(existing, incoming)
@@ -510,6 +857,75 @@ function canUpdateExistingNodeById(nodes: RenderNode[], existingIndex: number, i
   }
   const existingKey = semanticNodeKey(existing);
   return existingKey !== undefined && existingKey === semanticNodeKey(incoming);
+}
+
+function canReplaceExistingNodeById(existing: RenderNode, incoming: RenderNode): boolean {
+  if (existing.kind !== incoming.kind || existing.taskId !== incoming.taskId || existing.lane !== incoming.lane) {
+    return false;
+  }
+  if (isGlobalControlNode(existing) && isGlobalControlNode(incoming)) {
+    return true;
+  }
+  return (
+    sameOptionalScopeValue(existing.turnId, incoming.turnId) &&
+    sameOptionalScopeValue(existing.acpSessionId, incoming.acpSessionId) &&
+    sameSemanticNodeWhenKnown(existing, incoming)
+  );
+}
+
+function hasLaterReplacementMoveTarget(existing: RenderNode, laterBatchNodes: RenderNode[]): boolean {
+  return laterBatchNodes.some((candidate) => candidate.id !== existing.id && sameReplacementMoveTarget(existing, candidate));
+}
+
+function sameReplacementMoveTarget(existing: RenderNode, candidate: RenderNode): boolean {
+  if (existing.kind !== candidate.kind || !sameTimelineScope(existing, candidate)) {
+    return false;
+  }
+  return replacementMoveKey(existing) !== undefined && replacementMoveKey(existing) === replacementMoveKey(candidate);
+}
+
+function replacementMoveKey(node: RenderNode): string | undefined {
+  switch (node.kind) {
+    case "message":
+      return `message:${node.role}:${node.acpMessageId || ""}`;
+    case "thought":
+      return `thought:${node.acpMessageId || ""}`;
+    case "tool":
+      return `tool:${node.acpToolCallId || node.toolCallId}`;
+    case "terminal":
+      return `terminal:${node.acpToolCallId || ""}:${node.terminalId}`;
+    case "diff":
+      return `diff:${node.acpToolCallId || ""}:${node.path}`;
+    case "approval":
+      return `approval:${approvalToolIdentity(node) || ""}:${node.requestId}`;
+    case "plan":
+      return "plan";
+    case "checkpoint":
+      return `checkpoint:${node.checkpointId || ""}`;
+    case "completion":
+      return "completion";
+    case "unknown":
+      return `unknown:${unknownEventIdentity(node)}`;
+    default:
+      return undefined;
+  }
+}
+
+function isGlobalControlNode(node: RenderNode): boolean {
+  switch (node.kind) {
+    case "commands":
+    case "config":
+    case "mode":
+    case "session":
+    case "usage":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function sameOptionalScopeValue(left: string | undefined, right: string | undefined): boolean {
+  return left === right || left === undefined || right === undefined;
 }
 
 function hasExternalTimelineBoundaryAfter(nodes: RenderNode[], index: number, node: RenderNode): boolean {
@@ -524,11 +940,13 @@ function hasExternalTimelineBoundaryAfter(nodes: RenderNode[], index: number, no
 }
 
 function isSameToolFamilyNode(candidate: RenderNode, node: RenderNode): boolean {
-  const toolCallId = node.kind === "tool" ? node.toolCallId : node.acpToolCallId;
-  if (!toolCallId) {
+  const toolCallIds = node.kind === "tool"
+    ? [node.toolCallId, node.acpToolCallId].filter((id): id is string => typeof id === "string")
+    : [node.acpToolCallId].filter((id): id is string => typeof id === "string");
+  if (!toolCallIds.length) {
     return false;
   }
-  return candidate.acpToolCallId === toolCallId && (candidate.kind === "terminal" || candidate.kind === "diff");
+  return toolCallIds.includes(candidate.acpToolCallId || "") && (candidate.kind === "terminal" || candidate.kind === "diff");
 }
 
 function canUpdateAfterExternalBoundary(existing: RenderNode, incoming: RenderNode): boolean {
@@ -571,12 +989,113 @@ function sameTimelineScope(left: RenderNode, right: RenderNode): boolean {
   );
 }
 
+function compatibleStreamTimelineScope(left: RenderNode, right: RenderNode): boolean {
+  return (
+    left.taskId === right.taskId &&
+    left.lane === right.lane &&
+    left.turnId === right.turnId &&
+    compatibleOptionalScopeValue(left.acpSessionId, right.acpSessionId) &&
+    left.source === right.source
+  );
+}
+
+function compatibleOptionalScopeValue(left: string | undefined, right: string | undefined): boolean {
+  return left === right || left === undefined || right === undefined;
+}
+
 function findSameSemanticNode(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
   const key = semanticNodeKey(node);
   if (!key) {
     return undefined;
   }
   return nodes.find((candidate) => candidate.id !== node.id && semanticNodeKey(candidate) === key);
+}
+
+function findSameReplacementNode(nodes: RenderNode[], node: RenderNode): RenderNode | undefined {
+  return nodes.find((candidate) => candidate.id !== node.id && sameSnapshotReplacementNode(candidate, node));
+}
+
+function sameSnapshotReplacementNode(left: RenderNode, right: RenderNode): boolean {
+  if (left.kind !== right.kind || !sameSnapshotReplacementScope(left, right)) {
+    return false;
+  }
+  switch (left.kind) {
+    case "message":
+      return right.kind === "message" && sameSnapshotMessageNode(left, right);
+    case "thought":
+      return right.kind === "thought" && sameSnapshotText(contentBlocksToText(left.content), contentBlocksToText(right.content));
+    case "tool":
+      return right.kind === "tool" && sameRequiredString(toolIdentity(left), toolIdentity(right));
+    case "terminal":
+      return right.kind === "terminal" && sameRequiredString(left.terminalId, right.terminalId) && sameOptionalString(left.acpToolCallId, right.acpToolCallId);
+    case "diff":
+      return right.kind === "diff" && left.path === right.path && sameOptionalString(left.acpToolCallId, right.acpToolCallId);
+    case "approval":
+      return right.kind === "approval" && left.requestId === right.requestId && sameOptionalString(approvalToolIdentity(left), approvalToolIdentity(right));
+    case "plan":
+    case "completion":
+      return true;
+    case "checkpoint":
+      return right.kind === "checkpoint" && sameOptionalString(left.checkpointId, right.checkpointId);
+    case "resource":
+      return right.kind === "resource" && stableJson(left.content) === stableJson(right.content);
+    case "unknown":
+      return right.kind === "unknown" && unknownEventIdentity(left) === unknownEventIdentity(right);
+    default:
+      return false;
+  }
+}
+
+function sameSnapshotReplacementScope(left: RenderNode, right: RenderNode): boolean {
+  return (
+    left.taskId === right.taskId &&
+    left.lane === right.lane &&
+    compatibleOptionalScopeValue(left.turnId, right.turnId) &&
+    compatibleOptionalScopeValue(left.acpSessionId, right.acpSessionId) &&
+    compatibleOptionalScopeValue(left.provider, right.provider)
+  );
+}
+
+function sameSnapshotMessageNode(
+  left: Extract<RenderNode, { kind: "message" }>,
+  right: Extract<RenderNode, { kind: "message" }>
+): boolean {
+  if (left.role !== right.role) {
+    return false;
+  }
+  if (left.acpMessageId && right.acpMessageId) {
+    return left.acpMessageId === right.acpMessageId;
+  }
+  return sameSnapshotText(left.text, right.text);
+}
+
+function sameSnapshotText(left: string, right: string): boolean {
+  const normalizedLeft = normalizeSnapshotText(left);
+  const normalizedRight = normalizeSnapshotText(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.startsWith(normalizedRight) ||
+    normalizedRight.startsWith(normalizedLeft)
+  );
+}
+
+function normalizeSnapshotText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function toolIdentity(node: Extract<RenderNode, { kind: "tool" }>): string | undefined {
+  return node.acpToolCallId || node.toolCallId;
+}
+
+function sameRequiredString(left: string | undefined, right: string | undefined): boolean {
+  return Boolean(left && right && left === right);
+}
+
+function sameOptionalString(left: string | undefined, right: string | undefined): boolean {
+  return left === right || left === undefined || right === undefined;
 }
 
 function semanticNodeKey(node: RenderNode): string | undefined {
@@ -589,14 +1108,30 @@ function semanticNodeKey(node: RenderNode): string | undefined {
     case "diff":
       return `${scope}\u0000diff\u0000${node.acpToolCallId || ""}\u0000${node.path}`;
     case "approval":
-      return `${scope}\u0000approval\u0000${node.requestId}`;
+      return `${scope}\u0000approval\u0000${approvalToolIdentity(node) || ""}\u0000${node.requestId}`;
     case "plan":
       return `${scope}\u0000plan`;
     case "resource":
       return `${scope}\u0000resource\u0000${node.id}`;
+    case "unknown":
+      return `${scope}\u0000unknown\u0000${unknownEventIdentity(node)}`;
     default:
       return undefined;
   }
+}
+
+function sameSemanticNodeWhenKnown(left: RenderNode, right: RenderNode): boolean {
+  const leftKey = replacementMoveKey(left);
+  const rightKey = replacementMoveKey(right);
+  return leftKey === undefined || rightKey === undefined || leftKey === rightKey;
+}
+
+function approvalToolIdentity(node: Extract<RenderNode, { kind: "approval" }>): string | undefined {
+  return node.acpToolCallId || node.tool.acpToolCallId || node.tool.toolCallId;
+}
+
+function unknownEventIdentity(node: Extract<RenderNode, { kind: "unknown" }>): string {
+  return `${node.label}\u0000${stableJson(node.payload)}`;
 }
 
 function nextScopedCollisionNodeId(nodes: RenderNode[], node: RenderNode): string {
@@ -676,6 +1211,7 @@ function timelineStructureKey(node: RenderNode): string {
     lane: node.lane,
     turnId: node.turnId,
     acpSessionId: node.acpSessionId,
+    source: node.source,
     status: node.status,
     sortKey: timelineSortKey(node)
   });
@@ -743,6 +1279,7 @@ export function isHydratableNodePatchPayload(patch: RenderPatch): boolean {
     node.kind === "approval" ||
     node.kind === "checkpoint" ||
     node.kind === "completion" ||
-    node.kind === "resource"
+    node.kind === "resource" ||
+    node.kind === "unknown"
   );
 }

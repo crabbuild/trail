@@ -384,7 +384,7 @@ impl CrabDb {
         Ok(Some(stamps))
     }
 
-    fn cached_worktree_index_entries_for_paths(
+    pub(crate) fn cached_worktree_index_entries_for_paths(
         &self,
         paths: &[String],
     ) -> Result<BTreeMap<String, IndexedDiskManifest>> {

@@ -27,6 +27,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 ignore = "0.4"
+libc = "0.2"
 notify = "6.1"
 getrandom = "0.2"
 similar = "2.6"

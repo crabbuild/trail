@@ -45,6 +45,13 @@ crabdb agent start --provider aider
 crabdb agent start --provider opencode
 ```
 
+Use `--workdir-mode overlay-cow` when a large repository should be exposed as a
+mounted COW filesystem view instead of a full copied workdir:
+
+```sh
+crabdb agent start --provider codex --workdir-mode overlay-cow
+```
+
 For an unsupported terminal agent, pass the exact command after `--`:
 
 ```sh
@@ -91,7 +98,7 @@ validation, apply, or recovery step.
 | --- | --- |
 | Task | One unit of agent work tracked by CrabDB |
 | Lane | Isolated CrabDB branch-like workspace for the task |
-| Workdir | Materialized filesystem directory where a terminal agent edits |
+| Workdir | Filesystem directory where a terminal agent edits; usually full-cow, optionally overlay-cow |
 | Turn | One prompt or response cycle captured from ACP |
 | Checkpoint | Recorded code state that can be reviewed, applied, or rewound |
 | `latest` | The most recent non-archived agent task |
@@ -145,18 +152,23 @@ crabdb agent acp --provider <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
 crabdb agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
-  [--name <NAME>] [--from <REF>] [-- <COMMAND>...]
+  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|overlay-cow] \
+  [-- <COMMAND>...]
 
 crabdb agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
-  [--provider <PROVIDER>] [--name <NAME>] [-- <COMMAND>...]
+  [--provider <PROVIDER>] [--name <NAME>] \
+  [--workdir-mode full-cow|overlay-cow] [-- <COMMAND>...]
 ```
 
 Use `agent acp` as the stable editor entrypoint. It creates a fresh task lane
 for each ACP session.
 
 Use `agent start` when launching an agent directly from the terminal. It creates
-a materialized task workdir, runs the agent there, and records a checkpoint when
-the command exits.
+a task workdir, runs the agent there, and records a checkpoint when the command
+exits. The default `full-cow` mode creates a full materialized workdir using
+filesystem clone COW when possible. `overlay-cow` mounts a FUSE view for the
+duration of the run so the agent sees normal files without the initial full
+copy; it requires macFUSE on macOS or FUSE access on Linux.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.

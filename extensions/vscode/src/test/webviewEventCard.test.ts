@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { EventCard, type EventCardProps } from "../webview/EventCard";
 
 const iconHtml = '<svg class="icon" aria-hidden="true"></svg>';
+const eventCardSource = fs.readFileSync(path.join(process.cwd(), "src", "webview", "EventCard.tsx"), "utf8");
 
 function renderEvent(props: EventCardProps): string {
   return renderToStaticMarkup(React.createElement(EventCard, { props }));
@@ -86,6 +89,10 @@ test("renders checkpoints as collapsed accordion separators", () => {
   );
 
   assert.match(html, /checkpoint-separator/);
+  assert.match(eventCardSource, /import \{ useSyncedAccordionValue \} from "\.\/syncedAccordionState"/);
+  assert.match(eventCardSource, /useSyncedAccordionValue\(eventCardOpenValue\(props\)\)/);
+  assert.match(eventCardSource, /value=\{openValue\}[\s\S]*onValueChange=\{setOpenValue\}/);
+  assert.doesNotMatch(eventCardSource, /defaultValue=\{props\.defaultOpen/);
   assert.match(html, /data-slot="accordion"/);
   assert.match(html, /data-slot="accordion-trigger"/);
   assert.match(html, /aria-expanded="false"/);

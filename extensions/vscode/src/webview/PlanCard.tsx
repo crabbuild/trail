@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import { Badge } from "@/webview/components/ui/badge"
@@ -146,7 +147,9 @@ export function mountPlanCards(options: MountPlanCardsOptions): void {
       return
     }
     lastPlanCardPropsJson.set(nodeId, propsJson)
-    mounted.root.render(<PlanCard props={props} />)
+    flushSync(() => {
+      mounted.root.render(<PlanCard props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, nodeId) => {

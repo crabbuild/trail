@@ -70,10 +70,14 @@ test("finalizes active live turn presentation nodes after successful completion"
   assert.equal(tool.toolStatus, "completed");
   assert.equal((tool.content[0] as Record<string, unknown>).status, "completed");
   assert.equal((tool.content[1] as Record<string, unknown>).status, "completed");
+  assert.equal((tool.content[2] as Record<string, unknown>).state, "completed");
 
   const terminal = findNode(next, "terminal:run:term-1", "terminal");
   assert.equal(terminal.status, "completed");
   assert.equal(terminal.terminalStatus, "completed");
+
+  const providerEvent = findNode(next, "unknown:provider-progress", "unknown");
+  assert.equal(providerEvent.status, "completed");
 
   const failedTool = findNode(next, "tool:failed", "tool");
   assert.equal(failedTool.status, "failed");
@@ -96,7 +100,8 @@ test("finalization emits patches for active live turn nodes and cancels pending 
       "message:assistant:one",
       "plan:turn-1",
       "terminal:run:term-1",
-      "tool:run"
+      "tool:run",
+      "unknown:provider-progress"
     ].sort()
   );
   const approvalPatch = patches.find((patch) => patch.node?.id === "approval:perm-1");
@@ -133,6 +138,12 @@ function turnFinalizationFixture(): RenderNode[] {
         type: "terminal",
         terminalId: "term-2",
         stdout: "no explicit status"
+      },
+      {
+        type: "terminal",
+        terminalId: "term-3",
+        state: "running",
+        stdout: "state-only status"
       }
     ]
   };
@@ -175,6 +186,16 @@ function turnFinalizationFixture(): RenderNode[] {
       tool,
       options: [{ optionId: "allow", label: "Allow" }],
       status: "pending"
+    },
+    {
+      ...base,
+      id: "unknown:provider-progress",
+      kind: "unknown",
+      label: "Unsupported ACP update: provider_progress",
+      payload: {
+        sessionUpdate: "provider_progress",
+        detail: "still running"
+      }
     },
     {
       ...base,

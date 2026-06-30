@@ -22,11 +22,24 @@ impl CrabDb {
         dir: &Path,
         root_id: &ObjectId,
     ) -> Result<CachedWorkdirManifestStatus> {
-        let Some(manifest) = self.read_clean_workdir_manifest(dir)? else {
+        self.cached_workdir_manifest_status_from_path(
+            dir,
+            &clean_workdir_manifest_path(dir),
+            root_id,
+        )
+    }
+
+    pub(crate) fn cached_workdir_manifest_status_from_path(
+        &self,
+        dir: &Path,
+        manifest_path: &Path,
+        root_id: &ObjectId,
+    ) -> Result<CachedWorkdirManifestStatus> {
+        let Some(manifest) = self.read_clean_workdir_manifest_from_path(manifest_path)? else {
             return Ok(CachedWorkdirManifestStatus::Missing);
         };
         if manifest.version != CLEAN_WORKDIR_MANIFEST_VERSION {
-            remove_clean_workdir_manifest(dir)?;
+            remove_clean_workdir_manifest_path(manifest_path)?;
             return Ok(CachedWorkdirManifestStatus::Missing);
         }
 
@@ -113,6 +126,52 @@ impl CrabDb {
         )
     }
 
+    pub(crate) fn write_clean_workdir_manifest_to_path<'a, I>(
+        &self,
+        dir: &Path,
+        manifest_path: &Path,
+        root_id: &ObjectId,
+        files: &BTreeMap<String, FileEntry>,
+        expected_paths: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let expected = expected_paths
+            .into_iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let pinned_paths = expected.iter().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths(dir, &pinned_paths)?;
+        let stamped = stamps.keys().cloned().collect::<BTreeSet<_>>();
+        if stamped != expected {
+            remove_clean_workdir_manifest_path(manifest_path)?;
+            return Ok(());
+        }
+
+        let mut entries = BTreeMap::new();
+        for path in expected {
+            let Some(stamp) = stamps.get(&path).cloned() else {
+                remove_clean_workdir_manifest_path(manifest_path)?;
+                return Ok(());
+            };
+            let Some(file) = files.get(&path) else {
+                remove_clean_workdir_manifest_path(manifest_path)?;
+                return Ok(());
+            };
+            entries.insert(
+                path,
+                CleanWorkdirManifestEntry {
+                    stamp,
+                    kind: file.kind.clone(),
+                    content_hash: file.content_hash.clone(),
+                },
+            );
+        }
+
+        self.write_clean_workdir_manifest_entries_to_path(manifest_path, root_id, entries)
+    }
+
     pub(crate) fn write_clean_workdir_manifest_from_stamps<'a, I>(
         &self,
         dir: &Path,
@@ -193,6 +252,52 @@ impl CrabDb {
             expected,
             stamps,
         )
+    }
+
+    pub(crate) fn write_clean_workdir_manifest_from_disk_manifest_to_path<'a, I>(
+        &self,
+        dir: &Path,
+        manifest_path: &Path,
+        root_id: &ObjectId,
+        disk_manifest: &BTreeMap<String, DiskManifest>,
+        expected_paths: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let expected = expected_paths
+            .into_iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let pinned_paths = expected.iter().cloned().collect::<Vec<_>>();
+        let stamps = self.scan_workdir_file_stamps_with_pinned_paths(dir, &pinned_paths)?;
+        let stamped = stamps.keys().cloned().collect::<BTreeSet<_>>();
+        if stamped != expected {
+            remove_clean_workdir_manifest_path(manifest_path)?;
+            return Ok(());
+        }
+
+        let mut entries = BTreeMap::new();
+        for path in expected {
+            let Some(stamp) = stamps.get(&path).cloned() else {
+                remove_clean_workdir_manifest_path(manifest_path)?;
+                return Ok(());
+            };
+            let Some(file) = disk_manifest.get(&path) else {
+                remove_clean_workdir_manifest_path(manifest_path)?;
+                return Ok(());
+            };
+            entries.insert(
+                path,
+                CleanWorkdirManifestEntry {
+                    stamp,
+                    kind: file.kind.clone(),
+                    content_hash: file.content_hash.clone(),
+                },
+            );
+        }
+
+        self.write_clean_workdir_manifest_entries_to_path(manifest_path, root_id, entries)
     }
 
     pub(crate) fn write_clean_workdir_manifest_from_disk_manifest_and_stamps<'a, I>(
@@ -346,6 +451,15 @@ impl CrabDb {
         entries: BTreeMap<String, CleanWorkdirManifestEntry>,
     ) -> Result<()> {
         let path = clean_workdir_manifest_path(dir);
+        self.write_clean_workdir_manifest_entries_to_path(&path, root_id, entries)
+    }
+
+    fn write_clean_workdir_manifest_entries_to_path(
+        &self,
+        path: &Path,
+        root_id: &ObjectId,
+        entries: BTreeMap<String, CleanWorkdirManifestEntry>,
+    ) -> Result<()> {
         let parent = path.parent().ok_or_else(|| Error::InvalidPath {
             path: path.to_string_lossy().to_string(),
             reason: "clean workdir manifest has no parent".to_string(),
@@ -402,8 +516,14 @@ impl CrabDb {
     }
 
     fn read_clean_workdir_manifest(&self, dir: &Path) -> Result<Option<CleanWorkdirManifest>> {
-        let path = clean_workdir_manifest_path(dir);
-        let bytes = match fs::read(&path) {
+        self.read_clean_workdir_manifest_from_path(&clean_workdir_manifest_path(dir))
+    }
+
+    fn read_clean_workdir_manifest_from_path(
+        &self,
+        path: &Path,
+    ) -> Result<Option<CleanWorkdirManifest>> {
+        let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(Error::Io(err)),
@@ -411,7 +531,7 @@ impl CrabDb {
         match serde_json::from_slice::<CleanWorkdirManifest>(&bytes) {
             Ok(manifest) => Ok(Some(manifest)),
             Err(_) => {
-                remove_clean_workdir_manifest(dir)?;
+                remove_clean_workdir_manifest_path(path)?;
                 Ok(None)
             }
         }
@@ -489,11 +609,15 @@ fn clean_workdir_manifest_path(dir: &Path) -> PathBuf {
 }
 
 fn remove_clean_workdir_manifest(dir: &Path) -> Result<()> {
-    let path = clean_workdir_manifest_path(dir);
-    if path.exists() {
-        fs::remove_file(path)?;
+    remove_clean_workdir_manifest_path(&clean_workdir_manifest_path(dir))
+}
+
+fn remove_clean_workdir_manifest_path(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::Io(err)),
     }
-    Ok(())
 }
 
 #[cfg(test)]

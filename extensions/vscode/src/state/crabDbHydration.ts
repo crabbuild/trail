@@ -135,9 +135,10 @@ function rootTranscriptTurnGroup(
   consumeMessageTurnId: boolean
 ): RootTranscriptTurnGroup {
   const record = asRecord(value);
-  const messageId = recordIdField(record, "message_id") || recordIdField(record, "messageId") || recordIdField(record, "id");
-  const explicitTurnId = stringField(record, "turn_id") || stringField(record, "turnId");
-  const time = rootTranscriptItemTime(record);
+  const metadataRecord = consumeMessageTurnId ? messageRecordFromValue(value) : record;
+  const messageId = messageIdFromValue(value);
+  const explicitTurnId = messageTurnIdFromValue(value);
+  const time = rootTranscriptItemTime(metadataRecord);
   const eventTurnId = messageId
     ? rootMessageTurnId(messageTurnIds, messageId, explicitTurnId, consumeMessageTurnId, time)
     : undefined;
@@ -156,8 +157,8 @@ function rootTranscriptTurnGroup(
   if (time < group.firstTime) {
     group.firstTime = time;
   }
-  group.checkpoint ||= rootTranscriptItemCheckpoint(record);
-  group.updatedAt ||= rootTranscriptItemUpdatedAt(record);
+  group.checkpoint ||= rootTranscriptItemCheckpoint(metadataRecord);
+  group.updatedAt ||= rootTranscriptItemUpdatedAt(metadataRecord);
   return group;
 }
 
@@ -241,11 +242,8 @@ function rootMessageTurnIdEntryIndex(queue: RootMessageTurnIdEntry[], messageTim
 }
 
 function rootTranscriptItemTime(record: Record<string, unknown>): number {
-  for (const value of [record.created_at, record.createdAt, record.updated_at, record.updatedAt, record.ended_at, record.endedAt]) {
-    const timestamp = timestampString(value);
-    if (!timestamp) {
-      continue;
-    }
+  const timestamp = hydrationRecordTimestamp(record);
+  if (timestamp) {
     const millis = Date.parse(timestamp);
     if (Number.isFinite(millis)) {
       return millis;
@@ -365,7 +363,7 @@ function hydrateTurnTimeline(
     const eventType = stringField(event, "event_type") || stringField(event, "eventType");
     if (eventType === "message_added") {
       const messageId = messageAddedEventMessageId(event);
-      const timestamp = timestampField(event, "created_at", "createdAt", "updated_at", "updatedAt");
+      const timestamp = hydrationEventTimestamp(event);
       const entry = messageId ? takeNextMessageEntry(messagesById, messageId, usedMessageIndexes, timestamp) : undefined;
       if (entry) {
         nodes.push({
@@ -446,7 +444,7 @@ function orderHydrationEvents(events: unknown[]): unknown[] {
 }
 
 function eventSortTime(eventValue: unknown): number {
-  const timestamp = timestampField(asRecord(eventValue), "created_at", "createdAt", "updated_at", "updatedAt");
+  const timestamp = hydrationEventTimestamp(asRecord(eventValue));
   if (!timestamp) {
     return Number.MAX_SAFE_INTEGER;
   }
@@ -463,7 +461,7 @@ function hydrateMessageEntry(
   duplicateMessageIds: Set<string>
 ): HydratedMessageEntry {
   const task = view.task;
-  const message = asRecord(messageValue);
+  const message = messageRecordFromValue(messageValue);
   const messageId = messageIdFromValue(messageValue);
   const role = stringField(message, "role") === "user" ? "user" : "assistant";
   const content = messageContentBlocks(message);
@@ -525,6 +523,37 @@ function hydrateMessageAddedEventEntry(
   return message ? hydrateMessageEntry(message, messageIndex, view, turnId, status, duplicateMessageIds) : undefined;
 }
 
+function messageRecordFromValue(value: unknown): Record<string, unknown> {
+  const record = asRecord(value);
+  const nestedMessage = asRecord(record.message);
+  if (!Object.keys(nestedMessage).length) {
+    return record;
+  }
+  const message: Record<string, unknown> = { ...nestedMessage };
+  copyFieldIfPresent(message, record, "message_id");
+  copyFieldIfPresent(message, record, "messageId");
+  copyFieldIfPresent(message, record, "id");
+  copyFieldIfPresent(message, record, "role");
+  copyFieldIfPresent(message, record, "turn_id");
+  copyFieldIfPresent(message, record, "turnId");
+  copyFieldIfPresent(message, record, "created_at");
+  copyFieldIfPresent(message, record, "createdAt");
+  copyFieldIfPresent(message, record, "updated_at");
+  copyFieldIfPresent(message, record, "updatedAt");
+  copyFieldIfPresent(message, record, "checkpoint");
+  copyFieldIfPresent(message, record, "after_change");
+  copyFieldIfPresent(message, record, "afterChange");
+  copyFieldIfPresent(message, record, "content");
+  copyFieldIfPresent(message, record, "body");
+  copyFieldIfPresent(message, record, "text");
+  copyFieldIfPresent(message, record, "content_text");
+  copyFieldIfPresent(message, record, "contentText");
+  copyFieldIfPresent(message, record, "delta");
+  copyFieldIfPresent(message, record, "content_delta");
+  copyFieldIfPresent(message, record, "contentDelta");
+  return message;
+}
+
 function messageRecordFromMessageAddedEvent(event: Record<string, unknown>): Record<string, unknown> | undefined {
   const payload = asRecord(event.payload);
   const nestedMessage = asRecord(payload.message);
@@ -550,12 +579,18 @@ function messageRecordFromMessageAddedEvent(event: Record<string, unknown>): Rec
   copyFieldIfPresent(message, event, "text");
   copyFieldIfPresent(message, event, "content_text");
   copyFieldIfPresent(message, event, "contentText");
+  copyFieldIfPresent(message, event, "delta");
+  copyFieldIfPresent(message, event, "content_delta");
+  copyFieldIfPresent(message, event, "contentDelta");
   copyFieldIfPresent(message, event, "message");
   copyFieldIfPresent(message, payload, "content");
   copyFieldIfPresent(message, payload, "body");
   copyFieldIfPresent(message, payload, "text");
   copyFieldIfPresent(message, payload, "content_text");
   copyFieldIfPresent(message, payload, "contentText");
+  copyFieldIfPresent(message, payload, "delta");
+  copyFieldIfPresent(message, payload, "content_delta");
+  copyFieldIfPresent(message, payload, "contentDelta");
   return hasRenderableMessageContent(message) ? message : undefined;
 }
 
@@ -566,13 +601,17 @@ function copyFieldIfPresent(target: Record<string, unknown>, source: Record<stri
 }
 
 function hasRenderableMessageContent(message: Record<string, unknown>): boolean {
-  return contentBlockArray(message.content).length > 0 || messageText(message) !== "";
+  return renderableMessageChunkContentBlocks(message.content).length > 0 || messageAliasContentBlock(message) !== undefined || messageText(message) !== "";
 }
 
 function messageContentBlocks(message: Record<string, unknown>): ContentBlock[] {
-  const content = contentBlockArray(message.content);
+  const content = renderableMessageChunkContentBlocks(message.content);
   if (content.length) {
     return content;
+  }
+  const aliasContent = messageAliasContentBlock(message);
+  if (aliasContent) {
+    return [aliasContent];
   }
   return [{ type: "text", text: messageText(message) }];
 }
@@ -584,9 +623,17 @@ function messageText(message: Record<string, unknown>): string {
     stringField(message, "text") ||
     stringField(message, "content_text") ||
     stringField(message, "contentText") ||
+    stringField(message, "delta") ||
+    stringField(message, "content_delta") ||
+    stringField(message, "contentDelta") ||
+    stringField(message, "value") ||
     stringField(message, "message") ||
     ""
   );
+}
+
+function messageAliasContentBlock(message: Record<string, unknown>): ContentBlock | undefined {
+  return contentBlockFromAliases(message, ["delta", "content_delta", "contentDelta", "value"]);
 }
 
 function contentBlockArray(value: unknown): ContentBlock[] {
@@ -618,8 +665,15 @@ function contentBlock(value: unknown): ContentBlock | undefined {
   if (typeof record.type === "string") {
     return record as ContentBlock;
   }
-  const text = stringField(record, "text");
-  return text === undefined ? undefined : { type: "text", text };
+  const text = stringField(record, "text") || stringField(record, "content") || stringField(record, "value");
+  if (text !== undefined) {
+    return { type: "text", text };
+  }
+  const nestedContent = record.content;
+  if (nestedContent && typeof nestedContent === "object" && nestedContent !== value) {
+    return contentBlock(nestedContent);
+  }
+  return undefined;
 }
 
 function takeNextMessageEntry(
@@ -691,8 +745,13 @@ function messageEntryTime(entry: HydratedMessageEntry): number | undefined {
 }
 
 function messageIdFromValue(messageValue: unknown): string | undefined {
-  const message = asRecord(messageValue);
+  const message = messageRecordFromValue(messageValue);
   return recordIdField(message, "message_id") || recordIdField(message, "messageId") || recordIdField(message, "id");
+}
+
+function messageTurnIdFromValue(messageValue: unknown): string | undefined {
+  const message = messageRecordFromValue(messageValue);
+  return stringField(message, "turn_id") || stringField(message, "turnId");
 }
 
 function duplicateIds(ids: Array<string | undefined>): Set<string> {
@@ -778,7 +837,7 @@ function hydrateSessionUpdateEvent(
   if (!update) {
     return nodes;
   }
-  const timestamp = timestampField(event, "created_at", "createdAt", "updated_at", "updatedAt");
+  const timestamp = hydrationEventTimestamp(event);
   const patches = reduceSessionUpdate(update, {
     taskId: task.id,
     lane: task.lane,
@@ -797,6 +856,9 @@ function hydrateSessionUpdateEvent(
         ...patch.node,
         source: "crabdb" as const,
         status,
+        ...(patch.node.kind === "message" && !isOpenStatus(status)
+          ? { streaming: false }
+          : {}),
         ...(patch.node.kind === "tool" && isOpenStatus(patch.node.toolStatus) && !isOpenStatus(status)
           ? { toolStatus: status }
           : {}),
@@ -870,12 +932,64 @@ function isHydratableSessionUpdateEventType(eventType: string | undefined): bool
 
 function sessionUpdateFromRecords(eventType: string | undefined, ...records: Record<string, unknown>[]): SessionUpdate | undefined {
   for (const record of records) {
-    const update = sessionUpdatePayload(record) || inferredSessionUpdatePayload(eventType, record);
-    if (update) {
-      return update;
+    for (const candidate of sessionUpdateCandidateRecords(record)) {
+      const update = sessionUpdatePayload(candidate) || inferredSessionUpdatePayload(eventType, candidate);
+      if (update) {
+        return sessionUpdateWithFallbackFields(update, records);
+      }
     }
   }
   return undefined;
+}
+
+function sessionUpdateWithFallbackFields(update: SessionUpdate, records: Record<string, unknown>[]): SessionUpdate {
+  const updateRecord = update as Record<string, unknown>;
+  if (isMessageChunkSessionUpdate(updateRecord.sessionUpdate) && !messageChunkIdFromRecord(updateRecord)) {
+    const messageId = firstRecordMessageChunkId(records);
+    if (messageId) {
+      return {
+        ...updateRecord,
+        messageId
+      } as SessionUpdate;
+    }
+  }
+  return update;
+}
+
+function firstRecordMessageChunkId(records: Record<string, unknown>[]): string | undefined {
+  for (const record of records) {
+    const messageId = messageChunkIdFromRecord(record);
+    if (messageId) {
+      return messageId;
+    }
+  }
+  return undefined;
+}
+
+function sessionUpdateCandidateRecords(record: Record<string, unknown>): Record<string, unknown>[] {
+  const candidates = [record];
+  const params = asRecord(record.params);
+  for (const value of [
+    record.update,
+    record.session_update,
+    record.sessionUpdatePayload,
+    record.sessionUpdate,
+    record.tool_call,
+    record.toolCall,
+    record.tool_call_update,
+    record.toolCallUpdate,
+    params.update,
+    params.session_update,
+    params.sessionUpdatePayload,
+    params.tool_call,
+    params.toolCall
+  ]) {
+    const candidate = asRecord(value);
+    if (Object.keys(candidate).length) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
 }
 
 function inferredSessionUpdatePayload(eventType: string | undefined, payload: Record<string, unknown>): SessionUpdate | undefined {
@@ -896,6 +1010,21 @@ function inferredSessionUpdatePayload(eventType: string | undefined, payload: Re
   if (updateKind === "plan" || updateKind === "plan_update") {
     const entries = arrayField(payload, "entries");
     return entries.length ? ({ ...payload, sessionUpdate: "plan", entries } as SessionUpdate) : undefined;
+  }
+  if (updateKind === "available_commands_update") {
+    return availableCommandsSessionUpdateRecord(payload);
+  }
+  if (updateKind === "current_mode_update") {
+    return currentModeSessionUpdateRecord(payload);
+  }
+  if (updateKind === "config_option_update") {
+    return configOptionSessionUpdateRecord(payload);
+  }
+  if (updateKind === "session_info_update") {
+    return sessionInfoSessionUpdateRecord(payload);
+  }
+  if (updateKind === "usage_update") {
+    return { ...payload, sessionUpdate: "usage_update" } as SessionUpdate;
   }
   return undefined;
 }
@@ -953,17 +1082,66 @@ function sessionUpdatePayload(payload: Record<string, unknown>): SessionUpdate |
       return toolSessionUpdateRecord(payload.sessionUpdate, payload, toolCallId) as SessionUpdate;
     }
   }
-  if (payload.sessionUpdate === "available_commands_update" && !Array.isArray(payload.availableCommands)) {
-    const commandNames = arrayField(payload, "command_names").filter((name): name is string => typeof name === "string");
-    return {
-      ...payload,
-      availableCommands: commandNames.map((name) => ({ name, description: "" }))
-    } as SessionUpdate;
+  if (payload.sessionUpdate === "available_commands_update") {
+    return availableCommandsSessionUpdateRecord(payload);
+  }
+  if (payload.sessionUpdate === "current_mode_update") {
+    return currentModeSessionUpdateRecord(payload);
+  }
+  if (payload.sessionUpdate === "config_option_update") {
+    return configOptionSessionUpdateRecord(payload);
+  }
+  if (payload.sessionUpdate === "session_info_update") {
+    return sessionInfoSessionUpdateRecord(payload);
   }
   return payload;
 }
 
+function availableCommandsSessionUpdateRecord(payload: Record<string, unknown>): SessionUpdate {
+  const update: Record<string, unknown> = {
+    ...payload,
+    sessionUpdate: "available_commands_update"
+  };
+  const availableCommands = firstArrayField(payload, "availableCommands", "available_commands", "commands");
+  if (availableCommands.length) {
+    update.availableCommands = availableCommands;
+  } else {
+    const commandNames = arrayField(payload, "command_names").filter((name): name is string => typeof name === "string");
+    update.availableCommands = commandNames.map((name) => ({ name, description: "" }));
+  }
+  return update as SessionUpdate;
+}
+
+function currentModeSessionUpdateRecord(payload: Record<string, unknown>): SessionUpdate {
+  const update: Record<string, unknown> = {
+    ...payload,
+    sessionUpdate: "current_mode_update"
+  };
+  copyAliasField(update, payload, "currentModeId", "current_mode_id");
+  copyAliasField(update, payload, "modeId", "mode_id");
+  return update as SessionUpdate;
+}
+
+function configOptionSessionUpdateRecord(payload: Record<string, unknown>): SessionUpdate {
+  const update: Record<string, unknown> = {
+    ...payload,
+    sessionUpdate: "config_option_update"
+  };
+  copyArrayAliasField(update, payload, "configOptions", "config_options");
+  return update as SessionUpdate;
+}
+
+function sessionInfoSessionUpdateRecord(payload: Record<string, unknown>): SessionUpdate {
+  const update: Record<string, unknown> = {
+    ...payload,
+    sessionUpdate: "session_info_update"
+  };
+  copyAliasField(update, payload, "updatedAt", "updated_at");
+  return update as SessionUpdate;
+}
+
 type MessageChunkSessionUpdate = "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk";
+type MessageChunkContent = ContentBlock | ContentBlock[];
 
 function isMessageChunkSessionUpdate(value: unknown): value is MessageChunkSessionUpdate {
   return value === "user_message_chunk" || value === "agent_message_chunk" || value === "agent_thought_chunk";
@@ -989,23 +1167,76 @@ function messageChunkSessionUpdateRecord(
   return update as SessionUpdate;
 }
 
-function messageChunkContentBlock(payload: Record<string, unknown>): ContentBlock | undefined {
-  const content = contentBlock(payload.content);
+function messageChunkContentBlock(payload: Record<string, unknown>): MessageChunkContent | undefined {
+  const content = messageChunkContentBlockFromRecord(payload);
   if (content) {
     return content;
   }
+  const nestedMessage = asRecord(payload.message);
+  if (Object.keys(nestedMessage).length) {
+    return messageChunkContentBlockFromRecord(nestedMessage);
+  }
+  return undefined;
+}
+
+function messageChunkContentBlockFromRecord(record: Record<string, unknown>): MessageChunkContent | undefined {
+  const content = renderableMessageChunkContentBlocks(record.content);
+  if (content.length === 1) {
+    return content[0];
+  }
+  if (content.length > 1) {
+    return content;
+  }
+  const aliasContent = contentBlockFromAliases(record, ["delta", "content_delta", "contentDelta", "chunk", "part", "value"]);
+  if (aliasContent) {
+    return aliasContent;
+  }
   const text =
-    stringField(payload, "text") ||
-    stringField(payload, "body") ||
-    stringField(payload, "message") ||
-    stringField(payload, "content_text") ||
-    stringField(payload, "contentText") ||
-    stringField(payload, "value");
+    stringField(record, "text") ||
+    stringField(record, "body") ||
+    stringField(record, "message") ||
+    stringField(record, "content_text") ||
+    stringField(record, "contentText");
   return text === undefined ? undefined : { type: "text", text };
 }
 
+function renderableMessageChunkContentBlocks(value: unknown): ContentBlock[] {
+  const content = contentBlockArray(value);
+  return contentBlocksHaveRenderableMessagePayload(content) ? content : [];
+}
+
+function contentBlocksHaveRenderableMessagePayload(content: ContentBlock[]): boolean {
+  return content.some((block) => {
+    if (block.type !== "text") {
+      return true;
+    }
+    const record = block as Record<string, unknown>;
+    return ["text", "content", "value"].some((key) => {
+      const value = record[key];
+      return typeof value === "string" && value.length > 0;
+    });
+  });
+}
+
+function contentBlockFromAliases(record: Record<string, unknown>, keys: string[]): ContentBlock | undefined {
+  for (const key of keys) {
+    const content = contentBlock(record[key]);
+    if (content) {
+      return content;
+    }
+  }
+  return undefined;
+}
+
 function messageChunkIdFromRecord(record: Record<string, unknown>): string | undefined {
-  return recordIdField(record, "messageId") || recordIdField(record, "message_id");
+  const nestedMessage = asRecord(record.message);
+  return (
+    recordIdField(record, "messageId") ||
+    recordIdField(record, "message_id") ||
+    recordIdField(nestedMessage, "messageId") ||
+    recordIdField(nestedMessage, "message_id") ||
+    recordIdField(nestedMessage, "id")
+  );
 }
 
 function toolSessionUpdateRecord(
@@ -1023,6 +1254,9 @@ function toolSessionUpdateRecord(
   }
   copyAliasField(update, payload, "rawInput", "raw_input");
   copyAliasField(update, payload, "rawOutput", "raw_output");
+  if (update.rawOutput === undefined && update.raw_output === undefined && hasOutputFields(payload)) {
+    update.rawOutput = payload;
+  }
   return update;
 }
 
@@ -1046,6 +1280,17 @@ function copyAliasField(
   }
 }
 
+function copyArrayAliasField(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+  targetKey: string,
+  aliasKey: string
+): void {
+  if (target[targetKey] === undefined && Array.isArray(source[aliasKey])) {
+    target[targetKey] = source[aliasKey];
+  }
+}
+
 function toolTitleFromRecords(...records: Record<string, unknown>[]): string | undefined {
   for (const record of records) {
     const title =
@@ -1061,7 +1306,7 @@ function toolTitleFromRecords(...records: Record<string, unknown>[]): string | u
 }
 
 function hasOutputFields(record: Record<string, unknown>): boolean {
-  return [
+  const outputFieldKeys = [
     "formatted_output",
     "formattedOutput",
     "output",
@@ -1072,7 +1317,12 @@ function hasOutputFields(record: Record<string, unknown>): boolean {
     "stderrPreview",
     "stderr_preview",
     "text"
-  ].some((key) => typeof record[key] === "string");
+  ];
+  if (outputFieldKeys.some((key) => typeof record[key] === "string")) {
+    return true;
+  }
+  const output = asRecord(record.output);
+  return outputFieldKeys.some((key) => typeof output[key] === "string");
 }
 
 function isSessionUpdate(value: unknown): value is SessionUpdate {
@@ -1092,15 +1342,30 @@ export function mergeHydratedNodes(hydrated: RenderNode[], current: RenderNode[]
     if (node.source === "crabdb") {
       return false;
     }
-    if (hasHydratedTranscript && node.kind === "completion" && node.checkpointPending) {
+    if (hydratedCheckpointResolvesCompletion(node, hydrated)) {
       return false;
     }
     if (hasHydratedEquivalentNode(node, hydratedForEquivalence, matchedHydratedIds, current, index)) {
       return false;
     }
-    return ["pending", "in_progress"].includes(node.status) || isPreservableCompletedLiveNode(node, hasHydratedTranscript);
+    return ["pending", "in_progress"].includes(node.status) || isPreservableCompletedLiveNode(node);
   });
   return reindexTimelineOrder(ensureUniqueMergedNodeIds(orderTimelineScopesFromCurrent([...hydratedForEquivalence, ...live], current)));
+}
+
+function hydratedCheckpointResolvesCompletion(liveNode: RenderNode, hydrated: RenderNode[]): boolean {
+  if (liveNode.kind !== "completion" || !liveNode.checkpointPending) {
+    return false;
+  }
+  return hydrated.some((node) => {
+    if (node.kind !== "checkpoint" || node.status !== "completed") {
+      return false;
+    }
+    if (node.taskId !== liveNode.taskId || node.lane !== liveNode.lane) {
+      return false;
+    }
+    return liveNode.turnId ? node.turnId === liveNode.turnId : true;
+  });
 }
 
 interface CurrentTimelineNodeOrder extends CurrentTimelineOrder {
@@ -1114,7 +1379,7 @@ function filterHydratedNodesForEquivalence(
 ): RenderNode[] {
   const orderQueues = new Map<string, CurrentTimelineNodeOrder[]>();
   current.forEach((node, index) => {
-    if (!isPreservableCompletedLiveNode(node, hasHydratedTranscript)) {
+    if (!isPreservableCompletedLiveNode(node)) {
       return;
     }
     const order = { index, timelineOrder: node.timelineOrder, node };
@@ -1241,7 +1506,14 @@ function hasHydratedEquivalentNode(
 
 function hasOverlappingTimelineKey(left: RenderNode, right: RenderNode): boolean {
   const rightKeys = timelineOrderKeys(right);
-  return timelineOrderKeys(left).some((key) => rightKeys.includes(key));
+  if (timelineOrderKeys(left).some((key) => rightKeys.includes(key))) {
+    return true;
+  }
+  if (left.turnId && right.turnId) {
+    return false;
+  }
+  const compatibleRightKeys = timelineOrderLookupKeys(right);
+  return timelineOrderLookupKeys(left).some((key) => compatibleRightKeys.includes(key));
 }
 
 interface MessageReplacementOptions {
@@ -1256,13 +1528,61 @@ function hydratedNodeCanReplaceLiveNode(
   if (liveNode.kind !== hydratedNode.kind) {
     return false;
   }
+  if (!hydratedLifecycleCanReplaceLiveLifecycle(liveNode, hydratedNode)) {
+    return false;
+  }
   if (liveNode.kind === "message" && hydratedNode.kind === "message") {
     if (liveNode.role !== hydratedNode.role) {
       return false;
     }
-    return hydratedMessageTextCanReplaceLiveText(liveNode.text, hydratedNode.text, options);
+    if (!hydratedMessageTextCanReplaceLiveText(liveNode.text, hydratedNode.text, options)) {
+      return false;
+    }
+    return hydratedMessageContentCanReplaceLiveContent(liveNode, hydratedNode);
   }
   return renderCompletenessScore(hydratedNode) >= renderCompletenessScore(liveNode);
+}
+
+function hydratedLifecycleCanReplaceLiveLifecycle(liveNode: RenderNode, hydratedNode: RenderNode): boolean {
+  if (!canReplaceLifecycleStatus(liveNode.status, hydratedNode.status)) {
+    return false;
+  }
+  if (liveNode.kind === "tool" && hydratedNode.kind === "tool") {
+    return canReplaceLifecycleStatus(liveNode.toolStatus, hydratedNode.toolStatus);
+  }
+  if (liveNode.kind === "terminal" && hydratedNode.kind === "terminal") {
+    return canReplaceLifecycleStatus(liveNode.terminalStatus, hydratedNode.terminalStatus);
+  }
+  return true;
+}
+
+function canReplaceLifecycleStatus(liveStatus: string | undefined, hydratedStatus: string | undefined): boolean {
+  const liveFailure = terminalLifecycleState(liveStatus);
+  if (!liveFailure) {
+    return true;
+  }
+  return liveFailure === terminalLifecycleState(hydratedStatus);
+}
+
+function terminalLifecycleState(status: string | undefined): "failed" | "cancelled" | undefined {
+  switch (normalizeLifecycleStatus(status)) {
+    case "failed":
+    case "error":
+      return "failed";
+    case "cancelled":
+    case "canceled":
+      return "cancelled";
+    default:
+      return undefined;
+  }
+}
+
+function normalizeLifecycleStatus(status: string | undefined): string {
+  return String(status || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function hydratedMessageTextCanReplaceLiveText(
@@ -1276,6 +1596,25 @@ function hydratedMessageTextCanReplaceLiveText(
     return true;
   }
   return options.allowMessagePrefixReplacement !== false && stableHydratedText.startsWith(stableLiveText);
+}
+
+function hydratedMessageContentCanReplaceLiveContent(
+  liveNode: Extract<RenderNode, { kind: "message" }>,
+  hydratedNode: Extract<RenderNode, { kind: "message" }>
+): boolean {
+  return messageContentRichnessScore(hydratedNode.content) >= messageContentRichnessScore(liveNode.content);
+}
+
+function messageContentRichnessScore(content: ContentBlock[]): number {
+  if (content.every((block) => block.type === "text")) {
+    return 0;
+  }
+  return content.reduce((score, block) => {
+    if (block.type === "text") {
+      return score;
+    }
+    return score + 1000 + stableJsonLength(block);
+  }, 0);
 }
 
 function renderCompletenessScore(node: RenderNode): number {
@@ -1327,8 +1666,8 @@ function stableJsonLength(value: unknown): number {
   }
 }
 
-function isPreservableCompletedLiveNode(node: RenderNode, hasHydratedTranscript: boolean): boolean {
-  if (!hasHydratedTranscript || node.source !== "acp-live" || isOpenStatus(node.status)) {
+function isPreservableCompletedLiveNode(node: RenderNode): boolean {
+  if (node.source !== "acp-live" || isOpenStatus(node.status)) {
     return false;
   }
   switch (node.kind) {
@@ -1340,6 +1679,7 @@ function isPreservableCompletedLiveNode(node: RenderNode, hasHydratedTranscript:
     case "terminal":
     case "approval":
     case "checkpoint":
+    case "completion":
     case "resource":
       return true;
     default:
@@ -1360,29 +1700,95 @@ function hydratedTimelineSegments(nodes: RenderNode[]): RenderNode[][] {
   return segments;
 }
 
+interface HydratedSegmentOrder {
+  node: RenderNode;
+  index: number;
+  currentIndex?: number | undefined;
+}
+
+interface MatchedSegmentOrder {
+  index: number;
+  currentIndex: number;
+}
+
 function orderHydratedSegmentFromCurrent(segment: RenderNode[], orderQueues: Map<string, CurrentTimelineOrder[]>): RenderNode[] {
   const usedCurrentIndexes = new Set<number>();
-  return segment
-    .map((node, index) => {
-      const currentOrder = takeTimelineOrder(node, orderQueues, usedCurrentIndexes);
-      return {
-        node: currentOrder?.timelineOrder === undefined ? node : { ...node, timelineOrder: currentOrder.timelineOrder },
-        index,
-        currentIndex: currentOrder?.index
-      };
-    })
+  const ordered = segment.map((node, index): HydratedSegmentOrder => {
+    const currentOrder = takeTimelineOrder(node, orderQueues, usedCurrentIndexes);
+    return {
+      node: currentOrder?.timelineOrder === undefined ? node : { ...node, timelineOrder: currentOrder.timelineOrder },
+      index,
+      currentIndex: currentOrder?.index
+    };
+  });
+  return ordered
+    .map((item, itemIndex) => ({
+      ...item,
+      sortKey: hydratedSegmentSortKey(ordered, itemIndex)
+    }))
     .sort((left, right) => {
-      const leftMatched = left.currentIndex !== undefined;
-      const rightMatched = right.currentIndex !== undefined;
-      if (leftMatched && rightMatched) {
-        return left.currentIndex! - right.currentIndex! || left.index - right.index;
-      }
-      if (leftMatched !== rightMatched) {
-        return leftMatched ? -1 : 1;
-      }
-      return left.index - right.index;
+      return left.sortKey - right.sortKey || left.index - right.index;
     })
     .map((item) => item.node);
+}
+
+function hydratedSegmentSortKey(ordered: HydratedSegmentOrder[], itemIndex: number): number {
+  const item = ordered[itemIndex]!;
+  if (item.currentIndex !== undefined) {
+    return item.currentIndex;
+  }
+  if (isTimelineMarkerNode(item.node)) {
+    return hydratedSegmentMarkerSortKey(ordered, item.index);
+  }
+  const previous = previousMatchedSegmentOrder(ordered, itemIndex);
+  const next = nextMatchedSegmentOrder(ordered, itemIndex);
+  if (previous && next) {
+    const span = next.index - previous.index;
+    const offset = item.index - previous.index;
+    return previous.currentIndex + ((next.currentIndex - previous.currentIndex) * offset) / span;
+  }
+  if (previous) {
+    return previous.currentIndex + (item.index - previous.index) / (ordered.length + 1);
+  }
+  if (next) {
+    return next.currentIndex - (next.index - item.index) / (ordered.length + 1);
+  }
+  return item.index;
+}
+
+function hydratedSegmentMarkerSortKey(ordered: HydratedSegmentOrder[], itemIndex: number): number {
+  const maxCurrentIndex = ordered.reduce((max, item) => Math.max(max, item.currentIndex ?? item.index), ordered.length);
+  return maxCurrentIndex + 1 + itemIndex / (ordered.length + 1);
+}
+
+function isTimelineMarkerNode(node: RenderNode): boolean {
+  return node.kind === "checkpoint" || node.kind === "completion";
+}
+
+function previousMatchedSegmentOrder(
+  ordered: HydratedSegmentOrder[],
+  itemIndex: number
+): MatchedSegmentOrder | undefined {
+  for (let index = itemIndex - 1; index >= 0; index -= 1) {
+    const item = ordered[index]!;
+    if (item.currentIndex !== undefined) {
+      return { index: item.index, currentIndex: item.currentIndex };
+    }
+  }
+  return undefined;
+}
+
+function nextMatchedSegmentOrder(
+  ordered: HydratedSegmentOrder[],
+  itemIndex: number
+): MatchedSegmentOrder | undefined {
+  for (let index = itemIndex + 1; index < ordered.length; index += 1) {
+    const item = ordered[index]!;
+    if (item.currentIndex !== undefined) {
+      return { index: item.index, currentIndex: item.currentIndex };
+    }
+  }
+  return undefined;
 }
 
 function takeTimelineOrder<T extends CurrentTimelineOrder>(
@@ -1390,7 +1796,7 @@ function takeTimelineOrder<T extends CurrentTimelineOrder>(
   orderQueues: Map<string, T[]>,
   usedCurrentIndexes: Set<number>
 ): T | undefined {
-  for (const key of timelineOrderKeys(node)) {
+  for (const key of timelineOrderLookupKeys(node)) {
     const queue = orderQueues.get(key);
     while (queue?.length) {
       const order = queue.shift()!;
@@ -1406,7 +1812,7 @@ function takeTimelineOrder<T extends CurrentTimelineOrder>(
 
 function timelineOrderKeys(node: RenderNode): string[] {
   const scope = timelineScopeKey(node);
-  const keys = [`${scope}:id:${node.id}`];
+  const keys = [timelineOrderIdKey(scope, node)];
   if (node.kind === "message") {
     const text = stableTimelineText(node.text);
     if (node.acpMessageId) {
@@ -1419,16 +1825,88 @@ function timelineOrderKeys(node: RenderNode): string[] {
     if (node.acpToolCallId) {
       keys.push(`${scope}:tool:${node.acpToolCallId}`);
     }
-  } else if (node.kind === "terminal" || node.kind === "diff" || node.kind === "approval") {
+  } else if (node.kind === "terminal") {
     if (node.acpToolCallId) {
-      keys.push(`${scope}:${node.kind}:tool:${node.acpToolCallId}`);
+      keys.push(`${scope}:terminal:tool:${node.acpToolCallId}:terminal:${node.terminalId}`);
+    }
+    keys.push(`${scope}:terminal:${node.terminalId}`);
+  } else if (node.kind === "diff") {
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:diff:tool:${node.acpToolCallId}:path:${node.path}`);
+    }
+    keys.push(`${scope}:diff:path:${node.path}`);
+  } else if (node.kind === "approval") {
+    const toolCallId = approvalToolIdentity(node);
+    if (toolCallId) {
+      keys.push(`${scope}:approval:tool:${toolCallId}:request:${node.requestId}`);
+    } else {
+      keys.push(`${scope}:approval:${node.requestId}`);
     }
   }
   return [...new Set(keys)];
 }
 
+function timelineOrderIdKey(scope: string, node: RenderNode): string {
+  if (node.kind === "approval") {
+    const toolCallId = approvalToolIdentity(node);
+    if (toolCallId) {
+      return `${scope}:id:${node.id}:tool:${toolCallId}`;
+    }
+  }
+  return `${scope}:id:${node.id}`;
+}
+
+function timelineOrderLookupKeys(node: RenderNode): string[] {
+  return [...new Set([...timelineOrderKeys(node), ...turnlessTimelineOrderKeys(node)])];
+}
+
+function turnlessTimelineOrderKeys(node: RenderNode): string[] {
+  if (!node.turnId) {
+    return [];
+  }
+  const scope = turnlessTimelineScopeKey(node);
+  const keys: string[] = [];
+  if (node.kind === "message") {
+    if (node.acpMessageId) {
+      keys.push(`${scope}:message-id-text:${node.acpMessageId}:${node.role}:${stableTimelineText(node.text)}`);
+      keys.push(`${scope}:message-id:${node.acpMessageId}`);
+    }
+  } else if (node.kind === "tool") {
+    keys.push(`${scope}:tool:${node.toolCallId}`);
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:tool:${node.acpToolCallId}`);
+    }
+  } else if (node.kind === "terminal") {
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:terminal:tool:${node.acpToolCallId}:terminal:${node.terminalId}`);
+    }
+    keys.push(`${scope}:terminal:${node.terminalId}`);
+  } else if (node.kind === "diff") {
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:diff:tool:${node.acpToolCallId}:path:${node.path}`);
+    }
+    keys.push(`${scope}:diff:path:${node.path}`);
+  } else if (node.kind === "approval") {
+    const toolCallId = approvalToolIdentity(node);
+    if (toolCallId) {
+      keys.push(`${scope}:approval:tool:${toolCallId}:request:${node.requestId}`);
+    } else {
+      keys.push(`${scope}:approval:${node.requestId}`);
+    }
+  }
+  return keys;
+}
+
+function approvalToolIdentity(node: Extract<RenderNode, { kind: "approval" }>): string | undefined {
+  return node.acpToolCallId || node.tool.acpToolCallId || node.tool.toolCallId;
+}
+
 function timelineScopeKey(node: RenderNode): string {
   return `${node.taskId}:${node.lane}:${node.turnId || ""}`;
+}
+
+function turnlessTimelineScopeKey(node: RenderNode): string {
+  return `${node.taskId}:${node.lane}:`;
 }
 
 function canUseMessagePrefixReplacement(liveNode: RenderNode, current: RenderNode[], currentIndex: number): boolean {
@@ -1447,6 +1925,48 @@ function canUseMessagePrefixReplacement(liveNode: RenderNode, current: RenderNod
 
 function stableTimelineText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function hydrationEventTimestamp(event: Record<string, unknown>): string | undefined {
+  return hydrationRecordTimestamp(event);
+}
+
+function hydrationRecordTimestamp(record: Record<string, unknown>): string | undefined {
+  const timestamp = timestampField(record, "created_at", "createdAt", "updated_at", "updatedAt", "ended_at", "endedAt");
+  if (timestamp) {
+    return timestamp;
+  }
+  for (const candidate of hydrationNestedTimestampRecords(record)) {
+    const nestedTimestamp = timestampField(candidate, "created_at", "createdAt", "updated_at", "updatedAt", "ended_at", "endedAt");
+    if (nestedTimestamp) {
+      return nestedTimestamp;
+    }
+  }
+  return undefined;
+}
+
+function hydrationNestedTimestampRecords(record: Record<string, unknown>): Record<string, unknown>[] {
+  const candidates: Record<string, unknown>[] = [];
+  const addCandidate = (value: unknown): void => {
+    const candidate = asRecord(value);
+    if (Object.keys(candidate).length && !candidates.includes(candidate)) {
+      candidates.push(candidate);
+    }
+  };
+  const payload = asRecord(record.payload);
+  addCandidate(payload);
+  addCandidate(record.message);
+  addCandidate(payload.message);
+  addCandidate(record.params);
+  addCandidate(payload.params);
+  for (const source of [record, payload]) {
+    for (const candidate of sessionUpdateCandidateRecords(source)) {
+      if (candidate !== source) {
+        addCandidate(candidate);
+      }
+    }
+  }
+  return candidates;
 }
 
 function timestampField(record: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -1515,6 +2035,16 @@ function arrayField(record: Record<string, unknown>, key: string): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function firstArrayField(record: Record<string, unknown>, ...keys: string[]): unknown[] {
+  for (const key of keys) {
+    const value = arrayField(record, key);
+    if (value.length) {
+      return value;
+    }
+  }
+  return [];
+}
+
 function stringField(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" ? value : undefined;
@@ -1522,11 +2052,22 @@ function stringField(record: Record<string, unknown>, key: string): string | und
 
 function recordIdField(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
+  const direct = recordIdValue(value);
+  if (direct !== undefined) {
+    return direct;
+  }
+  const nested = asRecord(value);
+  return recordIdValue(nested.id) || recordIdValue(nested["0"]);
+}
+
+function recordIdValue(value: unknown): string | undefined {
   if (typeof value === "string") {
     return value;
   }
-  const nested = asRecord(value);
-  return stringField(nested, "id") || stringField(nested, "0");
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

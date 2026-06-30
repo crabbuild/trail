@@ -105,7 +105,12 @@ impl CrabDb {
         let head = self.get_ref(&branch.ref_name)?;
         let sparse_paths = self.lane_sparse_workdir_paths(&branch, &workdir_path)?;
         let is_sparse = sparse_paths.is_some();
-        let cached_status = self.cached_workdir_manifest_status(&workdir_path, &head.root_id)?;
+        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(&branch)?;
+        let cached_status = self.lane_cached_workdir_manifest_status(
+            &workdir_path,
+            overlay_manifest_path.as_deref(),
+            &head.root_id,
+        )?;
         if matches!(cached_status, CachedWorkdirManifestStatus::Clean) {
             return Ok(LaneRecordReport {
                 lane_id: branch.lane_id,
@@ -168,15 +173,17 @@ impl CrabDb {
                         )?;
                     }
                     if use_disk_manifest_for_clean {
-                        self.write_clean_workdir_manifest_from_disk_manifest(
+                        self.write_lane_clean_workdir_manifest_from_disk_manifest(
                             &workdir_path,
+                            overlay_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
                             materialized_paths.iter(),
                         )?;
                     } else {
-                        self.write_clean_workdir_manifest(
+                        self.write_lane_clean_workdir_manifest(
                             &workdir_path,
+                            overlay_manifest_path.as_deref(),
                             &head.root_id,
                             &previous_files,
                             materialized_paths.iter(),
@@ -235,8 +242,9 @@ impl CrabDb {
                         self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?;
                     let materialized_paths = disk_manifest.keys().cloned().collect::<Vec<_>>();
                     if summaries.is_empty() {
-                        self.write_clean_workdir_manifest_from_disk_manifest(
+                        self.write_lane_clean_workdir_manifest_from_disk_manifest(
                             &workdir_path,
+                            overlay_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
                             materialized_paths.iter(),
@@ -276,15 +284,17 @@ impl CrabDb {
                 self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
             }
             if let Some(disk_manifest) = &clean_disk_manifest {
-                self.write_clean_workdir_manifest_from_disk_manifest(
+                self.write_lane_clean_workdir_manifest_from_disk_manifest(
                     &workdir_path,
+                    overlay_manifest_path.as_deref(),
                     &head.root_id,
                     disk_manifest,
                     materialized_paths.iter(),
                 )?;
             } else {
-                self.write_clean_workdir_manifest(
+                self.write_lane_clean_workdir_manifest(
                     &workdir_path,
+                    overlay_manifest_path.as_deref(),
                     &head.root_id,
                     &built.files,
                     materialized_paths.iter(),
@@ -353,15 +363,17 @@ impl CrabDb {
             self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
         }
         if let Some(disk_manifest) = &clean_disk_manifest {
-            self.write_clean_workdir_manifest_from_disk_manifest(
+            self.write_lane_clean_workdir_manifest_from_disk_manifest(
                 &workdir_path,
+                overlay_manifest_path.as_deref(),
                 &built.root_id,
                 disk_manifest,
                 materialized_paths.iter(),
             )?;
         } else {
-            self.write_clean_workdir_manifest(
+            self.write_lane_clean_workdir_manifest(
                 &workdir_path,
+                overlay_manifest_path.as_deref(),
                 &built.root_id,
                 &built.files,
                 materialized_paths.iter(),
@@ -394,6 +406,86 @@ impl CrabDb {
         })
     }
 
+    pub(crate) fn lane_overlay_clean_manifest_path(
+        &self,
+        branch: &LaneBranch,
+    ) -> Result<Option<PathBuf>> {
+        let record = self.lane_record(&branch.lane_id)?;
+        if self.lane_workdir_mode_for(&record, branch)? == LaneWorkdirMode::OverlayCow {
+            Ok(Some(self.overlay_clean_workdir_manifest_path_for_lane(
+                &branch.lane_id,
+            )?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn lane_cached_workdir_manifest_status(
+        &self,
+        workdir_path: &Path,
+        overlay_manifest_path: Option<&Path>,
+        root_id: &ObjectId,
+    ) -> Result<CachedWorkdirManifestStatus> {
+        if let Some(manifest_path) = overlay_manifest_path {
+            self.cached_workdir_manifest_status_from_path(workdir_path, manifest_path, root_id)
+        } else {
+            self.cached_workdir_manifest_status(workdir_path, root_id)
+        }
+    }
+
+    fn write_lane_clean_workdir_manifest<'a, I>(
+        &self,
+        workdir_path: &Path,
+        overlay_manifest_path: Option<&Path>,
+        root_id: &ObjectId,
+        files: &BTreeMap<String, FileEntry>,
+        expected_paths: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        if let Some(manifest_path) = overlay_manifest_path {
+            self.write_clean_workdir_manifest_to_path(
+                workdir_path,
+                manifest_path,
+                root_id,
+                files,
+                expected_paths,
+            )
+        } else {
+            self.write_clean_workdir_manifest(workdir_path, root_id, files, expected_paths)
+        }
+    }
+
+    fn write_lane_clean_workdir_manifest_from_disk_manifest<'a, I>(
+        &self,
+        workdir_path: &Path,
+        overlay_manifest_path: Option<&Path>,
+        root_id: &ObjectId,
+        disk_manifest: &BTreeMap<String, DiskManifest>,
+        expected_paths: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        if let Some(manifest_path) = overlay_manifest_path {
+            self.write_clean_workdir_manifest_from_disk_manifest_to_path(
+                workdir_path,
+                manifest_path,
+                root_id,
+                disk_manifest,
+                expected_paths,
+            )
+        } else {
+            self.write_clean_workdir_manifest_from_disk_manifest(
+                workdir_path,
+                root_id,
+                disk_manifest,
+                expected_paths,
+            )
+        }
+    }
+
     fn lane_workdir_record_changed_paths(
         &self,
         branch: &LaneBranch,
@@ -401,7 +493,12 @@ impl CrabDb {
         workdir_path: &Path,
     ) -> Result<Vec<FileDiffSummary>> {
         let sparse_paths = self.lane_sparse_workdir_paths(branch, workdir_path)?;
-        match self.cached_workdir_manifest_status(workdir_path, &head.root_id)? {
+        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(branch)?;
+        match self.lane_cached_workdir_manifest_status(
+            workdir_path,
+            overlay_manifest_path.as_deref(),
+            &head.root_id,
+        )? {
             CachedWorkdirManifestStatus::Clean => Ok(Vec::new()),
             CachedWorkdirManifestStatus::Dirty {
                 disk_manifest,

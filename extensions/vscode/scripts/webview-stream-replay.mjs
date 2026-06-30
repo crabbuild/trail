@@ -100,7 +100,10 @@ async function main() {
     "terminalUpdated",
     "planUpdated",
     "toolUpdated",
-    "completionRendered"
+    "completionRendered",
+    "timelineOrderRetained",
+    "assistantBeforeCompletion",
+    "completionIsLastTimelineItem"
   ].filter((key) => result[key] !== true);
   if (result.errors.length || failedChecks.length) {
     throw new Error(`Stream replay failed checks: ${[...failedChecks, ...result.errors].join(", ")}`);
@@ -556,10 +559,28 @@ function replaySource() {
     const finalCompletion = document.getElementById(domId("completion:replay"))?.textContent || "";
     const finalScroller = document.querySelector(".timeline");
     const finalBottomDrift = finalScroller ? Math.abs(finalScroller.scrollHeight - finalScroller.scrollTop - finalScroller.clientHeight) : 0;
+    const finalTimelineOrder = [...document.querySelectorAll("[data-timeline-group-body-item]")]
+      .map((element) => element.getAttribute("data-node-id") || "")
+      .filter(Boolean);
+    const expectedTimelineOrder = [
+      "message:user:replay",
+      ids.assistant,
+      ids.thought,
+      ids.plan,
+      ids.tool,
+      ids.terminal,
+      "completion:replay"
+    ];
+    const timelineOrderRetained =
+      finalTimelineOrder.length === expectedTimelineOrder.length &&
+      expectedTimelineOrder.every((id, index) => finalTimelineOrder[index] === id);
+    const assistantIndex = finalTimelineOrder.indexOf(ids.assistant);
+    const completionIndex = finalTimelineOrder.indexOf("completion:replay");
 
     return {
       frames,
       samples: samples.length,
+      finalTimelineOrder,
       addedTrackedNodes,
       removedTrackedNodes,
       articleRemounts,
@@ -578,6 +599,9 @@ function replaySource() {
       planUpdated: finalPlan.includes("90/90"),
       toolUpdated: finalTool.includes("Read rendering files"),
       completionRendered: finalCompletion.includes("Turn complete") || finalCompletion.includes("Completed"),
+      timelineOrderRetained,
+      assistantBeforeCompletion: assistantIndex >= 0 && completionIndex >= 0 && assistantIndex < completionIndex,
+      completionIsLastTimelineItem: finalTimelineOrder.at(-1) === "completion:replay",
       errors
     };
   }}())`;

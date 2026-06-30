@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import {
@@ -100,7 +101,9 @@ export function mountDiffCards(options: MountDiffCardsOptions): void {
       return
     }
     lastDiffCardPropsJson.set(nodeId, currentJson)
-    mounted.root.render(<DiffCard props={props} />)
+    flushSync(() => {
+      mounted.root.render(<DiffCard props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, nodeId) => {

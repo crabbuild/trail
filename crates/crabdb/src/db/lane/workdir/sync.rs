@@ -12,7 +12,7 @@ impl CrabDb {
             workdir: branch.workdir,
             cow_backend: workdir_mode.cow_backend().map(str::to_string),
             sparse_paths,
-            overlay_available: false,
+            overlay_available: workdir_mode == LaneWorkdirMode::OverlayCow,
             workdir_mode,
         })
     }

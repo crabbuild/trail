@@ -627,6 +627,11 @@ impl CrabDb {
         previous: &BTreeMap<String, FileEntry>,
         target: &BTreeMap<String, FileEntry>,
     ) -> Result<()> {
+        validate_no_case_fold_collisions(target.keys())?;
+        if target.keys().all(|path| previous.contains_key(path)) {
+            return Ok(());
+        }
+
         let mut paths = self
             .load_root_paths(previous_root_id)?
             .into_iter()

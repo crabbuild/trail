@@ -64,6 +64,59 @@ impl CrabDb {
         self.git_write_tree_node(&root)
     }
 
+    pub(crate) fn git_clean_worktree_index_matches_root(&self, root_id: &ObjectId) -> Result<bool> {
+        let Some(git_paths) = self.scan_git_tracked_paths_impl(true)? else {
+            return Ok(false);
+        };
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        if git_paths.len() as u64 != root.file_count {
+            return Ok(false);
+        }
+        let root_paths = self.load_root_paths(root_id)?;
+        if root_paths != git_paths {
+            return Ok(false);
+        }
+
+        for paths in root_paths.chunks(512) {
+            let root_files = self.load_root_files_for_paths(root_id, paths)?;
+            if root_files.len() != paths.len() {
+                return Ok(false);
+            }
+            let indexed = self.cached_worktree_index_entries_for_paths(paths)?;
+            if indexed.len() != paths.len() {
+                return Ok(false);
+            }
+            for path in paths {
+                let Some(root_entry) = root_files.get(path) else {
+                    return Ok(false);
+                };
+                let Some(indexed_entry) = indexed.get(path) else {
+                    return Ok(false);
+                };
+                if indexed_entry.manifest.kind != root_entry.kind
+                    || indexed_entry.manifest.executable != root_entry.executable
+                    || indexed_entry.manifest.content_hash != root_entry.content_hash
+                {
+                    return Ok(false);
+                }
+
+                let abs = self.workspace_root.join(path_from_rel(path));
+                let metadata = match fs::symlink_metadata(&abs) {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(err) => return Err(Error::Io(err)),
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Ok(false);
+                }
+                if WorktreeFileStamp::from_metadata(&metadata) != indexed_entry.stamp {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn git_write_tree_from_head_delta(
         &self,
         head: &str,

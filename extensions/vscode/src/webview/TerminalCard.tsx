@@ -1,4 +1,5 @@
 import * as React from "react"
+import { flushSync } from "react-dom"
 import { createRoot, type Root } from "react-dom/client"
 
 import {
@@ -13,6 +14,7 @@ import { Separator } from "@/webview/components/ui/separator"
 import { cn } from "@/webview/lib/utils"
 import { InlineActions } from "./InlineActions"
 import type { TerminalTone } from "./terminalModel"
+import { useSyncedAccordionValue } from "./syncedAccordionState"
 
 export interface TerminalTranscriptRow {
   id: string
@@ -57,9 +59,7 @@ const lastTerminalCardPropsJson = new Map<string, string>()
 export function TerminalCard({ props }: { props: TerminalCardProps }) {
   const commandRow = props.rows.find((row) => row.kind === "in")
   const outputRows = props.rows.filter((row) => row.kind !== "in")
-  const openValues = outputRows
-    .filter((row) => row.openByDefault)
-    .map((row) => row.id)
+  const [openValues, setOpenValues] = useSyncedAccordionValue(terminalOpenValues(outputRows))
 
   return (
     <Card
@@ -96,7 +96,8 @@ export function TerminalCard({ props }: { props: TerminalCardProps }) {
             <Accordion
               multiple
               keepMounted
-              defaultValue={openValues}
+              value={openValues}
+              onValueChange={setOpenValues}
               className="terminal-transcript-sections"
             >
               {outputRows.map((row) => (
@@ -160,6 +161,10 @@ export function TerminalCard({ props }: { props: TerminalCardProps }) {
       </CardContent>
     </Card>
   )
+}
+
+function terminalOpenValues(rows: TerminalTranscriptRow[]): string[] {
+  return rows.filter((row) => row.openByDefault).map((row) => row.id)
 }
 
 function StaticRow({ row }: { row: TerminalTranscriptRow }) {
@@ -226,7 +231,9 @@ export function mountTerminalCards(options: MountTerminalCardsOptions): void {
       }
       mountedRoots.set(nodeId, mounted)
     }
-    mounted.root.render(<TerminalCard props={props} />)
+    flushSync(() => {
+      mounted.root.render(<TerminalCard props={props} />)
+    })
   })
 
   mountedRoots.forEach((mounted, nodeId) => {

@@ -34,6 +34,7 @@ test("AcpClient negotiates capabilities and handles provider updates", async () 
   };
 
   const updates: SessionUpdate[] = [];
+  const updateSessionIds: Array<string | undefined> = [];
   const permissions: RequestPermissionParams[] = [];
   const completions: unknown[] = [];
   const errors: Error[] = [];
@@ -41,7 +42,10 @@ test("AcpClient negotiates capabilities and handles provider updates", async () 
 
   try {
     const session = await client.start({
-      update: (update) => updates.push(update),
+      update: (update, sessionId) => {
+        updates.push(update);
+        updateSessionIds.push(sessionId);
+      },
       permission: (requestId, params) => {
         permissions.push(params);
         client.approve(requestId, "allow");
@@ -84,11 +88,51 @@ test("AcpClient negotiates capabilities and handles provider updates", async () 
     assert.equal(completions.length, 1);
     assert.equal(errors.length, 0);
     assert.equal(updates.some((update) => update.sessionUpdate === "agent_message_chunk"), true);
+    assert.deepEqual(updateSessionIds, ["stub-session"]);
     assert.equal(permissions.length, 1);
     assert.equal(permissions[0]?.toolCall.kind, "execute");
   } finally {
     client.dispose();
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("AcpClient normalizes snake-case session ids for updates and permissions", async () => {
+  const { client, cleanup } = clientForLifecycleStub(snakeCaseSessionAliasStubSource());
+  const updates: SessionUpdate[] = [];
+  const updateSessionIds: Array<string | undefined> = [];
+  const permissions: RequestPermissionParams[] = [];
+
+  try {
+    const session = await client.start({
+      update: (update, sessionId) => {
+        updates.push(update);
+        updateSessionIds.push(sessionId);
+      },
+      permission: (requestId, params) => {
+        permissions.push(params);
+        client.approve(requestId, "allow");
+      },
+      completed(): void {},
+      error(error): void {
+        throw error;
+      },
+      exit(): void {}
+    });
+
+    assert.equal(session.sessionId, "snake-session");
+    const response = await client.prompt([{ type: "text", text: "hello" }]);
+    assert.deepEqual(response, { stopReason: "end_turn" });
+    assert.equal(updates[0]?.sessionUpdate, "agent_message_chunk");
+    assert.deepEqual(updateSessionIds, ["snake-session"]);
+    assert.equal(permissions.length, 1);
+    assert.equal(permissions[0]?.sessionId, "snake-session");
+    assert.equal(permissions[0]?.toolCall.toolCallId, "snake-tool");
+    assert.equal(permissions[0]?.options[0]?.optionId, "allow");
+    assert.equal(permissions[0]?.options[0]?.name, "Allow");
+  } finally {
+    client.dispose();
+    cleanup();
   }
 });
 
@@ -773,6 +817,97 @@ rl.on("line", (line) => {
   }
 
   if (message.id === "permission-1") {
+    send({
+      jsonrpc: "2.0",
+      id: promptRequestId,
+      result: {
+        stopReason: "end_turn"
+      }
+    });
+    setTimeout(() => process.exit(0), 10);
+  }
+});
+`;
+}
+
+function snakeCaseSessionAliasStubSource(): string {
+  return `
+import readline from "node:readline";
+
+let promptRequestId = null;
+const rl = readline.createInterface({ input: process.stdin });
+
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}
+
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        protocolVersion: "1",
+        agentCapabilities: {}
+      }
+    });
+    return;
+  }
+
+  if (message.method === "session/new") {
+    send({
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        session_id: "snake-session"
+      }
+    });
+    return;
+  }
+
+  if (message.method === "session/prompt") {
+    promptRequestId = message.id;
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        session_id: "snake-session",
+        session_update: {
+          session_update: "agent_message_chunk",
+          message_id: "snake-message",
+          content: {
+            type: "text",
+            text: "received"
+          }
+        }
+      }
+    });
+    send({
+      jsonrpc: "2.0",
+      id: "snake-permission",
+      method: "session/request_permission",
+      params: {
+        session_id: "snake-session",
+        tool_call: {
+          session_update: "tool_call",
+          tool_call_id: "snake-tool",
+          title: "Run snake command",
+          kind: "execute",
+          status: "pending"
+        },
+        options: [
+          {
+            option_id: "allow",
+            label: "Allow"
+          }
+        ]
+      }
+    });
+    return;
+  }
+
+  if (message.id === "snake-permission") {
     send({
       jsonrpc: "2.0",
       id: promptRequestId,

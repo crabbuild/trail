@@ -118,13 +118,18 @@ crabdb lane rm <NAME> [--force]
 | `virtual` | Creates no filesystem workdir. This is the high-scale default. |
 | `sparse` | Materializes only selected paths. |
 | `full-cow` | Materializes the full root and tries filesystem clone COW. |
-| `overlay-cow` | Reserved for a future backend. Currently unavailable. |
+| `overlay-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from CrabDB objects; writes land in the lane upper layer. |
 
 Compatibility flags:
 
 - `--materialize` creates a materialized workdir.
 - `--no-materialize` keeps the lane virtual.
 - `--paths <PATH>...` implies a sparse materialized workdir.
+
+`overlay-cow` requires FUSE support when mounted by a runtime such as
+`crabdb agent start --workdir-mode overlay-cow`: macFUSE on macOS, or `/dev/fuse`
+access on Linux. If the mount fails, CrabDB reports the setup error instead of
+copying the full workdir.
 
 ### Sparse path boundaries
 

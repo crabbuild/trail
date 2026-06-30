@@ -120,9 +120,11 @@ stale.
 `POST /v1/lanes` accepts `workdir_mode` values `virtual`, `sparse`,
 `full-cow`, and `overlay-cow`. `virtual` creates no workdir, `sparse` requires
 `paths`, and `full-cow` creates a full materialized workdir using filesystem
-clone COW when available. `overlay-cow` is reserved and currently returns an
-unavailable-backend error. The response includes `workdir_mode`, `cow_backend`,
-`sparse_paths`, and `overlay_available`.
+clone COW when available. `overlay-cow` creates an empty workdir mountpoint and
+records an overlay backend; a runtime such as `crabdb agent start
+--workdir-mode overlay-cow` mounts the FUSE view and keeps it alive while the
+agent runs. The response includes `workdir_mode`, `cow_backend`, `sparse_paths`,
+and `overlay_available`.
 
 `POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
 `sync-workdir`, but requires at least one `paths` entry.

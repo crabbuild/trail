@@ -167,17 +167,26 @@ impl CrabDb {
         } else {
             None
         };
+        let overlay_available = workdir_mode == LaneWorkdirMode::OverlayCow;
         let mut sparse_policy_paths = None;
         let materialized_workdir = if let Some(dir) = &workdir_path {
-            self.materialize_lane_workdir_at_paths_with_neighbors(
-                &source.root_id,
-                dir,
-                workdir.is_some(),
-                &sparse_paths,
-                include_neighbors,
-            )?;
-            if !sparse_paths.is_empty() {
-                sparse_policy_paths = self.sparse_workdir_paths(dir)?;
+            match &workdir_mode {
+                LaneWorkdirMode::OverlayCow => {
+                    self.prepare_overlay_cow_lane_workdir(name, dir, workdir.is_some())?;
+                }
+                LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => {
+                    self.materialize_lane_workdir_at_paths_with_neighbors(
+                        &source.root_id,
+                        dir,
+                        workdir.is_some(),
+                        &sparse_paths,
+                        include_neighbors,
+                    )?;
+                    if !sparse_paths.is_empty() {
+                        sparse_policy_paths = self.sparse_workdir_paths(dir)?;
+                    }
+                }
+                LaneWorkdirMode::Virtual => {}
             }
             Some(dir.to_string_lossy().to_string())
         } else {
@@ -189,7 +198,7 @@ impl CrabDb {
             "cow_backend": workdir_mode.cow_backend(),
             "sparse_paths": sparse_paths_for_report,
             "include_neighbors": include_neighbors,
-            "overlay_available": false
+            "overlay_available": overlay_available
         }))?;
         self.set_ref(
             &ref_name,
@@ -240,7 +249,7 @@ impl CrabDb {
                 "cow_backend": workdir_mode.cow_backend(),
                 "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
                 "include_neighbors": include_neighbors,
-                "overlay_available": false
+                "overlay_available": overlay_available
             }),
         )?;
         Ok(LaneSpawnReport {
@@ -250,7 +259,7 @@ impl CrabDb {
             workdir: materialized_workdir,
             cow_backend: workdir_mode.cow_backend().map(str::to_string),
             sparse_paths: sparse_policy_paths.unwrap_or_default(),
-            overlay_available: false,
+            overlay_available,
             workdir_mode,
         })
     }
@@ -277,12 +286,13 @@ impl CrabDb {
             let record = self.lane_record(&branch.lane_id)?;
             let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
             let sparse_paths = self.lane_report_sparse_paths(&branch)?;
+            let overlay_available = workdir_mode == LaneWorkdirMode::OverlayCow;
             return Ok(LaneWorkdirReport {
                 lane_id: branch.lane_id,
                 workdir: Some(existing),
                 cow_backend: workdir_mode.cow_backend().map(str::to_string),
                 sparse_paths,
-                overlay_available: false,
+                overlay_available,
                 workdir_mode,
             });
         }
@@ -716,9 +726,12 @@ fn validate_lane_workdir_mode_request(
             }
         }
         LaneWorkdirMode::OverlayCow => {
-            return Err(Error::InvalidInput(
-                "overlay-cow lane workdir mode is experimental and unavailable in this build; use sparse or full-cow".to_string(),
-            ));
+            if !sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(
+                    "overlay-cow lane workdir mode cannot be combined with sparse paths"
+                        .to_string(),
+                ));
+            }
         }
     }
     Ok(())

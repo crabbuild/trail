@@ -517,7 +517,7 @@ export class ChatPanel {
         try {
           const session = await client.start(
             {
-              update: (update) => this.handleAcpUpdate(update),
+              update: (update, sessionId) => this.handleAcpUpdate(update, sessionId),
               permission: (requestId, params) => this.handlePermission(requestId, params),
               completed: (response) => this.handlePromptComplete(response),
               error: (error) => this.markProviderFailure("The agent process reported an error before the turn completed.", error.message),
@@ -614,13 +614,22 @@ export class ChatPanel {
     }
   }
 
-  private handleAcpUpdate(update: SessionUpdate): void {
-    this.streamScheduler.push(reduceSessionUpdate(update, this.renderContext()));
+  private handleAcpUpdate(update: SessionUpdate, sessionId?: string | undefined): void {
+    if (sessionId && !this.acpSessionId) {
+      this.acpSessionId = sessionId;
+    }
+    this.streamScheduler.push(reduceSessionUpdate(update, this.renderContext(undefined, sessionId || this.acpSessionId)));
   }
 
   private handlePermission(requestId: string, params: RequestPermissionParams): void {
     this.streamScheduler.flush();
-    this.applyAndPostRenderPatches(reducePermissionRequest(requestId, params, this.renderContext()), { force: true });
+    if (params.sessionId && !this.acpSessionId) {
+      this.acpSessionId = params.sessionId;
+    }
+    this.applyAndPostRenderPatches(
+      reducePermissionRequest(requestId, params, this.renderContext(undefined, params.sessionId || this.acpSessionId)),
+      { force: true }
+    );
     const title = params.toolCall.title || params.toolCall.kind || "tool call";
     vscode.window.showWarningMessage(`Agent permission required: ${title}`);
   }
@@ -1100,11 +1109,11 @@ export class ChatPanel {
     };
   }
 
-  private renderContext(lane = this.task?.lane || "new-task"): RenderReduceContext {
+  private renderContext(lane = this.task?.lane || "new-task", acpSessionId = this.acpSessionId): RenderReduceContext {
     return {
       taskId: this.task?.id || lane,
       lane,
-      acpSessionId: this.acpSessionId,
+      acpSessionId,
       currentTurnId: this.currentTurnId,
       provider: this.provider.id,
       now: () => new Date().toISOString()

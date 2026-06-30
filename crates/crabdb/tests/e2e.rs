@@ -15256,6 +15256,69 @@ fn git_export_uses_clean_head_mapping_for_delta_commit() {
 }
 
 #[test]
+fn git_export_seeds_clean_mapping_from_worktree_index_for_delta_commit() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "crabdb@example.test"],
+    );
+    run_git(temp.path(), &["config", "user.name", "CrabDB Test"]);
+    fs::write(temp.path().join("README.md"), "one\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+
+    fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
+    let init = CrabDb::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = CrabDb::open(temp.path()).unwrap();
+    let dirty_mapping = db.git_mappings(1).unwrap().pop().unwrap();
+    assert!(dirty_mapping.git_dirty);
+
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "commit imported root"]);
+    let git_head = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    assert!(git_output(
+        temp.path(),
+        &["status", "--porcelain", "--untracked-files=no"]
+    )
+    .is_empty());
+
+    db.spawn_lane("delta-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "lane adds export line",
+        "edits": [
+            {"op": "write", "path": "README.md", "content": "one\ntwo\nthree\n"}
+        ]
+    }))
+    .unwrap();
+    let applied = apply_lane_patch_at_head(&mut db, "delta-bot", patch).unwrap();
+    let range = format!("{}..{}", init.operation.0, applied.operation.0);
+    let exported = db
+        .git_export_commit(&range, "Export index-verified delta")
+        .unwrap();
+
+    assert_eq!(exported.parent.as_deref(), Some(git_head.as_str()));
+    assert_eq!(
+        git_output(
+            temp.path(),
+            &["show", &format!("{}:README.md", exported.commit)]
+        ),
+        "one\ntwo\nthree"
+    );
+    let mappings = db.git_mappings(10).unwrap();
+    assert!(mappings.iter().any(|mapping| {
+        mapping.direction == "verify-index"
+            && mapping.git_head.as_deref() == Some(git_head.as_str())
+            && mapping.crab_root == init.root_id
+    }));
+}
+
+#[test]
 fn same_position_rewrite_preserves_line_identity() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "one\ntwo\nthree\n").unwrap();
@@ -18468,6 +18531,31 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     );
     assert!(no_materialize_spawn["workdir"].is_null());
     assert_eq!(no_materialize_spawn["workdir_mode"], "virtual");
+
+    let overlay_spawn = run_crabdb_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "overlay-bot",
+            "--from",
+            "main",
+            "--workdir-mode",
+            "overlay-cow",
+        ],
+    );
+    assert_eq!(overlay_spawn["workdir_mode"], "overlay-cow");
+    assert_eq!(overlay_spawn["cow_backend"], "overlay");
+    assert_eq!(overlay_spawn["overlay_available"], true);
+    assert_eq!(overlay_spawn["sparse_paths"].as_array().unwrap().len(), 0);
+    let overlay_workdir = PathBuf::from(overlay_spawn["workdir"].as_str().unwrap());
+    assert!(overlay_workdir.is_dir());
+    assert!(fs::read_dir(&overlay_workdir).unwrap().next().is_none());
+    assert!(!overlay_workdir.join("README.md").exists());
+    assert!(temp
+        .path()
+        .join(".crabdb/overlay-cow/overlay-bot/upper/.crabdb")
+        .is_dir());
 
     let mut db = CrabDb::open(temp.path()).unwrap();
     assert_eq!(

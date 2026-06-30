@@ -6,10 +6,18 @@ New commands and JSON reports expose this as `workdir_mode`:
 - `virtual`: no workdir; branch state changes through patches or API calls.
 - `sparse`: materialize selected paths and hydrate more paths explicitly.
 - `full-cow`: materialize the full root, using filesystem clone COW when safe.
-- `overlay-cow`: reserved for a future transparent write-time COW backend.
+- `overlay-cow`: create an empty mountpoint and use a FUSE overlay view at
+  runtime; reads come from CrabDB objects and writes land in a per-lane upper
+  directory.
 
-Current COW means safe file clone during materialization or hydration. It does
-not intercept arbitrary writes to unhydrated paths.
+For `full-cow` and `sparse`, COW means safe file clone during materialization or
+hydration. It does not intercept arbitrary writes to unhydrated paths.
+
+Overlay COW is different: the visible workdir is mounted while a terminal agent
+is running. The mountpoint starts empty on disk, the writable upper layer lives
+under `.crabdb/overlay-cow/<lane>/upper`, and CrabDB records through the mounted
+view before unmounting. On macOS this requires macFUSE; on Linux it requires
+FUSE access such as `/dev/fuse`.
 
 ## Spawn Without Materialization
 
@@ -34,6 +42,32 @@ crabdb lane spawn doc-bot --from main --materialize=true --workdir /tmp/doc-bot
 ```
 
 Custom workdirs must be empty or absent and cannot be symlinks.
+
+## Overlay COW For Terminal Agents
+
+```sh
+crabdb agent start --provider codex --workdir-mode overlay-cow
+crabdb agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+```
+
+`overlay-cow` lets a terminal agent see a normal filesystem tree without first
+copying every file into the lane workdir. Lower files are served from CrabDB
+objects. The first write, create, rename, or delete for a path is captured in
+the lane upper layer and then recorded as the agent checkpoint.
+
+The lane mount exists only for the duration of the terminal run. If mounting
+fails, CrabDB reports the FUSE setup error instead of silently falling back to a
+full copy.
+
+On macOS with Docker Desktop, verify the Linux path with:
+
+```sh
+scripts/verify-linux-overlay-cow-docker.sh
+```
+
+The script runs a privileged Linux container with `/dev/fuse`, builds CrabDB,
+starts a terminal task with `--workdir-mode overlay-cow`, and asserts that the
+agent saw a FUSE filesystem and recorded modified, added, and deleted paths.
 
 ## Sparse Materialization
 

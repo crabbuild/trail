@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { TerminalCard, type TerminalCardProps } from "../webview/TerminalCard";
 
 const iconHtml = '<svg class="icon" aria-hidden="true"></svg>';
+const terminalCardSource = fs.readFileSync(path.join(process.cwd(), "src", "webview", "TerminalCard.tsx"), "utf8");
 
 function renderTerminal(props: TerminalCardProps): string {
   return renderToStaticMarkup(React.createElement(TerminalCard, { props }));
@@ -58,6 +61,10 @@ test("renders terminal cards with shadcn card accordion badges and open action",
   assert.match(html, /data-terminal-card/);
   assert.match(html, /data-slot="card"/);
   assert.match(html, /data-slot="accordion"/);
+  assert.match(terminalCardSource, /import \{ useSyncedAccordionValue \} from "\.\/syncedAccordionState"/);
+  assert.match(terminalCardSource, /useSyncedAccordionValue\(terminalOpenValues\(outputRows\)\)/);
+  assert.match(terminalCardSource, /value=\{openValues\}[\s\S]*onValueChange=\{setOpenValues\}/);
+  assert.doesNotMatch(terminalCardSource, /defaultValue=\{openValues\}/);
   assert.match(html, /data-slot="accordion-trigger"/);
   assert.match(html, /data-slot="badge"/);
   assert.match(html, /terminal-transcript/);

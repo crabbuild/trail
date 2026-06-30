@@ -46,20 +46,26 @@ import {
   type ComposerRailItem,
   MAX_COMPOSER_DRAFT_CHARS
 } from "./composerModel";
+import { textContentValue, textOnlyContent } from "./contentTextModel";
 import type { DiffModel, DiffRow, DiffSegment } from "./diffModel";
 import type { DiffCardProps } from "./DiffCard";
 import { buildEventPresentation, type EventAction, type EventFact, type EventPresentation } from "./eventModel";
 import { buildFilePreviewModel, type FilePreviewModel } from "./filePreviewModel";
 import { dispatchFloatingMenuClose } from "./floatingMenu";
 import {
+  buildTimelineConversationGroups,
   buildToolActivitySummary,
   filterTimelineNodes,
+  hasTimelineDisplayStructuralChange,
+  isInlineToolDiffNode,
   isTimelineFilter,
   sortTimelineNodes,
   TIMELINE_FILTERS,
+  timelineDisplayPatchChanges,
   timelineDisplayNodes,
   timelineSearchTokens,
   timelineFilterCounts,
+  type TimelineConversationGroup,
   type TimelineFilter
 } from "./timelineModel";
 import { buildReviewReadiness, type ReviewAction, type ReviewActionGroup } from "./reviewModel";
@@ -98,7 +104,6 @@ import {
   changedRenderNodes,
   applyRenderPatchesLocally,
   changedRenderNodesFromPatches,
-  hasTimelineStructuralChange,
   isHydratableNodePatchPayload,
   parseBaseRenderRevision,
   parseRenderRevision,
@@ -898,7 +903,7 @@ function routeRenderChanges({
   patches?: RenderPatch[] | undefined;
   timelineFrameStateChanged: boolean;
 }): void {
-  const visibleChanges = filterRenderPatchChanges(beforeNodes, state.nodes, changes, isTimelineVisibleNode);
+  const visibleChanges = timelineDisplayPatchChanges(beforeNodes, state.nodes, changes);
   const hiddenStateChanged = hasRenderPatchChange(beforeNodes, state.nodes, changes, isHiddenChromeNode);
   const needsChromeHydration = chromeStateChanged || hiddenStateChanged;
   const localPayloads = patches ? patches.every(isLocallyHydratablePatchPayload) : true;
@@ -921,7 +926,7 @@ function routeRenderChanges({
     return;
   }
   if (hasAnyPatchChanges(visibleChanges)) {
-    if (hasTimelineStructuralChange(beforeNodes, state.nodes, visibleChanges)) {
+    if (hasTimelineDisplayStructuralChange(beforeNodes, state.nodes, visibleChanges)) {
       scheduleTimelineStructureHydration({ includeChrome: needsChromeHydration });
       return;
     }
@@ -987,20 +992,8 @@ function hasAnyPatchChanges(changes: RenderPatchChanges): boolean {
   return Boolean(changes.changedNodeIds.size || changes.addedNodeIds.size || changes.removedNodeIds.size);
 }
 
-function isTimelineVisibleNode(node: RenderNode): boolean {
-  return !HIDDEN.has(node.kind) && !isRoutineInternalUnknownNode(node);
-}
-
 function isHiddenChromeNode(node: RenderNode): boolean {
   return HIDDEN.has(node.kind);
-}
-
-function isRoutineInternalUnknownNode(node: RenderNode): boolean {
-  if (node.kind !== "unknown") {
-    return false;
-  }
-  const label = String(node.label || "").replace(/\s+/g, " ").trim().toLowerCase();
-  return label === "span_started" || label === "span_ended" || label.startsWith("span_started (") || label.startsWith("span_ended (");
 }
 
 function isLocallyHydratablePatchPayload(patch: RenderPatch): boolean {
@@ -1048,16 +1041,24 @@ function canHydratePatchedNodes(
   }
   return [...changes.changedNodeIds].every((id) => {
     const node = state.nodes.find((candidate) => candidate.id === id);
-    return Boolean(
-      node &&
-        (node.kind === "message" ||
-          node.kind === "thought" ||
-          node.kind === "plan" ||
-          node.kind === "tool" ||
-          node.kind === "diff" ||
-          node.kind === "terminal")
-    );
+    return Boolean(node && isPatchedTimelineCardNode(node));
   });
+}
+
+function isPatchedTimelineCardNode(node: RenderNode): boolean {
+  return (
+    node.kind === "message" ||
+    node.kind === "thought" ||
+    node.kind === "plan" ||
+    node.kind === "tool" ||
+    node.kind === "diff" ||
+    node.kind === "terminal" ||
+    node.kind === "approval" ||
+    node.kind === "checkpoint" ||
+    node.kind === "completion" ||
+    node.kind === "resource" ||
+    node.kind === "unknown"
+  );
 }
 
 function canApplyStreamingTextDomPatchesImmediately(changes: RenderPatchChanges): boolean {
@@ -1283,10 +1284,12 @@ async function hydratePatchedNodes(): Promise<void> {
   pendingPatchedNodeIds.clear();
   const forcePatchedBottomLock = pendingPatchedNodeBottomLock;
   pendingPatchedNodeBottomLock = false;
-  const visibleIds = new Set(visibleTimelineNodes().map((node) => node.id));
+  const visibleNodes = visibleTimelineNodes();
+  const visibleById = new Map(visibleNodes.map((node) => [node.id, node]));
   let needsFullRender = false;
   let needsDiffHydration = false;
   let needsIslandHydration = false;
+  let needsTimelineChromeHydration = false;
   let streamedTextDomPatchApplied = false;
   const directTargets = emptyPatchedTimelineHydrationTargets();
   const presentationRefreshNodeIds: string[] = [];
@@ -1295,26 +1298,18 @@ async function hydratePatchedNodes(): Promise<void> {
     (forcePatchedBottomLock && Date.now() >= timelineBottomLockUserPauseUntil) ||
     shouldKeepTimelinePinnedToBottom(timeline);
   for (const nodeId of nodeIds) {
-    if (!visibleIds.has(nodeId)) {
-      continue;
-    }
-    const node = state.nodes.find((candidate) => candidate.id === nodeId);
+    const node = visibleById.get(nodeId);
     if (!node) {
-      needsFullRender = true;
+      if (state.nodes.some((candidate) => candidate.id === nodeId)) {
+        needsTimelineChromeHydration = true;
+      }
       continue;
     }
     if (applyStreamingTextDomPatch(node)) {
       streamedTextDomPatchApplied = true;
       continue;
     }
-    if (
-      node.kind === "message" ||
-      node.kind === "thought" ||
-      node.kind === "plan" ||
-      node.kind === "tool" ||
-      node.kind === "diff" ||
-      node.kind === "terminal"
-    ) {
+    if (isPatchedTimelineCardNode(node)) {
       if (hydratePatchedNodeIslandDirectly(node, directTargets)) {
         needsDiffHydration ||= directTargets.needsDiffHydration;
         needsIslandHydration = true;
@@ -1333,6 +1328,9 @@ async function hydratePatchedNodes(): Promise<void> {
   if (streamedTextDomPatchApplied && restorePatchedBottom && timeline?.isConnected) {
     lockTimelineToBottom(timeline);
     queueTimelineBottomRestore();
+  }
+  if (needsTimelineChromeHydration) {
+    await hydrateTimelineChromeForPatchedNodes(visibleNodes);
   }
   if (!needsIslandHydration) {
     return;
@@ -1355,6 +1353,12 @@ async function hydratePatchedNodes(): Promise<void> {
       void hydrateDiffPreviews(++diffRenderEpoch).then(() => hydrateInlineActions());
     }
   });
+}
+
+async function hydrateTimelineChromeForPatchedNodes(visibleNodes: RenderNode[]): Promise<void> {
+  timelineNavigation(visibleNodes);
+  header(state.task);
+  await Promise.all([hydrateHeaderBars(), hydrateTimelineNavigation()]);
 }
 
 function applyStreamingTextDomPatch(node: RenderNode): boolean {
@@ -1458,14 +1462,7 @@ function canHydrateMountedNodeIslandDirectly(node: RenderNode): boolean {
 }
 
 function canHydrateDirectNodeKind(node: RenderNode): boolean {
-  return (
-    node.kind === "message" ||
-    node.kind === "thought" ||
-    node.kind === "plan" ||
-    node.kind === "tool" ||
-    node.kind === "diff" ||
-    node.kind === "terminal"
-  );
+  return isPatchedTimelineCardNode(node);
 }
 
 function mountedNodeIslandRoot(article: HTMLElement, node: RenderNode): Element | null {
@@ -1477,11 +1474,17 @@ function mountedNodeIslandRoot(article: HTMLElement, node: RenderNode): Element 
     case "plan":
       return article.querySelector("[data-plan-card-root]");
     case "tool":
+    case "approval":
       return article.querySelector("[data-tool-call-card-root]");
     case "diff":
       return article.querySelector("[data-diff-card-root]");
     case "terminal":
       return article.querySelector("[data-terminal-card-root]");
+    case "checkpoint":
+    case "completion":
+    case "resource":
+    case "unknown":
+      return article.querySelector("[data-event-card-root]");
     default:
       return null;
   }
@@ -1671,7 +1674,7 @@ function refreshTimelineGroupsForPatchedNodes(nodeIds: string[]): PatchedTimelin
   const toolGroupIds = new Set<string>();
   groups.forEach((group, index) => {
     if (group.nodes.some((node) => changedIds.has(node.id))) {
-      const item = renderTimelineGroup(group, index, groups.length);
+      const item = renderTimelineGroup(group, index, groups.length, groups);
       groupIds.add(item.id);
       collectHelperIslandIdsFromHtml(item.html, { inlineActionIds, payloadDisclosureIds });
       const props = timelineGroupProps.get(item.id);
@@ -2224,13 +2227,14 @@ async function hydrateDiffCards(options: { ids?: ReadonlySet<string> | undefined
   });
 }
 
-async function hydrateEventCards(): Promise<void> {
+async function hydrateEventCards(options: { ids?: ReadonlySet<string> | undefined } = {}): Promise<void> {
   if (!document.querySelector("[data-event-card-root]")) {
     return;
   }
   eventCardModulePromise ??= import("./EventCard.js");
   const module = await eventCardModulePromise;
   module.mountEventCards({
+    ids: options.ids,
     getProps: (nodeId) => eventCardProps.get(nodeId)
   });
 }
@@ -2327,6 +2331,7 @@ async function hydratePatchedTimelineIslands(targets: PatchedTimelineHydrationTa
   await hydrateTimelineGroups({ ids: targets.groupIds });
   await Promise.all([
     hydrateDiffCards({ ids: targets.nodeIds }),
+    hydrateEventCards({ ids: targets.nodeIds }),
     hydrateMessageCards({ ids: targets.nodeIds }),
     hydratePlanCards({ ids: targets.nodeIds }),
     hydrateTerminalCards({ ids: targets.nodeIds }),
@@ -2736,17 +2741,9 @@ function emptyStateAction(name: string, label: string, icon: IconName, tone: "pr
   };
 }
 
-interface TimelineGroup {
-  key: string;
-  baseKey: string;
+interface TimelineGroup extends TimelineConversationGroup {
   label: string;
   detail: string;
-  turnId?: string | undefined;
-  sessionId?: string | undefined;
-  lane: string;
-  status: RenderNode["status"];
-  index: number;
-  nodes: RenderNode[];
 }
 
 function renderTimeline(nodes: RenderNode[]): TimelineScrollerItemView[] {
@@ -2754,11 +2751,11 @@ function renderTimeline(nodes: RenderNode[]): TimelineScrollerItemView[] {
   if (!groups.length) {
     return [];
   }
-  return groups.map((group, index) => renderTimelineGroup(group, index, groups.length));
+  return groups.map((group, index) => renderTimelineGroup(group, index, groups.length, groups));
 }
 
-function renderTimelineGroup(group: TimelineGroup, index: number, total: number): TimelineScrollerItemView {
-  const open = shouldOpenTimelineGroup(group, index, total);
+function renderTimelineGroup(group: TimelineGroup, index: number, total: number, groups: TimelineGroup[]): TimelineScrollerItemView {
+  const open = shouldOpenTimelineGroup(group, index, total, groups);
   const id = timelineGroupDomId(group);
   const bodyItems = renderTimelineGroupBodyItems(group.nodes);
   timelineGroupProps.set(id, {
@@ -2807,30 +2804,6 @@ function renderTimelineGroupBodyItems(nodes: RenderNode[]): TimelineGroupCardPro
   return items;
 }
 
-function isInlineToolDiffNode(nodes: RenderNode[], node: RenderNode): boolean {
-  if (node.kind !== "diff" || !node.acpToolCallId) {
-    return false;
-  }
-  const nodePath = comparableDiffPath(node.path);
-  return nodes.some((candidate) => {
-    if (candidate.kind !== "tool" || candidate.toolCallId !== node.acpToolCallId) {
-      return false;
-    }
-    return candidate.content.some((item) => {
-      const record = asRecord(item);
-      if (record.type !== "diff") {
-        return false;
-      }
-      const recordPath = comparableDiffPath(String(record.path || "unknown"));
-      return recordPath === nodePath || recordPath.endsWith(`/${nodePath}`) || nodePath.endsWith(`/${recordPath}`);
-    });
-  });
-}
-
-function comparableDiffPath(path: string): string {
-  return path.replace(/^file:\/\//i, "").replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
-}
-
 function collectGroupableToolRun(nodes: RenderNode[], startIndex: number): ToolNodeView[] {
   if (!shouldGroupCompletedToolCalls()) {
     return [];
@@ -2866,33 +2839,11 @@ function timelineGroupDomId(group: TimelineGroup): string {
 }
 
 function timelineGroups(nodes: RenderNode[]): TimelineGroup[] {
-  const groups: TimelineGroup[] = [];
-  const segmentCounts = new Map<string, number>();
-  for (const node of nodes) {
-    const baseKey = node.turnId ? `turn:${node.turnId}` : "session";
-    let group = groups[groups.length - 1];
-    if (group?.baseKey !== baseKey) {
-      const segmentCount = (segmentCounts.get(baseKey) || 0) + 1;
-      segmentCounts.set(baseKey, segmentCount);
-      const key = segmentCount === 1 ? baseKey : `${baseKey}:segment-${segmentCount}`;
-      group = {
-        key,
-        baseKey,
-        label: "",
-        detail: "",
-        turnId: node.turnId,
-        sessionId: node.acpSessionId,
-        lane: node.lane,
-        status: node.status,
-        index: groups.length,
-        nodes: []
-      };
-      groups.push(group);
-    }
-    group.nodes.push(node);
-    group.status = combinedStatus(group.status, node.status);
-    group.sessionId = group.sessionId || node.acpSessionId;
-  }
+  const groups = buildTimelineConversationGroups(nodes).map((group): TimelineGroup => ({
+    ...group,
+    label: "",
+    detail: ""
+  }));
   groups.forEach((group) => {
     group.label = group.turnId ? `Turn ${turnSequenceLabel(group.index, groups)}` : "Task updates";
     group.detail = timelineGroupDetail(group);
@@ -2933,25 +2884,26 @@ function countLabel(count: number, label: string): string {
   return `${count} ${label}${count === 1 ? "" : "s"}`;
 }
 
-function combinedStatus(current: RenderNode["status"], next: RenderNode["status"]): RenderNode["status"] {
-  const priority: Record<RenderNode["status"], number> = {
-    failed: 5,
-    cancelled: 4,
-    pending: 3,
-    in_progress: 3,
-    completed: 1
-  };
-  return priority[next] > priority[current] ? next : current;
-}
-
-function shouldOpenTimelineGroup(group: TimelineGroup, index: number, total: number): boolean {
+function shouldOpenTimelineGroup(group: TimelineGroup, index: number, total: number, groups: TimelineGroup[]): boolean {
   if (timelineFilter !== "all" || timelineSearchTokens(timelineQuery).length) {
     return true;
   }
   if (group.status !== "completed") {
     return true;
   }
-  return total <= 2 || index === total - 1;
+  return total <= 2 || index === total - 1 || isLatestTurnGroup(group, index, groups);
+}
+
+function isLatestTurnGroup(group: TimelineGroup, index: number, groups: TimelineGroup[]): boolean {
+  if (!group.turnId) {
+    return false;
+  }
+  for (let nextIndex = index + 1; nextIndex < groups.length; nextIndex += 1) {
+    if (groups[nextIndex]?.turnId) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function renderNode(node: RenderNode): string {
@@ -3076,13 +3028,6 @@ function streamingTextForNode(
     return undefined;
   }
   return textOnlyContent(node.content);
-}
-
-function textOnlyContent(blocks: unknown[]): string | undefined {
-  if (!blocks.length || !blocks.every((block) => asRecord(block).type === "text")) {
-    return undefined;
-  }
-  return blocks.map((block) => String(asRecord(block).text || "")).join("");
 }
 
 type ToolNodeView = Extract<RenderNode, { kind: "tool" }>;
@@ -3529,7 +3474,7 @@ function approvalNode(node: Extract<RenderNode, { kind: "approval" }>): string {
 function approvalAsToolNode(node: ApprovalNodeView): ToolNodeView {
   const permission = permissionFromApproval(node);
   const toolStatus =
-    node.status === "cancelled" || node.status === "failed"
+    node.status === "completed" || node.status === "cancelled" || node.status === "failed"
       ? node.status
       : node.tool.toolStatus;
   return {
@@ -3848,7 +3793,7 @@ function contentBlocksToPlainText(blocks: unknown[]): string {
     .map((block) => {
       const record = asRecord(block);
       if (record.type === "text") {
-        return String(record.text || "");
+        return textContentValue(record) ?? "";
       }
       if (record.type === "resource_link") {
         return String(record.title || record.name || record.uri || "resource");
@@ -3867,7 +3812,7 @@ function renderContentBlock(block: unknown): string {
   const record = asRecord(block);
   const type = typeof record.type === "string" ? record.type : "unknown";
   if (type === "text") {
-    return markdownText(String(record.text || ""));
+    return markdownText(textContentValue(record) ?? "");
   }
   if (type === "image") {
     const mime = String(record.mimeType || "image/png");
@@ -4020,7 +3965,7 @@ function renderToolContentBlock(block: unknown, tool: ToolNodeView | undefined, 
       buildFilePreviewModel({
         path: title,
         language: languageForResource(title, "text/plain"),
-        text: String(record.text || ""),
+        text: textContentValue(record) ?? "",
         maxChars: MAX_TEXT_CHARS
       })
     );
@@ -4152,7 +4097,7 @@ function terminalContentTexts(content: unknown[]): string[] {
       }
       const contentBlock = asRecord(block.content);
       if (contentBlock.type === "text") {
-        return String(contentBlock.text || "").trim();
+        return (textContentValue(contentBlock) ?? "").trim();
       }
       const resource = asRecord(contentBlock.resource);
       return typeof resource.text === "string" ? resource.text.trim() : "";
@@ -4821,7 +4766,7 @@ function reviewDrawer(task: WebviewState["task"]): string {
   const conflictIds = conflictSetIdsFromSources(readiness, review);
   const overlaps = state.taskOverlaps || [];
   const providerTitle = providerSessionTitle(task?.title);
-  const turnCount = turns.length || transcriptTurnCount();
+  const turnCount = transcriptTurnCount() || turns.length;
   const reviewReadiness = buildReviewReadiness({
     taskStatus: task?.status,
     changedPaths: changedFiles.length,
@@ -6494,23 +6439,17 @@ function readinessText(status: string): string {
 }
 
 function transcriptTurnCount(): number {
-  return new Set(state.nodes.map((node) => node.turnId).filter(Boolean)).size;
+  return timelineGroups(chatNodes(state.nodes)).filter((group) => group.turnId).length;
 }
 
 function transcriptAnchors(): Array<{ id: string; label: string }> {
-  const seen = new Set<string>();
-  const links: Array<{ id: string; label: string }> = [];
-  for (const node of state.nodes) {
-    if (!node.turnId || seen.has(node.turnId)) {
-      continue;
-    }
-    seen.add(node.turnId);
-    links.push({
-      id: nodeDomId(node.id),
-      label: `Turn ${links.length + 1}`
-    });
-  }
-  return links.slice(0, 12);
+  return timelineGroups(chatNodes(state.nodes))
+    .filter((group) => group.turnId)
+    .slice(0, 12)
+    .map((group) => ({
+      id: timelineGroupDomId(group),
+      label: group.label
+    }));
 }
 
 function testSummary(taskView: Record<string, unknown>, extraRuns: unknown[] = []): string {

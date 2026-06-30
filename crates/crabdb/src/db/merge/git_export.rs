@@ -54,7 +54,14 @@ impl CrabDb {
             .head
             .as_deref()
             .filter(|_| !git_state.dirty)
-            .map(|head| self.git_clean_head_matches_root_mapping(head, &left_ref.root_id))
+            .map(|head| {
+                self.ensure_git_clean_head_root_mapping(
+                    &branch,
+                    &left_ref.change_id,
+                    &left_ref.root_id,
+                    head,
+                )
+            })
             .transpose()?
             .unwrap_or(false);
         let tree_oid = if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
@@ -175,5 +182,29 @@ impl CrabDb {
             )
             .optional()?;
         Ok(exists.is_some())
+    }
+
+    pub(crate) fn ensure_git_clean_head_root_mapping(
+        &self,
+        branch: &str,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        git_head: &str,
+    ) -> Result<bool> {
+        if self.git_clean_head_matches_root_mapping(git_head, root_id)? {
+            return Ok(true);
+        }
+        if !self.git_clean_worktree_index_matches_root(root_id)? {
+            return Ok(false);
+        }
+        self.insert_git_mapping_for_state(
+            "verify-index",
+            branch,
+            change_id,
+            root_id,
+            Some(git_head.to_string()),
+            false,
+        )?;
+        Ok(true)
     }
 }
