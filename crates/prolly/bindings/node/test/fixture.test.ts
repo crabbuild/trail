@@ -11,15 +11,28 @@ import {
   Tree,
   ValueRef,
   VersionedValue,
+  changedSpan,
+  changedSpanForPrefix,
+  changedSpanFromKey,
   decodeSegments,
+  encodingCbor,
+  encodingCustom,
+  encodingJson,
+  encodingRaw,
   encodeSegment,
   fromHex,
   i128Key,
   i64Key,
   isBoundaryConfig,
+  keyFromPrefixedSegments,
+  keyFromSegments,
+  largeValueConfig,
+  parallelConfig,
+  parallelConfigSequential,
   prefixEnd,
   prefixRange,
   toHex,
+  treeConfig,
   u128Key,
   u64Key,
 } from "../src/index.ts";
@@ -40,6 +53,35 @@ test("node fixtures decode, encode, and hash", () => {
 
 test("boundary and key fixtures match Rust", () => {
   const loaded = fixtures();
+  assert.equal(encodingRaw().kind, "raw");
+  assert.equal(encodingCbor().kind, "cbor");
+  assert.equal(encodingJson().kind, "json");
+  const customEncoding = encodingCustom("postcard");
+  assert.deepEqual(customEncoding, { kind: "custom", customName: "postcard" });
+  const constructedConfig = treeConfig({
+    minChunkSize: 2,
+    maxChunkSize: 64,
+    chunkingFactor: 32,
+    hashSeed: 7n,
+    encoding: customEncoding,
+    nodeCacheMaxNodes: 16,
+    nodeCacheMaxBytes: 4096,
+  });
+  assert.equal(constructedConfig.encoding, "custom");
+  assert.equal(constructedConfig.customEncodingName, "postcard");
+  assert.throws(() =>
+    treeConfig({
+      minChunkSize: 2,
+      maxChunkSize: 64,
+      chunkingFactor: 32,
+      hashSeed: 7n,
+      encoding: { kind: "custom" },
+    }),
+  );
+  assert.deepEqual(largeValueConfig(8), { inlineThreshold: 8 });
+  assert.deepEqual(parallelConfig(2, 24), { maxThreads: 2, parallelismThreshold: 24 });
+  assert.equal(parallelConfigSequential().maxThreads, 1);
+
   for (const fixture of loaded.boundary_fixtures) {
     assert.equal(
       isBoundaryConfig(
@@ -70,10 +112,17 @@ test("boundary and key fixtures match Rust", () => {
   }
 
   for (const fixture of loaded.key_fixtures.segments) {
-    const encoded = Buffer.concat(fixture.segments.map((segment: string) => encodeSegment(fromHex(segment))));
+    const segments = fixture.segments.map((segment: string) => fromHex(segment));
+    const encoded = Buffer.concat(segments.map(encodeSegment));
     assert.equal(toHex(encoded), fixture.encoded);
+    assert.equal(toHex(keyFromSegments(segments)), fixture.encoded);
+    assert.equal(toHex(keyFromPrefixedSegments(keyFromSegments(segments.slice(0, 1)), segments.slice(1))), fixture.encoded);
     assert.deepEqual(decodeSegments(fromHex(fixture.encoded)).map(toHex), fixture.decoded);
   }
+
+  assert.equal(toHex(changedSpan(fromHex("6b"), fromHex("6c")).end!), "6c");
+  assert.equal(toHex(changedSpanFromKey(fromHex("6b")).end!), "6b00");
+  assert.equal(toHex(changedSpanForPrefix(fromHex("6b")).end!), "6c");
 });
 
 test("tree fixture supports get, range, and diff", () => {

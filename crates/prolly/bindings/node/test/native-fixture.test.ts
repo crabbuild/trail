@@ -75,8 +75,14 @@ test("native boundary and key fixtures match Rust", { skip: native === null }, (
   }
 
   for (const fixture of loaded.key_fixtures.segments) {
-    const encoded = Buffer.concat(fixture.segments.map((segment: string) => native.encodeSegment(fromHex(segment))));
+    const segments = fixture.segments.map((segment: string) => fromHex(segment));
+    const encoded = Buffer.concat(segments.map((segment: Buffer) => native.encodeSegment(segment)));
     assert.equal(toHex(encoded), fixture.encoded);
+    assert.equal(toHex(native.keyFromSegments(segments)), fixture.encoded);
+    assert.equal(
+      toHex(native.keyFromPrefixedSegments(native.keyFromSegments(segments.slice(0, 1)), segments.slice(1))),
+      fixture.encoded,
+    );
     assert.deepEqual(native.decodeSegments(fromHex(fixture.encoded)).map(toHex), fixture.decoded);
   }
 
@@ -142,11 +148,25 @@ test("native codec fixtures round trip", { skip: native === null }, () => {
   const loaded = fixtures();
 
   for (const fixture of loaded.value_fixtures) {
-    assert.equal(toHex(native.versionedValueBytesRoundTrip(fromHex(fixture.bytes))), fixture.bytes);
+    const bytes = fromHex(fixture.bytes);
+    const version = String(fixture.version);
+    const nextVersion = String(BigInt(fixture.version) + 1n);
+    assert.equal(toHex(native.versionedValueBytesRoundTrip(bytes)), fixture.bytes);
+    assert.equal(native.versionedValueBytesMatchesSchema(bytes, fixture.schema_name, version), true);
+    assert.equal(native.versionedValueBytesMatchesSchema(bytes, fixture.schema_name, nextVersion), false);
+    assert.doesNotThrow(() => native.versionedValueBytesRequireSchema(bytes, fixture.schema_name, version));
+    assert.throws(() => native.versionedValueBytesRequireSchema(bytes, fixture.schema_name, nextVersion));
   }
   for (const fixture of loaded.blob_fixtures) {
-    assert.equal(toHex(native.valueRefBytesRoundTrip(fromHex(fixture.bytes))), fixture.bytes);
+    const bytes = fromHex(fixture.bytes);
+    assert.equal(toHex(native.valueRefBytesRoundTrip(bytes)), fixture.bytes);
+    assert.equal(native.valueRefFromStoredBytes(bytes).kind, fixture.kind);
+    assert.equal(native.valueRefInlineRequiresEscape(bytes), true);
   }
+  const rawInline = native.valueRefFromStoredBytes(Buffer.from("plain"));
+  assert.equal(rawInline.kind, "inline");
+  assert.equal(toHex(rawInline.value), "706c61696e");
+  assert.equal(native.valueRefInlineRequiresEscape(Buffer.from("plain")), false);
   for (const fixture of loaded.manifest_fixtures) {
     assert.equal(toHex(native.rootManifestBytesRoundTrip(fromHex(fixture.bytes))), fixture.bytes);
   }

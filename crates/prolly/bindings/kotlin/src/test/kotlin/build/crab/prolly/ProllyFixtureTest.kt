@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -78,10 +79,16 @@ class ProllyFixtureTest {
 
         for (fixture in fixtures["key_fixtures"]["segments"]) {
             var encoded = byteArrayOf()
+            val segmentBytes = mutableListOf<ByteArray>()
             for (segment in fixture["segments"]) {
-                encoded += encodeSegment(hex(segment.asText()))
+                val bytes = hex(segment.asText())
+                segmentBytes += bytes
+                encoded += encodeSegment(bytes)
             }
             assertArrayEquals(hex(fixture["encoded"].asText()), encoded)
+            assertArrayEquals(hex(fixture["encoded"].asText()), keyFromSegments(segmentBytes))
+            val prefix = keyFromSegments(segmentBytes.take(1))
+            assertArrayEquals(hex(fixture["encoded"].asText()), keyFromPrefixedSegments(prefix, segmentBytes.drop(1)))
             val actual = decodeSegments(hex(fixture["encoded"].asText())).map { it.hex() }
             val expected = fixture["decoded"].map { it.asText() }
             assertEquals(expected, actual)
@@ -158,12 +165,28 @@ class ProllyFixtureTest {
 
         for (fixture in fixtures["value_fixtures"]) {
             val bytes = hex(fixture["bytes"].asText())
+            val schema = fixture["schema_name"].asText()
+            val version = fixture["version"].asLong().toULong()
             assertArrayEquals(bytes, versionedValueToBytes(versionedValueFromBytes(bytes)))
+            assertTrue(versionedValueBytesMatchesSchema(bytes, schema, version))
+            assertFalse(versionedValueBytesMatchesSchema(bytes, schema, version + 1UL))
+            versionedValueBytesRequireSchema(bytes, schema, version)
+            assertThrows<ProllyBindingException> {
+                versionedValueBytesRequireSchema(bytes, schema, version + 1UL)
+            }
         }
         for (fixture in fixtures["blob_fixtures"]) {
             val bytes = hex(fixture["bytes"].asText())
             assertArrayEquals(bytes, valueRefToBytes(valueRefFromBytes(bytes)))
+            val expectedKind = if (fixture["kind"].asText() == "inline") ValueRefKind.INLINE else ValueRefKind.BLOB
+            assertEquals(expectedKind, valueRefFromStoredBytes(bytes).kind)
+            assertTrue(valueRefInlineRequiresEscape(bytes))
         }
+        val plain = "plain".toByteArray()
+        val rawInline = valueRefFromStoredBytes(plain)
+        assertEquals(ValueRefKind.INLINE, rawInline.kind)
+        assertArrayEquals(plain, rawInline.value ?: ByteArray(0))
+        assertFalse(valueRefInlineRequiresEscape(plain))
         for (fixture in fixtures["manifest_fixtures"]) {
             val bytes = hex(fixture["bytes"].asText())
             assertArrayEquals(bytes, rootManifestToBytes(rootManifestFromBytes(bytes)))

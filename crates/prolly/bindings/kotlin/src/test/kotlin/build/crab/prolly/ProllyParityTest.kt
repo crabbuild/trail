@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import java.nio.file.Files
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
@@ -19,13 +20,13 @@ class ProllyParityTest {
             val right = conflict.right
             return when {
                 left != null && right != null ->
-                    ResolutionRecord(ResolutionKind.VALUE, left + byteArrayOf('|'.code.toByte()) + right)
+                    resolutionValue(left + byteArrayOf('|'.code.toByte()) + right)
                 left != null ->
-                    ResolutionRecord(ResolutionKind.VALUE, left)
+                    resolutionValue(left)
                 right != null ->
-                    ResolutionRecord(ResolutionKind.VALUE, right)
+                    resolutionValue(right)
                 else ->
-                    ResolutionRecord(ResolutionKind.DELETE, null)
+                    resolutionDelete()
             }
         }
     }
@@ -36,13 +37,13 @@ class ProllyParityTest {
             val right = conflict.right
             return when {
                 left != null && right != null ->
-                    CrdtResolutionRecord(CrdtResolutionKind.VALUE, left + byteArrayOf('|'.code.toByte()) + right)
+                    crdtResolutionValue(left + byteArrayOf('|'.code.toByte()) + right)
                 left != null ->
-                    CrdtResolutionRecord(CrdtResolutionKind.VALUE, left)
+                    crdtResolutionValue(left)
                 right != null ->
-                    CrdtResolutionRecord(CrdtResolutionKind.VALUE, right)
+                    crdtResolutionValue(right)
                 else ->
-                    CrdtResolutionRecord(CrdtResolutionKind.DELETE, null)
+                    crdtResolutionDelete()
             }
         }
     }
@@ -52,14 +53,40 @@ class ProllyParityTest {
         ProllyNative.useLocalDebugLibrary()
 
         ProllyEngine.memory(defaultConfig()).use { engine ->
+            assertEquals(EncodingKind.RAW, defaultConfig().encoding.kind)
+            assertEquals(EncodingKind.RAW, encodingRaw().kind)
+            assertEquals(EncodingKind.CBOR, encodingCbor().kind)
+            assertEquals(EncodingKind.JSON, encodingJson().kind)
+            val customEncoding = encodingCustom("postcard")
+            assertEquals(EncodingKind.CUSTOM, customEncoding.kind)
+            assertEquals("postcard", customEncoding.customName)
+            val constructedConfig = treeConfig(2uL, 64uL, 32u, 7uL, customEncoding, 16uL, 4096uL)
+            assertEquals(EncodingKind.CUSTOM, constructedConfig.encoding.kind)
+            assertEquals(16uL, constructedConfig.nodeCacheMaxNodes)
+            assertThrows<ProllyBindingException> {
+                treeConfig(
+                    2uL,
+                    64uL,
+                    32u,
+                    7uL,
+                    EncodingRecord(EncodingKind.CUSTOM, null),
+                    null,
+                    null,
+                )
+            }
+            assertEquals(8uL, largeValueConfig(8uL).inlineThreshold)
+            assertEquals(1uL, parallelConfigSequential().maxThreads)
+
             val empty = engine.create()
+            assertEquals(MutationKind.UPSERT, upsertMutation("probe".bytes(), "value".bytes()).kind)
+            assertEquals(MutationKind.DELETE, deleteMutation("probe".bytes()).kind)
             val tree = engine.batch(
                 empty,
                 listOf(
-                    MutationRecord(MutationKind.UPSERT, "a".bytes(), "1".bytes()),
-                    MutationRecord(MutationKind.UPSERT, "b".bytes(), "2".bytes()),
-                    MutationRecord(MutationKind.UPSERT, "a".bytes(), "11".bytes()),
-                    MutationRecord(MutationKind.DELETE, "missing".bytes(), null),
+                    upsertMutation("a".bytes(), "1".bytes()),
+                    upsertMutation("b".bytes(), "2".bytes()),
+                    upsertMutation("a".bytes(), "11".bytes()),
+                    deleteMutation("missing".bytes()),
                 ),
             )
 
@@ -266,6 +293,18 @@ class ProllyParityTest {
                 ParallelConfigRecord(1uL, 1uL),
             )
             assertArrayEquals("kotlin".bytes(), engine.get(parallelTree, "q".bytes()))
+            val parallelStats = engine.parallelBatchWithStats(
+                empty,
+                listOf(
+                    MutationRecord(MutationKind.UPSERT, "r".bytes(), "route".bytes()),
+                    MutationRecord(MutationKind.UPSERT, "s".bytes(), "stats".bytes()),
+                ),
+                ParallelConfigRecord(1uL, 1uL),
+            )
+            assertArrayEquals("stats".bytes(), engine.get(parallelStats.tree, "s".bytes()))
+            assertEquals(2UL, parallelStats.stats.inputMutations)
+            assertEquals(2UL, parallelStats.stats.effectiveMutations)
+            assertTrue(parallelStats.stats.writtenNodes > 0UL)
 
             val appended = engine.appendBatch(
                 built,
@@ -299,9 +338,38 @@ class ProllyParityTest {
             val afterA = engine.rangeAfter(tree, "a".bytes(), null)
             assertEquals(1, afterA.size)
             assertArrayEquals("b".bytes(), afterA[0].key)
-            val fromCursor = engine.rangeFromCursor(tree, RangeCursorRecord("a".bytes()), null)
+            assertNull(rangeCursorStart().afterKey)
+            val afterACursor = rangeCursorAfterKey("a".bytes())
+            assertArrayEquals("a".bytes(), afterACursor.afterKey)
+            val fromCursor = engine.rangeFromCursor(tree, afterACursor, null)
             assertEquals(1, fromCursor.size)
             assertArrayEquals(afterA[0].key, fromCursor[0].key)
+            assertArrayEquals("a".bytes(), engine.firstEntry(tree)?.key)
+            assertArrayEquals("11".bytes(), engine.firstEntry(tree)?.value)
+            assertArrayEquals("b".bytes(), engine.lastEntry(tree)?.key)
+            assertArrayEquals("b".bytes(), engine.lowerBound(tree, "aa".bytes())?.key)
+            assertNull(engine.upperBound(tree, "b".bytes()))
+            val prefixEntries = engine.prefix(tree, "a".bytes())
+            assertEquals(1, prefixEntries.size)
+            assertArrayEquals("11".bytes(), prefixEntries[0].value)
+            val prefixPage = engine.prefixPage(tree, "a".bytes(), null, 1UL)
+            assertEquals(1, prefixPage.entries.size)
+            assertArrayEquals("11".bytes(), prefixPage.entries[0].value)
+            assertNotNull(prefixPage.nextCursor)
+
+            val window = engine.cursorWindow(tree, "aa".bytes(), null, 1UL)
+            assertArrayEquals("a".bytes(), window.positionKey)
+            assertArrayEquals("11".bytes(), window.positionValue)
+            assertFalse(window.found)
+            assertEquals(1, window.entries.size)
+            assertArrayEquals("b".bytes(), window.entries[0].key)
+            assertArrayEquals("b".bytes(), window.nextCursor?.afterKey)
+
+            val exactProbe = engine.cursorWindow(tree, "a".bytes(), null, 0UL)
+            assertTrue(exactProbe.found)
+            assertArrayEquals("a".bytes(), exactProbe.positionKey)
+            assertEquals(0, exactProbe.entries.size)
+            assertNull(exactProbe.nextCursor)
 
             val secondPage = engine.rangePage(tree, firstPage.nextCursor, null, 1UL)
             assertEquals(1, secondPage.entries.size)
@@ -311,6 +379,23 @@ class ProllyParityTest {
                 assertEquals(0, thirdPage.entries.size)
                 assertNull(thirdPage.nextCursor)
             }
+
+            assertNull(reverseCursorEnd().beforeKey)
+            val beforeCCursor = reverseCursorBeforeKey("c".bytes())
+            assertArrayEquals("c".bytes(), beforeCCursor.beforeKey)
+            val reverseFirst = engine.reversePage(built, null, ByteArray(0), 2UL)
+            assertEquals(2, reverseFirst.entries.size)
+            assertArrayEquals("c".bytes(), reverseFirst.entries[0].key)
+            assertArrayEquals("b".bytes(), reverseFirst.entries[1].key)
+            assertArrayEquals("b".bytes(), reverseFirst.nextCursor?.beforeKey)
+            val reverseSecond = engine.reversePage(built, reverseFirst.nextCursor, ByteArray(0), 2UL)
+            assertEquals(1, reverseSecond.entries.size)
+            assertArrayEquals("a".bytes(), reverseSecond.entries[0].key)
+            assertNull(reverseSecond.nextCursor)
+            val prefixReverse = engine.prefixReversePage(built, "b".bytes(), null, 8UL)
+            assertEquals(1, prefixReverse.entries.size)
+            assertArrayEquals("b".bytes(), prefixReverse.entries[0].key)
+            assertNull(prefixReverse.nextCursor)
 
             val changed = engine.put(tree, "b".bytes(), "22".bytes())
             val diffPage = engine.diffPage(tree, changed, null, null, 1UL)
@@ -464,6 +549,9 @@ class ProllyParityTest {
                 val changed = engine.put(tree, "b".bytes(), "22".bytes())
                 assertEquals(1, engine.diff(tree, changed).size)
                 assertNotNull(engine.rangePage(changed, null, null, 1UL).nextCursor)
+                val reversePage = engine.reversePage(changed, null, ByteArray(0), 2UL)
+                assertArrayEquals("b".bytes(), reversePage.entries[0].key)
+                assertArrayEquals("a".bytes(), reversePage.entries[1].key)
             }
         }
     }
@@ -517,6 +605,16 @@ class ProllyParityTest {
                     assertFalse(update.conflict)
 
                     assertTrue(engine.collectStatsJson(largeTree).json.contains("\"num_nodes\""))
+                    val typedStats = engine.collectStats(largeTree)
+                    assertTrue(typedStats.numNodes > 0UL)
+                    assertEquals(1UL, typedStats.totalKeyValuePairs)
+                    val typedDiffStats = engine.statsDiff(empty, largeTree)
+                    assertEquals(0UL, typedDiffStats.before.totalKeyValuePairs)
+                    assertEquals(1UL, typedDiffStats.after.totalKeyValuePairs)
+                    val debugTree = engine.debugTree(largeTree)
+                    assertTrue(debugTree.levels.isNotEmpty())
+                    val debugComparison = engine.debugCompareTrees(empty, largeTree)
+                    assertTrue(debugComparison.rightOnlyNodes > 0UL)
                     assertTrue(engine.pinTreeRoot(largeTree) > 0UL)
                     assertTrue(engine.cacheStats().pinnedNodes > 0UL)
                     assertTrue(engine.unpinAllCacheNodes() > 0UL)
@@ -553,9 +651,28 @@ class ProllyParityTest {
             assertNotNull(explanation.result)
             assertNull(explanation.error)
             assertTrue(explanation.traceJson.contains("events"))
+            assertTrue(explanation.trace.events.isNotEmpty())
+            assertTrue(
+                explanation.trace.events.any { event ->
+                    event.kind == MergeTraceEventKind.RESOLVER_CALLED &&
+                        event.resolution == MergeTraceResolutionKind.VALUE
+                }
+            )
 
             val merged = engine.merge(base, left, right, "prefer_right")
             assertArrayEquals("right".bytes(), engine.get(merged, "k".bytes()))
+
+            val updateConflict = ConflictRecord("k".bytes(), "base".bytes(), "left".bytes(), "right".bytes())
+            assertArrayEquals("left".bytes(), resolvePreferLeft(updateConflict).value)
+            assertEquals(ResolutionKind.UNRESOLVED, resolveDeleteWins(updateConflict).kind)
+            val deleteConflict = ConflictRecord("k".bytes(), "base".bytes(), null, "right".bytes())
+            assertEquals(ResolutionKind.DELETE, resolveDeleteWins(deleteConflict).kind)
+            assertArrayEquals("right".bytes(), resolveUpdateWins(deleteConflict).value)
+            val preferRightCallback = object : MergeResolverCallback {
+                override fun resolve(conflict: ConflictRecord): ResolutionRecord = resolvePreferRight(conflict)
+            }
+            val preferRightMerged = engine.mergeWithResolver(base, left, right, preferRightCallback)
+            assertArrayEquals("right".bytes(), engine.get(preferRightMerged, "k".bytes()))
 
             val name = "main".bytes()
             engine.publishNamedRootAtMillis(name, merged, 42UL)
@@ -572,11 +689,25 @@ class ProllyParityTest {
             assertEquals(1, selection.roots.size)
             assertEquals(1, selection.missingNames.size)
 
-            val retained = engine.loadRetainedNamedRoots(
-                NamedRootRetentionRecord(NamedRootRetentionKind.ALL, emptyList(), ByteArray(0), null, null),
-            )
+            val retainAll = retainAllNamedRoots()
+            assertEquals(NamedRootRetentionKind.ALL, retainAll.kind)
+            val retainExact = retainExactNamedRoots(listOf(name, "missing".bytes()))
+            assertEquals(NamedRootRetentionKind.EXACT, retainExact.kind)
+            assertEquals(2, retainExact.names.size)
+            val retainPrefix = retainNamedRootPrefix("ma".bytes())
+            assertEquals(NamedRootRetentionKind.PREFIX, retainPrefix.kind)
+            assertArrayEquals("ma".bytes(), retainPrefix.prefix)
+            val retainNewest = retainNewestNamedRoots("checkpoint/".bytes(), 2UL)
+            assertEquals(NamedRootRetentionKind.NEWEST_BY_NAME, retainNewest.kind)
+            assertArrayEquals("checkpoint/".bytes(), retainNewest.prefix)
+            assertEquals(2UL, retainNewest.count)
+            val retainUpdated = retainNamedRootsUpdatedSince("checkpoint/".bytes(), 42UL)
+            assertEquals(NamedRootRetentionKind.UPDATED_SINCE, retainUpdated.kind)
+            assertArrayEquals("checkpoint/".bytes(), retainUpdated.prefix)
+            assertEquals(42UL, retainUpdated.minUpdatedAtMillis)
+
+            val retained = engine.loadRetainedNamedRoots(retainAll)
             assertEquals(1, retained.roots.size)
-            val retainAll = NamedRootRetentionRecord(NamedRootRetentionKind.ALL, emptyList(), ByteArray(0), null, null)
             assertEquals(1UL, engine.planStoreGcForRetention(retainAll).reachability.liveNodes)
             assertEquals(1UL, engine.sweepStoreGcForRetention(retainAll).plan.reachability.liveNodes)
 
@@ -627,7 +758,7 @@ class ProllyParityTest {
                 CrdtDeletePolicyKind.UPDATE_WINS,
                 object : CrdtResolverCallback {
                     override fun resolve(conflict: ConflictRecord): CrdtResolutionRecord =
-                        CrdtResolutionRecord(CrdtResolutionKind.DELETE, null)
+                        crdtResolutionDelete()
                 },
             )
             assertNull(engine.get(deleted, "k".bytes()))
@@ -698,10 +829,26 @@ class ProllyParityTest {
             val tree = engine.put(empty, "k".bytes(), "v".bytes())
 
             assertTrue(engine.collectStatsJson(tree).json.contains("\"num_nodes\""))
+            val typedStats = engine.collectStats(tree)
+            assertEquals(1UL, typedStats.totalKeyValuePairs)
+            assertTrue(typedStats.nodesPerLevel.any { it.level == 0.toUByte() && it.value > 0UL })
             assertTrue(engine.statsDiffJson(empty, tree).json.contains("\"absolute\""))
+            val typedDiffStats = engine.statsDiff(empty, tree)
+            assertEquals(0UL, typedDiffStats.before.totalKeyValuePairs)
+            assertEquals(1UL, typedDiffStats.after.totalKeyValuePairs)
+            assertEquals(1L, typedDiffStats.absolute.totalKeyValuePairsDiff)
             assertTrue(engine.debugTreeJson(tree).json.contains("\"levels\""))
+            val debugTree = engine.debugTree(tree)
+            assertTrue(debugTree.levels.isNotEmpty())
+            assertTrue(debugTree.levels.first().nodes.isNotEmpty())
             assertTrue(engine.debugTreeText(tree).contains("level"))
             assertTrue(engine.debugCompareTreesJson(empty, tree).json.contains("\"right_only_nodes\""))
+            val debugComparison = engine.debugCompareTrees(empty, tree)
+            assertEquals(0UL, debugComparison.leftOnlyNodes)
+            assertTrue(debugComparison.rightOnlyNodes > 0UL)
+            assertTrue(debugComparison.levels.any { level ->
+                level.nodes.any { node -> node.status == TreeDebugNodeStatusKind.RIGHT_ONLY }
+            })
             assertTrue(engine.debugCompareTreesText(empty, tree).contains("right"))
 
             assertTrue(engine.pinTreePath(tree, "k".bytes()) > 0UL)
@@ -717,11 +864,13 @@ class ProllyParityTest {
 
             assertFalse(engine.publishPrefixPathHint(tree, "k".bytes()))
             assertFalse(engine.hydratePrefixPathHint(tree, "k".bytes()))
+            assertArrayEquals(byteArrayOf('k'.code.toByte(), 0), changedSpanFromKey("k".bytes()).end)
+            assertArrayEquals("l".bytes(), changedSpanForPrefix("k".bytes()).end)
             assertFalse(
                 engine.publishChangedSpansHint(
                     empty,
                     tree,
-                    listOf(ChangedSpanRecord("k".bytes(), "l".bytes())),
+                    listOf(changedSpan("k".bytes(), "l".bytes())),
                 ),
             )
             assertNull(engine.loadChangedSpansHint(empty, tree))
@@ -729,6 +878,16 @@ class ProllyParityTest {
             val structuralPage = engine.structuralDiffPage(empty, tree, null, 1UL)
             assertTrue(structuralPage.diffs.isNotEmpty())
             assertTrue(structuralPage.stats.emittedDiffs > 0UL)
+            val structuralCursorPage = engine.structuralDiffPage(empty, tree, null, 0UL)
+            assertNotNull(structuralCursorPage.nextCursor)
+            assertNotNull(structuralCursorPage.nextCursorJson)
+            val resumedStructuralPage = engine.structuralDiffPageWithCursor(
+                empty,
+                tree,
+                structuralCursorPage.nextCursor,
+                1UL,
+            )
+            assertTrue(resumedStructuralPage.diffs.isNotEmpty())
 
             val reachability = engine.markReachable(listOf(tree))
             assertTrue(reachability.liveNodes > 0UL)
@@ -750,6 +909,38 @@ class ProllyParityTest {
                 assertEquals(0UL, engine.planMissingNodes(tree, destination).missingNodes)
                 assertArrayEquals("v".bytes(), destination.get(tree, "k".bytes()))
             }
+
+            val snapshotBundle = engine.exportSnapshot(tree)
+            assertEquals(1u, snapshotBundle.formatVersion)
+            assertTrue(snapshotBundle.nodes.isNotEmpty())
+            val snapshotBundleBytes = snapshotBundleToBytes(snapshotBundle)
+            val snapshotBundleDigest = snapshotBundleDigest(snapshotBundle)
+            assertArrayEquals(cidFromBytes(snapshotBundleBytes), snapshotBundleDigest)
+            assertArrayEquals(snapshotBundleDigest, snapshotBundleDigestBytes(snapshotBundleBytes))
+            val snapshotSummary = snapshotBundleSummary(snapshotBundle)
+            assertEquals(1u, snapshotSummary.formatVersion)
+            assertEquals(snapshotBundle.nodes.size.toULong(), snapshotSummary.nodeCount)
+            assertTrue(snapshotSummary.byteCount > 0u)
+            assertSnapshotSummaryEquals(snapshotSummary, snapshotBundleSummaryFromBytes(snapshotBundleBytes))
+            val snapshotVerification = verifySnapshotBundle(snapshotBundle)
+            assertTrue(snapshotVerification.valid)
+            assertSnapshotSummaryEquals(snapshotSummary, snapshotVerification.summary)
+            assertTrue(snapshotVerification.missingCids.isEmpty())
+            assertTrue(snapshotVerification.extraCids.isEmpty())
+            val byteSnapshotVerification = verifySnapshotBundleBytes(snapshotBundleBytes)
+            assertTrue(byteSnapshotVerification.valid)
+            assertSnapshotSummaryEquals(snapshotSummary, byteSnapshotVerification.summary)
+            assertTrue(byteSnapshotVerification.missingCids.isEmpty())
+            assertTrue(byteSnapshotVerification.extraCids.isEmpty())
+            val incompleteSnapshotVerification =
+                verifySnapshotBundle(snapshotBundle.copy(nodes = snapshotBundle.nodes.dropLast(1)))
+            assertFalse(incompleteSnapshotVerification.valid)
+            assertTrue(incompleteSnapshotVerification.missingCids.isNotEmpty())
+            val decodedSnapshotBundle = snapshotBundleFromBytes(snapshotBundleBytes)
+            ProllyEngine.memory(defaultConfig()).use { destination ->
+                val importedTree = destination.importSnapshot(decodedSnapshotBundle)
+                assertArrayEquals("v".bytes(), destination.get(importedTree, "k".bytes()))
+            }
         }
     }
 
@@ -762,6 +953,10 @@ class ProllyParityTest {
                 assertEquals(0UL, blobStore.blobCount())
                 val directRef = blobStore.putBlob("direct".bytes())
                 assertArrayEquals("direct".bytes(), blobStore.getBlob(directRef))
+                blobRefValidateBytes(directRef, "direct".bytes())
+                assertThrows<ProllyBindingException> {
+                    blobRefValidateBytes(directRef, "wrong".bytes())
+                }
                 blobStore.deleteBlob(directRef)
                 assertEquals(0UL, blobStore.blobCount())
 
@@ -799,6 +994,22 @@ class ProllyParityTest {
     }
 
     private fun String.bytes(): ByteArray = toByteArray()
+
+    private fun assertSnapshotSummaryEquals(
+        expected: SnapshotBundleSummaryRecord,
+        actual: SnapshotBundleSummaryRecord,
+    ) {
+        assertEquals(expected.formatVersion, actual.formatVersion)
+        if (expected.root == null || actual.root == null) {
+            assertEquals(expected.root, actual.root)
+        } else {
+            assertArrayEquals(expected.root, actual.root)
+        }
+        assertEquals(expected.nodeCount, actual.nodeCount)
+        assertEquals(expected.byteCount, actual.byteCount)
+        assertEquals(expected.minNodeBytes, actual.minNodeBytes)
+        assertEquals(expected.maxNodeBytes, actual.maxNodeBytes)
+    }
 
     private fun <T> runSuspend(block: suspend () -> T): T {
         var value: Any? = null

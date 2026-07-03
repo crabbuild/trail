@@ -2,7 +2,9 @@ package build.crab.prolly;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -11,6 +13,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
@@ -84,10 +87,18 @@ class ProllyFixtureTest {
 
         for (JsonNode fixture : fixtures.get("key_fixtures").get("segments")) {
             ByteArrayOutputStream encoded = new ByteArrayOutputStream();
+            List<byte[]> segmentBytes = new ArrayList<>();
             for (JsonNode segment : fixture.get("segments")) {
-                encoded.writeBytes(Prolly.encodeSegment(hex(segment.asText())));
+                byte[] bytes = hex(segment.asText());
+                segmentBytes.add(bytes);
+                encoded.writeBytes(Prolly.encodeSegment(bytes));
             }
             assertArrayEquals(hex(fixture.get("encoded").asText()), encoded.toByteArray());
+            assertArrayEquals(hex(fixture.get("encoded").asText()), Prolly.keyFromSegments(segmentBytes));
+            byte[] prefix = Prolly.keyFromSegments(segmentBytes.subList(0, 1));
+            assertArrayEquals(
+                    hex(fixture.get("encoded").asText()),
+                    Prolly.keyFromPrefixedSegments(prefix, segmentBytes.subList(1, segmentBytes.size())));
             List<byte[]> segments = Prolly.decodeSegments(hex(fixture.get("encoded").asText()));
             assertEquals(fixture.get("decoded").size(), segments.size());
             for (int i = 0; i < segments.size(); i++) {
@@ -162,12 +173,29 @@ class ProllyFixtureTest {
     void codecFixturesRoundTrip() throws Exception {
         for (JsonNode fixture : fixtures.get("value_fixtures")) {
             byte[] bytes = hex(fixture.get("bytes").asText());
+            String schema = fixture.get("schema_name").asText();
+            long version = fixture.get("version").asLong();
             assertArrayEquals(bytes, Prolly.versionedValueBytesRoundTrip(bytes));
+            assertTrue(Prolly.versionedValueBytesMatchesSchema(bytes, schema, version));
+            assertFalse(Prolly.versionedValueBytesMatchesSchema(bytes, schema, version + 1));
+            Prolly.versionedValueBytesRequireSchema(bytes, schema, version);
+            assertThrows(
+                    ProllyBindingException.class,
+                    () -> Prolly.versionedValueBytesRequireSchema(bytes, schema, version + 1));
         }
         for (JsonNode fixture : fixtures.get("blob_fixtures")) {
             byte[] bytes = hex(fixture.get("bytes").asText());
             assertArrayEquals(bytes, Prolly.valueRefBytesRoundTrip(bytes));
+            ValueRef.Kind expectedKind =
+                    fixture.get("kind").asText().equals("inline") ? ValueRef.Kind.INLINE : ValueRef.Kind.BLOB;
+            assertEquals(expectedKind, Prolly.valueRefFromStoredBytes(bytes).kind());
+            assertTrue(Prolly.valueRefInlineRequiresEscape(bytes));
         }
+        byte[] plain = "plain".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ValueRef rawInline = Prolly.valueRefFromStoredBytes(plain);
+        assertEquals(ValueRef.Kind.INLINE, rawInline.kind());
+        assertArrayEquals(plain, rawInline.value().orElseThrow());
+        assertFalse(Prolly.valueRefInlineRequiresEscape(plain));
         for (JsonNode fixture : fixtures.get("manifest_fixtures")) {
             byte[] bytes = hex(fixture.get("bytes").asText());
             assertArrayEquals(bytes, Prolly.rootManifestBytesRoundTrip(bytes));

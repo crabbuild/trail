@@ -39,6 +39,14 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertEqual(len(diffs), 1)
         self.assertEqual(diffs[0].key, b"a")
 
+    def test_key_helpers_build_composite_keys(self) -> None:
+        segments = [b"tenant", b"\x00\x01\xff", b""]
+        expected = b"tenant\x00\x00\x00\xff\x01\xff\x00\x00\x00\x00"
+        self.assertEqual(prolly.key_from_segments(segments), expected)
+        prefix = prolly.key_from_segments(segments[:1])
+        self.assertEqual(prolly.key_from_prefixed_segments(prefix, segments[1:]), expected)
+        self.assertEqual(prolly.decode_segments(expected), segments)
+
     def test_key_proofs_verify_without_store(self) -> None:
         engine = prolly.ProllyEngine.memory(prolly.default_config())
         tree = engine.create()
@@ -242,13 +250,15 @@ class UniFfiBindingTests(unittest.TestCase):
                 prolly.EntryRecord(key=b"c", value=b"3"),
             ],
         )
+        self.assertEqual(prolly.upsert_mutation(b"probe", b"value").kind, prolly.MutationKind.UPSERT)
+        self.assertEqual(prolly.delete_mutation(b"probe").kind, prolly.MutationKind.DELETE)
 
         batch = engine.batch_with_stats(
             empty,
             [
-                prolly.MutationRecord(kind=prolly.MutationKind.UPSERT, key=b"b", value=b"2"),
-                prolly.MutationRecord(kind=prolly.MutationKind.UPSERT, key=b"a", value=b"1"),
-                prolly.MutationRecord(kind=prolly.MutationKind.UPSERT, key=b"a", value=b"11"),
+                prolly.upsert_mutation(b"b", b"2"),
+                prolly.upsert_mutation(b"a", b"1"),
+                prolly.upsert_mutation(b"a", b"11"),
             ],
         )
         self.assertEqual(engine.get(batch.tree, b"a"), b"11")
@@ -451,21 +461,67 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertIsNotNone(first_page.next_cursor)
         after_a = engine.range_after(tree, b"a", None)
         self.assertEqual([entry.key for entry in after_a], [b"b", b"c"])
+        self.assertEqual((engine.first_entry(tree).key, engine.first_entry(tree).value), (b"a", b"1"))
+        self.assertEqual((engine.last_entry(tree).key, engine.last_entry(tree).value), (b"c", b"3"))
+        self.assertEqual((engine.lower_bound(tree, b"bb").key, engine.lower_bound(tree, b"bb").value), (b"c", b"3"))
+        self.assertIsNone(engine.upper_bound(tree, b"c"))
+        self.assertEqual([(entry.key, entry.value) for entry in engine.prefix(tree, b"b")], [(b"b", b"2")])
+        prefix_page = engine.prefix_page(tree, b"b", None, 1)
+        self.assertEqual([(entry.key, entry.value) for entry in prefix_page.entries], [(b"b", b"2")])
+        self.assertIsNotNone(prefix_page.next_cursor)
+        self.assertIsNone(prolly.range_cursor_start().after_key)
+        after_a_cursor = prolly.range_cursor_after_key(b"a")
+        self.assertEqual(after_a_cursor.after_key, b"a")
         from_cursor = engine.range_from_cursor(
             tree,
-            prolly.RangeCursorRecord(after_key=b"a"),
+            after_a_cursor,
             None,
         )
         self.assertEqual(
             [entry.key for entry in from_cursor],
             [entry.key for entry in after_a],
         )
+        window = engine.cursor_window(tree, b"bb", None, 1)
+        self.assertEqual(window.position_key, b"b")
+        self.assertEqual(window.position_value, b"2")
+        self.assertFalse(window.found)
+        self.assertEqual([(entry.key, entry.value) for entry in window.entries], [(b"c", b"3")])
+        self.assertEqual(window.next_cursor.after_key, b"c")
+
+        exact_probe = engine.cursor_window(tree, b"b", None, 0)
+        self.assertTrue(exact_probe.found)
+        self.assertEqual(exact_probe.position_key, b"b")
+        self.assertEqual(exact_probe.entries, [])
+        self.assertIsNone(exact_probe.next_cursor)
+
         second_page = engine.range_page(tree, first_page.next_cursor, None, 2)
         self.assertEqual(
             [(entry.key, entry.value) for entry in second_page.entries],
             [(b"c", b"3")],
         )
         self.assertIsNone(second_page.next_cursor)
+
+        self.assertIsNone(prolly.reverse_cursor_end().before_key)
+        before_c_cursor = prolly.reverse_cursor_before_key(b"c")
+        self.assertEqual(before_c_cursor.before_key, b"c")
+        reverse_first = engine.reverse_page(tree, None, b"", 2)
+        self.assertEqual(
+            [(entry.key, entry.value) for entry in reverse_first.entries],
+            [(b"c", b"3"), (b"b", b"2")],
+        )
+        self.assertEqual(reverse_first.next_cursor.before_key, b"b")
+        reverse_second = engine.reverse_page(tree, reverse_first.next_cursor, b"", 2)
+        self.assertEqual(
+            [(entry.key, entry.value) for entry in reverse_second.entries],
+            [(b"a", b"1")],
+        )
+        self.assertIsNone(reverse_second.next_cursor)
+        prefix_reverse = engine.prefix_reverse_page(tree, b"b", None, 8)
+        self.assertEqual(
+            [(entry.key, entry.value) for entry in prefix_reverse.entries],
+            [(b"b", b"2")],
+        )
+        self.assertIsNone(prefix_reverse.next_cursor)
 
         diff_page = engine.diff_page(empty, tree, None, None, 1)
         self.assertEqual(len(diff_page.diffs), 1)
@@ -586,6 +642,26 @@ class UniFfiBindingTests(unittest.TestCase):
             prolly.ParallelConfigRecord(max_threads=1, parallelism_threshold=1),
         )
         self.assertEqual(engine.get(parallel, b"e"), b"5")
+        parallel_stats = engine.parallel_batch_with_stats(
+            tree,
+            [
+                prolly.MutationRecord(
+                    kind=prolly.MutationKind.UPSERT,
+                    key=b"f",
+                    value=b"6",
+                ),
+                prolly.MutationRecord(
+                    kind=prolly.MutationKind.UPSERT,
+                    key=b"g",
+                    value=b"7",
+                ),
+            ],
+            prolly.ParallelConfigRecord(max_threads=1, parallelism_threshold=1),
+        )
+        self.assertEqual(engine.get(parallel_stats.tree, b"g"), b"7")
+        self.assertEqual(parallel_stats.stats.input_mutations, 2)
+        self.assertEqual(parallel_stats.stats.effective_mutations, 2)
+        self.assertGreater(parallel_stats.stats.written_nodes, 0)
 
         base = engine.put(empty, b"k", b"base")
         left = engine.put(base, b"k", b"left")
@@ -594,6 +670,14 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertIsNotNone(explanation.result)
         self.assertIsNone(explanation.error)
         self.assertIn("events", explanation.trace_json)
+        self.assertGreater(len(explanation.trace.events), 0)
+        self.assertTrue(
+            any(
+                event.kind == prolly.MergeTraceEventKind.RESOLVER_CALLED
+                and event.resolution == prolly.MergeTraceResolutionKind.VALUE
+                for event in explanation.trace.events
+            )
+        )
         merged = engine.merge(base, left, right, "prefer_right")
         self.assertEqual(engine.get(merged, b"k"), b"right")
         merged_range = engine.merge_range(base, left, right, b"k", None, "prefer_right")
@@ -604,26 +688,40 @@ class UniFfiBindingTests(unittest.TestCase):
         class JoinResolver(prolly.MergeResolverCallback):
             def resolve(self, conflict):
                 if conflict.left is not None and conflict.right is not None:
-                    return prolly.ResolutionRecord(
-                        kind=prolly.ResolutionKind.VALUE,
-                        value=conflict.left + b"|" + conflict.right,
-                    )
+                    return prolly.resolution_value(conflict.left + b"|" + conflict.right)
                 if conflict.left is not None:
-                    return prolly.ResolutionRecord(
-                        kind=prolly.ResolutionKind.VALUE,
-                        value=conflict.left,
-                    )
+                    return prolly.resolution_value(conflict.left)
                 if conflict.right is not None:
-                    return prolly.ResolutionRecord(
-                        kind=prolly.ResolutionKind.VALUE,
-                        value=conflict.right,
-                    )
-                return prolly.ResolutionRecord(
-                    kind=prolly.ResolutionKind.DELETE,
-                    value=None,
-                )
+                    return prolly.resolution_value(conflict.right)
+                return prolly.resolution_delete()
 
         resolver = JoinResolver()
+        self.assertEqual(prolly.resolution_unresolved().kind, prolly.ResolutionKind.UNRESOLVED)
+        update_conflict = prolly.ConflictRecord(
+            key=b"k", base=b"base", left=b"left", right=b"right"
+        )
+        self.assertEqual(prolly.resolve_prefer_left(update_conflict).value, b"left")
+        self.assertEqual(
+            prolly.resolve_delete_wins(update_conflict).kind,
+            prolly.ResolutionKind.UNRESOLVED,
+        )
+        delete_conflict = prolly.ConflictRecord(
+            key=b"k", base=b"base", left=None, right=b"right"
+        )
+        self.assertEqual(
+            prolly.resolve_delete_wins(delete_conflict).kind,
+            prolly.ResolutionKind.DELETE,
+        )
+        self.assertEqual(prolly.resolve_update_wins(delete_conflict).value, b"right")
+
+        class PreferRightResolver(prolly.MergeResolverCallback):
+            def resolve(self, conflict):
+                return prolly.resolve_prefer_right(conflict)
+
+        prefer_right_merged = engine.merge_with_resolver(
+            base, left, right, PreferRightResolver()
+        )
+        self.assertEqual(engine.get(prefer_right_merged, b"k"), b"right")
         callback_merged = engine.merge_with_resolver(base, left, right, resolver)
         self.assertEqual(engine.get(callback_merged, b"k"), b"left|right")
         callback_explanation = engine.merge_explain_with_resolver(
@@ -737,13 +835,22 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertEqual(manifests[0].manifest.tree, merged)
         self.assertEqual(manifests[0].manifest.created_at_millis, 42)
         self.assertEqual(manifests[0].manifest.updated_at_millis, 42)
-        retention = prolly.NamedRootRetentionRecord(
-            kind=prolly.NamedRootRetentionKind.ALL,
-            names=[],
-            prefix=b"",
-            count=None,
-            min_updated_at_millis=None,
-        )
+        retention = prolly.retain_all_named_roots()
+        self.assertEqual(retention.kind, prolly.NamedRootRetentionKind.ALL)
+        exact_retention = prolly.retain_exact_named_roots([b"main", b"missing"])
+        self.assertEqual(exact_retention.kind, prolly.NamedRootRetentionKind.EXACT)
+        self.assertEqual(exact_retention.names, [b"main", b"missing"])
+        prefix_retention = prolly.retain_named_root_prefix(b"ma")
+        self.assertEqual(prefix_retention.kind, prolly.NamedRootRetentionKind.PREFIX)
+        self.assertEqual(prefix_retention.prefix, b"ma")
+        newest_retention = prolly.retain_newest_named_roots(b"checkpoint/", 2)
+        self.assertEqual(newest_retention.kind, prolly.NamedRootRetentionKind.NEWEST_BY_NAME)
+        self.assertEqual(newest_retention.prefix, b"checkpoint/")
+        self.assertEqual(newest_retention.count, 2)
+        updated_retention = prolly.retain_named_roots_updated_since(b"checkpoint/", 42)
+        self.assertEqual(updated_retention.kind, prolly.NamedRootRetentionKind.UPDATED_SINCE)
+        self.assertEqual(updated_retention.prefix, b"checkpoint/")
+        self.assertEqual(updated_retention.min_updated_at_millis, 42)
         self.assertEqual(len(engine.load_retained_named_roots(retention).roots), 1)
         self.assertEqual(
             engine.plan_store_gc_for_retention(retention).reachability.live_nodes,
@@ -768,7 +875,30 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertEqual(prolly.root_manifest_from_bytes(manifest_bytes), manifest)
 
     def test_node_and_value_helpers_round_trip(self) -> None:
-        encoding = prolly.EncodingRecord(kind=prolly.EncodingKind.RAW, custom_name=None)
+        self.assertEqual(prolly.encoding_raw().kind, prolly.EncodingKind.RAW)
+        self.assertEqual(prolly.encoding_cbor().kind, prolly.EncodingKind.CBOR)
+        self.assertEqual(prolly.encoding_json().kind, prolly.EncodingKind.JSON)
+        custom_encoding = prolly.encoding_custom("postcard")
+        self.assertEqual(custom_encoding.kind, prolly.EncodingKind.CUSTOM)
+        self.assertEqual(custom_encoding.custom_name, "postcard")
+        config = prolly.tree_config(2, 64, 32, 7, custom_encoding, 16, 4096)
+        self.assertEqual(config.encoding, custom_encoding)
+        self.assertEqual(config.node_cache_max_nodes, 16)
+        with self.assertRaises(prolly.ProllyBindingError.InvalidArgument):
+            prolly.tree_config(
+                2,
+                64,
+                32,
+                7,
+                prolly.EncodingRecord(kind=prolly.EncodingKind.CUSTOM, custom_name=None),
+                None,
+                None,
+            )
+        self.assertEqual(prolly.large_value_config(8).inline_threshold, 8)
+        self.assertEqual(prolly.parallel_config(2, 24).max_threads, 2)
+        self.assertEqual(prolly.parallel_config_sequential().max_threads, 1)
+
+        encoding = prolly.encoding_raw()
         node = prolly.NodeRecord(
             keys=[b"a"],
             vals=[b"1"],
@@ -794,6 +924,30 @@ class UniFfiBindingTests(unittest.TestCase):
         )
         value_bytes = prolly.versioned_value_to_bytes(value)
         self.assertEqual(prolly.versioned_value_from_bytes(value_bytes), value)
+        self.assertTrue(prolly.versioned_value_matches_schema(value, "example", 1))
+        self.assertFalse(prolly.versioned_value_matches_schema(value, "example", 2))
+        prolly.versioned_value_require_schema(value, "example", 1)
+        with self.assertRaises(prolly.ProllyBindingError.Serialization):
+            prolly.versioned_value_require_schema(value, "other", 1)
+        self.assertTrue(prolly.versioned_value_bytes_matches_schema(value_bytes, "example", 1))
+        self.assertFalse(prolly.versioned_value_bytes_matches_schema(value_bytes, "example", 2))
+        prolly.versioned_value_bytes_require_schema(value_bytes, "example", 1)
+        with self.assertRaises(prolly.ProllyBindingError.Serialization):
+            prolly.versioned_value_bytes_require_schema(value_bytes, "other", 1)
+
+        value_ref = prolly.ValueRefRecord(
+            kind=prolly.ValueRefKind.INLINE,
+            value=b"plain",
+            blob=None,
+        )
+        value_ref_bytes = prolly.value_ref_to_bytes(value_ref)
+        self.assertEqual(prolly.value_ref_from_bytes(value_ref_bytes), value_ref)
+        self.assertEqual(prolly.value_ref_from_stored_bytes(value_ref_bytes), value_ref)
+        self.assertTrue(prolly.value_ref_inline_requires_escape(value_ref_bytes))
+        raw_value_ref = prolly.value_ref_from_stored_bytes(b"plain")
+        self.assertEqual(raw_value_ref.kind, prolly.ValueRefKind.INLINE)
+        self.assertEqual(raw_value_ref.value, b"plain")
+        self.assertFalse(prolly.value_ref_inline_requires_escape(b"plain"))
 
     def test_blob_store_and_large_value_helpers(self) -> None:
         engine = prolly.ProllyEngine.memory(prolly.default_config())
@@ -801,6 +955,9 @@ class UniFfiBindingTests(unittest.TestCase):
 
         direct_ref = blob_store.put_blob(b"direct")
         self.assertEqual(blob_store.get_blob(direct_ref), b"direct")
+        prolly.blob_ref_validate_bytes(direct_ref, b"direct")
+        with self.assertRaises(prolly.ProllyBindingError.Serialization):
+            prolly.blob_ref_validate_bytes(direct_ref, b"wrong")
         blob_store.delete_blob(direct_ref)
         self.assertEqual(blob_store.blob_count(), 0)
 
@@ -865,24 +1022,12 @@ class UniFfiBindingTests(unittest.TestCase):
         class CrdtJoinResolver(prolly.CrdtResolverCallback):
             def resolve(self, conflict):
                 if conflict.left is not None and conflict.right is not None:
-                    return prolly.CrdtResolutionRecord(
-                        kind=prolly.CrdtResolutionKind.VALUE,
-                        value=conflict.left + b"|" + conflict.right,
-                    )
+                    return prolly.crdt_resolution_value(conflict.left + b"|" + conflict.right)
                 if conflict.left is not None:
-                    return prolly.CrdtResolutionRecord(
-                        kind=prolly.CrdtResolutionKind.VALUE,
-                        value=conflict.left,
-                    )
+                    return prolly.crdt_resolution_value(conflict.left)
                 if conflict.right is not None:
-                    return prolly.CrdtResolutionRecord(
-                        kind=prolly.CrdtResolutionKind.VALUE,
-                        value=conflict.right,
-                    )
-                return prolly.CrdtResolutionRecord(
-                    kind=prolly.CrdtResolutionKind.DELETE,
-                    value=None,
-                )
+                    return prolly.crdt_resolution_value(conflict.right)
+                return prolly.crdt_resolution_delete()
 
         callback_merged = engine.crdt_merge_with_resolver(
             base,
@@ -896,6 +1041,16 @@ class UniFfiBindingTests(unittest.TestCase):
         page = engine.structural_diff_page(empty, merged, None, 1)
         self.assertEqual(len(page.diffs), 1)
         self.assertEqual(page.stats.emitted_diffs, 1)
+        cursor_page = engine.structural_diff_page(empty, merged, None, 0)
+        self.assertIsNotNone(cursor_page.next_cursor)
+        self.assertIsNotNone(cursor_page.next_cursor_json)
+        resumed_page = engine.structural_diff_page_with_cursor(
+            empty,
+            merged,
+            cursor_page.next_cursor,
+            1,
+        )
+        self.assertEqual(len(resumed_page.diffs), 1)
         self.assertEqual(len(engine.range_diff(empty, merged, b"k", b"l")), 1)
         self.assertEqual(
             engine.get_value_ref(merged, b"k").kind,
@@ -903,8 +1058,30 @@ class UniFfiBindingTests(unittest.TestCase):
         )
 
         self.assertGreater(json.loads(engine.collect_stats_json(merged).json)["num_nodes"], 0)
+        typed_stats = engine.collect_stats(merged)
+        self.assertEqual(typed_stats.total_key_value_pairs, 1)
+        self.assertTrue(
+            any(level.level == 0 and level.value > 0 for level in typed_stats.nodes_per_level)
+        )
+        typed_diff_stats = engine.stats_diff(empty, merged)
+        self.assertEqual(typed_diff_stats.before.total_key_value_pairs, 0)
+        self.assertEqual(typed_diff_stats.after.total_key_value_pairs, 1)
+        self.assertEqual(typed_diff_stats.absolute.total_key_value_pairs_diff, 1)
         self.assertIn("level", engine.debug_tree_text(merged))
+        debug_tree = engine.debug_tree(merged)
+        self.assertGreater(len(debug_tree.levels), 0)
+        self.assertTrue(any(level.nodes for level in debug_tree.levels))
         self.assertIn("right_only_nodes", engine.debug_compare_trees_json(empty, merged).json)
+        debug_comparison = engine.debug_compare_trees(empty, merged)
+        self.assertEqual(debug_comparison.left_only_nodes, 0)
+        self.assertGreater(debug_comparison.right_only_nodes, 0)
+        self.assertTrue(
+            any(
+                node.status == prolly.TreeDebugNodeStatusKind.RIGHT_ONLY
+                for level in debug_comparison.levels
+                for node in level.nodes
+            )
+        )
 
         reachable = engine.mark_reachable([merged])
         self.assertGreater(reachable.live_nodes, 0)
@@ -918,6 +1095,46 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertEqual(copied.copied_nodes, plan.missing_nodes)
         self.assertEqual(destination.get(merged, b"k"), engine.get(merged, b"k"))
 
+        snapshot_bundle = engine.export_snapshot(merged)
+        self.assertEqual(snapshot_bundle.format_version, 1)
+        self.assertGreater(len(snapshot_bundle.nodes), 0)
+        snapshot_bundle_bytes = prolly.snapshot_bundle_to_bytes(snapshot_bundle)
+        snapshot_bundle_digest = prolly.snapshot_bundle_digest(snapshot_bundle)
+        self.assertEqual(snapshot_bundle_digest, prolly.cid_from_bytes(snapshot_bundle_bytes))
+        self.assertEqual(
+            prolly.snapshot_bundle_digest_bytes(snapshot_bundle_bytes),
+            snapshot_bundle_digest,
+        )
+        snapshot_summary = prolly.snapshot_bundle_summary(snapshot_bundle)
+        self.assertEqual(snapshot_summary.format_version, 1)
+        self.assertEqual(snapshot_summary.node_count, len(snapshot_bundle.nodes))
+        self.assertGreater(snapshot_summary.byte_count, 0)
+        self.assertEqual(
+            prolly.snapshot_bundle_summary_from_bytes(snapshot_bundle_bytes),
+            snapshot_summary,
+        )
+        snapshot_verification = prolly.verify_snapshot_bundle(snapshot_bundle)
+        self.assertTrue(snapshot_verification.valid)
+        self.assertEqual(snapshot_verification.summary, snapshot_summary)
+        self.assertEqual(snapshot_verification.missing_cids, [])
+        self.assertEqual(snapshot_verification.extra_cids, [])
+        self.assertEqual(
+            prolly.verify_snapshot_bundle_bytes(snapshot_bundle_bytes),
+            snapshot_verification,
+        )
+        incomplete_snapshot_bundle = prolly.SnapshotBundleRecord(
+            format_version=snapshot_bundle.format_version,
+            tree=snapshot_bundle.tree,
+            nodes=snapshot_bundle.nodes[:-1],
+        )
+        incomplete_verification = prolly.verify_snapshot_bundle(incomplete_snapshot_bundle)
+        self.assertFalse(incomplete_verification.valid)
+        self.assertGreater(len(incomplete_verification.missing_cids), 0)
+        snapshot_bundle = prolly.snapshot_bundle_from_bytes(snapshot_bundle_bytes)
+        snapshot_destination = prolly.ProllyEngine.memory(prolly.default_config())
+        imported_tree = snapshot_destination.import_snapshot(snapshot_bundle)
+        self.assertEqual(snapshot_destination.get(imported_tree, b"k"), engine.get(merged, b"k"))
+
         engine.pin_tree_root(merged)
         engine.pin_tree_path(merged, b"k")
         self.assertGreater(engine.cache_stats().cached_nodes, 0)
@@ -926,11 +1143,13 @@ class UniFfiBindingTests(unittest.TestCase):
         self.assertEqual(engine.metrics().nodes_written, 0)
         self.assertFalse(engine.publish_prefix_path_hint(merged, b"k"))
         self.assertFalse(engine.hydrate_prefix_path_hint(merged, b"k"))
+        self.assertEqual(prolly.changed_span_from_key(b"k").end, b"k\x00")
+        self.assertEqual(prolly.changed_span_for_prefix(b"k").end, b"l")
         self.assertFalse(
             engine.publish_changed_spans_hint(
                 empty,
                 merged,
-                [prolly.ChangedSpanRecord(start=b"k", end=b"l")],
+                [prolly.changed_span(b"k", b"l")],
             )
         )
         self.assertIsNone(engine.load_changed_spans_hint(empty, merged))

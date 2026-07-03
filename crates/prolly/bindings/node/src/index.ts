@@ -9,7 +9,26 @@ const PRIME64_5 = 2870177450012600261n;
 
 export type EncodingKind = "raw" | "cbor" | "json" | "custom";
 
+export interface EncodingRecord {
+  kind: EncodingKind;
+  customName?: string;
+}
+
+export interface LargeValueConfig {
+  inlineThreshold: number;
+}
+
+export interface ParallelConfig {
+  maxThreads: number;
+  parallelismThreshold: number;
+}
+
 export interface RangeBounds {
+  start: Uint8Array;
+  end?: Uint8Array;
+}
+
+export interface ChangedSpan {
   start: Uint8Array;
   end?: Uint8Array;
 }
@@ -89,6 +108,58 @@ export class Config {
       nodeCacheMaxBytes: fixture.node_cache_max_bytes ?? undefined,
     });
   }
+}
+
+export function encodingRaw(): EncodingRecord {
+  return { kind: "raw" };
+}
+
+export function encodingCbor(): EncodingRecord {
+  return { kind: "cbor" };
+}
+
+export function encodingJson(): EncodingRecord {
+  return { kind: "json" };
+}
+
+export function encodingCustom(name: string): EncodingRecord {
+  return { kind: "custom", customName: name };
+}
+
+export function treeConfig(options: {
+  minChunkSize: number;
+  maxChunkSize: number;
+  chunkingFactor: number;
+  hashSeed: bigint;
+  encoding: EncodingRecord;
+  nodeCacheMaxNodes?: number;
+  nodeCacheMaxBytes?: number;
+}): Config {
+  if (options.encoding.kind === "custom" && options.encoding.customName == null) {
+    throw new Error("custom encoding requires customName");
+  }
+  return new Config({
+    minChunkSize: options.minChunkSize,
+    maxChunkSize: options.maxChunkSize,
+    chunkingFactor: options.chunkingFactor,
+    hashSeed: options.hashSeed,
+    encoding: options.encoding.kind,
+    customEncodingName: options.encoding.customName,
+    nodeCacheMaxNodes: options.nodeCacheMaxNodes,
+    nodeCacheMaxBytes: options.nodeCacheMaxBytes,
+  });
+}
+
+export function largeValueConfig(inlineThreshold: number): LargeValueConfig {
+  return { inlineThreshold };
+}
+
+export function parallelConfig(maxThreads: number, parallelismThreshold: number): ParallelConfig {
+  return { maxThreads, parallelismThreshold };
+}
+
+export function parallelConfigSequential(): ParallelConfig {
+  return { maxThreads: 1, parallelismThreshold: Number.MAX_SAFE_INTEGER };
 }
 
 export class ProllyNode {
@@ -562,6 +633,26 @@ export function encodeSegment(segment: Uint8Array): Uint8Array {
   }
   out.push(0, 0);
   return Uint8Array.from(out);
+}
+
+export function keyFromSegments(segments: Uint8Array[]): Uint8Array {
+  return concatBytes(segments.map(encodeSegment));
+}
+
+export function keyFromPrefixedSegments(prefix: Uint8Array, segments: Uint8Array[]): Uint8Array {
+  return concatBytes([prefix, ...segments.map(encodeSegment)]);
+}
+
+export function changedSpan(start: Uint8Array, end?: Uint8Array): ChangedSpan {
+  return { start: Uint8Array.from(start), end: end == null ? undefined : Uint8Array.from(end) };
+}
+
+export function changedSpanFromKey(key: Uint8Array): ChangedSpan {
+  return { start: Uint8Array.from(key), end: concatBytes([key, Uint8Array.of(0)]) };
+}
+
+export function changedSpanForPrefix(prefix: Uint8Array): ChangedSpan {
+  return { start: Uint8Array.from(prefix), end: prefixEnd(prefix) };
 }
 
 export function decodeSegments(key: Uint8Array): Uint8Array[] {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,15 +20,15 @@ func joinMergeResolver(conflict Conflict) Resolution {
 		value := append([]byte{}, conflict.Left...)
 		value = append(value, '|')
 		value = append(value, conflict.Right...)
-		return ResolveValue(value)
+		return ResolutionValue(value)
 	}
 	if conflict.LeftPresent {
-		return ResolveValue(conflict.Left)
+		return ResolutionValue(conflict.Left)
 	}
 	if conflict.RightPresent {
-		return ResolveValue(conflict.Right)
+		return ResolutionValue(conflict.Right)
 	}
-	return ResolveDelete()
+	return ResolutionDelete()
 }
 
 func joinCrdtResolver(conflict Conflict) CrdtResolution {
@@ -35,15 +36,15 @@ func joinCrdtResolver(conflict Conflict) CrdtResolution {
 		value := append([]byte{}, conflict.Left...)
 		value = append(value, '|')
 		value = append(value, conflict.Right...)
-		return CrdtResolveValue(value)
+		return CrdtResolutionValue(value)
 	}
 	if conflict.LeftPresent {
-		return CrdtResolveValue(conflict.Left)
+		return CrdtResolutionValue(conflict.Left)
 	}
 	if conflict.RightPresent {
-		return CrdtResolveValue(conflict.Right)
+		return CrdtResolutionValue(conflict.Right)
 	}
-	return CrdtResolveDelete()
+	return CrdtResolutionDelete()
 }
 
 type memoryHostStore struct {
@@ -325,6 +326,7 @@ type valueFixture struct {
 
 type blobFixture struct {
 	Bytes string `json:"bytes"`
+	Kind  string `json:"kind"`
 }
 
 type manifestFixture struct {
@@ -588,11 +590,17 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if upsert := UpsertMutation([]byte("probe"), []byte("value")); upsert.Kind != "upsert" || string(upsert.Value) != "value" {
+		t.Fatalf("unexpected upsert mutation helper: %#v", upsert)
+	}
+	if deletion := DeleteMutation([]byte("probe")); deletion.Kind != "delete" || len(deletion.Value) != 0 {
+		t.Fatalf("unexpected delete mutation helper: %#v", deletion)
+	}
 	tree, err := engine.Batch(empty, []Mutation{
-		{Kind: "upsert", Key: []byte("a"), Value: []byte("1")},
-		{Kind: "upsert", Key: []byte("b"), Value: []byte("2")},
-		{Kind: "upsert", Key: []byte("a"), Value: []byte("11")},
-		{Kind: "delete", Key: []byte("missing")},
+		UpsertMutation([]byte("a"), []byte("1")),
+		UpsertMutation([]byte("b"), []byte("2")),
+		UpsertMutation([]byte("a"), []byte("11")),
+		DeleteMutation([]byte("missing")),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1082,7 +1090,7 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	parallelTree, err := engine.ParallelBatch(empty, []Mutation{
 		{Kind: "upsert", Key: []byte("p"), Value: []byte("parallel")},
 		{Kind: "upsert", Key: []byte("q"), Value: []byte("go")},
-	}, ParallelConfig{MaxThreads: 1, ParallelismThreshold: 1})
+	}, NewParallelConfig(1, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1092,6 +1100,23 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	}
 	if !ok || string(parallelValue) != "go" {
 		t.Fatalf("unexpected parallel batch value: ok=%v value=%q", ok, parallelValue)
+	}
+	parallelStats, err := engine.ParallelBatchWithStats(empty, []Mutation{
+		{Kind: "upsert", Key: []byte("r"), Value: []byte("route")},
+		{Kind: "upsert", Key: []byte("s"), Value: []byte("stats")},
+	}, NewParallelConfig(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parallelStats.Stats.InputMutations != 2 || parallelStats.Stats.EffectiveMutations != 2 || parallelStats.Stats.WrittenNodes == 0 {
+		t.Fatalf("unexpected parallel batch stats: %#v", parallelStats.Stats)
+	}
+	parallelStatsValue, ok, err := engine.Get(parallelStats.Tree, []byte("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(parallelStatsValue) != "stats" {
+		t.Fatalf("unexpected parallel batch stats value: ok=%v value=%q", ok, parallelStatsValue)
 	}
 	appended, err := engine.AppendBatch(built, []Mutation{
 		{Kind: "upsert", Key: []byte("d"), Value: []byte("4")},
@@ -1141,6 +1166,13 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	if firstPage.NextCursor == nil {
 		t.Fatal("expected next cursor after first range page")
 	}
+	startCursor, err := RangeCursorStart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if startCursor.AfterKey != nil {
+		t.Fatalf("unexpected start cursor: %#v", startCursor)
+	}
 
 	afterA, err := engine.RangeAfter(tree, []byte("a"), nil)
 	if err != nil {
@@ -1149,12 +1181,77 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	if len(afterA) != 1 || string(afterA[0].Key) != "b" {
 		t.Fatalf("unexpected range_after result: %#v", afterA)
 	}
-	fromCursor, err := engine.RangeFromCursor(tree, &RangeCursor{AfterKey: []byte("a")}, nil)
+	afterACursor, err := RangeCursorAfterKey([]byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterACursor.AfterKey, []byte("a")) {
+		t.Fatalf("unexpected after-key cursor: %#v", afterACursor)
+	}
+	fromCursor, err := engine.RangeFromCursor(tree, &afterACursor, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(fromCursor) != len(afterA) || string(fromCursor[0].Key) != string(afterA[0].Key) {
 		t.Fatalf("range_from_cursor mismatch: after=%#v cursor=%#v", afterA, fromCursor)
+	}
+	prefixEntries, err := engine.Prefix(tree, []byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixEntries) != 1 || string(prefixEntries[0].Key) != "a" || string(prefixEntries[0].Value) != "11" {
+		t.Fatalf("unexpected prefix entries: %#v", prefixEntries)
+	}
+	prefixPage, err := engine.PrefixPage(tree, []byte("a"), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixPage.Entries) != 1 || string(prefixPage.Entries[0].Value) != "11" || prefixPage.NextCursor == nil {
+		t.Fatalf("unexpected prefix page: %#v", prefixPage)
+	}
+
+	firstEntry, err := engine.FirstEntry(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastEntry, err := engine.LastEntry(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowerBound, err := engine.LowerBound(tree, []byte("aa"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upperBound, err := engine.UpperBound(tree, []byte("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstEntry == nil || string(firstEntry.Key) != "a" || string(firstEntry.Value) != "11" ||
+		lastEntry == nil || string(lastEntry.Key) != "b" || string(lastEntry.Value) != "2" ||
+		lowerBound == nil || string(lowerBound.Key) != "b" ||
+		upperBound != nil {
+		t.Fatalf("unexpected boundary entries: first=%#v last=%#v lower=%#v upper=%#v", firstEntry, lastEntry, lowerBound, upperBound)
+	}
+
+	window, err := engine.CursorWindow(tree, []byte("aa"), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !window.HasPositionKey || string(window.PositionKey) != "a" ||
+		!window.HasPositionValue || string(window.PositionValue) != "11" ||
+		window.Found ||
+		len(window.Entries) != 1 || string(window.Entries[0].Key) != "b" ||
+		window.NextCursor == nil || string(window.NextCursor.AfterKey) != "b" {
+		t.Fatalf("unexpected cursor window: %#v", window)
+	}
+
+	exactProbe, err := engine.CursorWindow(tree, []byte("a"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exactProbe.Found || string(exactProbe.PositionKey) != "a" ||
+		len(exactProbe.Entries) != 0 || exactProbe.NextCursor != nil {
+		t.Fatalf("unexpected exact cursor probe: %#v", exactProbe)
 	}
 
 	secondPage, err := engine.RangePage(tree, firstPage.NextCursor, nil, 1)
@@ -1175,6 +1272,59 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 		if thirdPage.NextCursor != nil {
 			t.Fatalf("expected no next cursor after third range page: %#v", thirdPage.NextCursor)
 		}
+	}
+
+	reverseEnd, err := ReverseCursorEnd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reverseEnd.BeforeKey != nil {
+		t.Fatalf("unexpected reverse end cursor: %#v", reverseEnd)
+	}
+	beforeCCursor, err := ReverseCursorBeforeKey([]byte("c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeCCursor.BeforeKey, []byte("c")) {
+		t.Fatalf("unexpected before-key cursor: %#v", beforeCCursor)
+	}
+	reverseFirst, err := engine.ReversePage(built, nil, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverseFirst.Entries) != 2 ||
+		string(reverseFirst.Entries[0].Key) != "c" ||
+		string(reverseFirst.Entries[1].Key) != "b" ||
+		reverseFirst.NextCursor == nil ||
+		string(reverseFirst.NextCursor.BeforeKey) != "b" {
+		t.Fatalf("unexpected first reverse page: %#v", reverseFirst)
+	}
+	reverseSecond, err := engine.ReversePage(built, reverseFirst.NextCursor, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverseSecond.Entries) != 1 ||
+		string(reverseSecond.Entries[0].Key) != "a" ||
+		reverseSecond.NextCursor != nil {
+		t.Fatalf("unexpected second reverse page: %#v", reverseSecond)
+	}
+	reverseBounded, err := engine.ReversePage(built, nil, []byte("b"), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverseBounded.Entries) != 2 ||
+		string(reverseBounded.Entries[0].Key) != "c" ||
+		string(reverseBounded.Entries[1].Key) != "b" {
+		t.Fatalf("unexpected bounded reverse page: %#v", reverseBounded)
+	}
+	prefixReverse, err := engine.PrefixReversePage(built, []byte("b"), nil, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixReverse.Entries) != 1 ||
+		string(prefixReverse.Entries[0].Key) != "b" ||
+		prefixReverse.NextCursor != nil {
+		t.Fatalf("unexpected prefix reverse page: %#v", prefixReverse)
 	}
 
 	changed, err := engine.Put(tree, []byte("b"), []byte("22"))
@@ -1287,6 +1437,16 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	if explanation.Result == nil || explanation.HasError || !strings.Contains(explanation.TraceJSON, "events") {
 		t.Fatalf("unexpected merge explanation: %#v", explanation)
 	}
+	foundResolverTrace := false
+	for _, event := range explanation.Trace.Events {
+		if event.Kind == "resolver_called" && event.Resolution == "value" {
+			foundResolverTrace = true
+			break
+		}
+	}
+	if !foundResolverTrace {
+		t.Fatalf("expected typed merge trace to include resolver-called value event: %#v", explanation.Trace)
+	}
 	merged, err := engine.Merge(base, left, right, "prefer_right")
 	if err != nil {
 		t.Fatal(err)
@@ -1319,6 +1479,45 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	}
 	if !ok || string(value) != "right" {
 		t.Fatalf("unexpected prefix merged value: ok=%v value=%q", ok, value)
+	}
+	preferRightCallback, err := engine.MergeWithResolver(base, left, right, ResolvePreferRight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err = engine.Get(preferRightCallback, []byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(value) != "right" {
+		t.Fatalf("unexpected built-in resolver helper value: ok=%v value=%q", ok, value)
+	}
+	updateConflict := Conflict{
+		Key:          []byte("k"),
+		Base:         []byte("base"),
+		BasePresent:  true,
+		Left:         []byte("left"),
+		LeftPresent:  true,
+		Right:        []byte("right"),
+		RightPresent: true,
+	}
+	if got := ResolvePreferLeft(updateConflict); got.Kind != "value" || string(got.Value) != "left" {
+		t.Fatalf("unexpected prefer-left helper: %#v", got)
+	}
+	if got := ResolveDeleteWins(updateConflict); got.Kind != "unresolved" {
+		t.Fatalf("expected delete-wins update/update conflict to remain unresolved: %#v", got)
+	}
+	deleteConflict := Conflict{
+		Key:          []byte("k"),
+		Base:         []byte("base"),
+		BasePresent:  true,
+		Right:        []byte("right"),
+		RightPresent: true,
+	}
+	if got := ResolveDeleteWins(deleteConflict); got.Kind != "delete" {
+		t.Fatalf("unexpected delete-wins helper: %#v", got)
+	}
+	if got := ResolveUpdateWins(deleteConflict); got.Kind != "value" || string(got.Value) != "right" {
+		t.Fatalf("unexpected update-wins helper: %#v", got)
 	}
 	callbackMerged, err := engine.MergeWithResolver(base, left, right, joinMergeResolver)
 	if err != nil {
@@ -1505,14 +1704,51 @@ func TestParityBatchPagesMergeAndNamedRoots(t *testing.T) {
 	if len(selection.Roots) != 1 || len(selection.MissingNames) != 1 {
 		t.Fatalf("unexpected named root selection: %#v", selection)
 	}
-	retained, err := engine.LoadRetainedNamedRoots(NamedRootRetention{Kind: "all"})
+	retainAll, err := RetainAllNamedRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retainAll.Kind != "all" {
+		t.Fatalf("unexpected retain-all policy: %#v", retainAll)
+	}
+	retainExact, err := RetainExactNamedRoots([][]byte{[]byte("main"), []byte("missing")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retainExact.Kind != "exact" || len(retainExact.Names) != 2 {
+		t.Fatalf("unexpected exact retention policy: %#v", retainExact)
+	}
+	retainPrefix, err := RetainNamedRootPrefix([]byte("ma"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retainPrefix.Kind != "prefix" || !bytes.Equal(retainPrefix.Prefix, []byte("ma")) {
+		t.Fatalf("unexpected prefix retention policy: %#v", retainPrefix)
+	}
+	retainNewest, err := RetainNewestNamedRoots([]byte("checkpoint/"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retainNewest.Kind != "newest_by_name" || retainNewest.Count == nil || *retainNewest.Count != 2 {
+		t.Fatalf("unexpected newest retention policy: %#v", retainNewest)
+	}
+	retainUpdated, err := RetainNamedRootsUpdatedSince([]byte("checkpoint/"), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retainUpdated.Kind != "updated_since" ||
+		retainUpdated.MinUpdatedAtMillis == nil ||
+		*retainUpdated.MinUpdatedAtMillis != 42 {
+		t.Fatalf("unexpected updated-since retention policy: %#v", retainUpdated)
+	}
+	retained, err := engine.LoadRetainedNamedRoots(retainAll)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(retained.Roots) != 1 {
 		t.Fatalf("unexpected retained roots: %#v", retained)
 	}
-	retainedPlan, err := engine.PlanStoreGCForRetention(NamedRootRetention{Kind: "all"})
+	retainedPlan, err := engine.PlanStoreGCForRetention(retainAll)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1669,6 +1905,61 @@ func TestContextWrappers(t *testing.T) {
 	if len(page.Entries) != 1 || string(page.Entries[0].Key) != "a" {
 		t.Fatalf("unexpected context range page: %#v", page)
 	}
+	reversePage, err := engine.ReversePageContext(ctx, tree, nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reversePage.Entries) != 1 || string(reversePage.Entries[0].Key) != "a" {
+		t.Fatalf("unexpected context reverse page: %#v", reversePage)
+	}
+	prefixEntries, err := engine.PrefixContext(ctx, tree, []byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixEntries) != 1 || string(prefixEntries[0].Key) != "a" {
+		t.Fatalf("unexpected context prefix entries: %#v", prefixEntries)
+	}
+	prefixPage, err := engine.PrefixPageContext(ctx, tree, []byte("a"), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixPage.Entries) != 1 || string(prefixPage.Entries[0].Key) != "a" {
+		t.Fatalf("unexpected context prefix page: %#v", prefixPage)
+	}
+	prefixReversePage, err := engine.PrefixReversePageContext(ctx, tree, []byte("a"), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefixReversePage.Entries) != 1 || string(prefixReversePage.Entries[0].Key) != "a" {
+		t.Fatalf("unexpected context prefix reverse page: %#v", prefixReversePage)
+	}
+	firstEntry, err := engine.FirstEntryContext(ctx, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowerBound, err := engine.LowerBoundContext(ctx, tree, []byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingLowerBound, err := engine.LowerBoundContext(ctx, tree, []byte("aa"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstEntry == nil || string(firstEntry.Key) != "a" ||
+		lowerBound == nil || string(lowerBound.Key) != "a" ||
+		missingLowerBound != nil {
+		t.Fatalf("unexpected context boundary entries: first=%#v lower=%#v missingLower=%#v", firstEntry, lowerBound, missingLowerBound)
+	}
+	window, err := engine.CursorWindowContext(ctx, tree, []byte("aa"), nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !window.HasPositionKey || string(window.PositionKey) != "a" ||
+		window.Found ||
+		len(window.Entries) != 0 ||
+		window.NextCursor != nil {
+		t.Fatalf("unexpected context cursor window: %#v", window)
+	}
 	provedPage, err := engine.ProveRangePageContext(ctx, tree, nil, nil, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -1707,6 +1998,15 @@ func TestContextWrappers(t *testing.T) {
 	}
 	if !parallelFound || string(parallelValue) != "parallel" {
 		t.Fatalf("unexpected context parallel batch result: found=%v value=%q", parallelFound, parallelValue)
+	}
+	parallelStats, err := engine.ParallelBatchWithStatsContext(ctx, tree, []Mutation{
+		{Kind: "upsert", Key: []byte("ps"), Value: []byte("parallel-stats")},
+	}, parallelConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parallelStats.Stats.InputMutations != 1 || parallelStats.Stats.WrittenNodes == 0 {
+		t.Fatalf("unexpected context parallel batch stats: %#v", parallelStats.Stats)
 	}
 	conflictPage, err := engine.ConflictPageContext(ctx, tree, changed, tree, nil, 1)
 	if err != nil {
@@ -1924,6 +2224,20 @@ func TestContextWrappers(t *testing.T) {
 	if !strings.Contains(statsJSON, `"num_nodes"`) {
 		t.Fatalf("context stats JSON missing num_nodes: %s", statsJSON)
 	}
+	typedStats, err := engine.CollectStatsContext(ctx, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typedStats.TotalKeyValuePairs == 0 || typedStats.NodesPerLevel["0"] == 0 {
+		t.Fatalf("unexpected context typed stats: %#v", typedStats)
+	}
+	debugView, err := engine.DebugTreeContext(ctx, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(debugView.Levels) == 0 || len(debugView.Levels[0].Nodes) == 0 {
+		t.Fatalf("unexpected context debug view: %#v", debugView)
+	}
 	pinned, err := engine.PinTreeRootContext(ctx, tree)
 	if err != nil {
 		t.Fatal(err)
@@ -1992,6 +2306,13 @@ func TestOperationalApis(t *testing.T) {
 	if !strings.Contains(stats, `"num_nodes"`) {
 		t.Fatalf("stats JSON missing num_nodes: %s", stats)
 	}
+	typedStats, err := engine.CollectStats(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typedStats.TotalKeyValuePairs != 1 || typedStats.NodesPerLevel["0"] == 0 {
+		t.Fatalf("unexpected typed stats: %#v", typedStats)
+	}
 	diffStats, err := engine.StatsDiffJSON(empty, tree)
 	if err != nil {
 		t.Fatal(err)
@@ -1999,12 +2320,28 @@ func TestOperationalApis(t *testing.T) {
 	if !strings.Contains(diffStats, `"absolute"`) {
 		t.Fatalf("stats diff JSON missing absolute: %s", diffStats)
 	}
+	typedDiffStats, err := engine.StatsDiff(empty, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typedDiffStats.Before.TotalKeyValuePairs != 0 ||
+		typedDiffStats.After.TotalKeyValuePairs != 1 ||
+		typedDiffStats.Absolute.TotalKeyValuePairsDiff != 1 {
+		t.Fatalf("unexpected typed stats diff: %#v", typedDiffStats)
+	}
 	debugJSON, err := engine.DebugTreeJSON(tree)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(debugJSON, `"levels"`) {
 		t.Fatalf("debug JSON missing levels: %s", debugJSON)
+	}
+	debugView, err := engine.DebugTree(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(debugView.Levels) == 0 || len(debugView.Levels[0].Nodes) == 0 {
+		t.Fatalf("unexpected typed debug tree: %#v", debugView)
 	}
 	debugText, err := engine.DebugTreeText(tree)
 	if err != nil {
@@ -2019,6 +2356,13 @@ func TestOperationalApis(t *testing.T) {
 	}
 	if !strings.Contains(compareJSON, `"right_only_nodes"`) {
 		t.Fatalf("debug comparison JSON missing right_only_nodes: %s", compareJSON)
+	}
+	typedCompare, err := engine.DebugCompareTrees(empty, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typedCompare.RightOnlyNodes == 0 {
+		t.Fatalf("unexpected typed debug comparison: %#v", typedCompare)
 	}
 	compareText, err := engine.DebugCompareTreesText(empty, tree)
 	if err != nil {
@@ -2091,7 +2435,25 @@ func TestOperationalApis(t *testing.T) {
 	if hydrated {
 		t.Fatal("memory engine should not hydrate prefix path hints")
 	}
-	publishedSpans, err := engine.PublishChangedSpansHint(empty, tree, []ChangedSpan{{Start: []byte("k"), End: []byte("l")}})
+	rangeSpan, err := ChangedSpanRange([]byte("k"), []byte("l"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactSpan, err := ChangedSpanFromKey([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(exactSpan.End, []byte("k\x00")) {
+		t.Fatalf("exact changed span end=%x", exactSpan.End)
+	}
+	prefixSpan, err := ChangedSpanForPrefix([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(prefixSpan.Start, []byte("k")) || !bytes.Equal(prefixSpan.End, []byte("l")) {
+		t.Fatalf("prefix changed span=%#v", prefixSpan)
+	}
+	publishedSpans, err := engine.PublishChangedSpansHint(empty, tree, []ChangedSpan{rangeSpan})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2112,6 +2474,20 @@ func TestOperationalApis(t *testing.T) {
 	}
 	if len(structuralPage.Diffs) == 0 || structuralPage.Stats.EmittedDiffs == 0 {
 		t.Fatalf("expected structural diff page to emit diffs: %#v", structuralPage)
+	}
+	cursorPage, err := engine.StructuralDiffPage(empty, tree, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursorPage.NextCursor == nil || !cursorPage.HasNextCursor {
+		t.Fatalf("expected structural diff page to expose typed and JSON cursors: %#v", cursorPage)
+	}
+	resumedStructuralPage, err := engine.StructuralDiffPageWithCursor(empty, tree, cursorPage.NextCursor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumedStructuralPage.Diffs) == 0 {
+		t.Fatalf("expected typed structural diff cursor to resume: %#v", resumedStructuralPage)
 	}
 
 	reachability, err := engine.MarkReachable([]Tree{tree})
@@ -2206,6 +2582,96 @@ func TestOperationalApis(t *testing.T) {
 	}
 	if !copiedOK || string(copiedValue) != "v" {
 		t.Fatalf("destination get after sync returned ok=%v value=%q", copiedOK, copiedValue)
+	}
+
+	bundle, err := engine.ExportSnapshot(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.FormatVersion != 1 {
+		t.Fatalf("snapshot format version = %d, want 1", bundle.FormatVersion)
+	}
+	if len(bundle.Nodes) == 0 {
+		t.Fatal("expected exported snapshot bundle nodes")
+	}
+	bundleBytes, err := SnapshotBundleToBytes(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleDigest, err := SnapshotBundleDigest(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byteBundleDigest, err := SnapshotBundleDigestBytes(bundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedBundleDigest, err := CidFromBytes(bundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bundleDigest, expectedBundleDigest) || !bytes.Equal(byteBundleDigest, bundleDigest) {
+		t.Fatalf("snapshot bundle digest mismatch")
+	}
+	summary, err := SummarizeSnapshotBundle(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.FormatVersion != 1 || summary.NodeCount != uint64(len(bundle.Nodes)) || summary.ByteCount == 0 || !summary.HasRoot {
+		t.Fatalf("snapshot bundle summary mismatch: %#v", summary)
+	}
+	byteSummary, err := SummarizeSnapshotBundleBytes(bundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(byteSummary, summary) {
+		t.Fatalf("snapshot bundle byte summary mismatch: %#v != %#v", byteSummary, summary)
+	}
+	verification, err := VerifySnapshotBundle(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.Valid || len(verification.MissingCids) != 0 || len(verification.ExtraCids) != 0 {
+		t.Fatalf("snapshot bundle verification mismatch: %#v", verification)
+	}
+	byteVerification, err := VerifySnapshotBundleBytes(bundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !byteVerification.Valid || !reflect.DeepEqual(byteVerification.Summary, summary) {
+		t.Fatalf("snapshot bundle byte verification mismatch: %#v", byteVerification)
+	}
+	incompleteBundle := bundle
+	incompleteBundle.Nodes = append([]SnapshotBundleNode(nil), bundle.Nodes[:len(bundle.Nodes)-1]...)
+	incompleteVerification, err := VerifySnapshotBundle(incompleteBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incompleteVerification.Valid || len(incompleteVerification.MissingCids) == 0 {
+		t.Fatalf("expected incomplete snapshot bundle to report missing CIDs: %#v", incompleteVerification)
+	}
+	decodedBundle, err := SnapshotBundleFromBytes(bundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedBundle.FormatVersion != bundle.FormatVersion || len(decodedBundle.Nodes) != len(bundle.Nodes) {
+		t.Fatalf("decoded snapshot bundle mismatch: %#v", decodedBundle)
+	}
+	importDestination, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer importDestination.Close()
+	importedTree, err := importDestination.ImportSnapshot(decodedBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	importedValue, importedOK, err := importDestination.Get(importedTree, []byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !importedOK || string(importedValue) != "v" {
+		t.Fatalf("destination get after snapshot import returned ok=%v value=%q", importedOK, importedValue)
 	}
 }
 
@@ -2411,6 +2877,12 @@ func TestBlobStoreLargeValuesAndBlobGC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := BlobRefValidateBytes(directRef, []byte("direct")); err != nil {
+		t.Fatal(err)
+	}
+	if err := BlobRefValidateBytes(directRef, []byte("wrong")); err == nil {
+		t.Fatal("expected blob ref validation to reject wrong bytes")
+	}
 	direct, ok, err := blobStore.GetBlob(directRef)
 	if err != nil {
 		t.Fatal(err)
@@ -2434,7 +2906,7 @@ func TestBlobStoreLargeValuesAndBlobGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	largeValue := bytes.Repeat([]byte{42}, 64)
-	tree, err := engine.PutLargeValue(blobStore, empty, []byte("big"), largeValue, LargeValueConfig{InlineThreshold: 8})
+	tree, err := engine.PutLargeValue(blobStore, empty, []byte("big"), largeValue, NewLargeValueConfig(8))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2648,14 +3120,31 @@ func TestConformanceBoundaryAndKeyFixtures(t *testing.T) {
 
 	for _, fixture := range fixtures.KeyFixtures.Segments {
 		var encoded []byte
+		segmentBytes := make([][]byte, 0, len(fixture.Segments))
 		for _, segment := range fixture.Segments {
-			part, err := EncodeSegment(mustHex(t, segment))
+			bytes := mustHex(t, segment)
+			segmentBytes = append(segmentBytes, bytes)
+			part, err := EncodeSegment(bytes)
 			if err != nil {
 				t.Fatal(err)
 			}
 			encoded = append(encoded, part...)
 		}
 		assertHexBytes(t, fixture.Encoded, encoded)
+		key, err := KeyFromSegments(segmentBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertHexBytes(t, fixture.Encoded, key)
+		prefix, err := KeyFromSegments(segmentBytes[:1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefixed, err := KeyFromPrefixedSegments(prefix, segmentBytes[1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertHexBytes(t, fixture.Encoded, prefixed)
 		segments, err := DecodeSegments(mustHex(t, fixture.Encoded))
 		if err != nil {
 			t.Fatal(err)
@@ -2808,11 +3297,40 @@ func TestConformanceCodecFixtures(t *testing.T) {
 		}
 	}
 	for _, fixture := range fixtures.BlobFixtures {
-		actual, err := ValueRefBytesRoundTrip(mustHex(t, fixture.Bytes))
+		bytes := mustHex(t, fixture.Bytes)
+		actual, err := ValueRefBytesRoundTrip(bytes)
 		if err != nil {
 			t.Fatal(err)
 		}
 		assertHexBytes(t, fixture.Bytes, actual)
+		stored, err := ValueRefFromStoredBytes(bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Kind != fixture.Kind {
+			t.Fatalf("unexpected stored value ref kind: got %q want %q", stored.Kind, fixture.Kind)
+		}
+		requiresEscape, err := ValueRefInlineRequiresEscape(bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !requiresEscape {
+			t.Fatalf("expected value ref envelope to require inline escaping: %s", fixture.Bytes)
+		}
+	}
+	rawInline, err := ValueRefFromStoredBytes([]byte("plain"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rawInline.Kind != "inline" || string(rawInline.Value) != "plain" {
+		t.Fatalf("unexpected raw inline value ref: %#v", rawInline)
+	}
+	requiresEscape, err := ValueRefInlineRequiresEscape([]byte("plain"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requiresEscape {
+		t.Fatal("plain inline bytes should not require escaping")
 	}
 	for _, fixture := range fixtures.ManifestFixtures {
 		actual, err := RootManifestBytesRoundTrip(mustHex(t, fixture.Bytes))
@@ -2846,6 +3364,51 @@ func assertEntries(t *testing.T, expected []entryFixture, actual []Entry) {
 	for i := range expected {
 		assertHexBytes(t, expected[i].Key, actual[i].Key)
 		assertHexBytes(t, expected[i].Value, actual[i].Value)
+	}
+}
+
+func TestConfigConstructors(t *testing.T) {
+	encoding := EncodingCustom("postcard")
+	if encoding.Kind != "custom" || encoding.CustomName == nil || *encoding.CustomName != "postcard" {
+		t.Fatalf("unexpected custom encoding: %#v", encoding)
+	}
+	if EncodingRaw().Kind != "raw" || EncodingCBOR().Kind != "cbor" || EncodingJSON().Kind != "json" {
+		t.Fatal("unexpected built-in encoding helper")
+	}
+
+	maxNodes := uint64(16)
+	maxBytes := uint64(4096)
+	config, err := TreeConfig(2, 64, 32, 7, encoding, &maxNodes, &maxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := Memory(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	tree, err := engine.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err = engine.Put(tree, []byte("cfg"), []byte("ok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := engine.Get(tree, []byte("cfg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(value) != "ok" {
+		t.Fatalf("unexpected config helper value: ok=%v value=%q", ok, value)
+	}
+
+	sequential := SequentialParallelConfig()
+	if sequential.MaxThreads != 1 || sequential.ParallelismThreshold != ^uint64(0) {
+		t.Fatalf("unexpected sequential parallel config: %#v", sequential)
+	}
+	if _, err := TreeConfig(2, 64, 32, 7, Encoding{Kind: "custom"}, nil, nil); err == nil {
+		t.Fatal("expected custom encoding without a name to fail")
 	}
 }
 
