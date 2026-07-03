@@ -7,7 +7,11 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{BatchOp, OrderedBatchReadPlan, Store};
+use super::super::manifest::{
+    sort_named_root_manifests, ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRootManifest,
+    RootManifest,
+};
+use super::{cid_from_store_key, sort_cids, BatchOp, NodeStoreScan, OrderedBatchReadPlan, Store};
 
 const CREATE_TABLE_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS prolly_nodes (
@@ -23,12 +27,26 @@ CREATE TABLE IF NOT EXISTS prolly_hints (
     PRIMARY KEY (namespace, key)
 ) WITHOUT ROWID;";
 
+const CREATE_ROOTS_TABLE_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS prolly_roots (
+    name     BLOB PRIMARY KEY NOT NULL,
+    manifest BLOB NOT NULL
+) WITHOUT ROWID;";
+
 const SELECT_SQL: &str = "SELECT node FROM prolly_nodes WHERE cid = ?1";
+const SELECT_NODE_CIDS_SQL: &str = "SELECT cid FROM prolly_nodes ORDER BY cid";
 const UPSERT_SQL: &str = "\
 INSERT INTO prolly_nodes (cid, node)
 VALUES (?1, ?2)
 ON CONFLICT(cid) DO UPDATE SET node = excluded.node";
 const DELETE_SQL: &str = "DELETE FROM prolly_nodes WHERE cid = ?1";
+const SELECT_ROOT_SQL: &str = "SELECT manifest FROM prolly_roots WHERE name = ?1";
+const SELECT_ROOTS_SQL: &str = "SELECT name, manifest FROM prolly_roots ORDER BY name";
+const UPSERT_ROOT_SQL: &str = "\
+INSERT INTO prolly_roots (name, manifest)
+VALUES (?1, ?2)
+ON CONFLICT(name) DO UPDATE SET manifest = excluded.manifest";
+const DELETE_ROOT_SQL: &str = "DELETE FROM prolly_roots WHERE name = ?1";
 
 /// Configuration options for [`SqliteStore`].
 #[derive(Debug, Clone)]
@@ -157,6 +175,8 @@ impl SqliteStore {
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to initialize schema"))?;
         conn.execute_batch(CREATE_HINTS_TABLE_SQL)
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to initialize hint schema"))?;
+        conn.execute_batch(CREATE_ROOTS_TABLE_SQL)
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to initialize root schema"))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -377,6 +397,141 @@ impl Store for SqliteStore {
         tx.commit()
             .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to commit transaction"))
     }
+}
+
+impl NodeStoreScan for SqliteStore {
+    type Error = SqliteStoreError;
+
+    fn list_node_cids(&self) -> Result<Vec<super::super::cid::Cid>, Self::Error> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare_cached(SELECT_NODE_CIDS_SQL)
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to prepare node CID listing"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to list node CIDs"))?;
+
+        let mut cids = Vec::new();
+        for row in rows {
+            let key = row
+                .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to read listed node CID"))?;
+            cids.push(cid_from_store_key(&key, "SQLite node").map_err(SqliteStoreError::new)?);
+        }
+        sort_cids(&mut cids);
+        Ok(cids)
+    }
+}
+
+impl ManifestStore for SqliteStore {
+    type Error = SqliteStoreError;
+
+    fn get_root(&self, name: &[u8]) -> Result<Option<RootManifest>, Self::Error> {
+        let conn = self.connection()?;
+        let bytes = conn
+            .query_row(SELECT_ROOT_SQL, params![name], |row| row.get(0))
+            .optional()
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to read root manifest"))?;
+        decode_root_manifest(bytes)
+    }
+
+    fn put_root(&self, name: &[u8], manifest: &RootManifest) -> Result<(), Self::Error> {
+        let conn = self.connection()?;
+        let bytes = encode_root_manifest(manifest)?;
+        conn.execute(UPSERT_ROOT_SQL, params![name, bytes])
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to write root manifest"))?;
+        Ok(())
+    }
+
+    fn delete_root(&self, name: &[u8]) -> Result<(), Self::Error> {
+        let conn = self.connection()?;
+        conn.execute(DELETE_ROOT_SQL, params![name])
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to delete root manifest"))?;
+        Ok(())
+    }
+
+    fn compare_and_swap_root(
+        &self,
+        name: &[u8],
+        expected: Option<&RootManifest>,
+        new: Option<&RootManifest>,
+    ) -> Result<ManifestUpdate, Self::Error> {
+        let expected_bytes = expected.map(encode_root_manifest).transpose()?;
+        let new_bytes = new.map(encode_root_manifest).transpose()?;
+
+        let mut conn = self.connection()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to start root transaction"))?;
+
+        let current_bytes = tx
+            .query_row(SELECT_ROOT_SQL, params![name], |row| row.get(0))
+            .optional()
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to read root manifest"))?;
+
+        if current_bytes.as_deref() != expected_bytes.as_deref() {
+            return Ok(ManifestUpdate::Conflict {
+                current: decode_root_manifest(current_bytes)?,
+            });
+        }
+
+        match new_bytes {
+            Some(bytes) => {
+                tx.execute(UPSERT_ROOT_SQL, params![name, bytes])
+                    .map_err(|e| {
+                        SqliteStoreError::from_sqlite(e, "Failed to write root manifest")
+                    })?;
+            }
+            None => {
+                tx.execute(DELETE_ROOT_SQL, params![name]).map_err(|e| {
+                    SqliteStoreError::from_sqlite(e, "Failed to delete root manifest")
+                })?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to commit root transaction"))?;
+        Ok(ManifestUpdate::Applied)
+    }
+}
+
+impl ManifestStoreScan for SqliteStore {
+    fn list_roots(&self) -> Result<Vec<NamedRootManifest>, Self::Error> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare_cached(SELECT_ROOTS_SQL).map_err(|e| {
+            SqliteStoreError::from_sqlite(e, "Failed to prepare root manifest listing")
+        })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| SqliteStoreError::from_sqlite(e, "Failed to list root manifests"))?;
+
+        let mut roots = Vec::new();
+        for row in rows {
+            let (name, bytes) = row.map_err(|e| {
+                SqliteStoreError::from_sqlite(e, "Failed to read listed root manifest")
+            })?;
+            let manifest = RootManifest::from_bytes(&bytes)
+                .map_err(|err| SqliteStoreError::new(err.to_string()))?;
+            roots.push(NamedRootManifest::new(name, manifest));
+        }
+        sort_named_root_manifests(&mut roots);
+        Ok(roots)
+    }
+}
+
+fn encode_root_manifest(manifest: &RootManifest) -> Result<Vec<u8>, SqliteStoreError> {
+    manifest
+        .to_bytes()
+        .map_err(|e| SqliteStoreError::new(format!("failed to encode root manifest: {e}")))
+}
+
+fn decode_root_manifest(bytes: Option<Vec<u8>>) -> Result<Option<RootManifest>, SqliteStoreError> {
+    bytes
+        .as_deref()
+        .map(RootManifest::from_bytes)
+        .transpose()
+        .map_err(|e| SqliteStoreError::new(format!("failed to decode root manifest: {e}")))
 }
 
 #[cfg(test)]

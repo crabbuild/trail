@@ -225,6 +225,88 @@ test("reconciles cross-source hydrated message replacements by message identity 
   assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-hydrated-cross-source"]);
 });
 
+test("reconciles hydrated prompt turn replacements across CrabDB turn ids locally", () => {
+  const liveUser: Extract<RenderNode, { kind: "message" }> = {
+    ...base,
+    id: "message:user:turn-live",
+    kind: "message",
+    turnId: "turn-live",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    status: "completed",
+    role: "user",
+    content: [{ type: "text", text: "what I have in current repo and how many lines of code ?" }],
+    text: "what I have in current repo and how many lines of code ?",
+    streaming: false,
+    timelineOrder: 1
+  };
+  const liveTool: Extract<RenderNode, { kind: "tool" }> = {
+    ...toolNode("tool:list-files:live", "turn-live"),
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    toolCallId: "list-files",
+    acpToolCallId: "list-files",
+    title: "Listed files",
+    timelineOrder: 2
+  };
+  const liveAssistant: Extract<RenderNode, { kind: "message" }> = {
+    ...messageNode("message:assistant:msg-summary", "Here's a summary of your repo."),
+    turnId: "turn-live",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    status: "completed",
+    streaming: false,
+    timelineOrder: 3
+  };
+  const hydratedUser: Extract<RenderNode, { kind: "message" }> = {
+    ...liveUser,
+    id: "crabdb-message:turn-crabdb:msg-user",
+    turnId: "turn-crabdb",
+    source: "crabdb",
+    updatedAt: "2026-06-27T00:01:00.000Z"
+  };
+  const hydratedTool: Extract<RenderNode, { kind: "tool" }> = {
+    ...liveTool,
+    id: "tool:list-files",
+    turnId: "turn-crabdb",
+    source: "crabdb",
+    updatedAt: "2026-06-27T00:01:01.000Z"
+  };
+  const hydratedAssistant: Extract<RenderNode, { kind: "message" }> = {
+    ...liveAssistant,
+    id: "crabdb-message:turn-crabdb:msg-summary",
+    turnId: "turn-crabdb",
+    source: "crabdb",
+    updatedAt: "2026-06-27T00:01:02.000Z"
+  };
+  const before = [liveUser, liveTool, liveAssistant];
+  const patches: RenderPatch[] = [
+    { type: "replace", node: hydratedUser },
+    { type: "replace", node: hydratedTool },
+    { type: "replace", node: hydratedAssistant }
+  ];
+
+  const nodes = applyRenderPatchesLocally(before, patches);
+  const changes = changedRenderNodesFromPatches(before, patches);
+
+  assert.deepEqual(
+    nodes.map((node) => `${node.id}:${node.source}:${node.turnId}`),
+    [
+      "message:user:turn-live:crabdb:turn-crabdb",
+      "tool:list-files:live:crabdb:turn-crabdb",
+      "message:assistant:msg-summary:crabdb:turn-crabdb"
+    ]
+  );
+  assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3]);
+  assert.deepEqual([...changes.addedNodeIds], []);
+  assert.deepEqual([...changes.removedNodeIds], []);
+  assert.deepEqual([...changes.changedNodeIds], [
+    "message:user:turn-live",
+    "tool:list-files:live",
+    "message:assistant:msg-summary"
+  ]);
+});
+
 test("merges delta streamed message patches locally without losing prior text", () => {
   const first = messageNode("message:assistant:one", "Hello ");
   const second = messageNode("message:assistant:one", "world");

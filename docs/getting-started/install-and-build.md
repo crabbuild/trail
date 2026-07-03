@@ -115,7 +115,7 @@ cargo test -p crabdb
 Run the prolly crate tests separately when changing storage internals:
 
 ```sh
-cargo test -p prolly
+cargo test -p prolly-map
 ```
 
 ## What Gets Installed

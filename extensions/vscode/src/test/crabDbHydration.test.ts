@@ -3946,23 +3946,26 @@ test("reconciles completed live turn with hydrated turn when the user prompt mat
       timelineOrder: 3
     }
   ];
+  const hydratedUser = hydrated[0] as Extract<RenderNode, { kind: "message" }>;
+  const hydratedTool = hydrated[1] as Extract<RenderNode, { kind: "tool" }>;
+  const hydratedAssistant = hydrated[2] as Extract<RenderNode, { kind: "message" }>;
   const current: RenderNode[] = [
     {
-      ...hydrated[0]!,
+      ...hydratedUser,
       id: "message:user:turn-live",
       turnId: "turn-live",
       source: "acp-live",
       timelineOrder: 1
     },
     {
-      ...hydrated[1]!,
+      ...hydratedTool,
       id: "tool:list-files:live",
       turnId: "turn-live",
       source: "acp-live",
       timelineOrder: 2
     },
     {
-      ...hydrated[2]!,
+      ...hydratedAssistant,
       id: "message:assistant:msg-assistant",
       turnId: "turn-live",
       source: "acp-live",
@@ -3987,6 +3990,511 @@ test("reconciles completed live turn with hydrated turn when the user prompt mat
     ]
   );
   assert.deepEqual(merged.map((node) => node.timelineOrder), [1, 2, 3]);
+});
+
+test("drops checkpoint-pending live completion when aliased hydrated turn has a checkpoint", () => {
+  const hydrated: RenderNode[] = [
+    {
+      id: "crabdb-message:turn-crabdb-checkpoint:msg-user",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-checkpoint",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "what I have in current repo and how many lines of code ?" }],
+      text: "what I have in current repo and how many lines of code ?",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:00.000Z",
+      timelineOrder: 1
+    },
+    {
+      id: "tool:count-lines",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-checkpoint",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      acpToolCallId: "count-lines",
+      toolCallId: "count-lines",
+      title: "Ran line count",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      updatedAt: "2026-06-27T00:10:01.000Z",
+      timelineOrder: 2
+    },
+    {
+      id: "crabdb-message:turn-crabdb-checkpoint:msg-assistant",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-checkpoint",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-assistant-checkpoint",
+      content: [{ type: "text", text: "So the repo has about 5,357 lines of code." }],
+      text: "So the repo has about 5,357 lines of code.",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:02.000Z",
+      timelineOrder: 3
+    },
+    {
+      id: "crabdb-checkpoint:turn-crabdb-checkpoint",
+      kind: "checkpoint",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-checkpoint",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      checkpointId: "ch_done",
+      label: "Checkpoint ch_done",
+      updatedAt: "2026-06-27T00:10:03.000Z",
+      timelineOrder: 4
+    }
+  ];
+  const hydratedUser = hydrated[0] as Extract<RenderNode, { kind: "message" }>;
+  const hydratedTool = hydrated[1] as Extract<RenderNode, { kind: "tool" }>;
+  const hydratedAssistant = hydrated[2] as Extract<RenderNode, { kind: "message" }>;
+  const current: RenderNode[] = [
+    {
+      ...hydratedUser,
+      id: "message:user:turn-live-checkpoint",
+      turnId: "turn-live-checkpoint",
+      source: "acp-live",
+      timelineOrder: 1
+    },
+    {
+      ...hydratedTool,
+      id: "tool:count-lines:live",
+      turnId: "turn-live-checkpoint",
+      source: "acp-live",
+      timelineOrder: 2
+    },
+    {
+      ...hydratedAssistant,
+      id: "message:assistant:msg-assistant-checkpoint",
+      turnId: "turn-live-checkpoint",
+      source: "acp-live",
+      content: [{ type: "text", text: "So the repo has about 5,357 lines of code" }],
+      text: "So the repo has about 5,357 lines of code",
+      timelineOrder: 3
+    },
+    {
+      id: "completion:turn-live-checkpoint",
+      kind: "completion",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-checkpoint",
+      provider: "provider",
+      source: "acp-live",
+      status: "pending",
+      stopReason: "end_turn",
+      label: "Turn complete; checkpoint pending",
+      checkpointPending: true,
+      updatedAt: "2026-06-27T00:10:04.000Z",
+      timelineOrder: 4
+    }
+  ];
+
+  const merged = mergeHydratedNodes(hydrated, current);
+
+  assert.deepEqual(
+    merged.map((node) => (
+      node.kind === "message"
+        ? `${node.source}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.source}:${node.turnId}:${node.kind}:${node.status}`
+    )),
+    [
+      "crabdb:turn-crabdb-checkpoint:user:what I have in current repo and how many lines of code ?",
+      "crabdb:turn-crabdb-checkpoint:tool:completed",
+      "crabdb:turn-crabdb-checkpoint:assistant:So the repo has about 5,357 lines of code.",
+      "crabdb:turn-crabdb-checkpoint:checkpoint:completed"
+    ]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1, 2, 3, 4]);
+});
+
+test("reconciles hydrated transcript while keeping only checkpoint-pending completion", () => {
+  const hydrated: RenderNode[] = [
+    {
+      id: "crabdb-message:turn-crabdb-pending:msg-user",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-pending",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "what I have in current repo and how many lines of code ?" }],
+      text: "what I have in current repo and how many lines of code ?",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:00.000Z",
+      timelineOrder: 1
+    },
+    {
+      id: "tool:count-lines-pending",
+      kind: "tool",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-pending",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      acpToolCallId: "count-lines",
+      toolCallId: "count-lines",
+      title: "Ran line count",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      updatedAt: "2026-06-27T00:10:01.000Z",
+      timelineOrder: 2
+    },
+    {
+      id: "crabdb-message:turn-crabdb-pending:msg-assistant",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-crabdb-pending",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-assistant-pending",
+      content: [{ type: "text", text: "So the repo has about 5,357 lines of code." }],
+      text: "So the repo has about 5,357 lines of code.",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:02.000Z",
+      timelineOrder: 3
+    }
+  ];
+  const hydratedUser = hydrated[0] as Extract<RenderNode, { kind: "message" }>;
+  const hydratedTool = hydrated[1] as Extract<RenderNode, { kind: "tool" }>;
+  const hydratedAssistant = hydrated[2] as Extract<RenderNode, { kind: "message" }>;
+  const current: RenderNode[] = [
+    {
+      ...hydratedUser,
+      id: "message:user:turn-live-pending",
+      turnId: "turn-live-pending",
+      source: "acp-live",
+      timelineOrder: 1
+    },
+    {
+      ...hydratedTool,
+      id: "tool:count-lines-pending:live",
+      turnId: "turn-live-pending",
+      source: "acp-live",
+      timelineOrder: 2
+    },
+    {
+      ...hydratedAssistant,
+      id: "message:assistant:msg-assistant-pending",
+      turnId: "turn-live-pending",
+      source: "acp-live",
+      content: [{ type: "text", text: "So the repo has about 5,357 lines of code" }],
+      text: "So the repo has about 5,357 lines of code",
+      timelineOrder: 3
+    },
+    {
+      id: "completion:turn-live-pending",
+      kind: "completion",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-pending",
+      provider: "provider",
+      source: "acp-live",
+      status: "pending",
+      stopReason: "end_turn",
+      label: "Turn complete; checkpoint pending",
+      checkpointPending: true,
+      updatedAt: "2026-06-27T00:10:04.000Z",
+      timelineOrder: 4
+    }
+  ];
+
+  const merged = mergeHydratedNodes(hydrated, current);
+
+  assert.deepEqual(
+    merged.map((node) => (
+      node.kind === "message"
+        ? `${node.source}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.source}:${node.turnId}:${node.kind}:${node.status}`
+    )),
+    [
+      "crabdb:turn-crabdb-pending:user:what I have in current repo and how many lines of code ?",
+      "crabdb:turn-crabdb-pending:tool:completed",
+      "crabdb:turn-crabdb-pending:assistant:So the repo has about 5,357 lines of code.",
+      "acp-live:turn-crabdb-pending:completion:pending"
+    ]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1, 2, 3, 4]);
+
+  const settled = mergeHydratedNodes(
+    [
+      ...hydrated,
+      {
+        id: "crabdb-checkpoint:turn-crabdb-pending",
+        kind: "checkpoint",
+        taskId: "task-1",
+        lane: "lane-1",
+        turnId: "turn-crabdb-pending",
+        provider: "provider",
+        source: "crabdb",
+        status: "completed",
+        checkpointId: "ch_done",
+        label: "Checkpoint ch_done",
+        updatedAt: "2026-06-27T00:10:05.000Z",
+        timelineOrder: 4
+      }
+    ],
+    merged
+  );
+  assert.equal(settled.some((node) => node.kind === "completion"), false);
+  assert.deepEqual(
+    settled.map((node) => `${node.source}:${node.turnId}:${node.kind}:${node.status}`),
+    [
+      "crabdb:turn-crabdb-pending:message:completed",
+      "crabdb:turn-crabdb-pending:tool:completed",
+      "crabdb:turn-crabdb-pending:message:completed",
+      "crabdb:turn-crabdb-pending:checkpoint:completed"
+    ]
+  );
+});
+
+test("reconciles newly claimed CrabDB task with live new-task prompt scope", () => {
+  const hydrated: RenderNode[] = [
+    {
+      id: "crabdb-message:turn-crabdb-new-task:msg-user",
+      kind: "message",
+      taskId: "task-claimed",
+      lane: "lane-claimed",
+      turnId: "turn-crabdb-new-task",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "what I have in current repo and how many lines of code ?" }],
+      text: "what I have in current repo and how many lines of code ?",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:00.000Z",
+      timelineOrder: 1
+    },
+    {
+      id: "tool:count-lines-new-task",
+      kind: "tool",
+      taskId: "task-claimed",
+      lane: "lane-claimed",
+      turnId: "turn-crabdb-new-task",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      acpToolCallId: "count-lines",
+      toolCallId: "count-lines",
+      title: "Ran line count",
+      toolKind: "execute",
+      toolStatus: "completed",
+      locations: [],
+      content: [],
+      updatedAt: "2026-06-27T00:10:01.000Z",
+      timelineOrder: 2
+    },
+    {
+      id: "crabdb-message:turn-crabdb-new-task:msg-assistant",
+      kind: "message",
+      taskId: "task-claimed",
+      lane: "lane-claimed",
+      turnId: "turn-crabdb-new-task",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "assistant",
+      acpMessageId: "msg-assistant-new-task",
+      content: [{ type: "text", text: "So the repo has about 5,357 lines of code." }],
+      text: "So the repo has about 5,357 lines of code.",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:02.000Z",
+      timelineOrder: 3
+    }
+  ];
+  const hydratedUser = hydrated[0] as Extract<RenderNode, { kind: "message" }>;
+  const hydratedTool = hydrated[1] as Extract<RenderNode, { kind: "tool" }>;
+  const hydratedAssistant = hydrated[2] as Extract<RenderNode, { kind: "message" }>;
+  const current: RenderNode[] = [
+    {
+      ...hydratedUser,
+      id: "message:user:turn-live-new-task",
+      taskId: "new-task",
+      lane: "new-task",
+      turnId: "turn-live-new-task",
+      source: "acp-live",
+      timelineOrder: 1
+    },
+    {
+      ...hydratedTool,
+      id: "tool:count-lines-new-task:live",
+      taskId: "new-task",
+      lane: "new-task",
+      turnId: "turn-live-new-task",
+      source: "acp-live",
+      timelineOrder: 2
+    },
+    {
+      ...hydratedAssistant,
+      id: "message:assistant:msg-assistant-new-task",
+      taskId: "new-task",
+      lane: "new-task",
+      turnId: "turn-live-new-task",
+      source: "acp-live",
+      content: [{ type: "text", text: "So the repo has about 5,357 lines of code" }],
+      text: "So the repo has about 5,357 lines of code",
+      timelineOrder: 3
+    },
+    {
+      id: "completion:turn-live-new-task",
+      kind: "completion",
+      taskId: "new-task",
+      lane: "new-task",
+      turnId: "turn-live-new-task",
+      provider: "provider",
+      source: "acp-live",
+      status: "pending",
+      stopReason: "end_turn",
+      label: "Turn complete; checkpoint pending",
+      checkpointPending: true,
+      updatedAt: "2026-06-27T00:10:04.000Z",
+      timelineOrder: 4
+    }
+  ];
+
+  const merged = mergeHydratedNodes(hydrated, current);
+
+  assert.deepEqual(
+    merged.map((node) => (
+      node.kind === "message"
+        ? `${node.source}:${node.taskId}:${node.lane}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.source}:${node.taskId}:${node.lane}:${node.turnId}:${node.kind}:${node.status}`
+    )),
+    [
+      "crabdb:task-claimed:lane-claimed:turn-crabdb-new-task:user:what I have in current repo and how many lines of code ?",
+      "crabdb:task-claimed:lane-claimed:turn-crabdb-new-task:tool:completed",
+      "crabdb:task-claimed:lane-claimed:turn-crabdb-new-task:assistant:So the repo has about 5,357 lines of code.",
+      "acp-live:task-claimed:lane-claimed:turn-crabdb-new-task:completion:pending"
+    ]
+  );
+  assert.deepEqual(merged.map((node) => node.timelineOrder), [1, 2, 3, 4]);
+});
+
+test("does not reconcile a checkpoint-pending repeat prompt with an older hydrated turn", () => {
+  const hydrated: RenderNode[] = [
+    {
+      id: "crabdb-message:turn-old-repeat:msg-user",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-old-repeat",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "What I have in current repo" }],
+      text: "What I have in current repo",
+      streaming: false,
+      createdAt: "2026-06-27T00:00:00.000Z",
+      timelineOrder: 1
+    },
+    {
+      id: "crabdb-message:turn-old-repeat:msg-assistant",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-old-repeat",
+      provider: "provider",
+      source: "crabdb",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "text", text: "Old summary." }],
+      text: "Old summary.",
+      streaming: false,
+      createdAt: "2026-06-27T00:00:01.000Z",
+      timelineOrder: 2
+    }
+  ];
+  const current: RenderNode[] = [
+    {
+      id: "message:user:turn-live-repeat",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-repeat",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "user",
+      content: [{ type: "text", text: "What I have in current repo" }],
+      text: "What I have in current repo",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:00.000Z",
+      timelineOrder: 3
+    },
+    {
+      id: "message:assistant:turn-live-repeat",
+      kind: "message",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-repeat",
+      provider: "provider",
+      source: "acp-live",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "text", text: "New summary." }],
+      text: "New summary.",
+      streaming: false,
+      updatedAt: "2026-06-27T00:10:01.000Z",
+      timelineOrder: 4
+    },
+    {
+      id: "completion:turn-live-repeat",
+      kind: "completion",
+      taskId: "task-1",
+      lane: "lane-1",
+      turnId: "turn-live-repeat",
+      provider: "provider",
+      source: "acp-live",
+      status: "pending",
+      stopReason: "end_turn",
+      label: "Turn complete; checkpoint pending",
+      checkpointPending: true,
+      updatedAt: "2026-06-27T00:10:02.000Z",
+      timelineOrder: 5
+    }
+  ];
+
+  const merged = mergeHydratedNodes(hydrated, current);
+
+  assert.deepEqual(
+    merged.map((node) => (
+      node.kind === "message"
+        ? `${node.source}:${node.turnId}:${node.role}:${node.text}`
+        : `${node.source}:${node.turnId}:${node.kind}:${node.status}`
+    )),
+    [
+      "crabdb:turn-old-repeat:user:What I have in current repo",
+      "crabdb:turn-old-repeat:assistant:Old summary.",
+      "acp-live:turn-live-repeat:user:What I have in current repo",
+      "acp-live:turn-live-repeat:assistant:New summary.",
+      "acp-live:turn-live-repeat:completion:pending"
+    ]
+  );
 });
 
 test("reconciles completed live tools with hydrated tools when the live turn id is missing", () => {

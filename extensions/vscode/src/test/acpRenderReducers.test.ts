@@ -1370,6 +1370,102 @@ test("converts live-to-hydrated message snapshot ids into replacements without r
   ]);
 });
 
+test("converts live-to-hydrated prompt turn snapshots into replacements across CrabDB turn ids", () => {
+  const liveUser: RenderNode = {
+    id: "message:user:turn-live",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-live",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    source: "acp-live",
+    status: "completed",
+    role: "user",
+    content: [{ type: "text", text: "what I have in current repo and how many lines of code ?" }],
+    text: "what I have in current repo and how many lines of code ?",
+    streaming: false,
+    timelineOrder: 1
+  };
+  const liveTool: RenderNode = {
+    id: "tool:list-files:live",
+    kind: "tool",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-live",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    source: "acp-live",
+    status: "completed",
+    acpToolCallId: "list-files",
+    toolCallId: "list-files",
+    title: "Listed files",
+    toolKind: "execute",
+    toolStatus: "completed",
+    locations: [],
+    content: [],
+    timelineOrder: 2
+  };
+  const liveAssistant: RenderNode = {
+    id: "message:assistant:msg-summary",
+    kind: "message",
+    taskId: "task-1",
+    lane: "lane-1",
+    turnId: "turn-live",
+    acpSessionId: "sess-1",
+    provider: "test-provider",
+    source: "acp-live",
+    status: "completed",
+    role: "assistant",
+    acpMessageId: "msg-summary",
+    content: [{ type: "text", text: "Here's a summary of your repo." }],
+    text: "Here's a summary of your repo.",
+    streaming: false,
+    timelineOrder: 3
+  };
+  const hydratedUser: RenderNode = {
+    ...liveUser,
+    id: "crabdb-message:turn-crabdb:msg-user",
+    turnId: "turn-crabdb",
+    source: "crabdb",
+    updatedAt: "2026-06-27T00:01:00.000Z"
+  };
+  const hydratedTool: RenderNode = {
+    ...liveTool,
+    id: "tool:list-files",
+    turnId: "turn-crabdb",
+    source: "crabdb",
+    updatedAt: "2026-06-27T00:01:01.000Z"
+  };
+  const hydratedAssistant: RenderNode = {
+    ...liveAssistant,
+    id: "crabdb-message:turn-crabdb:msg-summary",
+    turnId: "turn-crabdb",
+    source: "crabdb",
+    updatedAt: "2026-06-27T00:01:02.000Z"
+  };
+
+  const before = [liveUser, liveTool, liveAssistant];
+  const next = [hydratedUser, hydratedTool, hydratedAssistant];
+  const patches = renderNodeSnapshotPatches(before, next);
+  const applied = applyRenderPatchesAndCollect(before, patches);
+
+  assert.deepEqual(patches.map((patch) => `${patch.type}:${patch.node?.id || patch.id}`), [
+    "replace:crabdb-message:turn-crabdb:msg-user",
+    "replace:tool:list-files",
+    "replace:crabdb-message:turn-crabdb:msg-summary"
+  ]);
+  assert.deepEqual(
+    applied.nodes.map((node) => `${node.id}:${node.source}:${node.turnId}`),
+    [
+      "message:user:turn-live:crabdb:turn-crabdb",
+      "tool:list-files:live:crabdb:turn-crabdb",
+      "message:assistant:msg-summary:crabdb:turn-crabdb"
+    ]
+  );
+  assert.deepEqual(applied.nodes.map((node) => node.timelineOrder), [1, 2, 3]);
+});
+
 test("converts refreshed render snapshots into applicable patches", () => {
   const liveMessage: RenderNode = {
     id: "message:assistant:live",

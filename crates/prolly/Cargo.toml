@@ -1,10 +1,16 @@
 [package]
-name = "prolly"
-description = "Content-addressed prolly tree storage primitives for CrabDB."
+name = "prolly-map"
+description = "Content-addressed versioned map storage primitives."
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 license.workspace = true
+repository = "https://github.com/crabbuild/crabdb"
+homepage = "https://github.com/crabbuild/crabdb"
+documentation = "https://docs.rs/prolly-map"
+keywords = ["prolly-tree", "versioned-map", "content-addressed", "local-first", "merge"]
+categories = ["data-structures", "database-implementations"]
 
 [lib]
 name = "prolly"
@@ -12,10 +18,12 @@ path = "src/lib.rs"
 
 [features]
 default = []
+async-store = ["dep:futures-util"]
 pglite = ["dep:hex"]
 rocksdb = ["dep:rocksdb"]
 slatedb = ["dep:futures-util", "dep:slatedb", "dep:tokio"]
 sqlite = ["dep:rusqlite"]
+tokio = ["async-store", "dep:tokio"]
 
 [dependencies]
 hex = { workspace = true, optional = true }
@@ -42,6 +50,10 @@ name = "prolly_bench"
 harness = false
 
 [[bench]]
+name = "ai_workloads_bench"
+harness = false
+
+[[bench]]
 name = "sqlite_scale_bench"
 harness = false
 required-features = ["sqlite"]
@@ -62,5 +74,10 @@ required-features = ["slatedb"]
 
 [[bench]]
 name = "slatedb_ops_bench"
+harness = false
+required-features = ["slatedb"]
+
+[[bench]]
+name = "slatedb_workload_bench"
 harness = false
 required-features = ["slatedb"]

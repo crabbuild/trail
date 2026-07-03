@@ -18,7 +18,7 @@ pub const DEFAULT_MAX_CHUNK_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_CHUNKING_FACTOR: u32 = 128;
 
 /// Encoding type for values
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Encoding {
     #[default]
     Raw,

@@ -248,6 +248,7 @@ impl DefaultParallelRebalancer {
 
                 // Flush writes for this group
                 collector.flush(prolly.store())?;
+                prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
 
                 // Update the current tree for the next iteration
                 current_tree = Tree {

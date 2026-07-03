@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use prolly::{
     append_batch, BatchBuilder, BatchWriter, BatchWriterConfig, Config, MemStore, Mutation,
-    ParallelConfig, Prolly, Resolver, Store, Tree,
+    ParallelConfig, Prolly, Resolution, Resolver, Store, Tree,
 };
 
 const DEFAULT_SCALE: usize = 10_000;
@@ -500,7 +500,8 @@ fn bench_merge_conflict_resolved(items: usize) {
     }
 
     measure("merge_conflict_resolved_mem", 10, conflicts, || {
-        let resolver: Resolver = Box::new(|conflict| Some(conflict.right.clone()));
+        let resolver: Resolver =
+            Box::new(|conflict| Resolution::value(conflict.right.clone().expect("right value")));
         let merged = prolly.merge(&base, &left, &right, Some(resolver)).unwrap();
         black_box(merged.root);
     });

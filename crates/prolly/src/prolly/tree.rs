@@ -1,10 +1,12 @@
 //! Tree structure for Prolly Trees
 
+use serde::{Deserialize, Serialize};
+
 use super::cid::Cid;
 use super::config::Config;
 
 /// A Prolly Tree handle
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Tree {
     /// Root node CID (None if empty)
     pub root: Option<Cid>,

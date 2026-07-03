@@ -1,10 +1,13 @@
 #![cfg(feature = "sqlite")]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use prolly::{BatchOp, Config, Prolly, SqliteStore, Store};
+use prolly::{Config, Prolly, SqliteStore};
 
 #[test]
 fn sqlite_store_is_send_and_sync() {
@@ -16,35 +19,19 @@ fn sqlite_store_is_send_and_sync() {
 #[test]
 fn sqlite_store_supports_store_contract_operations() {
     let store = SqliteStore::open_in_memory().unwrap();
+    common::assert_store_contract(&store);
+}
 
-    store.put(b"a", b"1").unwrap();
-    store.put(b"b", b"2").unwrap();
-    assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
+#[test]
+fn sqlite_store_supports_manifest_contract_operations() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    common::assert_manifest_store_contract(&store);
+}
 
-    let keys: Vec<&[u8]> = vec![b"b", b"missing", b"a"];
-    assert_eq!(
-        store.batch_get_ordered(&keys).unwrap(),
-        vec![Some(b"2".to_vec()), None, Some(b"1".to_vec())]
-    );
-
-    store
-        .batch(&[
-            BatchOp::Upsert {
-                key: b"a",
-                value: b"updated",
-            },
-            BatchOp::Delete { key: b"b" },
-            BatchOp::Upsert {
-                key: b"c",
-                value: b"3",
-            },
-        ])
-        .unwrap();
-
-    let found = store.batch_get(&[b"a", b"b", b"c"]).unwrap();
-    assert_eq!(found.get(b"a".as_slice()), Some(&b"updated".to_vec()));
-    assert!(!found.contains_key(b"b".as_slice()));
-    assert_eq!(found.get(b"c".as_slice()), Some(&b"3".to_vec()));
+#[test]
+fn sqlite_store_supports_node_scan_contract_operations() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    common::assert_node_store_scan_contract(store);
 }
 
 #[test]
@@ -84,6 +71,44 @@ fn sqlite_store_persists_prolly_tree_nodes_across_reopen() {
         assert_eq!(prolly.get(&tree, b"k17").unwrap(), Some(b"v17".to_vec()));
         assert_eq!(prolly.get(&tree, b"k39").unwrap(), Some(b"v39".to_vec()));
         assert_eq!(prolly.get(&tree, b"missing").unwrap(), None);
+    }
+
+    remove_sqlite_files(&path);
+}
+
+#[test]
+fn sqlite_store_persists_named_root_across_reopen() {
+    let path = temp_db_path("root-manifest");
+    remove_sqlite_files(&path);
+
+    let config = Config::builder()
+        .min_chunk_size(2)
+        .max_chunk_size(4)
+        .chunking_factor(2)
+        .build();
+
+    let tree = {
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        let prolly = Prolly::new(store.clone(), config.clone());
+        let tree = prolly.create();
+        let tree = prolly
+            .put(&tree, b"project/name".to_vec(), b"crabdb".to_vec())
+            .unwrap();
+
+        prolly.publish_named_root(b"main", &tree).unwrap();
+        tree
+    };
+
+    {
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        let prolly = Prolly::new(store, config.clone());
+        let loaded = prolly.load_named_root(b"main").unwrap().unwrap();
+        assert_eq!(loaded, tree);
+
+        assert_eq!(
+            prolly.get(&loaded, b"project/name").unwrap(),
+            Some(b"crabdb".to_vec())
+        );
     }
 
     remove_sqlite_files(&path);

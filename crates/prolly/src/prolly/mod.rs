@@ -85,14 +85,27 @@
 //! nature of trees means multiple threads can safely read from the same tree simultaneously.
 
 use rayon::prelude::*;
-use std::collections::{hash_map::Entry, HashMap};
+use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PARALLEL_NODE_DECODE_THRESHOLD: usize = 16;
 const GET_MANY_PREFETCH_PARALLELISM: usize = 16;
 const GET_MANY_BOUNDARY_ROUTE_MIN_POSITIONS: usize = 32;
 const STATS_FRONTIER_PREFETCH_PARALLELISM: usize = 16;
+#[cfg(feature = "async-store")]
+const ASYNC_NODE_PREFETCH_BATCH_SIZE: usize = 64;
+
+fn current_unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
 
 // Core modules - moved from root level
 pub mod boundary;
@@ -100,15 +113,26 @@ pub mod builder;
 pub mod cid;
 pub mod config;
 pub mod cursor;
+pub mod debug;
 pub mod encoding;
 pub mod error;
+pub mod gc;
+pub mod key;
+pub mod manifest;
 pub mod node;
+pub mod policy;
+pub mod proof;
+pub mod snapshot;
 pub mod stats;
 pub mod store;
+pub mod sync;
+pub mod tombstone;
 pub mod tree;
+pub mod value;
 
 // Public submodules - each handles a specific concern
 pub mod batch;
+pub mod blob;
 pub mod crdt;
 pub mod diff;
 pub mod parallel;
@@ -120,15 +144,26 @@ pub mod utils;
 // Internal traits for future extensibility (not exposed publicly)
 mod traits;
 
+use self::sync::{MissingNodeCopy, MissingNodePlan};
+use blob::{BlobStore, BlobStoreScan, LargeValueConfig};
 use cid::Cid;
 use config::Config;
 use encoding::INIT_LEVEL;
+use error::Conflict;
 use error::Diff;
 use error::Error;
 use error::Mutation;
 use error::Resolver;
+use gc::{BlobGcPlan, BlobGcReachability, BlobGcSweep, GcPlan, GcReachability, GcSweep};
+use manifest::{
+    ManifestStore, ManifestStoreScan, NamedRoot, NamedRootRetention, NamedRootSelection,
+    NamedRootUpdate, RootManifest,
+};
 use node::Node;
-use stats::TreeStats;
+use stats::{StatsComparison, TreeStats};
+#[cfg(feature = "async-store")]
+use store::AsyncStore;
+use store::NodeStoreScan;
 use store::Store;
 use tree::Tree;
 
@@ -143,6 +178,9 @@ struct MissingNodeBatch {
     cids: Vec<Cid>,
     positions: Vec<InlinePositions>,
 }
+
+type MissingNodeBytes = Vec<(Cid, Vec<u8>)>;
+type PreparedMissingNodes = (MissingNodePlan, MissingNodeBytes);
 
 struct InlinePositions {
     first: usize,
@@ -223,53 +261,404 @@ impl MissingNodeBatch {
     }
 }
 
-// Re-export RangeIter for range queries
-pub use range::RangeIter;
+struct NodeCacheEntry {
+    node: Arc<Node>,
+    generation: u64,
+    bytes: usize,
+    pinned: bool,
+}
 
-// Re-export batch types and functions for public API
-pub use batch::append_batch;
-pub use batch::apply_batch_with_rebuild;
-pub use batch::apply_mutations_deferred;
-pub use batch::apply_mutations_to_leaf;
-pub use batch::apply_mutations_to_leaf_binary_search;
-pub use batch::bottom_up_rebuild;
-pub use batch::bottom_up_rebuild_groups;
-pub use batch::build_internal_level;
-pub use batch::compute_affected_spans;
-pub use batch::filter_mutations_for_range;
-pub use batch::get_max_key;
-pub use batch::group_mutations_by_leaf;
-pub use batch::group_mutations_by_leaf_cursor;
-pub use batch::prefetch_leaves;
-pub use batch::preprocess_mutations;
-pub use batch::rebuild_from_modified_leaves;
-pub use batch::should_use_deferred_rebalancing;
-pub use batch::split_oversized_node;
-pub use batch::BatchApplyResult;
-pub use batch::BatchApplyStats;
-pub use batch::BatchWriteCollector;
-pub use batch::BatchWriter;
-pub use batch::BatchWriterConfig;
-pub use batch::DeferredMutationResult;
-pub use batch::LeafMutationGroup;
-pub use batch::LeafSpan;
-pub use batch::MutationBuffer;
-pub use batch::RebuildResult;
+struct NodeCache {
+    max_nodes: Option<usize>,
+    max_bytes: Option<usize>,
+    nodes: HashMap<Cid, NodeCacheEntry>,
+    access_log: VecDeque<(Cid, u64)>,
+    next_generation: u64,
+    bytes: usize,
+}
 
-// Re-export rebalance functions for testing
-pub use rebalance::split_into_chunks;
+impl NodeCache {
+    fn new(max_nodes: Option<usize>, max_bytes: Option<usize>) -> Self {
+        Self {
+            max_nodes,
+            max_bytes,
+            nodes: HashMap::new(),
+            access_log: VecDeque::new(),
+            next_generation: 0,
+            bytes: 0,
+        }
+    }
 
-// Re-export streaming diff types
-pub use streaming::{DefaultStreamingDiffer, StreamingDiffer};
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
 
-// Re-export CRDT types for conflict-free merging
-pub use crdt::{
-    ConflictFreeMerger, CrdtConfig, CustomMergeFn, DefaultConflictFreeMerger, DeletePolicy,
-    MergeStrategy, MultiValueSet, TimestampExtractor, TimestampedValue,
-};
+    fn bytes_len(&self) -> usize {
+        self.bytes
+    }
 
-// Re-export parallel rebalancer types
-pub use parallel::{DefaultParallelRebalancer, ParallelConfig, ParallelRebalancer};
+    fn pinned_len(&self) -> usize {
+        self.nodes.values().filter(|entry| entry.pinned).count()
+    }
+
+    fn pinned_bytes_len(&self) -> usize {
+        self.nodes
+            .values()
+            .filter(|entry| entry.pinned)
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    fn clear(&mut self) -> usize {
+        let evicted = self.nodes.len();
+        self.nodes.clear();
+        self.access_log.clear();
+        self.bytes = 0;
+        evicted
+    }
+
+    fn get(&mut self, cid: &Cid) -> Option<Arc<Node>> {
+        if !self.nodes.contains_key(cid) {
+            return None;
+        }
+
+        let generation = self.next_generation();
+        let node = {
+            let entry = self
+                .nodes
+                .get_mut(cid)
+                .expect("node was checked before generation update");
+            entry.generation = generation;
+            entry.node.clone()
+        };
+        self.access_log.push_back((cid.clone(), generation));
+        self.compact_access_log_if_needed();
+        Some(node)
+    }
+
+    fn insert(&mut self, cid: Cid, node: Arc<Node>, bytes: usize) -> usize {
+        self.insert_with_pin(cid, node, bytes, false).1
+    }
+
+    fn insert_pinned(&mut self, cid: Cid, node: Arc<Node>, bytes: usize) -> (bool, usize) {
+        self.insert_with_pin(cid, node, bytes, true)
+    }
+
+    fn insert_with_pin(
+        &mut self,
+        cid: Cid,
+        node: Arc<Node>,
+        bytes: usize,
+        pinned: bool,
+    ) -> (bool, usize) {
+        if self.max_nodes == Some(0) || self.max_bytes == Some(0) {
+            return (false, self.clear());
+        }
+
+        let generation = self.next_generation();
+        let mut newly_pinned = pinned;
+        if let Some(previous) = self.nodes.insert(
+            cid.clone(),
+            NodeCacheEntry {
+                node,
+                generation,
+                bytes,
+                pinned,
+            },
+        ) {
+            newly_pinned = pinned && !previous.pinned;
+            let entry = self
+                .nodes
+                .get_mut(&cid)
+                .expect("entry was inserted before preserving pin state");
+            entry.pinned = previous.pinned || pinned;
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.access_log.push_back((cid, generation));
+
+        let evicted = self.evict_to_limit();
+        self.compact_access_log_if_needed();
+        (newly_pinned, evicted)
+    }
+
+    fn pin_existing(&mut self, cid: &Cid) -> bool {
+        let Some(entry) = self.nodes.get_mut(cid) else {
+            return false;
+        };
+        let was_pinned = entry.pinned;
+        entry.pinned = true;
+        !was_pinned
+    }
+
+    fn unpin_all(&mut self) -> (usize, usize) {
+        let mut unpinned = 0;
+        for entry in self.nodes.values_mut() {
+            if entry.pinned {
+                entry.pinned = false;
+                unpinned += 1;
+            }
+        }
+        let evicted = self.evict_to_limit();
+        self.compact_access_log_if_needed();
+        (unpinned, evicted)
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation
+    }
+
+    fn evict_to_limit(&mut self) -> usize {
+        let mut evicted = 0;
+        let mut scanned_without_eviction = 0usize;
+        while self.exceeds_limit() {
+            let Some((cid, generation)) = self.access_log.pop_front() else {
+                break;
+            };
+
+            let Some(entry) = self.nodes.get(&cid) else {
+                continue;
+            };
+            if entry.generation != generation {
+                continue;
+            }
+
+            if entry.pinned {
+                self.access_log.push_back((cid, generation));
+                scanned_without_eviction += 1;
+                if scanned_without_eviction >= self.access_log.len() {
+                    break;
+                }
+                continue;
+            }
+
+            evicted += self.remove_entry(&cid);
+            scanned_without_eviction = 0;
+        }
+        evicted
+    }
+
+    fn exceeds_limit(&self) -> bool {
+        self.max_nodes
+            .map(|max_nodes| self.nodes.len() > max_nodes)
+            .unwrap_or(false)
+            || self
+                .max_bytes
+                .map(|max_bytes| self.bytes > max_bytes)
+                .unwrap_or(false)
+    }
+
+    fn remove_entry(&mut self, cid: &Cid) -> usize {
+        if let Some(entry) = self.nodes.remove(cid) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+            1
+        } else {
+            0
+        }
+    }
+
+    fn compact_access_log_if_needed(&mut self) {
+        let max_log_len = self.nodes.len().saturating_mul(4).max(64);
+        if self.access_log.len() <= max_log_len {
+            return;
+        }
+
+        self.access_log.retain(|(cid, generation)| {
+            self.nodes
+                .get(cid)
+                .map(|entry| entry.generation == *generation)
+                .unwrap_or(false)
+        });
+    }
+}
+
+/// Cumulative cache and node I/O metrics for a prolly manager.
+///
+/// These counters are store-neutral observations from the tree manager's point
+/// of view. Cache hits are requested node slots served from the in-process
+/// cache. Cache misses are unique node CIDs fetched from the backing store.
+/// Byte counters use serialized node sizes before backend-specific compression,
+/// buffering, or object layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProllyMetricsSnapshot {
+    /// Requested node slots served from the in-process node cache.
+    pub node_cache_hits: u64,
+    /// Unique node CIDs fetched from the backing store.
+    pub node_cache_misses: u64,
+    /// Decoded nodes evicted from the in-process node cache.
+    pub node_cache_evictions: u64,
+    /// Serialized nodes read from the backing store.
+    pub nodes_read: u64,
+    /// Serialized node bytes read from the backing store.
+    pub bytes_read: u64,
+    /// Serialized nodes written to the backing store.
+    pub nodes_written: u64,
+    /// Serialized node bytes written to the backing store.
+    pub bytes_written: u64,
+    /// Successful point-read calls made by the manager.
+    pub store_get_calls: u64,
+    /// Successful ordered batch-read calls made by the manager.
+    pub store_batch_get_calls: u64,
+    /// Unique node keys requested through ordered batch reads.
+    pub store_batch_get_keys: u64,
+    /// Successful point-write calls made by the manager.
+    pub store_put_calls: u64,
+    /// Successful batch-write calls made by the manager.
+    pub store_batch_put_calls: u64,
+    /// Unique serialized nodes passed through batch writes.
+    pub store_batch_put_nodes: u64,
+}
+
+#[derive(Default)]
+struct ProllyMetrics {
+    node_cache_hits: AtomicU64,
+    node_cache_misses: AtomicU64,
+    node_cache_evictions: AtomicU64,
+    nodes_read: AtomicU64,
+    bytes_read: AtomicU64,
+    nodes_written: AtomicU64,
+    bytes_written: AtomicU64,
+    store_get_calls: AtomicU64,
+    store_batch_get_calls: AtomicU64,
+    store_batch_get_keys: AtomicU64,
+    store_put_calls: AtomicU64,
+    store_batch_put_calls: AtomicU64,
+    store_batch_put_nodes: AtomicU64,
+}
+
+impl ProllyMetrics {
+    fn snapshot(&self) -> ProllyMetricsSnapshot {
+        ProllyMetricsSnapshot {
+            node_cache_hits: self.node_cache_hits.load(Ordering::Relaxed),
+            node_cache_misses: self.node_cache_misses.load(Ordering::Relaxed),
+            node_cache_evictions: self.node_cache_evictions.load(Ordering::Relaxed),
+            nodes_read: self.nodes_read.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            nodes_written: self.nodes_written.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            store_get_calls: self.store_get_calls.load(Ordering::Relaxed),
+            store_batch_get_calls: self.store_batch_get_calls.load(Ordering::Relaxed),
+            store_batch_get_keys: self.store_batch_get_keys.load(Ordering::Relaxed),
+            store_put_calls: self.store_put_calls.load(Ordering::Relaxed),
+            store_batch_put_calls: self.store_batch_put_calls.load(Ordering::Relaxed),
+            store_batch_put_nodes: self.store_batch_put_nodes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.node_cache_hits.store(0, Ordering::Relaxed);
+        self.node_cache_misses.store(0, Ordering::Relaxed);
+        self.node_cache_evictions.store(0, Ordering::Relaxed);
+        self.nodes_read.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
+        self.nodes_written.store(0, Ordering::Relaxed);
+        self.bytes_written.store(0, Ordering::Relaxed);
+        self.store_get_calls.store(0, Ordering::Relaxed);
+        self.store_batch_get_calls.store(0, Ordering::Relaxed);
+        self.store_batch_get_keys.store(0, Ordering::Relaxed);
+        self.store_put_calls.store(0, Ordering::Relaxed);
+        self.store_batch_put_calls.store(0, Ordering::Relaxed);
+        self.store_batch_put_nodes.store(0, Ordering::Relaxed);
+    }
+
+    fn add_cache_hits(&self, count: usize) {
+        add_metric(&self.node_cache_hits, count);
+    }
+
+    fn add_cache_misses(&self, count: usize) {
+        add_metric(&self.node_cache_misses, count);
+    }
+
+    fn add_cache_evictions(&self, count: usize) {
+        add_metric(&self.node_cache_evictions, count);
+    }
+
+    fn record_point_read(&self, bytes: usize) {
+        add_metric(&self.store_get_calls, 1);
+        add_metric(&self.nodes_read, 1);
+        add_metric(&self.bytes_read, bytes);
+    }
+
+    fn record_batch_read(&self, keys: usize, loaded_bytes: usize, loaded_nodes: usize) {
+        add_metric(&self.store_batch_get_calls, 1);
+        add_metric(&self.store_batch_get_keys, keys);
+        add_metric(&self.nodes_read, loaded_nodes);
+        add_metric(&self.bytes_read, loaded_bytes);
+    }
+
+    fn record_point_write(&self, bytes: usize) {
+        add_metric(&self.store_put_calls, 1);
+        add_metric(&self.nodes_written, 1);
+        add_metric(&self.bytes_written, bytes);
+    }
+
+    fn record_batch_write(&self, nodes: usize, bytes: usize) {
+        if nodes == 0 {
+            return;
+        }
+
+        add_metric(&self.store_batch_put_calls, 1);
+        add_metric(&self.store_batch_put_nodes, nodes);
+        add_metric(&self.nodes_written, nodes);
+        add_metric(&self.bytes_written, bytes);
+    }
+}
+
+fn add_metric(counter: &AtomicU64, value: usize) {
+    if value > 0 {
+        counter.fetch_add(value as u64, Ordering::Relaxed);
+    }
+}
+
+fn loaded_node_totals(loaded: &[Option<Vec<u8>>]) -> (usize, usize) {
+    loaded
+        .iter()
+        .filter_map(|bytes| bytes.as_ref())
+        .fold((0, 0), |(nodes, bytes), value| {
+            (nodes + 1, bytes + value.len())
+        })
+}
+
+#[cfg(feature = "async-store")]
+async fn async_batch_get_ordered_unique_bounded<S>(
+    store: &S,
+    keys: &[&[u8]],
+    max_batch_len: usize,
+) -> Result<Vec<Option<Vec<u8>>>, Error>
+where
+    S: AsyncStore,
+    S::Error: Send + Sync,
+{
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_batch_len = max_batch_len.max(1);
+    if keys.len() <= max_batch_len {
+        let values = store
+            .batch_get_ordered_unique(keys)
+            .await
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        if values.len() != keys.len() {
+            return Err(Error::InvalidNode);
+        }
+        return Ok(values);
+    }
+
+    let mut values = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(max_batch_len) {
+        let chunk_values = store
+            .batch_get_ordered_unique(chunk)
+            .await
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        if chunk_values.len() != chunk.len() {
+            return Err(Error::InvalidNode);
+        }
+        values.extend(chunk_values);
+    }
+    Ok(values)
+}
 
 /// Prolly tree manager
 ///
@@ -287,8 +676,214 @@ pub use parallel::{DefaultParallelRebalancer, ParallelConfig, ParallelRebalancer
 pub struct Prolly<S: Store> {
     store: S,
     config: Config,
-    node_cache: RwLock<HashMap<Cid, Arc<Node>>>,
+    node_cache: RwLock<NodeCache>,
     rightmost_path_cache: RwLock<Option<(Cid, Vec<CachedRightmostPathEntry>)>>,
+    metrics: ProllyMetrics,
+}
+
+/// Async Prolly tree manager.
+///
+/// `AsyncProlly` is available behind the `async-store` feature. It keeps the
+/// synchronous [`Prolly`] API untouched while allowing remote, browser, and
+/// object-store backends to serve tree reads without blocking on the core
+/// `Store` trait.
+///
+/// The async surface covers reads, writes, range scans, diff, merge, CRDT merge,
+/// stats, cache pinning, large-value helpers, and route-planned batch mutation
+/// without requiring a Tokio dependency.
+#[cfg(feature = "async-store")]
+pub struct AsyncProlly<S: AsyncStore> {
+    store: S,
+    config: Config,
+    node_cache: RwLock<NodeCache>,
+    rightmost_path_cache: RwLock<Option<(Cid, Vec<CachedRightmostPathEntry>)>>,
+    metrics: ProllyMetrics,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncWriteCollector {
+    nodes: Vec<(Cid, Vec<u8>)>,
+    seen_cids: HashSet<Cid>,
+    cache_nodes: Vec<(Cid, Node)>,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncBuildNodeSummary {
+    cid: Cid,
+    first_key: Vec<u8>,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncBatchLeafGroup {
+    leaf: Node,
+    route_path: Option<Arc<AsyncBatchRoutePath>>,
+    mutations: Arc<Vec<Mutation>>,
+    range: Range<usize>,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncBatchRouteFrame {
+    cid: Cid,
+    path: Option<Arc<AsyncBatchRoutePath>>,
+    mutations: Arc<Vec<Mutation>>,
+    range: Range<usize>,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncBatchRoutePath {
+    parent: Option<Arc<AsyncBatchRoutePath>>,
+    node: Arc<Node>,
+    cid: Cid,
+    child_index: usize,
+}
+
+#[cfg(feature = "async-store")]
+#[derive(Clone)]
+struct AsyncBatchChildRef {
+    cid: Cid,
+    first_key: Vec<u8>,
+    level: u8,
+}
+
+#[cfg(feature = "async-store")]
+type AsyncBatchChildReplacements = Vec<(usize, Vec<AsyncBatchChildRef>)>;
+
+#[cfg(feature = "async-store")]
+#[derive(Clone)]
+struct AsyncBatchParentLink {
+    parent_cid: Cid,
+    child_index: usize,
+}
+
+#[cfg(feature = "async-store")]
+#[derive(Clone)]
+struct AsyncBatchAncestorContext {
+    node: Node,
+    parent: Option<AsyncBatchParentLink>,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncBatchApplyResult {
+    root: Option<Cid>,
+    changed_leaves: usize,
+}
+
+#[cfg(feature = "async-store")]
+#[derive(Clone)]
+struct AsyncRightmostPathEntry {
+    cid: Cid,
+    node: Node,
+    child_index: usize,
+}
+
+#[cfg(feature = "async-store")]
+struct AsyncAppendTreeUpdate {
+    root: Cid,
+    rightmost_path: Vec<AsyncRightmostPathEntry>,
+}
+
+#[cfg(feature = "async-store")]
+const RIGHTMOST_PATH_HINT_NAMESPACE: &[u8] = b"prolly:rightmost-path:v1";
+
+#[cfg(feature = "async-store")]
+#[derive(Serialize, Deserialize)]
+struct AsyncRightmostPathHint {
+    version: u8,
+    entries: Vec<AsyncRightmostPathHintEntry>,
+}
+
+#[cfg(feature = "async-store")]
+#[derive(Serialize, Deserialize)]
+struct AsyncRightmostPathHintEntry {
+    cid: Cid,
+    child_index: usize,
+}
+
+#[cfg(feature = "async-store")]
+impl AsyncWriteCollector {
+    fn new_cached() -> Self {
+        Self {
+            nodes: Vec::new(),
+            seen_cids: HashSet::new(),
+            cache_nodes: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, node: &Node) -> Cid {
+        let bytes = node.to_bytes();
+        let cid = Cid::from_bytes(&bytes);
+        if !self.seen_cids.insert(cid.clone()) {
+            return cid;
+        }
+
+        self.cache_nodes.push((cid.clone(), node.clone()));
+        self.nodes.push((cid.clone(), bytes));
+        cid
+    }
+
+    fn add_many(&mut self, nodes: Vec<Node>) -> Vec<Cid> {
+        nodes.iter().map(|node| self.add(node)).collect()
+    }
+
+    async fn flush<S>(&self, store: &S) -> Result<(), Error>
+    where
+        S: AsyncStore,
+        S::Error: Send + Sync,
+    {
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+
+        let entries = self
+            .nodes
+            .iter()
+            .map(|(cid, bytes)| (cid.as_bytes(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        store
+            .batch_put(&entries)
+            .await
+            .map_err(|e| Error::Store(Box::new(e)))
+    }
+
+    async fn flush_with_hint<S>(
+        &self,
+        store: &S,
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), Error>
+    where
+        S: AsyncStore,
+        S::Error: Send + Sync,
+    {
+        let entries = self
+            .nodes
+            .iter()
+            .map(|(cid, bytes)| (cid.as_bytes(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        store
+            .batch_put_with_hint(&entries, namespace, key, value)
+            .await
+            .map_err(|e| Error::Store(Box::new(e)))
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn bytes_len(&self) -> usize {
+        self.nodes.iter().map(|(_, bytes)| bytes.len()).sum()
+    }
+
+    fn cache_nodes<S: AsyncStore>(&self, prolly: &AsyncProlly<S>) {
+        let mut evictions = 0;
+        if let Ok(mut cache) = prolly.node_cache.write() {
+            for (cid, node) in &self.cache_nodes {
+                evictions += cache.insert(cid.clone(), Arc::new(node.clone()), node.encoded_len());
+            }
+        }
+        prolly.metrics.add_cache_evictions(evictions);
+    }
 }
 
 #[derive(Clone)]
@@ -296,6 +891,91 @@ pub(crate) struct CachedRightmostPathEntry {
     pub cid: Cid,
     pub node: Node,
     pub child_index: usize,
+}
+
+/// Half-open key range that was recently changed.
+///
+/// `start` is inclusive and `end` is exclusive. `end == None` means the span
+/// extends to the end of the keyspace. Changed-span hints are performance
+/// sidecars for sync and indexing jobs; they do not change tree semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedSpan {
+    /// Inclusive lower key bound.
+    pub start: Vec<u8>,
+    /// Exclusive upper key bound, or `None` for the rest of the keyspace.
+    pub end: Option<Vec<u8>>,
+}
+
+impl ChangedSpan {
+    /// Create a half-open changed span `[start, end)`.
+    pub fn new(start: impl Into<Vec<u8>>, end: Option<Vec<u8>>) -> Self {
+        Self {
+            start: start.into(),
+            end,
+        }
+    }
+
+    /// Create a changed span for one exact key.
+    pub fn from_key(key: impl Into<Vec<u8>>) -> Self {
+        let start = key.into();
+        let mut end = start.clone();
+        end.push(0);
+        Self {
+            start,
+            end: Some(end),
+        }
+    }
+
+    /// Create a changed span for every key under `prefix`.
+    pub fn for_prefix(prefix: impl Into<Vec<u8>>) -> Self {
+        let start = prefix.into();
+        let end = key::prefix_end(&start);
+        Self { start, end }
+    }
+}
+
+/// Recently changed key spans for a specific root transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedSpanHint {
+    /// Root before the change.
+    pub base_root: Option<Cid>,
+    /// Root after the change.
+    pub changed_root: Option<Cid>,
+    /// Normalized, sorted, non-overlapping changed spans.
+    pub spans: Vec<ChangedSpan>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChangedSpanHintWire {
+    version: u8,
+    base_root: Option<Cid>,
+    changed_root: Option<Cid>,
+    spans: Vec<ChangedSpan>,
+}
+
+struct PrefixPathHintEntryWithNode {
+    cid: Cid,
+    node: Arc<Node>,
+    child_index: usize,
+}
+
+const PREFIX_PATH_HINT_NAMESPACE: &[u8] = b"prolly:prefix-path:v1";
+const PREFIX_PATH_HINT_VERSION: u8 = 1;
+const CHANGED_SPANS_HINT_NAMESPACE: &[u8] = b"prolly:changed-spans:v1";
+const CHANGED_SPANS_HINT_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct PrefixPathHint {
+    version: u8,
+    root: Cid,
+    prefix: Vec<u8>,
+    entries: Vec<PrefixPathHintEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PrefixPathHintEntry {
+    cid: Cid,
+    child_index: usize,
 }
 
 fn is_rightmost_append_path(path: &[(Node, usize)], key: &[u8]) -> bool {
@@ -318,11 +998,14 @@ impl<S: Store> Prolly<S> {
     /// * `store` - Storage backend implementing the `Store` trait
     /// * `config` - Tree configuration (chunking parameters, encoding, etc.)
     pub fn new(store: S, config: Config) -> Self {
+        let node_cache_max_nodes = config.node_cache_max_nodes;
+        let node_cache_max_bytes = config.node_cache_max_bytes;
         Self {
             store,
             config,
-            node_cache: RwLock::new(HashMap::new()),
+            node_cache: RwLock::new(NodeCache::new(node_cache_max_nodes, node_cache_max_bytes)),
             rightmost_path_cache: RwLock::new(None),
+            metrics: ProllyMetrics::default(),
         }
     }
 
@@ -334,6 +1017,39 @@ impl<S: Store> Prolly<S> {
             root: None,
             config: self.config.clone(),
         }
+    }
+
+    /// Build a tree from key/value entries using [`BatchBuilder`].
+    ///
+    /// The builder sorts entries by byte-lexicographic key order before
+    /// chunking, so callers may provide unsorted input. Duplicate keys are
+    /// preserved with the same semantics as [`BatchBuilder`].
+    pub fn build_from_entries(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Tree, Error>
+    where
+        S: Clone + Send + Sync,
+        S::Error: Send + Sync,
+    {
+        let mut builder = builder::BatchBuilder::new(self.store.clone(), self.config.clone());
+        for (key, value) in entries {
+            builder.add(key, value);
+        }
+        builder.build()
+    }
+
+    /// Build a tree from entries that are already sorted by key.
+    ///
+    /// This delegates to [`SortedBatchBuilder`] and returns
+    /// [`Error::UnsortedInput`] if any key is lower than the previous key.
+    pub fn build_from_sorted_entries(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Tree, Error>
+    where
+        S: Clone + Send + Sync,
+        S::Error: Send + Sync,
+    {
+        let mut builder = builder::SortedBatchBuilder::new(self.store.clone(), self.config.clone());
+        for (key, value) in entries {
+            builder.add(key, value)?;
+        }
+        builder.build()
     }
 
     /// Get value by key from the tree.
@@ -377,6 +1093,32 @@ impl<S: Store> Prolly<S> {
             // Descend to child
             cid = child_cid_at(&node, idx)?;
         }
+    }
+
+    /// Get a stored large-value reference by key.
+    ///
+    /// Non-envelope values are returned as [`blob::ValueRef::Inline`], so this
+    /// can inspect trees that mix ordinary raw values and offloaded blob
+    /// references.
+    pub fn get_value_ref(&self, tree: &Tree, key: &[u8]) -> Result<Option<blob::ValueRef>, Error> {
+        self.get(tree, key)?
+            .map(|value| blob::ValueRef::from_stored_bytes(&value))
+            .transpose()
+    }
+
+    /// Get a value by key, resolving offloaded blob references when present.
+    pub fn get_large_value<B>(
+        &self,
+        blob_store: &B,
+        tree: &Tree,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error>
+    where
+        B: BlobStore,
+    {
+        self.get(tree, key)?
+            .map(|value| blob::resolve_stored_value(blob_store, &value))
+            .transpose()
     }
 
     /// Get multiple values from the tree while preserving caller order.
@@ -516,12 +1258,35 @@ impl<S: Store> Prolly<S> {
         )?
         .ok_or(Error::InvalidNode)?;
         collector.flush(self.store())?;
+        self.record_batch_write_metrics(collector.len(), collector.bytes_len());
         collector.cache_nodes(self)?;
 
         Ok(Tree {
             root: Some(new_root),
             config: tree.config.clone(),
         })
+    }
+
+    /// Insert or update a value, offloading large payloads to a blob store.
+    ///
+    /// Values larger than `config.inline_threshold` are written to `blob_store`
+    /// and represented in the tree by a compact content-addressed reference.
+    /// Smaller values are stored as raw leaf bytes unless they start with the
+    /// value-reference magic prefix, in which case they are escaped with an
+    /// inline envelope.
+    pub fn put_large_value<B>(
+        &self,
+        blob_store: &B,
+        tree: &Tree,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        config: LargeValueConfig,
+    ) -> Result<Tree, Error>
+    where
+        B: BlobStore,
+    {
+        let stored = blob::encode_stored_value(blob_store, value, &config)?;
+        self.put(tree, key, stored)
     }
 
     /// Delete a key from the tree.
@@ -575,6 +1340,7 @@ impl<S: Store> Prolly<S> {
             &mut collector,
         )?;
         collector.flush(self.store())?;
+        self.record_batch_write_metrics(collector.len(), collector.bytes_len());
         collector.cache_nodes(self)?;
 
         Ok(Tree {
@@ -628,8 +1394,77 @@ impl<S: Store> Prolly<S> {
         tree: &Tree,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> Result<RangeIter<'a, S>, Error> {
+    ) -> Result<range::RangeIter<'a, S>, Error> {
         range::create_range_iter(self, tree, start, end)
+    }
+
+    /// Create a range iterator that resumes strictly after `after_key`.
+    ///
+    /// Persist the last key successfully processed, then resume with this
+    /// method to avoid yielding that key again. The `end` bound remains
+    /// exclusive.
+    pub fn range_after<'a>(
+        &'a self,
+        tree: &Tree,
+        after_key: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<range::RangeIter<'a, S>, Error> {
+        range::create_range_after_iter(self, tree, after_key, end)
+    }
+
+    /// Create a range iterator from a stable range cursor.
+    pub fn range_from_cursor<'a>(
+        &'a self,
+        tree: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+    ) -> Result<range::RangeIter<'a, S>, Error> {
+        match cursor.after() {
+            Some(after_key) => self.range_after(tree, after_key, end),
+            None => self.range(tree, &[], end),
+        }
+    }
+
+    /// Read a bounded page from a range scan.
+    ///
+    /// `cursor` is either [`RangeCursor::start`](crate::RangeCursor::start) or
+    /// a cursor returned by a previous page. `end` is exclusive. When `limit`
+    /// is zero this returns an empty page with the original cursor so callers
+    /// can treat zero-sized requests as no-ops.
+    pub fn range_page(
+        &self,
+        tree: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<range::RangePage, Error> {
+        if limit == 0 {
+            return Ok(range::RangePage {
+                entries: Vec::new(),
+                next_cursor: Some(cursor.clone()),
+            });
+        }
+
+        let mut iter = self.range_from_cursor(tree, cursor, end)?;
+        let mut entries = Vec::with_capacity(limit);
+
+        for _ in 0..limit {
+            let Some(item) = iter.next() else {
+                return Ok(range::RangePage {
+                    entries,
+                    next_cursor: None,
+                });
+            };
+            entries.push(item?);
+        }
+
+        let next_cursor = entries
+            .last()
+            .map(|(key, _)| range::RangeCursor::after_key(key.clone()));
+        Ok(range::RangePage {
+            entries,
+            next_cursor,
+        })
     }
 
     /// Compute the difference between two trees.
@@ -683,6 +1518,80 @@ impl<S: Store> Prolly<S> {
         diff::compute_range_diff(self, base, other, start, end)
     }
 
+    /// Compute diffs from a stable cursor.
+    ///
+    /// This resumes strictly after the cursor key, so callers can persist the
+    /// last processed diff key and avoid re-processing it on the next scan.
+    /// `end` remains an exclusive upper bound.
+    pub fn diff_from_cursor(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<Diff>, Error> {
+        let start = cursor.after().unwrap_or(&[]);
+        let mut diffs = self.range_diff(base, other, start, end)?;
+        if let Some(after_key) = cursor.after() {
+            diffs.retain(|diff| diff.key() > after_key);
+        }
+        Ok(diffs)
+    }
+
+    /// Read a bounded page of diffs from a stable cursor.
+    ///
+    /// `cursor` is either [`RangeCursor::start`](crate::RangeCursor::start) or
+    /// a cursor returned by a previous page. `end` is exclusive. When `limit`
+    /// is zero this returns an empty page with the original cursor so callers
+    /// can treat zero-sized requests as no-ops.
+    pub fn diff_page(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<diff::DiffPage, Error> {
+        if limit == 0 {
+            return Ok(diff::DiffPage {
+                diffs: Vec::new(),
+                next_cursor: Some(cursor.clone()),
+            });
+        }
+
+        let mut diffs = self.diff_from_cursor(base, other, cursor, end)?;
+        let has_more = diffs.len() > limit;
+        if has_more {
+            diffs.truncate(limit);
+        }
+
+        let next_cursor = if has_more {
+            diffs
+                .last()
+                .map(|diff| range::RangeCursor::after_key(diff.key().to_vec()))
+        } else {
+            None
+        };
+
+        Ok(diff::DiffPage { diffs, next_cursor })
+    }
+
+    /// Read a bounded page from the structural diff traversal.
+    ///
+    /// This preserves the CID frontier between pages instead of resuming from
+    /// a key. It is better suited to long-running sync or indexing jobs where
+    /// preserving subtree pruning across checkpoints matters. Pass `None` to
+    /// start, then pass the returned cursor until `next_cursor` is `None`.
+    pub fn structural_diff_page(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        cursor: Option<&diff::StructuralDiffCursor>,
+        limit: usize,
+    ) -> Result<diff::StructuralDiffPage, Error> {
+        diff::structural_diff_page(self, base, other, cursor, limit)
+    }
+
     /// Merge two trees using three-way merge.
     ///
     /// Performs a three-way merge using `base` as the common ancestor.
@@ -698,20 +1607,22 @@ impl<S: Store> Prolly<S> {
     /// # Returns
     /// * `Ok(merged_tree)` - The merged tree
     /// * `Err(Error::Conflict)` - If a conflict occurs and no resolver is provided
-    ///   or the resolver returns `None`
+    ///   or the resolver returns `Resolution::Unresolved`
     ///
     /// # Conflict Handling
     /// A conflict occurs when both `left` and `right` modify the same key differently
     /// from `base`. When this happens:
     /// - If a resolver is provided, it's called with the conflict information
-    /// - If the resolver returns `Some(value)`, that value is used
-    /// - If the resolver returns `None` or no resolver is provided, an error is returned
+    /// - If the resolver returns `Resolution::Value`, that value is used
+    /// - If the resolver returns `Resolution::Delete`, the key is removed
+    /// - If the resolver returns `Resolution::Unresolved` or no resolver is provided,
+    ///   an error is returned
     ///
     /// Keys that have the same value in both trees are included once in the result.
     ///
     /// # Example
     /// ```
-    /// use prolly::{Prolly, MemStore, Config, Resolver};
+    /// use prolly::{Prolly, MemStore, Config};
     ///
     /// let store = MemStore::new();
     /// let prolly = Prolly::new(store, Config::default());
@@ -740,6 +1651,110 @@ impl<S: Store> Prolly<S> {
         resolver: Option<Resolver>,
     ) -> Result<Tree, Error> {
         diff::merge_trees(self, base, left, right, resolver)
+    }
+
+    /// Perform a three-way merge and return structured diagnostic trace events.
+    ///
+    /// This is the diagnostics-oriented counterpart to [`Prolly::merge`]. The
+    /// returned [`crate::MergeExplanation`] keeps its trace even when the merge
+    /// result is an error, which is useful for custom resolver debugging and
+    /// sync-job observability.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, MergeTraceEvent, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let base = prolly
+    ///     .put(&prolly.create(), b"a".to_vec(), b"1".to_vec())
+    ///     .unwrap();
+    /// let left = prolly
+    ///     .put(&base, b"b".to_vec(), b"2".to_vec())
+    ///     .unwrap();
+    /// let right = prolly
+    ///     .put(&base, b"c".to_vec(), b"3".to_vec())
+    ///     .unwrap();
+    ///
+    /// let explanation = prolly.merge_explain(&base, &left, &right, None);
+    /// assert!(explanation
+    ///     .trace
+    ///     .events
+    ///     .iter()
+    ///     .any(|event| matches!(event, MergeTraceEvent::BatchMerge { .. })));
+    ///
+    /// let merged = explanation.into_result().unwrap();
+    /// assert!(prolly.get(&merged, b"c").unwrap().is_some());
+    /// ```
+    pub fn merge_explain(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        resolver: Option<Resolver>,
+    ) -> diff::MergeExplanation {
+        diff::merge_trees_explain(self, base, left, right, resolver)
+    }
+
+    /// Merge only right-side changes whose keys are in `[start, end)`.
+    ///
+    /// Keys outside the range are left exactly as they are in `left`. Conflict
+    /// detection and resolver behavior match [`Prolly::merge`], but only for
+    /// keys inside the requested range.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let base = prolly
+    ///     .put(&prolly.create(), b"doc/1/title".to_vec(), b"old".to_vec())
+    ///     .unwrap();
+    /// let left = prolly
+    ///     .put(&base, b"doc/2/title".to_vec(), b"local".to_vec())
+    ///     .unwrap();
+    /// let right = prolly
+    ///     .put(&base, b"doc/1/title".to_vec(), b"remote".to_vec())
+    ///     .unwrap();
+    ///
+    /// let merged = prolly
+    ///     .merge_range(&base, &left, &right, b"doc/1/", Some(b"doc/2/"), None)
+    ///     .unwrap();
+    ///
+    /// assert_eq!(
+    ///     prolly.get(&merged, b"doc/1/title").unwrap(),
+    ///     Some(b"remote".to_vec())
+    /// );
+    /// assert_eq!(
+    ///     prolly.get(&merged, b"doc/2/title").unwrap(),
+    ///     Some(b"local".to_vec())
+    /// );
+    /// ```
+    pub fn merge_range(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        start: &[u8],
+        end: Option<&[u8]>,
+        resolver: Option<Resolver>,
+    ) -> Result<Tree, Error> {
+        diff::merge_trees_range(self, base, left, right, start, end, resolver)
+    }
+
+    /// Merge only right-side changes whose keys start with `prefix`.
+    ///
+    /// This is a convenience wrapper over [`Prolly::merge_range`] using the
+    /// lexicographic prefix bounds from [`crate::prefix_range`].
+    pub fn merge_prefix(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        prefix: &[u8],
+        resolver: Option<Resolver>,
+    ) -> Result<Tree, Error> {
+        let (start, end) = key::prefix_range(prefix);
+        self.merge_range(base, left, right, &start, end.as_deref(), resolver)
     }
 
     /// Collect comprehensive statistics about a tree
@@ -784,6 +1799,720 @@ impl<S: Store> Prolly<S> {
 
         // Return result
         Ok(stats)
+    }
+
+    /// Return a deterministic debug view of the tree grouped by level.
+    ///
+    /// This is intended for diagnostics, CLI inspection, and tests that need
+    /// to inspect tree shape without depending on private node traversal code.
+    /// Levels are ordered from root to leaves, and each node includes its CID,
+    /// entry count, fill factor, encoded size, and key range.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let tree = prolly.put(&prolly.create(), b"k".to_vec(), b"v".to_vec()).unwrap();
+    ///
+    /// let view = prolly.debug_tree(&tree).unwrap();
+    /// assert!(view.to_text().contains("level 0"));
+    /// ```
+    pub fn debug_tree(&self, tree: &Tree) -> Result<debug::TreeDebugView, Error> {
+        debug::collect_tree_debug_view(self, tree)
+    }
+
+    /// Compare two trees by CID sharing and rewritten subtrees.
+    ///
+    /// Shared nodes are counted once. Left-only and right-only nodes represent
+    /// subtrees that were rewritten, added, or removed between the two roots.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let before = prolly.put(&prolly.create(), b"k".to_vec(), b"v1".to_vec()).unwrap();
+    /// let after = prolly.put(&before, b"k".to_vec(), b"v2".to_vec()).unwrap();
+    ///
+    /// let comparison = prolly.debug_compare_trees(&before, &after).unwrap();
+    /// assert_eq!(comparison.left_only_nodes, 1);
+    /// assert_eq!(comparison.right_only_nodes, 1);
+    /// ```
+    pub fn debug_compare_trees(
+        &self,
+        left: &Tree,
+        right: &Tree,
+    ) -> Result<debug::TreeDebugComparison, Error> {
+        debug::compare_tree_debug_views(self, left, right)
+    }
+
+    /// Compare structural statistics between two trees.
+    ///
+    /// This collects [`TreeStats`] for both trees and returns a combined report
+    /// with the baseline stats, candidate stats, absolute deltas, and
+    /// percentage deltas. Deltas are computed as `after - before`.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let before = prolly.create();
+    /// let after = prolly.put(&before, b"key".to_vec(), b"value".to_vec()).unwrap();
+    ///
+    /// let comparison = prolly.stats_diff(&before, &after).unwrap();
+    /// assert_eq!(comparison.absolute.total_key_value_pairs_diff, 1);
+    /// ```
+    pub fn stats_diff(&self, before: &Tree, after: &Tree) -> Result<StatsComparison, Error> {
+        let before_stats = self.collect_stats(before)?;
+        let after_stats = self.collect_stats(after)?;
+        Ok(StatsComparison::new(before_stats, after_stats))
+    }
+
+    /// Mark all content-addressed nodes reachable from retained tree roots.
+    ///
+    /// This is the safe first phase of garbage collection. Empty roots are
+    /// ignored, duplicate roots and shared subtrees are counted once, and the
+    /// returned CID list is sorted for deterministic planning.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let tree = prolly.create();
+    /// let tree = prolly.put(&tree, b"k".to_vec(), b"v".to_vec()).unwrap();
+    ///
+    /// let reachable = prolly.mark_reachable(&[tree]).unwrap();
+    /// assert_eq!(reachable.live_nodes, reachable.cids().len());
+    /// ```
+    pub fn mark_reachable(&self, roots: &[Tree]) -> Result<GcReachability, Error> {
+        let parallelism = if self.store.prefers_batch_reads() {
+            STATS_FRONTIER_PREFETCH_PARALLELISM
+        } else {
+            1
+        };
+        let mut seen = HashSet::new();
+        let mut frontier = Vec::new();
+
+        for tree in roots {
+            if let Some(root_cid) = &tree.root {
+                if seen.insert(root_cid.clone()) {
+                    frontier.push(root_cid.clone());
+                }
+            }
+        }
+
+        let mut live_cids = Vec::new();
+        let mut live_bytes = 0usize;
+        let mut leaf_nodes = 0usize;
+        let mut internal_nodes = 0usize;
+
+        while !frontier.is_empty() {
+            let current = std::mem::take(&mut frontier);
+            let nodes = self.load_many_ordered_with_parallelism(&current, parallelism)?;
+
+            for (cid, node) in current.into_iter().zip(nodes) {
+                if node.keys.len() != node.vals.len() {
+                    return Err(Error::InvalidNode);
+                }
+
+                live_bytes += node.encoded_len();
+                if node.leaf {
+                    leaf_nodes += 1;
+                } else {
+                    internal_nodes += 1;
+                    frontier.reserve(node.vals.len());
+                    for idx in 0..node.len() {
+                        let child_cid = child_cid_at(&node, idx)?;
+                        if seen.insert(child_cid.clone()) {
+                            frontier.push(child_cid);
+                        }
+                    }
+                }
+                live_cids.push(cid);
+            }
+        }
+
+        gc::sort_cids(&mut live_cids);
+        Ok(GcReachability {
+            live_nodes: live_cids.len(),
+            live_cids,
+            live_bytes,
+            leaf_nodes,
+            internal_nodes,
+        })
+    }
+
+    /// Plan which content-addressed nodes a destination store is missing for a tree.
+    ///
+    /// This is the dry-run phase for Merkle-style store synchronization. The
+    /// source tree is walked from its root, the destination is checked with an
+    /// ordered batch read, and any present destination bytes are verified against
+    /// their requested CID. Missing source bytes are also verified before their
+    /// byte weight is counted.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    /// use std::sync::Arc;
+    ///
+    /// let source = Arc::new(MemStore::new());
+    /// let destination = Arc::new(MemStore::new());
+    /// let prolly = Prolly::new(source, Config::default());
+    ///
+    /// let tree = prolly.create();
+    /// let tree = prolly.put(&tree, b"k".to_vec(), b"v".to_vec()).unwrap();
+    ///
+    /// let plan = prolly.plan_missing_nodes(&tree, &destination).unwrap();
+    /// assert_eq!(plan.missing_nodes, plan.missing_cids().len());
+    /// ```
+    pub fn plan_missing_nodes<D>(
+        &self,
+        tree: &Tree,
+        destination: &D,
+    ) -> Result<MissingNodePlan, Error>
+    where
+        D: Store,
+    {
+        let (plan, _) = self.prepare_missing_nodes(tree, destination)?;
+        Ok(plan)
+    }
+
+    /// Copy all destination-missing nodes required by `tree`.
+    ///
+    /// The destination receives only immutable content-addressed node bytes it
+    /// does not already have. Source and destination bytes are verified by CID
+    /// before the copy succeeds.
+    ///
+    /// # Example
+    /// ```
+    /// use prolly::{Config, MemStore, Prolly};
+    /// use std::sync::Arc;
+    ///
+    /// let source = Arc::new(MemStore::new());
+    /// let destination = Arc::new(MemStore::new());
+    /// let source_prolly = Prolly::new(source, Config::default());
+    ///
+    /// let tree = source_prolly.create();
+    /// let tree = source_prolly
+    ///     .put(&tree, b"k".to_vec(), b"v".to_vec())
+    ///     .unwrap();
+    ///
+    /// let copied = source_prolly.copy_missing_nodes(&tree, &destination).unwrap();
+    /// assert_eq!(copied.copied_nodes, copied.plan.missing_nodes);
+    ///
+    /// let destination_prolly = Prolly::new(destination, tree.config.clone());
+    /// assert_eq!(destination_prolly.get(&tree, b"k").unwrap(), Some(b"v".to_vec()));
+    /// ```
+    pub fn copy_missing_nodes<D>(
+        &self,
+        tree: &Tree,
+        destination: &D,
+    ) -> Result<MissingNodeCopy, Error>
+    where
+        D: Store,
+    {
+        let (plan, node_bytes) = self.prepare_missing_nodes(tree, destination)?;
+        let copied_nodes = node_bytes.len();
+        let copied_bytes = node_bytes
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>();
+
+        if !node_bytes.is_empty() {
+            let entries = node_bytes
+                .iter()
+                .map(|(cid, bytes)| (cid.as_bytes(), bytes.as_slice()))
+                .collect::<Vec<_>>();
+            destination
+                .batch_put(&entries)
+                .map_err(|err| Error::Store(Box::new(err)))?;
+        }
+
+        Ok(MissingNodeCopy {
+            plan,
+            copied_nodes,
+            copied_bytes,
+        })
+    }
+
+    fn prepare_missing_nodes<D>(
+        &self,
+        tree: &Tree,
+        destination: &D,
+    ) -> Result<PreparedMissingNodes, Error>
+    where
+        D: Store,
+    {
+        let reachability = self.mark_reachable(std::slice::from_ref(tree))?;
+        let required_nodes = reachability.live_nodes;
+        let required_bytes = reachability.live_bytes;
+        let required_cids = reachability.live_cids;
+
+        if required_cids.is_empty() {
+            return Ok((
+                MissingNodePlan {
+                    required_cids,
+                    required_nodes,
+                    required_bytes,
+                    missing_cids: Vec::new(),
+                    missing_nodes: 0,
+                    missing_bytes: 0,
+                },
+                Vec::new(),
+            ));
+        }
+
+        let destination_keys = required_cids
+            .iter()
+            .map(|cid| cid.as_bytes())
+            .collect::<Vec<_>>();
+        let destination_values = destination
+            .batch_get_ordered_unique(&destination_keys)
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        if destination_values.len() != required_cids.len() {
+            return Err(Error::InvalidNode);
+        }
+
+        let mut missing_cids = Vec::new();
+        for (cid, value) in required_cids.iter().zip(destination_values) {
+            match value {
+                Some(bytes) => self::sync::verify_node_bytes(cid, &bytes)?,
+                None => missing_cids.push(cid.clone()),
+            }
+        }
+
+        let missing_keys = missing_cids
+            .iter()
+            .map(|cid| cid.as_bytes())
+            .collect::<Vec<_>>();
+        let source_values = self
+            .store
+            .batch_get_ordered_unique(&missing_keys)
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        if source_values.len() != missing_cids.len() {
+            return Err(Error::InvalidNode);
+        }
+
+        let mut missing_bytes = 0usize;
+        let mut node_bytes = Vec::with_capacity(missing_cids.len());
+        for (cid, value) in missing_cids.iter().zip(source_values) {
+            let bytes = value.ok_or_else(|| Error::NotFound(cid.clone()))?;
+            self::sync::verify_node_bytes(cid, &bytes)?;
+            missing_bytes += bytes.len();
+            node_bytes.push((cid.clone(), bytes));
+        }
+
+        Ok((
+            MissingNodePlan {
+                required_cids,
+                required_nodes,
+                required_bytes,
+                missing_nodes: missing_cids.len(),
+                missing_cids,
+                missing_bytes,
+            },
+            node_bytes,
+        ))
+    }
+
+    /// Build a dry-run garbage-collection plan from retained roots and
+    /// caller-supplied candidate CIDs.
+    ///
+    /// The generic [`Store`] trait cannot list all stored nodes, so callers
+    /// provide the candidate set. Pass every content CID that may be swept, and
+    /// pass every tree root that must be retained. Unreachable candidates that
+    /// are present in the store are reported as reclaimable; missing candidates
+    /// are counted separately and never treated as reclaimable bytes.
+    pub fn plan_gc<I, C>(&self, roots: &[Tree], candidates: I) -> Result<GcPlan, Error>
+    where
+        I: IntoIterator<Item = C>,
+        C: Borrow<Cid>,
+    {
+        let reachability = self.mark_reachable(roots)?;
+        let live_cids = reachability
+            .live_cids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut seen_candidates = HashSet::new();
+        let mut reclaimable_cids = Vec::new();
+        let mut reclaimable_bytes = 0usize;
+        let mut missing_candidates = 0usize;
+        let mut candidate_nodes = 0usize;
+
+        for candidate in candidates {
+            let cid = candidate.borrow();
+            if !seen_candidates.insert(cid.clone()) {
+                continue;
+            }
+            candidate_nodes += 1;
+
+            if live_cids.contains(cid) {
+                continue;
+            }
+
+            match self
+                .store
+                .get(cid.as_bytes())
+                .map_err(|err| Error::Store(Box::new(err)))?
+            {
+                Some(bytes) => {
+                    reclaimable_bytes += bytes.len();
+                    reclaimable_cids.push(cid.clone());
+                }
+                None => {
+                    missing_candidates += 1;
+                }
+            }
+        }
+
+        gc::sort_cids(&mut reclaimable_cids);
+        Ok(GcPlan {
+            reachability,
+            candidate_nodes,
+            reclaimable_nodes: reclaimable_cids.len(),
+            reclaimable_cids,
+            reclaimable_bytes,
+            missing_candidates,
+        })
+    }
+
+    /// Delete unreachable candidate nodes from the backing store.
+    ///
+    /// This runs [`Prolly::plan_gc`] first, then deletes exactly the plan's
+    /// reclaimable candidates with a single store batch. The manager cache is
+    /// cleared after deletion so swept nodes are not still readable from this
+    /// process' in-memory cache.
+    pub fn sweep_gc<I, C>(&self, roots: &[Tree], candidates: I) -> Result<GcSweep, Error>
+    where
+        I: IntoIterator<Item = C>,
+        C: Borrow<Cid>,
+    {
+        let plan = self.plan_gc(roots, candidates)?;
+        let deleted_nodes = plan.reclaimable_nodes;
+        let deleted_bytes = plan.reclaimable_bytes;
+
+        if !plan.reclaimable_cids.is_empty() {
+            let ops = plan
+                .reclaimable_cids
+                .iter()
+                .map(|cid| store::BatchOp::Delete {
+                    key: cid.as_bytes(),
+                })
+                .collect::<Vec<_>>();
+            self.store
+                .batch(&ops)
+                .map_err(|err| Error::Store(Box::new(err)))?;
+            self.clear_cache();
+        }
+
+        Ok(GcSweep {
+            plan,
+            deleted_nodes,
+            deleted_bytes,
+        })
+    }
+
+    /// Mark all offloaded blobs reachable from retained tree roots.
+    ///
+    /// This scans reachable leaf values for [`blob::ValueRef::Blob`] envelopes.
+    /// Ordinary raw values and escaped inline values are ignored. Empty roots,
+    /// duplicate roots, shared subtrees, and duplicate blob references are
+    /// counted once where appropriate.
+    pub fn mark_reachable_blobs(&self, roots: &[Tree]) -> Result<BlobGcReachability, Error> {
+        let parallelism = if self.store.prefers_batch_reads() {
+            STATS_FRONTIER_PREFETCH_PARALLELISM
+        } else {
+            1
+        };
+        let mut seen_nodes = HashSet::new();
+        let mut frontier = Vec::new();
+
+        for tree in roots {
+            if let Some(root_cid) = &tree.root {
+                if seen_nodes.insert(root_cid.clone()) {
+                    frontier.push(root_cid.clone());
+                }
+            }
+        }
+
+        let mut live_blobs_by_cid = HashMap::<Cid, blob::BlobRef>::new();
+        let mut scanned_nodes = 0usize;
+        let mut scanned_values = 0usize;
+
+        while !frontier.is_empty() {
+            let current = std::mem::take(&mut frontier);
+            let nodes = self.load_many_ordered_with_parallelism(&current, parallelism)?;
+
+            for node in nodes {
+                if node.keys.len() != node.vals.len() {
+                    return Err(Error::InvalidNode);
+                }
+                scanned_nodes += 1;
+
+                if node.leaf {
+                    scanned_values += node.vals.len();
+                    for value in &node.vals {
+                        if let blob::ValueRef::Blob(reference) =
+                            blob::ValueRef::from_stored_bytes(value)?
+                        {
+                            match live_blobs_by_cid.entry(reference.cid.clone()) {
+                                Entry::Occupied(entry) => {
+                                    if entry.get().len != reference.len {
+                                        return Err(Error::Deserialize(
+                                            "conflicting blob reference lengths for same CID"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                                Entry::Vacant(entry) => {
+                                    entry.insert(reference);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    frontier.reserve(node.vals.len());
+                    for idx in 0..node.len() {
+                        let child_cid = child_cid_at(&node, idx)?;
+                        if seen_nodes.insert(child_cid.clone()) {
+                            frontier.push(child_cid);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut live_blobs = live_blobs_by_cid.into_values().collect::<Vec<_>>();
+        gc::sort_blob_refs(&mut live_blobs);
+        let live_blob_bytes = live_blobs
+            .iter()
+            .map(|reference| reference.len)
+            .sum::<u64>();
+
+        Ok(BlobGcReachability {
+            live_blob_count: live_blobs.len(),
+            live_blobs,
+            live_blob_bytes,
+            scanned_nodes,
+            scanned_values,
+        })
+    }
+
+    /// Build a dry-run garbage-collection plan for offloaded blobs.
+    ///
+    /// The generic [`BlobStore`] trait does not require blob listing, so callers
+    /// provide candidate blob references. Pass every blob reference that may be
+    /// swept, and every tree root that must be retained. Unreachable candidates
+    /// that are present in the blob store are reported as reclaimable; missing
+    /// candidates are counted separately.
+    pub fn plan_blob_gc<B, I, C>(
+        &self,
+        blob_store: &B,
+        roots: &[Tree],
+        candidates: I,
+    ) -> Result<BlobGcPlan, Error>
+    where
+        B: BlobStore,
+        I: IntoIterator<Item = C>,
+        C: Borrow<blob::BlobRef>,
+    {
+        let reachability = self.mark_reachable_blobs(roots)?;
+        let live_cids = reachability
+            .live_blobs
+            .iter()
+            .map(|reference| reference.cid.clone())
+            .collect::<HashSet<_>>();
+        let mut seen_candidates = HashSet::new();
+        let mut reclaimable_blobs = Vec::new();
+        let mut reclaimable_blob_bytes = 0u64;
+        let mut missing_candidates = 0usize;
+        let mut candidate_blobs = 0usize;
+
+        for candidate in candidates {
+            let reference = candidate.borrow();
+            if !seen_candidates.insert(reference.cid.clone()) {
+                continue;
+            }
+            candidate_blobs += 1;
+
+            if live_cids.contains(&reference.cid) {
+                continue;
+            }
+
+            match blob_store
+                .get_blob(reference)
+                .map_err(|err| Error::Store(Box::new(err)))?
+            {
+                Some(bytes) => {
+                    reference.validate_bytes(&bytes)?;
+                    reclaimable_blob_bytes += bytes.len() as u64;
+                    reclaimable_blobs.push(reference.clone());
+                }
+                None => {
+                    missing_candidates += 1;
+                }
+            }
+        }
+
+        gc::sort_blob_refs(&mut reclaimable_blobs);
+        Ok(BlobGcPlan {
+            reachability,
+            candidate_blobs,
+            reclaimable_blob_count: reclaimable_blobs.len(),
+            reclaimable_blobs,
+            reclaimable_blob_bytes,
+            missing_candidates,
+        })
+    }
+
+    /// Delete unreachable candidate blobs from the backing blob store.
+    ///
+    /// This runs [`Prolly::plan_blob_gc`] first, then deletes exactly the
+    /// plan's reclaimable blob references. Missing candidates are ignored.
+    pub fn sweep_blob_gc<B, I, C>(
+        &self,
+        blob_store: &B,
+        roots: &[Tree],
+        candidates: I,
+    ) -> Result<BlobGcSweep, Error>
+    where
+        B: BlobStore,
+        I: IntoIterator<Item = C>,
+        C: Borrow<blob::BlobRef>,
+    {
+        let plan = self.plan_blob_gc(blob_store, roots, candidates)?;
+        let deleted_blobs = plan.reclaimable_blob_count;
+        let deleted_blob_bytes = plan.reclaimable_blob_bytes;
+
+        for reference in &plan.reclaimable_blobs {
+            blob_store
+                .delete_blob(reference)
+                .map_err(|err| Error::Store(Box::new(err)))?;
+        }
+
+        Ok(BlobGcSweep {
+            plan,
+            deleted_blobs,
+            deleted_blob_bytes,
+        })
+    }
+
+    /// Build a dry-run blob garbage-collection plan using the blob store's full
+    /// blob-reference listing.
+    ///
+    /// This is available only when the blob backend implements
+    /// [`BlobStoreScan`]. It is equivalent to calling
+    /// [`BlobStoreScan::list_blob_refs`] and then [`Prolly::plan_blob_gc`].
+    pub fn plan_blob_store_gc<B>(&self, blob_store: &B, roots: &[Tree]) -> Result<BlobGcPlan, Error>
+    where
+        B: BlobStoreScan,
+    {
+        let candidates = blob_store
+            .list_blob_refs()
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        self.plan_blob_gc(blob_store, roots, candidates)
+    }
+
+    /// Sweep unreachable blobs from every blob reference listed by the blob
+    /// store.
+    ///
+    /// This is available only when the blob backend implements
+    /// [`BlobStoreScan`].
+    pub fn sweep_blob_store_gc<B>(
+        &self,
+        blob_store: &B,
+        roots: &[Tree],
+    ) -> Result<BlobGcSweep, Error>
+    where
+        B: BlobStoreScan,
+    {
+        let candidates = blob_store
+            .list_blob_refs()
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        self.sweep_blob_gc(blob_store, roots, candidates)
+    }
+
+    /// Build a dry-run garbage-collection plan using the store's full node-CID
+    /// listing.
+    ///
+    /// This is available only when the backing store implements
+    /// [`NodeStoreScan`]. It is equivalent to calling
+    /// [`NodeStoreScan::list_node_cids`] and then [`Prolly::plan_gc`].
+    pub fn plan_store_gc(&self, roots: &[Tree]) -> Result<GcPlan, Error>
+    where
+        S: NodeStoreScan,
+    {
+        let candidates = self
+            .store
+            .list_node_cids()
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        self.plan_gc(roots, candidates)
+    }
+
+    /// Sweep unreachable nodes from every node CID listed by the backing store.
+    ///
+    /// This is available only when the backing store implements
+    /// [`NodeStoreScan`]. The manager cache is cleared if any nodes are deleted.
+    pub fn sweep_store_gc(&self, roots: &[Tree]) -> Result<GcSweep, Error>
+    where
+        S: NodeStoreScan,
+    {
+        let candidates = self
+            .store
+            .list_node_cids()
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        self.sweep_gc(roots, candidates)
+    }
+
+    /// Build a store-wide GC plan using roots selected from named-root manifests.
+    ///
+    /// This combines [`Prolly::load_retained_named_roots`] with
+    /// [`Prolly::plan_store_gc`]. Exact-name policies fail with
+    /// [`Error::MissingNamedRoots`] if any requested name is absent so a typo
+    /// cannot silently drop a retained branch from the GC plan.
+    pub fn plan_store_gc_for_retention(
+        &self,
+        retention: &NamedRootRetention,
+    ) -> Result<GcPlan, Error>
+    where
+        S: NodeStoreScan + ManifestStoreScan,
+    {
+        let selection = self.load_retained_named_roots(retention)?;
+        Self::ensure_retention_selection_complete(&selection)?;
+        let roots = selection.trees();
+        self.plan_store_gc(&roots)
+    }
+
+    /// Sweep store-wide unreachable nodes using roots selected from manifests.
+    ///
+    /// This combines [`Prolly::load_retained_named_roots`] with
+    /// [`Prolly::sweep_store_gc`]. Exact-name policies fail with
+    /// [`Error::MissingNamedRoots`] if any requested name is absent.
+    pub fn sweep_store_gc_for_retention(
+        &self,
+        retention: &NamedRootRetention,
+    ) -> Result<GcSweep, Error>
+    where
+        S: NodeStoreScan + ManifestStoreScan,
+    {
+        let selection = self.load_retained_named_roots(retention)?;
+        Self::ensure_retention_selection_complete(&selection)?;
+        let roots = selection.trees();
+        self.sweep_store_gc(&roots)
+    }
+
+    fn ensure_retention_selection_complete(selection: &NamedRootSelection) -> Result<(), Error> {
+        if selection.is_complete() {
+            Ok(())
+        } else {
+            Err(Error::MissingNamedRoots {
+                names: selection.missing_names.clone(),
+            })
+        }
     }
 
     /// Frontier helper for collecting statistics
@@ -1014,6 +2743,50 @@ impl<S: Store> Prolly<S> {
         Ok(Box::new(diff::stream_diff(self, base, other)))
     }
 
+    /// Create a streaming merge-conflict iterator for a three-way merge.
+    ///
+    /// This walks the same structural diff path as [`Prolly::stream_diff`],
+    /// compares each right-side change with `left`, and yields only keys that
+    /// would require a resolver during [`Prolly::merge`]. Non-conflicting
+    /// changes are skipped, and each yielded conflict preserves absence and
+    /// deletion as `None`.
+    ///
+    /// This is useful for UIs, background agents, and sync workflows that need
+    /// to inspect or ask about conflicts before choosing a resolver strategy.
+    ///
+    /// # Example
+    /// ```rust
+    /// use prolly::{Config, MemStore, Prolly};
+    ///
+    /// let prolly = Prolly::new(MemStore::new(), Config::default());
+    /// let base = prolly
+    ///     .put(&prolly.create(), b"title".to_vec(), b"base".to_vec())
+    ///     .unwrap();
+    /// let left = prolly
+    ///     .put(&base, b"title".to_vec(), b"left".to_vec())
+    ///     .unwrap();
+    /// let right = prolly
+    ///     .put(&base, b"title".to_vec(), b"right".to_vec())
+    ///     .unwrap();
+    ///
+    /// let conflicts = prolly
+    ///     .stream_conflicts(&base, &left, &right)
+    ///     .unwrap()
+    ///     .collect::<Result<Vec<_>, _>>()
+    ///     .unwrap();
+    ///
+    /// assert_eq!(conflicts.len(), 1);
+    /// assert_eq!(conflicts[0].key, b"title".to_vec());
+    /// ```
+    pub fn stream_conflicts<'a>(
+        &'a self,
+        base: &Tree,
+        left: &'a Tree,
+        right: &Tree,
+    ) -> Result<Box<dyn Iterator<Item = Result<Conflict, Error>> + 'a>, Error> {
+        Ok(Box::new(diff::stream_conflicts(self, base, left, right)))
+    }
+
     /// Load a node by its CID from the store.
     pub(crate) fn load(&self, cid: &Cid) -> Result<Node, Error> {
         Ok(self.load_arc(cid)?.as_ref().clone())
@@ -1021,25 +2794,57 @@ impl<S: Store> Prolly<S> {
 
     /// Load a node by its CID, reusing the in-process immutable node cache.
     pub(crate) fn load_arc(&self, cid: &Cid) -> Result<Arc<Node>, Error> {
-        if let Ok(cache) = self.node_cache.read() {
+        if let Ok(mut cache) = self.node_cache.write() {
             if let Some(node) = cache.get(cid) {
-                return Ok(node.clone());
+                self.metrics.add_cache_hits(1);
+                return Ok(node);
             }
         }
 
+        self.metrics.add_cache_misses(1);
         let bytes = self
             .store
             .get(cid.as_bytes())
             .map_err(|e| Error::Store(Box::new(e)))?
             .ok_or_else(|| Error::NotFound(cid.clone()))?;
+        self.metrics.record_point_read(bytes.len());
         let node = Arc::new(Node::from_bytes(&bytes)?);
 
         if let Ok(mut cache) = self.node_cache.write() {
-            let cached = cache.entry(cid.clone()).or_insert_with(|| node.clone());
-            return Ok(cached.clone());
+            let evictions = cache.insert(cid.clone(), node.clone(), bytes.len());
+            self.metrics.add_cache_evictions(evictions);
         }
 
         Ok(node)
+    }
+
+    fn load_arc_pinned(&self, cid: &Cid) -> Result<(Arc<Node>, bool), Error> {
+        if let Ok(mut cache) = self.node_cache.write() {
+            if let Some(node) = cache.get(cid) {
+                let newly_pinned = cache.pin_existing(cid);
+                self.metrics.add_cache_hits(1);
+                return Ok((node, newly_pinned));
+            }
+        }
+
+        self.metrics.add_cache_misses(1);
+        let bytes = self
+            .store
+            .get(cid.as_bytes())
+            .map_err(|e| Error::Store(Box::new(e)))?
+            .ok_or_else(|| Error::NotFound(cid.clone()))?;
+        self.metrics.record_point_read(bytes.len());
+        let node = Arc::new(Node::from_bytes(&bytes)?);
+
+        let mut newly_pinned = false;
+        if let Ok(mut cache) = self.node_cache.write() {
+            let (inserted_pinned, evictions) =
+                cache.insert_pinned(cid.clone(), node.clone(), bytes.len());
+            newly_pinned = inserted_pinned;
+            self.metrics.add_cache_evictions(evictions);
+        }
+
+        Ok((node, newly_pinned))
     }
 
     /// Load nodes by CID in input order, batching cache misses through the store.
@@ -1060,11 +2865,13 @@ impl<S: Store> Prolly<S> {
 
         let mut nodes: Vec<Option<Arc<Node>>>;
         let mut missing: Option<MissingNodeBatch>;
-        if let Ok(cache) = self.node_cache.read() {
+        if let Ok(mut cache) = self.node_cache.write() {
+            let mut cache_hits = 0usize;
             let mut cached_nodes = Vec::with_capacity(cids.len());
             let mut first_miss = None;
             for (idx, cid) in cids.iter().enumerate() {
                 if let Some(node) = cache.get(cid) {
+                    cache_hits += 1;
                     cached_nodes.push(node.clone());
                 } else {
                     first_miss = Some(idx);
@@ -1073,6 +2880,7 @@ impl<S: Store> Prolly<S> {
             }
 
             let Some(first_miss) = first_miss else {
+                self.metrics.add_cache_hits(cache_hits);
                 return Ok(cached_nodes);
             };
 
@@ -1084,12 +2892,14 @@ impl<S: Store> Prolly<S> {
                 missing_batch.record(&cids[first_miss], first_miss);
                 for (idx, cid) in cids.iter().enumerate().skip(first_miss + 1) {
                     if let Some(node) = cache.get(cid) {
+                        cache_hits += 1;
                         nodes[idx] = Some(node.clone());
                     } else {
                         missing_batch.record(cid, idx);
                     }
                 }
             }
+            self.metrics.add_cache_hits(cache_hits);
         } else {
             nodes = vec![None; cids.len()];
             let mut missing_batch = MissingNodeBatch::with_capacity(cids.len());
@@ -1126,6 +2936,7 @@ impl<S: Store> Prolly<S> {
                     .iter()
                     .map(|cid| cid.as_bytes())
                     .collect::<Vec<_>>();
+                self.metrics.add_cache_misses(keys.len());
                 let loaded = self
                     .store
                     .batch_get_ordered_unique(&keys)
@@ -1133,6 +2944,9 @@ impl<S: Store> Prolly<S> {
                 if loaded.len() != missing_cids.len() {
                     return Err(Error::InvalidNode);
                 }
+                let (loaded_nodes, loaded_bytes) = loaded_node_totals(&loaded);
+                self.metrics
+                    .record_batch_read(keys.len(), loaded_bytes, loaded_nodes);
                 loaded
             } else {
                 let chunk_size = missing_cids.len().div_ceil(parallelism);
@@ -1140,6 +2954,7 @@ impl<S: Store> Prolly<S> {
                     .par_chunks(chunk_size)
                     .map(|chunk| {
                         let keys = chunk.iter().map(|cid| cid.as_bytes()).collect::<Vec<_>>();
+                        self.metrics.add_cache_misses(keys.len());
                         let loaded = self
                             .store
                             .batch_get_ordered_unique(&keys)
@@ -1147,6 +2962,9 @@ impl<S: Store> Prolly<S> {
                         if loaded.len() != chunk.len() {
                             return Err(Error::InvalidNode);
                         }
+                        let (loaded_nodes, loaded_bytes) = loaded_node_totals(&loaded);
+                        self.metrics
+                            .record_batch_read(keys.len(), loaded_bytes, loaded_nodes);
                         Ok(loaded)
                     })
                     .collect::<Result<Vec<_>, Error>>()?
@@ -1178,19 +2996,16 @@ impl<S: Store> Prolly<S> {
             };
 
             let mut cache = self.node_cache.write().ok();
+            let mut evictions = 0usize;
             for ((cid, node), positions) in decoded.into_iter().zip(missing_positions) {
-                let node = if let Some(cache) = cache.as_mut() {
-                    cache
-                        .entry(cid.clone())
-                        .or_insert_with(|| node.clone())
-                        .clone()
-                } else {
-                    node
-                };
+                if let Some(cache) = cache.as_mut() {
+                    evictions += cache.insert(cid, node.clone(), node.encoded_len());
+                }
                 for idx in positions {
                     nodes[idx] = Some(node.clone());
                 }
             }
+            self.metrics.add_cache_evictions(evictions);
         }
 
         nodes
@@ -1206,23 +3021,32 @@ impl<S: Store> Prolly<S> {
         self.store
             .put(cid.as_bytes(), &bytes)
             .map_err(|e| Error::Store(Box::new(e)))?;
+        self.metrics.record_point_write(bytes.len());
         if let Ok(mut cache) = self.node_cache.write() {
-            cache.insert(cid.clone(), Arc::new(node.clone()));
+            let evictions = cache.insert(cid.clone(), Arc::new(node.clone()), bytes.len());
+            self.metrics.add_cache_evictions(evictions);
         }
         Ok(cid)
     }
 
     pub(crate) fn cache_node(&self, cid: Cid, node: Node) {
         if let Ok(mut cache) = self.node_cache.write() {
-            cache.insert(cid, Arc::new(node));
+            let bytes = node.encoded_len();
+            let evictions = cache.insert(cid, Arc::new(node), bytes);
+            self.metrics.add_cache_evictions(evictions);
         }
     }
 
     pub(crate) fn cached_node_arc(&self, cid: &Cid) -> Option<Arc<Node>> {
-        self.node_cache
-            .read()
+        let node = self
+            .node_cache
+            .write()
             .ok()
-            .and_then(|cache| cache.get(cid).cloned())
+            .and_then(|mut cache| cache.get(cid));
+        if node.is_some() {
+            self.metrics.add_cache_hits(1);
+        }
+        node
     }
 
     pub(crate) fn cached_rightmost_path(
@@ -1250,7 +3074,8 @@ impl<S: Store> Prolly<S> {
     /// intentionally mutate the backing store outside the Prolly API.
     pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.node_cache.write() {
-            cache.clear();
+            let evictions = cache.clear();
+            self.metrics.add_cache_evictions(evictions);
         }
         if let Ok(mut cache) = self.rightmost_path_cache.write() {
             *cache = None;
@@ -1262,9 +3087,487 @@ impl<S: Store> Prolly<S> {
         self.node_cache.read().map(|cache| cache.len()).unwrap_or(0)
     }
 
-    /// Get a reference to the underlying store.
-    pub(crate) fn store(&self) -> &S {
+    /// Return the serialized-node byte weight retained by this manager cache.
+    pub fn cache_bytes_len(&self) -> usize {
+        self.node_cache
+            .read()
+            .map(|cache| cache.bytes_len())
+            .unwrap_or(0)
+    }
+
+    /// Return the number of pinned nodes currently retained by this manager.
+    ///
+    /// Pinned nodes are a cache hint only. They may temporarily keep the cache
+    /// above configured node or byte limits, and cache misses still fall back to
+    /// the backing store.
+    pub fn cache_pinned_len(&self) -> usize {
+        self.node_cache
+            .read()
+            .map(|cache| cache.pinned_len())
+            .unwrap_or(0)
+    }
+
+    /// Return the serialized-node byte weight of pinned cache entries.
+    pub fn cache_pinned_bytes_len(&self) -> usize {
+        self.node_cache
+            .read()
+            .map(|cache| cache.pinned_bytes_len())
+            .unwrap_or(0)
+    }
+
+    /// Pin the root node of a tree in this manager's node cache.
+    ///
+    /// This is useful for hot snapshots where repeated reads are expected to
+    /// start from the same root. Empty trees pin nothing. The return value is
+    /// the number of nodes that became newly pinned.
+    pub fn pin_tree_root(&self, tree: &Tree) -> Result<usize, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(0);
+        };
+
+        let (_, newly_pinned) = self.load_arc_pinned(root_cid)?;
+        Ok(usize::from(newly_pinned))
+    }
+
+    /// Pin the root-to-leaf lookup path for `key` in this manager's node cache.
+    ///
+    /// The path is the same traversal that a lookup or point mutation would use
+    /// for the key, including the would-be leaf for missing keys. Empty trees
+    /// pin nothing. The return value is the number of nodes that became newly
+    /// pinned.
+    pub fn pin_tree_path(&self, tree: &Tree, key: &[u8]) -> Result<usize, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(0);
+        };
+
+        let mut cid = root_cid.clone();
+        let mut newly_pinned = 0usize;
+
+        loop {
+            let (node, was_newly_pinned) = self.load_arc_pinned(&cid)?;
+            newly_pinned += usize::from(was_newly_pinned);
+
+            if node.leaf {
+                break;
+            }
+
+            let idx = match node.search(key) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            cid = child_cid_at(&node, idx)?;
+        }
+
+        Ok(newly_pinned)
+    }
+
+    /// Persist a correctness-optional root-to-leaf path hint for a hot prefix.
+    ///
+    /// The hint records the path a range scan would use to seek to `prefix`.
+    /// Durable stores that support hints can use it to warm a fresh manager's
+    /// cache before repeatedly scanning a hot tenant, document, workspace, or
+    /// index shard. Empty trees and stores without hint support return
+    /// `Ok(false)`.
+    ///
+    /// Hints are performance sidecars only. A missing, stale, or malformed hint
+    /// is ignored by [`Prolly::hydrate_prefix_path_hint`], and all tree
+    /// operations retain their normal traversal fallback.
+    pub fn publish_prefix_path_hint(&self, tree: &Tree, prefix: &[u8]) -> Result<bool, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(false);
+        };
+
+        if !self.store.supports_hints() {
+            return Ok(false);
+        }
+
+        let path = self.find_path_hint_entries(tree, prefix)?;
+        if path.is_empty() {
+            return Ok(false);
+        }
+
+        let bytes = encode_prefix_path_hint(root_cid, prefix, &path)?;
+        self.store
+            .put_hint(
+                PREFIX_PATH_HINT_NAMESPACE,
+                &prefix_path_hint_key(root_cid, prefix),
+                &bytes,
+            )
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        Ok(true)
+    }
+
+    /// Hydrate this manager's node cache from a persisted prefix path hint.
+    ///
+    /// Returns `Ok(true)` when a valid hint was found and loaded. Returns
+    /// `Ok(false)` when the tree is empty, the store does not support hints, no
+    /// hint exists, or the hint cannot be validated for this exact root and
+    /// prefix. Store I/O errors are still returned.
+    pub fn hydrate_prefix_path_hint(&self, tree: &Tree, prefix: &[u8]) -> Result<bool, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(false);
+        };
+
+        if !self.store.supports_hints() {
+            return Ok(false);
+        }
+
+        load_prefix_path_hint(self, root_cid, prefix)
+    }
+
+    /// Persist recently changed key spans for a root transition.
+    ///
+    /// This is useful when a writer already knows the affected key ranges and
+    /// wants a later sync or indexing job to prioritize those ranges. Spans are
+    /// sorted and coalesced before storage. Empty span sets, unchanged roots,
+    /// and stores without hint support return `Ok(false)`.
+    ///
+    /// Changed-span hints are correctness-optional. Callers that need an
+    /// authoritative diff should still use [`Prolly::diff`],
+    /// [`Prolly::range_diff`], or [`Prolly::structural_diff_page`].
+    pub fn publish_changed_spans_hint<I>(
+        &self,
+        base: &Tree,
+        changed: &Tree,
+        spans: I,
+    ) -> Result<bool, Error>
+    where
+        I: IntoIterator<Item = ChangedSpan>,
+    {
+        if base.root == changed.root || !self.store.supports_hints() {
+            return Ok(false);
+        }
+
+        let spans = normalize_changed_spans(spans);
+        if spans.is_empty() {
+            return Ok(false);
+        }
+
+        let hint = ChangedSpanHint {
+            base_root: base.root.clone(),
+            changed_root: changed.root.clone(),
+            spans,
+        };
+        let bytes = encode_changed_span_hint(&hint)?;
+        self.store
+            .put_hint(
+                CHANGED_SPANS_HINT_NAMESPACE,
+                &changed_span_hint_key(base.root.as_ref(), changed.root.as_ref()),
+                &bytes,
+            )
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        Ok(true)
+    }
+
+    /// Load recently changed key spans for a root transition.
+    ///
+    /// Returns `Ok(Some(_))` only when a well-formed hint exists for this exact
+    /// `(base, changed)` root pair. Missing, stale, malformed, or invalid span
+    /// hints return `Ok(None)`, preserving the caller's normal diff fallback.
+    pub fn load_changed_spans_hint(
+        &self,
+        base: &Tree,
+        changed: &Tree,
+    ) -> Result<Option<ChangedSpanHint>, Error> {
+        if !self.store.supports_hints() {
+            return Ok(None);
+        }
+
+        load_changed_span_hint(self, base.root.as_ref(), changed.root.as_ref())
+    }
+
+    /// Unpin all pinned node-cache entries for this manager.
+    ///
+    /// After unpinning, normal cache eviction runs immediately. Returns the
+    /// number of entries that were pinned before this call.
+    pub fn unpin_all_cache_nodes(&self) -> usize {
+        if let Ok(mut cache) = self.node_cache.write() {
+            let (unpinned, evictions) = cache.unpin_all();
+            self.metrics.add_cache_evictions(evictions);
+            unpinned
+        } else {
+            0
+        }
+    }
+
+    /// Return cumulative cache and node I/O metrics for this manager.
+    pub fn metrics(&self) -> ProllyMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Reset cumulative manager metrics to zero.
+    ///
+    /// This does not clear the node cache; call [`Prolly::clear_cache`] when
+    /// you want the next operation to run from a cold manager cache.
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
+    }
+
+    /// Load a named root as a [`Tree`] through the underlying manifest store.
+    ///
+    /// This is available when the store implements both [`Store`] and
+    /// [`ManifestStore`]. Missing names return `Ok(None)`.
+    pub fn load_named_root(&self, name: &[u8]) -> Result<Option<Tree>, Error>
+    where
+        S: ManifestStore,
+    {
+        self.store
+            .get_root(name)
+            .map(|manifest| manifest.map(RootManifest::into_tree))
+            .map_err(|err| Error::Store(Box::new(err)))
+    }
+
+    /// Load explicit named roots and report names that were absent.
+    ///
+    /// Duplicate names are ignored after their first occurrence. Missing names
+    /// are reported in [`NamedRootSelection::missing_names`] instead of being
+    /// silently dropped so callers can decide whether to continue.
+    pub fn load_named_roots<I, N>(&self, names: I) -> Result<NamedRootSelection, Error>
+    where
+        S: ManifestStore,
+        I: IntoIterator<Item = N>,
+        N: AsRef<[u8]>,
+    {
+        let mut seen = HashSet::new();
+        let mut roots = Vec::new();
+        let mut missing_names = Vec::new();
+
+        for name in names {
+            let name = name.as_ref().to_vec();
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+
+            match self.load_named_root(&name)? {
+                Some(tree) => roots.push(NamedRoot::new(name, tree)),
+                None => missing_names.push(name),
+            }
+        }
+
+        Ok(NamedRootSelection::new(roots, missing_names))
+    }
+
+    /// List every named root in the manifest store.
+    ///
+    /// Results are sorted by raw name bytes when the backing store implements
+    /// the [`ManifestStoreScan`] contract.
+    pub fn list_named_root_manifests(&self) -> Result<Vec<manifest::NamedRootManifest>, Error>
+    where
+        S: ManifestStoreScan,
+    {
+        self.store
+            .list_roots()
+            .map_err(|err| Error::Store(Box::new(err)))
+    }
+
+    /// List every named root in the manifest store.
+    ///
+    /// Results are sorted by raw name bytes when the backing store implements
+    /// the [`ManifestStoreScan`] contract.
+    pub fn list_named_roots(&self) -> Result<Vec<NamedRoot>, Error>
+    where
+        S: ManifestStoreScan,
+    {
+        Ok(self
+            .list_named_root_manifests()?
+            .into_iter()
+            .map(|root| root.into_named_root())
+            .collect())
+    }
+
+    /// Select named roots according to a retention policy.
+    ///
+    /// Prefix and newest-by-name policies use manifest scanning. Exact policies
+    /// load the requested names and report absent names explicitly.
+    pub fn load_retained_named_roots(
+        &self,
+        retention: &NamedRootRetention,
+    ) -> Result<NamedRootSelection, Error>
+    where
+        S: ManifestStoreScan,
+    {
+        match retention {
+            NamedRootRetention::All => Ok(NamedRootSelection::new(
+                self.list_named_roots()?,
+                Vec::new(),
+            )),
+            NamedRootRetention::Exact { names } => self.load_named_roots(names.iter()),
+            NamedRootRetention::Prefix { prefix } => {
+                let roots = self
+                    .list_named_roots()?
+                    .into_iter()
+                    .filter(|root| root.name.starts_with(prefix))
+                    .collect();
+                Ok(NamedRootSelection::new(roots, Vec::new()))
+            }
+            NamedRootRetention::NewestByName { prefix, count } => {
+                if *count == 0 {
+                    return Ok(NamedRootSelection::default());
+                }
+
+                let mut roots = self
+                    .list_named_roots()?
+                    .into_iter()
+                    .filter(|root| root.name.starts_with(prefix))
+                    .collect::<Vec<_>>();
+                if roots.len() > *count {
+                    roots = roots.split_off(roots.len() - *count);
+                }
+                Ok(NamedRootSelection::new(roots, Vec::new()))
+            }
+            NamedRootRetention::UpdatedSince {
+                prefix,
+                min_updated_at_millis,
+            } => {
+                let roots = self
+                    .list_named_root_manifests()?
+                    .into_iter()
+                    .filter(|root| root.name.starts_with(prefix))
+                    .filter(|root| {
+                        root.manifest
+                            .updated_at_millis
+                            .map(|updated_at| updated_at >= *min_updated_at_millis)
+                            .unwrap_or(false)
+                    })
+                    .map(|root| root.into_named_root())
+                    .collect();
+                Ok(NamedRootSelection::new(roots, Vec::new()))
+            }
+        }
+    }
+
+    /// Publish a tree handle under a durable name.
+    ///
+    /// This unconditionally replaces the existing named root. Use
+    /// [`Prolly::compare_and_swap_named_root`] when coordinating concurrent
+    /// writers.
+    pub fn publish_named_root(&self, name: &[u8], tree: &Tree) -> Result<(), Error>
+    where
+        S: ManifestStore,
+    {
+        self.publish_named_root_at_millis(name, tree, current_unix_time_millis())
+    }
+
+    /// Publish a tree handle under a durable name with explicit timestamp
+    /// metadata.
+    ///
+    /// `created_at_millis` is preserved from the existing manifest when present;
+    /// otherwise it is initialized to `timestamp_millis`. `updated_at_millis` is
+    /// always set to `timestamp_millis`.
+    pub fn publish_named_root_at_millis(
+        &self,
+        name: &[u8],
+        tree: &Tree,
+        timestamp_millis: u64,
+    ) -> Result<(), Error>
+    where
+        S: ManifestStore,
+    {
+        let created_at_millis = self
+            .store
+            .get_root(name)
+            .map_err(|err| Error::Store(Box::new(err)))?
+            .and_then(|manifest| manifest.created_at_millis)
+            .unwrap_or(timestamp_millis);
+        let manifest = RootManifest::from_tree_with_timestamps_millis(
+            tree,
+            Some(created_at_millis),
+            Some(timestamp_millis),
+        );
+        self.store
+            .put_root(name, &manifest)
+            .map_err(|err| Error::Store(Box::new(err)))
+    }
+
+    /// Delete a durable named root.
+    ///
+    /// Deleting a missing name is not an error. This removes the mutable name
+    /// only; it does not garbage-collect content-addressed nodes.
+    pub fn delete_named_root(&self, name: &[u8]) -> Result<(), Error>
+    where
+        S: ManifestStore,
+    {
+        self.store
+            .delete_root(name)
+            .map_err(|err| Error::Store(Box::new(err)))
+    }
+
+    /// Atomically update a named root when the current tree matches `expected`.
+    ///
+    /// `expected == None` means the name must be absent. `new == None` deletes
+    /// the name after a successful compare.
+    pub fn compare_and_swap_named_root(
+        &self,
+        name: &[u8],
+        expected: Option<&Tree>,
+        new: Option<&Tree>,
+    ) -> Result<NamedRootUpdate, Error>
+    where
+        S: ManifestStore,
+    {
+        self.compare_and_swap_named_root_at_millis(name, expected, new, current_unix_time_millis())
+    }
+
+    /// Atomically update a named root with explicit timestamp metadata.
+    ///
+    /// Tree-level compare-and-swap compares `expected` against the current tree
+    /// handle, then performs the backend CAS against the exact current manifest.
+    /// This keeps tree CAS stable even as manifests gain metadata fields.
+    pub fn compare_and_swap_named_root_at_millis(
+        &self,
+        name: &[u8],
+        expected: Option<&Tree>,
+        new: Option<&Tree>,
+        timestamp_millis: u64,
+    ) -> Result<NamedRootUpdate, Error>
+    where
+        S: ManifestStore,
+    {
+        let current = self
+            .store
+            .get_root(name)
+            .map_err(|err| Error::Store(Box::new(err)))?;
+        let expected_manifest = match (expected, current) {
+            (None, None) => None,
+            (None, Some(current)) => {
+                return Ok(NamedRootUpdate::Conflict {
+                    current: Some(current.into_tree()),
+                });
+            }
+            (Some(expected_tree), Some(current)) if current.to_tree() == *expected_tree => {
+                Some(current)
+            }
+            (Some(_), current) => {
+                return Ok(NamedRootUpdate::Conflict {
+                    current: current.map(RootManifest::into_tree),
+                });
+            }
+        };
+
+        let new_manifest = new.map(|tree| {
+            let created_at_millis = expected_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.created_at_millis)
+                .unwrap_or(timestamp_millis);
+            RootManifest::from_tree_with_timestamps_millis(
+                tree,
+                Some(created_at_millis),
+                Some(timestamp_millis),
+            )
+        });
+        self.store
+            .compare_and_swap_root(name, expected_manifest.as_ref(), new_manifest.as_ref())
+            .map(NamedRootUpdate::from)
+            .map_err(|err| Error::Store(Box::new(err)))
+    }
+
+    /// Borrow the underlying store.
+    pub fn store(&self) -> &S {
         &self.store
+    }
+
+    pub(crate) fn record_batch_write_metrics(&self, nodes: usize, bytes: usize) {
+        self.metrics.record_batch_write(nodes, bytes);
     }
 
     /// Find the path from root to the key.
@@ -1320,6 +3623,38 @@ impl<S: Store> Prolly<S> {
             };
 
             path.push((node.clone(), idx));
+
+            if node.leaf {
+                break;
+            }
+
+            cid = child_cid_at(&node, idx)?;
+        }
+
+        Ok(path)
+    }
+
+    fn find_path_hint_entries(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+    ) -> Result<Vec<PrefixPathHintEntryWithNode>, Error> {
+        let mut path = Vec::new();
+
+        let Some(root_cid) = &tree.root else {
+            return Ok(path);
+        };
+
+        let mut cid = root_cid.clone();
+        loop {
+            let node = self.load_arc(&cid)?;
+            let idx = path_index_for_key(&node, key);
+
+            path.push(PrefixPathHintEntryWithNode {
+                cid: cid.clone(),
+                node: node.clone(),
+                child_index: idx,
+            });
 
             if node.leaf {
                 break;
@@ -1408,6 +3743,39 @@ impl<S: Store> Prolly<S> {
     /// ```
     pub fn batch(&self, tree: &Tree, mutations: Vec<Mutation>) -> Result<Tree, Error> {
         batch::apply_batch(self, tree, mutations)
+    }
+
+    /// Apply batch mutations and return store-neutral execution stats.
+    ///
+    /// The returned counters describe tree-level work such as affected leaves,
+    /// write amplification, and which internal write path was selected.
+    pub fn batch_with_stats(
+        &self,
+        tree: &Tree,
+        mutations: Vec<Mutation>,
+    ) -> Result<batch::BatchApplyResult, Error> {
+        batch::BatchWriter::new().apply_batch_with_stats(self, tree, mutations)
+    }
+
+    /// Apply append-heavy mutations using the optimized append path when safe.
+    ///
+    /// If the mutations overlap existing data or cannot be applied as a pure
+    /// append, this falls back to the regular batch implementation for
+    /// correctness.
+    pub fn append_batch(&self, tree: &Tree, mutations: Vec<Mutation>) -> Result<Tree, Error> {
+        batch::append_batch(self, tree, mutations)
+    }
+
+    /// Apply append-heavy mutations and return store-neutral execution stats.
+    ///
+    /// If the append fast path cannot be used, the operation falls back to the
+    /// regular batch implementation and reports the fallback path stats.
+    pub fn append_batch_with_stats(
+        &self,
+        tree: &Tree,
+        mutations: Vec<Mutation>,
+    ) -> Result<batch::BatchApplyResult, Error> {
+        batch::append_batch_with_stats(self, tree, mutations)
     }
 
     /// Merge two trees using CRDT semantics for automatic conflict resolution.
@@ -1514,6 +3882,2958 @@ impl<S: Store> Prolly<S> {
             mutations,
             config,
         )
+    }
+}
+
+#[cfg(feature = "async-store")]
+impl<S> AsyncProlly<S>
+where
+    S: AsyncStore,
+    S::Error: Send + Sync,
+{
+    /// Create a new async Prolly tree manager.
+    pub fn new(store: S, config: Config) -> Self {
+        let node_cache_max_nodes = config.node_cache_max_nodes;
+        let node_cache_max_bytes = config.node_cache_max_bytes;
+        Self {
+            store,
+            config,
+            node_cache: RwLock::new(NodeCache::new(node_cache_max_nodes, node_cache_max_bytes)),
+            rightmost_path_cache: RwLock::new(None),
+            metrics: ProllyMetrics::default(),
+        }
+    }
+
+    /// Create a new empty tree.
+    pub fn create(&self) -> Tree {
+        Tree {
+            root: None,
+            config: self.config.clone(),
+        }
+    }
+
+    /// Borrow the underlying async store.
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Borrow this manager's tree configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Get value by key from the tree.
+    pub async fn get(&self, tree: &Tree, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(None);
+        };
+
+        let mut cid = root_cid.clone();
+        loop {
+            let node = self.load_arc(&cid).await?;
+            let idx = match node.search(key) {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == 0 {
+                        return Ok(None);
+                    } else {
+                        i - 1
+                    }
+                }
+            };
+
+            if node.leaf {
+                if node.keys.get(idx).map(|k| k.as_slice()) == Some(key) {
+                    return Ok(Some(leaf_value_at(&node, idx)?));
+                }
+                return Ok(None);
+            }
+
+            cid = child_cid_at(&node, idx)?;
+        }
+    }
+
+    /// Get a stored large-value reference by key.
+    ///
+    /// Non-envelope values are returned as [`blob::ValueRef::Inline`], so this
+    /// can inspect trees that mix ordinary raw values and offloaded blob
+    /// references.
+    pub async fn get_value_ref(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+    ) -> Result<Option<blob::ValueRef>, Error> {
+        self.get(tree, key)
+            .await?
+            .map(|value| blob::ValueRef::from_stored_bytes(&value))
+            .transpose()
+    }
+
+    /// Get a value by key, resolving offloaded async blob references when
+    /// present.
+    pub async fn get_large_value<B>(
+        &self,
+        blob_store: &B,
+        tree: &Tree,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error>
+    where
+        B: blob::AsyncBlobStore,
+        B::Error: Send + Sync,
+    {
+        match self.get(tree, key).await? {
+            Some(value) => Ok(Some(
+                blob::resolve_stored_value_async(blob_store, &value).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Get multiple values while preserving caller order.
+    ///
+    /// This mirrors [`Prolly::get_many`] but loads frontier nodes through
+    /// [`AsyncStore::batch_get_ordered_unique`], allowing async stores to
+    /// overlap remote reads according to their `read_parallelism()`.
+    pub async fn get_many<K: AsRef<[u8]>>(
+        &self,
+        tree: &Tree,
+        keys: &[K],
+    ) -> Result<Vec<Option<Vec<u8>>>, Error> {
+        let mut values = vec![None; keys.len()];
+        let Some(root_cid) = &tree.root else {
+            return Ok(values);
+        };
+
+        if keys.is_empty() {
+            return Ok(values);
+        }
+
+        let positions = InlinePositions::from_vec(sorted_key_positions(keys))
+            .expect("keys is non-empty after early return");
+
+        let mut frames = vec![KeyLookupFrame {
+            cid: root_cid.clone(),
+            positions,
+        }];
+
+        while !frames.is_empty() {
+            let cids = frames
+                .iter()
+                .map(|frame| frame.cid.clone())
+                .collect::<Vec<_>>();
+            let nodes = self.load_child_frontier_ordered(&cids).await?;
+            let mut next_frames = Vec::new();
+
+            for (frame, node) in frames.into_iter().zip(nodes) {
+                if node.leaf {
+                    fill_leaf_lookup_values(&node, frame.positions, keys, &mut values)?;
+                    continue;
+                }
+
+                next_frames.extend(route_key_positions_to_children(
+                    &node,
+                    frame.positions,
+                    keys,
+                )?);
+            }
+
+            frames = next_frames;
+        }
+
+        Ok(values)
+    }
+
+    /// Insert or update a key-value pair in the tree.
+    ///
+    /// This is the async counterpart to [`Prolly::put`]. It rewrites only the
+    /// affected path, persists rewritten nodes through [`AsyncStore::batch_put`],
+    /// and returns a new immutable tree handle.
+    pub async fn put(&self, tree: &Tree, key: Vec<u8>, val: Vec<u8>) -> Result<Tree, Error> {
+        let path = self.find_path(tree, &key).await?;
+        let mut node = path
+            .last()
+            .map(|(node, _)| node.clone())
+            .unwrap_or_else(|| self.new_leaf_node());
+
+        match node.search(&key) {
+            Ok(idx) => {
+                if node.vals[idx] == val {
+                    return Ok(tree.clone());
+                }
+                node.vals[idx] = val;
+            }
+            Err(idx) => {
+                node.keys.insert(idx, key);
+                node.vals.insert(idx, val);
+            }
+        }
+
+        let mut collector = AsyncWriteCollector::new_cached();
+        let new_root = self
+            .rebalance_with_collector(
+                node,
+                path[..path.len().saturating_sub(1)].to_vec(),
+                &mut collector,
+            )
+            .await?
+            .ok_or(Error::InvalidNode)?;
+        collector.flush(&self.store).await?;
+        self.metrics
+            .record_batch_write(collector.len(), collector.bytes_len());
+        collector.cache_nodes(self);
+
+        Ok(Tree {
+            root: Some(new_root),
+            config: tree.config.clone(),
+        })
+    }
+
+    /// Insert or update a value, offloading large payloads to an async blob
+    /// store.
+    ///
+    /// Values larger than `config.inline_threshold` are written to `blob_store`
+    /// and represented in the tree by a compact content-addressed reference.
+    pub async fn put_large_value<B>(
+        &self,
+        blob_store: &B,
+        tree: &Tree,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        config: LargeValueConfig,
+    ) -> Result<Tree, Error>
+    where
+        B: blob::AsyncBlobStore,
+        B::Error: Send + Sync,
+    {
+        let stored = blob::encode_stored_value_async(blob_store, value, &config).await?;
+        self.put(tree, key, stored).await
+    }
+
+    /// Delete a key from the tree.
+    ///
+    /// Missing keys are idempotent and return the original tree unchanged.
+    pub async fn delete(&self, tree: &Tree, key: &[u8]) -> Result<Tree, Error> {
+        let Some(_) = &tree.root else {
+            return Ok(tree.clone());
+        };
+
+        let path = self.find_path(tree, key).await?;
+        let Some((mut node, _)) = path.last().cloned() else {
+            return Ok(tree.clone());
+        };
+
+        if let Ok(idx) = node.search(key) {
+            node.keys.remove(idx);
+            node.vals.remove(idx);
+        } else {
+            return Ok(tree.clone());
+        }
+
+        if node.is_empty() && path.len() == 1 {
+            return Ok(Tree {
+                root: None,
+                config: tree.config.clone(),
+            });
+        }
+
+        let mut collector = AsyncWriteCollector::new_cached();
+        let new_root = self
+            .rebalance_with_collector(
+                node,
+                path[..path.len().saturating_sub(1)].to_vec(),
+                &mut collector,
+            )
+            .await?;
+        collector.flush(&self.store).await?;
+        self.metrics
+            .record_batch_write(collector.len(), collector.bytes_len());
+        collector.cache_nodes(self);
+
+        Ok(Tree {
+            root: new_root,
+            config: tree.config.clone(),
+        })
+    }
+
+    /// Apply multiple mutations using one async batch write.
+    ///
+    /// Mutations are sorted and deduplicated with last-write-wins semantics.
+    /// The async batch planner routes those mutations to affected leaves using
+    /// ordered async node loads, applies each touched leaf once, rebuilds only
+    /// touched ancestors, and flushes all rewritten nodes through a single
+    /// [`AsyncStore::batch_put`] call.
+    pub async fn batch(&self, tree: &Tree, mutations: Vec<Mutation>) -> Result<Tree, Error> {
+        let mutations = batch::preprocess_mutations(mutations);
+        if mutations.is_empty() {
+            return Ok(tree.clone());
+        }
+
+        if mutations
+            .iter()
+            .all(|mutation| matches!(mutation, Mutation::Upsert { .. }))
+        {
+            if let Some(appended) = self.try_append_batch(tree, &mutations).await? {
+                return Ok(appended);
+            }
+        }
+
+        let groups = self.group_batch_mutations_by_leaf(tree, mutations).await?;
+        if groups.is_empty() {
+            return Ok(tree.clone());
+        }
+
+        let mut collector = AsyncWriteCollector::new_cached();
+        let result = self.apply_batch_groups_coalesced(tree, groups, &mut collector)?;
+        if result.changed_leaves == 0 {
+            return Ok(tree.clone());
+        }
+
+        collector.flush(&self.store).await?;
+        self.metrics
+            .record_batch_write(collector.len(), collector.bytes_len());
+        collector.cache_nodes(self);
+
+        Ok(Tree {
+            root: result.root,
+            config: tree.config.clone(),
+        })
+    }
+
+    async fn try_append_batch(
+        &self,
+        tree: &Tree,
+        mutations: &[Mutation],
+    ) -> Result<Option<Tree>, Error> {
+        if mutations.is_empty() {
+            return Ok(Some(tree.clone()));
+        }
+
+        let rightmost_path = if tree.root.is_some() {
+            self.find_rightmost_path(tree).await?
+        } else {
+            Vec::new()
+        };
+
+        if let Some(max_key) = rightmost_path
+            .last()
+            .and_then(|entry| entry.node.keys.last())
+        {
+            if mutations[0].key() <= max_key.as_slice() {
+                return Ok(None);
+            }
+        }
+
+        let mut collector = AsyncWriteCollector::new_cached();
+
+        if tree.root.is_none() {
+            let new_leaves = self.build_append_leaf_chunks(None, mutations);
+            if new_leaves.is_empty() {
+                return Ok(Some(tree.clone()));
+            }
+
+            let leaf_cids = new_leaves
+                .iter()
+                .map(|leaf| collector.add(leaf))
+                .collect::<Vec<_>>();
+            let update =
+                self.build_tree_from_append_leaves(&leaf_cids, &new_leaves, &mut collector)?;
+            self.flush_append_collector(&collector, Some((&update.root, &update.rightmost_path)))
+                .await?;
+
+            return Ok(Some(Tree {
+                root: Some(update.root),
+                config: tree.config.clone(),
+            }));
+        }
+
+        let existing_tail = rightmost_path.last().ok_or(Error::InvalidNode)?;
+        let existing_tail_leaf = existing_tail.node.clone();
+        let existing_tail_cid = existing_tail.cid.clone();
+        let new_leaves = self.build_append_leaf_chunks(Some(existing_tail_leaf.clone()), mutations);
+        let new_leaf_cids = self.collect_append_leaf_cids(
+            &existing_tail_cid,
+            &existing_tail_leaf,
+            &new_leaves,
+            &mut collector,
+        );
+
+        let update = self.append_leaves_to_rightmost_path(
+            &rightmost_path,
+            &new_leaf_cids,
+            &new_leaves,
+            &mut collector,
+        )?;
+        self.flush_append_collector(&collector, Some((&update.root, &update.rightmost_path)))
+            .await?;
+
+        Ok(Some(Tree {
+            root: Some(update.root),
+            config: tree.config.clone(),
+        }))
+    }
+
+    async fn find_rightmost_path(
+        &self,
+        tree: &Tree,
+    ) -> Result<Vec<AsyncRightmostPathEntry>, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(Vec::new());
+        };
+
+        if let Some(cached) = self.cached_rightmost_path(root_cid) {
+            return Ok(async_rightmost_entries_from_cache(cached));
+        }
+
+        if let Some(path) = self.load_rightmost_path_hint(root_cid).await? {
+            self.cache_rightmost_path(root_cid.clone(), cached_rightmost_entries(&path));
+            return Ok(path);
+        }
+
+        let mut path = Vec::new();
+        let mut cid = root_cid.clone();
+
+        loop {
+            let node = self.load_arc(&cid).await?;
+            if node.keys.len() != node.vals.len() || node.is_empty() {
+                return Err(Error::InvalidNode);
+            }
+
+            let child_index = node.len().saturating_sub(1);
+            let node_cid = cid.clone();
+            let next_cid = if node.leaf {
+                None
+            } else {
+                Some(child_cid_at(&node, child_index)?)
+            };
+
+            path.push(AsyncRightmostPathEntry {
+                cid: node_cid,
+                node: node.as_ref().clone(),
+                child_index,
+            });
+
+            let Some(next_cid) = next_cid else {
+                break;
+            };
+            cid = next_cid;
+        }
+
+        self.publish_rightmost_path_hint(root_cid, &path).await;
+        self.cache_rightmost_path(root_cid.clone(), cached_rightmost_entries(&path));
+
+        Ok(path)
+    }
+
+    fn cached_rightmost_path(&self, root: &Cid) -> Option<Vec<CachedRightmostPathEntry>> {
+        self.rightmost_path_cache
+            .read()
+            .ok()
+            .and_then(|cached| match cached.as_ref() {
+                Some((cached_root, path)) if cached_root == root => Some(path.clone()),
+                _ => None,
+            })
+    }
+
+    fn cache_rightmost_path(&self, root: Cid, path: Vec<CachedRightmostPathEntry>) {
+        if let Ok(mut cache) = self.rightmost_path_cache.write() {
+            *cache = Some((root, path));
+        }
+    }
+
+    async fn load_rightmost_path_hint(
+        &self,
+        root: &Cid,
+    ) -> Result<Option<Vec<AsyncRightmostPathEntry>>, Error> {
+        let Some(bytes) = self
+            .store
+            .get_hint(RIGHTMOST_PATH_HINT_NAMESPACE, root.as_bytes())
+            .await
+            .map_err(|err| Error::Store(Box::new(err)))?
+        else {
+            return Ok(None);
+        };
+
+        let Ok(hint) = serde_cbor::from_slice::<AsyncRightmostPathHint>(&bytes) else {
+            return Ok(None);
+        };
+
+        if hint.version != 2
+            || hint.entries.is_empty()
+            || hint.entries.first().map(|entry| &entry.cid) != Some(root)
+        {
+            return Ok(None);
+        }
+
+        let keys = hint
+            .entries
+            .iter()
+            .map(|entry| entry.cid.as_bytes())
+            .collect::<Vec<_>>();
+        let node_bytes = self
+            .store
+            .batch_get_ordered_unique(&keys)
+            .await
+            .map_err(|err| Error::Store(Box::new(err)))?;
+
+        if node_bytes.len() != hint.entries.len() || node_bytes.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
+        let mut path = Vec::with_capacity(hint.entries.len());
+        for (entry, bytes) in hint.entries.into_iter().zip(node_bytes) {
+            let Some(bytes) = bytes else {
+                return Ok(None);
+            };
+            let Ok(node) = Node::from_bytes(&bytes) else {
+                return Ok(None);
+            };
+            path.push(AsyncRightmostPathEntry {
+                cid: entry.cid,
+                node,
+                child_index: entry.child_index,
+            });
+        }
+
+        if !rightmost_path_hint_is_valid(root, &path) {
+            return Ok(None);
+        }
+
+        for entry in &path {
+            self.cache_node(entry.cid.clone(), entry.node.clone());
+        }
+
+        Ok(Some(path))
+    }
+
+    async fn publish_rightmost_path_hint(&self, root: &Cid, path: &[AsyncRightmostPathEntry]) {
+        if !self.store.supports_hints() {
+            return;
+        }
+        let Ok(bytes) = encode_rightmost_path_hint(path) else {
+            return;
+        };
+        let _ = self
+            .store
+            .put_hint(RIGHTMOST_PATH_HINT_NAMESPACE, root.as_bytes(), &bytes)
+            .await;
+    }
+
+    async fn flush_append_collector(
+        &self,
+        collector: &AsyncWriteCollector,
+        rightmost_hint: Option<(&Cid, &[AsyncRightmostPathEntry])>,
+    ) -> Result<(), Error> {
+        if let Some((root, path)) = rightmost_hint {
+            if self.store.supports_hints() {
+                match encode_rightmost_path_hint(path) {
+                    Ok(bytes) => {
+                        collector
+                            .flush_with_hint(
+                                &self.store,
+                                RIGHTMOST_PATH_HINT_NAMESPACE,
+                                root.as_bytes(),
+                                &bytes,
+                            )
+                            .await?;
+                    }
+                    Err(_) => collector.flush(&self.store).await?,
+                }
+            } else {
+                collector.flush(&self.store).await?;
+            }
+
+            self.cache_rightmost_path(root.clone(), cached_rightmost_entries(path));
+        } else {
+            collector.flush(&self.store).await?;
+        }
+
+        self.metrics
+            .record_batch_write(collector.len(), collector.bytes_len());
+        collector.cache_nodes(self);
+
+        Ok(())
+    }
+
+    fn build_append_leaf_chunks(
+        &self,
+        existing_tail_leaf: Option<Node>,
+        mutations: &[Mutation],
+    ) -> Vec<Node> {
+        let mut leaves = Vec::new();
+        let mut current_leaf = existing_tail_leaf.unwrap_or_else(|| self.new_leaf_node());
+        let max_chunk_size = current_leaf.max_chunk_size;
+
+        if should_close_append_leaf(&current_leaf, max_chunk_size) {
+            leaves.push(current_leaf);
+            current_leaf = self.new_leaf_node();
+        }
+
+        for mutation in mutations {
+            let Mutation::Upsert { key, val } = mutation else {
+                continue;
+            };
+
+            current_leaf.keys.push(key.clone());
+            current_leaf.vals.push(val.clone());
+
+            if should_close_append_leaf(&current_leaf, max_chunk_size) {
+                leaves.push(current_leaf);
+                current_leaf = self.new_leaf_node();
+            }
+        }
+
+        if !current_leaf.is_empty() {
+            leaves.push(current_leaf);
+        }
+
+        leaves
+    }
+
+    fn collect_append_leaf_cids(
+        &self,
+        existing_tail_cid: &Cid,
+        existing_tail_leaf: &Node,
+        new_leaves: &[Node],
+        collector: &mut AsyncWriteCollector,
+    ) -> Vec<Cid> {
+        let mut cids = Vec::with_capacity(new_leaves.len());
+        let start_idx = if new_leaves.first() == Some(existing_tail_leaf) {
+            cids.push(existing_tail_cid.clone());
+            1
+        } else {
+            0
+        };
+
+        for leaf in &new_leaves[start_idx..] {
+            cids.push(collector.add(leaf));
+        }
+
+        cids
+    }
+
+    fn build_tree_from_append_leaves(
+        &self,
+        leaf_cids: &[Cid],
+        leaves: &[Node],
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<AsyncAppendTreeUpdate, Error> {
+        if leaf_cids.len() != leaves.len() || leaf_cids.is_empty() {
+            return Err(Error::InvalidNode);
+        }
+
+        let mut current_level = leaf_cids
+            .iter()
+            .cloned()
+            .zip(leaves.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut rightmost_path = vec![async_rightmost_entry_from_node_ref(
+            current_level.last().ok_or(Error::InvalidNode)?,
+        )];
+
+        if current_level.len() == 1 {
+            return Ok(AsyncAppendTreeUpdate {
+                root: current_level[0].0.clone(),
+                rightmost_path,
+            });
+        }
+
+        let mut level = 1;
+        loop {
+            current_level = self.build_append_parent_level(&current_level, level, collector);
+            rightmost_path.insert(
+                0,
+                async_rightmost_entry_from_node_ref(
+                    current_level.last().ok_or(Error::InvalidNode)?,
+                ),
+            );
+
+            if current_level.len() == 1 {
+                return Ok(AsyncAppendTreeUpdate {
+                    root: current_level[0].0.clone(),
+                    rightmost_path,
+                });
+            }
+
+            level += 1;
+        }
+    }
+
+    fn append_leaves_to_rightmost_path(
+        &self,
+        rightmost_path: &[AsyncRightmostPathEntry],
+        new_leaf_cids: &[Cid],
+        new_leaves: &[Node],
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<AsyncAppendTreeUpdate, Error> {
+        if rightmost_path.is_empty() || new_leaf_cids.is_empty() {
+            return Err(Error::InvalidNode);
+        }
+
+        let mut current_level = new_leaf_cids
+            .iter()
+            .cloned()
+            .zip(new_leaves.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut new_rightmost_path = vec![async_rightmost_entry_from_node_ref(
+            current_level.last().ok_or(Error::InvalidNode)?,
+        )];
+
+        if rightmost_path.len() == 1 && rightmost_path[0].node.leaf {
+            return self.build_tree_from_append_leaves(new_leaf_cids, new_leaves, collector);
+        }
+
+        for entry in rightmost_path.iter().rev() {
+            let node = &entry.node;
+            if node.leaf {
+                continue;
+            }
+
+            let idx = entry.child_index;
+            let mut updated_node = node.clone();
+            updated_node.keys.remove(idx);
+            updated_node.vals.remove(idx);
+
+            for (offset, (cid, child)) in current_level.iter().enumerate() {
+                updated_node.keys.insert(
+                    idx + offset,
+                    child.keys.first().cloned().unwrap_or_default(),
+                );
+                updated_node.vals.insert(idx + offset, cid.0.to_vec());
+            }
+
+            current_level = if updated_node.len() > updated_node.max_chunk_size {
+                self.split_append_internal_node(&updated_node, collector)
+            } else {
+                let cid = collector.add(&updated_node);
+                vec![(cid, updated_node)]
+            };
+
+            new_rightmost_path.insert(
+                0,
+                async_rightmost_entry_from_node_ref(
+                    current_level.last().ok_or(Error::InvalidNode)?,
+                ),
+            );
+        }
+
+        if current_level.len() == 1 {
+            return Ok(AsyncAppendTreeUpdate {
+                root: current_level[0].0.clone(),
+                rightmost_path: new_rightmost_path,
+            });
+        }
+
+        let root_level = rightmost_path
+            .first()
+            .map(|entry| entry.node.level + 1)
+            .unwrap_or(1);
+        let mut root = self.new_internal_node(root_level);
+        reserve_node_entries(&mut root, current_level.len());
+        for (cid, node) in &current_level {
+            root.keys
+                .push(node.keys.first().cloned().unwrap_or_default());
+            root.vals.push(cid.0.to_vec());
+        }
+
+        let root_cid = collector.add(&root);
+        new_rightmost_path.insert(
+            0,
+            AsyncRightmostPathEntry {
+                cid: root_cid.clone(),
+                node: root,
+                child_index: current_level.len() - 1,
+            },
+        );
+
+        Ok(AsyncAppendTreeUpdate {
+            root: root_cid,
+            rightmost_path: new_rightmost_path,
+        })
+    }
+
+    fn build_append_parent_level(
+        &self,
+        children: &[(Cid, Node)],
+        level: u8,
+        collector: &mut AsyncWriteCollector,
+    ) -> Vec<(Cid, Node)> {
+        let mut parents = Vec::new();
+        let mut current_parent = self.new_internal_node(level);
+        let parent_capacity = children.len().min(current_parent.max_chunk_size.max(1));
+        reserve_node_entries(&mut current_parent, parent_capacity);
+
+        for (idx, (cid, child)) in children.iter().enumerate() {
+            current_parent
+                .keys
+                .push(child.keys.first().cloned().unwrap_or_default());
+            current_parent.vals.push(cid.0.to_vec());
+
+            if boundary::is_boundary(&current_parent, current_parent.len() - 1) {
+                parents.push(current_parent);
+                current_parent = self.new_internal_node(level);
+                let remaining = children.len().saturating_sub(idx + 1);
+                let parent_capacity = remaining.min(current_parent.max_chunk_size.max(1));
+                reserve_node_entries(&mut current_parent, parent_capacity);
+            }
+        }
+
+        if !current_parent.is_empty() {
+            parents.push(current_parent);
+        }
+
+        parents
+            .into_iter()
+            .map(|parent| {
+                let cid = collector.add(&parent);
+                (cid, parent)
+            })
+            .collect()
+    }
+
+    fn split_append_internal_node(
+        &self,
+        node: &Node,
+        collector: &mut AsyncWriteCollector,
+    ) -> Vec<(Cid, Node)> {
+        self.split_node_chunks(node)
+            .into_iter()
+            .map(|chunk| {
+                let cid = collector.add(&chunk);
+                (cid, chunk)
+            })
+            .collect()
+    }
+
+    async fn group_batch_mutations_by_leaf(
+        &self,
+        tree: &Tree,
+        mutations: Vec<Mutation>,
+    ) -> Result<Vec<AsyncBatchLeafGroup>, Error> {
+        if mutations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mutations = Arc::new(mutations);
+        let Some(root_cid) = &tree.root else {
+            return Ok(vec![AsyncBatchLeafGroup {
+                leaf: self.new_leaf_node(),
+                route_path: None,
+                range: 0..mutations.len(),
+                mutations,
+            }]);
+        };
+
+        let mut frames = vec![AsyncBatchRouteFrame {
+            cid: root_cid.clone(),
+            path: None,
+            range: 0..mutations.len(),
+            mutations,
+        }];
+        let mut groups = Vec::new();
+
+        while !frames.is_empty() {
+            let cids = frames
+                .iter()
+                .map(|frame| frame.cid.clone())
+                .collect::<Vec<_>>();
+            let nodes = self.load_child_frontier_ordered(&cids).await?;
+            let mut next_frames = Vec::new();
+
+            for (frame, node) in frames.into_iter().zip(nodes) {
+                if node.leaf {
+                    groups.push(AsyncBatchLeafGroup {
+                        leaf: node.as_ref().clone(),
+                        route_path: frame.path,
+                        mutations: frame.mutations,
+                        range: frame.range,
+                    });
+                    continue;
+                }
+
+                let parent_path = frame.path.clone();
+                let parent_node = node.clone();
+                let parent_cid = frame.cid.clone();
+                let mutations = frame.mutations.clone();
+
+                batch::route_sorted_mutation_ranges_to_children_each(
+                    &node,
+                    &mutations,
+                    frame.range,
+                    |child_index, child_range| {
+                        let child_cid = child_cid_at(&node, child_index)?;
+                        let path = Arc::new(AsyncBatchRoutePath {
+                            parent: parent_path.clone(),
+                            node: parent_node.clone(),
+                            cid: parent_cid.clone(),
+                            child_index,
+                        });
+                        next_frames.push(AsyncBatchRouteFrame {
+                            cid: child_cid,
+                            path: Some(path),
+                            mutations: mutations.clone(),
+                            range: child_range,
+                        });
+                        Ok(())
+                    },
+                )?;
+            }
+
+            frames = next_frames;
+        }
+
+        Ok(groups)
+    }
+
+    fn apply_batch_groups_coalesced(
+        &self,
+        tree: &Tree,
+        groups: Vec<AsyncBatchLeafGroup>,
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<AsyncBatchApplyResult, Error> {
+        let group_count = groups.len();
+        let mut contexts =
+            HashMap::<Cid, AsyncBatchAncestorContext>::with_capacity(group_count.saturating_mul(2));
+        let mut pending = HashMap::<Cid, AsyncBatchChildReplacements>::with_capacity(group_count);
+        let mut root_replacement: Option<Vec<AsyncBatchChildRef>> = None;
+        let mut changed_leaves = 0usize;
+
+        for group in groups {
+            let mutation_slice = &group.mutations[group.range.clone()];
+            let (modified_leaf, leaf_changed, _) =
+                batch::apply_leaf_mutations_with_change(group.leaf, mutation_slice, true);
+
+            if !leaf_changed {
+                continue;
+            }
+
+            changed_leaves += 1;
+            let child_refs =
+                self.async_batch_child_refs_from_modified_node(modified_leaf, collector);
+
+            if let Some(path) = group.route_path {
+                collect_async_batch_route_contexts(&path, &mut contexts);
+                pending
+                    .entry(path.cid.clone())
+                    .or_default()
+                    .push((path.child_index, child_refs));
+            } else {
+                if root_replacement.is_some() || !pending.is_empty() {
+                    return Err(Error::InvalidNode);
+                }
+                root_replacement = Some(child_refs);
+            }
+        }
+
+        if changed_leaves == 0 {
+            return Ok(AsyncBatchApplyResult {
+                root: tree.root.clone(),
+                changed_leaves,
+            });
+        }
+
+        if let Some(replacement) = root_replacement {
+            return Ok(AsyncBatchApplyResult {
+                root: self.build_root_from_async_child_refs(replacement, collector)?,
+                changed_leaves,
+            });
+        }
+
+        let mut root_refs: Option<Vec<AsyncBatchChildRef>> = None;
+        while !pending.is_empty() {
+            let current = std::mem::take(&mut pending);
+
+            for (node_cid, replacements) in current {
+                let context = contexts.get(&node_cid).ok_or(Error::InvalidNode)?;
+                let replacement_refs = self.apply_async_batch_child_replacements(
+                    &context.node,
+                    replacements,
+                    collector,
+                )?;
+
+                if let Some(parent) = &context.parent {
+                    pending
+                        .entry(parent.parent_cid.clone())
+                        .or_default()
+                        .push((parent.child_index, replacement_refs));
+                } else {
+                    if root_refs.is_some() {
+                        return Err(Error::InvalidNode);
+                    }
+                    root_refs = Some(replacement_refs);
+                }
+            }
+        }
+
+        let root_refs = root_refs.ok_or(Error::InvalidNode)?;
+        Ok(AsyncBatchApplyResult {
+            root: self.build_root_from_async_child_refs(root_refs, collector)?,
+            changed_leaves,
+        })
+    }
+
+    fn async_batch_child_refs_from_modified_node(
+        &self,
+        node: Node,
+        collector: &mut AsyncWriteCollector,
+    ) -> Vec<AsyncBatchChildRef> {
+        if node.is_empty() {
+            return Vec::new();
+        }
+
+        if node.len() <= node.max_chunk_size || node.len() == 1 {
+            let first_key = node.keys.first().cloned().unwrap_or_default();
+            let level = node.level;
+            let cid = collector.add(&node);
+            return vec![AsyncBatchChildRef {
+                cid,
+                first_key,
+                level,
+            }];
+        }
+
+        let chunks = self.split_node_chunks(&node);
+        let metadata = chunks
+            .iter()
+            .map(|chunk| (chunk.keys.first().cloned().unwrap_or_default(), chunk.level))
+            .collect::<Vec<_>>();
+
+        metadata
+            .into_iter()
+            .zip(collector.add_many(chunks))
+            .map(|((first_key, level), cid)| AsyncBatchChildRef {
+                cid,
+                first_key,
+                level,
+            })
+            .collect()
+    }
+
+    fn apply_async_batch_child_replacements(
+        &self,
+        node: &Node,
+        mut replacements: AsyncBatchChildReplacements,
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<Vec<AsyncBatchChildRef>, Error> {
+        if node.keys.len() != node.vals.len() {
+            return Err(Error::InvalidNode);
+        }
+
+        replacements.sort_by_key(|(idx, _)| *idx);
+        let mut previous_idx = None;
+        for (idx, _) in &replacements {
+            if *idx >= node.len() || previous_idx == Some(*idx) {
+                return Err(Error::InvalidNode);
+            }
+            previous_idx = Some(*idx);
+        }
+
+        if replacements.iter().all(|(_, children)| children.len() == 1) {
+            let mut updated = node.clone();
+            for (idx, children) in replacements {
+                let child = &children[0];
+                updated.keys[idx] = child.first_key.clone();
+                updated.vals[idx] = child.cid.0.to_vec();
+            }
+
+            debug_assert!(
+                updated.keys.windows(2).all(|pair| pair[0] < pair[1]),
+                "async coalesced batch rebuild must preserve parent key order"
+            );
+
+            return Ok(self.async_batch_child_refs_from_modified_node(updated, collector));
+        }
+
+        let replacement_len = node.len() - replacements.len()
+            + replacements
+                .iter()
+                .map(|(_, children)| children.len())
+                .sum::<usize>();
+        let mut updated = self.new_node_like(node);
+        reserve_node_entries(&mut updated, replacement_len);
+        let mut replacements = replacements.into_iter().peekable();
+
+        for idx in 0..node.len() {
+            if replacements
+                .peek()
+                .map(|(replacement_idx, _)| *replacement_idx == idx)
+                .unwrap_or(false)
+            {
+                let (_, children) = replacements.next().ok_or(Error::InvalidNode)?;
+                for child in children {
+                    updated.keys.push(child.first_key);
+                    updated.vals.push(child.cid.0.to_vec());
+                }
+            } else {
+                updated.keys.push(node.keys[idx].clone());
+                updated.vals.push(node.vals[idx].clone());
+            }
+        }
+
+        debug_assert!(
+            updated.keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "async coalesced batch rebuild must preserve parent key order"
+        );
+
+        Ok(self.async_batch_child_refs_from_modified_node(updated, collector))
+    }
+
+    fn build_root_from_async_child_refs(
+        &self,
+        child_refs: Vec<AsyncBatchChildRef>,
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<Option<Cid>, Error> {
+        if child_refs.is_empty() {
+            return Ok(None);
+        }
+
+        if child_refs.len() == 1 {
+            return Ok(Some(child_refs[0].cid.clone()));
+        }
+
+        let first_level = child_refs[0].level;
+        if child_refs.iter().any(|child| child.level != first_level) {
+            return Err(Error::InvalidNode);
+        }
+
+        let mut level = first_level.saturating_add(1);
+        let mut summaries = child_refs
+            .into_iter()
+            .map(|child| AsyncBuildNodeSummary {
+                cid: child.cid,
+                first_key: child.first_key,
+            })
+            .collect::<Vec<_>>();
+
+        loop {
+            summaries = self.build_internal_level_from_summaries(summaries, level, collector)?;
+
+            if summaries.len() == 1 {
+                return Ok(Some(summaries[0].cid.clone()));
+            }
+
+            level = level.saturating_add(1);
+        }
+    }
+
+    /// Create an async range iterator over key-value pairs.
+    ///
+    /// The iterator yields keys in lexicographic order from `start`
+    /// inclusive to `end` exclusive. It is lazy: each call to
+    /// [`AsyncRangeIter::next`](crate::AsyncRangeIter::next) reads only the nodes needed to advance,
+    /// while stores that prefer batch reads can prefetch nearby child nodes.
+    pub async fn range<'a>(
+        &'a self,
+        tree: &Tree,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<range::AsyncRangeIter<'a, S>, Error> {
+        range::create_async_range_iter(self, tree, start, end).await
+    }
+
+    /// Create an async range iterator that resumes strictly after `after_key`.
+    ///
+    /// This is useful for checkpointed background jobs: persist the last key
+    /// successfully processed, then resume with this method to avoid yielding
+    /// that key again.
+    pub async fn range_after<'a>(
+        &'a self,
+        tree: &Tree,
+        after_key: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<range::AsyncRangeIter<'a, S>, Error> {
+        range::create_async_range_after_iter(self, tree, after_key, end).await
+    }
+
+    /// Create an async range iterator from a stable range cursor.
+    pub async fn range_from_cursor<'a>(
+        &'a self,
+        tree: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+    ) -> Result<range::AsyncRangeIter<'a, S>, Error> {
+        match cursor.after() {
+            Some(after_key) => self.range_after(tree, after_key, end).await,
+            None => self.range(tree, &[], end).await,
+        }
+    }
+
+    /// Read a bounded page from an async range scan.
+    ///
+    /// `cursor` is either [`RangeCursor::start`](crate::RangeCursor::start) or
+    /// a cursor returned by a previous page. `end` is still exclusive. When
+    /// `limit` is zero this returns an empty page with the original cursor so
+    /// callers can treat zero-sized requests as no-ops.
+    pub async fn range_page(
+        &self,
+        tree: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<range::AsyncRangePage, Error> {
+        if limit == 0 {
+            return Ok(range::AsyncRangePage {
+                entries: Vec::new(),
+                next_cursor: Some(cursor.clone()),
+            });
+        }
+
+        let mut iter = self.range_from_cursor(tree, cursor, end).await?;
+        let mut entries = Vec::with_capacity(limit);
+
+        for _ in 0..limit {
+            let Some(item) = iter.next().await else {
+                return Ok(range::AsyncRangePage {
+                    entries,
+                    next_cursor: None,
+                });
+            };
+            entries.push(item?);
+        }
+
+        let next_cursor = entries
+            .last()
+            .map(|(key, _)| range::RangeCursor::after_key(key.clone()));
+        Ok(range::AsyncRangePage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    /// Compute the difference between two trees through the async store.
+    ///
+    /// This mirrors [`Prolly::diff`] and preserves structural subtree pruning:
+    /// identical CIDs are skipped, aligned internal nodes are compared by child
+    /// CID, and stores that prefer batch reads hydrate sibling frontiers through
+    /// ordered async batch reads.
+    pub async fn diff(&self, base: &Tree, other: &Tree) -> Result<Vec<Diff>, Error> {
+        diff::compute_async_diff(self, base, other).await
+    }
+
+    /// Compute the difference between two trees within a half-open key range.
+    ///
+    /// Returns only changes whose key is in `[start, end)`. This mirrors
+    /// [`Prolly::range_diff`] but loads nodes through [`AsyncStore`].
+    pub async fn range_diff(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<Diff>, Error> {
+        diff::compute_async_range_diff(self, base, other, start, end).await
+    }
+
+    /// Compute diffs from a stable cursor through the async store.
+    ///
+    /// This resumes strictly after the cursor key, so callers can persist the
+    /// last processed diff key and avoid re-processing it on the next scan.
+    pub async fn diff_from_cursor(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<Diff>, Error> {
+        let start = cursor.after().unwrap_or(&[]);
+        let mut diffs = self.range_diff(base, other, start, end).await?;
+        if let Some(after_key) = cursor.after() {
+            diffs.retain(|diff| diff.key() > after_key);
+        }
+        Ok(diffs)
+    }
+
+    /// Read a bounded page of diffs through the async store.
+    pub async fn diff_page(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        cursor: &range::RangeCursor,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<diff::DiffPage, Error> {
+        if limit == 0 {
+            return Ok(diff::DiffPage {
+                diffs: Vec::new(),
+                next_cursor: Some(cursor.clone()),
+            });
+        }
+
+        let mut diffs = self.diff_from_cursor(base, other, cursor, end).await?;
+        let has_more = diffs.len() > limit;
+        if has_more {
+            diffs.truncate(limit);
+        }
+
+        let next_cursor = if has_more {
+            diffs
+                .last()
+                .map(|diff| range::RangeCursor::after_key(diff.key().to_vec()))
+        } else {
+            None
+        };
+
+        Ok(diff::DiffPage { diffs, next_cursor })
+    }
+
+    /// Read a bounded page from the async structural diff traversal.
+    ///
+    /// This is the async counterpart to [`Prolly::structural_diff_page`].
+    /// Pass `None` to start, then pass the returned cursor until
+    /// `next_cursor` is `None`.
+    pub async fn structural_diff_page(
+        &self,
+        base: &Tree,
+        other: &Tree,
+        cursor: Option<&diff::StructuralDiffCursor>,
+        limit: usize,
+    ) -> Result<diff::StructuralDiffPage, Error> {
+        diff::structural_diff_page_async(self, base, other, cursor, limit).await
+    }
+
+    /// Create an async streaming diff iterator between two trees.
+    ///
+    /// This is the async counterpart to [`Prolly::stream_diff`]. The iterator
+    /// preserves structural subtree pruning and yields one diff at a time
+    /// through [`AsyncDiffIter::next`](crate::AsyncDiffIter::next), so callers
+    /// can stop early without materializing every change.
+    pub fn stream_diff<'a>(&'a self, base: &Tree, other: &Tree) -> diff::AsyncDiffIter<'a, S> {
+        diff::AsyncDiffIter::new(self, base, other)
+    }
+
+    /// Create an async streaming merge-conflict iterator for a three-way merge.
+    ///
+    /// This is the async counterpart to [`Prolly::stream_conflicts`]. It walks
+    /// the async structural diff path, skips non-conflicting right-side
+    /// changes, and yields delete-aware [`Conflict`] values through
+    /// [`AsyncConflictIter::next`](crate::AsyncConflictIter::next).
+    pub fn stream_conflicts<'a>(
+        &'a self,
+        base: &Tree,
+        left: &'a Tree,
+        right: &Tree,
+    ) -> diff::AsyncConflictIter<'a, S> {
+        diff::AsyncConflictIter::new(self, base, left, right)
+    }
+
+    /// Merge two trees using async three-way merge.
+    ///
+    /// This mirrors [`Prolly::merge`]: `base` is the common ancestor, changes
+    /// from `right` are applied to `left`, and conflicting edits are passed to
+    /// the optional delete-aware resolver. The implementation loads changed
+    /// keys through [`AsyncStore`] and writes the merged tree through the async
+    /// batch path.
+    pub async fn merge(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        resolver: Option<Resolver>,
+    ) -> Result<Tree, Error> {
+        diff::merge_trees_async(self, base, left, right, resolver).await
+    }
+
+    /// Perform an async three-way merge and return structured diagnostic trace events.
+    ///
+    /// This is the async diagnostics-oriented counterpart to
+    /// [`AsyncProlly::merge`]. The returned [`crate::MergeExplanation`] keeps
+    /// its trace even when the merge result is an error, which is useful for
+    /// remote sync jobs, object-store backends, and custom resolver debugging.
+    pub async fn merge_explain(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        resolver: Option<Resolver>,
+    ) -> diff::MergeExplanation {
+        diff::merge_trees_explain_async(self, base, left, right, resolver).await
+    }
+
+    /// Merge only right-side changes whose keys are in `[start, end)` through
+    /// the async store.
+    ///
+    /// Keys outside the range are left exactly as they are in `left`. Conflict
+    /// detection and resolver behavior match [`AsyncProlly::merge`], but only
+    /// for keys inside the requested range.
+    pub async fn merge_range(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        start: &[u8],
+        end: Option<&[u8]>,
+        resolver: Option<Resolver>,
+    ) -> Result<Tree, Error> {
+        diff::merge_trees_range_async(self, base, left, right, start, end, resolver).await
+    }
+
+    /// Merge only right-side changes whose keys start with `prefix` through
+    /// the async store.
+    pub async fn merge_prefix(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        prefix: &[u8],
+        resolver: Option<Resolver>,
+    ) -> Result<Tree, Error> {
+        let (start, end) = key::prefix_range(prefix);
+        self.merge_range(base, left, right, &start, end.as_deref(), resolver)
+            .await
+    }
+
+    /// Merge two trees with async CRDT-style conflict-free resolution.
+    ///
+    /// This mirrors [`Prolly::crdt_merge`]. Built-in and custom CRDT
+    /// strategies always choose a value or delete for conflicts, so this method
+    /// never returns [`Error::Conflict`] unless a lower layer violates the merge
+    /// contract.
+    pub async fn crdt_merge(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+        config: &crdt::CrdtConfig,
+    ) -> Result<Tree, Error> {
+        let config = config.clone();
+        let resolver: Resolver = Box::new(move |conflict| {
+            crdt::resolve_conflict(&config, conflict)
+                .map(error::Resolution::value)
+                .unwrap_or_else(error::Resolution::delete)
+        });
+        self.merge(base, left, right, Some(resolver)).await
+    }
+
+    /// Collect comprehensive statistics about a tree through the async store.
+    ///
+    /// This mirrors [`Prolly::collect_stats`], traversing the tree
+    /// level-by-level and hydrating each child frontier through ordered async
+    /// batch reads.
+    pub async fn collect_stats(&self, tree: &Tree) -> Result<TreeStats, Error> {
+        let Some(root_cid) = &tree.root else {
+            let mut stats = TreeStats::new();
+            stats.finalize();
+            return Ok(stats);
+        };
+
+        let mut stats = TreeStats::new();
+        self.collect_stats_from_frontier(root_cid, &mut stats)
+            .await?;
+        stats.finalize();
+        Ok(stats)
+    }
+
+    /// Return a deterministic debug view of the tree through the async store.
+    ///
+    /// This mirrors [`Prolly::debug_tree`] and loads each child frontier through
+    /// ordered async batch reads.
+    pub async fn debug_tree(&self, tree: &Tree) -> Result<debug::TreeDebugView, Error> {
+        debug::collect_tree_debug_view_async(self, tree).await
+    }
+
+    /// Compare two trees by CID sharing and rewritten subtrees through the
+    /// async store.
+    ///
+    /// This mirrors [`Prolly::debug_compare_trees`]. Shared nodes are counted
+    /// once; side-only nodes show which subtrees were rewritten, added, or
+    /// removed.
+    pub async fn debug_compare_trees(
+        &self,
+        left: &Tree,
+        right: &Tree,
+    ) -> Result<debug::TreeDebugComparison, Error> {
+        debug::compare_tree_debug_views_async(self, left, right).await
+    }
+
+    /// Compare structural statistics between two trees through the async store.
+    ///
+    /// Deltas are computed as `after - before`, matching
+    /// [`Prolly::stats_diff`].
+    pub async fn stats_diff(&self, before: &Tree, after: &Tree) -> Result<StatsComparison, Error> {
+        let before_stats = self.collect_stats(before).await?;
+        let after_stats = self.collect_stats(after).await?;
+        Ok(StatsComparison::new(before_stats, after_stats))
+    }
+
+    /// Mark all content-addressed nodes reachable from retained tree roots.
+    ///
+    /// This mirrors [`Prolly::mark_reachable`] while loading changed frontiers
+    /// through [`AsyncStore::batch_get_ordered_unique`].
+    pub async fn mark_reachable(&self, roots: &[Tree]) -> Result<GcReachability, Error> {
+        let mut seen = HashSet::new();
+        let mut frontier = Vec::new();
+
+        for tree in roots {
+            if let Some(root_cid) = &tree.root {
+                if seen.insert(root_cid.clone()) {
+                    frontier.push(root_cid.clone());
+                }
+            }
+        }
+
+        let mut live_cids = Vec::new();
+        let mut live_bytes = 0usize;
+        let mut leaf_nodes = 0usize;
+        let mut internal_nodes = 0usize;
+
+        while !frontier.is_empty() {
+            let current = std::mem::take(&mut frontier);
+            let nodes = self.load_child_frontier_ordered(&current).await?;
+
+            for (cid, node) in current.into_iter().zip(nodes) {
+                if node.keys.len() != node.vals.len() {
+                    return Err(Error::InvalidNode);
+                }
+
+                live_bytes += node.encoded_len();
+                if node.leaf {
+                    leaf_nodes += 1;
+                } else {
+                    internal_nodes += 1;
+                    frontier.reserve(node.vals.len());
+                    for idx in 0..node.len() {
+                        let child_cid = child_cid_at(&node, idx)?;
+                        if seen.insert(child_cid.clone()) {
+                            frontier.push(child_cid);
+                        }
+                    }
+                }
+                live_cids.push(cid);
+            }
+        }
+
+        gc::sort_cids(&mut live_cids);
+        Ok(GcReachability {
+            live_nodes: live_cids.len(),
+            live_cids,
+            live_bytes,
+            leaf_nodes,
+            internal_nodes,
+        })
+    }
+
+    /// Plan which content-addressed nodes an async destination store is missing.
+    ///
+    /// This is the async equivalent of [`Prolly::plan_missing_nodes`]. The
+    /// destination and source are read through ordered async batch APIs so
+    /// remote stores can overlap fetches internally.
+    pub async fn plan_missing_nodes<D>(
+        &self,
+        tree: &Tree,
+        destination: &D,
+    ) -> Result<MissingNodePlan, Error>
+    where
+        D: AsyncStore,
+        D::Error: Send + Sync,
+    {
+        let (plan, _) = self.prepare_missing_nodes(tree, destination).await?;
+        Ok(plan)
+    }
+
+    /// Copy all async-destination-missing nodes required by `tree`.
+    ///
+    /// Source and destination node bytes are verified against their CIDs before
+    /// the copy succeeds.
+    pub async fn copy_missing_nodes<D>(
+        &self,
+        tree: &Tree,
+        destination: &D,
+    ) -> Result<MissingNodeCopy, Error>
+    where
+        D: AsyncStore,
+        D::Error: Send + Sync,
+    {
+        let (plan, node_bytes) = self.prepare_missing_nodes(tree, destination).await?;
+        let copied_nodes = node_bytes.len();
+        let copied_bytes = node_bytes
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>();
+
+        if !node_bytes.is_empty() {
+            let entries = node_bytes
+                .iter()
+                .map(|(cid, bytes)| (cid.as_bytes(), bytes.as_slice()))
+                .collect::<Vec<_>>();
+            destination
+                .batch_put(&entries)
+                .await
+                .map_err(|err| Error::Store(Box::new(err)))?;
+        }
+
+        Ok(MissingNodeCopy {
+            plan,
+            copied_nodes,
+            copied_bytes,
+        })
+    }
+
+    async fn prepare_missing_nodes<D>(
+        &self,
+        tree: &Tree,
+        destination: &D,
+    ) -> Result<PreparedMissingNodes, Error>
+    where
+        D: AsyncStore,
+        D::Error: Send + Sync,
+    {
+        let reachability = self.mark_reachable(std::slice::from_ref(tree)).await?;
+        let required_nodes = reachability.live_nodes;
+        let required_bytes = reachability.live_bytes;
+        let required_cids = reachability.live_cids;
+
+        if required_cids.is_empty() {
+            return Ok((
+                MissingNodePlan {
+                    required_cids,
+                    required_nodes,
+                    required_bytes,
+                    missing_cids: Vec::new(),
+                    missing_nodes: 0,
+                    missing_bytes: 0,
+                },
+                Vec::new(),
+            ));
+        }
+
+        let destination_keys = required_cids
+            .iter()
+            .map(|cid| cid.as_bytes())
+            .collect::<Vec<_>>();
+        let destination_values = async_batch_get_ordered_unique_bounded(
+            destination,
+            &destination_keys,
+            ASYNC_NODE_PREFETCH_BATCH_SIZE,
+        )
+        .await?;
+
+        let mut missing_cids = Vec::new();
+        for (cid, value) in required_cids.iter().zip(destination_values) {
+            match value {
+                Some(bytes) => self::sync::verify_node_bytes(cid, &bytes)?,
+                None => missing_cids.push(cid.clone()),
+            }
+        }
+
+        let missing_keys = missing_cids
+            .iter()
+            .map(|cid| cid.as_bytes())
+            .collect::<Vec<_>>();
+        let source_values = async_batch_get_ordered_unique_bounded(
+            &self.store,
+            &missing_keys,
+            ASYNC_NODE_PREFETCH_BATCH_SIZE,
+        )
+        .await?;
+
+        let mut missing_bytes = 0usize;
+        let mut node_bytes = Vec::with_capacity(missing_cids.len());
+        for (cid, value) in missing_cids.iter().zip(source_values) {
+            let bytes = value.ok_or_else(|| Error::NotFound(cid.clone()))?;
+            self::sync::verify_node_bytes(cid, &bytes)?;
+            missing_bytes += bytes.len();
+            node_bytes.push((cid.clone(), bytes));
+        }
+
+        Ok((
+            MissingNodePlan {
+                required_cids,
+                required_nodes,
+                required_bytes,
+                missing_nodes: missing_cids.len(),
+                missing_cids,
+                missing_bytes,
+            },
+            node_bytes,
+        ))
+    }
+
+    /// Mark all offloaded blobs reachable from retained tree roots through the
+    /// async node store.
+    pub async fn mark_reachable_blobs(&self, roots: &[Tree]) -> Result<BlobGcReachability, Error> {
+        let mut seen_nodes = HashSet::new();
+        let mut frontier = Vec::new();
+
+        for tree in roots {
+            if let Some(root_cid) = &tree.root {
+                if seen_nodes.insert(root_cid.clone()) {
+                    frontier.push(root_cid.clone());
+                }
+            }
+        }
+
+        let mut live_blobs_by_cid = HashMap::<Cid, blob::BlobRef>::new();
+        let mut scanned_nodes = 0usize;
+        let mut scanned_values = 0usize;
+
+        while !frontier.is_empty() {
+            let nodes = self.load_child_frontier_ordered(&frontier).await?;
+            let mut next_frontier = Vec::new();
+
+            for node in nodes {
+                if node.keys.len() != node.vals.len() {
+                    return Err(Error::InvalidNode);
+                }
+                scanned_nodes += 1;
+
+                if node.leaf {
+                    scanned_values += node.vals.len();
+                    for value in &node.vals {
+                        if let blob::ValueRef::Blob(reference) =
+                            blob::ValueRef::from_stored_bytes(value)?
+                        {
+                            match live_blobs_by_cid.entry(reference.cid.clone()) {
+                                Entry::Occupied(entry) => {
+                                    if entry.get().len != reference.len {
+                                        return Err(Error::Deserialize(
+                                            "conflicting blob reference lengths for same CID"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                                Entry::Vacant(entry) => {
+                                    entry.insert(reference);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    next_frontier.reserve(node.vals.len());
+                    for idx in 0..node.len() {
+                        let child_cid = child_cid_at(&node, idx)?;
+                        if seen_nodes.insert(child_cid.clone()) {
+                            next_frontier.push(child_cid);
+                        }
+                    }
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        let mut live_blobs = live_blobs_by_cid.into_values().collect::<Vec<_>>();
+        gc::sort_blob_refs(&mut live_blobs);
+        let live_blob_bytes = live_blobs
+            .iter()
+            .map(|reference| reference.len)
+            .sum::<u64>();
+
+        Ok(BlobGcReachability {
+            live_blob_count: live_blobs.len(),
+            live_blobs,
+            live_blob_bytes,
+            scanned_nodes,
+            scanned_values,
+        })
+    }
+
+    /// Build a dry-run garbage-collection plan for offloaded blobs through an
+    /// async blob store.
+    pub async fn plan_blob_gc<B, I, C>(
+        &self,
+        blob_store: &B,
+        roots: &[Tree],
+        candidates: I,
+    ) -> Result<BlobGcPlan, Error>
+    where
+        B: blob::AsyncBlobStore,
+        B::Error: Send + Sync,
+        I: IntoIterator<Item = C>,
+        C: Borrow<blob::BlobRef>,
+    {
+        let reachability = self.mark_reachable_blobs(roots).await?;
+        let live_cids = reachability
+            .live_blobs
+            .iter()
+            .map(|reference| reference.cid.clone())
+            .collect::<HashSet<_>>();
+        let mut seen_candidates = HashSet::new();
+        let mut reclaimable_blobs = Vec::new();
+        let mut reclaimable_blob_bytes = 0u64;
+        let mut missing_candidates = 0usize;
+        let mut candidate_blobs = 0usize;
+
+        for candidate in candidates {
+            let reference = candidate.borrow();
+            if !seen_candidates.insert(reference.cid.clone()) {
+                continue;
+            }
+            candidate_blobs += 1;
+
+            if live_cids.contains(&reference.cid) {
+                continue;
+            }
+
+            match blob_store
+                .get_blob(reference)
+                .await
+                .map_err(|err| Error::Store(Box::new(err)))?
+            {
+                Some(bytes) => {
+                    reference.validate_bytes(&bytes)?;
+                    reclaimable_blob_bytes += bytes.len() as u64;
+                    reclaimable_blobs.push(reference.clone());
+                }
+                None => {
+                    missing_candidates += 1;
+                }
+            }
+        }
+
+        gc::sort_blob_refs(&mut reclaimable_blobs);
+        Ok(BlobGcPlan {
+            reachability,
+            candidate_blobs,
+            reclaimable_blob_count: reclaimable_blobs.len(),
+            reclaimable_blobs,
+            reclaimable_blob_bytes,
+            missing_candidates,
+        })
+    }
+
+    /// Delete unreachable candidate blobs from an async blob store.
+    pub async fn sweep_blob_gc<B, I, C>(
+        &self,
+        blob_store: &B,
+        roots: &[Tree],
+        candidates: I,
+    ) -> Result<BlobGcSweep, Error>
+    where
+        B: blob::AsyncBlobStore,
+        B::Error: Send + Sync,
+        I: IntoIterator<Item = C>,
+        C: Borrow<blob::BlobRef>,
+    {
+        let plan = self.plan_blob_gc(blob_store, roots, candidates).await?;
+        let deleted_blobs = plan.reclaimable_blob_count;
+        let deleted_blob_bytes = plan.reclaimable_blob_bytes;
+
+        for reference in &plan.reclaimable_blobs {
+            blob_store
+                .delete_blob(reference)
+                .await
+                .map_err(|err| Error::Store(Box::new(err)))?;
+        }
+
+        Ok(BlobGcSweep {
+            plan,
+            deleted_blobs,
+            deleted_blob_bytes,
+        })
+    }
+
+    /// Clear in-process async manager caches.
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache) = self.node_cache.write() {
+            let evictions = cache.clear();
+            self.metrics.add_cache_evictions(evictions);
+        }
+        if let Ok(mut cache) = self.rightmost_path_cache.write() {
+            *cache = None;
+        }
+    }
+
+    /// Return the current node-cache entry count.
+    pub fn cache_len(&self) -> usize {
+        self.node_cache.read().map(|cache| cache.len()).unwrap_or(0)
+    }
+
+    /// Return the serialized-node byte weight retained by this async manager cache.
+    pub fn cache_bytes_len(&self) -> usize {
+        self.node_cache
+            .read()
+            .map(|cache| cache.bytes_len())
+            .unwrap_or(0)
+    }
+
+    /// Return the number of pinned nodes currently retained by this async manager.
+    ///
+    /// Pinned nodes are a cache hint only. They may temporarily keep the cache
+    /// above configured node or byte limits, and cache misses still fall back to
+    /// the backing store.
+    pub fn cache_pinned_len(&self) -> usize {
+        self.node_cache
+            .read()
+            .map(|cache| cache.pinned_len())
+            .unwrap_or(0)
+    }
+
+    /// Return the serialized-node byte weight of pinned async cache entries.
+    pub fn cache_pinned_bytes_len(&self) -> usize {
+        self.node_cache
+            .read()
+            .map(|cache| cache.pinned_bytes_len())
+            .unwrap_or(0)
+    }
+
+    /// Pin the root node of a tree in this async manager's node cache.
+    ///
+    /// This is useful for hot snapshots where repeated reads are expected to
+    /// start from the same root. Empty trees pin nothing. The return value is
+    /// the number of nodes that became newly pinned.
+    pub async fn pin_tree_root(&self, tree: &Tree) -> Result<usize, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(0);
+        };
+
+        let (_, newly_pinned) = self.load_arc_pinned(root_cid).await?;
+        Ok(usize::from(newly_pinned))
+    }
+
+    /// Pin the root-to-leaf lookup path for `key` in this async manager's cache.
+    ///
+    /// The path is the same traversal that a lookup or point mutation would use
+    /// for the key, including the would-be leaf for missing keys. Empty trees
+    /// pin nothing. The return value is the number of nodes that became newly
+    /// pinned.
+    pub async fn pin_tree_path(&self, tree: &Tree, key: &[u8]) -> Result<usize, Error> {
+        let Some(root_cid) = &tree.root else {
+            return Ok(0);
+        };
+
+        let mut cid = root_cid.clone();
+        let mut newly_pinned = 0usize;
+
+        loop {
+            let (node, was_newly_pinned) = self.load_arc_pinned(&cid).await?;
+            newly_pinned += usize::from(was_newly_pinned);
+
+            if node.leaf {
+                break;
+            }
+
+            let idx = match node.search(key) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            cid = child_cid_at(&node, idx)?;
+        }
+
+        Ok(newly_pinned)
+    }
+
+    /// Unpin all pinned node-cache entries for this async manager.
+    ///
+    /// After unpinning, normal cache eviction runs immediately. Returns the
+    /// number of entries that were pinned before this call.
+    pub fn unpin_all_cache_nodes(&self) -> usize {
+        if let Ok(mut cache) = self.node_cache.write() {
+            let (unpinned, evictions) = cache.unpin_all();
+            self.metrics.add_cache_evictions(evictions);
+            unpinned
+        } else {
+            0
+        }
+    }
+
+    /// Return cumulative cache and node I/O metrics for this async manager.
+    pub fn metrics(&self) -> ProllyMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Reset cumulative async manager metrics to zero.
+    ///
+    /// This does not clear the node cache; call [`AsyncProlly::clear_cache`]
+    /// when you want the next operation to run from a cold manager cache.
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
+    }
+
+    pub(crate) async fn load_arc(&self, cid: &Cid) -> Result<Arc<Node>, Error> {
+        if let Ok(mut cache) = self.node_cache.write() {
+            if let Some(node) = cache.get(cid) {
+                self.metrics.add_cache_hits(1);
+                return Ok(node);
+            }
+        }
+
+        self.metrics.add_cache_misses(1);
+        let bytes = self
+            .store
+            .get(cid.as_bytes())
+            .await
+            .map_err(|e| Error::Store(Box::new(e)))?
+            .ok_or_else(|| Error::NotFound(cid.clone()))?;
+        self.metrics.record_point_read(bytes.len());
+        let node = Arc::new(Node::from_bytes(&bytes)?);
+
+        if let Ok(mut cache) = self.node_cache.write() {
+            let evictions = cache.insert(cid.clone(), node.clone(), bytes.len());
+            self.metrics.add_cache_evictions(evictions);
+        }
+
+        Ok(node)
+    }
+
+    async fn load_arc_pinned(&self, cid: &Cid) -> Result<(Arc<Node>, bool), Error> {
+        if let Ok(mut cache) = self.node_cache.write() {
+            if let Some(node) = cache.get(cid) {
+                let newly_pinned = cache.pin_existing(cid);
+                self.metrics.add_cache_hits(1);
+                return Ok((node, newly_pinned));
+            }
+        }
+
+        self.metrics.add_cache_misses(1);
+        let bytes = self
+            .store
+            .get(cid.as_bytes())
+            .await
+            .map_err(|e| Error::Store(Box::new(e)))?
+            .ok_or_else(|| Error::NotFound(cid.clone()))?;
+        self.metrics.record_point_read(bytes.len());
+        let node = Arc::new(Node::from_bytes(&bytes)?);
+
+        let mut newly_pinned = false;
+        if let Ok(mut cache) = self.node_cache.write() {
+            let (inserted_pinned, evictions) =
+                cache.insert_pinned(cid.clone(), node.clone(), bytes.len());
+            newly_pinned = inserted_pinned;
+            self.metrics.add_cache_evictions(evictions);
+        }
+
+        Ok((node, newly_pinned))
+    }
+
+    async fn collect_stats_from_frontier(
+        &self,
+        root_cid: &Cid,
+        stats: &mut TreeStats,
+    ) -> Result<(), Error> {
+        let mut frontier = vec![root_cid.clone()];
+
+        while !frontier.is_empty() {
+            let nodes = self.load_child_frontier_ordered(&frontier).await?;
+            let mut next_frontier = Vec::new();
+
+            for node in nodes {
+                if node.keys.len() != node.vals.len() {
+                    return Err(Error::InvalidNode);
+                }
+                stats.accumulate(&node);
+
+                if !node.leaf {
+                    next_frontier.reserve(node.vals.len());
+                    for idx in 0..node.len() {
+                        next_frontier.push(child_cid_at(&node, idx)?);
+                    }
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn load_child_frontier_ordered(
+        &self,
+        cids: &[Cid],
+    ) -> Result<Vec<Arc<Node>>, Error> {
+        if cids.len() <= ASYNC_NODE_PREFETCH_BATCH_SIZE {
+            return self.load_many_ordered(cids).await;
+        }
+
+        let mut nodes = Vec::with_capacity(cids.len());
+        for chunk in cids.chunks(ASYNC_NODE_PREFETCH_BATCH_SIZE) {
+            nodes.extend(self.load_many_ordered(chunk).await?);
+        }
+        Ok(nodes)
+    }
+
+    pub(crate) async fn load_many_ordered(&self, cids: &[Cid]) -> Result<Vec<Arc<Node>>, Error> {
+        if cids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut nodes: Vec<Option<Arc<Node>>>;
+        let mut missing: Option<MissingNodeBatch>;
+        if let Ok(mut cache) = self.node_cache.write() {
+            let mut cache_hits = 0usize;
+            let mut cached_nodes = Vec::with_capacity(cids.len());
+            let mut first_miss = None;
+            for (idx, cid) in cids.iter().enumerate() {
+                if let Some(node) = cache.get(cid) {
+                    cache_hits += 1;
+                    cached_nodes.push(node.clone());
+                } else {
+                    first_miss = Some(idx);
+                    break;
+                }
+            }
+
+            let Some(first_miss) = first_miss else {
+                self.metrics.add_cache_hits(cache_hits);
+                return Ok(cached_nodes);
+            };
+
+            nodes = Vec::with_capacity(cids.len());
+            nodes.extend(cached_nodes.into_iter().map(Some));
+            nodes.resize_with(cids.len(), || None);
+            missing = Some(MissingNodeBatch::with_capacity(cids.len() - first_miss));
+            if let Some(missing_batch) = missing.as_mut() {
+                missing_batch.record(&cids[first_miss], first_miss);
+                for (idx, cid) in cids.iter().enumerate().skip(first_miss + 1) {
+                    if let Some(node) = cache.get(cid) {
+                        cache_hits += 1;
+                        nodes[idx] = Some(node.clone());
+                    } else {
+                        missing_batch.record(cid, idx);
+                    }
+                }
+            }
+            self.metrics.add_cache_hits(cache_hits);
+        } else {
+            nodes = vec![None; cids.len()];
+            let mut missing_batch = MissingNodeBatch::with_capacity(cids.len());
+            for (idx, cid) in cids.iter().enumerate() {
+                missing_batch.record(cid, idx);
+            }
+            missing = Some(missing_batch);
+        }
+
+        if let Some(MissingNodeBatch {
+            cids: missing_cids,
+            positions: missing_positions,
+            ..
+        }) = missing
+        {
+            if missing_cids.len() == 1 && !self.store.prefers_batch_reads() {
+                let node = self.load_arc(&missing_cids[0]).await?;
+                let positions = missing_positions
+                    .into_iter()
+                    .next()
+                    .ok_or(Error::InvalidNode)?;
+                for idx in positions {
+                    nodes[idx] = Some(node.clone());
+                }
+
+                return nodes
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(Error::InvalidNode);
+            }
+
+            let keys = missing_cids
+                .iter()
+                .map(|cid| cid.as_bytes())
+                .collect::<Vec<_>>();
+            self.metrics.add_cache_misses(keys.len());
+            let loaded = self
+                .store
+                .batch_get_ordered_unique(&keys)
+                .await
+                .map_err(|e| Error::Store(Box::new(e)))?;
+            if loaded.len() != missing_cids.len() {
+                return Err(Error::InvalidNode);
+            }
+            let (loaded_nodes, loaded_bytes) = loaded_node_totals(&loaded);
+            self.metrics
+                .record_batch_read(keys.len(), loaded_bytes, loaded_nodes);
+
+            let decoded = missing_cids
+                .into_iter()
+                .zip(loaded)
+                .map(|(cid, bytes)| {
+                    let bytes = bytes.ok_or_else(|| Error::NotFound(cid.clone()))?;
+                    let node = Arc::new(Node::from_bytes(&bytes)?);
+                    Ok((cid, node))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+
+            let mut cache = self.node_cache.write().ok();
+            let mut evictions = 0usize;
+            for ((cid, node), positions) in decoded.into_iter().zip(missing_positions) {
+                if let Some(cache) = cache.as_mut() {
+                    evictions += cache.insert(cid, node.clone(), node.encoded_len());
+                }
+                for idx in positions {
+                    nodes[idx] = Some(node.clone());
+                }
+            }
+            self.metrics.add_cache_evictions(evictions);
+        }
+
+        nodes
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::InvalidNode)
+    }
+
+    pub(crate) fn cached_node_arc(&self, cid: &Cid) -> Option<Arc<Node>> {
+        let node = self
+            .node_cache
+            .write()
+            .ok()
+            .and_then(|mut cache| cache.get(cid));
+        if node.is_some() {
+            self.metrics.add_cache_hits(1);
+        }
+        node
+    }
+
+    fn cache_node(&self, cid: Cid, node: Node) {
+        if let Ok(mut cache) = self.node_cache.write() {
+            let bytes = node.encoded_len();
+            let evictions = cache.insert(cid, Arc::new(node), bytes);
+            self.metrics.add_cache_evictions(evictions);
+        }
+    }
+
+    async fn find_path(&self, tree: &Tree, key: &[u8]) -> Result<Vec<(Node, usize)>, Error> {
+        let mut path = Vec::new();
+
+        let Some(root_cid) = &tree.root else {
+            return Ok(path);
+        };
+
+        let mut cid = root_cid.clone();
+        loop {
+            let node = self.load_arc(&cid).await?;
+            let idx = match node.search(key) {
+                Ok(idx) => idx,
+                Err(idx) => idx.saturating_sub(1),
+            };
+
+            path.push((node.as_ref().clone(), idx));
+
+            if node.leaf {
+                break;
+            }
+
+            cid = child_cid_at(&node, idx)?;
+        }
+
+        Ok(path)
+    }
+
+    pub(crate) async fn find_path_arcs(
+        &self,
+        tree: &Tree,
+        key: &[u8],
+    ) -> Result<Vec<(Arc<Node>, usize)>, Error> {
+        let mut path = Vec::new();
+
+        let Some(root_cid) = &tree.root else {
+            return Ok(path);
+        };
+
+        let mut cid = root_cid.clone();
+        loop {
+            let node = self.load_arc(&cid).await?;
+            let idx = match node.search(key) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+
+            path.push((node.clone(), idx));
+
+            if node.leaf {
+                break;
+            }
+
+            cid = child_cid_at(&node, idx)?;
+        }
+
+        Ok(path)
+    }
+
+    fn build_internal_level_from_summaries(
+        &self,
+        children: Vec<AsyncBuildNodeSummary>,
+        level: u8,
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<Vec<AsyncBuildNodeSummary>, Error> {
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hash_boundaries = children
+            .iter()
+            .map(|child| {
+                boundary::is_hash_boundary_config(
+                    &self.config,
+                    &child.first_key,
+                    child.cid.as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let chunk_ranges =
+            builder::chunk_ranges_from_hash_boundaries(&self.config, &hash_boundaries);
+        let mut summaries = Vec::with_capacity(chunk_ranges.len());
+
+        for range in chunk_ranges {
+            let start = *range.start();
+            let end = *range.end();
+            let mut node = self.new_internal_node(level);
+            reserve_node_entries(&mut node, end - start + 1);
+
+            for child in children.iter().take(end + 1).skip(start) {
+                node.keys.push(child.first_key.clone());
+                node.vals.push(child.cid.0.to_vec());
+            }
+
+            summaries.push(self.collect_build_node(node, collector)?);
+        }
+
+        Ok(summaries)
+    }
+
+    fn collect_build_node(
+        &self,
+        node: Node,
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<AsyncBuildNodeSummary, Error> {
+        let first_key = node.keys.first().cloned().ok_or(Error::InvalidNode)?;
+        let cid = collector.add(&node);
+        Ok(AsyncBuildNodeSummary { cid, first_key })
+    }
+
+    fn new_leaf_node(&self) -> Node {
+        Node::builder()
+            .leaf(true)
+            .level(INIT_LEVEL)
+            .min_chunk_size(self.config.min_chunk_size)
+            .max_chunk_size(self.config.max_chunk_size)
+            .chunking_factor(self.config.chunking_factor)
+            .hash_seed(self.config.hash_seed)
+            .encoding(self.config.encoding.clone())
+            .build()
+    }
+
+    fn new_internal_node(&self, level: u8) -> Node {
+        Node::builder()
+            .leaf(false)
+            .level(level)
+            .min_chunk_size(self.config.min_chunk_size)
+            .max_chunk_size(self.config.max_chunk_size)
+            .chunking_factor(self.config.chunking_factor)
+            .hash_seed(self.config.hash_seed)
+            .encoding(self.config.encoding.clone())
+            .build()
+    }
+
+    fn new_node_like(&self, template: &Node) -> Node {
+        Node::builder()
+            .leaf(template.leaf)
+            .level(template.level)
+            .min_chunk_size(template.min_chunk_size)
+            .max_chunk_size(template.max_chunk_size)
+            .chunking_factor(template.chunking_factor)
+            .hash_seed(template.hash_seed)
+            .encoding(template.encoding.clone())
+            .build()
+    }
+
+    async fn rebalance_with_collector(
+        &self,
+        mut node: Node,
+        mut ancestors: Vec<(Node, usize)>,
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<Option<Cid>, Error> {
+        loop {
+            if node.is_empty() {
+                let Some((mut parent, idx)) = ancestors.pop() else {
+                    return Ok(None);
+                };
+
+                parent.keys.remove(idx);
+                parent.vals.remove(idx);
+
+                if parent.is_empty() && ancestors.is_empty() {
+                    return Ok(None);
+                }
+
+                node = parent;
+                continue;
+            }
+
+            if node.len() > node.max_chunk_size && node.len() > 1 {
+                let chunks = self.split_node_chunks(&node);
+
+                if chunks.len() == 1 {
+                    node = chunks.into_iter().next().ok_or(Error::InvalidNode)?;
+                } else {
+                    let first_keys = chunks
+                        .iter()
+                        .map(|chunk| chunk.keys.first().cloned().unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    let chunk_info = collector
+                        .add_many(chunks)
+                        .into_iter()
+                        .zip(first_keys)
+                        .collect::<Vec<_>>();
+
+                    if ancestors.is_empty() {
+                        let mut parent = self.new_internal_node(node.level + 1);
+                        reserve_node_entries(&mut parent, chunk_info.len());
+                        for (cid, first_key) in &chunk_info {
+                            parent.keys.push(first_key.clone());
+                            parent.vals.push(cid.0.to_vec());
+                        }
+                        node = parent;
+                        continue;
+                    }
+
+                    let (mut parent, idx) = ancestors.pop().ok_or(Error::InvalidNode)?;
+                    parent.keys.remove(idx);
+                    parent.vals.remove(idx);
+                    reserve_node_entries(&mut parent, chunk_info.len().saturating_sub(1));
+                    for (offset, (cid, first_key)) in chunk_info.iter().enumerate() {
+                        parent.keys.insert(idx + offset, first_key.clone());
+                        parent.vals.insert(idx + offset, cid.0.to_vec());
+                    }
+                    node = parent;
+                    continue;
+                }
+            }
+
+            if !ancestors.is_empty() && node.len() < node.min_chunk_size {
+                if let Some((merged_node, merged_ancestors)) = self
+                    .try_merge_with_sibling(&node, &ancestors, collector)
+                    .await?
+                {
+                    node = merged_node;
+                    ancestors = merged_ancestors;
+                    continue;
+                }
+            }
+
+            let cid = collector.add(&node);
+
+            let Some((mut parent, idx)) = ancestors.pop() else {
+                return Ok(Some(cid));
+            };
+
+            if !node.keys.is_empty() {
+                parent.keys[idx] = node.keys[0].clone();
+            }
+            parent.vals[idx] = cid.0.to_vec();
+            node = parent;
+        }
+    }
+
+    async fn try_merge_with_sibling(
+        &self,
+        node: &Node,
+        ancestors: &[(Node, usize)],
+        collector: &mut AsyncWriteCollector,
+    ) -> Result<Option<(Node, Vec<(Node, usize)>)>, Error> {
+        let (parent, idx) = ancestors.last().ok_or(Error::InvalidNode)?;
+        let idx = *idx;
+
+        if idx > 0 {
+            let left_cid = child_cid_at(parent, idx - 1)?;
+            let left_sibling = self.load_arc(&left_cid).await?;
+
+            if !is_valid_boundary_between(&left_sibling, node) {
+                let merged = self.merge_nodes(&left_sibling, node);
+                let mut new_parent = parent.clone();
+                new_parent.keys.remove(idx - 1);
+                new_parent.vals.remove(idx - 1);
+                let new_idx = idx - 1;
+
+                if merged.len() > merged.max_chunk_size && merged.len() > 1 {
+                    let mut new_ancestors = ancestors[..ancestors.len() - 1].to_vec();
+                    new_ancestors.push((new_parent, new_idx));
+                    return Ok(Some((merged, new_ancestors)));
+                }
+
+                let merged_cid = collector.add(&merged);
+                new_parent.keys[new_idx] = merged.keys[0].clone();
+                new_parent.vals[new_idx] = merged_cid.0.to_vec();
+                return Ok(Some((
+                    new_parent,
+                    ancestors[..ancestors.len() - 1].to_vec(),
+                )));
+            }
+        }
+
+        if idx + 1 < parent.vals.len() {
+            let right_cid = child_cid_at(parent, idx + 1)?;
+            let right_sibling = self.load_arc(&right_cid).await?;
+
+            if !is_valid_boundary_between(node, &right_sibling) {
+                let merged = self.merge_nodes(node, &right_sibling);
+                let mut new_parent = parent.clone();
+                new_parent.keys.remove(idx + 1);
+                new_parent.vals.remove(idx + 1);
+
+                if merged.len() > merged.max_chunk_size && merged.len() > 1 {
+                    let mut new_ancestors = ancestors[..ancestors.len() - 1].to_vec();
+                    new_ancestors.push((new_parent, idx));
+                    return Ok(Some((merged, new_ancestors)));
+                }
+
+                let merged_cid = collector.add(&merged);
+                new_parent.keys[idx] = merged.keys[0].clone();
+                new_parent.vals[idx] = merged_cid.0.to_vec();
+                return Ok(Some((
+                    new_parent,
+                    ancestors[..ancestors.len() - 1].to_vec(),
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn split_node_chunks(&self, node: &Node) -> Vec<Node> {
+        let capacity = node.max_chunk_size.max(1);
+        if node.len() <= capacity {
+            return vec![node.clone()];
+        }
+
+        let num_chunks = node.len().div_ceil(capacity);
+        let mut chunks = Vec::with_capacity(num_chunks);
+        let mut start = 0;
+
+        while start < node.len() {
+            let remaining_chunks = num_chunks - chunks.len();
+            let remaining_entries = node.len() - start;
+            let target_end = if remaining_chunks == 0 {
+                (start + remaining_entries).min(start + capacity)
+            } else {
+                start + (remaining_entries / remaining_chunks).max(1)
+            };
+
+            let max_end = (start + capacity).min(node.len());
+            let min_end = start + 1;
+            let mut end = target_end.min(max_end).max(min_end);
+            let search_start = target_end.saturating_sub(50).max(min_end);
+            let search_end = (target_end + 50).min(max_end);
+
+            for idx in (search_start..=search_end).rev() {
+                if idx <= max_end && idx < node.len() && boundary::is_boundary(node, idx - 1) {
+                    end = idx;
+                    break;
+                }
+            }
+
+            if end - start > capacity {
+                end = start + capacity;
+            }
+
+            let remaining_after = node.len() - end;
+            if remaining_after > 0
+                && remaining_after < capacity / 4
+                && (end - start) + remaining_after <= capacity
+            {
+                end = node.len();
+            }
+
+            if end - start > capacity {
+                end = start + capacity;
+            }
+
+            let mut chunk = self.new_node_like(node);
+            chunk.keys = node.keys[start..end].to_vec();
+            chunk.vals = node.vals[start..end].to_vec();
+            chunks.push(chunk);
+            start = end;
+        }
+
+        chunks
+    }
+
+    fn merge_nodes(&self, left: &Node, right: &Node) -> Node {
+        let mut merged = self.new_node_like(left);
+        let merged_len = left.len() + right.len();
+        merged.keys = Vec::with_capacity(merged_len);
+        merged.keys.extend(left.keys.iter().cloned());
+        merged.keys.extend(right.keys.iter().cloned());
+        merged.vals = Vec::with_capacity(merged_len);
+        merged.vals.extend(left.vals.iter().cloned());
+        merged.vals.extend(right.vals.iter().cloned());
+        merged
+    }
+}
+
+#[cfg(feature = "async-store")]
+fn collect_async_batch_route_contexts(
+    path: &Arc<AsyncBatchRoutePath>,
+    contexts: &mut HashMap<Cid, AsyncBatchAncestorContext>,
+) {
+    let mut current = Some(path.clone());
+
+    while let Some(path) = current {
+        let parent = path.parent.as_ref().map(|parent| AsyncBatchParentLink {
+            parent_cid: parent.cid.clone(),
+            child_index: parent.child_index,
+        });
+
+        contexts
+            .entry(path.cid.clone())
+            .or_insert_with(|| AsyncBatchAncestorContext {
+                node: path.node.as_ref().clone(),
+                parent,
+            });
+
+        current = path.parent.clone();
+    }
+}
+
+#[cfg(feature = "async-store")]
+fn should_close_append_leaf(node: &Node, max_chunk_size: usize) -> bool {
+    if node.is_empty() {
+        return false;
+    }
+
+    if node.len() >= max_chunk_size {
+        return true;
+    }
+
+    boundary::is_boundary(node, node.len() - 1)
+}
+
+#[cfg(feature = "async-store")]
+fn async_rightmost_entry_from_node_ref((cid, node): &(Cid, Node)) -> AsyncRightmostPathEntry {
+    AsyncRightmostPathEntry {
+        cid: cid.clone(),
+        node: node.clone(),
+        child_index: node.len().saturating_sub(1),
+    }
+}
+
+#[cfg(feature = "async-store")]
+fn cached_rightmost_entries(path: &[AsyncRightmostPathEntry]) -> Vec<CachedRightmostPathEntry> {
+    path.iter()
+        .map(|entry| CachedRightmostPathEntry {
+            cid: entry.cid.clone(),
+            node: entry.node.clone(),
+            child_index: entry.child_index,
+        })
+        .collect()
+}
+
+#[cfg(feature = "async-store")]
+fn async_rightmost_entries_from_cache(
+    path: Vec<CachedRightmostPathEntry>,
+) -> Vec<AsyncRightmostPathEntry> {
+    path.into_iter()
+        .map(|entry| AsyncRightmostPathEntry {
+            cid: entry.cid,
+            node: entry.node,
+            child_index: entry.child_index,
+        })
+        .collect()
+}
+
+#[cfg(feature = "async-store")]
+fn encode_rightmost_path_hint(path: &[AsyncRightmostPathEntry]) -> Result<Vec<u8>, Error> {
+    let hint = AsyncRightmostPathHint {
+        version: 2,
+        entries: path
+            .iter()
+            .map(|entry| AsyncRightmostPathHintEntry {
+                cid: entry.cid.clone(),
+                child_index: entry.child_index,
+            })
+            .collect(),
+    };
+    serde_cbor::ser::to_vec_packed(&hint).map_err(|err| Error::Deserialize(err.to_string()))
+}
+
+#[cfg(feature = "async-store")]
+fn rightmost_path_hint_is_valid(root: &Cid, path: &[AsyncRightmostPathEntry]) -> bool {
+    if path.first().map(|entry| &entry.cid) != Some(root) {
+        return false;
+    }
+
+    for (idx, entry) in path.iter().enumerate() {
+        if entry.node.keys.len() != entry.node.vals.len() || entry.node.is_empty() {
+            return false;
+        }
+
+        if entry.child_index != entry.node.len() - 1 {
+            return false;
+        }
+
+        let is_last = idx + 1 == path.len();
+        if is_last != entry.node.leaf {
+            return false;
+        }
+
+        if !is_last {
+            let Some(child) = entry.node.vals.get(entry.child_index) else {
+                return false;
+            };
+            let child_bytes: [u8; 32] = match child.as_slice().try_into() {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            };
+            if Cid(child_bytes) != path[idx + 1].cid {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn prefix_path_hint_key(root: &Cid, prefix: &[u8]) -> Vec<u8> {
+    let prefix_hash = Cid::from_bytes(prefix);
+    let mut key = Vec::with_capacity(root.as_bytes().len() + prefix_hash.as_bytes().len());
+    key.extend_from_slice(root.as_bytes());
+    key.extend_from_slice(prefix_hash.as_bytes());
+    key
+}
+
+fn changed_span_hint_key(base_root: Option<&Cid>, changed_root: Option<&Cid>) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + 32 + 32);
+    append_optional_root_to_key(&mut key, base_root);
+    append_optional_root_to_key(&mut key, changed_root);
+    key
+}
+
+fn append_optional_root_to_key(key: &mut Vec<u8>, root: Option<&Cid>) {
+    match root {
+        Some(cid) => {
+            key.push(1);
+            key.extend_from_slice(cid.as_bytes());
+        }
+        None => key.push(0),
+    }
+}
+
+fn encode_prefix_path_hint(
+    root: &Cid,
+    prefix: &[u8],
+    path: &[PrefixPathHintEntryWithNode],
+) -> Result<Vec<u8>, Error> {
+    let hint = PrefixPathHint {
+        version: PREFIX_PATH_HINT_VERSION,
+        root: root.clone(),
+        prefix: prefix.to_vec(),
+        entries: path
+            .iter()
+            .map(|entry| PrefixPathHintEntry {
+                cid: entry.cid.clone(),
+                child_index: entry.child_index,
+            })
+            .collect(),
+    };
+    serde_cbor::ser::to_vec_packed(&hint).map_err(|err| Error::Deserialize(err.to_string()))
+}
+
+fn encode_changed_span_hint(hint: &ChangedSpanHint) -> Result<Vec<u8>, Error> {
+    let wire = ChangedSpanHintWire {
+        version: CHANGED_SPANS_HINT_VERSION,
+        base_root: hint.base_root.clone(),
+        changed_root: hint.changed_root.clone(),
+        spans: hint.spans.clone(),
+    };
+    serde_cbor::ser::to_vec_packed(&wire).map_err(|err| Error::Deserialize(err.to_string()))
+}
+
+fn load_prefix_path_hint<S: Store>(
+    prolly: &Prolly<S>,
+    root: &Cid,
+    prefix: &[u8],
+) -> Result<bool, Error> {
+    let Some(bytes) = prolly
+        .store()
+        .get_hint(
+            PREFIX_PATH_HINT_NAMESPACE,
+            &prefix_path_hint_key(root, prefix),
+        )
+        .map_err(|err| Error::Store(Box::new(err)))?
+    else {
+        return Ok(false);
+    };
+
+    let Ok(hint) = serde_cbor::from_slice::<PrefixPathHint>(&bytes) else {
+        return Ok(false);
+    };
+
+    if hint.version != PREFIX_PATH_HINT_VERSION
+        || hint.root != *root
+        || hint.prefix != prefix
+        || hint.entries.is_empty()
+        || hint.entries.first().map(|entry| &entry.cid) != Some(root)
+    {
+        return Ok(false);
+    }
+
+    let keys = hint
+        .entries
+        .iter()
+        .map(|entry| entry.cid.as_bytes())
+        .collect::<Vec<_>>();
+    let node_bytes = prolly
+        .store()
+        .batch_get_ordered(&keys)
+        .map_err(|err| Error::Store(Box::new(err)))?;
+
+    if node_bytes.len() != hint.entries.len() || node_bytes.iter().any(Option::is_none) {
+        return Ok(false);
+    }
+
+    let mut path = Vec::with_capacity(hint.entries.len());
+    for (entry, bytes) in hint.entries.into_iter().zip(node_bytes) {
+        let Some(bytes) = bytes else {
+            return Ok(false);
+        };
+        if Cid::from_bytes(&bytes) != entry.cid {
+            return Ok(false);
+        }
+        let Ok(node) = Node::from_bytes(&bytes) else {
+            return Ok(false);
+        };
+        path.push(PrefixPathHintEntryWithNode {
+            cid: entry.cid,
+            node: Arc::new(node),
+            child_index: entry.child_index,
+        });
+    }
+
+    if !prefix_path_hint_is_valid(root, prefix, &path) {
+        return Ok(false);
+    }
+
+    for entry in path {
+        prolly.cache_node(entry.cid, entry.node.as_ref().clone());
+    }
+
+    Ok(true)
+}
+
+fn load_changed_span_hint<S: Store>(
+    prolly: &Prolly<S>,
+    base_root: Option<&Cid>,
+    changed_root: Option<&Cid>,
+) -> Result<Option<ChangedSpanHint>, Error> {
+    let Some(bytes) = prolly
+        .store()
+        .get_hint(
+            CHANGED_SPANS_HINT_NAMESPACE,
+            &changed_span_hint_key(base_root, changed_root),
+        )
+        .map_err(|err| Error::Store(Box::new(err)))?
+    else {
+        return Ok(None);
+    };
+
+    let Ok(wire) = serde_cbor::from_slice::<ChangedSpanHintWire>(&bytes) else {
+        return Ok(None);
+    };
+
+    if wire.version != CHANGED_SPANS_HINT_VERSION
+        || wire.base_root.as_ref() != base_root
+        || wire.changed_root.as_ref() != changed_root
+    {
+        return Ok(None);
+    }
+
+    let spans = normalize_changed_spans(wire.spans);
+    if spans.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ChangedSpanHint {
+        base_root: wire.base_root,
+        changed_root: wire.changed_root,
+        spans,
+    }))
+}
+
+fn prefix_path_hint_is_valid(
+    root: &Cid,
+    prefix: &[u8],
+    path: &[PrefixPathHintEntryWithNode],
+) -> bool {
+    if path.first().map(|entry| &entry.cid) != Some(root) {
+        return false;
+    }
+
+    for (idx, entry) in path.iter().enumerate() {
+        if entry.node.keys.len() != entry.node.vals.len()
+            || entry.node.is_empty()
+            || entry.child_index >= entry.node.len()
+            || entry.child_index != path_index_for_key(&entry.node, prefix)
+        {
+            return false;
+        }
+
+        let is_last = idx + 1 == path.len();
+        if is_last != entry.node.leaf {
+            return false;
+        }
+
+        if !is_last {
+            let Ok(child_cid) = child_cid_at(&entry.node, entry.child_index) else {
+                return false;
+            };
+            if path.get(idx + 1).map(|next| &next.cid) != Some(&child_cid) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn normalize_changed_spans<I>(spans: I) -> Vec<ChangedSpan>
+where
+    I: IntoIterator<Item = ChangedSpan>,
+{
+    let mut spans = spans
+        .into_iter()
+        .filter(changed_span_is_valid)
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| compare_span_end(&left.end, &right.end))
+    });
+
+    let mut normalized: Vec<ChangedSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let Some(last) = normalized.last_mut() else {
+            normalized.push(span);
+            continue;
+        };
+
+        if span_starts_before_or_at_end(&span.start, &last.end) {
+            last.end = max_span_end(last.end.take(), span.end);
+        } else {
+            normalized.push(span);
+        }
+    }
+
+    normalized
+}
+
+fn changed_span_is_valid(span: &ChangedSpan) -> bool {
+    span.end
+        .as_ref()
+        .map_or(true, |end| end.as_slice() > span.start.as_slice())
+}
+
+fn span_starts_before_or_at_end(start: &[u8], end: &Option<Vec<u8>>) -> bool {
+    end.as_ref().map_or(true, |end| start <= end.as_slice())
+}
+
+fn max_span_end(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (None, _) | (_, None) => None,
+        (Some(left), Some(right)) if right > left => Some(right),
+        (Some(left), Some(_)) => Some(left),
+    }
+}
+
+fn compare_span_end(left: &Option<Vec<u8>>, right: &Option<Vec<u8>>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn path_index_for_key(node: &Node, key: &[u8]) -> usize {
+    match node.search(key) {
+        Ok(idx) => idx,
+        Err(idx) => idx.saturating_sub(1),
     }
 }
 
@@ -1712,6 +7032,21 @@ fn child_cid_at(node: &Node, idx: usize) -> Result<Cid, Error> {
         .map_err(|_| Error::InvalidNode)?))
 }
 
+#[cfg(feature = "async-store")]
+fn reserve_node_entries(node: &mut Node, additional: usize) {
+    node.keys.reserve(additional);
+    node.vals.reserve(additional);
+}
+
+#[cfg(feature = "async-store")]
+fn is_valid_boundary_between(left: &Node, _right: &Node) -> bool {
+    if left.is_empty() {
+        return false;
+    }
+
+    boundary::is_boundary(left, left.len() - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1719,7 +7054,28 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    #[cfg(feature = "async-store")]
+    use std::{
+        future::Future,
+        task::{Context, Poll},
+    };
+    #[cfg(feature = "async-store")]
+    use store::SyncStoreAsAsync;
     use store::{BatchOp, MemStore};
+
+    #[cfg(feature = "async-store")]
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CountingStoreError;
@@ -1819,6 +7175,66 @@ mod tests {
 
         assert!(tree.is_empty());
         assert!(tree.root.is_none());
+    }
+
+    #[cfg(feature = "async-store")]
+    #[test]
+    fn async_prolly_get_reads_tree_from_async_store() {
+        let store = Arc::new(MemStore::new());
+        let config = Config::default();
+        let prolly = Prolly::new(store.clone(), config.clone());
+        let tree = prolly.create();
+        let tree = prolly.put(&tree, b"a".to_vec(), b"1".to_vec()).unwrap();
+        let tree = prolly.put(&tree, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        let async_prolly = AsyncProlly::new(SyncStoreAsAsync::new(store), config);
+
+        let value = block_on(async_prolly.get(&tree, b"b")).unwrap();
+        assert_eq!(value, Some(b"2".to_vec()));
+        assert_eq!(block_on(async_prolly.get(&tree, b"missing")).unwrap(), None);
+        assert!(
+            async_prolly.cache_len() > 0,
+            "async reads should populate the async manager node cache"
+        );
+
+        async_prolly.clear_cache();
+        assert_eq!(async_prolly.cache_len(), 0);
+    }
+
+    #[cfg(feature = "async-store")]
+    #[test]
+    fn async_prolly_get_many_preserves_order_duplicates_and_missing_keys() {
+        let store = Arc::new(MemStore::new());
+        let config = Config::default();
+        let prolly = Prolly::new(store.clone(), config.clone());
+        let mut tree = prolly.create();
+        for (key, value) in [
+            (b"a".as_slice(), b"1".as_slice()),
+            (b"b".as_slice(), b"2".as_slice()),
+            (b"c".as_slice(), b"3".as_slice()),
+        ] {
+            tree = prolly.put(&tree, key.to_vec(), value.to_vec()).unwrap();
+        }
+
+        let async_prolly = AsyncProlly::new(SyncStoreAsAsync::new(store), config);
+        let keys = vec![
+            b"c".to_vec(),
+            b"missing".to_vec(),
+            b"a".to_vec(),
+            b"c".to_vec(),
+        ];
+
+        let values = block_on(async_prolly.get_many(&tree, &keys)).unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                Some(b"3".to_vec()),
+                None,
+                Some(b"1".to_vec()),
+                Some(b"3".to_vec())
+            ]
+        );
     }
 
     #[test]
@@ -3793,8 +9209,8 @@ mod tests {
         if let Err(Error::Conflict(conflict)) = result {
             assert_eq!(conflict.key, b"a".to_vec());
             assert_eq!(conflict.base, Some(b"1".to_vec()));
-            assert_eq!(conflict.left, b"left".to_vec());
-            assert_eq!(conflict.right, b"right".to_vec());
+            assert_eq!(conflict.left, Some(b"left".to_vec()));
+            assert_eq!(conflict.right, Some(b"right".to_vec()));
         }
     }
 
@@ -3809,7 +9225,8 @@ mod tests {
         let right = prolly.put(&base, b"a".to_vec(), b"right".to_vec()).unwrap();
 
         // Resolver that prefers left
-        let resolver: error::Resolver = Box::new(|c| Some(c.left.clone()));
+        let resolver: error::Resolver =
+            Box::new(|c| error::Resolution::value(c.left.clone().expect("left value")));
         let merged = prolly.merge(&base, &left, &right, Some(resolver)).unwrap();
 
         assert_eq!(prolly.get(&merged, b"a").unwrap(), Some(b"left".to_vec()));
@@ -3826,7 +9243,8 @@ mod tests {
         let right = prolly.put(&base, b"a".to_vec(), b"right".to_vec()).unwrap();
 
         // Resolver that prefers right
-        let resolver: error::Resolver = Box::new(|c| Some(c.right.clone()));
+        let resolver: error::Resolver =
+            Box::new(|c| error::Resolution::value(c.right.clone().expect("right value")));
         let merged = prolly.merge(&base, &left, &right, Some(resolver)).unwrap();
 
         assert_eq!(prolly.get(&merged, b"a").unwrap(), Some(b"right".to_vec()));
@@ -3842,8 +9260,8 @@ mod tests {
         let left = prolly.put(&base, b"a".to_vec(), b"left".to_vec()).unwrap();
         let right = prolly.put(&base, b"a".to_vec(), b"right".to_vec()).unwrap();
 
-        // Resolver that returns None
-        let resolver: error::Resolver = Box::new(|_| None);
+        // Resolver that leaves the conflict unresolved
+        let resolver: error::Resolver = Box::new(|_| error::Resolution::unresolved());
         let result = prolly.merge(&base, &left, &right, Some(resolver));
 
         assert!(matches!(result, Err(Error::Conflict(_))));

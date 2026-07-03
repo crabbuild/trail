@@ -1329,34 +1329,278 @@ function isSessionUpdate(value: unknown): value is SessionUpdate {
   return typeof asRecord(value).sessionUpdate === "string";
 }
 
+interface HydratedTurnAliases {
+  equivalentScopeByScope: Map<string, string>;
+  canonicalScopeByScope: Map<string, HydratedTimelineScope>;
+}
+
+interface HydratedTimelineScope {
+  taskId: string;
+  lane: string;
+  turnId: string | undefined;
+}
+
+interface TurnPromptCandidate {
+  index: number;
+  node: Extract<RenderNode, { kind: "message" }>;
+  scope: string;
+  signature: string;
+  provisionalSignature: string;
+}
+
+const EMPTY_HYDRATED_TURN_ALIASES: HydratedTurnAliases = {
+  equivalentScopeByScope: new Map(),
+  canonicalScopeByScope: new Map()
+};
+const PROMPT_ALIAS_CLOCK_SKEW_MS = 30_000;
+
 export function mergeHydratedNodes(hydrated: RenderNode[], current: RenderNode[]): RenderNode[] {
-  const orderedHydrated = orderHydratedNodesFromCurrent(hydrated, current);
+  const turnAliases = buildHydratedTurnAliases(hydrated, current);
+  const orderedHydrated = orderHydratedNodesFromCurrent(hydrated, current, turnAliases);
   const hasHydratedTranscript = hydrated.some((node) => node.turnId);
   const hydratedForEquivalence = filterHydratedNodesForEquivalence(
     orderedHydrated,
     current,
-    hasHydratedTranscript
+    hasHydratedTranscript,
+    turnAliases
   );
   const matchedHydratedIds = new Set<string>();
-  const live = current.filter((node, index) => {
+  const live = current.flatMap((node, index) => {
     if (node.source === "crabdb") {
-      return false;
+      return [];
     }
-    if (hydratedCheckpointResolvesCompletion(node, hydrated)) {
-      return false;
+    if (hydratedCheckpointResolvesCompletion(node, hydrated, { turnAliases })) {
+      return [];
     }
-    if (hasHydratedEquivalentNode(node, hydratedForEquivalence, matchedHydratedIds, current, index)) {
-      return false;
+    if (hasHydratedEquivalentNode(node, hydratedForEquivalence, matchedHydratedIds, current, index, turnAliases)) {
+      return [];
     }
-    return ["pending", "in_progress"].includes(node.status) || isPreservableCompletedLiveNode(node);
+    if (["pending", "in_progress"].includes(node.status) || isPreservableCompletedLiveNode(node)) {
+      return [canonicalizeLiveNodeForHydratedAlias(node, turnAliases)];
+    }
+    return [];
   });
-  return reindexTimelineOrder(ensureUniqueMergedNodeIds(orderTimelineScopesFromCurrent([...hydratedForEquivalence, ...live], current)));
+  return reindexTimelineOrder(ensureUniqueMergedNodeIds(orderTimelineScopesFromCurrent([...hydratedForEquivalence, ...live], current, turnAliases)));
 }
 
-function hydratedCheckpointResolvesCompletion(liveNode: RenderNode, hydrated: RenderNode[]): boolean {
+function buildHydratedTurnAliases(hydrated: RenderNode[], current: RenderNode[]): HydratedTurnAliases {
+  const hydratedPromptsBySignature = new Map<string, TurnPromptCandidate[]>();
+  hydrated.forEach((node, index) => {
+    const candidate = turnPromptCandidate(node, index);
+    if (!candidate) {
+      return;
+    }
+    for (const signature of turnPromptStorageSignatures(candidate)) {
+      const prompts = hydratedPromptsBySignature.get(signature);
+      if (prompts) {
+        prompts.push(candidate);
+      } else {
+        hydratedPromptsBySignature.set(signature, [candidate]);
+      }
+    }
+  });
+  if (!hydratedPromptsBySignature.size) {
+    return EMPTY_HYDRATED_TURN_ALIASES;
+  }
+
+  const equivalentScopeByScope = new Map<string, string>();
+  const canonicalScopeByScope = new Map<string, HydratedTimelineScope>();
+  const usedHydratedScopes = new Set<string>();
+  const currentPrompts = current.flatMap((node, index) => {
+    if (node.source === "crabdb") {
+      return [];
+    }
+    const candidate = turnPromptCandidate(node, index);
+    if (!candidate) {
+      return [];
+    }
+    return [candidate];
+  });
+
+  for (let currentIndex = currentPrompts.length - 1; currentIndex >= 0; currentIndex -= 1) {
+    const currentPrompt = currentPrompts[currentIndex]!;
+    const hydratedPrompts = hydratedCandidatesForCurrentPrompt(currentPrompt, hydratedPromptsBySignature);
+    if (!hydratedPrompts?.length) {
+      continue;
+    }
+    for (let hydratedIndex = hydratedPrompts.length - 1; hydratedIndex >= 0; hydratedIndex -= 1) {
+      const hydratedPrompt = hydratedPrompts[hydratedIndex]!;
+      if (
+        usedHydratedScopes.has(hydratedPrompt.scope) ||
+        !promptAliasTimeCompatible(currentPrompt.node, hydratedPrompt.node) ||
+        currentTurnHasUnresolvedOpenNodes(current, currentPrompt.node.turnId, hydrated, hydratedPrompt.scope)
+      ) {
+        continue;
+      }
+      hydratedPrompts.splice(hydratedIndex, 1);
+      usedHydratedScopes.add(hydratedPrompt.scope);
+      if (currentPrompt.scope !== hydratedPrompt.scope) {
+        equivalentScopeByScope.set(currentPrompt.scope, hydratedPrompt.scope);
+        equivalentScopeByScope.set(hydratedPrompt.scope, currentPrompt.scope);
+        canonicalScopeByScope.set(currentPrompt.scope, renderNodeTimelineScope(hydratedPrompt.node));
+        canonicalScopeByScope.set(hydratedPrompt.scope, renderNodeTimelineScope(hydratedPrompt.node));
+      }
+      break;
+    }
+  }
+
+  return equivalentScopeByScope.size
+    ? { equivalentScopeByScope, canonicalScopeByScope }
+    : EMPTY_HYDRATED_TURN_ALIASES;
+}
+
+function turnPromptCandidate(node: RenderNode, index: number): TurnPromptCandidate | undefined {
+  if (node.kind !== "message" || node.role !== "user" || !node.turnId) {
+    return undefined;
+  }
+  const text = stableTimelineText(node.text);
+  if (!text) {
+    return undefined;
+  }
+  return {
+    index,
+    node,
+    scope: timelineScopeKey(node),
+    signature: turnPromptSignature(node, text),
+    provisionalSignature: provisionalTurnPromptSignature(node, text)
+  };
+}
+
+function turnPromptSignature(node: RenderNode, text: string): string {
+  return [node.taskId, node.lane, node.provider || "", text].join("\u0000");
+}
+
+function provisionalTurnPromptSignature(node: RenderNode, text: string): string {
+  return ["provisional", node.provider || "", text].join("\u0000");
+}
+
+function turnPromptStorageSignatures(candidate: TurnPromptCandidate): string[] {
+  return [candidate.signature, candidate.provisionalSignature];
+}
+
+function turnPromptLookupSignatures(candidate: TurnPromptCandidate): string[] {
+  if (isProvisionalPromptScope(candidate.node)) {
+    return [candidate.signature, candidate.provisionalSignature];
+  }
+  return [candidate.signature];
+}
+
+function hydratedCandidatesForCurrentPrompt(
+  currentPrompt: TurnPromptCandidate,
+  hydratedPromptsBySignature: Map<string, TurnPromptCandidate[]>
+): TurnPromptCandidate[] {
+  const seen = new Set<string>();
+  const candidates: TurnPromptCandidate[] = [];
+  for (const signature of turnPromptLookupSignatures(currentPrompt)) {
+    for (const candidate of hydratedPromptsBySignature.get(signature) || []) {
+      const key = `${candidate.scope}\u0000${candidate.index}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function isProvisionalPromptScope(node: RenderNode): boolean {
+  return node.taskId === "new-task" || node.lane === "new-task";
+}
+
+function renderNodeTimelineScope(node: RenderNode): HydratedTimelineScope {
+  return {
+    taskId: node.taskId,
+    lane: node.lane,
+    turnId: node.turnId
+  };
+}
+
+function currentTurnHasUnresolvedOpenNodes(
+  current: RenderNode[],
+  turnId: string | undefined,
+  hydrated: RenderNode[],
+  equivalentHydratedScope?: string
+): boolean {
+  if (!turnId) {
+    return false;
+  }
+  return current.some((node) => (
+    node.source !== "crabdb" &&
+    node.turnId === turnId &&
+    !isHydrationTurnFinalNode(node) &&
+    isOpenRenderNode(node) &&
+    !hydratedCheckpointResolvesCompletion(node, hydrated, { equivalentHydratedScope })
+  ));
+}
+
+function canonicalizeLiveNodeForHydratedAlias(node: RenderNode, turnAliases: HydratedTurnAliases): RenderNode {
+  if (!isHydrationTurnFinalNode(node)) {
+    return node;
+  }
+  const canonicalScope = turnAliases.canonicalScopeByScope.get(timelineScopeKey(node));
+  if (!canonicalScope) {
+    return node;
+  }
+  if (node.taskId === canonicalScope.taskId && node.lane === canonicalScope.lane && node.turnId === canonicalScope.turnId) {
+    return node;
+  }
+  return {
+    ...node,
+    taskId: canonicalScope.taskId,
+    lane: canonicalScope.lane,
+    turnId: canonicalScope.turnId
+  } as RenderNode;
+}
+
+function isHydrationTurnFinalNode(node: RenderNode): boolean {
+  return node.kind === "completion" || node.kind === "checkpoint";
+}
+
+function isOpenRenderNode(node: RenderNode): boolean {
+  if (isOpenStatus(node.status)) {
+    return true;
+  }
+  if (node.kind === "tool") {
+    return isOpenStatus(node.toolStatus);
+  }
+  if (node.kind === "terminal") {
+    return isOpenStatus(node.terminalStatus || "");
+  }
+  return false;
+}
+
+function promptAliasTimeCompatible(
+  currentPrompt: Extract<RenderNode, { kind: "message" }>,
+  hydratedPrompt: Extract<RenderNode, { kind: "message" }>
+): boolean {
+  const currentTime = finiteNodeSortTime(currentPrompt);
+  const hydratedTime = finiteNodeSortTime(hydratedPrompt);
+  if (currentTime === undefined || hydratedTime === undefined) {
+    return true;
+  }
+  return hydratedTime + PROMPT_ALIAS_CLOCK_SKEW_MS >= currentTime;
+}
+
+function finiteNodeSortTime(node: RenderNode): number | undefined {
+  const time = nodeSortTime(node);
+  return Number.isFinite(time) && time !== Number.MAX_SAFE_INTEGER ? time : undefined;
+}
+
+interface HydratedCheckpointResolutionOptions {
+  turnAliases?: HydratedTurnAliases | undefined;
+  equivalentHydratedScope?: string | undefined;
+}
+
+function hydratedCheckpointResolvesCompletion(
+  liveNode: RenderNode,
+  hydrated: RenderNode[],
+  options: HydratedCheckpointResolutionOptions = {}
+): boolean {
   if (liveNode.kind !== "completion" || !liveNode.checkpointPending) {
     return false;
   }
+  const turnAliases = options.turnAliases || EMPTY_HYDRATED_TURN_ALIASES;
   return hydrated.some((node) => {
     if (node.kind !== "checkpoint" || node.status !== "completed") {
       return false;
@@ -1364,7 +1608,16 @@ function hydratedCheckpointResolvesCompletion(liveNode: RenderNode, hydrated: Re
     if (node.taskId !== liveNode.taskId || node.lane !== liveNode.lane) {
       return false;
     }
-    return liveNode.turnId ? node.turnId === liveNode.turnId : true;
+    if (!liveNode.turnId) {
+      return true;
+    }
+    if (node.turnId === liveNode.turnId) {
+      return true;
+    }
+    if (options.equivalentHydratedScope && timelineScopeKey(node) === options.equivalentHydratedScope) {
+      return true;
+    }
+    return sameOrAliasedTimelineScope(liveNode, node, turnAliases);
   });
 }
 
@@ -1375,7 +1628,8 @@ interface CurrentTimelineNodeOrder extends CurrentTimelineOrder {
 function filterHydratedNodesForEquivalence(
   hydrated: RenderNode[],
   current: RenderNode[],
-  hasHydratedTranscript: boolean
+  hasHydratedTranscript: boolean,
+  turnAliases: HydratedTurnAliases
 ): RenderNode[] {
   const orderQueues = new Map<string, CurrentTimelineNodeOrder[]>();
   current.forEach((node, index) => {
@@ -1383,7 +1637,7 @@ function filterHydratedNodesForEquivalence(
       return;
     }
     const order = { index, timelineOrder: node.timelineOrder, node };
-    for (const key of timelineOrderKeys(node)) {
+    for (const key of timelineOrderKeys(node, turnAliases)) {
       const queue = orderQueues.get(key);
       if (queue) {
         queue.push(order);
@@ -1394,7 +1648,7 @@ function filterHydratedNodesForEquivalence(
   });
   const usedCurrentIndexes = new Set<number>();
   return hydrated.filter((hydratedNode) => {
-    const liveOrder = takeTimelineOrder(hydratedNode, orderQueues, usedCurrentIndexes);
+    const liveOrder = takeTimelineOrder(hydratedNode, orderQueues, usedCurrentIndexes, turnAliases);
     if (!liveOrder) {
       return true;
     }
@@ -1453,14 +1707,22 @@ interface CurrentTimelineOrder {
   timelineOrder?: number | undefined;
 }
 
-function orderHydratedNodesFromCurrent(hydrated: RenderNode[], current: RenderNode[]): RenderNode[] {
-  return orderTimelineScopesFromCurrent(hydrated, current);
+function orderHydratedNodesFromCurrent(
+  hydrated: RenderNode[],
+  current: RenderNode[],
+  turnAliases: HydratedTurnAliases
+): RenderNode[] {
+  return orderTimelineScopesFromCurrent(hydrated, current, turnAliases);
 }
 
-function orderTimelineScopesFromCurrent(nodes: RenderNode[], current: RenderNode[]): RenderNode[] {
+function orderTimelineScopesFromCurrent(
+  nodes: RenderNode[],
+  current: RenderNode[],
+  turnAliases: HydratedTurnAliases
+): RenderNode[] {
   const orderQueues = new Map<string, CurrentTimelineOrder[]>();
   current.forEach((node, index) => {
-    for (const key of timelineOrderKeys(node)) {
+    for (const key of timelineOrderKeys(node, turnAliases)) {
       const queue = orderQueues.get(key);
       const order = { index, timelineOrder: node.timelineOrder };
       if (queue) {
@@ -1475,7 +1737,7 @@ function orderTimelineScopesFromCurrent(nodes: RenderNode[], current: RenderNode
   }
   const ordered: RenderNode[] = [];
   for (const segment of hydratedTimelineSegments(nodes)) {
-    ordered.push(...orderHydratedSegmentFromCurrent(segment, orderQueues));
+    ordered.push(...orderHydratedSegmentFromCurrent(segment, orderQueues, turnAliases));
   }
   return ordered;
 }
@@ -1485,14 +1747,15 @@ function hasHydratedEquivalentNode(
   hydrated: RenderNode[],
   matchedHydratedIds: Set<string>,
   current: RenderNode[],
-  currentIndex: number
+  currentIndex: number,
+  turnAliases: HydratedTurnAliases
 ): boolean {
   for (const hydratedNode of hydrated) {
     if (matchedHydratedIds.has(hydratedNode.id)) {
       continue;
     }
     if (
-      hasOverlappingTimelineKey(node, hydratedNode) &&
+      hasOverlappingTimelineKey(node, hydratedNode, turnAliases) &&
       hydratedNodeCanReplaceLiveNode(node, hydratedNode, {
         allowMessagePrefixReplacement: canUseMessagePrefixReplacement(node, current, currentIndex)
       })
@@ -1504,16 +1767,16 @@ function hasHydratedEquivalentNode(
   return false;
 }
 
-function hasOverlappingTimelineKey(left: RenderNode, right: RenderNode): boolean {
-  const rightKeys = timelineOrderKeys(right);
-  if (timelineOrderKeys(left).some((key) => rightKeys.includes(key))) {
+function hasOverlappingTimelineKey(left: RenderNode, right: RenderNode, turnAliases: HydratedTurnAliases): boolean {
+  const rightKeys = timelineOrderKeys(right, turnAliases);
+  if (timelineOrderKeys(left, turnAliases).some((key) => rightKeys.includes(key))) {
     return true;
   }
-  if (left.turnId && right.turnId) {
+  if (left.turnId && right.turnId && !sameOrAliasedTimelineScope(left, right, turnAliases)) {
     return false;
   }
-  const compatibleRightKeys = timelineOrderLookupKeys(right);
-  return timelineOrderLookupKeys(left).some((key) => compatibleRightKeys.includes(key));
+  const compatibleRightKeys = timelineOrderLookupKeys(right, turnAliases);
+  return timelineOrderLookupKeys(left, turnAliases).some((key) => compatibleRightKeys.includes(key));
 }
 
 interface MessageReplacementOptions {
@@ -1711,10 +1974,14 @@ interface MatchedSegmentOrder {
   currentIndex: number;
 }
 
-function orderHydratedSegmentFromCurrent(segment: RenderNode[], orderQueues: Map<string, CurrentTimelineOrder[]>): RenderNode[] {
+function orderHydratedSegmentFromCurrent(
+  segment: RenderNode[],
+  orderQueues: Map<string, CurrentTimelineOrder[]>,
+  turnAliases: HydratedTurnAliases
+): RenderNode[] {
   const usedCurrentIndexes = new Set<number>();
   const ordered = segment.map((node, index): HydratedSegmentOrder => {
-    const currentOrder = takeTimelineOrder(node, orderQueues, usedCurrentIndexes);
+    const currentOrder = takeTimelineOrder(node, orderQueues, usedCurrentIndexes, turnAliases);
     return {
       node: currentOrder?.timelineOrder === undefined ? node : { ...node, timelineOrder: currentOrder.timelineOrder },
       index,
@@ -1794,9 +2061,10 @@ function nextMatchedSegmentOrder(
 function takeTimelineOrder<T extends CurrentTimelineOrder>(
   node: RenderNode,
   orderQueues: Map<string, T[]>,
-  usedCurrentIndexes: Set<number>
+  usedCurrentIndexes: Set<number>,
+  turnAliases: HydratedTurnAliases
 ): T | undefined {
-  for (const key of timelineOrderLookupKeys(node)) {
+  for (const key of timelineOrderLookupKeys(node, turnAliases)) {
     const queue = orderQueues.get(key);
     while (queue?.length) {
       const order = queue.shift()!;
@@ -1810,8 +2078,67 @@ function takeTimelineOrder<T extends CurrentTimelineOrder>(
   return undefined;
 }
 
-function timelineOrderKeys(node: RenderNode): string[] {
-  const scope = timelineScopeKey(node);
+function timelineOrderKeys(node: RenderNode, turnAliases: HydratedTurnAliases = EMPTY_HYDRATED_TURN_ALIASES): string[] {
+  const keys = timelineScopeKeys(node, turnAliases).flatMap((scope) => timelineOrderKeysForScope(node, scope));
+  return [...new Set(keys)];
+}
+
+function timelineOrderIdKey(scope: string, node: RenderNode): string {
+  if (node.kind === "approval") {
+    const toolCallId = approvalToolIdentity(node);
+    if (toolCallId) {
+      return `${scope}:id:${node.id}:tool:${toolCallId}`;
+    }
+  }
+  return `${scope}:id:${node.id}`;
+}
+
+function timelineOrderLookupKeys(node: RenderNode, turnAliases: HydratedTurnAliases = EMPTY_HYDRATED_TURN_ALIASES): string[] {
+  return [...new Set([...timelineOrderKeys(node, turnAliases), ...turnlessTimelineOrderKeys(node)])];
+}
+
+function turnlessTimelineOrderKeys(node: RenderNode): string[] {
+  if (!node.turnId) {
+    return [];
+  }
+  const scope = turnlessTimelineScopeKey(node);
+  const keys: string[] = [];
+  if (node.kind === "message") {
+    const text = stableTimelineText(node.text);
+    if (node.acpMessageId) {
+      keys.push(`${scope}:message-id-text:${node.acpMessageId}:${node.role}:${text}`);
+      keys.push(`${scope}:message-id:${node.acpMessageId}`);
+    }
+    if (text) {
+      keys.push(`${scope}:message:${node.role}:${text}`);
+    }
+  } else if (node.kind === "tool") {
+    keys.push(`${scope}:tool:${node.toolCallId}`);
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:tool:${node.acpToolCallId}`);
+    }
+  } else if (node.kind === "terminal") {
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:terminal:tool:${node.acpToolCallId}:terminal:${node.terminalId}`);
+    }
+    keys.push(`${scope}:terminal:${node.terminalId}`);
+  } else if (node.kind === "diff") {
+    if (node.acpToolCallId) {
+      keys.push(`${scope}:diff:tool:${node.acpToolCallId}:path:${node.path}`);
+    }
+    keys.push(`${scope}:diff:path:${node.path}`);
+  } else if (node.kind === "approval") {
+    const toolCallId = approvalToolIdentity(node);
+    if (toolCallId) {
+      keys.push(`${scope}:approval:tool:${toolCallId}:request:${node.requestId}`);
+    } else {
+      keys.push(`${scope}:approval:${node.requestId}`);
+    }
+  }
+  return keys;
+}
+
+function timelineOrderKeysForScope(node: RenderNode, scope: string): string[] {
   const keys = [timelineOrderIdKey(scope, node)];
   if (node.kind === "message") {
     const text = stableTimelineText(node.text);
@@ -1843,58 +2170,19 @@ function timelineOrderKeys(node: RenderNode): string[] {
       keys.push(`${scope}:approval:${node.requestId}`);
     }
   }
-  return [...new Set(keys)];
-}
-
-function timelineOrderIdKey(scope: string, node: RenderNode): string {
-  if (node.kind === "approval") {
-    const toolCallId = approvalToolIdentity(node);
-    if (toolCallId) {
-      return `${scope}:id:${node.id}:tool:${toolCallId}`;
-    }
-  }
-  return `${scope}:id:${node.id}`;
-}
-
-function timelineOrderLookupKeys(node: RenderNode): string[] {
-  return [...new Set([...timelineOrderKeys(node), ...turnlessTimelineOrderKeys(node)])];
-}
-
-function turnlessTimelineOrderKeys(node: RenderNode): string[] {
-  if (!node.turnId) {
-    return [];
-  }
-  const scope = turnlessTimelineScopeKey(node);
-  const keys: string[] = [];
-  if (node.kind === "message") {
-    if (node.acpMessageId) {
-      keys.push(`${scope}:message-id-text:${node.acpMessageId}:${node.role}:${stableTimelineText(node.text)}`);
-      keys.push(`${scope}:message-id:${node.acpMessageId}`);
-    }
-  } else if (node.kind === "tool") {
-    keys.push(`${scope}:tool:${node.toolCallId}`);
-    if (node.acpToolCallId) {
-      keys.push(`${scope}:tool:${node.acpToolCallId}`);
-    }
-  } else if (node.kind === "terminal") {
-    if (node.acpToolCallId) {
-      keys.push(`${scope}:terminal:tool:${node.acpToolCallId}:terminal:${node.terminalId}`);
-    }
-    keys.push(`${scope}:terminal:${node.terminalId}`);
-  } else if (node.kind === "diff") {
-    if (node.acpToolCallId) {
-      keys.push(`${scope}:diff:tool:${node.acpToolCallId}:path:${node.path}`);
-    }
-    keys.push(`${scope}:diff:path:${node.path}`);
-  } else if (node.kind === "approval") {
-    const toolCallId = approvalToolIdentity(node);
-    if (toolCallId) {
-      keys.push(`${scope}:approval:tool:${toolCallId}:request:${node.requestId}`);
-    } else {
-      keys.push(`${scope}:approval:${node.requestId}`);
-    }
-  }
   return keys;
+}
+
+function timelineScopeKeys(node: RenderNode, turnAliases: HydratedTurnAliases): string[] {
+  const scope = timelineScopeKey(node);
+  const aliased = turnAliases.equivalentScopeByScope.get(scope);
+  return aliased && aliased !== scope ? [scope, aliased] : [scope];
+}
+
+function sameOrAliasedTimelineScope(left: RenderNode, right: RenderNode, turnAliases: HydratedTurnAliases): boolean {
+  const leftScopes = timelineScopeKeys(left, turnAliases);
+  const rightScopes = new Set(timelineScopeKeys(right, turnAliases));
+  return leftScopes.some((scope) => rightScopes.has(scope));
 }
 
 function approvalToolIdentity(node: Extract<RenderNode, { kind: "approval" }>): string | undefined {

@@ -385,11 +385,11 @@ Conflicts include:
 - One branch changes a key while the other deletes it.
 - Both branches add the same key with different values.
 
-A resolver can choose a value for a conflict. Without a resolver, unresolved
-conflicts return an error.
+A resolver can choose a value, delete the key, or leave the conflict unresolved.
+Without a resolver, unresolved conflicts return an error.
 
 ```rust
-use prolly::{Config, MemStore, Prolly, Resolver};
+use prolly::{Config, MemStore, Prolly, Resolution, Resolver};
 
 let store = MemStore::new();
 let prolly = Prolly::new(store, Config::default());
@@ -400,7 +400,12 @@ let base = prolly.put(&base, b"mode".to_vec(), b"old".to_vec()).unwrap();
 let left = prolly.put(&base, b"mode".to_vec(), b"left".to_vec()).unwrap();
 let right = prolly.put(&base, b"mode".to_vec(), b"right".to_vec()).unwrap();
 
-let prefer_left: Resolver = Box::new(|conflict| Some(conflict.left.clone()));
+let prefer_left: Resolver = Box::new(|conflict| {
+    conflict
+        .left
+        .clone()
+        .map_or_else(Resolution::delete, Resolution::value)
+});
 let merged = prolly.merge(&base, &left, &right, Some(prefer_left)).unwrap();
 
 assert_eq!(
@@ -714,7 +719,7 @@ compared, merged, and synchronized.
 ## Further Reading
 
 - [CrabDB prolly crate README](../../crates/prolly/README.md)
-- [CrabDB prolly performance hardening notes](../../crates/prolly/PERFORMANCE.md)
+- [CrabDB prolly performance guide](../../crates/prolly/docs/performance.md)
 - [CrabDB storage and indexing design](../design/storage-and-indexing.md)
 - [CrabDB objects, roots, text, and line identity](objects-roots-text-and-line-identity.md)
 - [Dolt prolly tree storage-engine docs](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree/)

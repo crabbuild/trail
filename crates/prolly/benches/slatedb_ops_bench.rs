@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use prolly::{
     append_batch, BatchApplyResult, BatchApplyStats, BatchOp, BatchWriter, BatchWriterConfig,
-    Config, Error, Mutation, Prolly, Resolver, SlateDbStore, Store, Tree,
+    Config, Error, Mutation, Prolly, Resolution, Resolver, SlateDbStore, Store, Tree,
 };
 use slatedb::object_store::aws::AmazonS3Builder;
 use slatedb::object_store::path::Path as ObjectPath;
@@ -304,7 +304,7 @@ fn main() {
         (found, found == changes)
     });
 
-    let random_read_indices = random_indices(records, changes, 0x7265_6164);
+    let random_read_indices = random_indices(records, changes, seed(b"read"));
     let random_read_keys = keys_for_indices(&random_read_indices);
     measure_store_row(&store, "point_get_random", records, changes, || {
         let found = random_read_indices
@@ -323,7 +323,7 @@ fn main() {
         (found, found == changes)
     });
 
-    let clustered_read_indices = clustered_indices(records, changes, 8, 0x636c_7573_7465_72);
+    let clustered_read_indices = clustered_indices(records, changes, 8, seed(b"cluster-read"));
     measure_store_row(&store, "point_get_clustered", records, changes, || {
         let found = clustered_read_indices
             .iter()
@@ -345,8 +345,8 @@ fn main() {
                 Some(&key_for_index(end_idx)),
             )
             .unwrap()
-            .map(|entry| entry.unwrap())
-            .count();
+            .try_fold(0usize, |count, entry| entry.map(|_| count + 1))
+            .unwrap();
         (count, count == changes)
     });
 
@@ -354,8 +354,8 @@ fn main() {
         let count = prolly
             .range(&base, &[], None)
             .unwrap()
-            .map(|entry| entry.unwrap())
-            .count();
+            .try_fold(0usize, |count, entry| entry.map(|_| count + 1))
+            .unwrap();
         (count, count == records)
     });
 
@@ -371,7 +371,7 @@ fn main() {
     let verified = verify_updates(&prolly, &batch_updated, changes, "spread-update");
     print_verify_row("verify_batch_update_spread", records, changes, verified);
 
-    let random_update_indices = random_indices(records, changes, 0x7570_6461_7465);
+    let random_update_indices = random_indices(records, changes, seed(b"update"));
     let random_update_keys = keys_for_indices(&random_update_indices);
     let random_update_ops = update_mutations_for_indices(&random_update_indices, "random-update");
     let random_updated =
@@ -500,7 +500,7 @@ fn main() {
         verified,
     );
 
-    let clustered_update_indices = clustered_indices(records, changes, 8, 0x7570_6461_7465_c1u64);
+    let clustered_update_indices = clustered_indices(records, changes, 8, seed(b"cluster-update"));
     let clustered_update_ops =
         update_mutations_for_indices(&clustered_update_indices, "cluster-update");
     let clustered_updated =
@@ -527,7 +527,7 @@ fn main() {
     let verified = verify_deletes(&prolly, &batch_deleted, changes);
     print_verify_row("verify_batch_delete_spread", records, changes, verified);
 
-    let random_delete_indices = random_indices(records, changes, 0x6465_6c65_7465);
+    let random_delete_indices = random_indices(records, changes, seed(b"delete"));
     let random_delete_ops = delete_mutations_for_indices(&random_delete_indices);
     let random_deleted =
         measure_batch_tree_row(&store, "batch_delete_random", records, changes, || {
@@ -538,7 +538,7 @@ fn main() {
     let verified = verify_deletes_for_indices(&prolly, &random_deleted, &random_delete_indices);
     print_verify_row("verify_batch_delete_random", records, changes, verified);
 
-    let clustered_delete_indices = clustered_indices(records, changes, 8, 0x6465_6c65_7465_c1u64);
+    let clustered_delete_indices = clustered_indices(records, changes, 8, seed(b"cluster-delete"));
     let clustered_delete_ops = delete_mutations_for_indices(&clustered_delete_indices);
     let clustered_deleted =
         measure_batch_tree_row(&store, "batch_delete_clustered", records, changes, || {
@@ -559,7 +559,7 @@ fn main() {
     let verified = verify_mixed(&prolly, &mixed, records, changes, "mixed");
     print_verify_row("verify_batch_mixed_spread", records, changes, verified);
 
-    let random_mixed_indices = random_indices(records, changes, 0x6d69_7865_64);
+    let random_mixed_indices = random_indices(records, changes, seed(b"mixed"));
     let random_mixed_ops = mixed_mutations_for_indices(&random_mixed_indices, "random-mixed");
     let random_mixed =
         measure_batch_tree_row(&store, "batch_mixed_random", records, changes, || {
@@ -575,7 +575,7 @@ fn main() {
     );
     print_verify_row("verify_batch_mixed_random", records, changes, verified);
 
-    let clustered_mixed_indices = clustered_indices(records, changes, 8, 0x6d69_7865_64_c1u64);
+    let clustered_mixed_indices = clustered_indices(records, changes, 8, seed(b"cluster-mixed"));
     let clustered_mixed_ops =
         mixed_mutations_for_indices(&clustered_mixed_indices, "cluster-mixed");
     let clustered_mixed =
@@ -760,9 +760,9 @@ fn main() {
         verified,
     );
 
-    let random_left_indices = random_indices_in_range(0, records / 2, changes, 0x6c65_6674);
+    let random_left_indices = random_indices_in_range(0, records / 2, changes, seed(b"left"));
     let random_right_indices =
-        random_indices_in_range(records / 2, records, changes, 0x7269_6768_74);
+        random_indices_in_range(records / 2, records, changes, seed(b"right"));
     let random_left = prolly
         .batch(
             &base,
@@ -802,9 +802,9 @@ fn main() {
     );
 
     let clustered_left_indices =
-        clustered_indices_in_range(0, records / 3, changes, 4, 0x6c65_6674_c1u64);
+        clustered_indices_in_range(0, records / 3, changes, 4, seed(b"cluster-left"));
     let clustered_right_indices =
-        clustered_indices_in_range(records * 2 / 3, records, changes, 4, 0x7269_6768_74_c1u64);
+        clustered_indices_in_range(records * 2 / 3, records, changes, 4, seed(b"cluster-right"));
     let clustered_left = prolly
         .batch(
             &base,
@@ -866,7 +866,8 @@ fn main() {
             (1, detected)
         },
     );
-    let resolver: Resolver = Box::new(|conflict| Some(conflict.right.clone()));
+    let resolver: Resolver =
+        Box::new(|conflict| Resolution::value(conflict.right.clone().expect("right value")));
     let resolved = measure_tree_row(
         &store,
         "merge_conflict_resolved",
@@ -978,18 +979,18 @@ where
     }
     let read_stats = store.read_stats();
     let write_stats = store.write_stats();
-    print_row(
-        "build_base_append_batches",
+    print_row(PrintRow {
+        operation: "build_base_append_batches",
         records,
-        records,
-        start.elapsed(),
-        written,
+        items: records,
+        elapsed: start.elapsed(),
+        result_count: written,
         read_stats,
         write_stats,
-        BatchApplyStats::default(),
-        written == records,
-        "ok",
-    );
+        batch_stats: BatchApplyStats::default(),
+        verified: written == records,
+        status: "ok",
+    });
     tree
 }
 
@@ -1009,18 +1010,18 @@ where
     let tree = f();
     let read_stats = store.read_stats();
     let write_stats = store.write_stats();
-    print_row(
+    print_row(PrintRow {
         operation,
         records,
         items,
-        start.elapsed(),
-        items,
+        elapsed: start.elapsed(),
+        result_count: items,
         read_stats,
         write_stats,
-        BatchApplyStats::default(),
-        true,
-        "ok",
-    );
+        batch_stats: BatchApplyStats::default(),
+        verified: true,
+        status: "ok",
+    });
     tree
 }
 
@@ -1040,18 +1041,18 @@ where
     let result = f();
     let read_stats = store.read_stats();
     let write_stats = store.write_stats();
-    print_row(
+    print_row(PrintRow {
         operation,
         records,
         items,
-        start.elapsed(),
-        items,
+        elapsed: start.elapsed(),
+        result_count: items,
         read_stats,
         write_stats,
-        result.stats,
-        true,
-        "ok",
-    );
+        batch_stats: result.stats,
+        verified: true,
+        status: "ok",
+    });
     result.tree
 }
 
@@ -1070,18 +1071,18 @@ fn measure_store_row<S, F>(
     let (result_count, verified) = f();
     let read_stats = store.read_stats();
     let write_stats = store.write_stats();
-    print_row(
+    print_row(PrintRow {
         operation,
         records,
         items,
-        start.elapsed(),
+        elapsed: start.elapsed(),
         result_count,
         read_stats,
         write_stats,
-        BatchApplyStats::default(),
+        batch_stats: BatchApplyStats::default(),
         verified,
-        "ok",
-    );
+        status: "ok",
+    });
 }
 
 fn measure_row<F>(operation: &str, records: usize, items: usize, f: F)
@@ -1090,37 +1091,37 @@ where
 {
     let start = Instant::now();
     let (result_count, verified) = f();
-    print_row(
+    print_row(PrintRow {
         operation,
         records,
         items,
-        start.elapsed(),
+        elapsed: start.elapsed(),
         result_count,
-        StoreReadStats::default(),
-        StoreWriteStats::default(),
-        BatchApplyStats::default(),
+        read_stats: StoreReadStats::default(),
+        write_stats: StoreWriteStats::default(),
+        batch_stats: BatchApplyStats::default(),
         verified,
-        "ok",
-    );
+        status: "ok",
+    });
 }
 
 fn print_verify_row(operation: &str, records: usize, items: usize, verified: bool) {
-    print_row(
+    print_row(PrintRow {
         operation,
         records,
         items,
-        Duration::ZERO,
-        0,
-        StoreReadStats::default(),
-        StoreWriteStats::default(),
-        BatchApplyStats::default(),
+        elapsed: Duration::ZERO,
+        result_count: 0,
+        read_stats: StoreReadStats::default(),
+        write_stats: StoreWriteStats::default(),
+        batch_stats: BatchApplyStats::default(),
         verified,
-        "ok",
-    );
+        status: "ok",
+    });
 }
 
-fn print_row(
-    operation: &str,
+struct PrintRow<'a> {
+    operation: &'a str,
     records: usize,
     items: usize,
     elapsed: Duration,
@@ -1129,8 +1130,22 @@ fn print_row(
     write_stats: StoreWriteStats,
     batch_stats: BatchApplyStats,
     verified: bool,
-    status: &str,
-) {
+    status: &'a str,
+}
+
+fn print_row(row: PrintRow<'_>) {
+    let PrintRow {
+        operation,
+        records,
+        items,
+        elapsed,
+        result_count,
+        read_stats,
+        write_stats,
+        batch_stats,
+        verified,
+        status,
+    } = row;
     let total_ms = elapsed.as_secs_f64() * 1_000.0;
     let items_per_sec = if total_ms > 0.0 {
         items as f64 / (total_ms / 1_000.0)
@@ -1525,6 +1540,15 @@ fn sample_indices(len: usize) -> Vec<usize> {
     indices.sort_unstable();
     indices.dedup();
     indices
+}
+
+fn seed(label: &[u8]) -> u64 {
+    let mut value = 0xcbf2_9ce4_8422_2325;
+    for byte in label {
+        value ^= u64::from(*byte);
+        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    value
 }
 
 fn random_indices(records: usize, count: usize, salt: u64) -> Vec<usize> {

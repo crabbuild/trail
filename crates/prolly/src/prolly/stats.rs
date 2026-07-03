@@ -70,16 +70,9 @@
 //! # let tree1 = prolly.create();
 //! # let mut tree2 = tree1.clone();
 //! # tree2 = prolly.put(&tree2, b"key".to_vec(), b"value".to_vec()).unwrap();
-//! let stats1 = prolly.collect_stats(&tree1).unwrap();
-//! let stats2 = prolly.collect_stats(&tree2).unwrap();
-//!
-//! // Compute absolute differences
-//! let diff = stats2.diff(&stats1);
-//! println!("Nodes added: {:+}", diff.num_nodes_diff);
-//!
-//! // Compute percentage changes
-//! let pct = stats2.percentage_change(&stats1);
-//! println!("Size change: {:+.2}%", pct.total_tree_size_bytes_pct);
+//! let comparison = prolly.stats_diff(&tree1, &tree2).unwrap();
+//! println!("Nodes added: {:+}", comparison.absolute.num_nodes_diff);
+//! println!("Size change: {:+.2}%", comparison.percentage.total_tree_size_bytes_pct);
 //! ```
 //!
 //! ## Incremental Updates
@@ -1050,6 +1043,40 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.2} KB", bytes as f64 / KB)
     } else {
         format!("{:.2} MB", bytes as f64 / MB)
+    }
+}
+
+/// Combined statistics comparison between two tree snapshots.
+///
+/// `before` and `after` contain the full collected statistics for each tree.
+/// `absolute` is computed as `after - before`, and `percentage` uses `before`
+/// as the baseline.
+///
+/// Created by calling [`Prolly::stats_diff`](crate::prolly::Prolly::stats_diff)
+/// or [`StatsComparison::new`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StatsComparison {
+    /// Statistics collected from the baseline tree.
+    pub before: TreeStats,
+    /// Statistics collected from the candidate/current tree.
+    pub after: TreeStats,
+    /// Absolute metric deltas computed as `after - before`.
+    pub absolute: StatsDiff,
+    /// Percentage metric deltas using `before` as the baseline.
+    pub percentage: StatsPercentageChange,
+}
+
+impl StatsComparison {
+    /// Create a comparison from already collected statistics.
+    pub fn new(before: TreeStats, after: TreeStats) -> Self {
+        let absolute = after.diff(&before);
+        let percentage = after.percentage_change(&before);
+        Self {
+            before,
+            after,
+            absolute,
+            percentage,
+        }
     }
 }
 

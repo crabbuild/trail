@@ -198,9 +198,8 @@ pub trait TreeDiffer<S: Store> {
     ///
     /// # Conflict Handling
     /// A conflict occurs when both branches modify the same key differently.
-    /// If a resolver is provided, it's called to determine the final value.
-    /// If the resolver returns `None` or no resolver is provided, an error
-    /// is returned.
+    /// If a resolver is provided, it can keep a value, delete the key, or leave
+    /// the conflict unresolved. Unresolved conflicts return an error.
     fn merge(
         &self,
         base: &Tree,

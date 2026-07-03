@@ -84,10 +84,67 @@ use super::store::Store;
 use super::tree::Tree;
 
 use super::Prolly;
+#[cfg(feature = "async-store")]
+use super::{store::AsyncStore, AsyncProlly};
+#[cfg(feature = "async-store")]
+use futures_util::stream::{self, Stream};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 type RangeItem = Result<(Vec<u8>, Vec<u8>), Error>;
+type LeafEntry = (Vec<u8>, Vec<u8>);
+type OptionalLeafEntry = Result<Option<LeafEntry>, Error>;
 pub(crate) const RANGE_CHILD_PREFETCH_PARALLELISM: usize = 16;
+
+/// Stable cursor token for resumable range scans.
+///
+/// The token is independent of in-memory traversal state: it records the last
+/// emitted key, and the next scan resumes strictly after that key. This makes it
+/// suitable for checkpointing background indexing or sync jobs for an immutable
+/// tree snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeCursor {
+    after_key: Option<Vec<u8>>,
+}
+
+impl RangeCursor {
+    /// Start scanning from the beginning of the requested range.
+    pub fn start() -> Self {
+        Self { after_key: None }
+    }
+
+    /// Resume scanning strictly after `key`.
+    pub fn after_key(key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            after_key: Some(key.into()),
+        }
+    }
+
+    /// Return the key this cursor resumes after, if any.
+    pub fn after(&self) -> Option<&[u8]> {
+        self.after_key.as_deref()
+    }
+
+    /// Whether this cursor represents the beginning of a range.
+    pub fn is_start(&self) -> bool {
+        self.after_key.is_none()
+    }
+}
+
+/// A bounded page of range-scan results.
+///
+/// `next_cursor` is `Some` when another call should resume after the last entry
+/// in this page. It is `None` when the scan reached the end bound or the end of
+/// the tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RangePage {
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub next_cursor: Option<RangeCursor>,
+}
+
+/// Backward-compatible name for async range pages.
+#[cfg(feature = "async-store")]
+pub type AsyncRangePage = RangePage;
 
 /// Create a range iterator over key-value pairs.
 ///
@@ -118,10 +175,70 @@ pub fn create_range_iter<'a, S: Store>(
     Ok(RangeIter::new(prolly, path, start, end))
 }
 
+/// Create a range iterator that starts strictly after `after_key`.
+pub fn create_range_after_iter<'a, S: Store>(
+    prolly: &'a Prolly<S>,
+    tree: &Tree,
+    after_key: &[u8],
+    end: Option<&[u8]>,
+) -> Result<RangeIter<'a, S>, Error> {
+    if end.is_some_and(|end| end <= after_key) {
+        return Ok(RangeIter::new_after(prolly, Vec::new(), after_key, end));
+    }
+
+    let path = prolly.find_path_arcs(tree, after_key)?;
+    Ok(RangeIter::new_after(prolly, path, after_key, end))
+}
+
+/// Create an async range iterator over key-value pairs.
+#[cfg(feature = "async-store")]
+pub async fn create_async_range_iter<'a, S>(
+    prolly: &'a AsyncProlly<S>,
+    tree: &Tree,
+    start: &[u8],
+    end: Option<&[u8]>,
+) -> Result<AsyncRangeIter<'a, S>, Error>
+where
+    S: AsyncStore,
+    S::Error: Send + Sync,
+{
+    if end.is_some_and(|end| end <= start) {
+        return Ok(AsyncRangeIter::new(prolly, Vec::new(), start, end));
+    }
+
+    let path = prolly.find_path_arcs(tree, start).await?;
+    Ok(AsyncRangeIter::new(prolly, path, start, end))
+}
+
+/// Create an async range iterator that starts strictly after `after_key`.
+#[cfg(feature = "async-store")]
+pub async fn create_async_range_after_iter<'a, S>(
+    prolly: &'a AsyncProlly<S>,
+    tree: &Tree,
+    after_key: &[u8],
+    end: Option<&[u8]>,
+) -> Result<AsyncRangeIter<'a, S>, Error>
+where
+    S: AsyncStore,
+    S::Error: Send + Sync,
+{
+    if end.is_some_and(|end| end <= after_key) {
+        return Ok(AsyncRangeIter::new_after(
+            prolly,
+            Vec::new(),
+            after_key,
+            end,
+        ));
+    }
+
+    let path = prolly.find_path_arcs(tree, after_key).await?;
+    Ok(AsyncRangeIter::new_after(prolly, path, after_key, end))
+}
+
 /// Iterator over key-value pairs in a range.
 ///
-/// Created by [`Prolly::range`] or [`create_range_iter`]. Yields `(key, value)` pairs
-/// in lexicographic order.
+/// Created by [`Prolly::range`]. Yields `(key, value)` pairs in lexicographic
+/// order.
 ///
 /// Maintains a stack of (node, index) pairs to track the current position in the tree
 /// and supports optional end bounds for range queries.
@@ -136,6 +253,10 @@ pub struct RangeIter<'a, S: Store> {
     started: bool,
     /// The start key for initial positioning
     start_key: Vec<u8>,
+    /// Whether to skip an entry equal to the start key.
+    skip_start_key: bool,
+    /// Last key yielded by this iterator.
+    last_key: Option<Vec<u8>>,
 }
 
 impl<'a, S: Store> RangeIter<'a, S> {
@@ -158,7 +279,37 @@ impl<'a, S: Store> RangeIter<'a, S> {
             end: end.map(|e| e.to_vec()),
             started: false,
             start_key: start.to_vec(),
+            skip_start_key: false,
+            last_key: None,
         }
+    }
+
+    pub(crate) fn new_after(
+        prolly: &'a Prolly<S>,
+        stack: Vec<(Arc<Node>, usize)>,
+        after_key: &[u8],
+        end: Option<&[u8]>,
+    ) -> Self {
+        Self {
+            prolly,
+            stack,
+            end: end.map(|e| e.to_vec()),
+            started: false,
+            start_key: after_key.to_vec(),
+            skip_start_key: true,
+            last_key: None,
+        }
+    }
+
+    /// Return a resumable cursor for the last key yielded by this iterator.
+    ///
+    /// If the iterator has not yielded an item yet, this returns
+    /// [`RangeCursor::start`].
+    pub fn resume_cursor(&self) -> RangeCursor {
+        self.last_key
+            .clone()
+            .map(RangeCursor::after_key)
+            .unwrap_or_else(RangeCursor::start)
     }
 
     /// Position the iterator at the first key >= start_key.
@@ -180,6 +331,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
         if node.leaf {
             // Find first key >= start_key
             let start_idx = match node.search(&self.start_key) {
+                Ok(i) if self.skip_start_key => i.saturating_add(1),
                 Ok(i) => i,  // Exact match
                 Err(i) => i, // First key > start_key
             };
@@ -195,6 +347,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
             match leaf_entry_before_end(node, *idx, self.end.as_deref()) {
                 Ok(Some(entry)) => {
                     *idx += 1;
+                    self.last_key = Some(entry.0.clone());
                     return Some(Ok(entry));
                 }
                 Ok(None) => return None,
@@ -225,6 +378,7 @@ impl<'a, S: Store> RangeIter<'a, S> {
                         if let Some((_, idx)) = self.stack.last_mut() {
                             *idx += 1;
                         }
+                        self.last_key = Some(entry.0.clone());
                         return Some(Ok(entry));
                     }
                     Ok(None) => return None,
@@ -362,6 +516,7 @@ impl<'a, S: Store> Iterator for RangeIter<'a, S> {
                 match leaf_entry_before_end(node, *idx, self.end.as_deref()) {
                     Ok(Some(entry)) => {
                         *idx += 1;
+                        self.last_key = Some(entry.0.clone());
                         return Some(Ok(entry));
                     }
                     Ok(None) => return None,
@@ -391,11 +546,216 @@ impl<'a, S: Store> Iterator for RangeIter<'a, S> {
     }
 }
 
-fn leaf_entry_before_end(
-    node: &Node,
-    idx: usize,
-    end: Option<&[u8]>,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+/// Async iterator over key-value pairs in a range.
+///
+/// Created by [`AsyncProlly::range`](crate::AsyncProlly::range). Call
+/// [`AsyncRangeIter::next`] to lazily read one item at a time, or
+/// [`AsyncRangeIter::into_stream`] to adapt it to a `futures_util::Stream`.
+#[cfg(feature = "async-store")]
+pub struct AsyncRangeIter<'a, S: AsyncStore> {
+    prolly: &'a AsyncProlly<S>,
+    stack: Vec<(Arc<Node>, usize)>,
+    end: Option<Vec<u8>>,
+    started: bool,
+    start_key: Vec<u8>,
+    skip_start_key: bool,
+    last_key: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "async-store")]
+impl<'a, S> AsyncRangeIter<'a, S>
+where
+    S: AsyncStore,
+    S::Error: Send + Sync,
+{
+    pub(crate) fn new(
+        prolly: &'a AsyncProlly<S>,
+        stack: Vec<(Arc<Node>, usize)>,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Self {
+        Self {
+            prolly,
+            stack,
+            end: end.map(|e| e.to_vec()),
+            started: false,
+            start_key: start.to_vec(),
+            skip_start_key: false,
+            last_key: None,
+        }
+    }
+
+    pub(crate) fn new_after(
+        prolly: &'a AsyncProlly<S>,
+        stack: Vec<(Arc<Node>, usize)>,
+        after_key: &[u8],
+        end: Option<&[u8]>,
+    ) -> Self {
+        Self {
+            prolly,
+            stack,
+            end: end.map(|e| e.to_vec()),
+            started: false,
+            start_key: after_key.to_vec(),
+            skip_start_key: true,
+            last_key: None,
+        }
+    }
+
+    /// Return the next key-value pair in lexicographic order.
+    pub async fn next(&mut self) -> Option<RangeItem> {
+        self.position_at_start();
+
+        loop {
+            let (node, idx) = self.stack.last_mut()?;
+
+            if !node.leaf && node.keys.len() != node.vals.len() {
+                return Some(Err(Error::InvalidNode));
+            }
+
+            if *idx >= node.len() {
+                match self.advance_to_next_sibling() {
+                    Ok(true) => continue,
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            if node.leaf {
+                match leaf_entry_before_end(node, *idx, self.end.as_deref()) {
+                    Ok(Some(entry)) => {
+                        *idx += 1;
+                        self.last_key = Some(entry.0.clone());
+                        return Some(Ok(entry));
+                    }
+                    Ok(None) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            match child_starts_at_or_after_end(self.end.as_deref(), node, *idx) {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(e) => return Some(Err(e)),
+            }
+
+            let child = {
+                let (node, idx) = self.stack.last()?;
+                self.load_child_for_descent(node, *idx).await
+            };
+
+            match child {
+                Ok(child) => self.stack.push((child, 0)),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// Collect all remaining range entries into memory.
+    pub async fn collect(mut self) -> Result<Vec<LeafEntry>, Error> {
+        let mut entries = Vec::new();
+        while let Some(item) = self.next().await {
+            entries.push(item?);
+        }
+        Ok(entries)
+    }
+
+    /// Return a resumable cursor for the last key yielded by this iterator.
+    ///
+    /// If the iterator has not yielded an item yet, this returns
+    /// [`RangeCursor::start`].
+    pub fn resume_cursor(&self) -> RangeCursor {
+        self.last_key
+            .clone()
+            .map(RangeCursor::after_key)
+            .unwrap_or_else(RangeCursor::start)
+    }
+
+    /// Convert this iterator into a `futures_util::Stream`.
+    pub fn into_stream(self) -> impl Stream<Item = RangeItem> + 'a {
+        stream::unfold(self, |mut iter| async move {
+            iter.next().await.map(|item| (item, iter))
+        })
+    }
+
+    fn position_at_start(&mut self) {
+        if self.started {
+            return;
+        }
+
+        self.started = true;
+        let Some((node, idx)) = self.stack.last_mut() else {
+            return;
+        };
+
+        if node.leaf {
+            *idx = match node.search(&self.start_key) {
+                Ok(i) if self.skip_start_key => i.saturating_add(1),
+                Ok(i) | Err(i) => i,
+            };
+        }
+    }
+
+    fn advance_to_next_sibling(&mut self) -> Result<bool, Error> {
+        loop {
+            self.stack.pop();
+            let Some((parent, parent_idx)) = self.stack.last_mut() else {
+                return Ok(false);
+            };
+
+            *parent_idx += 1;
+
+            if *parent_idx < parent.len() {
+                if child_starts_at_or_after_end(self.end.as_deref(), parent, *parent_idx)? {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+
+            if parent.keys.len() != parent.vals.len() {
+                return Err(Error::InvalidNode);
+            }
+        }
+    }
+
+    async fn load_child_for_descent(&self, node: &Node, idx: usize) -> Result<Arc<Node>, Error> {
+        let child_cid = child_cid_at(node, idx)?;
+
+        if !self.prolly.store().prefers_batch_reads() {
+            return self.prolly.load_arc(&child_cid).await;
+        }
+
+        if let Some(child) = self.prolly.cached_node_arc(&child_cid) {
+            return Ok(child);
+        }
+
+        let max_child_idx = node
+            .len()
+            .min(idx.saturating_add(RANGE_CHILD_PREFETCH_PARALLELISM));
+        let mut child_cids = Vec::with_capacity(max_child_idx.saturating_sub(idx));
+        child_cids.push(child_cid);
+
+        for child_idx in idx + 1..max_child_idx {
+            if child_starts_at_or_after_end(self.end.as_deref(), node, child_idx).unwrap_or(true) {
+                break;
+            }
+
+            match child_cid_at(node, child_idx) {
+                Ok(cid) => child_cids.push(cid),
+                Err(_) => break,
+            }
+        }
+
+        if child_cids.len() == 1 {
+            return self.prolly.load_arc(&child_cids[0]).await;
+        }
+
+        let children = self.prolly.load_child_frontier_ordered(&child_cids).await?;
+        children.into_iter().next().ok_or(Error::InvalidNode)
+    }
+}
+
+fn leaf_entry_before_end(node: &Node, idx: usize, end: Option<&[u8]>) -> OptionalLeafEntry {
     let key = node.keys.get(idx).ok_or(Error::InvalidNode)?;
     if let Some(end) = end {
         if key.as_slice() >= end {

@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use prolly::{append_batch, Config, Error, MemStore, Mutation, Prolly, Resolver, Store, Tree};
+use prolly::{
+    append_batch, Config, Error, MemStore, Mutation, Prolly, Resolution, Resolver, Store, Tree,
+};
 
 #[cfg(feature = "slatedb")]
 use futures_util::StreamExt;
@@ -111,16 +113,16 @@ where
 
     let start = Instant::now();
     let base = append_batch(&prolly, &prolly.create(), base_mutations(records)).unwrap();
-    print_row(
-        store_name,
-        "build_base",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "build_base",
         records,
-        records,
-        start.elapsed(),
-        0,
-        verify_base(&prolly, &base, records),
-        "ok",
-    );
+        changes: records,
+        elapsed: start.elapsed(),
+        diff_count: 0,
+        verified: verify_base(&prolly, &base, records),
+        status: "ok",
+    });
 
     let left_mutations = left_update_mutations(changes);
     let right_mutations = right_update_mutations(records, changes);
@@ -133,16 +135,16 @@ where
     let left_diff_elapsed = start.elapsed();
     let left_diff_verified =
         left_diff.len() == changes && verify_left_updates(&prolly, &left, changes);
-    print_row(
-        store_name,
-        "diff_sparse_left",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "diff_sparse_left",
         records,
         changes,
-        left_diff_elapsed,
-        left_diff.len(),
-        left_diff_verified,
-        "ok",
-    );
+        elapsed: left_diff_elapsed,
+        diff_count: left_diff.len(),
+        verified: left_diff_verified,
+        status: "ok",
+    });
 
     let start = Instant::now();
     let streaming = prolly
@@ -152,16 +154,16 @@ where
         .unwrap();
     let streaming_elapsed = start.elapsed();
     let streaming_verified = streaming == left_diff;
-    print_row(
-        store_name,
-        "stream_diff_sparse_left",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "stream_diff_sparse_left",
         records,
         changes,
-        streaming_elapsed,
-        streaming.len(),
-        streaming_verified,
-        "ok",
-    );
+        elapsed: streaming_elapsed,
+        diff_count: streaming.len(),
+        verified: streaming_verified,
+        status: "ok",
+    });
 
     let range_start = key_for_index(0);
     let range_end = key_for_index(changes);
@@ -171,16 +173,16 @@ where
         .unwrap();
     let range_elapsed = start.elapsed();
     let range_verified = range_diff.len() == changes;
-    print_row(
-        store_name,
-        "range_diff_left_window",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "range_diff_left_window",
         records,
         changes,
-        range_elapsed,
-        range_diff.len(),
-        range_verified,
-        "ok",
-    );
+        elapsed: range_elapsed,
+        diff_count: range_diff.len(),
+        verified: range_verified,
+        status: "ok",
+    });
 
     let start = Instant::now();
     let merged = prolly.merge(&base, &left, &right, None).unwrap();
@@ -188,16 +190,16 @@ where
     let merge_verified = verify_left_updates(&prolly, &merged, changes)
         && verify_right_updates(&prolly, &merged, records, changes)
         && verify_base_unchanged_sample(&prolly, &merged, records, changes);
-    print_row(
-        store_name,
-        "merge_disjoint",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "merge_disjoint",
         records,
-        changes * 2,
-        merge_elapsed,
-        changes * 2,
-        merge_verified,
-        "ok",
-    );
+        changes: changes * 2,
+        elapsed: merge_elapsed,
+        diff_count: changes * 2,
+        verified: merge_verified,
+        status: "ok",
+    });
 
     let conflict_changes = changes.min(128);
     let conflict_left = prolly
@@ -215,22 +217,22 @@ where
         prolly.merge(&base, &conflict_left, &conflict_right, None),
         Err(Error::Conflict(_))
     );
-    print_row(
-        store_name,
-        "merge_conflict_detect",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "merge_conflict_detect",
         records,
-        conflict_changes,
-        start.elapsed(),
-        1,
-        conflict_detected,
-        "ok",
-    );
+        changes: conflict_changes,
+        elapsed: start.elapsed(),
+        diff_count: 1,
+        verified: conflict_detected,
+        status: "ok",
+    });
 
     let resolver: Resolver = Box::new(|conflict| {
-        let mut value = conflict.left.clone();
+        let mut value = conflict.left.clone().expect("left value");
         value.extend_from_slice(b"+");
-        value.extend_from_slice(&conflict.right);
-        Some(value)
+        value.extend_from_slice(conflict.right.as_ref().expect("right value"));
+        Resolution::value(value)
     });
     let start = Instant::now();
     let resolved = prolly
@@ -238,34 +240,46 @@ where
         .unwrap();
     let resolved_elapsed = start.elapsed();
     let resolved_verified = verify_conflict_resolution(&prolly, &resolved, conflict_changes);
-    print_row(
-        store_name,
-        "merge_conflict_resolved",
+    print_row(BenchRow {
+        store: store_name,
+        operation: "merge_conflict_resolved",
         records,
-        conflict_changes,
-        resolved_elapsed,
-        conflict_changes,
-        resolved_verified,
-        "ok",
-    );
+        changes: conflict_changes,
+        elapsed: resolved_elapsed,
+        diff_count: conflict_changes,
+        verified: resolved_verified,
+        status: "ok",
+    });
 }
 
-fn print_row(
-    store: &str,
-    operation: &str,
+struct BenchRow<'a> {
+    store: &'a str,
+    operation: &'a str,
     records: usize,
     changes: usize,
     elapsed: Duration,
     diff_count: usize,
     verified: bool,
-    status: &str,
-) {
-    let total_ms = elapsed.as_secs_f64() * 1_000.0;
+    status: &'a str,
+}
+
+fn print_row(row: BenchRow<'_>) {
+    let total_ms = row.elapsed.as_secs_f64() * 1_000.0;
     let items_per_sec = if total_ms > 0.0 {
-        changes as f64 / (total_ms / 1_000.0)
+        row.changes as f64 / (total_ms / 1_000.0)
     } else {
         0.0
     };
+    let BenchRow {
+        store,
+        operation,
+        records,
+        changes,
+        diff_count,
+        verified,
+        status,
+        ..
+    } = row;
     println!(
         "{store},{operation},{records},{changes},{total_ms:.3},{items_per_sec:.0},{diff_count},{verified},{status}"
     );

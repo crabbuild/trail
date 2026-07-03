@@ -11,7 +11,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::{json, Map, Value};
 
-use super::{BatchOp, OrderedBatchReadPlan, Store};
+use super::super::manifest::{
+    sort_named_root_manifests, ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRootManifest,
+    RootManifest,
+};
+use super::{cid_from_store_key, sort_cids, BatchOp, NodeStoreScan, OrderedBatchReadPlan, Store};
 
 const SIDECAR_SCRIPT: &str = r#"
 import { PGlite } from '@electric-sql/pglite';
@@ -30,6 +34,10 @@ CREATE TABLE IF NOT EXISTS prolly_hints (
   key bytea NOT NULL,
   value bytea NOT NULL,
   PRIMARY KEY(namespace, key)
+);
+CREATE TABLE IF NOT EXISTS prolly_roots (
+  name bytea PRIMARY KEY,
+  manifest bytea NOT NULL
 );
 `);
 
@@ -57,6 +65,13 @@ async function deleteNode(key) {
   await db.query("DELETE FROM prolly_nodes WHERE cid = decode($1, 'hex')", [key]);
 }
 
+async function listNodeCids() {
+  const result = await db.query(
+    "SELECT encode(cid, 'hex') AS cid FROM prolly_nodes ORDER BY cid"
+  );
+  return result.rows.map((row) => row.cid);
+}
+
 async function readHint(namespace, key) {
   const result = await db.query(
     "SELECT encode(value, 'hex') AS value FROM prolly_hints " +
@@ -73,6 +88,34 @@ async function upsertHint(namespace, key, value) {
       "ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value",
     [namespace, key, value]
   );
+}
+
+async function readRoot(name) {
+  const result = await db.query(
+    "SELECT encode(manifest, 'hex') AS manifest FROM prolly_roots WHERE name = decode($1, 'hex')",
+    [name]
+  );
+  return result.rows.length === 0 ? null : result.rows[0].manifest;
+}
+
+async function listRoots() {
+  const result = await db.query(
+    "SELECT encode(name, 'hex') AS name, encode(manifest, 'hex') AS manifest " +
+      "FROM prolly_roots ORDER BY name"
+  );
+  return result.rows;
+}
+
+async function upsertRoot(name, manifest) {
+  await db.query(
+    "INSERT INTO prolly_roots (name, manifest) VALUES (decode($1, 'hex'), decode($2, 'hex')) " +
+      "ON CONFLICT(name) DO UPDATE SET manifest = excluded.manifest",
+    [name, manifest]
+  );
+}
+
+async function deleteRoot(name) {
+  await db.query("DELETE FROM prolly_roots WHERE name = decode($1, 'hex')", [name]);
 }
 
 async function inTransaction(fn) {
@@ -131,6 +174,8 @@ async function handle(request) {
       }
       return { values };
     }
+    case 'list_node_cids':
+      return { cids: await listNodeCids() };
     case 'batch_put':
       await inTransaction(async () => {
         for (const entry of request.entries || []) {
@@ -151,6 +196,29 @@ async function handle(request) {
         await upsertHint(request.namespace, request.key, request.value);
       });
       return {};
+    case 'get_root':
+      return { manifest: await readRoot(request.name) };
+    case 'list_roots':
+      return { roots: await listRoots() };
+    case 'put_root':
+      await upsertRoot(request.name, request.manifest);
+      return {};
+    case 'delete_root':
+      await deleteRoot(request.name);
+      return {};
+    case 'compare_and_swap_root':
+      return await inTransaction(async () => {
+        const current = await readRoot(request.name);
+        if (current !== request.expected) {
+          return { applied: false, current };
+        }
+        if (request.new === null) {
+          await deleteRoot(request.name);
+        } else {
+          await upsertRoot(request.name, request.new);
+        }
+        return { applied: true, current: request.new };
+      });
     case 'shutdown':
       await db.close();
       return { shutdown: true };
@@ -579,9 +647,108 @@ impl Store for PgliteStore {
     }
 }
 
+impl NodeStoreScan for PgliteStore {
+    type Error = PgliteStoreError;
+
+    fn list_node_cids(&self) -> Result<Vec<super::super::cid::Cid>, Self::Error> {
+        let result = self.request("list_node_cids", Map::new())?;
+        let raw_cids = result
+            .get("cids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PgliteStoreError::new("PGlite list_node_cids response missing cids"))?;
+        let mut cids = raw_cids
+            .iter()
+            .map(|value| {
+                let key = hex_value(value, "cid")?;
+                cid_from_store_key(&key, "PGlite node").map_err(PgliteStoreError::new)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        sort_cids(&mut cids);
+        Ok(cids)
+    }
+}
+
+impl ManifestStore for PgliteStore {
+    type Error = PgliteStoreError;
+
+    fn get_root(&self, name: &[u8]) -> Result<Option<RootManifest>, Self::Error> {
+        let result = self.request("get_root", root_fields(name))?;
+        root_manifest_option(result.get("manifest"))
+    }
+
+    fn put_root(&self, name: &[u8], manifest: &RootManifest) -> Result<(), Self::Error> {
+        let mut fields = root_fields(name);
+        fields.insert("manifest".to_string(), json!(root_manifest_hex(manifest)?));
+        self.request("put_root", fields)?;
+        Ok(())
+    }
+
+    fn delete_root(&self, name: &[u8]) -> Result<(), Self::Error> {
+        self.request("delete_root", root_fields(name))?;
+        Ok(())
+    }
+
+    fn compare_and_swap_root(
+        &self,
+        name: &[u8],
+        expected: Option<&RootManifest>,
+        new: Option<&RootManifest>,
+    ) -> Result<ManifestUpdate, Self::Error> {
+        let mut fields = root_fields(name);
+        fields.insert(
+            "expected".to_string(),
+            optional_root_manifest_json(expected)?,
+        );
+        fields.insert("new".to_string(), optional_root_manifest_json(new)?);
+
+        let result = self.request("compare_and_swap_root", fields)?;
+        let applied = result
+            .get("applied")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| PgliteStoreError::new("PGlite CAS response missing applied flag"))?;
+        if applied {
+            return Ok(ManifestUpdate::Applied);
+        }
+
+        Ok(ManifestUpdate::Conflict {
+            current: root_manifest_option(result.get("current"))?,
+        })
+    }
+}
+
+impl ManifestStoreScan for PgliteStore {
+    fn list_roots(&self) -> Result<Vec<NamedRootManifest>, Self::Error> {
+        let result = self.request("list_roots", Map::new())?;
+        let raw_roots = result
+            .get("roots")
+            .and_then(Value::as_array)
+            .ok_or_else(|| PgliteStoreError::new("PGlite list_roots response missing roots"))?;
+        let mut roots = Vec::with_capacity(raw_roots.len());
+        for value in raw_roots {
+            let name = hex_value(
+                value
+                    .get("name")
+                    .ok_or_else(|| PgliteStoreError::new("PGlite root listing missing name"))?,
+                "root name",
+            )?;
+            let manifest = root_manifest_option(value.get("manifest"))?
+                .ok_or_else(|| PgliteStoreError::new("PGlite root listing missing manifest"))?;
+            roots.push(NamedRootManifest::new(name, manifest));
+        }
+        sort_named_root_manifests(&mut roots);
+        Ok(roots)
+    }
+}
+
 fn map_with_key(key: &[u8]) -> Map<String, Value> {
     let mut fields = Map::new();
     fields.insert("key".to_string(), json!(hex::encode(key)));
+    fields
+}
+
+fn root_fields(name: &[u8]) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("name".to_string(), json!(hex::encode(name)));
     fields
 }
 
@@ -590,6 +757,33 @@ fn hint_fields(namespace: &[u8], key: &[u8]) -> Map<String, Value> {
     fields.insert("namespace".to_string(), json!(hex::encode(namespace)));
     fields.insert("key".to_string(), json!(hex::encode(key)));
     fields
+}
+
+fn optional_root_manifest_json(manifest: Option<&RootManifest>) -> Result<Value, PgliteStoreError> {
+    manifest
+        .map(root_manifest_hex)
+        .transpose()
+        .map(|manifest| manifest.map_or(Value::Null, Value::String))
+}
+
+fn root_manifest_hex(manifest: &RootManifest) -> Result<String, PgliteStoreError> {
+    manifest
+        .to_bytes()
+        .map(hex::encode)
+        .map_err(|e| PgliteStoreError::new(format!("failed to encode root manifest: {e}")))
+}
+
+fn root_manifest_option(value: Option<&Value>) -> Result<Option<RootManifest>, PgliteStoreError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let bytes = hex_value(value, "manifest")?;
+    RootManifest::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|e| PgliteStoreError::new(format!("failed to decode root manifest: {e}")))
 }
 
 fn hex_option(value: Option<&Value>) -> Result<Option<Vec<u8>>, PgliteStoreError> {

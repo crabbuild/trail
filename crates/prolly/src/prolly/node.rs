@@ -508,6 +508,151 @@ impl NodeBuilder {
 mod tests {
     use super::*;
 
+    const COMPACT_LEAF_FIXTURE_HEX: &str = concat!(
+        "4352414201010010800480022a000300166372617465732f70726f6c6c792f7372632f612e7273",
+        "0776616c75652d611204622e72730776616c75652d621204632e72730776616c75652d63"
+    );
+    const COMPACT_INTERNAL_FIXTURE_HEX: &str = concat!(
+        "4352414201000210800480022a000300166372617465732f70726f6c6c792f7372632f612e7273",
+        "0001000000000000000000000000000000000000000000000000000000000000001204622e7273",
+        "0002000000000000000000000000000000000000000000000000000000000000001204632e7273",
+        "010c6c65676163792d6368696c64"
+    );
+    const COMPACT_CUSTOM_ENCODING_FIXTURE_HEX: &str = concat!(
+        "43524142010100028001402a031e6170706c69636174696f6e2f782d6372616264622d6e6f6465",
+        "2d746573740200016101310001620132"
+    );
+    const LEGACY_CBOR_LEAF_FIXTURE_HEX: &str = concat!(
+        "a9008396186318721861187418651873182f18701872186f186c186c1879182f187318721863182f",
+        "1861182e1872187396186318721861187418651873182f18701872186f186c186c1879182f1873",
+        "18721863182f1862182e1872187396186318721861187418651873182f18701872186f186c186c",
+        "1879182f187318721863182f1863182e1872187301838718761861186c18751865182d1861",
+        "8718761861186c18751865182d18628718761861186c18751865182d186302f503000410051",
+        "902000619010007182a0800"
+    );
+
+    fn fixture_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn bytes_from_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "hex fixture must have an even length");
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digits = std::str::from_utf8(pair).expect("fixture hex is ASCII");
+                u8::from_str_radix(digits, 16).expect("fixture hex is valid")
+            })
+            .collect()
+    }
+
+    fn leaf_fixture_node() -> Node {
+        Node::builder()
+            .keys(vec![
+                b"crates/prolly/src/a.rs".to_vec(),
+                b"crates/prolly/src/b.rs".to_vec(),
+                b"crates/prolly/src/c.rs".to_vec(),
+            ])
+            .vals(vec![
+                b"value-a".to_vec(),
+                b"value-b".to_vec(),
+                b"value-c".to_vec(),
+            ])
+            .leaf(true)
+            .level(0)
+            .min_chunk_size(16)
+            .max_chunk_size(512)
+            .chunking_factor(256)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build()
+    }
+
+    fn internal_fixture_node() -> Node {
+        let mut cid_a = [0u8; 32];
+        cid_a[0] = 1;
+        let mut cid_b = [0u8; 32];
+        cid_b[0] = 2;
+        Node::builder()
+            .keys(vec![
+                b"crates/prolly/src/a.rs".to_vec(),
+                b"crates/prolly/src/b.rs".to_vec(),
+                b"crates/prolly/src/c.rs".to_vec(),
+            ])
+            .vals(vec![
+                cid_a.to_vec(),
+                cid_b.to_vec(),
+                b"legacy-child".to_vec(),
+            ])
+            .leaf(false)
+            .level(2)
+            .min_chunk_size(16)
+            .max_chunk_size(512)
+            .chunking_factor(256)
+            .hash_seed(42)
+            .encoding(Encoding::Raw)
+            .build()
+    }
+
+    fn custom_encoding_fixture_node() -> Node {
+        Node::builder()
+            .keys(vec![b"a".to_vec(), b"b".to_vec()])
+            .vals(vec![b"1".to_vec(), b"2".to_vec()])
+            .leaf(true)
+            .level(0)
+            .min_chunk_size(2)
+            .max_chunk_size(128)
+            .chunking_factor(64)
+            .hash_seed(42)
+            .encoding(Encoding::Custom(
+                "application/x-crabdb-node-test".to_string(),
+            ))
+            .build()
+    }
+
+    #[test]
+    fn compact_leaf_serialization_matches_fixture() {
+        let node = leaf_fixture_node();
+        let bytes = node.to_bytes();
+
+        assert_eq!(fixture_hex(&bytes), COMPACT_LEAF_FIXTURE_HEX);
+        assert_eq!(bytes.len(), node.encoded_len());
+        assert_eq!(Node::from_bytes(&bytes).unwrap(), node);
+    }
+
+    #[test]
+    fn compact_internal_serialization_matches_fixture() {
+        let node = internal_fixture_node();
+        let bytes = node.to_bytes();
+
+        assert_eq!(fixture_hex(&bytes), COMPACT_INTERNAL_FIXTURE_HEX);
+        assert_eq!(bytes.len(), node.encoded_len());
+        assert_eq!(Node::from_bytes(&bytes).unwrap(), node);
+    }
+
+    #[test]
+    fn compact_custom_encoding_serialization_matches_fixture() {
+        let node = custom_encoding_fixture_node();
+        let bytes = node.to_bytes();
+
+        assert_eq!(fixture_hex(&bytes), COMPACT_CUSTOM_ENCODING_FIXTURE_HEX);
+        assert_eq!(bytes.len(), node.encoded_len());
+        assert_eq!(Node::from_bytes(&bytes).unwrap(), node);
+    }
+
+    #[test]
+    fn legacy_cbor_leaf_fixture_remains_readable() {
+        let node = leaf_fixture_node();
+        let legacy_bytes = bytes_from_hex(LEGACY_CBOR_LEAF_FIXTURE_HEX);
+
+        assert!(!legacy_bytes.starts_with(COMPACT_MAGIC));
+        assert_eq!(Node::from_bytes(&legacy_bytes).unwrap(), node);
+        assert_eq!(
+            fixture_hex(&serde_cbor::ser::to_vec_packed(&node).unwrap()),
+            LEGACY_CBOR_LEAF_FIXTURE_HEX
+        );
+    }
+
     #[test]
     fn test_new_leaf() {
         let node = Node::new_leaf();

@@ -852,10 +852,36 @@ function sameSnapshotReplacementScope(left: RenderNode, right: RenderNode): bool
   return (
     left.taskId === right.taskId &&
     left.lane === right.lane &&
-    compatibleOptionalScopeValue(left.turnId, right.turnId) &&
+    compatibleSnapshotTurnScope(left, right) &&
     compatibleOptionalScopeValue(left.acpSessionId, right.acpSessionId) &&
     compatibleOptionalScopeValue(left.provider, right.provider)
   );
+}
+
+function compatibleSnapshotTurnScope(left: RenderNode, right: RenderNode): boolean {
+  if (compatibleOptionalScopeValue(left.turnId, right.turnId)) {
+    return true;
+  }
+  return isCompletedLiveHydrationReplacement(left, right);
+}
+
+function isCompletedLiveHydrationReplacement(left: RenderNode, right: RenderNode): boolean {
+  const live = left.source === "acp-live" ? left : right.source === "acp-live" ? right : undefined;
+  const hydrated = left.source === "crabdb" ? left : right.source === "crabdb" ? right : undefined;
+  return Boolean(live && hydrated && !isActiveReplacementNode(live));
+}
+
+function isActiveReplacementNode(node: RenderNode): boolean {
+  if (isActiveRenderStatus(node.status)) {
+    return true;
+  }
+  if (node.kind === "tool") {
+    return isActiveRenderStatus(node.toolStatus);
+  }
+  if (node.kind === "terminal") {
+    return isActiveRenderStatus(node.terminalStatus);
+  }
+  return false;
 }
 
 function sameSnapshotMessageNode(

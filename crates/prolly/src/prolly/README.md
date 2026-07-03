@@ -18,7 +18,7 @@ Prolly trees (Probabilistic B-Trees) are persistent, immutable data structures t
 - **CRDT Support**: Conflict-free replicated data type semantics for distributed systems
 - **Parallel Processing**: Optional parallel batch operations for large trees
 
-See [`PERFORMANCE.md`](../../PERFORMANCE.md) for the paper-derived optimization plan, implemented hardening, and benchmark coverage.
+See [`performance.md`](../../docs/performance.md) for the paper-derived optimization plan, implemented hardening, and benchmark coverage.
 
 ## Quick Start
 
@@ -178,6 +178,45 @@ for diff in diffs {
 
 **Short-circuit**: If both trees have the same root CID, returns empty vector immediately.
 
+#### `structural_diff_page(&base, &other, cursor, limit) -> Result<StructuralDiffPage, Error>`
+Read a bounded page from the structural diff traversal. The returned
+`StructuralDiffCursor` records the remaining CID frontier and pending leaf
+diffs, so background jobs can checkpoint large diffs without restarting from a
+key cursor.
+
+```rust
+let mut cursor = None;
+loop {
+    let page = prolly
+        .structural_diff_page(&base, &other, cursor.as_ref(), 64)
+        .unwrap();
+    for diff in page.diffs {
+        println!("{:?}", diff);
+    }
+    match page.next_cursor {
+        Some(next) => cursor = Some(next),
+        None => break,
+    }
+}
+```
+
+#### `stream_conflicts(&base, &left, &right) -> Result<Iterator<Item = Result<Conflict, Error>>, Error>`
+Stream only conflicts for a standard three-way merge. The iterator walks the
+same structural diff path as `stream_diff`, skips non-conflicting right-side
+changes, and yields delete-aware `Conflict` values where absent sides are
+preserved as `None`.
+
+```rust
+let conflicts = prolly
+    .stream_conflicts(&base, &left, &right)
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+```
+
+`AsyncProlly::stream_conflicts` exposes the same conflict stream under the
+`async-store` feature with async `next`, `collect`, and stream adapters.
+
 #### `merge(&base, &left, &right, resolver) -> Result<Tree, Error>`
 Three-way merge using `base` as the common ancestor.
 
@@ -186,14 +225,50 @@ Three-way merge using `base` as the common ancestor.
 let merged = prolly.merge(&base, &left, &right, None).unwrap();
 
 // Merge with conflict resolver (prefer left)
-let resolver: Resolver = Box::new(|conflict| Some(conflict.left.clone()));
+let resolver: Resolver = Box::new(|conflict| {
+    conflict
+        .left
+        .clone()
+        .map_or_else(Resolution::delete, Resolution::value)
+});
 let merged = prolly.merge(&base, &left, &right, Some(resolver)).unwrap();
 ```
 
 **Conflict Handling**:
 - Conflict occurs when both branches modify the same key differently
-- If no resolver provided or resolver returns `None`, returns `Error::Conflict`
-- Resolver receives `Conflict` with `key`, `base`, `left`, and `right` values
+- If no resolver provided or resolver returns `Resolution::Unresolved`, returns `Error::Conflict`
+- Resolver receives `Conflict` with `key`, `base`, `left`, and `right`; each side is `Option<Vec<u8>>`
+- Resolver returns `Resolution::Value`, `Resolution::Delete`, or `Resolution::Unresolved`
+
+#### `merge_range(&base, &left, &right, start, end, resolver) -> Result<Tree, Error>`
+Three-way merge scoped to right-side changes in the half-open key range
+`[start, end)`. Keys outside the range remain exactly as they are in `left`.
+Use `merge_prefix(&base, &left, &right, prefix, resolver)` for prefix-partitioned
+data such as one document, tenant, workspace, or index shard.
+
+```rust
+let merged = prolly
+    .merge_prefix(&base, &left, &right, b"documents/123/", None)
+    .unwrap();
+```
+
+#### `merge_explain(&base, &left, &right, resolver) -> MergeExplanation`
+Diagnostics-oriented merge. The returned explanation contains both the merge
+result and a typed `MergeTrace`, so callers can inspect fast paths, structural
+reuse, rewritten nodes, resolver calls, and fallback reasons even when the merge
+result is `Error::Conflict`. Diff/batch fallbacks also emit `DiffTraversal`
+counters for compared nodes, reused subtrees, collected fallback paths, and
+emitted diffs.
+
+```rust
+let explanation = prolly.merge_explain(&base, &left, &right, None);
+for event in &explanation.trace.events {
+    println!("{event:?}");
+}
+```
+
+`AsyncProlly::merge_explain` exposes the same `MergeExplanation` shape under
+the `async-store` feature.
 
 ### Advanced Features
 
@@ -262,6 +337,8 @@ let config = Config::builder()
     .chunking_factor(128)        // Higher = larger nodes (default: 128)
     .hash_seed(42)               // Seed for boundary detection
     .encoding(Encoding::Raw)     // Value encoding (Raw, Cbor, Json, Custom)
+    .node_cache_max_nodes(50_000) // Optional decoded-node cache cap
+    .node_cache_max_bytes(256 * 1024 * 1024) // Optional serialized-byte cap
     .build();
 
 let prolly = Prolly::new(store, config);

@@ -61,13 +61,18 @@
 //! # Example: Custom Merge Function
 //!
 //! ```rust
-//! use prolly::CrdtConfig;
+//! use prolly::{CrdtConfig, CrdtResolution};
 //!
 //! // Custom merge: concatenate values
-//! let config = CrdtConfig::custom(|_key, left, right| {
-//!     let mut result = left.to_vec();
-//!     result.extend(right);
-//!     result
+//! let config = CrdtConfig::custom(|conflict| {
+//!     match (&conflict.left, &conflict.right) {
+//!         (Some(left), Some(right)) => {
+//!             let mut result = left.clone();
+//!             result.extend(right);
+//!             CrdtResolution::value(result)
+//!         }
+//!         _ => CrdtResolution::delete(),
+//!     }
 //! });
 //! ```
 
@@ -252,10 +257,32 @@ impl MultiValueSet {
 // Merge Strategy and Configuration
 // ============================================================================
 
+/// Conflict-free custom resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrdtResolution {
+    /// Keep the key with this value.
+    Value(Vec<u8>),
+    /// Delete the key from the merged tree.
+    Delete,
+}
+
+impl CrdtResolution {
+    /// Resolve the conflict to a concrete value.
+    pub fn value(value: impl Into<Vec<u8>>) -> Self {
+        Self::Value(value.into())
+    }
+
+    /// Resolve the conflict by deleting the key.
+    pub fn delete() -> Self {
+        Self::Delete
+    }
+}
+
 /// Custom merge function type.
 ///
-/// Takes the key, left value, and right value, and returns the merged value.
-pub type CustomMergeFn = Arc<dyn Fn(&[u8], &[u8], &[u8]) -> Vec<u8> + Send + Sync>;
+/// Takes a full conflict, including delete/absence state, and returns a
+/// conflict-free value-or-delete resolution.
+pub type CustomMergeFn = Arc<dyn Fn(&Conflict) -> CrdtResolution + Send + Sync>;
 
 /// Merge strategy for conflict-free merging.
 ///
@@ -278,8 +305,8 @@ pub enum MergeStrategy {
 
     /// Custom: use provided merge function.
     ///
-    /// The function receives the key, left value, and right value,
-    /// and returns the merged value.
+    /// The function receives the full conflict and returns a value-or-delete
+    /// resolution.
     Custom(CustomMergeFn),
 }
 
@@ -391,7 +418,7 @@ impl CrdtConfig {
     /// Create a new CrdtConfig with a custom merge function.
     pub fn custom<F>(merge_fn: F) -> Self
     where
-        F: Fn(&[u8], &[u8], &[u8]) -> Vec<u8> + Send + Sync + 'static,
+        F: Fn(&Conflict) -> CrdtResolution + Send + Sync + 'static,
     {
         Self {
             strategy: MergeStrategy::Custom(Arc::new(merge_fn)),
@@ -419,7 +446,7 @@ impl CrdtConfig {
 // ConflictFreeMerger Trait
 // ============================================================================
 
-use super::error::Error;
+use super::error::{Conflict, Error};
 use super::store::Store;
 use super::tree::Tree;
 
@@ -579,8 +606,11 @@ impl DefaultConflictFreeMerger {
     }
 
     /// Resolve a conflict using a custom merge function.
-    fn resolve_custom(key: &[u8], left: &[u8], right: &[u8], merge_fn: &CustomMergeFn) -> Vec<u8> {
-        merge_fn(key, left, right)
+    fn resolve_custom(conflict: &Conflict, merge_fn: &CustomMergeFn) -> Option<Vec<u8>> {
+        match merge_fn(conflict) {
+            CrdtResolution::Value(value) => Some(value),
+            CrdtResolution::Delete => None,
+        }
     }
 
     /// Resolve a delete vs update conflict based on the configured policy.
@@ -597,6 +627,7 @@ impl DefaultConflictFreeMerger {
     ///
     /// # Arguments
     /// * `key` - The key where the conflict occurred
+    /// * `base` - The base branch value (Some for present, None for absent)
     /// * `left` - The left branch value (Some for update, None for delete)
     /// * `right` - The right branch value (Some for update, None for delete)
     /// * `config` - CRDT configuration
@@ -606,17 +637,28 @@ impl DefaultConflictFreeMerger {
     /// * `None` - The key should be deleted
     fn resolve_conflict(
         key: &[u8],
+        base: &Option<Vec<u8>>,
         left: &Option<Vec<u8>>,
         right: &Option<Vec<u8>>,
         config: &CrdtConfig,
     ) -> Option<Vec<u8>> {
+        if let MergeStrategy::Custom(f) = &config.strategy {
+            let conflict = Conflict {
+                key: key.to_vec(),
+                base: base.clone(),
+                left: left.clone(),
+                right: right.clone(),
+            };
+            return Self::resolve_custom(&conflict, f);
+        }
+
         match (left, right) {
             // Both have values - use strategy to resolve
             (Some(l), Some(r)) => {
                 let resolved = match &config.strategy {
                     MergeStrategy::LastWriterWins => Self::resolve_lww(l, r, config),
                     MergeStrategy::MultiValue => Self::resolve_mv(l, r),
-                    MergeStrategy::Custom(f) => Self::resolve_custom(key, l, r, f),
+                    MergeStrategy::Custom(_) => unreachable!("custom strategy returned above"),
                 };
                 Some(resolved)
             }
@@ -631,6 +673,21 @@ impl DefaultConflictFreeMerger {
             (None, None) => None,
         }
     }
+}
+
+#[cfg(feature = "async-store")]
+/// Resolve one CRDT conflict using the default strategy implementation.
+///
+/// This is used by async manager-level CRDT merge so built-in and custom
+/// conflict-free semantics stay aligned with the sync CRDT merger.
+pub(crate) fn resolve_conflict(config: &CrdtConfig, conflict: &Conflict) -> Option<Vec<u8>> {
+    DefaultConflictFreeMerger::resolve_conflict(
+        &conflict.key,
+        &conflict.base,
+        &conflict.left,
+        &conflict.right,
+        config,
+    )
 }
 
 use super::boundary::is_boundary_config;
@@ -701,8 +758,10 @@ fn crdt_merge_impl<S: Store>(
 
             // Both changed - resolve conflict using CRDT strategy
             (Some(left_change), right_change) => {
+                let base_value = base_entries.get(key).cloned();
                 let resolved = DefaultConflictFreeMerger::resolve_conflict(
                     key,
+                    &base_value,
                     left_change,
                     right_change,
                     config,
@@ -1075,7 +1134,9 @@ mod tests {
 
     #[test]
     fn test_crdt_config_custom() {
-        let config = CrdtConfig::custom(|_key, left, _right| left.to_vec());
+        let config = CrdtConfig::custom(|conflict| {
+            CrdtResolution::value(conflict.left.clone().expect("left value"))
+        });
         assert!(matches!(config.strategy, MergeStrategy::Custom(_)));
     }
 
@@ -1116,7 +1177,9 @@ mod tests {
             "LastWriterWins"
         );
         assert_eq!(format!("{:?}", MergeStrategy::MultiValue), "MultiValue");
-        let custom = MergeStrategy::Custom(Arc::new(|_, l, _| l.to_vec()));
+        let custom = MergeStrategy::Custom(Arc::new(|conflict: &Conflict| {
+            CrdtResolution::value(conflict.left.clone().expect("left value"))
+        }));
         assert_eq!(format!("{:?}", custom), "Custom(<fn>)");
     }
 
@@ -1208,17 +1271,36 @@ mod tests {
     // Custom merge function tests
     #[test]
     fn test_resolve_custom_function() {
-        let merge_fn: CustomMergeFn = Arc::new(|_key, left, right| {
+        let merge_fn: CustomMergeFn = Arc::new(|conflict| {
             // Concatenate left and right
-            let mut result = left.to_vec();
-            result.extend(right);
-            result
+            let mut result = conflict.left.clone().expect("left value");
+            result.extend(conflict.right.as_ref().expect("right value"));
+            CrdtResolution::value(result)
         });
 
-        let result =
-            DefaultConflictFreeMerger::resolve_custom(b"key", b"left", b"right", &merge_fn);
+        let conflict = Conflict {
+            key: b"key".to_vec(),
+            base: Some(b"base".to_vec()),
+            left: Some(b"left".to_vec()),
+            right: Some(b"right".to_vec()),
+        };
+        let result = DefaultConflictFreeMerger::resolve_custom(&conflict, &merge_fn);
 
-        assert_eq!(result, b"leftright");
+        assert_eq!(result, Some(b"leftright".to_vec()));
+    }
+
+    #[test]
+    fn test_resolve_custom_function_can_delete() {
+        let merge_fn: CustomMergeFn = Arc::new(|_| CrdtResolution::delete());
+        let conflict = Conflict {
+            key: b"key".to_vec(),
+            base: Some(b"base".to_vec()),
+            left: None,
+            right: Some(b"right".to_vec()),
+        };
+        let result = DefaultConflictFreeMerger::resolve_custom(&conflict, &merge_fn);
+
+        assert!(result.is_none());
     }
 
     // Delete policy tests
@@ -1245,6 +1327,7 @@ mod tests {
 
         let result = DefaultConflictFreeMerger::resolve_conflict(
             b"key",
+            &Some(b"base".to_vec()),
             &Some(old_value.to_bytes()),
             &Some(new_value.to_bytes()),
             &config,
@@ -1261,6 +1344,7 @@ mod tests {
 
         let result = DefaultConflictFreeMerger::resolve_conflict(
             b"key",
+            &Some(b"base".to_vec()),
             &None,
             &Some(b"right_value".to_vec()),
             &config,
@@ -1275,6 +1359,7 @@ mod tests {
 
         let result = DefaultConflictFreeMerger::resolve_conflict(
             b"key",
+            &Some(b"base".to_vec()),
             &None,
             &Some(b"right_value".to_vec()),
             &config,
@@ -1287,7 +1372,8 @@ mod tests {
     fn test_resolve_conflict_both_deleted() {
         let config = CrdtConfig::default();
 
-        let result = DefaultConflictFreeMerger::resolve_conflict(b"key", &None, &None, &config);
+        let result =
+            DefaultConflictFreeMerger::resolve_conflict(b"key", &None, &None, &None, &config);
 
         assert!(result.is_none());
     }
@@ -1405,6 +1491,79 @@ mod tests {
         assert_eq!(mv.values.len(), 2);
         assert!(mv.values.contains(&b"left".to_vec()));
         assert!(mv.values.contains(&b"right".to_vec()));
+    }
+
+    #[test]
+    fn test_crdt_merge_with_custom_value_resolution() {
+        use crate::prolly::config::Config;
+        use crate::prolly::store::MemStore;
+        use crate::prolly::Prolly;
+        use std::sync::Arc;
+
+        let store = Arc::new(MemStore::new());
+        let config = Config::default();
+        let prolly = Prolly::new(store.clone(), config);
+
+        let base = prolly.create();
+        let base = prolly
+            .put(&base, b"key".to_vec(), b"base".to_vec())
+            .unwrap();
+        let left = prolly
+            .put(&base, b"key".to_vec(), b"left".to_vec())
+            .unwrap();
+        let right = prolly
+            .put(&base, b"key".to_vec(), b"right".to_vec())
+            .unwrap();
+
+        let crdt_config = CrdtConfig::custom(|conflict| {
+            assert_eq!(conflict.base.as_deref(), Some(b"base".as_slice()));
+            let mut value = conflict.left.clone().expect("left value");
+            value.extend_from_slice(b"+");
+            value.extend_from_slice(conflict.right.as_ref().expect("right value"));
+            CrdtResolution::value(value)
+        });
+        let merger = DefaultConflictFreeMerger::new();
+        let merged = merger
+            .crdt_merge(store.as_ref(), &base, &left, &right, &crdt_config)
+            .unwrap();
+
+        assert_eq!(
+            prolly.get(&merged, b"key").unwrap(),
+            Some(b"left+right".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_crdt_merge_with_custom_delete_resolution() {
+        use crate::prolly::config::Config;
+        use crate::prolly::store::MemStore;
+        use crate::prolly::Prolly;
+        use std::sync::Arc;
+
+        let store = Arc::new(MemStore::new());
+        let config = Config::default();
+        let prolly = Prolly::new(store.clone(), config);
+
+        let base = prolly.create();
+        let base = prolly
+            .put(&base, b"key".to_vec(), b"base".to_vec())
+            .unwrap();
+        let left = prolly.delete(&base, b"key").unwrap();
+        let right = prolly
+            .put(&base, b"key".to_vec(), b"right".to_vec())
+            .unwrap();
+
+        let crdt_config = CrdtConfig::custom(|conflict| {
+            assert!(conflict.left.is_none());
+            assert_eq!(conflict.right.as_deref(), Some(b"right".as_slice()));
+            CrdtResolution::delete()
+        });
+        let merger = DefaultConflictFreeMerger::new();
+        let merged = merger
+            .crdt_merge(store.as_ref(), &base, &left, &right, &crdt_config)
+            .unwrap();
+
+        assert_eq!(prolly.get(&merged, b"key").unwrap(), None);
     }
 
     #[test]

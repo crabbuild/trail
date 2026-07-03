@@ -246,6 +246,7 @@ use std::sync::Arc;
 
 use super::boundary::is_boundary;
 use super::cid::Cid;
+#[cfg(test)]
 use super::cursor::Cursor;
 use super::error::Error;
 use super::error::Mutation;
@@ -262,6 +263,9 @@ const SPARSE_LEAF_APPLY_MAX_MUTATIONS: usize = 8;
 const SPARSE_LEAF_APPLY_MIN_LEAF_TO_MUTATION_RATIO: usize = 8;
 const EXISTING_KEY_LINEAR_SCAN_MIN_MUTATIONS: usize = 16;
 const EXISTING_KEY_LINEAR_SCAN_MIN_DENSITY_DIVISOR: usize = 4;
+
+type ExistingKeyMutationChange<'a> = (usize, Option<&'a Vec<u8>>);
+type ExistingKeyMutationChanges<'a> = Vec<ExistingKeyMutationChange<'a>>;
 const EXACT_ROUTE_BUCKET_MIN_MUTATIONS: usize = 32;
 
 /// Leaf span affected by mutations.
@@ -288,7 +292,8 @@ const EXACT_ROUTE_BUCKET_MIN_MUTATIONS: usize = 32;
 /// println!("Span covers keys from {:?} to {:?}", span.start_key, span.end_key);
 /// ```
 #[derive(Debug, Clone)]
-pub struct LeafSpan {
+#[cfg(test)]
+pub(crate) struct LeafSpan {
     /// CID of the leaf node
     pub leaf_cid: Cid,
     /// First key in this leaf's range
@@ -309,7 +314,7 @@ pub struct LeafSpan {
 /// let cid = collector.add(&node);
 /// collector.flush(&store)?;
 /// ```
-pub struct BatchWriteCollector {
+pub(crate) struct BatchWriteCollector {
     /// Nodes to write: (cid, node_bytes)
     nodes: Vec<(Cid, Vec<u8>)>,
     seen_cids: HashSet<Cid>,
@@ -479,7 +484,9 @@ impl BatchWriteCollector {
     ///
     /// # Returns
     /// `true` if no nodes have been added, `false` otherwise.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
@@ -487,7 +494,8 @@ impl BatchWriteCollector {
     ///
     /// # Returns
     /// An iterator yielding `(cid_bytes, node_bytes)` pairs.
-    pub fn nodes_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+    #[cfg(test)]
+    pub(crate) fn nodes_iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.nodes
             .iter()
             .map(|(cid, bytes)| (cid.as_bytes(), bytes.as_slice()))
@@ -900,7 +908,7 @@ impl Default for MutationBuffer {
 ///
 /// Used internally by the batch method to group mutations that
 /// affect the same leaf, enabling efficient batch application.
-pub struct LeafMutationGroup {
+pub(crate) struct LeafMutationGroup {
     /// The leaf node to modify
     pub leaf: Node,
     /// Path from root to this leaf (excluding the leaf itself)
@@ -1023,6 +1031,7 @@ fn child_refs_from_nodes(nodes: Vec<Node>, collector: &mut BatchWriteCollector) 
         .collect()
 }
 
+#[cfg(test)]
 fn node_cids_with_first_keys(
     nodes: Vec<Node>,
     collector: &mut BatchWriteCollector,
@@ -1092,6 +1101,7 @@ struct AncestorContext {
 /// )?;
 /// ```
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct DeferredMutationResult {
     /// Modified leaves after mutations have been applied.
     ///
@@ -1173,7 +1183,8 @@ pub struct DeferredMutationResult {
 /// // Later: rebuild the tree, splitting oversized leaves
 /// let new_root = rebuild_from_modified_leaves(&prolly, deferred_result, &mut collector)?;
 /// ```
-pub fn apply_mutations_deferred(groups: Vec<LeafMutationGroup>) -> DeferredMutationResult {
+#[cfg(test)]
+pub(crate) fn apply_mutations_deferred(groups: Vec<LeafMutationGroup>) -> DeferredMutationResult {
     let mut modified_leaves = Vec::with_capacity(groups.len());
     let mut ancestor_paths = Vec::with_capacity(groups.len());
     let mut first_keys = Vec::with_capacity(groups.len());
@@ -1241,7 +1252,8 @@ pub fn apply_mutations_deferred(groups: Vec<LeafMutationGroup>) -> DeferredMutat
 ///     assert!(chunk.len() <= chunk.max_chunk_size);
 /// }
 /// ```
-pub fn split_oversized_node<S: Store>(prolly: &Prolly<S>, node: &Node) -> Vec<Node> {
+#[cfg(test)]
+pub(crate) fn split_oversized_node<S: Store>(prolly: &Prolly<S>, node: &Node) -> Vec<Node> {
     rebalance::split_into_chunks(prolly, node, node.max_chunk_size)
 }
 
@@ -1301,7 +1313,9 @@ pub fn split_oversized_node<S: Store>(prolly: &Prolly<S>, node: &Node) -> Vec<No
 /// // If all children fit in one node, parent_info.len() == 1
 /// // Otherwise, multiple internal nodes are created
 /// ```
-pub fn build_internal_level<S: Store>(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn build_internal_level<S: Store>(
     prolly: &Prolly<S>,
     child_cids: &[Cid],
     first_keys: &[Vec<u8>],
@@ -1419,7 +1433,9 @@ pub fn build_internal_level<S: Store>(
 ///
 /// // new_root is the CID of the rebuilt tree
 /// ```
-pub fn rebuild_from_modified_leaves<S: Store>(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn rebuild_from_modified_leaves<S: Store>(
     prolly: &Prolly<S>,
     deferred_result: DeferredMutationResult,
     collector: &mut BatchWriteCollector,
@@ -1494,7 +1510,7 @@ pub fn rebuild_from_modified_leaves<S: Store>(
 /// A new vector of mutations, sorted by key with duplicates removed.
 ///
 /// # Example
-/// ```
+/// ```rust,ignore
 /// use prolly::Mutation;
 /// use prolly::preprocess_mutations;
 ///
@@ -1512,7 +1528,7 @@ pub fn rebuild_from_modified_leaves<S: Store>(
 /// assert_eq!(processed[1].key(), b"b");
 /// // The value for "b" is "3" (last-write-wins)
 /// ```
-pub fn preprocess_mutations(mutations: Vec<Mutation>) -> Vec<Mutation> {
+pub(crate) fn preprocess_mutations(mutations: Vec<Mutation>) -> Vec<Mutation> {
     preprocess_mutations_with_info(mutations).mutations
 }
 
@@ -1622,7 +1638,9 @@ fn inspect_sorted_mutations(mutations: &[Mutation]) -> (bool, bool) {
 /// - Memory is extremely constrained (avoids pre-allocation)
 ///
 /// For typical batch operations, use `apply_mutations_to_leaf` instead.
-pub fn apply_mutations_to_leaf_binary_search(leaf: Node, mutations: &[Mutation]) -> Node {
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn apply_mutations_to_leaf_binary_search(leaf: Node, mutations: &[Mutation]) -> Node {
     apply_mutations_to_leaf_binary_search_with_change(leaf, mutations).0
 }
 
@@ -1736,7 +1754,7 @@ fn apply_mutations_to_leaf_binary_search_with_change(
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// use prolly::{Node, Mutation, apply_mutations_to_leaf};
 ///
 /// // Create a leaf with existing entries
@@ -1754,7 +1772,7 @@ fn apply_mutations_to_leaf_binary_search_with_change(
 /// let result = apply_mutations_to_leaf(leaf, &mutations);
 /// // Result: [("a", "1"), ("b", "2"), ("c", "33")]
 /// ```
-pub fn apply_mutations_to_leaf(leaf: Node, mutations: &[Mutation]) -> Node {
+pub(crate) fn apply_mutations_to_leaf(leaf: Node, mutations: &[Mutation]) -> Node {
     apply_mutations_to_leaf_with_change(leaf, mutations).0
 }
 
@@ -1923,7 +1941,7 @@ fn leaf_merge_result<'a>(
     result.as_mut().expect("leaf merge result initialized")
 }
 
-fn apply_leaf_mutations_with_change(
+pub(crate) fn apply_leaf_mutations_with_change(
     leaf: Node,
     mutations: &[Mutation],
     use_optimized_merge: bool,
@@ -1953,7 +1971,7 @@ fn should_use_sparse_leaf_apply(leaf: &Node, mutations: &[Mutation]) -> bool {
 fn existing_key_mutation_changes<'a>(
     leaf: &Node,
     mutations: &'a [Mutation],
-) -> Option<Vec<(usize, Option<&'a Vec<u8>>)>> {
+) -> Option<ExistingKeyMutationChanges<'a>> {
     if leaf.keys.is_empty() {
         return None;
     }
@@ -1976,7 +1994,7 @@ fn should_scan_existing_key_mutations_linearly(leaf: &Node, mutations: &[Mutatio
 fn existing_key_mutation_changes_binary<'a>(
     leaf: &Node,
     mutations: &'a [Mutation],
-) -> Option<Vec<(usize, Option<&'a Vec<u8>>)>> {
+) -> Option<ExistingKeyMutationChanges<'a>> {
     let mut changes = Vec::with_capacity(mutations.len());
     let mut previous_key: Option<&[u8]> = None;
 
@@ -2006,7 +2024,7 @@ fn existing_key_mutation_changes_binary<'a>(
 fn existing_key_mutation_changes_linear<'a>(
     leaf: &Node,
     mutations: &'a [Mutation],
-) -> Option<Vec<(usize, Option<&'a Vec<u8>>)>> {
+) -> Option<ExistingKeyMutationChanges<'a>> {
     let mut changes = Vec::with_capacity(mutations.len());
     let mut leaf_index = 0usize;
     let mut previous_key: Option<&[u8]> = None;
@@ -2044,7 +2062,7 @@ fn existing_key_mutation_changes_linear<'a>(
 
 fn apply_existing_key_mutations_in_place(
     mut leaf: Node,
-    changes: Vec<(usize, Option<&Vec<u8>>)>,
+    changes: ExistingKeyMutationChanges<'_>,
 ) -> (Node, bool) {
     let mut changed = false;
     for (index, value) in changes.into_iter().rev() {
@@ -2095,27 +2113,57 @@ pub fn append_batch<S: Store>(
     tree: &Tree,
     mutations: Vec<Mutation>,
 ) -> Result<Tree, Error> {
+    Ok(append_batch_with_stats(prolly, tree, mutations)?.tree)
+}
+
+/// Apply append-heavy mutations and return store-neutral execution stats.
+///
+/// This uses the optimized append path when safe. If the mutations overlap
+/// existing data or otherwise cannot be applied as a pure append, it falls back
+/// to the regular batch implementation and reports the fallback path stats.
+pub fn append_batch_with_stats<S: Store>(
+    prolly: &Prolly<S>,
+    tree: &Tree,
+    mutations: Vec<Mutation>,
+) -> Result<BatchApplyResult, Error> {
     let input_mutations = mutations.len();
 
     // Handle empty mutations
     if mutations.is_empty() {
-        return Ok(tree.clone());
+        return Ok(BatchApplyResult {
+            tree: tree.clone(),
+            stats: BatchApplyStats::new(input_mutations, false),
+        });
     }
 
     // Preprocess mutations
     let preprocessed = preprocess_mutations_with_info(mutations);
+    let input_was_sorted = preprocessed.input_was_sorted;
     let mutations = preprocessed.mutations;
+    let effective_mutations = mutations.len();
     if mutations.is_empty() {
-        return Ok(tree.clone());
+        let mut stats = BatchApplyStats::new(input_mutations, false);
+        stats.effective_mutations = effective_mutations;
+        stats.preprocess_input_sorted = input_was_sorted;
+        return Ok(BatchApplyResult {
+            tree: tree.clone(),
+            stats,
+        });
     }
 
     let mut stats = BatchApplyStats::new(input_mutations, false);
-    stats.effective_mutations = mutations.len();
-    stats.preprocess_input_sorted = preprocessed.input_was_sorted;
+    stats.effective_mutations = effective_mutations;
+    stats.preprocess_input_sorted = input_was_sorted;
 
     match try_append_batch_preprocessed(prolly, tree, mutations, false, stats)? {
-        AppendBatchAttempt::Appended(result) => Ok(result.tree),
-        AppendBatchAttempt::NotAppend(mutations) => apply_batch(prolly, tree, mutations),
+        AppendBatchAttempt::Appended(result) => Ok(result),
+        AppendBatchAttempt::NotAppend(mutations) => {
+            let mut result = BatchWriter::new().apply_batch_with_stats(prolly, tree, mutations)?;
+            result.stats.input_mutations = input_mutations;
+            result.stats.effective_mutations = effective_mutations;
+            result.stats.preprocess_input_sorted = input_was_sorted;
+            Ok(result)
+        }
     }
 }
 
@@ -2339,15 +2387,19 @@ fn flush_append_collector<S: Store>(
                     root.as_bytes(),
                     &bytes,
                 )?;
+                prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
             } else {
                 collector.flush(prolly.store())?;
+                prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
             }
         } else {
             collector.flush(prolly.store())?;
+            prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
         }
         prolly.cache_rightmost_path(root.clone(), cached_rightmost_entries(path));
     } else {
         collector.flush(prolly.store())?;
+        prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
     }
 
     if cache_written_nodes {
@@ -2612,7 +2664,10 @@ fn build_append_leaf_chunks<S: Store>(
 ///
 /// # Requirements
 /// - Requirement 1.4: Compute tree's maximum key in O(h) time
-pub fn get_max_key<S: Store>(prolly: &Prolly<S>, root_cid: &Cid) -> Result<Option<Vec<u8>>, Error> {
+pub(crate) fn get_max_key<S: Store>(
+    prolly: &Prolly<S>,
+    root_cid: &Cid,
+) -> Result<Option<Vec<u8>>, Error> {
     let mut cid = root_cid.clone();
 
     loop {
@@ -2655,7 +2710,7 @@ pub fn get_max_key<S: Store>(prolly: &Prolly<S>, root_cid: &Cid) -> Result<Optio
 /// - Requirement 1.1: Detect append patterns (all keys > max key)
 /// - Requirement 1.2: Detect single-leaf groups
 /// - Requirement 1.3: Enable deferred rebalancing when either condition is met
-pub fn should_use_deferred_rebalancing<S: Store>(
+pub(crate) fn should_use_deferred_rebalancing<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     groups: &[LeafMutationGroup],
@@ -3030,7 +3085,7 @@ fn split_internal_node<S: Store>(
 /// - All new nodes are written atomically via Store::batch
 /// - The input tree is not modified (immutable operation)
 /// - Affected leaves are prefetched to optimize I/O (when supported by store)
-pub fn apply_batch<S: Store>(
+pub(crate) fn apply_batch<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     mutations: Vec<Mutation>,
@@ -3077,7 +3132,9 @@ pub fn apply_batch<S: Store>(
 ///
 /// let new_tree = apply_batch_with_rebuild(&prolly, &tree, mutations).unwrap();
 /// ```
-pub fn apply_batch_with_rebuild<S: Store>(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn apply_batch_with_rebuild<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     mutations: Vec<Mutation>,
@@ -3120,6 +3177,7 @@ pub fn apply_batch_with_rebuild<S: Store>(
 
     // Step 5: Flush all writes atomically
     collector.flush(prolly.store())?;
+    prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
 
     Ok(Tree {
         root: new_root,
@@ -3133,6 +3191,7 @@ fn flush_batch_collector<S: Store>(
     cache_written_nodes: bool,
 ) -> Result<(), Error> {
     collector.flush(prolly.store())?;
+    prolly.record_batch_write_metrics(collector.len(), collector.bytes_len());
     if cache_written_nodes {
         collector.cache_nodes(prolly)?;
     }
@@ -3168,7 +3227,8 @@ fn batch_write_collector(cache_written_nodes: bool) -> BatchWriteCollector {
 /// - Uses `batch_get` for parallel I/O when supported by the store
 /// - Avoid calling it with freshly routed groups unless the store benefits from
 ///   duplicate cache probes
-pub fn prefetch_leaves<S: Store>(store: &S, groups: &[LeafMutationGroup]) {
+#[cfg(test)]
+pub(crate) fn prefetch_leaves<S: Store>(store: &S, groups: &[LeafMutationGroup]) {
     if groups.is_empty() {
         return;
     }
@@ -3230,7 +3290,9 @@ pub fn prefetch_leaves<S: Store>(store: &S, groups: &[LeafMutationGroup]) {
 /// assert_eq!(filtered[0].key(), b"b");
 /// assert_eq!(filtered[1].key(), b"c");
 /// ```
-pub fn filter_mutations_for_range(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn filter_mutations_for_range(
     mutations: &[Mutation],
     start_key: &[u8],
     end_key: &[u8],
@@ -3266,7 +3328,7 @@ pub fn filter_mutations_for_range(
 ///
 /// # Returns
 /// Vector of LeafMutationGroup, each containing a leaf and its mutations
-pub fn group_mutations_by_leaf<S: Store>(
+pub(crate) fn group_mutations_by_leaf<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     mutations: Vec<Mutation>,
@@ -3503,7 +3565,7 @@ fn route_sorted_mutation_ranges_to_children(
     Ok(routed)
 }
 
-fn route_sorted_mutation_ranges_to_children_each<F>(
+pub(crate) fn route_sorted_mutation_ranges_to_children_each<F>(
     node: &Node,
     mutations: &[Mutation],
     range: Range<usize>,
@@ -3841,7 +3903,9 @@ fn next_leaf_first_key(ancestors: &[(Node, usize)]) -> Result<Option<Vec<u8>>, E
 /// For a tree with 500K entries and 2K mutations per batch:
 /// - Old approach: ~2K × 4 × 8 = 64K node operations per batch
 /// - New approach: ~4 + 8 = 12 node operations per batch (for single-leaf batches)
-pub fn group_mutations_by_leaf_cursor<S: Store>(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn group_mutations_by_leaf_cursor<S: Store>(
     prolly: &Prolly<S>,
     tree: &Tree,
     mutations: Vec<Mutation>,
@@ -3853,7 +3917,9 @@ pub fn group_mutations_by_leaf_cursor<S: Store>(
 ///
 /// Contains the new root CID and information about the nodes that were written.
 #[derive(Debug, Clone)]
-pub struct RebuildResult {
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct RebuildResult {
     /// CID of the new root node (None if tree becomes empty)
     pub root_cid: Option<Cid>,
     /// Number of nodes written during rebuild
@@ -3907,7 +3973,9 @@ pub struct RebuildResult {
 /// let result = bottom_up_rebuild(&prolly, new_leaves, &ancestors, &mut collector)?;
 /// println!("New root: {:?}, nodes written: {}", result.root_cid, result.nodes_written);
 /// ```
-pub fn bottom_up_rebuild<S: Store>(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn bottom_up_rebuild<S: Store>(
     prolly: &Prolly<S>,
     new_leaves: Vec<Node>,
     original_ancestors: &[(Node, usize)],
@@ -4021,7 +4089,7 @@ pub fn bottom_up_rebuild<S: Store>(
 ///
 /// * `Ok(Option<Cid>)` - The new root CID, or None if tree becomes empty
 /// * `Err(Error)` - On processing errors
-pub fn bottom_up_rebuild_groups<S: Store>(
+pub(crate) fn bottom_up_rebuild_groups<S: Store>(
     prolly: &Prolly<S>,
     leaf_groups: Vec<(Node, Vec<(Node, usize)>)>,
     collector: &mut BatchWriteCollector,
@@ -5304,7 +5372,8 @@ impl BatchWriter {
 /// let spans = compute_affected_spans(store.as_ref(), &tree, &mutations).unwrap();
 /// // spans contains LeafSpan entries for leaves covering keys "a" through "b"
 /// ```
-pub fn compute_affected_spans<S: Store>(
+#[cfg(test)]
+pub(crate) fn compute_affected_spans<S: Store>(
     store: &S,
     tree: &Tree,
     mutations: &[Mutation],
@@ -5384,6 +5453,7 @@ pub fn compute_affected_spans<S: Store>(
     Ok(spans)
 }
 
+#[cfg(test)]
 fn first_unsorted_mutation_pair(mutations: &[Mutation]) -> Option<(&[u8], &[u8])> {
     mutations.windows(2).find_map(|pair| {
         let previous = pair[0].key();
@@ -5392,6 +5462,7 @@ fn first_unsorted_mutation_pair(mutations: &[Mutation]) -> Option<(&[u8], &[u8])
     })
 }
 
+#[cfg(test)]
 fn advance_cursor_to_next_leaf<S: Store>(
     cursor: &mut Cursor,
     store: &S,

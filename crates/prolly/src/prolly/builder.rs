@@ -432,7 +432,7 @@ where
         .map_err(|e| Error::Store(Box::new(e)))
 }
 
-fn chunk_ranges_from_hash_boundaries(
+pub(crate) fn chunk_ranges_from_hash_boundaries(
     config: &Config,
     hash_boundaries: &[bool],
 ) -> Vec<std::ops::RangeInclusive<usize>> {

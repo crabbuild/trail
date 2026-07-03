@@ -3,12 +3,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
-use super::{BatchOp, OrderedBatchReadPlan, Store};
+use super::super::manifest::{
+    sort_named_root_manifests, ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRootManifest,
+    RootManifest,
+};
+use super::{cid_from_store_key, sort_cids, BatchOp, NodeStoreScan, OrderedBatchReadPlan, Store};
 
 /// In-memory store for testing and simple use cases
 #[derive(Debug, Default)]
 pub struct MemStore {
     data: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
+    roots: RwLock<BTreeMap<Vec<u8>, RootManifest>>,
 }
 
 /// Error type for MemStore operations
@@ -28,6 +33,7 @@ impl MemStore {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(BTreeMap::new()),
+            roots: RwLock::new(BTreeMap::new()),
         }
     }
 }
@@ -141,6 +147,96 @@ impl Store for MemStore {
             data.insert(key.to_vec(), value.to_vec());
         }
         Ok(())
+    }
+}
+
+impl NodeStoreScan for MemStore {
+    type Error = MemStoreError;
+
+    fn list_node_cids(&self) -> Result<Vec<super::super::cid::Cid>, Self::Error> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+        let mut cids = data
+            .keys()
+            .map(|key| cid_from_store_key(key, "MemStore node"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(MemStoreError)?;
+        sort_cids(&mut cids);
+        Ok(cids)
+    }
+}
+
+impl ManifestStore for MemStore {
+    type Error = MemStoreError;
+
+    fn get_root(&self, name: &[u8]) -> Result<Option<RootManifest>, Self::Error> {
+        let roots = self
+            .roots
+            .read()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+        Ok(roots.get(name).cloned())
+    }
+
+    fn put_root(&self, name: &[u8], manifest: &RootManifest) -> Result<(), Self::Error> {
+        let mut roots = self
+            .roots
+            .write()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+        roots.insert(name.to_vec(), manifest.clone());
+        Ok(())
+    }
+
+    fn delete_root(&self, name: &[u8]) -> Result<(), Self::Error> {
+        let mut roots = self
+            .roots
+            .write()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+        roots.remove(name);
+        Ok(())
+    }
+
+    fn compare_and_swap_root(
+        &self,
+        name: &[u8],
+        expected: Option<&RootManifest>,
+        new: Option<&RootManifest>,
+    ) -> Result<ManifestUpdate, Self::Error> {
+        let mut roots = self
+            .roots
+            .write()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+        let current = roots.get(name).cloned();
+        if current.as_ref() != expected {
+            return Ok(ManifestUpdate::Conflict { current });
+        }
+
+        match new {
+            Some(manifest) => {
+                roots.insert(name.to_vec(), manifest.clone());
+            }
+            None => {
+                roots.remove(name);
+            }
+        }
+
+        Ok(ManifestUpdate::Applied)
+    }
+}
+
+impl ManifestStoreScan for MemStore {
+    fn list_roots(&self) -> Result<Vec<NamedRootManifest>, Self::Error> {
+        let roots = self
+            .roots
+            .read()
+            .map_err(|e| MemStoreError(format!("lock poisoned: {}", e)))?;
+        let mut roots = roots
+            .iter()
+            .map(|(name, manifest)| NamedRootManifest::new(name.clone(), manifest.clone()))
+            .collect::<Vec<_>>();
+        sort_named_root_manifests(&mut roots);
+        Ok(roots)
     }
 }
 

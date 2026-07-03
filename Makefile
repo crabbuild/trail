@@ -92,7 +92,7 @@ test-crabdb: ## Run crabdb crate tests
 
 .PHONY: test-prolly
 test-prolly: ## Run prolly crate tests
-	$(CARGO) test -p prolly $(TEST_FLAGS) -- --nocapture
+	$(CARGO) test -p prolly-map $(TEST_FLAGS) -- --nocapture
 
 .PHONY: test-e2e
 test-e2e: ## Run only end-to-end tests

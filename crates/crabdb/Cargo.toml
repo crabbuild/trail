@@ -13,7 +13,7 @@ hex.workspace = true
 ignore.workspace = true
 libc.workspace = true
 notify.workspace = true
-prolly = { path = "../prolly", features = ["slatedb", "sqlite"] }
+prolly = { package = "prolly-map", path = "../prolly", features = ["slatedb", "sqlite"] }
 rayon.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true

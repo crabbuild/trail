@@ -1,4 +1,16 @@
 /target/
 **/*.rs.bk
 .DS_Store
-
+.venv/
+__pycache__/
+*.py[cod]
+crates/prolly/bindings/python/prolly/uniffi/*.dylib
+crates/prolly/bindings/python/prolly/uniffi/*.so
+crates/prolly/bindings/python/prolly/uniffi/*.dll
+crates/prolly/bindings/python/prolly/uniffi/*.pyd
+crates/prolly/bindings/*/target/
+crates/prolly/bindings/node/*.node
+crates/prolly/bindings/node/node_modules/
+crates/prolly/bindings/ruby/Gemfile.lock
+crates/prolly/bindings/swift/.build/
+crates/prolly/bindings/wasm/pkg/

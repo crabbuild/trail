@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures_util::stream::{self, StreamExt};
 use slatedb::bytes::Bytes;
@@ -11,10 +11,15 @@ use slatedb::object_store::ObjectStore;
 use slatedb::{Db, WriteBatch};
 use tokio::runtime::{Builder, Runtime};
 
-use super::{BatchOp, OrderedBatchReadPlan, Store};
+use super::super::manifest::{
+    sort_named_root_manifests, ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRootManifest,
+    RootManifest,
+};
+use super::{cid_from_store_key, sort_cids, BatchOp, NodeStoreScan, OrderedBatchReadPlan, Store};
 
 const NODE_PREFIX: &[u8] = b"node:";
 const HINT_PREFIX: &[u8] = b"hint:";
+const ROOT_PREFIX: &[u8] = b"root:";
 
 /// Configuration options for [`SlateDbStore`].
 #[derive(Debug, Clone)]
@@ -100,6 +105,7 @@ impl From<slatedb::Error> for SlateDbStoreError {
 pub struct SlateDbStore {
     db: Db,
     runtime: Runtime,
+    manifest_lock: Mutex<()>,
     flush_after_write: bool,
     close_on_drop: bool,
     read_parallelism: usize,
@@ -140,6 +146,7 @@ impl SlateDbStore {
         Ok(Self {
             db,
             runtime,
+            manifest_lock: Mutex::new(()),
             flush_after_write: config.flush_after_write,
             close_on_drop: config.close_on_drop,
             read_parallelism: config.read_parallelism.max(1),
@@ -395,6 +402,161 @@ impl Store for SlateDbStore {
     }
 }
 
+impl NodeStoreScan for SlateDbStore {
+    type Error = SlateDbStoreError;
+
+    fn list_node_cids(&self) -> Result<Vec<super::super::cid::Cid>, Self::Error> {
+        self.block_on(
+            async {
+                let mut iter = self.db.scan_prefix(NODE_PREFIX, ..).await?;
+                let mut cids = Vec::new();
+                while let Some(kv) = iter.next().await? {
+                    let key = kv.key.as_ref();
+                    let cid = key
+                        .strip_prefix(NODE_PREFIX)
+                        .ok_or_else(|| {
+                            slatedb::Error::invalid(
+                                "SlateDB node scan returned key without node prefix".to_string(),
+                            )
+                        })
+                        .and_then(|key| {
+                            cid_from_store_key(key, "SlateDB node").map_err(slatedb::Error::invalid)
+                        })?;
+                    cids.push(cid);
+                }
+                sort_cids(&mut cids);
+                Ok(cids)
+            },
+            "failed to list node CIDs",
+        )
+    }
+}
+
+impl ManifestStore for SlateDbStore {
+    type Error = SlateDbStoreError;
+
+    fn get_root(&self, name: &[u8]) -> Result<Option<RootManifest>, Self::Error> {
+        let key = root_key(name);
+        let bytes = self
+            .block_on(
+                async { self.db.get(key).await },
+                "failed to read root manifest",
+            )?
+            .map(|bytes| bytes.to_vec());
+        decode_root_manifest(bytes)
+    }
+
+    fn put_root(&self, name: &[u8], manifest: &RootManifest) -> Result<(), Self::Error> {
+        let _guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|e| SlateDbStoreError::new(format!("manifest lock poisoned: {e}")))?;
+
+        let key = Bytes::from(root_key(name));
+        let bytes = encode_root_manifest(manifest)?;
+        let value = Bytes::from(bytes);
+        self.block_on(
+            async { self.db.put_bytes(key, value).await.map(|_| ()) },
+            "failed to write root manifest",
+        )?;
+        self.flush_after_write_if_configured()
+    }
+
+    fn delete_root(&self, name: &[u8]) -> Result<(), Self::Error> {
+        let _guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|e| SlateDbStoreError::new(format!("manifest lock poisoned: {e}")))?;
+
+        let key = root_key(name);
+        self.block_on(
+            async { self.db.delete(key).await.map(|_| ()) },
+            "failed to delete root manifest",
+        )?;
+        self.flush_after_write_if_configured()
+    }
+
+    fn compare_and_swap_root(
+        &self,
+        name: &[u8],
+        expected: Option<&RootManifest>,
+        new: Option<&RootManifest>,
+    ) -> Result<ManifestUpdate, Self::Error> {
+        let _guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|e| SlateDbStoreError::new(format!("manifest lock poisoned: {e}")))?;
+
+        let key = root_key(name);
+        let current_bytes = self
+            .block_on(
+                async { self.db.get(key.clone()).await },
+                "failed to read root manifest",
+            )?
+            .map(|bytes| bytes.to_vec());
+        let current = decode_root_manifest(current_bytes)?;
+        if current.as_ref() != expected {
+            return Ok(ManifestUpdate::Conflict { current });
+        }
+
+        match new {
+            Some(manifest) => {
+                let key = Bytes::from(key);
+                let value = Bytes::from(encode_root_manifest(manifest)?);
+                self.block_on(
+                    async { self.db.put_bytes(key, value).await.map(|_| ()) },
+                    "failed to write root manifest",
+                )?;
+            }
+            None => {
+                self.block_on(
+                    async { self.db.delete(key).await.map(|_| ()) },
+                    "failed to delete root manifest",
+                )?;
+            }
+        }
+
+        self.flush_after_write_if_configured()?;
+        Ok(ManifestUpdate::Applied)
+    }
+}
+
+impl ManifestStoreScan for SlateDbStore {
+    fn list_roots(&self) -> Result<Vec<NamedRootManifest>, Self::Error> {
+        let raw_roots = self.block_on(
+            async {
+                let mut iter = self.db.scan_prefix(ROOT_PREFIX, ..).await?;
+                let mut roots = Vec::new();
+                while let Some(kv) = iter.next().await? {
+                    let key = kv.key.as_ref();
+                    let name = key
+                        .strip_prefix(ROOT_PREFIX)
+                        .ok_or_else(|| {
+                            slatedb::Error::invalid(
+                                "SlateDB root scan returned key without root prefix".to_string(),
+                            )
+                        })?
+                        .to_vec();
+                    roots.push((name, kv.value.to_vec()));
+                }
+                Ok(roots)
+            },
+            "failed to list root manifests",
+        )?;
+
+        let mut roots = raw_roots
+            .into_iter()
+            .map(|(name, bytes)| {
+                let manifest = RootManifest::from_bytes(&bytes)
+                    .map_err(|err| SlateDbStoreError::new(err.to_string()))?;
+                Ok(NamedRootManifest::new(name, manifest))
+            })
+            .collect::<Result<Vec<_>, SlateDbStoreError>>()?;
+        sort_named_root_manifests(&mut roots);
+        Ok(roots)
+    }
+}
+
 fn node_key(key: &[u8]) -> Vec<u8> {
     let mut storage_key = Vec::with_capacity(NODE_PREFIX.len() + key.len());
     storage_key.extend_from_slice(NODE_PREFIX);
@@ -409,6 +571,27 @@ fn hint_key(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     storage_key.extend_from_slice(namespace);
     storage_key.extend_from_slice(key);
     storage_key
+}
+
+fn root_key(name: &[u8]) -> Vec<u8> {
+    let mut storage_key = Vec::with_capacity(ROOT_PREFIX.len() + name.len());
+    storage_key.extend_from_slice(ROOT_PREFIX);
+    storage_key.extend_from_slice(name);
+    storage_key
+}
+
+fn encode_root_manifest(manifest: &RootManifest) -> Result<Vec<u8>, SlateDbStoreError> {
+    manifest
+        .to_bytes()
+        .map_err(|e| SlateDbStoreError::new(format!("failed to encode root manifest: {e}")))
+}
+
+fn decode_root_manifest(bytes: Option<Vec<u8>>) -> Result<Option<RootManifest>, SlateDbStoreError> {
+    bytes
+        .as_deref()
+        .map(RootManifest::from_bytes)
+        .transpose()
+        .map_err(|e| SlateDbStoreError::new(format!("failed to decode root manifest: {e}")))
 }
 
 #[cfg(test)]

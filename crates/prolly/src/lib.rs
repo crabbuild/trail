@@ -116,6 +116,29 @@
 //! assert!(val.is_some());
 //! ```
 //!
+//! ## Named Roots
+//!
+//! Use named-root helpers when an application needs durable names for immutable
+//! tree snapshots:
+//!
+//! ```rust
+//! use prolly::{Config, MemStore, Prolly};
+//! use std::sync::Arc;
+//!
+//! let store = Arc::new(MemStore::new());
+//! let prolly = Prolly::new(store.clone(), Config::default());
+//! let tree = prolly.create();
+//! let tree = prolly.put(&tree, b"name".to_vec(), b"CrabDB".to_vec()).unwrap();
+//!
+//! let update = prolly
+//!     .compare_and_swap_named_root(b"main", None, Some(&tree))
+//!     .unwrap();
+//! assert!(update.is_applied());
+//!
+//! let loaded = prolly.load_named_root(b"main").unwrap().unwrap();
+//! assert_eq!(prolly.get(&loaded, b"name").unwrap(), Some(b"CrabDB".to_vec()));
+//! ```
+//!
 //! ## Custom Storage Backend
 //!
 //! Implement the [`Store`] trait for custom storage:
@@ -165,6 +188,8 @@
 //!     .chunking_factor(128)     // Controls average node size
 //!     .hash_seed(42)            // Seed for boundary detection
 //!     .encoding(Encoding::Raw)  // Value encoding type
+//!     .node_cache_max_nodes(50_000) // Optional decoded-node cache cap
+//!     .node_cache_max_bytes(256 * 1024 * 1024) // Optional serialized-byte cap
 //!     .build();
 //! ```
 //!
@@ -200,7 +225,7 @@
 //! Use [`ConflictFreeMerger`] for automatic conflict resolution:
 //!
 //! ```rust
-//! use prolly::{CrdtConfig, MergeStrategy, DeletePolicy, TimestampedValue};
+//! use prolly::{CrdtConfig, CrdtResolution, MergeStrategy, DeletePolicy, TimestampedValue};
 //!
 //! // Last-Writer-Wins strategy
 //! let lww_config = CrdtConfig::lww();
@@ -209,9 +234,11 @@
 //! let mv_config = CrdtConfig::multi_value();
 //!
 //! // Custom merge function
-//! let custom_config = CrdtConfig::custom(|_key, left, right| {
-//!     // Your merge logic here
-//!     left.to_vec()
+//! let custom_config = CrdtConfig::custom(|conflict| {
+//!     match &conflict.left {
+//!         Some(value) => CrdtResolution::value(value.clone()),
+//!         None => CrdtResolution::delete(),
+//!     }
 //! });
 //! ```
 //!
@@ -231,70 +258,84 @@
 //! let rebalancer = DefaultParallelRebalancer::new();
 //! ```
 
-/// Prolly tree implementation - all core modules are now in this submodule
-pub mod prolly;
+mod prolly;
 
 // Re-export public API from prolly module
+pub use prolly::batch::{
+    append_batch, BatchApplyResult, BatchApplyStats, BatchWriter, BatchWriterConfig, MutationBuffer,
+};
+#[cfg(feature = "async-store")]
+pub use prolly::blob::{AsyncBlobStore, SyncBlobStoreAsAsync};
+pub use prolly::blob::{
+    BlobRef, BlobStore, BlobStoreScan, FileBlobStore, FileBlobStoreError, LargeValueConfig,
+    MemBlobStore, MemBlobStoreError, ValueRef, DEFAULT_INLINE_VALUE_THRESHOLD,
+};
+#[cfg(feature = "tokio")]
+pub use prolly::blob::{TokioBlockingBlobStore, TokioBlockingBlobStoreError};
 pub use prolly::boundary::{is_boundary, is_boundary_config};
 pub use prolly::builder::{BatchBuilder, SortedBatchBuilder};
 pub use prolly::cid::Cid;
 pub use prolly::config::{Config, ConfigBuilder};
-pub use prolly::cursor::{Cursor, CursorIterator, DiffCursor};
-pub use prolly::encoding::Encoding;
-pub use prolly::error::{Conflict, Diff, Error, Mutation, Resolver};
-pub use prolly::node::{Node, NodeBuilder};
-pub use prolly::{
-    append_batch,
-    apply_batch_with_rebuild,
-    apply_mutations_deferred,
-    apply_mutations_to_leaf,
-    apply_mutations_to_leaf_binary_search,
-    bottom_up_rebuild,
-    bottom_up_rebuild_groups,
-    build_internal_level,
-    compute_affected_spans,
-    filter_mutations_for_range,
-    group_mutations_by_leaf,
-    group_mutations_by_leaf_cursor,
-    prefetch_leaves,
-    preprocess_mutations,
-    rebuild_from_modified_leaves,
-    should_use_deferred_rebalancing,
-    // Re-export for testing
-    split_into_chunks,
-    split_oversized_node,
-    BatchApplyResult,
-    BatchApplyStats,
-    BatchWriteCollector,
-    BatchWriter,
-    BatchWriterConfig,
-    // CRDT types for conflict-free merging
-    ConflictFreeMerger,
-    CrdtConfig,
-    CustomMergeFn,
-    DefaultConflictFreeMerger,
-    // Parallel rebalancer types
-    DefaultParallelRebalancer,
-    DefaultStreamingDiffer,
-    DeferredMutationResult,
-    DeletePolicy,
-    LeafMutationGroup,
-    LeafSpan,
-    MergeStrategy,
-    MultiValueSet,
-    MutationBuffer,
-    ParallelConfig,
-    ParallelRebalancer,
-    Prolly,
-    RangeIter,
-    RebuildResult,
-    StreamingDiffer,
-    TimestampExtractor,
-    TimestampedValue,
+pub use prolly::crdt::{
+    ConflictFreeMerger, CrdtConfig, CrdtResolution, CustomMergeFn, DefaultConflictFreeMerger,
+    DeletePolicy, MergeStrategy, MultiValueSet, TimestampExtractor, TimestampedValue,
 };
+pub use prolly::cursor::{Cursor, CursorIterator, DiffCursor};
+pub use prolly::debug::{
+    TreeDebugComparedNode, TreeDebugComparison, TreeDebugComparisonLevel, TreeDebugLevel,
+    TreeDebugNode, TreeDebugNodeStatus, TreeDebugView,
+};
+#[cfg(feature = "async-store")]
+pub use prolly::diff::{AsyncConflictIter, AsyncDiffIter};
+pub use prolly::diff::{
+    DiffPage, DiffTraversalStats, MergeExplanation, MergeFallbackReason, MergeFastPath,
+    MergeResolutionKind, MergeReuseReason, MergeTrace, MergeTraceEvent, MergeTraceStage,
+    StructuralDiffCursor, StructuralDiffMarker, StructuralDiffPage,
+};
+pub use prolly::encoding::Encoding;
+pub use prolly::error::{resolver, Conflict, Diff, Error, Mutation, Resolution, Resolver};
+pub use prolly::gc::{
+    BlobGcPlan, BlobGcReachability, BlobGcSweep, GcPlan, GcReachability, GcSweep,
+};
+pub use prolly::key::{
+    debug_key, decode_segments, encode_segment, i128_key, i64_key, prefix_end, prefix_range,
+    timestamp_millis_key, u128_key, u64_key, KeyBuilder, KeyDecodeError,
+};
+pub use prolly::manifest::{
+    ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRoot, NamedRootManifest,
+    NamedRootRetention, NamedRootSelection, NamedRootUpdate, RootManifest,
+};
+pub use prolly::node::{Node, NodeBuilder};
+pub use prolly::parallel::{DefaultParallelRebalancer, ParallelConfig, ParallelRebalancer};
+pub use prolly::policy::{
+    MergePolicyFn, MergePolicyRegistry, MergePolicyRule, MergePolicyRuleLabel,
+};
+pub use prolly::proof::{
+    inspect_proof_bundle, sign_proof_bundle_hmac_sha256, verify_authenticated_proof_bundle,
+    verify_authenticated_proof_envelope, verify_diff_page_proof, verify_key_proof,
+    verify_multi_key_proof, verify_proof_bundle, verify_range_page_proof, verify_range_proof,
+    AuthenticatedProofBundleVerification, AuthenticatedProofEnvelope,
+    AuthenticatedProofEnvelopeVerification, DiffPageProof, DiffPageProofVerification, KeyProof,
+    KeyProofVerification, MultiKeyProof, MultiKeyProofVerification, ProofBundleKind,
+    ProofBundleSummary, ProofBundleVerification, ProvedDiffPage, ProvedRangePage, RangePageProof,
+    RangePageProofVerification, RangeProof, RangeProofVerification,
+};
+pub use prolly::range::{RangeCursor, RangeIter, RangePage};
+pub use prolly::snapshot::{
+    snapshot_id_from_name, snapshot_root_name, SnapshotManager, SnapshotNamespace, SnapshotRoot,
+    SnapshotSelection, SNAPSHOT_BRANCH_PREFIX, SNAPSHOT_CHECKPOINT_PREFIX, SNAPSHOT_TAG_PREFIX,
+};
+pub use prolly::streaming::{DefaultStreamingDiffer, StreamingDiffer};
+pub use prolly::{ChangedSpan, ChangedSpanHint, Prolly, ProllyMetricsSnapshot};
 
-pub use prolly::stats::TreeStats;
-pub use prolly::store::{BatchOp, MemStore, MemStoreError, Store};
+#[cfg(feature = "async-store")]
+pub use prolly::range::{AsyncRangeIter, AsyncRangePage};
+pub use prolly::stats::{StatsComparison, StatsDiff, StatsPercentageChange, TreeStats};
+#[cfg(feature = "async-store")]
+pub use prolly::store::{AsyncStore, SyncStoreAsAsync};
+pub use prolly::store::{
+    BatchOp, FileNodeStore, FileNodeStoreError, MemStore, MemStoreError, NodeStoreScan, Store,
+};
 #[cfg(feature = "rocksdb")]
 pub use prolly::store::{CompressionType, RocksDBConfig, RocksDBStore, RocksDBStoreError};
 #[cfg(feature = "pglite")]
@@ -303,7 +344,19 @@ pub use prolly::store::{PgliteStore, PgliteStoreConfig, PgliteStoreError};
 pub use prolly::store::{SlateDbStore, SlateDbStoreConfig, SlateDbStoreError};
 #[cfg(feature = "sqlite")]
 pub use prolly::store::{SqliteStore, SqliteStoreConfig, SqliteStoreError};
+#[cfg(feature = "tokio")]
+pub use prolly::store::{TokioBlockingStore, TokioBlockingStoreError};
+pub use prolly::sync::{MissingNodeCopy, MissingNodePlan};
+pub use prolly::tombstone::{
+    is_tombstone_value, tombstone_compaction, tombstone_upsert, Tombstone,
+};
 pub use prolly::tree::Tree;
+pub use prolly::value::{
+    decode_cbor, decode_json, encode_cbor, encode_json, CborCodec, JsonCodec, ValueCodec,
+    VersionedCborCodec, VersionedJsonCodec, VersionedValue,
+};
+#[cfg(feature = "async-store")]
+pub use prolly::AsyncProlly;
 
 // Re-export constants
 pub use prolly::encoding::{
