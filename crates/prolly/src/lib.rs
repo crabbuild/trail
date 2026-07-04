@@ -121,6 +121,12 @@
 //! Use named-root helpers when an application needs durable names for immutable
 //! tree snapshots:
 //!
+//! A named root is a mutable pointer, not a live view. `put`, `delete`, `batch`,
+//! and `merge` return new immutable [`Tree`] handles and do not automatically
+//! advance any name. Publish the replacement tree explicitly, preferably with
+//! `compare_and_swap_named_root` when another writer could update the same
+//! name.
+//!
 //! ```rust
 //! use prolly::{Config, MemStore, Prolly};
 //! use std::sync::Arc;
@@ -301,6 +307,8 @@ pub use prolly::key::{
     debug_key, decode_segments, encode_segment, i128_key, i64_key, prefix_end, prefix_range,
     timestamp_millis_key, u128_key, u64_key, KeyBuilder, KeyDecodeError,
 };
+#[cfg(feature = "async-store")]
+pub use prolly::manifest::{AsyncManifestStore, AsyncManifestStoreScan};
 pub use prolly::manifest::{
     ManifestStore, ManifestStoreScan, ManifestUpdate, NamedRoot, NamedRootManifest,
     NamedRootRetention, NamedRootSelection, NamedRootUpdate, RootManifest,
@@ -332,6 +340,11 @@ pub use prolly::{ChangedSpan, ChangedSpanHint, Prolly, ProllyMetricsSnapshot};
 
 #[cfg(feature = "async-store")]
 pub use prolly::range::{AsyncRangeIter, AsyncRangePage, AsyncReversePage};
+#[cfg(feature = "async-store")]
+pub use prolly::remote::{
+    conformance as remote_conformance, RemoteAdapterError, RemoteBatchOp, RemoteManifestUpdate,
+    RemoteNamedRoot, RemoteProllyStore, RemoteStoreBackend, RemoteStoreConfig,
+};
 pub use prolly::stats::{StatsComparison, StatsDiff, StatsPercentageChange, TreeStats};
 #[cfg(feature = "async-store")]
 pub use prolly::store::{AsyncStore, SyncStoreAsAsync};
