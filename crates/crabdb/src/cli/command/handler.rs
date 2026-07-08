@@ -136,7 +136,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Agent(agent_command) => agent::handle_agent_command(&ctx, agent_command),
         Command::Transcript(args) => acp::handle_transcript_command(&ctx, args),
         Command::Turn(turn) => acp::handle_top_turn_command(&ctx, turn),
-        Command::Demo(demo) => acp::handle_demo_command(&ctx, demo),
         Command::Session(session_command) => {
             collaboration::handle_session_command(&ctx, session_command)
         }

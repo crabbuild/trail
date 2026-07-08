@@ -107,21 +107,3 @@ pub(super) struct TopTurnCommand {
 pub(super) struct TopTurnShowArgs {
     pub(super) turn_id: String,
 }
-
-#[derive(Subcommand)]
-pub(super) enum DemoSubcommand {
-    /// Show or run an ACP demo workflow.
-    Acp(DemoAcpArgs),
-}
-
-#[derive(Args)]
-pub(super) struct DemoCommand {
-    #[command(subcommand)]
-    pub(super) command: DemoSubcommand,
-}
-
-#[derive(Args)]
-pub(super) struct DemoAcpArgs {
-    #[arg(long, default_value = "claude-code")]
-    pub(super) agent: String,
-}

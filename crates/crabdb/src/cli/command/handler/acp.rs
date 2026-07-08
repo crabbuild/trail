@@ -27,40 +27,6 @@ pub(super) fn handle_top_turn_command(ctx: &RuntimeContext, turn: TopTurnCommand
     }
 }
 
-pub(super) fn handle_demo_command(ctx: &RuntimeContext, demo: DemoCommand) -> Result<()> {
-    match demo.command {
-        DemoSubcommand::Acp(args) => handle_demo_acp(ctx, args),
-    }
-}
-
-fn handle_demo_acp(ctx: &RuntimeContext, args: DemoAcpArgs) -> Result<()> {
-    let install = crabdb::acp::acp_install_report(&args.agent, "generic", true)?;
-    if ctx.json {
-        return render_json(&serde_json::json!({
-            "agent": args.agent,
-            "steps": [
-                "crabdb init --working-tree",
-                format!("crabdb acp doctor --agent {}", install.agent),
-                "run an ACP editor with the generated relay command",
-                "crabdb transcript <lane>",
-                "crabdb lane review <lane>",
-                "crabdb lane rewind <lane> --to <checkpoint>"
-            ],
-            "relay_command": install.relay_command
-        }));
-    }
-    if !ctx.quiet {
-        println!("ACP demo workflow ({})", args.agent);
-        println!("1. Initialize a workspace: crabdb init --working-tree");
-        println!("2. Check setup: crabdb acp doctor --agent {}", args.agent);
-        println!("3. Configure your ACP editor with:");
-        println!("{}", install.snippet);
-        println!("4. After one prompt: crabdb transcript <lane>");
-        println!("5. Review or recover: crabdb lane review <lane>");
-    }
-    Ok(())
-}
-
 fn handle_acp_install(ctx: &RuntimeContext, args: AcpInstallArgs) -> Result<()> {
     let report = crabdb::acp::acp_install_report(&args.agent, &args.editor, args.dry_run)?;
     render_acp_install(&report, ctx.json, ctx.quiet, args.print_only)

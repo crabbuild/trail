@@ -909,14 +909,6 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .unwrap()
         .windows(2)
         .any(|parts| parts[0] == "agent" && parts[1] == "acp"));
-
-    let demo = run_crabdb_json(temp.path(), &["demo", "acp", "--agent", "claude-code"]);
-    assert_eq!(demo["agent"], "claude-code");
-    assert!(demo["relay_command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "relay"));
 }
 
 #[cfg(unix)]

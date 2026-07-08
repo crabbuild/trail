@@ -83,7 +83,6 @@ validation, apply, or recovery step.
 | `git` | Export, import, and inspect Git mappings |
 | `api` | Generate OpenAPI output |
 | `daemon` | Run CrabDB as a local HTTP service |
-| `demo` | Print guided demo workflows |
 | `doctor` | Workspace and integration diagnostics |
 | `backup` | Create, verify, and restore backups |
 | `fsck` | Verify repository integrity |
@@ -457,15 +456,6 @@ Defaults:
 automation.
 
 Rate-limit and timeout values must be greater than zero.
-
-## Demo
-
-```text
-crabdb demo acp [--agent <claude-code|codex|cursor>]
-```
-
-Prints a guided workflow for configuring an ACP editor and reviewing captured
-agent work.
 
 ## Doctor
 
