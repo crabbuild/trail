@@ -28,7 +28,7 @@ pub(super) struct AcpInstallArgs {
         long,
         default_value = "claude-code",
         value_name = "AGENT",
-        help = "ACP provider profile: claude-code, codex, cursor"
+        help = "Built-in alias or ACP registry agent ID (run `trail acp list`)"
     )]
     pub(super) agent: String,
     #[arg(long, default_value = "generic")]
@@ -45,7 +45,7 @@ pub(super) struct AcpDoctorArgs {
         long,
         default_value = "claude-code",
         value_name = "AGENT",
-        help = "ACP provider profile: claude-code, codex, cursor"
+        help = "Built-in alias or ACP registry agent ID (run `trail acp list`)"
     )]
     pub(super) agent: String,
     #[arg(long = "relay-command", num_args = 1.., allow_hyphen_values = true)]
@@ -62,7 +62,7 @@ pub(super) struct AcpSessionsArgs {
 pub(super) struct AcpRelayArgs {
     #[arg(
         value_name = "AGENT",
-        help = "Built-in ACP agent: claude-code, codex, or cursor"
+        help = "Built-in ACP alias or registry agent ID (run `trail acp list`)"
     )]
     pub(super) agent: Option<String>,
     #[arg(long)]

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::*;
 use trail::model::{AcpDoctorCheck, AcpDoctorReport, AcpProviderProfile};
 
@@ -28,12 +30,20 @@ pub(super) fn handle_top_turn_command(ctx: &RuntimeContext, turn: TopTurnCommand
 }
 
 fn handle_acp_install(ctx: &RuntimeContext, args: AcpInstallArgs) -> Result<()> {
-    let report = trail::acp::acp_install_report(&args.agent, &args.editor, args.dry_run)?;
+    let db = open_db(ctx).ok();
+    let report = trail::acp::acp_install_report_with_registry(
+        &args.agent,
+        &args.editor,
+        args.dry_run,
+        db.as_ref().map(|db| db.db_dir()),
+    )?;
     render_acp_install(&report, ctx.json, ctx.quiet, args.print_only)
 }
 
 fn handle_acp_list(ctx: &RuntimeContext) -> Result<()> {
-    let profiles = trail::acp::acp_provider_profiles();
+    let db = open_db(ctx).ok();
+    let profiles =
+        trail::acp::acp_provider_profiles_with_registry(db.as_ref().map(|db| db.db_dir()))?;
     render_acp_profiles(&profiles, ctx.json, ctx.quiet)
 }
 
@@ -57,7 +67,10 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
         }
     }
 
-    let profile = match trail::acp::acp_provider_profile(&args.agent) {
+    let profile = match trail::acp::acp_provider_profile_with_registry(
+        &args.agent,
+        db_result.as_ref().ok().map(|db| db.db_dir()),
+    ) {
         Ok(profile) => profile,
         Err(_) if !args.relay_command.is_empty() => AcpProviderProfile {
             agent: args.agent.clone(),
@@ -170,7 +183,8 @@ fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
         true
     };
 
-    let (provider, upstream_command) = resolve_acp_relay_command(&args)?;
+    let (provider, upstream_command, upstream_env) =
+        resolve_acp_relay_command(&args, Some(db.db_dir()))?;
 
     trail::acp::run_stdio_relay(AcpRelayOptions {
         workspace_root: db.workspace_root().to_path_buf(),
@@ -183,27 +197,33 @@ fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
         workdir: args.workdir.clone(),
         inject_mcp: !args.no_mcp,
         upstream_command,
+        upstream_env,
     })
 }
 
-fn resolve_acp_relay_command(args: &AcpRelayArgs) -> Result<(Option<String>, Vec<String>)> {
+fn resolve_acp_relay_command(
+    args: &AcpRelayArgs,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<(Option<String>, Vec<String>, BTreeMap<String, String>)> {
     if args.command.is_empty() {
         let agent = args.agent.as_deref().or(args.provider.as_deref()).ok_or_else(|| {
             Error::InvalidInput(
                 "choose a built-in ACP agent, for example `trail acp relay codex`, or pass a custom ACP command after `--`".to_string(),
             )
         })?;
-        let profile = trail::acp::acp_provider_profile(agent)?;
+        let launch = trail::acp::resolve_acp_provider(agent, cache_dir)?;
         return Ok((
-            Some(profile.agent.clone()),
-            trail::acp::acp_provider_upstream_command(&profile.agent)?,
+            Some(launch.profile.agent),
+            launch.upstream_command,
+            launch.upstream_env,
         ));
     }
 
     if let Some(agent) = args.agent.as_deref() {
-        let profile = trail::acp::acp_provider_profile(agent)?;
+        let profile = trail::acp::acp_provider_profile_with_registry(agent, cache_dir)?;
         if let Some(provider) = args.provider.as_deref() {
-            let explicit_profile = trail::acp::acp_provider_profile(provider)?;
+            let explicit_profile =
+                trail::acp::acp_provider_profile_with_registry(provider, cache_dir)?;
             if profile.agent != explicit_profile.agent {
                 return Err(Error::InvalidInput(format!(
                     "built-in agent `{}` does not match --provider `{}`",
@@ -211,10 +231,10 @@ fn resolve_acp_relay_command(args: &AcpRelayArgs) -> Result<(Option<String>, Vec
                 )));
             }
         }
-        return Ok((Some(profile.agent), args.command.clone()));
+        return Ok((Some(profile.agent), args.command.clone(), BTreeMap::new()));
     }
 
-    Ok((args.provider.clone(), args.command.clone()))
+    Ok((args.provider.clone(), args.command.clone(), BTreeMap::new()))
 }
 
 fn acp_check(name: &str, status: &str, message: &str) -> AcpDoctorCheck {

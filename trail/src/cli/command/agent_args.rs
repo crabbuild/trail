@@ -227,7 +227,7 @@ pub(super) struct AgentAcpArgs {
         long,
         default_value = "claude-code",
         value_name = "PROVIDER",
-        help = "ACP provider profile: claude-code, codex, cursor"
+        help = "Built-in or ACP registry provider (see `trail acp list`)"
     )]
     pub(super) provider: String,
     #[arg(long)]

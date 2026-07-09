@@ -686,6 +686,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `trail daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `trail mcp` | Start the MCP stdio server for agent hosts |
+| `trail acp list` | List built-in aliases and current official ACP registry agents |
 | `trail acp install --agent claude-code` | Print an ACP relay command and editor snippet |
 | `trail acp install --agent codex` | Print the Codex ACP relay command and editor snippet |
 | `trail acp doctor --agent claude-code` | Check ACP provider and relay readiness |

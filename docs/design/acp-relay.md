@@ -43,6 +43,8 @@ The first production slice is implemented in `trail acp relay`.
 Implemented:
 
 - New CLI group: `trail acp relay <built-in-agent>` or `trail acp relay -- <upstream-command>`.
+- Official ACP registry discovery with cached fallback, package-runner launch,
+  and platform-binary installation for current registry agents.
 - Newline-delimited JSON-RPC stdio relay for local ACP agents.
 - Upstream child process lifecycle and stderr isolation.
 - `_meta.trail` initialization metadata.

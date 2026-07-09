@@ -7,7 +7,9 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+bzip2.workspace = true
 clap.workspace = true
+flate2.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 ignore.workspace = true
@@ -15,6 +17,7 @@ libc.workspace = true
 notify.workspace = true
 prolly = { package = "prolly-map", path = "../prolly", features = ["slatedb", "sqlite"] }
 rayon.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -24,10 +27,12 @@ sha2.workspace = true
 slatedb.workspace = true
 similar.workspace = true
 sqlite-vec.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 unicode-normalization.workspace = true
 walkdir.workspace = true
+zip.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.15.1", default-features = false }

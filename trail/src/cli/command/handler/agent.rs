@@ -93,22 +93,35 @@ fn handle_agent_setup(ctx: &RuntimeContext, args: AgentSetupArgs) -> Result<()> 
 fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let lane = db.fresh_agent_lane_name(&args.provider, args.name.as_deref());
-    let upstream_command = if args.command.is_empty() {
-        default_acp_upstream_command(&args.provider, &lane)?
+    let launch = if args.command.is_empty() {
+        Some(trail::acp::resolve_acp_provider(
+            &args.provider,
+            Some(db.db_dir()),
+        )?)
     } else {
-        args.command
+        None
     };
+    let provider = launch
+        .as_ref()
+        .map(|launch| launch.profile.agent.clone())
+        .unwrap_or_else(|| args.provider.clone());
+    let upstream_command = launch
+        .as_ref()
+        .map(|launch| launch.upstream_command.clone())
+        .unwrap_or(args.command);
+    let upstream_env = launch.map(|launch| launch.upstream_env).unwrap_or_default();
     trail::acp::run_stdio_relay(AcpRelayOptions {
         workspace_root: db.workspace_root().to_path_buf(),
         db_dir: db.db_dir().to_path_buf(),
         lane: Some(lane),
         from_ref: args.from,
-        provider: Some(args.provider),
+        provider: Some(provider),
         model: None,
         materialize: true,
         workdir: None,
         inject_mcp: !args.no_mcp,
         upstream_command,
+        upstream_env,
     })
 }
 
@@ -2234,10 +2247,6 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
         }
     }
     Ok(())
-}
-
-fn default_acp_upstream_command(provider: &str, _lane: &str) -> Result<Vec<String>> {
-    trail::acp::acp_provider_upstream_command(provider)
 }
 
 fn default_terminal_agent_command(provider: &str) -> Result<Vec<String>> {

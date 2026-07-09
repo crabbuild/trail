@@ -373,10 +373,10 @@ trail acp relay [AGENT] [--lane <LANE>] [--from <REF>] \
   [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] \
   [--provider <NAME>] [--model <NAME>] [--no-mcp] [-- <COMMAND>...]
 
-trail acp install --agent <claude-code|codex|cursor> \
+trail acp install --agent <AGENT> \
   [--editor generic|zed] [--dry-run] [--print]
 
-trail acp doctor --agent <claude-code|codex|cursor> \
+trail acp doctor --agent <AGENT> \
   [--relay-command <COMMAND>...]
 
 trail acp list
@@ -391,8 +391,13 @@ trail acp relay codex
 trail acp relay cursor
 ```
 
-`--materialize` is enabled by default. For another ACP-compatible agent, keep
-the explicit form: `trail acp relay --provider my-agent -- my-agent acp`.
+`AGENT` may also be any ID from the official ACP registry. `trail acp list`
+fetches and caches that registry, then shows the current IDs. Registry `npx`
+and `uvx` entries install through their package runner; matching binary entries
+download into `.trail/acp/agents/` on first launch.
+
+`--materialize` is enabled by default. For an ACP-compatible agent outside the
+registry, keep the explicit form: `trail acp relay --provider my-agent -- my-agent acp`.
 For a terminal-first agent session instead, use `trail agent start --provider codex`.
 
 Use `acp install` to print setup snippets. It does not mutate editor

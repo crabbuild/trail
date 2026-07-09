@@ -12,11 +12,13 @@ trail --help
 
 ## 2. Check ACP Readiness
 
-For the built-in ACP providers:
+For built-in aliases or any current ACP registry agent:
 
 ```sh
 trail acp doctor --agent claude-code
 trail acp doctor --agent codex
+trail acp list
+trail acp doctor --agent gemini
 ```
 
 Print the editor command:
@@ -24,6 +26,7 @@ Print the editor command:
 ```sh
 trail acp install --agent claude-code --print
 trail acp install --agent codex --print
+trail acp install --agent gemini --print
 ```
 
 ## 3. Run One Prompt

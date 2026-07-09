@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -11,6 +11,8 @@ use serde_json::{Map, Value};
 
 use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
+
+mod registry;
 
 const ACP_CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(30);
 const CLAUDE_ACP_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@latest";
@@ -31,6 +33,15 @@ pub struct AcpRelayOptions {
     pub workdir: Option<PathBuf>,
     pub inject_mcp: bool,
     pub upstream_command: Vec<String>,
+    pub upstream_env: BTreeMap<String, String>,
+}
+
+/// A resolved ACP provider profile and the command Trail will launch upstream.
+#[derive(Clone, Debug)]
+pub struct AcpProviderLaunch {
+    pub profile: AcpProviderProfile,
+    pub upstream_command: Vec<String>,
+    pub upstream_env: BTreeMap<String, String>,
 }
 
 pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
@@ -97,11 +108,47 @@ pub fn acp_provider_upstream_command(agent: &str) -> Result<Vec<String>> {
     }
 }
 
+/// Resolves either a built-in provider alias or an agent from the official ACP registry.
+///
+/// Registry agents are fetched from the official index and cached below `cache_dir`
+/// when supplied. Registry `npx` and `uvx` agents use their package runner directly;
+/// matching binary distributions are downloaded into the cache on first launch.
+pub fn resolve_acp_provider(
+    agent: &str,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<AcpProviderLaunch> {
+    if let Ok(profile) = acp_provider_profile(agent) {
+        return Ok(AcpProviderLaunch {
+            upstream_command: acp_provider_upstream_command(&profile.agent)?,
+            profile,
+            upstream_env: BTreeMap::new(),
+        });
+    }
+    registry::resolve_registry_provider(agent, cache_dir)
+}
+
+/// Resolves a built-in or registry provider profile without downloading a binary.
+pub fn acp_provider_profile_with_registry(
+    agent: &str,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<AcpProviderProfile> {
+    acp_provider_profile(agent).or_else(|_| registry::registry_provider_profile(agent, cache_dir))
+}
+
 pub fn acp_provider_profiles() -> Vec<AcpProviderProfile> {
     supported_acp_agents()
         .into_iter()
         .filter_map(|agent| acp_provider_profile(agent).ok())
         .collect()
+}
+
+/// Lists Trail's built-in profiles plus every agent currently in the official ACP registry.
+pub fn acp_provider_profiles_with_registry(
+    cache_dir: Option<&std::path::Path>,
+) -> Result<Vec<AcpProviderProfile>> {
+    // Listing providers should keep working offline; named registry agents still
+    // return a clear resolution error until a live or cached registry is available.
+    Ok(registry::registry_provider_profiles(cache_dir).unwrap_or_else(|_| acp_provider_profiles()))
 }
 
 pub fn agent_provider_profile(provider: &str) -> Result<AcpProviderProfile> {
@@ -155,7 +202,16 @@ pub fn terminal_agent_command(provider: &str) -> Result<Vec<String>> {
 }
 
 pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<AcpInstallReport> {
-    let profile = acp_provider_profile(agent)?;
+    acp_install_report_with_registry(agent, editor, dry_run, None)
+}
+
+pub fn acp_install_report_with_registry(
+    agent: &str,
+    editor: &str,
+    dry_run: bool,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<AcpInstallReport> {
+    let profile = acp_provider_profile_with_registry(agent, cache_dir)?;
     let editor = match editor {
         "generic" | "zed" => editor,
         other => {
@@ -266,7 +322,7 @@ fn terminal_provider_profile(
     }
 }
 
-fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
+pub(crate) fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
     vec![
         "trail".to_string(),
         "acp".to_string(),
@@ -284,6 +340,7 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
 
     let mut child = Command::new(&options.upstream_command[0])
         .args(&options.upstream_command[1..])
+        .envs(&options.upstream_env)
         .current_dir(&options.workspace_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -364,7 +421,7 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
     }
 }
 
-fn command_in_path(command: &str) -> bool {
+pub(crate) fn command_in_path(command: &str) -> bool {
     if command.contains(std::path::MAIN_SEPARATOR) {
         return PathBuf::from(command).is_file();
     }
@@ -2322,6 +2379,7 @@ mod tests {
             workdir: None,
             inject_mcp: true,
             upstream_command: vec!["agent".to_string()],
+            upstream_env: BTreeMap::new(),
         };
         let mut params = Map::new();
         params.insert("mcpServers".to_string(), Value::Array(Vec::new()));
@@ -2495,6 +2553,7 @@ mod tests {
                 "--api-key".to_string(),
                 "secret".to_string(),
             ],
+            upstream_env: BTreeMap::new(),
         })
         .unwrap();
 
@@ -2628,6 +2687,7 @@ mod tests {
             workdir: None,
             inject_mcp: false,
             upstream_command: vec!["codex".to_string()],
+            upstream_env: BTreeMap::new(),
         })
         .unwrap();
 

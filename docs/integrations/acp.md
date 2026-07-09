@@ -19,7 +19,7 @@ Trail now treats code-agent integration as three complementary paths:
   mount a transparent COW view for large repositories instead of creating a full
   copied workdir.
 
-## Built-In Providers
+## Built-In Aliases and Registry Providers
 
 Trail ships provider profiles for:
 
@@ -30,8 +30,22 @@ Trail ships provider profiles for:
 - `aider`, terminal mode
 - `opencode`, terminal mode
 
-Any other ACP-compatible agent can still be used by passing its upstream ACP
-command after `--` to `trail agent acp` or `trail acp relay`.
+Trail also reads the [official ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json), so every current registry ID can be launched directly:
+
+```sh
+trail acp list
+trail acp relay gemini
+trail acp relay qwen-code
+trail acp relay github-copilot-cli
+```
+
+Registry package distributions launch through `npx` or `uvx`; matching binary
+distributions download into `.trail/acp/agents/` on first use. Trail caches a
+validated registry index locally and uses it if the registry is temporarily
+unavailable. Built-in aliases remain available without a registry request.
+
+An ACP-compatible agent outside the registry can still be used by passing its
+upstream command after `--` to `trail agent acp` or `trail acp relay`.
 Any terminal agent can be used by passing its command after `--` to
 `trail agent start`.
 
