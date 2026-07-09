@@ -38,14 +38,12 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
         Some("claude-code") => Ok(npx_acp_profile(
             "claude-code",
             "Claude Code",
-            CLAUDE_ACP_ADAPTER,
             "uses the Claude ACP adapter through npx",
             Some(vec!["claude".to_string()]),
         )),
         Some("codex") => Ok(npx_acp_profile(
             "codex",
             "Codex",
-            CODEX_ACP_ADAPTER,
             "uses the Codex ACP adapter through npx",
             Some(vec!["codex".to_string()]),
         )),
@@ -55,7 +53,7 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
                 agent: "cursor".to_string(),
                 display_name: "Cursor".to_string(),
                 available,
-                relay_command: cursor_acp_relay_command(),
+                relay_command: built_in_acp_relay_command("cursor"),
                 notes: if available {
                     vec!["uses the Cursor CLI ACP server through `agent acp`".to_string()]
                 } else {
@@ -70,6 +68,31 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
         _ => Err(Error::InvalidInput(format!(
             "unsupported ACP agent `{agent}`; supported agents: {}; use `trail acp relay -- <COMMAND>...` for another ACP-compatible agent",
             supported_acp_agents().join(", ")
+        ))),
+    }
+}
+
+/// Returns the upstream ACP command for one of Trail's built-in ACP providers.
+///
+/// This keeps the user-facing relay command short (`trail acp relay codex`) while
+/// retaining an explicit command path for custom ACP-compatible agents.
+pub fn acp_provider_upstream_command(agent: &str) -> Result<Vec<String>> {
+    let profile = acp_provider_profile(agent)?;
+    match profile.agent.as_str() {
+        "claude-code" => Ok(vec![
+            "npx".to_string(),
+            "-y".to_string(),
+            CLAUDE_ACP_ADAPTER.to_string(),
+        ]),
+        "codex" => Ok(vec![
+            "npx".to_string(),
+            "-y".to_string(),
+            CODEX_ACP_ADAPTER.to_string(),
+        ]),
+        "cursor" => Ok(vec!["agent".to_string(), "acp".to_string()]),
+        _ => Err(Error::InvalidInput(format!(
+            "provider `{}` does not define an ACP upstream command",
+            profile.agent
         ))),
     }
 }
@@ -193,17 +216,15 @@ fn canonical_agent_provider(provider: &str) -> Option<&'static str> {
 fn npx_acp_profile(
     provider: &str,
     display_name: &str,
-    adapter: &str,
     available_note: &str,
     terminal_command: Option<Vec<String>>,
 ) -> AcpProviderProfile {
-    let relay_command = npx_adapter_relay_command(provider, adapter);
     let available = command_in_path("npx");
     AcpProviderProfile {
         agent: provider.to_string(),
         display_name: display_name.to_string(),
         available,
-        relay_command,
+        relay_command: built_in_acp_relay_command(provider),
         notes: if available {
             vec![available_note.to_string()]
         } else {
@@ -245,32 +266,12 @@ fn terminal_provider_profile(
     }
 }
 
-fn npx_adapter_relay_command(provider: &str, adapter: &str) -> Vec<String> {
+fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
     vec![
         "trail".to_string(),
         "acp".to_string(),
         "relay".to_string(),
-        "--provider".to_string(),
         provider.to_string(),
-        "--materialize".to_string(),
-        "--".to_string(),
-        "npx".to_string(),
-        "-y".to_string(),
-        adapter.to_string(),
-    ]
-}
-
-fn cursor_acp_relay_command() -> Vec<String> {
-    vec![
-        "trail".to_string(),
-        "acp".to_string(),
-        "relay".to_string(),
-        "--provider".to_string(),
-        "cursor".to_string(),
-        "--materialize".to_string(),
-        "--".to_string(),
-        "agent".to_string(),
-        "acp".to_string(),
     ]
 }
 
@@ -2339,14 +2340,26 @@ mod tests {
         assert!(cursor.supports_acp);
         assert!(cursor.supports_mcp);
         assert!(cursor.supports_terminal);
-        let separator = cursor
-            .relay_command
-            .iter()
-            .position(|part| part == "--")
-            .unwrap();
         assert_eq!(
-            cursor.relay_command[separator + 1..],
+            cursor.relay_command,
+            [
+                "trail".to_string(),
+                "acp".to_string(),
+                "relay".to_string(),
+                "cursor".to_string()
+            ]
+        );
+        assert_eq!(
+            acp_provider_upstream_command("cursor").unwrap(),
             ["agent".to_string(), "acp".to_string()]
+        );
+        assert_eq!(
+            acp_provider_upstream_command("codex-cli").unwrap(),
+            [
+                "npx".to_string(),
+                "-y".to_string(),
+                CODEX_ACP_ADAPTER.to_string()
+            ]
         );
 
         let gemini = agent_provider_profile("gemini-cli").unwrap();

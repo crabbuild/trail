@@ -365,12 +365,13 @@ This table lists the main `agent` commands without repeating every alias.
 ## ACP
 
 Use `acp` when you need the low-level ACP relay rather than the higher-level
-task workflow.
+task workflow. The relay is an ACP stdio server, so configure one of these
+commands in an ACP-capable editor or host; it is not a terminal chat client.
 
 ```text
-trail acp relay [--lane <LANE>] [--from <REF>] \
+trail acp relay [AGENT] [--lane <LANE>] [--from <REF>] \
   [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] \
-  [--provider <NAME>] [--model <NAME>] [--no-mcp] -- <COMMAND>...
+  [--provider <NAME>] [--model <NAME>] [--no-mcp] [-- <COMMAND>...]
 
 trail acp install --agent <claude-code|codex|cursor> \
   [--editor generic|zed] [--dry-run] [--print]
@@ -382,15 +383,17 @@ trail acp list
 trail acp sessions [--lane <LANE>]
 ```
 
-Built-in ACP upstream commands:
+Start a built-in ACP provider with its default upstream adapter:
 
 ```sh
-trail acp relay --provider claude-code --materialize -- \
-  npx -y @agentclientprotocol/claude-agent-acp@latest
-
-trail acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
-trail acp relay --provider cursor --materialize -- agent acp
+trail acp relay claude-code
+trail acp relay codex
+trail acp relay cursor
 ```
+
+`--materialize` is enabled by default. For another ACP-compatible agent, keep
+the explicit form: `trail acp relay --provider my-agent -- my-agent acp`.
+For a terminal-first agent session instead, use `trail agent start --provider codex`.
 
 Use `acp install` to print setup snippets. It does not mutate editor
 configuration. Use `acp sessions` to inspect captured ACP sessions.

@@ -88,20 +88,37 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
     } else {
         args.relay_command.clone()
     };
-    if relay_command.iter().any(|part| part == "relay")
-        && relay_command.iter().any(|part| part == "--")
-    {
-        checks.push(acp_check("relay", "ok", "relay command shape is valid"));
+    if relay_command.iter().any(|part| part == "relay") {
+        checks.push(acp_check(
+            "relay",
+            "ok",
+            "relay command is valid; built-in providers use the short form",
+        ));
     } else {
         status = "failed".to_string();
         checks.push(acp_check(
             "relay",
             "failed",
-            "relay command should include `acp relay` and `-- <upstream>`",
+            "relay command should include `trail acp relay`",
         ));
     }
 
-    if let Some(upstream) = upstream_command_name(&relay_command) {
+    if args.relay_command.is_empty() {
+        if profile.available {
+            checks.push(acp_check(
+                "launch",
+                "ok",
+                "built-in ACP adapter command is available",
+            ));
+        } else {
+            status = "failed".to_string();
+            checks.push(acp_check(
+                "launch",
+                "failed",
+                "built-in ACP adapter command is unavailable",
+            ));
+        }
+    } else if let Some(upstream) = upstream_command_name(&relay_command) {
         if command_available(upstream) || upstream.starts_with('<') {
             checks.push(acp_check("launch", "ok", "upstream command is available"));
         } else {
@@ -153,18 +170,51 @@ fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {
         true
     };
 
+    let (provider, upstream_command) = resolve_acp_relay_command(&args)?;
+
     trail::acp::run_stdio_relay(AcpRelayOptions {
         workspace_root: db.workspace_root().to_path_buf(),
         db_dir: db.db_dir().to_path_buf(),
-        lane: args.lane,
-        from_ref: args.from,
-        provider: args.provider,
-        model: args.model,
+        lane: args.lane.clone(),
+        from_ref: args.from.clone(),
+        provider,
+        model: args.model.clone(),
         materialize,
-        workdir: args.workdir,
+        workdir: args.workdir.clone(),
         inject_mcp: !args.no_mcp,
-        upstream_command: args.command,
+        upstream_command,
     })
+}
+
+fn resolve_acp_relay_command(args: &AcpRelayArgs) -> Result<(Option<String>, Vec<String>)> {
+    if args.command.is_empty() {
+        let agent = args.agent.as_deref().or(args.provider.as_deref()).ok_or_else(|| {
+            Error::InvalidInput(
+                "choose a built-in ACP agent, for example `trail acp relay codex`, or pass a custom ACP command after `--`".to_string(),
+            )
+        })?;
+        let profile = trail::acp::acp_provider_profile(agent)?;
+        return Ok((
+            Some(profile.agent.clone()),
+            trail::acp::acp_provider_upstream_command(&profile.agent)?,
+        ));
+    }
+
+    if let Some(agent) = args.agent.as_deref() {
+        let profile = trail::acp::acp_provider_profile(agent)?;
+        if let Some(provider) = args.provider.as_deref() {
+            let explicit_profile = trail::acp::acp_provider_profile(provider)?;
+            if profile.agent != explicit_profile.agent {
+                return Err(Error::InvalidInput(format!(
+                    "built-in agent `{}` does not match --provider `{}`",
+                    profile.agent, explicit_profile.agent
+                )));
+            }
+        }
+        return Ok((Some(profile.agent), args.command.clone()));
+    }
+
+    Ok((args.provider.clone(), args.command.clone()))
 }
 
 fn acp_check(name: &str, status: &str, message: &str) -> AcpDoctorCheck {

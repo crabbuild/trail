@@ -60,6 +60,11 @@ pub(super) struct AcpSessionsArgs {
 
 #[derive(Args)]
 pub(super) struct AcpRelayArgs {
+    #[arg(
+        value_name = "AGENT",
+        help = "Built-in ACP agent: claude-code, codex, or cursor"
+    )]
+    pub(super) agent: Option<String>,
     #[arg(long)]
     pub(super) lane: Option<String>,
     #[arg(long)]
@@ -82,7 +87,12 @@ pub(super) struct AcpRelayArgs {
     pub(super) model: Option<String>,
     #[arg(long = "no-mcp")]
     pub(super) no_mcp: bool,
-    #[arg(last = true, num_args = 1.., required = true)]
+    #[arg(
+        last = true,
+        num_args = 0..,
+        value_name = "COMMAND",
+        help = "Custom ACP agent command; pass after `--` instead of a built-in agent"
+    )]
     pub(super) command: Vec<String>,
 }
 

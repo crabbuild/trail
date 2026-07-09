@@ -110,23 +110,26 @@ trail agent ready latest
 trail agent apply latest
 ```
 
-The lower-level Claude Code ACP profile still uses:
+The lower-level relay can start a built-in provider directly:
 
 ```sh
-trail acp relay --provider claude-code --materialize -- npx -y @agentclientprotocol/claude-agent-acp@latest
+trail acp relay claude-code
 ```
 
-The lower-level Codex ACP profile uses:
+For Codex:
 
 ```sh
-trail acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
+trail acp relay codex
 ```
 
-The lower-level Cursor ACP profile uses:
+For Cursor:
 
 ```sh
-trail acp relay --provider cursor --materialize -- agent acp
+trail acp relay cursor
 ```
+
+For an ACP-compatible agent without a built-in profile, keep the explicit
+form: `trail acp relay --provider my-agent -- my-agent acp`.
 
 Terminal-first agents use fresh task lanes:
 

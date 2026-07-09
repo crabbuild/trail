@@ -2237,17 +2237,7 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
 }
 
 fn default_acp_upstream_command(provider: &str, _lane: &str) -> Result<Vec<String>> {
-    let profile = trail::acp::acp_provider_profile(provider)?;
-    let separator = profile
-        .relay_command
-        .iter()
-        .position(|part| part == "--")
-        .ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "provider `{provider}` does not define an ACP upstream command"
-            ))
-        })?;
-    Ok(profile.relay_command[separator + 1..].to_vec())
+    trail::acp::acp_provider_upstream_command(provider)
 }
 
 fn default_terminal_agent_command(provider: &str) -> Result<Vec<String>> {

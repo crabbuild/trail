@@ -798,15 +798,14 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         ],
     );
     assert_eq!(install["agent"], "claude-code");
-    assert!(install["relay_command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "relay"));
+    assert_eq!(
+        install["relay_command"],
+        serde_json::json!(["trail", "acp", "relay", "claude-code"])
+    );
     assert!(install["snippet"]
         .as_str()
         .unwrap()
-        .contains("trail acp relay"));
+        .contains("trail acp relay claude-code"));
 
     let zed_install = run_trail_json(
         temp.path(),
@@ -877,11 +876,10 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         ],
     );
     assert_eq!(codex_install["agent"], "codex");
-    assert!(codex_install["relay_command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "@agentclientprotocol/codex-acp@latest"));
+    assert_eq!(
+        codex_install["relay_command"],
+        serde_json::json!(["trail", "acp", "relay", "codex"])
+    );
     let codex_zed_snippet: serde_json::Value =
         serde_json::from_str(codex_install["snippet"].as_str().unwrap()).unwrap();
     assert_eq!(
@@ -902,11 +900,31 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         ],
     );
     assert_eq!(cursor_install["agent"], "cursor");
-    assert!(cursor_install["relay_command"]
-        .as_array()
-        .unwrap()
-        .windows(2)
-        .any(|parts| parts[0] == "agent" && parts[1] == "acp"));
+    assert_eq!(
+        cursor_install["relay_command"],
+        serde_json::json!(["trail", "acp", "relay", "cursor"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_accepts_a_built_in_agent_shortcut() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["acp", "relay", "codex", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "trail acp relay codex failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(unix)]

@@ -44,15 +44,13 @@ provider, captures the transcript and tools, and records the workdir checkpoint.
 For Claude Code the low-level relay command is:
 
 ```sh
-trail acp relay --provider claude-code --materialize -- \
-  npx -y @agentclientprotocol/claude-agent-acp@latest
+trail acp relay claude-code
 ```
 
 For Codex the low-level relay command is:
 
 ```sh
-trail acp relay --provider codex --materialize -- \
-  npx -y @agentclientprotocol/codex-acp@latest
+trail acp relay codex
 ```
 
 `--materialize` is the default mode for practical coding-agent work. Trail

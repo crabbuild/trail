@@ -42,7 +42,7 @@ The first production slice is implemented in `trail acp relay`.
 
 Implemented:
 
-- New CLI group: `trail acp relay -- <upstream-command>`.
+- New CLI group: `trail acp relay <built-in-agent>` or `trail acp relay -- <upstream-command>`.
 - Newline-delimited JSON-RPC stdio relay for local ACP agents.
 - Upstream child process lifecycle and stderr isolation.
 - `_meta.trail` initialization metadata.
@@ -181,6 +181,9 @@ Trail lets me review, merge, or rewind.
 Run a local ACP relay in front of a real ACP agent:
 
 ```sh
+trail acp relay codex
+
+# Or configure a custom upstream ACP agent explicitly.
 trail acp relay \
   --lane docs-bot \
   --from main \
@@ -638,7 +641,7 @@ Acceptance criteria:
 
 Deliverables:
 
-- `trail acp relay -- <upstream-command>`.
+- `trail acp relay <built-in-agent>` and `trail acp relay -- <upstream-command>`.
 - Child process lifecycle management.
 - Transparent ACP forwarding.
 - Basic `initialize` and `session/new` pass-through.
