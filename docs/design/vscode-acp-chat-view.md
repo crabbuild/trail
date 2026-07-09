@@ -805,7 +805,7 @@ Filesystem:
 Suggested TypeScript packages inside a future extension scaffold:
 
 ```text
-extensions/vscode/src/
+trail-vscode/src/
   extension.ts
   acp/
     AcpClient.ts
