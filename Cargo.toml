@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/trail",
-    "crates/prolly",
-    "crates/prolly/stores/prolly-store-cosmosdb",
-    "crates/prolly/stores/prolly-store-dynamodb",
-    "crates/prolly/stores/prolly-store-mysql",
-    "crates/prolly/stores/prolly-store-postgres",
-    "crates/prolly/stores/prolly-store-redis",
-    "crates/prolly/stores/prolly-store-spanner",
-    "crates/prolly/bindings/node/native",
-    "crates/prolly/bindings/uniffi",
-    "crates/prolly/bindings/wasm",
+    "trail",
+    "prolly",
+    "prolly/stores/prolly-store-cosmosdb",
+    "prolly/stores/prolly-store-dynamodb",
+    "prolly/stores/prolly-store-mysql",
+    "prolly/stores/prolly-store-postgres",
+    "prolly/stores/prolly-store-redis",
+    "prolly/stores/prolly-store-spanner",
+    "prolly/bindings/node/native",
+    "prolly/bindings/uniffi",
+    "prolly/bindings/wasm",
 ]
 resolver = "2"
 

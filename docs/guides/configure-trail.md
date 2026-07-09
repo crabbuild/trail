@@ -121,6 +121,6 @@ trail config set guardrails.policy "block:path:production;approval:keyword:deplo
 
 ## Code Facts Used
 
-- Config command args: `crates/trail/src/cli/command/workspace_args.rs`
-- Config entries and validation: `crates/trail/src/db/util/config`
+- Config command args: `trail/src/cli/command/workspace_args.rs`
+- Config entries and validation: `trail/src/db/util/config`
 - Tests: `config_api_lists_sets_persists_and_validates_keys`, `required_gate_config_blocks_merge_until_test_and_eval_pass`

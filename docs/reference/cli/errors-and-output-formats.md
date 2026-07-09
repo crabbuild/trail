@@ -88,8 +88,8 @@ The HTTP daemon maps selected errors to:
 
 ## Code Facts Used
 
-- Error enum and exit codes: `crates/trail/src/error.rs`
-- CLI rendering: `crates/trail/src/cli/command/handler/errors.rs`
-- HTTP error responses: `crates/trail/src/server/route/utils.rs`
+- Error enum and exit codes: `trail/src/error.rs`
+- CLI rendering: `trail/src/cli/command/handler/errors.rs`
+- HTTP error responses: `trail/src/server/route/utils.rs`
 - Tests: `cli_json_errors_are_machine_readable`
 

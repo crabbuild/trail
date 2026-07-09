@@ -17,12 +17,12 @@ Trail is built as a local-first operation database for code and text worktrees. 
 
 Trail is split into these layers:
 
-- CLI: `crates/trail/src/cli`
-- Core library API: `crates/trail/src/lib.rs` and `crates/trail/src/db`
-- Domain and report models: `crates/trail/src/model`
-- HTTP daemon and OpenAPI: `crates/trail/src/server`
-- MCP stdio server: `crates/trail/src/mcp`
-- Ordered map storage: `crates/prolly`
+- CLI: `trail/src/cli`
+- Core library API: `trail/src/lib.rs` and `trail/src/db`
+- Domain and report models: `trail/src/model`
+- HTTP daemon and OpenAPI: `trail/src/server`
+- MCP stdio server: `trail/src/mcp`
+- Ordered map storage: `prolly`
 
 The `trail` binary is intentionally thin: `src/main.rs` calls `cli::run()`. The core behavior lives in the library so the CLI, HTTP server, MCP server, tests, and external Rust callers can use the same implementation.
 
@@ -36,7 +36,7 @@ flowchart TB
     end
 
     Core["Trail core<br/>workspace, refs, objects, agents, merge"]
-    Reports["Serializable report structs<br/>crates/trail/src/model/reports"]
+    Reports["Serializable report structs<br/>trail/src/model/reports"]
 
     subgraph State["Durable local state"]
         SQLite["SQLite<br/>objects, refs, indexes, coordination"]
@@ -198,10 +198,10 @@ Inspect the architecture layer when adding:
 
 ## Code Facts Used
 
-- CLI runtime: `crates/trail/src/cli/command/handler.rs`
-- Runtime context: `crates/trail/src/cli/command/handler/runtime.rs`
-- Daemon routing: `crates/trail/src/cli/command/handler/daemon_rpc.rs`
-- `Trail`: `crates/trail/src/db/mod.rs`
-- Initialization/opening: `crates/trail/src/db/core/init.rs`
-- Library exports: `crates/trail/src/lib.rs`
-- Error model: `crates/trail/src/error.rs`
+- CLI runtime: `trail/src/cli/command/handler.rs`
+- Runtime context: `trail/src/cli/command/handler/runtime.rs`
+- Daemon routing: `trail/src/cli/command/handler/daemon_rpc.rs`
+- `Trail`: `trail/src/db/mod.rs`
+- Initialization/opening: `trail/src/db/core/init.rs`
+- Library exports: `trail/src/lib.rs`
+- Error model: `trail/src/error.rs`

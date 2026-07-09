@@ -209,6 +209,6 @@ merge-queue removal.
 
 ## Code Facts Used
 
-- OpenAPI paths: `crates/trail/src/server/openapi/paths`
-- Route handlers: `crates/trail/src/server/route`
-- Request types: `crates/trail/src/server/request_types`
+- OpenAPI paths: `trail/src/server/openapi/paths`
+- Route handlers: `trail/src/server/route`
+- Request types: `trail/src/server/request_types`

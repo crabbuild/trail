@@ -49,7 +49,7 @@ Run status filters accept paused, resumed, blocked, cancelled, or all.
 
 ## Code Facts Used
 
-- Session args: `crates/trail/src/cli/command/collaboration_args/sessions.rs`
-- Turn/run args: `crates/trail/src/cli/command/lane_args/turn.rs`, `crates/trail/src/cli/command/lane_args/run.rs`
-- Models: `crates/trail/src/model/lane/activity.rs`, `crates/trail/src/model/lane/coordination.rs`
+- Session args: `trail/src/cli/command/collaboration_args/sessions.rs`
+- Turn/run args: `trail/src/cli/command/lane_args/turn.rs`, `trail/src/cli/command/lane_args/run.rs`
+- Models: `trail/src/model/lane/activity.rs`, `trail/src/model/lane/coordination.rs`
 - Tests: `local_api_and_mcp_manage_lane_sessions`, `lane_turn_cli_tracks_events_and_closeout`

@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Follow this plan step by step. Run each verification command before moving to the next step. If a STOP condition occurs, stop and report instead of broadening scope. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- crates/trail/src/db/util/fs_cow.rs crates/trail/src/db/lane/lifecycle.rs crates/trail/src/db/lane/workdir/manifest.rs`
+> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- trail/src/db/util/fs_cow.rs trail/src/db/lane/lifecycle.rs trail/src/db/lane/workdir/manifest.rs`
 >
 > If any in-scope file changed since this plan was written, compare the "Current state" section against live code before proceeding. Treat a semantic mismatch as a STOP condition.
 
@@ -21,7 +21,7 @@ After source and destination full scans are removed, serial file cloning becomes
 
 ## Current state
 
-- `crates/trail/src/db/util/fs_cow.rs` owns CoW cloning. Around lines 10-37, `materialize_from_workspace_cow` loops serially over the target entries.
+- `trail/src/db/util/fs_cow.rs` owns CoW cloning. Around lines 10-37, `materialize_from_workspace_cow` loops serially over the target entries.
 - The same file has per-file stamped validation around lines 61-83 and clone implementation around lines 124-160.
 - The `trail` crate already depends on workspace `rayon`, so no new dependency should be needed.
 - Plan 002 should have introduced a materialization report or equivalent stamp return path that parallel workers can populate.
@@ -40,9 +40,9 @@ After source and destination full scans are removed, serial file cloning becomes
 
 **In scope**:
 
-- `crates/trail/src/db/util/fs_cow.rs`
-- small call-site adjustments in `crates/trail/src/db/lane/lifecycle.rs`
-- materialization report integration in `crates/trail/src/db/lane/workdir/manifest.rs` if needed
+- `trail/src/db/util/fs_cow.rs`
+- small call-site adjustments in `trail/src/db/lane/lifecycle.rs`
+- materialization report integration in `trail/src/db/lane/workdir/manifest.rs` if needed
 - focused lane/CoW tests
 
 **Out of scope**:

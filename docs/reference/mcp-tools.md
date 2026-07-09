@@ -393,7 +393,7 @@ spans.
 
 ## Code Facts Used
 
-- Tools: `crates/trail/src/mcp/tools`
-- Tool calls: `crates/trail/src/mcp/tool_call`
-- Risk annotations: `crates/trail/src/mcp/tools/annotations.rs`
-- Prompts/resources: `crates/trail/src/mcp/capabilities`
+- Tools: `trail/src/mcp/tools`
+- Tool calls: `trail/src/mcp/tool_call`
+- Risk annotations: `trail/src/mcp/tools/annotations.rs`
+- Prompts/resources: `trail/src/mcp/capabilities`

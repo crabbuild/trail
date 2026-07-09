@@ -62,6 +62,6 @@ trail lane readiness doc-bot
 
 ## Code Facts Used
 
-- Conflict CLI args: `crates/trail/src/cli/command/collaboration_args/merge.rs`
-- Manual resolution parsing: `crates/trail/src/cli/command/handler/parsing.rs`
+- Conflict CLI args: `trail/src/cli/command/collaboration_args/merge.rs`
+- Manual resolution parsing: `trail/src/cli/command/handler/parsing.rs`
 - Tests: `merge_queue_pauses_on_conflict`, `manual_conflict_resolution_works_through_db_cli_http_and_mcp`

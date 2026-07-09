@@ -61,7 +61,7 @@ the shared target branch.
 
 ## Code Facts Used
 
-- Lane lifecycle: `crates/trail/src/db/lane/lifecycle.rs`
-- Leases: `crates/trail/src/db/lane/leases.rs`
-- Rewind: `crates/trail/src/db/lane/rewind.rs`
+- Lane lifecycle: `trail/src/db/lane/lifecycle.rs`
+- Leases: `trail/src/db/lane/leases.rs`
+- Rewind: `trail/src/db/lane/rewind.rs`
 - Tests: `advisory_leases_coordinate_lane_paths`, `lane_claims_are_soft_leases_across_cli_api_and_mcp`

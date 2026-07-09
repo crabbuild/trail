@@ -25,7 +25,7 @@ This is useful for iterative local work, editor automation, and change review be
 
 ## Code Facts Used
 
-- Worktree commands: `crates/trail/src/cli/command/worktree_args.rs`
-- Git export: `crates/trail/src/db/merge/git_export.rs`
+- Worktree commands: `trail/src/cli/command/worktree_args.rs`
+- Git export: `trail/src/db/merge/git_export.rs`
 - Tests: `record_paths_records_only_selected_changes`, `git_export_with_message_creates_commit_object_and_mapping`
 

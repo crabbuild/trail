@@ -32,7 +32,7 @@ The OpenAPI path builder groups routes as:
 
 ## Code Facts Used
 
-- OpenAPI builder: `crates/trail/src/server/openapi.rs`
-- Paths: `crates/trail/src/server/openapi/paths`
-- Schemas: `crates/trail/src/server/openapi/schemas`
+- OpenAPI builder: `trail/src/server/openapi.rs`
+- Paths: `trail/src/server/openapi/paths`
+- Schemas: `trail/src/server/openapi/schemas`
 - Tests: `local_api_and_cli_export_openapi_contract`

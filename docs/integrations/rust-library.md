@@ -39,8 +39,8 @@ Reports and model types are serializable with Serde. The CLI, HTTP API, MCP tool
 
 ## Code Facts Used
 
-- Library exports: `crates/trail/src/lib.rs`
-- Public methods: `crates/trail/src/db`
-- Public models: `crates/trail/src/model`
+- Library exports: `trail/src/lib.rs`
+- Public methods: `trail/src/db`
+- Public models: `trail/src/model`
 - Test: `prolly_is_importable_through_trail_namespaces`
 

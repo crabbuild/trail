@@ -263,10 +263,10 @@ CLI daemon routing can read the token from `--daemon-token`, `TRAIL_DAEMON_TOKEN
 
 ## Code Facts Used
 
-- Path safety: `crates/trail/src/db/util/path.rs`
-- Materialization safety: `crates/trail/src/db/util/materialize.rs`
-- Ignore handling: `crates/trail/src/db/core/workspace/ignore.rs`
-- Patch policy: `crates/trail/src/db/lane/patch_policy.rs`
-- Guardrails: `crates/trail/src/db/core/workspace/guardrails.rs`, `crates/trail/src/db/util/guardrails`
-- Redaction: `crates/trail/src/db/util/redaction.rs`
-- Daemon auth: `crates/trail/src/server/route/utils.rs`, `crates/trail/src/cli/command/handler/maintenance.rs`
+- Path safety: `trail/src/db/util/path.rs`
+- Materialization safety: `trail/src/db/util/materialize.rs`
+- Ignore handling: `trail/src/db/core/workspace/ignore.rs`
+- Patch policy: `trail/src/db/lane/patch_policy.rs`
+- Guardrails: `trail/src/db/core/workspace/guardrails.rs`, `trail/src/db/util/guardrails`
+- Redaction: `trail/src/db/util/redaction.rs`
+- Daemon auth: `trail/src/server/route/utils.rs`, `trail/src/cli/command/handler/maintenance.rs`

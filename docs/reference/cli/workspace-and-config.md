@@ -48,6 +48,6 @@ Returns `allowed`, `approval_required`, or `blocked`.
 
 ## Code Facts Used
 
-- Args: `crates/trail/src/cli/command/workspace_args.rs`, `crates/trail/src/cli/command/worktree_args.rs`
-- Config validation: `crates/trail/src/db/util/config`
-- Ignore/guardrails: `crates/trail/src/db/core/workspace`
+- Args: `trail/src/cli/command/workspace_args.rs`, `trail/src/cli/command/worktree_args.rs`
+- Config validation: `trail/src/db/util/config`
+- Ignore/guardrails: `trail/src/db/core/workspace`

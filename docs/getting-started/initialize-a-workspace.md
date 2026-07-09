@@ -64,8 +64,8 @@ Default `.trailignore` patterns include `.trail/`, `.git/`, `.env`, `.env.*`, pr
 
 ## Code Facts Used
 
-- Init args: `crates/trail/src/cli/command/worktree_args.rs`
-- Init behavior: `crates/trail/src/db/core/init.rs`
-- Text policy: `crates/trail/src/db/util/config/policy.rs`
-- Default ignore patterns: `crates/trail/src/db/mod.rs`
+- Init args: `trail/src/cli/command/worktree_args.rs`
+- Init behavior: `trail/src/db/core/init.rs`
+- Text policy: `trail/src/db/util/config/policy.rs`
+- Default ignore patterns: `trail/src/db/mod.rs`
 - Tests: `init_record_why_and_fsck_work`, `init_text_policy_sets_text_tracking_thresholds`

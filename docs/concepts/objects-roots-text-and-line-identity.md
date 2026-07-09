@@ -53,8 +53,8 @@ Structured patches can replace a specific line by `line_id` and optional `expect
 
 ## Code Facts Used
 
-- Object model: `crates/trail/src/model/domain/objects.rs`
-- IDs: `crates/trail/src/ids.rs`
-- Line changes: `crates/trail/src/model/lane/changes.rs`
+- Object model: `trail/src/model/domain/objects.rs`
+- IDs: `trail/src/ids.rs`
+- Line changes: `trail/src/model/lane/changes.rs`
 - Tests: `same_position_rewrite_preserves_line_identity`, `copying_a_file_allocates_a_new_file_identity`, `small_text_policy_avoids_prolly_text_maps_for_tiny_files`
 

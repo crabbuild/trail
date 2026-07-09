@@ -31,7 +31,7 @@ Mappings connect Git head/dirty state to Trail changes and roots.
 
 ## Code Facts Used
 
-- Git args/handler: `crates/trail/src/cli/command/maintenance_args.rs`, `crates/trail/src/cli/command/handler/maintenance.rs`
-- Git storage: `crates/trail/src/db/storage/git.rs`
-- Reports: `crates/trail/src/model/reports/worktree.rs`
+- Git args/handler: `trail/src/cli/command/maintenance_args.rs`, `trail/src/cli/command/handler/maintenance.rs`
+- Git storage: `trail/src/db/storage/git.rs`
+- Reports: `trail/src/model/reports/worktree.rs`
 

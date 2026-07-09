@@ -50,8 +50,8 @@ Mappings include direction, branch, Git head, whether Git was dirty, Trail chang
 
 ## Code Facts Used
 
-- Git CLI args: `crates/trail/src/cli/command/maintenance_args.rs`
-- Git handlers: `crates/trail/src/cli/command/handler/maintenance.rs`
-- Git storage: `crates/trail/src/db/storage/git.rs`
+- Git CLI args: `trail/src/cli/command/maintenance_args.rs`
+- Git handlers: `trail/src/cli/command/handler/maintenance.rs`
+- Git storage: `trail/src/db/storage/git.rs`
 - Tests: `git_import_update_records_current_git_tracked_snapshot`, `git_export_with_message_creates_commit_object_and_mapping`
 

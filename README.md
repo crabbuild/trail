@@ -34,9 +34,9 @@ provenance, and lane-coordination layer.
                          |
                          v
   +---------------------------------------------------------+
-  | Trail                                                  |
+  | Trail                                                   |
   | record operations, preserve line identity, isolate      |
-  | lane branches, run guardrails, check readiness,        |
+  | lane branches, run guardrails, check readiness,         |
   | produce review and handoff reports                      |
   +--------------------------+------------------------------+
                              |
@@ -156,20 +156,20 @@ The same architecture in text form:
                          entry points
   +-----------+   +---------------+   +--------------+   +-------------+
   | CLI       |   | HTTP daemon   |   | MCP stdio    |   | Rust API    |
-  | trail    |   | /v1 JSON API  |   | tools/docs   |   | Trail      |
+  | trail     |   | /v1 JSON API  |   | tools/docs   |   | Trail       |
   +-----+-----+   +-------+-------+   +------+-------+   +------+------+
         |                 |                  |                  |
         +-----------------+------------------+------------------+
                                      |
                                      v
   +-------------------------------------------------------------------+
-  | Trail core                                                       |
-  | workspace policy, refs, objects, records, lanes, merges, reports |
+  | Trail core                                                        |
+  | workspace policy, refs, objects, records, lanes, merges, reports  |
   +-----------+------------------+--------------------+---------------+
               |                  |                    |
               v                  v                    v
   +-------------------+  +------------------+  +----------------------+
-  | SQLite            |  | Prolly maps      |  | .trail sidecars     |
+  | SQLite            |  | Prolly maps      |  | .trail sidecars      |
   | objects, refs,    |  | path maps, file  |  | config, HEAD, refs,  |
   | indexes, queues,  |  | indexes, text    |  | daemon files,        |
   | lane state        |  | and line order   |  | workdir manifests    |
@@ -276,7 +276,7 @@ merges into a target branch only after checks pass.
 
 ```text
   +-------------------+        +----------------------+
-  | lanes             |        | lane_branches       |
+  | lanes             |        | lane_branches        |
   | identity, model,  |------->| ref, base/head root, |
   | provider, metadata|        | session, workdir,    |
   +-------------------+        | status               |
@@ -1224,8 +1224,8 @@ library prelude.
 ## Repository Layout
 
 ```text
-crates/trail/   CLI, library API, HTTP daemon, MCP server, models, storage
-crates/prolly/   Ordered map storage used by roots and text indexes
+trail/   CLI, library API, HTTP daemon, MCP server, models, storage
+prolly/   Ordered map storage used by roots and text indexes
 docs/            User, operator, integration, reference, and design docs
 scripts/         Local helper and benchmark scripts
 ```

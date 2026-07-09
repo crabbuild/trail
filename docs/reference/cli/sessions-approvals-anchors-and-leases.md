@@ -85,6 +85,6 @@ Lease mode defaults to `write`; TTL defaults to 3600 seconds.
 
 ## Code Facts Used
 
-- Args: `crates/trail/src/cli/command/collaboration_args`, `crates/trail/src/cli/command/lane_args`
-- Models: `crates/trail/src/model/lane/activity.rs`, `crates/trail/src/model/lane/coordination.rs`
+- Args: `trail/src/cli/command/collaboration_args`, `trail/src/cli/command/lane_args`
+- Models: `trail/src/model/lane/activity.rs`, `trail/src/model/lane/coordination.rs`
 - Tests: `anchors_follow_stable_line_identity`, `local_api_and_mcp_expose_advisory_leases`

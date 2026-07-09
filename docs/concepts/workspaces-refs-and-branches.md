@@ -52,8 +52,8 @@ Branches store the current `change_id`, `root_id`, generation, and update timest
 
 ## Code Facts Used
 
-- Global args: `crates/trail/src/cli/command.rs`
-- Branch args: `crates/trail/src/cli/command/worktree_args.rs`
-- Ref storage: `crates/trail/src/db/storage/refs.rs`
+- Global args: `trail/src/cli/command.rs`
+- Branch args: `trail/src/cli/command/worktree_args.rs`
+- Ref storage: `trail/src/db/storage/refs.rs`
 - Tests: `branch_list_rename_and_delete_work`, `cli_env_defaults_select_workspace_db_branch_and_format`
 

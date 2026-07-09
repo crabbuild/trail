@@ -192,7 +192,7 @@ This page summarizes public types used across CLI JSON, HTTP API, MCP structured
 
 ## Code Facts Used
 
-- IDs: `crates/trail/src/ids.rs`
-- Models: `crates/trail/src/model`
-- Reports: `crates/trail/src/model/reports`
-- Library exports: `crates/trail/src/lib.rs`
+- IDs: `trail/src/ids.rs`
+- Models: `trail/src/model`
+- Reports: `trail/src/model/reports`
+- Library exports: `trail/src/lib.rs`

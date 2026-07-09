@@ -55,8 +55,8 @@ Where decision is `allow`, `approval`, or `block`, and scope is `action`, `keywo
 
 ## Code Facts Used
 
-- Record/watch args: `crates/trail/src/cli/command/worktree_args.rs`
-- Ignore behavior: `crates/trail/src/db/core/workspace/ignore.rs`, `crates/trail/src/db/util/path.rs`
-- Guardrail behavior: `crates/trail/src/db/core/workspace/guardrails.rs`, `crates/trail/src/db/util/guardrails`
+- Record/watch args: `trail/src/cli/command/worktree_args.rs`
+- Ignore behavior: `trail/src/db/core/workspace/ignore.rs`, `trail/src/db/util/path.rs`
+- Guardrail behavior: `trail/src/db/core/workspace/guardrails.rs`, `trail/src/db/util/guardrails`
 - Tests: `ignore_cli_manages_trailignore_and_status`, `lane_patch_respects_ignore_policy_and_explicit_opt_in`, `local_api_and_mcp_expose_ignore_controls`
 

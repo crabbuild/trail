@@ -39,6 +39,6 @@ trail merge-queue run
 
 ## Code Facts Used
 
-- Readiness/handoff: `crates/trail/src/db/lane/readiness.rs`
-- Guardrails/approvals: `crates/trail/src/db/core/workspace/guardrails.rs`, `crates/trail/src/db/lane/control/approvals.rs`
+- Readiness/handoff: `trail/src/db/lane/readiness.rs`
+- Guardrails/approvals: `trail/src/db/core/workspace/guardrails.rs`, `trail/src/db/lane/control/approvals.rs`
 - Tests: `merge_lane_and_queue_enforce_readiness_blockers`, `local_api_and_mcp_manage_human_approval_gates`

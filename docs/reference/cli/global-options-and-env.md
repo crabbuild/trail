@@ -61,8 +61,8 @@ Parse errors and runtime errors are rendered as JSON when `--json`, `--format js
 
 ## Code Facts Used
 
-- Parser: `crates/trail/src/cli/command.rs`
-- Runtime resolution: `crates/trail/src/cli/command/handler/runtime.rs`
-- Error rendering: `crates/trail/src/cli/command/handler/errors.rs`
+- Parser: `trail/src/cli/command.rs`
+- Runtime resolution: `trail/src/cli/command/handler/runtime.rs`
+- Error rendering: `trail/src/cli/command/handler/errors.rs`
 - Tests: `cli_json_errors_are_machine_readable`, `cli_env_defaults_select_workspace_db_branch_and_format`
 

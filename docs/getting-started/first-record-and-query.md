@@ -66,8 +66,8 @@ Use `--show-line-ids` when an agent or reviewer needs stable line IDs for precis
 
 ## Code Facts Used
 
-- Record, status, diff args: `crates/trail/src/cli/command/worktree_args.rs`
-- History/provenance args: `crates/trail/src/cli/command/inspect_args.rs`
-- Record reports and operation model: `crates/trail/src/model/reports/worktree.rs`, `crates/trail/src/model/domain/operations.rs`
+- Record, status, diff args: `trail/src/cli/command/worktree_args.rs`
+- History/provenance args: `trail/src/cli/command/inspect_args.rs`
+- Record reports and operation model: `trail/src/model/reports/worktree.rs`, `trail/src/model/domain/operations.rs`
 - Tests: `init_record_why_and_fsck_work`, `record_paths_records_only_selected_changes`, `diff_supports_roots_dirty_and_line_id_surfaces`
 

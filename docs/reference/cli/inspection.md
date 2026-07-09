@@ -65,6 +65,6 @@ These commands are advanced/internal debugging tools for prolly maps and object 
 
 ## Code Facts Used
 
-- Args: `crates/trail/src/cli/command/inspect_args.rs`
-- Renderers: `crates/trail/src/cli/command/render/inspection.rs`
+- Args: `trail/src/cli/command/inspect_args.rs`
+- Renderers: `trail/src/cli/command/render/inspection.rs`
 - Tests: `inspection_apis_decode_objects_roots_and_texts`, `map_debug_commands_decode_known_prolly_maps`

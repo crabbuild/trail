@@ -61,9 +61,7 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
 fn trail_bin() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_trail")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/trail")
-        })
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/trail"))
 }
 
 #[cfg(unix)]

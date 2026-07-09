@@ -72,6 +72,6 @@ Finds operations and changed paths from a message, session, or lane.
 
 ## Code Facts Used
 
-- Args: `crates/trail/src/cli/command/worktree_args.rs`, `crates/trail/src/cli/command/inspect_args.rs`
-- Handler parsing: `crates/trail/src/cli/command/handler/parsing.rs`
-- Reports: `crates/trail/src/model/reports/worktree.rs`, `crates/trail/src/model/inspect`
+- Args: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/inspect_args.rs`
+- Handler parsing: `trail/src/cli/command/handler/parsing.rs`
+- Reports: `trail/src/model/reports/worktree.rs`, `trail/src/model/inspect`

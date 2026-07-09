@@ -408,10 +408,10 @@ When adding a new core behavior:
 
 ## Code Facts Used
 
-- Daemon handler/auth: `crates/trail/src/cli/command/handler/maintenance.rs`
-- Daemon routing: `crates/trail/src/cli/command/handler/daemon_rpc.rs`
-- HTTP transport: `crates/trail/src/server/transport.rs`
-- HTTP routes: `crates/trail/src/server/route`
-- OpenAPI: `crates/trail/src/server/openapi`
-- MCP protocol/capabilities/tools: `crates/trail/src/mcp`
+- Daemon handler/auth: `trail/src/cli/command/handler/maintenance.rs`
+- Daemon routing: `trail/src/cli/command/handler/daemon_rpc.rs`
+- HTTP transport: `trail/src/server/transport.rs`
+- HTTP routes: `trail/src/server/route`
+- OpenAPI: `trail/src/server/openapi`
+- MCP protocol/capabilities/tools: `trail/src/mcp`
 - Tests: `cli_daemon_url_routes_hot_lane_commands`, `local_api_and_cli_export_openapi_contract`, `mcp_stdio_tools_drive_lane_turn_workflow`

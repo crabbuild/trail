@@ -69,7 +69,7 @@ Sensitive values in trace metadata are redacted by the storage layer.
 
 ## Code Facts Used
 
-- Lane models: `crates/trail/src/model/lane`
-- Lane/session/turn/trace CLI args: `crates/trail/src/cli/command/lane_args`
-- Trace storage/query: `crates/trail/src/db/lane/control/traces`
+- Lane models: `trail/src/model/lane`
+- Lane/session/turn/trace CLI args: `trail/src/cli/command/lane_args`
+- Trace storage/query: `trail/src/db/lane/control/traces`
 - Tests: `lane_sessions_track_messages_patches_and_turns`, `lane_turn_cli_tracks_events_and_closeout`, `lane_trace_spans_are_parentable_redacted_and_available_across_surfaces`

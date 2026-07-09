@@ -10567,23 +10567,23 @@ fn agent_change_card_profile(path: &str) -> (&'static str, &'static str) {
         ("docs", "Docs and getting-started")
     } else if path == "Cargo.toml" || path == "Cargo.lock" || path.ends_with("/Cargo.toml") {
         ("build", "Build and dependencies")
-    } else if path.starts_with("crates/trail/src/cli/") {
+    } else if path.starts_with("trail/src/cli/") {
         ("cli", "CLI workflow")
-    } else if path.starts_with("crates/trail/src/mcp/") {
+    } else if path.starts_with("trail/src/mcp/") {
         ("mcp", "MCP and editor surfaces")
-    } else if path == "crates/trail/src/acp.rs" || path.contains("/acp") {
+    } else if path == "trail/src/acp.rs" || path.contains("/acp") {
         ("acp", "ACP agent integration")
-    } else if path.starts_with("crates/trail/src/server/") || path == "crates/trail/src/server.rs" {
+    } else if path.starts_with("trail/src/server/") || path == "trail/src/server.rs" {
         ("api", "HTTP API surface")
-    } else if path.starts_with("crates/trail/src/db/storage/") {
+    } else if path.starts_with("trail/src/db/storage/") {
         ("storage", "Storage and indexing")
-    } else if path.starts_with("crates/trail/src/db/merge/") {
+    } else if path.starts_with("trail/src/db/merge/") {
         ("merge", "Merge and apply safety")
-    } else if path.starts_with("crates/trail/src/db/lane/") {
+    } else if path.starts_with("trail/src/db/lane/") {
         ("lane", "Lane and workdir mechanics")
-    } else if path.starts_with("crates/trail/src/db/") {
+    } else if path.starts_with("trail/src/db/") {
         ("db", "Trail behavior")
-    } else if path.starts_with("crates/trail/tests/") || path.ends_with("tests.rs") {
+    } else if path.starts_with("trail/tests/") || path.ends_with("tests.rs") {
         ("tests", "Tests and regression coverage")
     } else if path.starts_with("crates/core/") {
         ("core", "Core library behavior")

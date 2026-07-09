@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Follow this plan step by step. Run each verification command before moving to the next step. If a STOP condition occurs, stop and report instead of broadening scope. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- crates/trail/src/db/storage/content.rs crates/trail/src/db/storage/manifest.rs crates/trail/src/db/lane/lifecycle.rs crates/trail/src/db/record/checkout.rs`
+> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- trail/src/db/storage/content.rs trail/src/db/storage/manifest.rs trail/src/db/lane/lifecycle.rs trail/src/db/record/checkout.rs`
 >
 > If any in-scope file changed since this plan was written, compare the "Current state" section against live code before proceeding. Treat a semantic mismatch as a STOP condition.
 
@@ -21,11 +21,11 @@ The current materialization APIs are convenient but load full roots and object b
 
 ## Current state
 
-- `crates/trail/src/db/storage/content.rs` exposes `load_root_files` around lines 124-139, returning a full `BTreeMap`.
+- `trail/src/db/storage/content.rs` exposes `load_root_files` around lines 124-139, returning a full `BTreeMap`.
 - `materialize_entries_bytes` around lines 218-268 collects object IDs, fetches objects, and returns a second `BTreeMap<String, Vec<u8>>`.
-- `crates/trail/src/db/lane/lifecycle.rs` uses full-root loading for non-sparse lane materialization.
-- `crates/trail/src/db/record/checkout.rs` loads current root files and target root files around lines 38-48 before diffing them.
-- `crates/trail/src/db/storage/manifest.rs` already has streaming sorted-merge patterns in `diff_root_to_worktree_index` and `diff_root_to_disk_manifest`.
+- `trail/src/db/lane/lifecycle.rs` uses full-root loading for non-sparse lane materialization.
+- `trail/src/db/record/checkout.rs` loads current root files and target root files around lines 38-48 before diffing them.
+- `trail/src/db/storage/manifest.rs` already has streaming sorted-merge patterns in `diff_root_to_worktree_index` and `diff_root_to_disk_manifest`.
 
 ## Commands you will need
 
@@ -42,10 +42,10 @@ The current materialization APIs are convenient but load full roots and object b
 
 **In scope**:
 
-- `crates/trail/src/db/storage/content.rs`
-- `crates/trail/src/db/storage/manifest.rs` only as an iterator exemplar or for shared helper extraction
-- `crates/trail/src/db/lane/lifecycle.rs`
-- `crates/trail/src/db/record/checkout.rs`
+- `trail/src/db/storage/content.rs`
+- `trail/src/db/storage/manifest.rs` only as an iterator exemplar or for shared helper extraction
+- `trail/src/db/lane/lifecycle.rs`
+- `trail/src/db/record/checkout.rs`
 - materialization helper tests and lane/checkout tests
 - benchmark docs only if this repo normally records benchmark deltas with performance work
 

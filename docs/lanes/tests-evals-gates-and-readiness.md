@@ -45,7 +45,7 @@ Readiness blocks merge until required gates are present and passing.
 
 ## Code Facts Used
 
-- Test/eval args: `crates/trail/src/cli/command/lane_args.rs`
-- Gate reports: `crates/trail/src/model/reports/lane.rs`
-- Gate runner: `crates/trail/src/db/lane/gates`
+- Test/eval args: `trail/src/cli/command/lane_args.rs`
+- Gate reports: `trail/src/model/reports/lane.rs`
+- Gate runner: `trail/src/db/lane/gates`
 - Tests: `lane_test_runs_in_workdir_and_records_events_and_output_blobs`, `required_gate_config_blocks_merge_until_test_and_eval_pass`

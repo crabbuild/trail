@@ -141,8 +141,8 @@ Scopes:
 
 ## Code Facts Used
 
-- Config model: `crates/trail/src/model/domain/config.rs`
-- Config entries: `crates/trail/src/db/util/config/entries.rs`
-- Config validation: `crates/trail/src/db/util/config/set.rs`
-- Parsing helpers: `crates/trail/src/db/util/config_parse.rs`
-- Guardrail policy parser: `crates/trail/src/db/util/guardrails/policy.rs`
+- Config model: `trail/src/model/domain/config.rs`
+- Config entries: `trail/src/db/util/config/entries.rs`
+- Config validation: `trail/src/db/util/config/set.rs`
+- Parsing helpers: `trail/src/db/util/config_parse.rs`
+- Guardrail policy parser: `trail/src/db/util/guardrails/policy.rs`

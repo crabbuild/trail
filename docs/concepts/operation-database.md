@@ -34,7 +34,7 @@ Trail can import from and export to Git, but it is not just a Git wrapper. It tr
 
 ## Code Facts Used
 
-- Operation model: `crates/trail/src/model/domain/operations.rs`
-- Ref storage: `crates/trail/src/db/storage/refs.rs`
-- Reports: `crates/trail/src/model/reports/worktree.rs`, `crates/trail/src/model/reports/merge.rs`
+- Operation model: `trail/src/model/domain/operations.rs`
+- Ref storage: `trail/src/db/storage/refs.rs`
+- Reports: `trail/src/model/reports/worktree.rs`, `trail/src/model/reports/merge.rs`
 

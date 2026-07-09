@@ -57,8 +57,8 @@ known-good state.
 
 ## Code Facts Used
 
-- MCP server: `crates/trail/src/mcp`
-- Tools: `crates/trail/src/mcp/tools`
-- Resources: `crates/trail/src/mcp/capabilities/resources.rs`
-- Prompts: `crates/trail/src/mcp/capabilities/prompts.rs`
+- MCP server: `trail/src/mcp`
+- Tools: `trail/src/mcp/tools`
+- Resources: `trail/src/mcp/capabilities/resources.rs`
+- Prompts: `trail/src/mcp/capabilities/prompts.rs`
 - Tests: `mcp_stdio_tools_drive_lane_turn_workflow`, `local_api_and_mcp_drive_merge_queue_and_conflicts`

@@ -227,9 +227,9 @@ flowchart LR
 
 ## Code Facts Used
 
-- Domain objects: `crates/trail/src/model/domain`
-- Lane models: `crates/trail/src/model/lane`
-- Reports: `crates/trail/src/model/reports`
-- Inspection models: `crates/trail/src/model/inspect`
-- IDs: `crates/trail/src/ids.rs`
-- Object storage: `crates/trail/src/db/storage/objects`
+- Domain objects: `trail/src/model/domain`
+- Lane models: `trail/src/model/lane`
+- Reports: `trail/src/model/reports`
+- Inspection models: `trail/src/model/inspect`
+- IDs: `trail/src/ids.rs`
+- Object storage: `trail/src/db/storage/objects`

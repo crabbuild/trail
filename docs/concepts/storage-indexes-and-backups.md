@@ -82,7 +82,7 @@ trail gc
 
 ## Code Facts Used
 
-- Storage schema: `crates/trail/src/db/storage/schema`
-- Index rebuild/gc/backup: `crates/trail/src/db/storage/lifecycle`, `crates/trail/src/db/core/backup`
-- Maintenance args: `crates/trail/src/cli/command/maintenance_args.rs`
+- Storage schema: `trail/src/db/storage/schema`
+- Index rebuild/gc/backup: `trail/src/db/storage/lifecycle`, `trail/src/db/core/backup`
+- Maintenance args: `trail/src/cli/command/maintenance_args.rs`
 - Tests: `backup_create_verify_and_restore_roundtrip`, `index_rebuild_restores_derived_history_from_objects`, `gc_prunes_unreachable_known_objects_and_preserves_reachable_roots`

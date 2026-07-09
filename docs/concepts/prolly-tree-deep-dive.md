@@ -718,8 +718,8 @@ compared, merged, and synchronized.
 
 ## Further Reading
 
-- [Trail prolly crate README](../../crates/prolly/README.md)
-- [Trail prolly performance guide](../../crates/prolly/docs/performance.md)
+- [Trail prolly crate README](../../prolly/README.md)
+- [Trail prolly performance guide](../../prolly/docs/performance.md)
 - [Trail storage and indexing design](../design/storage-and-indexing.md)
 - [Trail objects, roots, text, and line identity](objects-roots-text-and-line-identity.md)
 - [Dolt prolly tree storage-engine docs](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree/)

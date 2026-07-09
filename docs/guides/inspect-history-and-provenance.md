@@ -63,6 +63,6 @@ Use these when debugging storage or implementing integrations. Most users should
 
 ## Code Facts Used
 
-- Inspect args: `crates/trail/src/cli/command/inspect_args.rs`
-- Inspection models: `crates/trail/src/model/inspect`
+- Inspect args: `trail/src/cli/command/inspect_args.rs`
+- Inspection models: `trail/src/model/inspect`
 - Tests: `show_history_and_code_from_use_recorded_indexes`, `inspection_apis_decode_objects_roots_and_texts`, `map_debug_commands_decode_known_prolly_maps`

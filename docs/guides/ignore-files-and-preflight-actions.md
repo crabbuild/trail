@@ -58,7 +58,7 @@ After approval, matching approval-required reasons can become allowed for that a
 
 ## Code Facts Used
 
-- Ignore/guardrail args: `crates/trail/src/cli/command/workspace_args.rs`
-- Approval args: `crates/trail/src/cli/command/collaboration_args/approvals.rs`
-- Guardrail implementation: `crates/trail/src/db/core/workspace/guardrails.rs`
+- Ignore/guardrail args: `trail/src/cli/command/workspace_args.rs`
+- Approval args: `trail/src/cli/command/collaboration_args/approvals.rs`
+- Guardrail implementation: `trail/src/db/core/workspace/guardrails.rs`
 - Tests: `local_api_and_mcp_manage_human_approval_gates`, `hardcoded_private_key_denylist_is_not_recorded`

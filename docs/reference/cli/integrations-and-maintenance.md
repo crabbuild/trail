@@ -520,6 +520,6 @@ Use `--dry-run` to preview cleanup before deleting unused data.
 
 Use these files when you need to verify the CLI surface from code:
 
-- `crates/trail/src/cli/command/maintenance_args.rs`
-- `crates/trail/src/cli/command/handler/maintenance.rs`
-- `crates/trail/src/model/reports/maintenance.rs`
+- `trail/src/cli/command/maintenance_args.rs`
+- `trail/src/cli/command/handler/maintenance.rs`
+- `trail/src/model/reports/maintenance.rs`

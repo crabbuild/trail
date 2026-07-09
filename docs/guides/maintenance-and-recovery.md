@@ -57,7 +57,7 @@ Garbage collection prunes unreachable known objects while preserving reachable r
 
 ## Code Facts Used
 
-- Maintenance CLI args: `crates/trail/src/cli/command/maintenance_args.rs`
-- Maintenance handlers: `crates/trail/src/cli/command/handler/maintenance.rs`
+- Maintenance CLI args: `trail/src/cli/command/maintenance_args.rs`
+- Maintenance handlers: `trail/src/cli/command/handler/maintenance.rs`
 - Tests: `doctor_reports_operational_health_across_cli_api_and_mcp`, `backup_create_verify_and_restore_roundtrip`, `gc_prunes_unreachable_known_objects_and_preserves_reachable_roots`
 

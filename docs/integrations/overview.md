@@ -52,11 +52,11 @@ Use the Rust library when:
 
 ## Code Facts Used
 
-- CLI entrypoint: `crates/trail/src/cli`
-- HTTP server: `crates/trail/src/server`
-- MCP server: `crates/trail/src/mcp`
+- CLI entrypoint: `trail/src/cli`
+- HTTP server: `trail/src/server`
+- MCP server: `trail/src/mcp`
 - ACP usage: `docs/integrations/acp-agent-usage.md`
-- Library exports: `crates/trail/src/lib.rs`
+- Library exports: `trail/src/lib.rs`
 - ACP relay proposal: `docs/design/acp-relay.md`
 - VS Code ACP chat view: `docs/design/vscode-acp-chat-view.md`
 - VS Code extension implementation: `trail-vscode`

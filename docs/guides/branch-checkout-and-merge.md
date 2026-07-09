@@ -102,7 +102,7 @@ unknown keys are rejected.
 
 ## Code Facts Used
 
-- Branch/checkout/merge args: `crates/trail/src/cli/command/worktree_args.rs`
-- Merge/conflict args: `crates/trail/src/cli/command/collaboration_args/merge.rs`
-- Conflict manual schema: `crates/trail/src/model/reports/merge.rs`
+- Branch/checkout/merge args: `trail/src/cli/command/worktree_args.rs`
+- Merge/conflict args: `trail/src/cli/command/collaboration_args/merge.rs`
+- Conflict manual schema: `trail/src/model/reports/merge.rs`
 - Tests: `checkout_dry_run_and_alternate_workdir_are_safe`, `merge_dry_run_reports_conflicts_without_opening_conflict_state`, `manual_conflict_resolution_works_through_db_cli_http_and_mcp`

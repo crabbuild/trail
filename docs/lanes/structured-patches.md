@@ -84,7 +84,7 @@ aliases, internal paths, and hardcoded private paths.
 
 ## Code Facts Used
 
-- Patch schema: `crates/trail/src/model/inspect/patch.rs`
-- HTTP patch request schema: `crates/trail/src/server/request_types/patches.rs`
-- Patch policy: `crates/trail/src/db/lane/patch_policy.rs`
+- Patch schema: `trail/src/model/inspect/patch.rs`
+- HTTP patch request schema: `trail/src/server/request_types/patches.rs`
+- Patch policy: `trail/src/db/lane/patch_policy.rs`
 - Tests: `lane_patch_incrementally_handles_rename_delete_and_write`, `lane_patch_can_replace_stable_line_with_expected_text`, `lane_payload_secret_scan_rejects_patch_content_and_redacts_stored_payloads`

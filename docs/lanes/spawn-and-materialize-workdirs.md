@@ -135,6 +135,6 @@ policy would allow the record.
 
 ## Code Facts Used
 
-- Spawn/read/sync args: `crates/trail/src/cli/command/lane_args.rs`
-- Workdir lifecycle: `crates/trail/src/db/lane/lifecycle.rs`, `crates/trail/src/db/lane/workdir`
+- Spawn/read/sync args: `trail/src/cli/command/lane_args.rs`
+- Workdir lifecycle: `trail/src/db/lane/lifecycle.rs`, `trail/src/db/lane/workdir`
 - Tests: `lane_spawn_supports_custom_and_configured_workdirs`, `large_roots_default_lanes_to_no_materialize`, `lane_workdir_sync_refuses_dirty_and_force_refreshes`

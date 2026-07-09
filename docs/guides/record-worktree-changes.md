@@ -61,7 +61,7 @@ For a continuous loop, omit `--once` and tune `--interval-secs`.
 
 ## Code Facts Used
 
-- CLI args: `crates/trail/src/cli/command/worktree_args.rs`
-- Record kind parsing: `crates/trail/src/cli/command/handler/parsing.rs`
+- CLI args: `trail/src/cli/command/worktree_args.rs`
+- Record kind parsing: `trail/src/cli/command/handler/parsing.rs`
 - Tests: `record_paths_records_only_selected_changes`, `record_kind_session_and_allow_ignored_path_are_audited`, `watch_cli_can_attach_recorded_operations_to_session`
 

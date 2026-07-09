@@ -426,10 +426,10 @@ Lanes are designed to keep risky work reviewable:
 
 Use these files when you need to verify the CLI surface from code:
 
-- `crates/trail/src/cli/command/lane_args.rs`
-- `crates/trail/src/cli/command/lane_args/turn.rs`
-- `crates/trail/src/cli/command/lane_args/run.rs`
-- `crates/trail/src/cli/command/lane_args/trace.rs`
-- `crates/trail/src/cli/command/handler/lane.rs`
-- `crates/trail/src/model/reports/lane.rs`
-- `crates/trail/src/model/lane`
+- `trail/src/cli/command/lane_args.rs`
+- `trail/src/cli/command/lane_args/turn.rs`
+- `trail/src/cli/command/lane_args/run.rs`
+- `trail/src/cli/command/lane_args/trace.rs`
+- `trail/src/cli/command/handler/lane.rs`
+- `trail/src/model/reports/lane.rs`
+- `trail/src/model/lane`

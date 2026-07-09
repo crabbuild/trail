@@ -312,10 +312,10 @@ This avoids silent overwrites and gives humans and lane-running hosts an explici
 
 ## Code Facts Used
 
-- Lane lifecycle: `crates/trail/src/db/lane/lifecycle.rs`
-- Lane workdirs: `crates/trail/src/db/lane/workdir`
-- Lane identity/status: `crates/trail/src/db/lane/identity.rs`
-- Lane control: `crates/trail/src/db/lane/control`
-- Leases: `crates/trail/src/db/lane/leases.rs`
-- Readiness/handoff: `crates/trail/src/db/lane/readiness.rs`
-- Merge queue: `crates/trail/src/db/merge`
+- Lane lifecycle: `trail/src/db/lane/lifecycle.rs`
+- Lane workdirs: `trail/src/db/lane/workdir`
+- Lane identity/status: `trail/src/db/lane/identity.rs`
+- Lane control: `trail/src/db/lane/control`
+- Leases: `trail/src/db/lane/leases.rs`
+- Readiness/handoff: `trail/src/db/lane/readiness.rs`
+- Merge queue: `trail/src/db/merge`

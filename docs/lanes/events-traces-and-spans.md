@@ -72,7 +72,7 @@ Trace metadata and event payloads pass through redaction helpers. Common secret-
 
 ## Code Facts Used
 
-- Trace args: `crates/trail/src/cli/command/lane_args/trace.rs`
-- Trace models: `crates/trail/src/model/lane/activity.rs`
-- Redaction: `crates/trail/src/db/util/redaction.rs`
+- Trace args: `trail/src/cli/command/lane_args/trace.rs`
+- Trace models: `trail/src/model/lane/activity.rs`
+- Redaction: `trail/src/db/util/redaction.rs`
 - Tests: `lane_trace_metadata_redacts_common_secrets`, `lane_trace_events_are_queryable_across_cli_api_and_mcp`, `lane_event_and_trace_payload_limits_are_enforced`

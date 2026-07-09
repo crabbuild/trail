@@ -686,9 +686,9 @@ checks automatically.
 
 ## Code Facts Used
 
-- Lane CLI surface: `crates/trail/src/cli/command/lane_args.rs`
-- Session and approvals CLI: `crates/trail/src/cli/command/collaboration_args`
-- Lane models: `crates/trail/src/model/lane`
-- Lane storage and lifecycle: `crates/trail/src/db/lane`
-- Readiness and handoff: `crates/trail/src/db/lane/readiness.rs`
-- Merge queue: `crates/trail/src/db/merge`
+- Lane CLI surface: `trail/src/cli/command/lane_args.rs`
+- Session and approvals CLI: `trail/src/cli/command/collaboration_args`
+- Lane models: `trail/src/model/lane`
+- Lane storage and lifecycle: `trail/src/db/lane`
+- Readiness and handoff: `trail/src/db/lane/readiness.rs`
+- Merge queue: `trail/src/db/merge`

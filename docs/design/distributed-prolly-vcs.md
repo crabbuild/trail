@@ -993,7 +993,7 @@ commit, not the derived row.
 New modules:
 
 ```text
-crates/trail/src/db/version/
+trail/src/db/version/
   mod.rs
   commit.rs
   refs.rs
@@ -1340,19 +1340,19 @@ Compatibility tests:
 
 ## Code Facts Used
 
-- Prolly design and invariants: `crates/prolly/DESIGN.md`
-- Prolly user-facing API: `crates/prolly/src/prolly/README.md`
-- SlateDB prolly backend: `crates/prolly/src/prolly/store/slatedb.rs`
-- Prolly tree handles: `crates/prolly/src/prolly/tree.rs`
-- Prolly named root manifests: `crates/prolly/src/prolly/manifest.rs`
-- Prolly large value/blob helpers: `crates/prolly/src/prolly/blob.rs`
+- Prolly design and invariants: `prolly/DESIGN.md`
+- Prolly user-facing API: `prolly/src/prolly/README.md`
+- SlateDB prolly backend: `prolly/src/prolly/store/slatedb.rs`
+- Prolly tree handles: `prolly/src/prolly/tree.rs`
+- Prolly named root manifests: `prolly/src/prolly/manifest.rs`
+- Prolly large value/blob helpers: `prolly/src/prolly/blob.rs`
 - Trail storage design: `docs/design/storage-and-indexing.md`
 - Trail data model: `docs/design/data-model.md`
 - Git interop guide: `docs/guides/git-interop.md`
 - Git integration overview: `docs/integrations/git.md`
-- Git storage helpers: `crates/trail/src/db/storage/git.rs`
-- Git import/update: `crates/trail/src/db/record/recording/git.rs`
-- Git export: `crates/trail/src/db/merge/git_export.rs`
-- Local refs and CAS: `crates/trail/src/db/storage/refs.rs`
-- Domain objects: `crates/trail/src/model/domain/objects.rs`
-- Domain operations: `crates/trail/src/model/domain/operations.rs`
+- Git storage helpers: `trail/src/db/storage/git.rs`
+- Git import/update: `trail/src/db/record/recording/git.rs`
+- Git export: `trail/src/db/merge/git_export.rs`
+- Local refs and CAS: `trail/src/db/storage/refs.rs`
+- Domain objects: `trail/src/model/domain/objects.rs`
+- Domain operations: `trail/src/model/domain/operations.rs`

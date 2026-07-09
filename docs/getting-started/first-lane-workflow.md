@@ -154,9 +154,9 @@ trail conflicts show <conflict-set-id>
 
 ## Code Facts Used
 
-- Lane CLI args: `crates/trail/src/cli/command/lane_args.rs`
-- Merge queue args: `crates/trail/src/cli/command/collaboration_args/merge.rs`
-- Patch schema: `crates/trail/src/model/inspect/patch.rs`
-- Readiness: `crates/trail/src/db/lane/readiness.rs`
-- Rewind: `crates/trail/src/db/lane/rewind.rs`
+- Lane CLI args: `trail/src/cli/command/lane_args.rs`
+- Merge queue args: `trail/src/cli/command/collaboration_args/merge.rs`
+- Patch schema: `trail/src/model/inspect/patch.rs`
+- Readiness: `trail/src/db/lane/readiness.rs`
+- Rewind: `trail/src/db/lane/rewind.rs`
 - Tests: `lane_patch_can_merge_into_main`, `merge_lane_and_queue_enforce_readiness_blockers`, `merge_queue_pauses_on_conflict`

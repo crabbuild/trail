@@ -135,7 +135,7 @@ Patch messages and edit payloads are secret-scanned before storage. Assignment-s
 
 ## Code Facts Used
 
-- Public patch schema: `crates/trail/src/model/inspect/patch.rs`
-- HTTP patch schema: `crates/trail/src/server/request_types/patches.rs`
-- HTTP parser: `crates/trail/src/server/route/utils.rs`
-- Patch policy: `crates/trail/src/db/lane/patch_policy.rs`
+- Public patch schema: `trail/src/model/inspect/patch.rs`
+- HTTP patch schema: `trail/src/server/request_types/patches.rs`
+- HTTP parser: `trail/src/server/route/utils.rs`
+- Patch policy: `trail/src/db/lane/patch_policy.rs`

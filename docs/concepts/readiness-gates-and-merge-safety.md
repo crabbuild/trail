@@ -66,7 +66,7 @@ Direct non-dry-run merges into the default branch require `--direct`.
 
 ## Code Facts Used
 
-- Readiness: `crates/trail/src/db/lane/readiness.rs`
-- Gate runner: `crates/trail/src/db/lane/gates`
-- Merge queue: `crates/trail/src/db/merge`
+- Readiness: `trail/src/db/lane/readiness.rs`
+- Gate runner: `trail/src/db/lane/gates`
+- Merge queue: `trail/src/db/merge`
 - Tests: `merge_lane_and_queue_enforce_readiness_blockers`, `required_gate_config_blocks_merge_until_test_and_eval_pass`, `dirty_lane_workdir_must_be_recorded_before_merge`

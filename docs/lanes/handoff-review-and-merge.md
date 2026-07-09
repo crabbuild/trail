@@ -80,8 +80,8 @@ Use the queue when multiple branches may target the same branch.
 
 ## Code Facts Used
 
-- Handoff/readiness: `crates/trail/src/db/lane/readiness.rs`
-- Rewind: `crates/trail/src/db/lane/rewind.rs`
-- Contribution: `crates/trail/src/db/lane/identity.rs`
-- Merge queue: `crates/trail/src/db/merge/queue.rs`
+- Handoff/readiness: `trail/src/db/lane/readiness.rs`
+- Rewind: `trail/src/db/lane/rewind.rs`
+- Contribution: `trail/src/db/lane/identity.rs`
+- Merge queue: `trail/src/db/merge/queue.rs`
 - Tests: `merge_queue_runs_lane_branch_into_main`, `merge_lane_and_queue_enforce_readiness_blockers`

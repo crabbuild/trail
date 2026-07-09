@@ -229,9 +229,9 @@ Review this design before changing:
 
 ## Code Facts Used
 
-- Schema DDL/versioning: `crates/trail/src/db/storage/schema`
-- Object storage: `crates/trail/src/db/storage/objects`
-- Worktree index: `crates/trail/src/db/storage/worktree_index.rs`
-- Rebuild/GC: `crates/trail/src/db/storage/lifecycle`
-- Backup/restore: `crates/trail/src/db/core/backup`
-- Prolly config: `crates/trail/src/db/util/prolly.rs`
+- Schema DDL/versioning: `trail/src/db/storage/schema`
+- Object storage: `trail/src/db/storage/objects`
+- Worktree index: `trail/src/db/storage/worktree_index.rs`
+- Rebuild/GC: `trail/src/db/storage/lifecycle`
+- Backup/restore: `trail/src/db/core/backup`
+- Prolly config: `trail/src/db/util/prolly.rs`

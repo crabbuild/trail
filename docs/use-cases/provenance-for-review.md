@@ -32,6 +32,6 @@ Look for:
 
 ## Code Facts Used
 
-- Provenance commands: `crates/trail/src/cli/command/inspect_args.rs`
-- Lane review reports: `crates/trail/src/model/lane/core.rs`
+- Provenance commands: `trail/src/cli/command/inspect_args.rs`
+- Lane review reports: `trail/src/model/lane/core.rs`
 - Tests: `show_history_and_code_from_use_recorded_indexes`, `lane_management_commands_have_backing_apis`

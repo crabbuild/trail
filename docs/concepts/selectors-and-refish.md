@@ -53,7 +53,7 @@ Daemon-backed `diff` enforces exactly one of positional range, `--root`, or `--d
 
 ## Code Facts Used
 
-- Inspect args: `crates/trail/src/cli/command/inspect_args.rs`
-- Diff args and daemon validation: `crates/trail/src/cli/command/worktree_args.rs`, `crates/trail/src/cli/command/handler/daemon_rpc.rs`
-- Ref resolution: `crates/trail/src/db/storage/refs.rs`
+- Inspect args: `trail/src/cli/command/inspect_args.rs`
+- Diff args and daemon validation: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/handler/daemon_rpc.rs`
+- Ref resolution: `trail/src/db/storage/refs.rs`
 - Tests: `refish_aliases_accept_branch_lane_and_root_selectors`, `timeline_branch_scope_accepts_command_flag_and_ref_aliases`

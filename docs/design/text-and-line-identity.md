@@ -178,10 +178,10 @@ The current merge strategy validator accepts `conservative`, `line-id-aware`, an
 
 ## Code Facts Used
 
-- Text model: `crates/trail/src/model/domain/objects.rs`
-- Line IDs: `crates/trail/src/ids.rs`
-- Text building: `crates/trail/src/db/storage/file_build/text.rs`
-- Content loading/materialization: `crates/trail/src/db/storage/content.rs`
-- Line utilities: `crates/trail/src/db/util/line_ops.rs`
-- Patch schema: `crates/trail/src/model/inspect/patch.rs`
+- Text model: `trail/src/model/domain/objects.rs`
+- Line IDs: `trail/src/ids.rs`
+- Text building: `trail/src/db/storage/file_build/text.rs`
+- Content loading/materialization: `trail/src/db/storage/content.rs`
+- Line utilities: `trail/src/db/util/line_ops.rs`
+- Patch schema: `trail/src/model/inspect/patch.rs`
 - Tests: `same_position_rewrite_preserves_line_identity`, `minimal_text_policy_uses_lazy_line_trackable_text`, `lane_patch_can_replace_stable_line_with_expected_text`

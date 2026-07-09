@@ -86,6 +86,6 @@ preserve the current head for later inspection.
 
 ## Code Facts Used
 
-- Lane CLI surface: `crates/trail/src/cli/command/lane_args.rs`
-- Lane models: `crates/trail/src/model/lane`
+- Lane CLI surface: `trail/src/cli/command/lane_args.rs`
+- Lane models: `trail/src/model/lane`
 - Tests: `lane_management_commands_have_backing_apis`, `lane_patch_can_merge_into_main`

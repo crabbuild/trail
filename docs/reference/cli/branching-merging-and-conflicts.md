@@ -72,6 +72,6 @@ rejected rather than ignored.
 
 ## Code Facts Used
 
-- Args: `crates/trail/src/cli/command/worktree_args.rs`, `crates/trail/src/cli/command/collaboration_args/merge.rs`
-- Merge logic: `crates/trail/src/db/merge`
-- Conflict reports: `crates/trail/src/model/reports/merge.rs`
+- Args: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/collaboration_args/merge.rs`
+- Merge logic: `trail/src/db/merge`
+- Conflict reports: `trail/src/model/reports/merge.rs`

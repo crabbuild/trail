@@ -249,8 +249,8 @@ operation.
 
 ### `acp` CLI Module
 
-New files should live under `crates/trail/src/cli/command/acp_args.rs` and
-`crates/trail/src/cli/command/handler/acp.rs`.
+New files should live under `trail/src/cli/command/acp_args.rs` and
+`trail/src/cli/command/handler/acp.rs`.
 
 Responsibilities:
 
@@ -262,7 +262,7 @@ Responsibilities:
 
 ### ACP Transport Runtime
 
-Add an internal transport module, likely under `crates/trail/src/acp`.
+Add an internal transport module, likely under `trail/src/acp`.
 
 Responsibilities:
 
@@ -792,11 +792,11 @@ structured ACP edit mapping is mature.
 
 ## Code Facts Used
 
-- Lane lifecycle: `crates/trail/src/db/lane/lifecycle.rs`
-- Lane branches and activity models: `crates/trail/src/model/lane`
-- Sessions, turns, runs, approvals: `crates/trail/src/db/lane/control`
-- Events and spans: `crates/trail/src/db/lane/control/traces`
-- Lane patching: `crates/trail/src/db/lane/patching.rs`
-- Lane workdir recording: `crates/trail/src/db/lane/workdir`
-- Lane rewind: `crates/trail/src/db/lane/rewind.rs`
-- MCP server: `crates/trail/src/mcp`
+- Lane lifecycle: `trail/src/db/lane/lifecycle.rs`
+- Lane branches and activity models: `trail/src/model/lane`
+- Sessions, turns, runs, approvals: `trail/src/db/lane/control`
+- Events and spans: `trail/src/db/lane/control/traces`
+- Lane patching: `trail/src/db/lane/patching.rs`
+- Lane workdir recording: `trail/src/db/lane/workdir`
+- Lane rewind: `trail/src/db/lane/rewind.rs`
+- MCP server: `trail/src/mcp`

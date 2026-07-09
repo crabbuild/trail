@@ -91,6 +91,6 @@ Or set `TRAIL_DAEMON_URL` and `TRAIL_DAEMON_TOKEN`. Supported hot commands can a
 
 ## Code Facts Used
 
-- Daemon args/auth: `crates/trail/src/cli/command/maintenance_args.rs`, `crates/trail/src/cli/command/handler/maintenance.rs`
-- HTTP transport/auth: `crates/trail/src/server/transport.rs`, `crates/trail/src/server/route/utils.rs`
-- CLI daemon routing: `crates/trail/src/cli/command/handler/daemon_rpc.rs`
+- Daemon args/auth: `trail/src/cli/command/maintenance_args.rs`, `trail/src/cli/command/handler/maintenance.rs`
+- HTTP transport/auth: `trail/src/server/transport.rs`, `trail/src/server/route/utils.rs`
+- CLI daemon routing: `trail/src/cli/command/handler/daemon_rpc.rs`

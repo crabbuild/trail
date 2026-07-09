@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Follow this plan step by step. Run each verification command before moving to the next step. If a STOP condition occurs, stop and report instead of broadening scope. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- crates/trail/src/db/lane/workdir/manifest.rs crates/trail/src/db/lane/lifecycle.rs crates/trail/src/db/storage/content.rs crates/trail/src/db/util/fs_cow.rs`
+> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- trail/src/db/lane/workdir/manifest.rs trail/src/db/lane/lifecycle.rs trail/src/db/storage/content.rs trail/src/db/util/fs_cow.rs`
 >
 > If any in-scope file changed since this plan was written, compare the "Current state" section against live code before proceeding. Treat a semantic mismatch as a STOP condition.
 
@@ -21,11 +21,11 @@ After lane files are cloned or written, Trail scans the destination workdir to b
 
 ## Current state
 
-- `crates/trail/src/db/lane/workdir/manifest.rs` writes clean manifests. Around lines 106-160, `write_clean_workdir_manifest` calls `scan_workdir_file_stamps(dir)`.
+- `trail/src/db/lane/workdir/manifest.rs` writes clean manifests. Around lines 106-160, `write_clean_workdir_manifest` calls `scan_workdir_file_stamps(dir)`.
 - The same module has `write_clean_workdir_manifest_from_disk_manifest` around lines 162-203, and it also calls `scan_workdir_file_stamps(dir)`.
 - `scan_workdir_file_stamps` around lines 333-379 canonicalizes the root, walks visible files, stats each file, and builds `WorkdirFileStamp` values.
-- `crates/trail/src/db/lane/lifecycle.rs` writes the clean workdir manifest after materialization around line 300.
-- `crates/trail/src/db/util/fs_cow.rs` and `crates/trail/src/db/storage/content.rs` already have the file-level write/clone points where destination stamps can be captured.
+- `trail/src/db/lane/lifecycle.rs` writes the clean workdir manifest after materialization around line 300.
+- `trail/src/db/util/fs_cow.rs` and `trail/src/db/storage/content.rs` already have the file-level write/clone points where destination stamps can be captured.
 
 ## Commands you will need
 
@@ -41,10 +41,10 @@ After lane files are cloned or written, Trail scans the destination workdir to b
 
 **In scope**:
 
-- `crates/trail/src/db/lane/workdir/manifest.rs`
-- `crates/trail/src/db/lane/lifecycle.rs`
-- `crates/trail/src/db/storage/content.rs`
-- `crates/trail/src/db/util/fs_cow.rs`
+- `trail/src/db/lane/workdir/manifest.rs`
+- `trail/src/db/lane/lifecycle.rs`
+- `trail/src/db/storage/content.rs`
+- `trail/src/db/util/fs_cow.rs`
 - focused workdir/lane tests
 
 **Out of scope**:

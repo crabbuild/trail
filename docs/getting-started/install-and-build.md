@@ -125,5 +125,5 @@ Trail does not require a background service to use the basic CLI. The daemon is 
 ## Code Facts Used
 
 - Workspace members and Rust version: `Cargo.toml`
-- Binary entrypoint: `crates/trail/src/main.rs`
-- CLI command surface: `crates/trail/src/cli/command.rs`
+- Binary entrypoint: `trail/src/main.rs`
+- CLI command surface: `trail/src/cli/command.rs`

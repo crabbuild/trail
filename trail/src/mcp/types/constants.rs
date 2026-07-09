@@ -90,13 +90,13 @@ pub(crate) const PROMPT_APPLY_AGENT: &str = "trail.apply_agent";
 
 pub(crate) const USER_GUIDE_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/USER_GUIDE.md"
+    "/../docs/USER_GUIDE.md"
 ));
 pub(crate) const LANE_WORKFLOWS_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/LANE_WORKFLOWS.md"
+    "/../docs/LANE_WORKFLOWS.md"
 ));
 pub(crate) const CLI_REFERENCE_MD: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/CLI_REFERENCE.md"
+    "/../docs/CLI_REFERENCE.md"
 ));

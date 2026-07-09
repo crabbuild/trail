@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Follow this plan step by step. Run each verification command before moving to the next step. If a STOP condition occurs, stop and report instead of broadening scope. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- crates/trail/src/db/storage/worktree_index.rs crates/trail/src/db/lane/lifecycle.rs crates/trail/src/db/record/checkout.rs crates/trail/src/db/util/fs_cow.rs`
+> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- trail/src/db/storage/worktree_index.rs trail/src/db/lane/lifecycle.rs trail/src/db/record/checkout.rs trail/src/db/util/fs_cow.rs`
 >
 > If any in-scope file changed since this plan was written, compare the "Current state" section against live code before proceeding. Treat a semantic mismatch as a STOP condition.
 
@@ -21,11 +21,11 @@ The first CoW implementation still pays for a full source workspace walk before 
 
 ## Current state
 
-- `crates/trail/src/db/lane/lifecycle.rs` owns lane workdir materialization. Around lines 256-301, `materialize_lane_workdir_at_paths_with_neighbors` loads root files, calls `workspace_file_stamps_if_entries_match`, tries `materialize_from_workspace_cow`, then writes a clean manifest.
-- `crates/trail/src/db/storage/worktree_index.rs` owns the persisted index. Around lines 330-348, `workspace_file_stamps_if_entries_match` calls `scan_worktree_manifest_indexed_with_stamps`, builds a disk manifest, diffs it against root entries, and returns stamps only when entries match.
-- `crates/trail/src/db/storage/worktree_index.rs` already has `worktree_index_baseline_root` and `set_worktree_index_baseline` around lines 610-624.
-- `crates/trail/src/db/util/fs_cow.rs` still validates source metadata before clone. Around lines 61-83, the stamped CoW helper compares expected file stamps before cloning, so indexed stamp reuse remains protected against source races.
-- `crates/trail/src/db/record/checkout.rs` has a same-root workdir branch around lines 52-78 that currently uses the same scan-based stamp helper before CoW.
+- `trail/src/db/lane/lifecycle.rs` owns lane workdir materialization. Around lines 256-301, `materialize_lane_workdir_at_paths_with_neighbors` loads root files, calls `workspace_file_stamps_if_entries_match`, tries `materialize_from_workspace_cow`, then writes a clean manifest.
+- `trail/src/db/storage/worktree_index.rs` owns the persisted index. Around lines 330-348, `workspace_file_stamps_if_entries_match` calls `scan_worktree_manifest_indexed_with_stamps`, builds a disk manifest, diffs it against root entries, and returns stamps only when entries match.
+- `trail/src/db/storage/worktree_index.rs` already has `worktree_index_baseline_root` and `set_worktree_index_baseline` around lines 610-624.
+- `trail/src/db/util/fs_cow.rs` still validates source metadata before clone. Around lines 61-83, the stamped CoW helper compares expected file stamps before cloning, so indexed stamp reuse remains protected against source races.
+- `trail/src/db/record/checkout.rs` has a same-root workdir branch around lines 52-78 that currently uses the same scan-based stamp helper before CoW.
 
 ## Commands you will need
 
@@ -41,15 +41,15 @@ The first CoW implementation still pays for a full source workspace walk before 
 
 **In scope**:
 
-- `crates/trail/src/db/storage/worktree_index.rs`
-- `crates/trail/src/db/lane/lifecycle.rs`
-- `crates/trail/src/db/record/checkout.rs`
-- `crates/trail/src/db/util/fs_cow.rs` only for small signature changes if needed
-- focused tests under existing `crates/trail` test locations
+- `trail/src/db/storage/worktree_index.rs`
+- `trail/src/db/lane/lifecycle.rs`
+- `trail/src/db/record/checkout.rs`
+- `trail/src/db/util/fs_cow.rs` only for small signature changes if needed
+- focused tests under existing `trail` test locations
 
 **Out of scope**:
 
-- `crates/prolly/**`
+- `prolly/**`
 - object storage formats
 - workdir manifest format
 - broad daemon protocol changes
