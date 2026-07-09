@@ -1,4 +1,4 @@
-export const FLOATING_MENU_CLOSE_EVENT = "crabdb-floating-menu-close";
+export const FLOATING_MENU_CLOSE_EVENT = "trail-floating-menu-close";
 
 export interface FloatingMenuCloseDetail {
   except?: HTMLElement | undefined;

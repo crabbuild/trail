@@ -4,17 +4,17 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OPENCLAW_PATH=${OPENCLAW_PATH:-/Users/haipingfu/Github/openclaw}
 IMAGE=${RUST_IMAGE:-rust:bookworm}
-TARGET_DIR=${CRABDB_DOCKER_TARGET_DIR:-/target}
-CARGO_HOME_DIR=${CRABDB_DOCKER_CARGO_HOME:-/cargo-home}
-CARGO_CACHE_VOLUME=${CRABDB_DOCKER_CARGO_CACHE_VOLUME:-crabdb-overlay-cow-cargo}
-TARGET_CACHE_VOLUME=${CRABDB_DOCKER_TARGET_CACHE_VOLUME:-crabdb-overlay-cow-target}
-LINUX_CACHE_VOLUME=${CRABDB_LINUX_CACHE_VOLUME:-crabdb-linux-source-cache}
+TARGET_DIR=${TRAIL_DOCKER_TARGET_DIR:-/target}
+CARGO_HOME_DIR=${TRAIL_DOCKER_CARGO_HOME:-/cargo-home}
+CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-overlay-cow-cargo}
+TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-overlay-cow-target}
+LINUX_CACHE_VOLUME=${TRAIL_LINUX_CACHE_VOLUME:-trail-linux-source-cache}
 LINUX_REPO_URL=${LINUX_REPO_URL:-https://github.com/torvalds/linux.git}
 LINUX_REF=${LINUX_REF:-}
-RUN_OPENCLAW=${CRABDB_PERF_RUN_OPENCLAW:-1}
-RUN_LINUX=${CRABDB_PERF_RUN_LINUX:-1}
-KEEP_BENCH=${CRABDB_PERF_KEEP_BENCH:-0}
-HOST_BENCH_ROOT=${CRABDB_PERF_HOST_BENCH_ROOT:-}
+RUN_OPENCLAW=${TRAIL_PERF_RUN_OPENCLAW:-1}
+RUN_LINUX=${TRAIL_PERF_RUN_LINUX:-1}
+KEEP_BENCH=${TRAIL_PERF_KEEP_BENCH:-0}
+HOST_BENCH_ROOT=${TRAIL_PERF_HOST_BENCH_ROOT:-}
 
 if [[ "$RUN_OPENCLAW" == "1" && ! -d "$OPENCLAW_PATH/.git" ]]; then
   echo "OpenClaw Git checkout not found at $OPENCLAW_PATH" >&2
@@ -172,7 +172,7 @@ for row in rows:
             row["agent_ms"],
             row["land_dry_run_ms"],
             row["land_ms"],
-            round(row["crabdb_bytes"] / 1024 / 1024, 1),
+            round(row["trail_bytes"] / 1024 / 1024, 1),
             round(row["worktrees_bytes"] / 1024, 1),
             round(row["overlay_bytes"] / 1024, 1),
             row["head_after"][:12],
@@ -190,8 +190,8 @@ verify_tools() {
 }
 
 configure_git() {
-  git config --global user.name "CrabDB Perf"
-  git config --global user.email "crabdb-perf@example.invalid"
+  git config --global user.name "Trail Perf"
+  git config --global user.email "trail-perf@example.invalid"
   git config --global protocol.file.allow always
   git config --global --add safe.directory /host-openclaw || true
 }
@@ -203,7 +203,7 @@ clone_openclaw() {
 }
 
 prepare_linux_cache() {
-  if [[ "${CRABDB_REFRESH_LINUX:-0}" == "1" ]]; then
+  if [[ "${TRAIL_REFRESH_LINUX:-0}" == "1" ]]; then
     rm -rf /linux-cache/linux.git
   fi
   if [[ ! -d /linux-cache/linux.git ]]; then
@@ -231,7 +231,7 @@ benchmark_repo() {
   local clone_ms init_ms agent_ms changes_ms land_dry_run_ms land_ms
   local tracked_files head_before head_after edit_file new_file marker
   local agent_out agent_err changes_json land_json status_tracked
-  local crabdb_bytes worktrees_bytes overlay_bytes
+  local trail_bytes worktrees_bytes overlay_bytes
 
   echo "== $name: clone =="
   if [[ "$clone_kind" == "openclaw" ]]; then
@@ -242,24 +242,24 @@ benchmark_repo() {
     echo "unknown clone kind: $clone_kind" >&2
     exit 1
   fi
-  git -C "$repo" config user.name "CrabDB Perf"
-  git -C "$repo" config user.email "crabdb-perf@example.invalid"
+  git -C "$repo" config user.name "Trail Perf"
+  git -C "$repo" config user.email "trail-perf@example.invalid"
   git -C "$repo" reset --hard HEAD >/dev/null
   git -C "$repo" clean -fdx >/dev/null
 
   tracked_files=$(git -C "$repo" ls-files | wc -l | awk '{print $1}')
   head_before=$(git -C "$repo" rev-parse HEAD)
   edit_file=$(choose_edit_file "$repo")
-  new_file="crabdb-perf/${name}-overlay.txt"
-  marker="crabdb-overlay-perf-${name}-$(date +%s)-$$"
+  new_file="trail-perf/${name}-overlay.txt"
+  marker="trail-overlay-perf-${name}-$(date +%s)-$$"
   agent_out="$BENCH_ROOT/${name}.agent.out"
   agent_err="$BENCH_ROOT/${name}.agent.err"
   changes_json="$BENCH_ROOT/${name}.changes.json"
   land_json="$BENCH_ROOT/${name}.land.json"
 
-  echo "== $name: crabdb init --from-git ($tracked_files files) =="
-  run_timed init_ms "$CRABDB" --workspace "$repo" init --from-git --force
-  "$CRABDB" --workspace "$repo" config set recording.ignore_gitignored false >/dev/null
+  echo "== $name: trail init --from-git ($tracked_files files) =="
+  run_timed init_ms "$TRAIL" --workspace "$repo" init --from-git --force
+  "$TRAIL" --workspace "$repo" config set recording.ignore_gitignored false >/dev/null
   status_tracked=$(git -C "$repo" status --short --untracked-files=no)
   if [[ -n "$status_tracked" ]]; then
     echo "tracked Git status changed after init:" >&2
@@ -271,7 +271,7 @@ benchmark_repo() {
   export PERF_EDIT_FILE="$edit_file"
   export PERF_NEW_FILE="$new_file"
   export PERF_MARKER="$marker"
-  run_timed agent_ms "$CRABDB" --workspace "$repo" agent start \
+  run_timed agent_ms "$TRAIL" --workspace "$repo" agent start \
     --provider custom \
     --workdir-mode overlay-cow \
     -- bash -lc '
@@ -286,7 +286,7 @@ test -f "$PERF_NEW_FILE"
 ' >"$agent_out" 2>"$agent_err"
   grep -F "agent-fs-type=fuseblk" "$agent_out" >/dev/null
 
-  run_timed changes_ms "$CRABDB" --workspace "$repo" agent changes latest --json >"$changes_json"
+  run_timed changes_ms "$TRAIL" --workspace "$repo" agent changes latest --json >"$changes_json"
   python3 - "$changes_json" "$edit_file" "$new_file" <<'PY'
 import json
 import sys
@@ -305,7 +305,7 @@ if any(workdir.iterdir()):
 PY
 
   echo "== $name: agent land dry-run =="
-  run_timed land_dry_run_ms "$CRABDB" --workspace "$repo" agent land latest \
+  run_timed land_dry_run_ms "$TRAIL" --workspace "$repo" agent land latest \
     --dry-run \
     --json >"$BENCH_ROOT/${name}.land-dry-run.json"
   python3 - "$BENCH_ROOT/${name}.land-dry-run.json" "$edit_file" "$new_file" <<'PY'
@@ -321,8 +321,8 @@ if paths != expected:
 PY
 
   echo "== $name: agent land =="
-  run_timed land_ms "$CRABDB" --workspace "$repo" agent land latest \
-    -m "CrabDB overlay perf test for $name" \
+  run_timed land_ms "$TRAIL" --workspace "$repo" agent land latest \
+    -m "Trail overlay perf test for $name" \
     --json >"$land_json"
   head_after=$(git -C "$repo" rev-parse HEAD)
   if [[ "$head_before" == "$head_after" ]]; then
@@ -339,9 +339,9 @@ PY
   grep -F "$marker" "$repo/$new_file" >/dev/null
   git -C "$repo" show --name-only --format='landed-commit=%H%nsubject=%s' HEAD | sed "s/^/$name: /"
 
-  crabdb_bytes=$(du_bytes "$repo/.crabdb")
-  worktrees_bytes=$(du_bytes "$repo/.crabdb/worktrees")
-  overlay_bytes=$(du_bytes "$repo/.crabdb/overlay-cow")
+  trail_bytes=$(du_bytes "$repo/.trail")
+  worktrees_bytes=$(du_bytes "$repo/.trail/worktrees")
+  overlay_bytes=$(du_bytes "$repo/.trail/overlay-cow")
   append_result_json \
     "repo=$name" \
     "tracked_files=$tracked_files" \
@@ -351,7 +351,7 @@ PY
     "changes_ms=$changes_ms" \
     "land_dry_run_ms=$land_dry_run_ms" \
     "land_ms=$land_ms" \
-    "crabdb_bytes=$crabdb_bytes" \
+    "trail_bytes=$trail_bytes" \
     "worktrees_bytes=$worktrees_bytes" \
     "overlay_bytes=$overlay_bytes" \
     "head_before=$head_before" \
@@ -362,10 +362,10 @@ PY
 
 verify_tools
 configure_git
-cargo build -p crabdb
-CRABDB="$CARGO_TARGET_DIR/debug/crabdb"
+cargo build -p trail
+TRAIL="$CARGO_TARGET_DIR/debug/trail"
 
-BENCH_ROOT=${BENCH_ROOT:-$(mktemp -d /tmp/crabdb-overlay-perf.XXXXXX)}
+BENCH_ROOT=${BENCH_ROOT:-$(mktemp -d /tmp/trail-overlay-perf.XXXXXX)}
 mkdir -p "$BENCH_ROOT"
 RESULTS="$BENCH_ROOT/results.jsonl"
 echo "bench-root=$BENCH_ROOT"

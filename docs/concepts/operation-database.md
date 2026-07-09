@@ -1,6 +1,6 @@
 # Operation Database
 
-CrabDB stores a history of operations rather than only snapshots. Each operation records who changed the workspace, which root it changed from and to, which paths changed, and which parent operations it follows.
+Trail stores a history of operations rather than only snapshots. Each operation records who changed the workspace, which root it changed from and to, which paths changed, and which parent operations it follows.
 
 ## Operation Shape
 
@@ -21,7 +21,7 @@ The public `Operation` model contains:
 
 Branches and lane branches point to refs. Refs point to operations and roots. A root describes the full worktree state at that point.
 
-This lets CrabDB answer questions such as:
+This lets Trail answer questions such as:
 
 - What changed in this operation?
 - Which operation introduced this line?
@@ -30,11 +30,11 @@ This lets CrabDB answer questions such as:
 
 ## Relationship to Git
 
-CrabDB can import from and export to Git, but it is not just a Git wrapper. It tracks stable file IDs, line IDs, lane sessions, messages, approvals, test/eval gates, trace events, and merge queue state.
+Trail can import from and export to Git, but it is not just a Git wrapper. It tracks stable file IDs, line IDs, lane sessions, messages, approvals, test/eval gates, trace events, and merge queue state.
 
 ## Code Facts Used
 
-- Operation model: `crates/crabdb/src/model/domain/operations.rs`
-- Ref storage: `crates/crabdb/src/db/storage/refs.rs`
-- Reports: `crates/crabdb/src/model/reports/worktree.rs`, `crates/crabdb/src/model/reports/merge.rs`
+- Operation model: `crates/trail/src/model/domain/operations.rs`
+- Ref storage: `crates/trail/src/db/storage/refs.rs`
+- Reports: `crates/trail/src/model/reports/worktree.rs`, `crates/trail/src/model/reports/merge.rs`
 

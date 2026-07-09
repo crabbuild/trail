@@ -6,7 +6,7 @@ export interface AcpProviderProfile {
   label: string;
   command: string;
   args: string[];
-  crabdbBacked: boolean;
+  trailBacked: boolean;
   supportsTaskName: boolean;
   supportsFromRef: boolean;
 }
@@ -17,8 +17,8 @@ export class ProviderRegistry {
   profiles(): AcpProviderProfile[] {
     const config = getExtensionConfig();
     const builtins: AcpProviderProfile[] = [
-      this.crabDbProviderProfile("claude-code", "Claude Code via CrabDB"),
-      this.crabDbProviderProfile("codex", "Codex via CrabDB")
+      this.trailProviderProfile("claude-code", "Claude Code via Trail"),
+      this.trailProviderProfile("codex", "Codex via Trail")
     ];
 
     const custom = config.customProviders.map((provider) => this.customProfile(provider));
@@ -30,7 +30,7 @@ export class ProviderRegistry {
     return (
       this.profiles().find((profile) => profile.id === config.defaultProvider) ??
       this.profiles()[0] ??
-      this.crabDbProviderProfile("claude-code", "Claude Code via CrabDB")
+      this.trailProviderProfile("claude-code", "Claude Code via Trail")
     );
   }
 
@@ -40,14 +40,14 @@ export class ProviderRegistry {
       profiles.map((profile) => ({
         label: profile.label,
         description: profile.id,
-        detail: profile.crabdbBacked
-          ? "Runs through CrabDB so transcripts, checkpoints, and review state are durable."
-          : "Custom ACP command. Use a CrabDB relay command to keep CrabDB as source of truth.",
+        detail: profile.trailBacked
+          ? "Runs through Trail so transcripts, checkpoints, and review state are durable."
+          : "Custom ACP command. Use a Trail relay command to keep Trail as source of truth.",
         profile
       })),
       {
         title: "Choose ACP agent provider",
-        placeHolder: "Provider for this CrabDB agent task"
+        placeHolder: "Provider for this Trail agent task"
       }
     );
     return picked?.profile;
@@ -56,27 +56,27 @@ export class ProviderRegistry {
   private customProfile(provider: CustomProviderConfig): AcpProviderProfile {
     const command = expandVariables(provider.command, this.workspaceRoot);
     const args = (provider.args ?? []).map((arg) => expandVariables(arg, this.workspaceRoot));
-    const crabdbBacked = command.includes("crabdb") || args.some((arg) => arg.includes("crabdb"));
-    const crabdbAgentAcp = crabdbBacked && args.includes("agent") && args.includes("acp");
+    const trailBacked = command.includes("trail") || args.some((arg) => arg.includes("trail"));
+    const trailAgentAcp = trailBacked && args.includes("agent") && args.includes("acp");
     return {
       id: provider.id,
       label: provider.label,
       command,
       args,
-      crabdbBacked,
-      supportsTaskName: crabdbAgentAcp,
-      supportsFromRef: crabdbAgentAcp
+      trailBacked,
+      supportsTaskName: trailAgentAcp,
+      supportsFromRef: trailAgentAcp
     };
   }
 
-  private crabDbProviderProfile(id: string, label: string): AcpProviderProfile {
+  private trailProviderProfile(id: string, label: string): AcpProviderProfile {
     const config = getExtensionConfig();
     return {
       id,
       label,
-      command: config.crabdbPath,
+      command: config.trailPath,
       args: ["--workspace", this.workspaceRoot, "agent", "acp", "--provider", id],
-      crabdbBacked: true,
+      trailBacked: true,
       supportsTaskName: true,
       supportsFromRef: true
     };
@@ -88,5 +88,5 @@ function expandVariables(value: string, workspaceRoot: string): string {
   return value
     .replaceAll("${workspaceFolder}", workspaceRoot)
     .replaceAll("${workspaceRoot}", workspaceRoot)
-    .replaceAll("${crabdbPath}", config.crabdbPath);
+    .replaceAll("${trailPath}", config.trailPath);
 }

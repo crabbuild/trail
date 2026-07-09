@@ -16,7 +16,7 @@ function baseProps(overrides: Partial<RecoveryBannerProps> = {}): RecoveryBanner
     ariaLive: "assertive",
     eyebrow: "Agent interrupted",
     title: "Provider stopped early",
-    description: "Partial transcript and lane changes remain in CrabDB.",
+    description: "Partial transcript and lane changes remain in Trail.",
     detail: "The provider exited before the turn finished.",
     badges: ["exit 1", "12:34"],
     actions: [
@@ -62,7 +62,7 @@ test("renders overlap warning paths and coordination actions", () => {
       ariaLive: "polite",
       eyebrow: "Parallel work overlap",
       title: "Schema task also changes src/db/schema.ts",
-      description: "Compare tasks or refresh CrabDB state before applying this lane.",
+      description: "Compare tasks or refresh Trail state before applying this lane.",
       detail: undefined,
       badges: ["2 tasks", "3 shared paths"],
       actions: [

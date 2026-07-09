@@ -1,6 +1,6 @@
-# CrabDB User Guide
+# Trail User Guide
 
-CrabDB records workspace state, structured changes, and agent activity in a local content-addressed database.
+Trail records workspace state, structured changes, and agent activity in a local content-addressed database.
 
 Start here:
 

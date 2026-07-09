@@ -16,8 +16,8 @@ test("renders ready transcript empty states with shadcn Empty and Button parts",
     variant: "ready",
     ariaLabel: "Empty transcript",
     iconHtml,
-    roleLabel: "CrabDB workspace",
-    title: "Ready for a CrabDB turn",
+    roleLabel: "Trail workspace",
+    title: "Ready for a Trail turn",
     description: "Message the agent.",
     actions: [
       { action: "focusComposer", label: "Write a message", iconHtml, tone: "primary", disabled: false },
@@ -34,7 +34,7 @@ test("renders ready transcript empty states with shadcn Empty and Button parts",
   assert.match(html, /data-slot="badge"/);
   assert.match(html, /empty-state-role/);
   assert.match(html, /data-slot="empty-title"/);
-  assert.match(html, /Ready for a CrabDB turn/);
+  assert.match(html, /Ready for a Trail turn/);
   assert.match(html, /data-slot="button"/);
   assert.match(html, /data-action="focusComposer"/);
   assert.match(html, /Write a message/);

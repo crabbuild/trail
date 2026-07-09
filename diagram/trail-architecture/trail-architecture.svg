@@ -1,0 +1,313 @@
+<svg viewBox="0 0 1400 980" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Trail Architecture</title>
+  <desc id="desc">Architecture diagram showing Trail entry points, shared core, local durable state, operation provenance, agent coordination, and safety gates.</desc>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap');
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace; }
+    .title { fill: #f8fafc; font-size: 24px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 12px; font-weight: 400; }
+    .region-label { font-size: 10px; font-weight: 700; letter-spacing: 0.5px; }
+    .box-title { fill: #f8fafc; font-size: 12px; font-weight: 700; text-anchor: middle; }
+    .box-sub { fill: #cbd5e1; font-size: 9px; font-weight: 400; text-anchor: middle; }
+    .tiny { fill: #94a3b8; font-size: 8px; font-weight: 400; text-anchor: middle; }
+    .note { fill: #cbd5e1; font-size: 10px; font-weight: 400; }
+    .mask { fill: #0f172a; }
+    .primary { fill: rgba(8, 51, 68, 0.45); stroke: #22d3ee; stroke-width: 1.5; }
+    .secondary { fill: rgba(6, 78, 59, 0.45); stroke: #34d399; stroke-width: 1.5; }
+    .tertiary { fill: rgba(76, 29, 149, 0.45); stroke: #a78bfa; stroke-width: 1.5; }
+    .accent { fill: rgba(120, 53, 15, 0.35); stroke: #fbbf24; stroke-width: 1.5; }
+    .alert { fill: rgba(136, 19, 55, 0.42); stroke: #fb7185; stroke-width: 1.5; }
+    .neutral { fill: rgba(30, 41, 59, 0.72); stroke: #94a3b8; stroke-width: 1.5; }
+    .highlight { fill: rgba(59, 130, 246, 0.35); stroke: #60a5fa; stroke-width: 1.5; }
+    .connector { stroke: #64748b; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+    .connector-cyan { stroke: #22d3ee; stroke-width: 1.6; fill: none; marker-end: url(#arrow-cyan); }
+    .connector-green { stroke: #34d399; stroke-width: 1.6; fill: none; marker-end: url(#arrow-green); }
+    .connector-purple { stroke: #a78bfa; stroke-width: 1.6; fill: none; marker-end: url(#arrow-purple); }
+    .connector-orange { stroke: #fb923c; stroke-width: 1.8; fill: none; marker-end: url(#arrow-orange); }
+    .line-cyan { stroke: #22d3ee; stroke-width: 1.6; fill: none; }
+    .connector, .connector-cyan, .connector-green, .connector-purple, .connector-orange, .line-cyan { stroke-linecap: round; stroke-linejoin: round; }
+    .dashed { stroke-dasharray: 7 5; opacity: 0.85; }
+    .region { fill: none; stroke-width: 1.1; stroke-dasharray: 9 5; rx: 12; }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fb923c"/>
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#0f172a"/>
+  <rect width="100%" height="100%" fill="url(#grid)"/>
+
+  <text x="30" y="42" class="title">Trail Architecture</text>
+  <text x="30" y="66" class="subtitle">Local-first operation database for worktrees, provenance, and coding-agent coordination</text>
+
+  <!-- Region boundaries -->
+  <rect x="30" y="95" width="260" height="330" class="region" stroke="#22d3ee"/>
+  <text x="45" y="117" class="region-label" fill="#22d3ee">ENTRY POINTS</text>
+  <rect x="330" y="95" width="345" height="330" class="region" stroke="#34d399"/>
+  <text x="345" y="117" class="region-label" fill="#34d399">SHARED CORE</text>
+  <rect x="720" y="95" width="650" height="330" class="region" stroke="#a78bfa"/>
+  <text x="735" y="117" class="region-label" fill="#a78bfa">LOCAL DURABLE STATE</text>
+  <rect x="30" y="465" width="650" height="300" class="region" stroke="#60a5fa"/>
+  <text x="45" y="487" class="region-label" fill="#60a5fa">OPERATION GRAPH AND PROVENANCE</text>
+  <rect x="720" y="465" width="650" height="300" class="region" stroke="#fb923c"/>
+  <text x="735" y="487" class="region-label" fill="#fb923c">AGENT COORDINATION AND SAFETY</text>
+  <rect x="30" y="805" width="1340" height="125" class="region" stroke="#94a3b8"/>
+  <text x="45" y="827" class="region-label" fill="#94a3b8">POSITIONING</text>
+
+  <!-- Connection arrows behind boxes -->
+  <path d="M 245 167.5 L 360 167.5" class="connector-cyan"/>
+  <path d="M 245 237.5 L 318 237.5" class="line-cyan"/>
+  <path d="M 245 307.5 L 318 307.5" class="line-cyan"/>
+  <path d="M 318 237.5 L 318 307.5" class="line-cyan"/>
+  <path d="M 318 272.5 L 360 272.5" class="connector-cyan"/>
+  <path d="M 245 377.5 L 360 377.5" class="connector-cyan"/>
+  <path d="M 642 167.5 C 690 167.5 705 175 760 175" class="connector-green"/>
+  <path d="M 642 272.5 C 695 272.5 708 285 760 285" class="connector-green"/>
+  <path d="M 930 285 L 985 285" class="connector-green"/>
+  <path d="M 1070 215 L 1070 245" class="connector-purple dashed"/>
+  <path d="M 174 570 L 285 570" class="connector"/>
+  <path d="M 405 570 L 505 570" class="connector"/>
+  <path d="M 565 600 L 565 665" class="connector"/>
+  <path d="M 565 665 L 430 665" class="connector"/>
+  <path d="M 330 665 L 225 665" class="connector"/>
+  <path d="M 1215 577.5 L 1260 577.5" class="connector-orange"/>
+  <path d="M 1055 577.5 L 1090 577.5" class="connector-orange"/>
+  <path d="M 890 577.5 L 925 577.5" class="connector-orange"/>
+  <path d="M 1055 665 L 1120 665" class="connector-orange"/>
+  <path d="M 1225 665 L 1260 665" class="connector-orange"/>
+  <path d="M 990 744 C 1080 760 1195 760 1300 744" class="connector-orange dashed"/>
+
+  <!-- Entry point boxes -->
+  <g>
+    <rect x="60" y="140" width="185" height="55" rx="6" class="mask"/>
+    <rect x="60" y="140" width="185" height="55" rx="6" class="primary"/>
+    <text x="152.5" y="162" class="box-title">CLI</text>
+    <text x="152.5" y="178" class="box-sub">clap commands</text>
+  </g>
+  <g>
+    <rect x="60" y="210" width="185" height="55" rx="6" class="mask"/>
+    <rect x="60" y="210" width="185" height="55" rx="6" class="primary"/>
+    <text x="152.5" y="232" class="box-title">HTTP daemon</text>
+    <text x="152.5" y="248" class="box-sub">/v1 JSON + OpenAPI</text>
+  </g>
+  <g>
+    <rect x="60" y="280" width="185" height="55" rx="6" class="mask"/>
+    <rect x="60" y="280" width="185" height="55" rx="6" class="primary"/>
+    <text x="152.5" y="302" class="box-title">MCP stdio</text>
+    <text x="152.5" y="318" class="box-sub">tools, resources, prompts</text>
+  </g>
+  <g>
+    <rect x="60" y="350" width="185" height="55" rx="6" class="mask"/>
+    <rect x="60" y="350" width="185" height="55" rx="6" class="primary"/>
+    <text x="152.5" y="372" class="box-title">Rust API</text>
+    <text x="152.5" y="388" class="box-sub">Trail + model reports</text>
+  </g>
+
+  <!-- Core boxes -->
+  <g>
+    <rect x="360" y="125" width="282" height="85" rx="7" class="mask"/>
+    <rect x="360" y="125" width="282" height="85" rx="7" class="secondary"/>
+    <text x="501" y="151" class="box-title">Trail core</text>
+    <text x="501" y="169" class="box-sub">workspace policy, refs, objects</text>
+    <text x="501" y="184" class="box-sub">recording, agents, merge logic</text>
+  </g>
+  <g>
+    <rect x="360" y="242.5" width="125" height="60" rx="6" class="mask"/>
+    <rect x="360" y="242.5" width="125" height="60" rx="6" class="secondary"/>
+    <text x="422.5" y="266.5" class="box-title">Reports</text>
+    <text x="422.5" y="282.5" class="box-sub">shared JSON shapes</text>
+  </g>
+  <g>
+    <rect x="517" y="242.5" width="125" height="60" rx="6" class="mask"/>
+    <rect x="517" y="242.5" width="125" height="60" rx="6" class="secondary"/>
+    <text x="579.5" y="266.5" class="box-title">Config</text>
+    <text x="579.5" y="282.5" class="box-sub">validated settings</text>
+  </g>
+  <g>
+    <rect x="360" y="347.5" width="282" height="60" rx="6" class="mask"/>
+    <rect x="360" y="347.5" width="282" height="60" rx="6" class="secondary"/>
+    <text x="501" y="371.5" class="box-title">Safety and coordination</text>
+    <text x="501" y="387.5" class="box-sub">locks, guardrails, leases, readiness</text>
+  </g>
+
+  <!-- Storage boxes -->
+  <g>
+    <rect x="760" y="135" width="170" height="80" rx="7" class="mask"/>
+    <rect x="760" y="135" width="170" height="80" rx="7" class="tertiary"/>
+    <text x="845" y="162" class="box-title">SQLite</text>
+    <text x="845" y="180" class="box-sub">objects, refs, indexes</text>
+    <text x="845" y="195" class="box-sub">agents, queues, conflicts</text>
+  </g>
+  <g>
+    <rect x="985" y="135" width="170" height="80" rx="7" class="mask"/>
+    <rect x="985" y="135" width="170" height="80" rx="7" class="tertiary"/>
+    <text x="1070" y="162" class="box-title">Prolly maps</text>
+    <text x="1070" y="180" class="box-sub">path maps, file indexes</text>
+    <text x="1070" y="195" class="box-sub">text order, line index</text>
+  </g>
+  <g>
+    <rect x="1210" y="135" width="130" height="80" rx="7" class="mask"/>
+    <rect x="1210" y="135" width="130" height="80" rx="7" class="tertiary"/>
+    <text x="1275" y="162" class="box-title">Sidecars</text>
+    <text x="1275" y="180" class="box-sub">config, HEAD, refs</text>
+    <text x="1275" y="195" class="box-sub">daemon, manifests</text>
+  </g>
+  <g>
+    <rect x="760" y="245" width="170" height="80" rx="7" class="mask"/>
+    <rect x="760" y="245" width="170" height="80" rx="7" class="tertiary"/>
+    <text x="845" y="272" class="box-title">CBOR objects</text>
+    <text x="845" y="290" class="box-sub">operations, roots, text</text>
+    <text x="845" y="305" class="box-sub">messages, anchors, blobs</text>
+  </g>
+  <g>
+    <rect x="985" y="245" width="170" height="80" rx="7" class="mask"/>
+    <rect x="985" y="245" width="170" height="80" rx="7" class="tertiary"/>
+    <text x="1070" y="272" class="box-title">Derived indexes</text>
+    <text x="1070" y="290" class="box-sub">timeline, history, why</text>
+    <text x="1070" y="305" class="box-sub">messages, traces</text>
+  </g>
+  <g>
+    <rect x="1210" y="245" width="130" height="80" rx="7" class="mask"/>
+    <rect x="1210" y="245" width="130" height="80" rx="7" class="tertiary"/>
+    <text x="1275" y="272" class="box-title">Worktree</text>
+    <text x="1275" y="290" class="box-sub">scan cache</text>
+    <text x="1275" y="305" class="box-sub">daemon hints</text>
+  </g>
+  <text x="1070" y="372" class="tiny">derived rows can be rebuilt from reachable objects</text>
+
+  <!-- Operation graph -->
+  <g>
+    <rect x="65" y="540" width="110" height="60" rx="6" class="mask"/>
+    <rect x="65" y="540" width="110" height="60" rx="6" class="highlight"/>
+    <text x="120" y="564" class="box-title">Ref</text>
+    <text x="120" y="580" class="box-sub">main or agent</text>
+  </g>
+  <g>
+    <rect x="285" y="535" width="120" height="70" rx="6" class="mask"/>
+    <rect x="285" y="535" width="120" height="70" rx="6" class="highlight"/>
+    <text x="345" y="561" class="box-title">Operation C</text>
+    <text x="345" y="578" class="box-sub">parents + changes</text>
+    <text x="345" y="592" class="box-sub">after_root Rc</text>
+  </g>
+  <g>
+    <rect x="505" y="535" width="120" height="70" rx="6" class="mask"/>
+    <rect x="505" y="535" width="120" height="70" rx="6" class="highlight"/>
+    <text x="565" y="561" class="box-title">WorktreeRoot</text>
+    <text x="565" y="578" class="box-sub">map roots</text>
+    <text x="565" y="592" class="box-sub">summary counts</text>
+  </g>
+  <g>
+    <rect x="330" y="635" width="100" height="60" rx="6" class="mask"/>
+    <rect x="330" y="635" width="100" height="60" rx="6" class="neutral"/>
+    <text x="380" y="660" class="box-title">Path map</text>
+    <text x="380" y="676" class="box-sub">path -&gt; file</text>
+  </g>
+  <g>
+    <rect x="175" y="635" width="100" height="60" rx="6" class="mask"/>
+    <rect x="175" y="635" width="100" height="60" rx="6" class="neutral"/>
+    <text x="225" y="660" class="box-title">Text</text>
+    <text x="225" y="676" class="box-sub">LineId history</text>
+  </g>
+  <text x="355" y="730" class="tiny">stable FileId and LineId preserve provenance across edits, moves, and merges</text>
+
+  <!-- Agent coordination -->
+  <g>
+    <rect x="760" y="540" width="130" height="75" rx="7" class="mask"/>
+    <rect x="760" y="540" width="130" height="75" rx="7" class="accent"/>
+    <text x="825" y="565" class="box-title">Agent</text>
+    <text x="825" y="583" class="box-sub">identity, provider</text>
+    <text x="825" y="598" class="box-sub">model, metadata</text>
+  </g>
+  <g>
+    <rect x="925" y="540" width="130" height="75" rx="7" class="mask"/>
+    <rect x="925" y="540" width="130" height="75" rx="7" class="accent"/>
+    <text x="990" y="565" class="box-title">Agent branch</text>
+    <text x="990" y="583" class="box-sub">base/head root</text>
+    <text x="990" y="598" class="box-sub">session, workdir</text>
+  </g>
+  <g>
+    <rect x="1090" y="540" width="125" height="75" rx="7" class="mask"/>
+    <rect x="1090" y="540" width="125" height="75" rx="7" class="accent"/>
+    <text x="1152.5" y="565" class="box-title">Agent ref</text>
+    <text x="1152.5" y="583" class="box-sub">refs/agents</text>
+    <text x="1152.5" y="598" class="box-sub">operation head</text>
+  </g>
+  <g>
+    <rect x="1260" y="540" width="80" height="75" rx="7" class="mask"/>
+    <rect x="1260" y="540" width="80" height="75" rx="7" class="accent"/>
+    <text x="1300" y="565" class="box-title">Merge</text>
+    <text x="1300" y="583" class="box-sub">direct or</text>
+    <text x="1300" y="598" class="box-sub">queue</text>
+  </g>
+  <g>
+    <rect x="760" y="635" width="130" height="60" rx="6" class="mask"/>
+    <rect x="760" y="635" width="130" height="60" rx="6" class="neutral"/>
+    <text x="825" y="660" class="box-title">Activity</text>
+    <text x="825" y="676" class="box-sub">sessions, turns, traces</text>
+  </g>
+  <g>
+    <rect x="925" y="635" width="130" height="60" rx="6" class="mask"/>
+    <rect x="925" y="635" width="130" height="60" rx="6" class="alert"/>
+    <text x="990" y="660" class="box-title">Guardrails</text>
+    <text x="990" y="676" class="box-sub">ignore + risk policy</text>
+  </g>
+  <g>
+    <rect x="1120" y="635" width="105" height="60" rx="6" class="mask"/>
+    <rect x="1120" y="635" width="105" height="60" rx="6" class="alert"/>
+    <text x="1172.5" y="660" class="box-title">Approvals</text>
+    <text x="1172.5" y="676" class="box-sub">human gates</text>
+  </g>
+  <g>
+    <rect x="1260" y="635" width="80" height="60" rx="6" class="mask"/>
+    <rect x="1260" y="635" width="80" height="60" rx="6" class="accent"/>
+    <text x="1300" y="660" class="box-title">Gates</text>
+    <text x="1300" y="676" class="box-sub">test/eval</text>
+  </g>
+  <text x="1045" y="720" class="tiny">readiness aggregates dirty workdirs, conflicts, approvals, and latest gate results before merge</text>
+
+  <!-- Positioning strip -->
+  <path d="M 76 868 L 1325 868" stroke="#334155" stroke-width="1.2"/>
+  <circle cx="165" cy="868" r="6" fill="#22d3ee"/>
+  <circle cx="410" cy="868" r="6" fill="#34d399"/>
+  <circle cx="690" cy="868" r="6" fill="#a78bfa"/>
+  <circle cx="970" cy="868" r="6" fill="#fb923c"/>
+  <circle cx="1225" cy="868" r="6" fill="#fbbf24"/>
+  <text x="165" y="895" class="box-title">Work happens</text>
+  <text x="165" y="910" class="box-sub">edits + agent turns</text>
+  <text x="410" y="895" class="box-title">Trail records</text>
+  <text x="410" y="910" class="box-sub">operations + provenance</text>
+  <text x="690" y="895" class="box-title">Safety checks</text>
+  <text x="690" y="910" class="box-sub">guardrails + readiness</text>
+  <text x="970" y="895" class="box-title">Reviewed merge</text>
+  <text x="970" y="910" class="box-sub">agent or branch into target</text>
+  <text x="1225" y="895" class="box-title">Git publishes</text>
+  <text x="1225" y="910" class="box-sub">accepted shared history</text>
+
+  <!-- Legend -->
+  <rect x="1080" y="35" width="290" height="44" rx="6" class="mask"/>
+  <rect x="1080" y="35" width="290" height="44" rx="6" fill="rgba(15,23,42,0.85)" stroke="#334155" stroke-width="1"/>
+  <circle cx="1102" cy="57" r="5" fill="#22d3ee"/>
+  <text x="1116" y="60" class="note">interface</text>
+  <circle cx="1182" cy="57" r="5" fill="#34d399"/>
+  <text x="1196" y="60" class="note">core</text>
+  <circle cx="1248" cy="57" r="5" fill="#a78bfa"/>
+  <text x="1262" y="60" class="note">storage</text>
+  <circle cx="1324" cy="57" r="5" fill="#fb7185"/>
+  <text x="1338" y="60" class="note">safety</text>
+</svg>

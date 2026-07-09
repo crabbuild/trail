@@ -1,6 +1,6 @@
 # CLI Reference: Lanes
 
-Lanes are isolated CrabDB workspaces. Use them when you want to try work,
+Lanes are isolated Trail workspaces. Use them when you want to try work,
 review changes, run validation, or coordinate multiple agents without changing
 the main workspace immediately.
 
@@ -13,26 +13,26 @@ Use this page when you want to:
 - Run tests and evaluations in a lane.
 - Inspect advanced turn, run, event, and trace records.
 
-For code-agent tasks, prefer the higher-level `crabdb agent ...` workflow. Use
-`crabdb lane ...` when you need lower-level lane control.
+For code-agent tasks, prefer the higher-level `trail agent ...` workflow. Use
+`trail lane ...` when you need lower-level lane control.
 
 ## Quick Start
 
 ### Create a virtual lane
 
 ```sh
-crabdb lane spawn feature-docs
-crabdb lane status feature-docs
+trail lane spawn feature-docs
+trail lane status feature-docs
 ```
 
-A virtual lane stores branch state in CrabDB and does not create a filesystem
+A virtual lane stores branch state in Trail and does not create a filesystem
 workdir.
 
 ### Create a lane with a workdir
 
 ```sh
-crabdb lane spawn feature-docs --workdir-mode full-cow
-crabdb lane workdir feature-docs
+trail lane spawn feature-docs --workdir-mode full-cow
+trail lane workdir feature-docs
 ```
 
 Use a materialized workdir when an editor, test command, or terminal agent needs
@@ -41,8 +41,8 @@ real files on disk.
 ### Create a sparse lane
 
 ```sh
-crabdb lane spawn docs-only --paths docs README.md
-crabdb lane hydrate docs-only docs/reference/cli/lanes.md
+trail lane spawn docs-only --paths docs README.md
+trail lane hydrate docs-only docs/reference/cli/lanes.md
 ```
 
 Sparse lanes materialize only selected paths. They are useful for bounded agent
@@ -51,11 +51,11 @@ or editor work.
 ### Review and apply later
 
 ```sh
-crabdb lane record feature-docs -m "Draft lane docs"
-crabdb lane review feature-docs
-crabdb lane diff feature-docs --stat
-crabdb lane diff feature-docs --patch
-crabdb lane readiness feature-docs
+trail lane record feature-docs -m "Draft lane docs"
+trail lane review feature-docs
+trail lane diff feature-docs --stat
+trail lane diff feature-docs --patch
+trail lane readiness feature-docs
 ```
 
 `lane` commands do not replace the safe apply workflow. Use higher-level agent
@@ -66,7 +66,7 @@ work.
 
 | Term | Meaning |
 | --- | --- |
-| Lane | A branch-like workspace tracked by CrabDB |
+| Lane | A branch-like workspace tracked by Trail |
 | Base | The change or ref the lane started from |
 | Head | The current latest change on the lane |
 | Workdir | Optional materialized filesystem copy of the lane |
@@ -99,16 +99,16 @@ The common lifecycle is:
 ## Create and Inspect Lanes
 
 ```text
-crabdb lane spawn <NAME> [--from <REF>] \
+trail lane spawn <NAME> [--from <REF>] \
   [--workdir-mode virtual|sparse|full-cow|overlay-cow] \
   [--materialize[=true|false]] [--no-materialize] \
   [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] \
   [--provider <PROVIDER>] [--model <MODEL>]
 
-crabdb lane list
-crabdb lane show <NAME>
-crabdb lane status <NAME>
-crabdb lane rm <NAME> [--force]
+trail lane list
+trail lane show <NAME>
+trail lane status <NAME>
+trail lane rm <NAME> [--force]
 ```
 
 ### Workdir modes
@@ -118,7 +118,7 @@ crabdb lane rm <NAME> [--force]
 | `virtual` | Creates no filesystem workdir. This is the high-scale default. |
 | `sparse` | Materializes only selected paths. |
 | `full-cow` | Materializes the full root and tries filesystem clone COW. |
-| `overlay-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from CrabDB objects; writes land in the lane upper layer. |
+| `overlay-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
 
 Compatibility flags:
 
@@ -127,8 +127,8 @@ Compatibility flags:
 - `--paths <PATH>...` implies a sparse materialized workdir.
 
 `overlay-cow` requires FUSE support when mounted by a runtime such as
-`crabdb agent start --workdir-mode overlay-cow`: macFUSE on macOS, or `/dev/fuse`
-access on Linux. If the mount fails, CrabDB reports the setup error instead of
+`trail agent start --workdir-mode overlay-cow`: macFUSE on macOS, or `/dev/fuse`
+access on Linux. If the mount fails, Trail reports the setup error instead of
 copying the full workdir.
 
 ### Sparse path boundaries
@@ -142,7 +142,7 @@ boundary:
 - Deletes must stay inside the selected paths.
 - Both sides of a rename must stay inside the selected paths.
 
-The boundary is stored with the lane. If a sparse manifest is missing, CrabDB
+The boundary is stored with the lane. If a sparse manifest is missing, Trail
 can restore it during the next valid sparse update.
 
 ### Status output
@@ -158,11 +158,11 @@ can restore it during the next valid sparse update.
 ## Review, Readiness, and Handoff
 
 ```text
-crabdb lane review <NAME> [--limit <N>]
-crabdb lane contribution <NAME> [--limit <N>]
-crabdb lane readiness <NAME>
-crabdb lane refresh-preview <NAME> [--target <BRANCH>]
-crabdb lane handoff <NAME> [--limit <N>]
+trail lane review <NAME> [--limit <N>]
+trail lane contribution <NAME> [--limit <N>]
+trail lane readiness <NAME>
+trail lane refresh-preview <NAME> [--target <BRANCH>]
+trail lane handoff <NAME> [--limit <N>]
 ```
 
 Default limit: 50 for `review`, `contribution`, and `handoff`.
@@ -184,14 +184,14 @@ Default limit: 50 for `review`, `contribution`, and `handoff`.
 ## Coordinate Work
 
 ```text
-crabdb lane claim <NAME> <PATH> [--ttl-secs <SECONDS>]
-crabdb lane message <NAME> --role <ROLE> --text <TEXT> [--session <SESSION>]
+trail lane claim <NAME> <PATH> [--ttl-secs <SECONDS>]
+trail lane message <NAME> --role <ROLE> --text <TEXT> [--session <SESSION>]
 ```
 
 Default claim TTL: 600 seconds.
 
 Claims and write leases are advisory by default. If `lane.claim_enforcement` is
-set to `warn` or `reject`, CrabDB checks writes against active claims and
+set to `warn` or `reject`, Trail checks writes against active claims and
 leases:
 
 - `warn` emits policy warnings.
@@ -204,21 +204,21 @@ or handoff context.
 ## Workdir Editing
 
 ```text
-crabdb lane record <NAME> [-m <MESSAGE>] [--preview]
+trail lane record <NAME> [-m <MESSAGE>] [--preview]
 
-crabdb lane watch <NAME> [-m <MESSAGE>] [--interval-secs <SECONDS>] \
+trail lane watch <NAME> [-m <MESSAGE>] [--interval-secs <SECONDS>] \
   [--debounce-ms <MS>] [--include-untracked] [--once]
 
-crabdb lane read <NAME> <PATH> [--hydrate] [--no-hydrate] [--force] \
+trail lane read <NAME> <PATH> [--hydrate] [--no-hydrate] [--force] \
   [--include-neighbors]
 
-crabdb lane hydrate <NAME> <PATH>... [--force] [--include-neighbors]
-crabdb lane workdir <NAME>
+trail lane hydrate <NAME> <PATH>... [--force] [--include-neighbors]
+trail lane workdir <NAME>
 
-crabdb lane sync-workdir <NAME> [--force] [--paths <PATH>...] \
+trail lane sync-workdir <NAME> [--force] [--paths <PATH>...] \
   [--include-neighbors]
 
-crabdb lane checkout <NAME> [--force] [--dry-run] [--workdir <PATH>]
+trail lane checkout <NAME> [--force] [--dry-run] [--workdir <PATH>]
 ```
 
 ### Record changes
@@ -229,7 +229,7 @@ Use `--preview` before recording risky work. Preview reports:
 
 - Changed paths.
 - Ignored paths.
-- Nested `.git` or `.crabdb` directories.
+- Nested `.git` or `.trail` directories.
 - Symlinks, hardlinks, and external mounts.
 - Oversized changed files.
 - Whether current lane policy would allow the record.
@@ -256,7 +256,7 @@ path before reading unless `--no-hydrate` is set.
 `lane hydrate` is the path-scoped convenience form of:
 
 ```sh
-crabdb lane sync-workdir <NAME> --paths <PATH>...
+trail lane sync-workdir <NAME> --paths <PATH>...
 ```
 
 It uses the same dirty-workdir and safety checks as `sync-workdir --paths`.
@@ -272,7 +272,7 @@ first.
 Human output prints:
 
 ```text
-Rescue workdir: .crabdb/lane-workdir-rescue/...
+Rescue workdir: .trail/lane-workdir-rescue/...
 ```
 
 Full workdir refreshes are staged in a hidden sibling directory and verified
@@ -281,12 +281,12 @@ against a manifest before replacing the visible workdir.
 ## Patches, Diffs, and History
 
 ```text
-crabdb lane apply-patch <NAME> --patch <FILE> \
+trail lane apply-patch <NAME> --patch <FILE> \
   [--allow-ignored] [--allow-stale]
 
-crabdb lane diff <NAME> [--stat] [--patch] [--show-line-ids]
-crabdb lane timeline <NAME> [--limit <N>]
-crabdb lane rewind <NAME> --to <CHANGE|ROOT|REF> \
+trail lane diff <NAME> [--stat] [--patch] [--show-line-ids]
+trail lane timeline <NAME> [--limit <N>]
+trail lane rewind <NAME> --to <CHANGE|ROOT|REF> \
   [--record-current] [--sync-workdir]
 ```
 
@@ -300,10 +300,10 @@ Timeline default limit: 30.
 | `rewind` | Move the lane back to a known change, root, or ref. |
 
 `lane diff --patch` prints a Git-style unified diff. In an interactive
-terminal, CrabDB colorizes patch headers, hunks, additions, and deletions by
+terminal, Trail colorizes patch headers, hunks, additions, and deletions by
 default. Pass the global `--no-color` flag, or set `NO_COLOR=1`, for plain text.
 
-`lane rewind` records a `LaneRewind` operation. With `--record-current`, CrabDB
+`lane rewind` records a `LaneRewind` operation. With `--record-current`, Trail
 first records dirty materialized workdir edits when possible and preserves the
 pre-rewind head as:
 
@@ -317,15 +317,15 @@ head.
 ## Tests, Evals, and Gates
 
 ```text
-crabdb lane test <NAME> [--turn <TURN>] [--timeout-secs <SECONDS>] \
+trail lane test <NAME> [--turn <TURN>] [--timeout-secs <SECONDS>] \
   [--suite <SUITE>] [--score <SCORE>] [--threshold <THRESHOLD>] \
   -- <COMMAND>...
 
-crabdb lane eval <NAME> [--turn <TURN>] [--timeout-secs <SECONDS>] \
+trail lane eval <NAME> [--turn <TURN>] [--timeout-secs <SECONDS>] \
   [--suite <SUITE>] [--score <SCORE>] [--threshold <THRESHOLD>] \
   -- <COMMAND>...
 
-crabdb lane gates <NAME> [--kind <KIND>] [--limit <N>]
+trail lane gates <NAME> [--kind <KIND>] [--limit <N>]
 ```
 
 Defaults:
@@ -341,23 +341,23 @@ scored or model-based checks. Both record gate metadata on the lane.
 ## Turns
 
 Turn commands are lower-level records for prompt and tool workflows. Most users
-will see turns through `crabdb agent ...`, but these commands are useful for
+will see turns through `trail agent ...`, but these commands are useful for
 custom integrations.
 
 ```text
-crabdb lane turn start <NAME> [--from <REF>] [--title <TITLE>] \
+trail lane turn start <NAME> [--from <REF>] [--title <TITLE>] \
   [--base-change <CHANGE>]
 
-crabdb lane turn show <TURN_ID>
-crabdb lane turn message <TURN_ID> --role <ROLE> --text <TEXT>
+trail lane turn show <TURN_ID>
+trail lane turn message <TURN_ID> --role <ROLE> --text <TEXT>
 
-crabdb lane turn event <TURN_ID> --event-type <TYPE> \
+trail lane turn event <TURN_ID> --event-type <TYPE> \
   [--payload-json <JSON>] [--change <CHANGE>] [--message <TEXT>]
 
-crabdb lane turn apply-patch <TURN_ID> --patch <FILE> \
+trail lane turn apply-patch <TURN_ID> --patch <FILE> \
   [--allow-ignored] [--allow-stale]
 
-crabdb lane turn end <TURN_ID> [--status <STATUS>]
+trail lane turn end <TURN_ID> [--status <STATUS>]
 ```
 
 Default turn end status: `completed`.
@@ -367,13 +367,13 @@ Default turn end status: `completed`.
 Runs track paused and resumed lane workflows.
 
 ```text
-crabdb lane run pause <NAME> --reason <REASON> --summary <SUMMARY> \
+trail lane run pause <NAME> --reason <REASON> --summary <SUMMARY> \
   [--state-json <JSON>] [--interruption-json <JSON>] \
   [--session <SESSION>] [--turn <TURN>]
 
-crabdb lane run list [--lane <LANE>] [--status <STATUS>]
-crabdb lane run show <RUN_ID>
-crabdb lane run resume <RUN_ID> [--reviewer <NAME>] [--note <TEXT>]
+trail lane run list [--lane <LANE>] [--status <STATUS>]
+trail lane run show <RUN_ID>
+trail lane run resume <RUN_ID> [--reviewer <NAME>] [--note <TEXT>]
 ```
 
 Use runs when an automation needs to pause for approval, persist state, and
@@ -382,21 +382,21 @@ resume later with reviewer context.
 ## Events and Traces
 
 ```text
-crabdb lane events [--lane <LANE>] [--session <SESSION>] [--turn <TURN>] \
+trail lane events [--lane <LANE>] [--session <SESSION>] [--turn <TURN>] \
   [--type <TYPE>] [--limit <N>]
 
-crabdb lane trace start <TURN_ID> --type <TYPE> --name <NAME> \
+trail lane trace start <TURN_ID> --type <TYPE> --name <NAME> \
   [--parent <SPAN>] [--trace-id <TRACE>] [--attributes-json <JSON>]
 
-crabdb lane trace end <SPAN_ID> [--status <STATUS>] [--result-json <JSON>]
+trail lane trace end <SPAN_ID> [--status <STATUS>] [--result-json <JSON>]
 
-crabdb lane trace list [--lane <LANE>] [--session <SESSION>] \
+trail lane trace list [--lane <LANE>] [--session <SESSION>] \
   [--turn <TURN>] [--trace-id <TRACE>] [--limit <N>]
 
-crabdb lane trace summary [--lane <LANE>] [--session <SESSION>] \
+trail lane trace summary [--lane <LANE>] [--session <SESSION>] \
   [--turn <TURN>] [--trace-id <TRACE>] [--slowest <N>]
 
-crabdb lane trace show <SPAN_ID>
+trail lane trace show <SPAN_ID>
 ```
 
 Defaults:
@@ -426,10 +426,10 @@ Lanes are designed to keep risky work reviewable:
 
 Use these files when you need to verify the CLI surface from code:
 
-- `crates/crabdb/src/cli/command/lane_args.rs`
-- `crates/crabdb/src/cli/command/lane_args/turn.rs`
-- `crates/crabdb/src/cli/command/lane_args/run.rs`
-- `crates/crabdb/src/cli/command/lane_args/trace.rs`
-- `crates/crabdb/src/cli/command/handler/lane.rs`
-- `crates/crabdb/src/model/reports/lane.rs`
-- `crates/crabdb/src/model/lane`
+- `crates/trail/src/cli/command/lane_args.rs`
+- `crates/trail/src/cli/command/lane_args/turn.rs`
+- `crates/trail/src/cli/command/lane_args/run.rs`
+- `crates/trail/src/cli/command/lane_args/trace.rs`
+- `crates/trail/src/cli/command/handler/lane.rs`
+- `crates/trail/src/model/reports/lane.rs`
+- `crates/trail/src/model/lane`

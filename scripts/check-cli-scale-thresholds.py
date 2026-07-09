@@ -118,12 +118,12 @@ def add_derived_file_metrics(metrics_path: pathlib.Path, metrics: dict[str, floa
     add_file_size_metric(
         metrics,
         "sqlite_bytes",
-        root / "repo" / ".crabdb" / "index" / "crabdb.sqlite",
+        root / "repo" / ".trail" / "index" / "trail.sqlite",
     )
     add_file_size_metric(
         metrics,
         "git_sqlite_bytes",
-        root / "git-repo" / ".crabdb" / "index" / "crabdb.sqlite",
+        root / "git-repo" / ".trail" / "index" / "trail.sqlite",
     )
 
 

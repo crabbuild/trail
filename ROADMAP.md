@@ -1,21 +1,21 @@
-# CrabDB Roadmap
+# Trail Roadmap
 
-CrabDB is a local-first operation database for code and text worktrees. Its
+Trail is a local-first operation database for code and text worktrees. Its
 long-term direction is to become the local coordination and provenance layer
 that sits between day-to-day work and Git publication.
 
-Git should remain the shared source-control system. CrabDB should own the local,
+Git should remain the shared source-control system. Trail should own the local,
 high-frequency, pre-commit layer: recorded operations, agent attempts,
 line-level provenance, readiness checks, review handoffs, merge safety, and
 machine-readable state for editors, agents, daemons, and automation.
 
 This roadmap is directional. It describes the product strategy, sequencing, and
-quality gates for CrabDB as it evolves from a powerful local tool into a durable
+quality gates for Trail as it evolves from a powerful local tool into a durable
 platform for human and agent collaboration.
 
 ## Product North Star
 
-CrabDB should make local and agent-driven code work understandable, recoverable,
+Trail should make local and agent-driven code work understandable, recoverable,
 reviewable, and safe to merge.
 
 The core promise is:
@@ -31,7 +31,7 @@ The core promise is:
 
 The current codebase already establishes the main architectural direction:
 
-- Local `.crabdb/` workspace state.
+- Local `.trail/` workspace state.
 - Operation history with content-addressed objects, refs, roots, and rebuildable
   indexes.
 - Stable `ChangeId`, `FileId`, and `LineId` identity for provenance and
@@ -56,7 +56,7 @@ with a separate model.
 ## Strategic Principles
 
 1. Git adjacency over Git replacement.
-   CrabDB should complement Git, not compete with it. Git remains the
+   Trail should complement Git, not compete with it. Git remains the
    publication, synchronization, and ecosystem layer.
 
 2. Local-first by default.
@@ -65,7 +65,7 @@ with a separate model.
    become a hard requirement for basic use.
 
 3. Operations before snapshots.
-   CrabDB should preserve the meaningful action that produced a state, not only
+   Trail should preserve the meaningful action that produced a state, not only
    the final tree. Recorded operations, messages, tests, gates, and approvals
    are part of the product.
 
@@ -79,7 +79,7 @@ with a separate model.
 
 6. Safety is a product feature.
    Dirty workdir checks, conflict sets, approval records, guardrails, leases,
-   gates, and readiness reports are not optional polish. They are how CrabDB
+   gates, and readiness reports are not optional polish. They are how Trail
    earns trust.
 
 7. Scale paths must be explicit.
@@ -91,7 +91,7 @@ with a separate model.
 
 ### Horizon 1: Stabilize the Local Developer Core
 
-Goal: make CrabDB dependable as a daily local operation database for a single
+Goal: make Trail dependable as a daily local operation database for a single
 developer working in normal Git repositories.
 
 Primary outcomes:
@@ -128,7 +128,7 @@ Exit criteria:
 
 ### Horizon 2: Make Agent Workflows Production-Ready
 
-Goal: make CrabDB the reliable local coordination layer for coding agents.
+Goal: make Trail the reliable local coordination layer for coding agents.
 
 Primary outcomes:
 
@@ -165,7 +165,7 @@ Exit criteria:
 
 ### Horizon 3: Promote the Daemon and Integration Surfaces
 
-Goal: make CrabDB useful to editors, agent hosts, local services, and automation
+Goal: make Trail useful to editors, agent hosts, local services, and automation
 without forcing every integration to shell out.
 
 Primary outcomes:
@@ -173,7 +173,7 @@ Primary outcomes:
 - CLI, HTTP, MCP, and Rust APIs expose the same conceptual model.
 - The daemon provides the fast large-repo loop through warmed state and
   watcher-backed dirty snapshots.
-- MCP tools make CrabDB directly useful inside agent hosts.
+- MCP tools make Trail directly useful inside agent hosts.
 - OpenAPI and Rust types are good enough for external integrations.
 
 Key work:
@@ -192,14 +192,14 @@ Key work:
 
 Exit criteria:
 
-- A non-Rust tool can use CrabDB through documented HTTP or MCP workflows.
+- A non-Rust tool can use Trail through documented HTTP or MCP workflows.
 - Repeated large-repo status, diff, record, readiness, trace, and merge
   operations use daemon-backed fast paths.
 - CLI JSON, HTTP, MCP, and Rust reports remain semantically aligned.
 
 ### Horizon 4: Improve Scale, Storage, and Performance
 
-Goal: keep CrabDB viable for large monorepos and high-volume agent workflows.
+Goal: keep Trail viable for large monorepos and high-volume agent workflows.
 
 Primary outcomes:
 
@@ -231,7 +231,7 @@ Exit criteria:
 
 ### Horizon 5: Deepen Provenance and Review Semantics
 
-Goal: make CrabDB the best local source of truth for why code exists.
+Goal: make Trail the best local source of truth for why code exists.
 
 Primary outcomes:
 
@@ -252,23 +252,23 @@ Key work:
   reviews, and accepted contributions.
 - Improve rename, move, and line-rewrite tracking where current heuristics are
   weak.
-- Add provenance views that connect Git commits back to CrabDB operations after
+- Add provenance views that connect Git commits back to Trail operations after
   export or import.
 
 Exit criteria:
 
 - A reviewer can answer "why is this line here?" and "what evidence supports
-  this change?" from documented CrabDB commands or APIs.
+  this change?" from documented Trail commands or APIs.
 - Handoff and contribution reports become practical review artifacts.
 
 ### Horizon 6: Team and Distributed Collaboration
 
-Goal: explore how CrabDB can support teams without sacrificing the local-first
+Goal: explore how Trail can support teams without sacrificing the local-first
 model.
 
 Primary outcomes:
 
-- Local CrabDB state can be selectively shared, exported, synchronized, or
+- Local Trail state can be selectively shared, exported, synchronized, or
   attached to review systems.
 - Teams can preserve agent context and provenance across machines when useful.
 - Shared workflows remain compatible with Git and existing code review systems.
@@ -280,7 +280,7 @@ Potential directions:
 - Signed or verifiable operation records for audit-sensitive workflows.
 - Optional team service for indexing, policy, review artifacts, and agent
   coordination across repositories.
-- Pull-request attachments that summarize CrabDB provenance, gates, approvals,
+- Pull-request attachments that summarize Trail provenance, gates, approvals,
   and agent contributions.
 - Cross-machine agent handoff where a receiving workspace can inspect and
   materialize a contribution safely.
@@ -335,7 +335,7 @@ Quality bar:
 
 ### 1.0
 
-Purpose: declare CrabDB dependable for daily local and agent-assisted work.
+Purpose: declare Trail dependable for daily local and agent-assisted work.
 
 Focus:
 
@@ -348,7 +348,7 @@ Focus:
 
 Quality bar:
 
-- Users can trust CrabDB with important local work.
+- Users can trust Trail with important local work.
 - Integrators can build against supported surfaces.
 - Known limitations are explicit.
 
@@ -393,7 +393,7 @@ Direction:
 Important questions:
 
 - How much line-history detail is useful before output becomes noisy?
-- How should CrabDB present uncertain provenance heuristics?
+- How should Trail present uncertain provenance heuristics?
 - What review workflows need durable anchors?
 
 ### Agent Coordination
@@ -424,7 +424,7 @@ Important questions:
 
 - Which guardrail defaults should be strict?
 - How should policy be configured per workspace, team, or organization?
-- How should CrabDB redact or omit sensitive agent messages and tool payloads?
+- How should Trail redact or omit sensitive agent messages and tool payloads?
 
 ### Interfaces and Ecosystem
 
@@ -458,12 +458,12 @@ Important questions:
 
 ## Evolution Opportunities
 
-CrabDB can evolve in several coherent directions. These are not separate
+Trail can evolve in several coherent directions. These are not separate
 products; they are layers that can grow from the current architecture.
 
 ### Local Operational Memory for Development
 
-CrabDB can become the durable memory of local software work: every meaningful
+Trail can become the durable memory of local software work: every meaningful
 operation, branch attempt, explanation, test result, approval, and handoff can
 be traced without polluting Git history.
 
@@ -472,31 +472,31 @@ workflows.
 
 ### Agent Control Plane
 
-CrabDB can become a local control plane for coding agents: spawn, isolate,
+Trail can become a local control plane for coding agents: spawn, isolate,
 claim, patch, test, approve, review, handoff, and merge. The product should make
 agent work observable and governable rather than magical.
 
 ### Provenance Layer for Code Review
 
-CrabDB can produce review artifacts that explain not only what changed, but
+Trail can produce review artifacts that explain not only what changed, but
 which operation or agent introduced it, what evidence exists, what risks were
 identified, and what approvals were granted.
 
 ### Editor and IDE Substrate
 
-CrabDB can power editor features such as line provenance, local operation
+Trail can power editor features such as line provenance, local operation
 timeline, agent branch inspection, conflict anchors, safe patch application,
 and readiness status directly inside the developer's working environment.
 
 ### Local Automation Database
 
-CrabDB can become a structured local database for automation around code: test
+Trail can become a structured local database for automation around code: test
 runs, eval results, generated review notes, policy decisions, merge queues, and
 maintenance reports can share one data model.
 
 ### Team Review and Audit Fabric
 
-Longer term, CrabDB can support optional sharing of operation bundles, signed
+Longer term, Trail can support optional sharing of operation bundles, signed
 agent contributions, review evidence, and policy results. This should remain
 opt-in and privacy-preserving.
 
@@ -507,7 +507,7 @@ Prefer work that:
 - Increases user trust in recorded local history.
 - Makes agent output easier to review, gate, and merge.
 - Reuses the existing core model across multiple surfaces.
-- Improves correctness or recovery for data already stored in `.crabdb/`.
+- Improves correctness or recovery for data already stored in `.trail/`.
 - Has measurable impact on large-repo or high-volume agent workflows.
 - Reduces conceptual complexity for users or integrators.
 
@@ -522,7 +522,7 @@ Defer work that:
 
 ## Non-Goals
 
-CrabDB should not become:
+Trail should not become:
 
 - A Git replacement.
 - A hosted-only collaboration service.
@@ -538,7 +538,7 @@ Product metrics:
 - Time from install to first recorded operation.
 - Percentage of documented workflows covered by automated smoke tests.
 - Number of integrations using CLI JSON, HTTP, MCP, or Rust reports.
-- Successful agent contributions reviewed and merged through CrabDB workflows.
+- Successful agent contributions reviewed and merged through Trail workflows.
 - Recovery success rate for backup, restore, fsck, and index rebuild scenarios.
 
 Technical metrics:
@@ -571,13 +571,13 @@ Trust metrics:
 
 ## Long-Term Vision
 
-CrabDB should become the standard local substrate for trustworthy human and
+Trail should become the standard local substrate for trustworthy human and
 agent collaboration on code.
 
 In that future:
 
 - Git stores accepted shared history.
-- CrabDB stores the local operational story behind that history.
+- Trail stores the local operational story behind that history.
 - Agents work through explicit branches, patches, gates, approvals, and
   handoffs.
 - Humans can inspect and govern every important step.
@@ -586,5 +586,5 @@ In that future:
 - Teams can optionally exchange provenance and review evidence without giving
   up local-first control.
 
-The best version of CrabDB does not make development feel heavier. It makes the
+The best version of Trail does not make development feel heavier. It makes the
 messy space before a commit visible, structured, and safe enough to trust.

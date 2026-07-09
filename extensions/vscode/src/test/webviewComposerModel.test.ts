@@ -155,7 +155,7 @@ test("builds prompt context rail items for durable fast prompts", () => {
       ["state", "Context ready", "ready"],
       ["context", "2 inline", "ready"],
       ["send", "Enter sends", "active"],
-      ["route", "CrabDB route", "ready"]
+      ["route", "Trail route", "ready"]
     ]
   );
 });

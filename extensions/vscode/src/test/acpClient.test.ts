@@ -9,7 +9,7 @@ import type { AcpProviderProfile } from "../acp/ProviderRegistry";
 import type { RequestPermissionParams, SessionUpdate } from "../shared/acpTypes";
 
 test("AcpClient negotiates capabilities and handles provider updates", async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
   const scriptPath = path.join(tempDir, "stub-acp-agent.mjs");
   fs.writeFileSync(scriptPath, stubAgentSource(), "utf8");
 
@@ -28,7 +28,7 @@ test("AcpClient negotiates capabilities and handles provider updates", async () 
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -137,7 +137,7 @@ test("AcpClient normalizes snake-case session ids for updates and permissions", 
 });
 
 test("AcpClient cancels pending permission requests when cancelling a turn", async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
   const scriptPath = path.join(tempDir, "stub-acp-agent.mjs");
   fs.writeFileSync(scriptPath, cancelPermissionStubSource(), "utf8");
   const provider: AcpProviderProfile = {
@@ -145,7 +145,7 @@ test("AcpClient cancels pending permission requests when cancelling a turn", asy
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -199,9 +199,9 @@ test("AcpClient preserves numeric permission request ids when approving", async 
 });
 
 test("AcpClient serves safe read-only workspace file requests", async () => {
-  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-workspace-"));
-  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
-  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-outside-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-workspace-"));
+  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
+  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-outside-"));
   const workspaceFile = path.join(workspaceRoot, "notes.txt");
   const outsideFile = path.join(outsideRoot, "secret.txt");
   const scriptPath = path.join(providerRoot, "stub-acp-agent.mjs");
@@ -214,7 +214,7 @@ test("AcpClient serves safe read-only workspace file requests", async () => {
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -243,9 +243,9 @@ test("AcpClient serves safe read-only workspace file requests", async () => {
 });
 
 test("AcpClient reads open editor buffers before disk content", async () => {
-  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-workspace-"));
-  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
-  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-outside-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-workspace-"));
+  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
+  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-outside-"));
   const workspaceFile = path.join(workspaceRoot, "notes.txt");
   const outsideFile = path.join(outsideRoot, "secret.txt");
   const scriptPath = path.join(providerRoot, "stub-acp-agent.mjs");
@@ -258,7 +258,7 @@ test("AcpClient reads open editor buffers before disk content", async () => {
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -287,10 +287,10 @@ test("AcpClient reads open editor buffers before disk content", async () => {
 });
 
 test("AcpClient allows reads from advertised additional workspace roots", async () => {
-  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-workspace-"));
-  const additionalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-additional-"));
-  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
-  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-outside-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-workspace-"));
+  const additionalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-additional-"));
+  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
+  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-outside-"));
   const additionalFile = path.join(additionalRoot, "notes.txt");
   const outsideFile = path.join(outsideRoot, "secret.txt");
   const scriptPath = path.join(providerRoot, "stub-acp-agent.mjs");
@@ -303,7 +303,7 @@ test("AcpClient allows reads from advertised additional workspace roots", async 
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -330,9 +330,9 @@ test("AcpClient allows reads from advertised additional workspace roots", async 
 });
 
 test("AcpClient denies additional workspace reads when not advertised", async () => {
-  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-workspace-"));
-  const additionalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-additional-"));
-  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-workspace-"));
+  const additionalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-additional-"));
+  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
   const additionalFile = path.join(additionalRoot, "notes.txt");
   const scriptPath = path.join(providerRoot, "stub-acp-agent.mjs");
   fs.writeFileSync(additionalFile, "extra-zero\nextra-one\n", "utf8");
@@ -343,7 +343,7 @@ test("AcpClient denies additional workspace reads when not advertised", async ()
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -438,9 +438,9 @@ test("AcpClient starts a new session when existing session loading is unsupporte
 });
 
 test("AcpClient sends additional workspace roots when advertised", async () => {
-  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-workspace-"));
-  const additionalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-additional-"));
-  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-workspace-"));
+  const additionalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-additional-"));
+  const providerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
   const scriptPath = path.join(providerRoot, "stub-acp-agent.mjs");
   fs.writeFileSync(
     scriptPath,
@@ -462,7 +462,7 @@ test("AcpClient sends additional workspace roots when advertised", async () => {
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -545,7 +545,7 @@ test("AcpClient leaves prompt requests unbounded so approvals can wait indefinit
     label: "Stub ACP",
     command: process.execPath,
     args: [],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -605,7 +605,7 @@ test("AcpClient forwards stderr and exit signal diagnostics", async () => {
   }
 });
 
-test("AcpClient passes task name and checkpoint ref to CrabDB-backed providers", async () => {
+test("AcpClient passes task name and checkpoint ref to Trail-backed providers", async () => {
   const { client, cleanup } = clientForLifecycleStub(
     lifecycleStubSource({
       capabilities: {},
@@ -1282,7 +1282,7 @@ function clientForLifecycleStub(
   source: string,
   profileOverrides: Partial<AcpProviderProfile> = {}
 ): { client: AcpClient; cleanup(): void } {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-acp-client-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trail-acp-client-"));
   const scriptPath = path.join(tempDir, "stub-acp-agent.mjs");
   fs.writeFileSync(scriptPath, source, "utf8");
   const provider: AcpProviderProfile = {
@@ -1290,7 +1290,7 @@ function clientForLifecycleStub(
     label: "Stub ACP",
     command: process.execPath,
     args: [scriptPath],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false,
     ...profileOverrides

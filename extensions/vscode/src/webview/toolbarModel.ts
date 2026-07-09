@@ -119,7 +119,7 @@ function toolbarRunState(
   if (coordinationSeverity === "warning") {
     return {
       label: "Needs review",
-      detail: "CrabDB has warnings for this lane.",
+      detail: "Trail has warnings for this lane.",
       tone: "warning"
     };
   }
@@ -241,9 +241,9 @@ function toolbarCapabilities(input: ToolbarModelInput): ToolbarCapability[] {
       group: "workflow",
       enabled: durable,
       detail: durable
-        ? "CrabDB persists transcript, checkpoints, review, and queue state."
+        ? "Trail persists transcript, checkpoints, review, and queue state."
         : raw
-          ? "Raw provider route lacks durable CrabDB state."
+          ? "Raw provider route lacks durable Trail state."
           : "Provider route has not reported durability."
     },
     {
@@ -252,10 +252,10 @@ function toolbarCapabilities(input: ToolbarModelInput): ToolbarCapability[] {
       group: "workflow",
       enabled: checkpoints,
       detail: checkpoints
-        ? "Follow-ups can start from a CrabDB checkpoint."
+        ? "Follow-ups can start from a Trail checkpoint."
         : durable
           ? "Checkpoint-start support is not advertised."
-          : "Use a CrabDB-backed provider for checkpoint recovery."
+          : "Use a Trail-backed provider for checkpoint recovery."
     },
     {
       id: "review-gates",
@@ -263,8 +263,8 @@ function toolbarCapabilities(input: ToolbarModelInput): ToolbarCapability[] {
       group: "workflow",
       enabled: durable,
       detail: durable
-        ? "Review, queue, approvals, tests, and evals use CrabDB evidence."
-        : "Durable gate state needs a CrabDB-backed route."
+        ? "Review, queue, approvals, tests, and evals use Trail evidence."
+        : "Durable gate state needs a Trail-backed route."
     },
     {
       id: "commands",

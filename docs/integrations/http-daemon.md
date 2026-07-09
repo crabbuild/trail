@@ -5,7 +5,7 @@ The daemon serves the local JSON HTTP API.
 ## Start
 
 ```sh
-crabdb daemon
+trail daemon
 ```
 
 Options:
@@ -26,7 +26,7 @@ Options:
 The daemon writes:
 
 ```text
-.crabdb/daemon.json
+.trail/daemon.json
 ```
 
 That file contains version, URL, pid, and whether auth is enabled.
@@ -34,7 +34,7 @@ That file contains version, URL, pid, and whether auth is enabled.
 When no token is supplied, the daemon creates or reads:
 
 ```text
-.crabdb/daemon.token
+.trail/daemon.token
 ```
 
 Token files must be regular files; symlink token files are rejected. On Unix,
@@ -76,7 +76,7 @@ Authorization: Bearer <token>
 Or:
 
 ```text
-x-crabdb-token: <token>
+x-trail-token: <token>
 ```
 
 ## CLI Routing
@@ -84,13 +84,13 @@ x-crabdb-token: <token>
 Use:
 
 ```sh
-crabdb --daemon-url http://127.0.0.1:8765 --daemon-token "$TOKEN" status
+trail --daemon-url http://127.0.0.1:8765 --daemon-token "$TOKEN" status
 ```
 
-Or set `CRABDB_DAEMON_URL` and `CRABDB_DAEMON_TOKEN`. Supported hot commands can also auto-discover `.crabdb/daemon.json`.
+Or set `TRAIL_DAEMON_URL` and `TRAIL_DAEMON_TOKEN`. Supported hot commands can also auto-discover `.trail/daemon.json`.
 
 ## Code Facts Used
 
-- Daemon args/auth: `crates/crabdb/src/cli/command/maintenance_args.rs`, `crates/crabdb/src/cli/command/handler/maintenance.rs`
-- HTTP transport/auth: `crates/crabdb/src/server/transport.rs`, `crates/crabdb/src/server/route/utils.rs`
-- CLI daemon routing: `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
+- Daemon args/auth: `crates/trail/src/cli/command/maintenance_args.rs`, `crates/trail/src/cli/command/handler/maintenance.rs`
+- HTTP transport/auth: `crates/trail/src/server/transport.rs`, `crates/trail/src/server/route/utils.rs`
+- CLI daemon routing: `crates/trail/src/cli/command/handler/daemon_rpc.rs`

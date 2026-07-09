@@ -1,13 +1,13 @@
 # CLI Reference: Integrations and Maintenance
 
-This page covers commands that connect CrabDB to external tools and commands
+This page covers commands that connect Trail to external tools and commands
 that keep a workspace healthy.
 
 Use it when you want to:
 
 - Run Claude Code, Codex, Cursor, Gemini, Aider, OpenCode, or another CLI agent
-  through CrabDB.
-- Expose CrabDB as an MCP server.
+  through Trail.
+- Expose Trail as an MCP server.
 - Capture ACP sessions from an editor.
 - Export or import Git changes.
 - Run diagnostics, backups, indexing, cleanup, or the daemon.
@@ -21,52 +21,52 @@ and apply.
 ### Set up an agent provider
 
 ```sh
-crabdb agent doctor --provider claude-code
-crabdb agent setup
+trail agent doctor --provider claude-code
+trail agent setup
 ```
 
 `agent setup` defaults to Claude Code plus VS Code. Use `--provider` for another
 agent:
 
 ```sh
-crabdb agent setup --provider codex
-crabdb agent setup --provider cursor
-crabdb agent setup --provider gemini --editor generic
+trail agent setup --provider codex
+trail agent setup --provider cursor
+trail agent setup --provider gemini --editor generic
 ```
 
 ### Run an agent task from the terminal
 
 ```sh
-crabdb agent start --provider claude-code
-crabdb agent start --provider codex
-crabdb agent start --provider cursor
-crabdb agent start --provider gemini
-crabdb agent start --provider aider
-crabdb agent start --provider opencode
+trail agent start --provider claude-code
+trail agent start --provider codex
+trail agent start --provider cursor
+trail agent start --provider gemini
+trail agent start --provider aider
+trail agent start --provider opencode
 ```
 
 Use `--workdir-mode overlay-cow` when a large repository should be exposed as a
 mounted COW filesystem view instead of a full copied workdir:
 
 ```sh
-crabdb agent start --provider codex --workdir-mode overlay-cow
+trail agent start --provider codex --workdir-mode overlay-cow
 ```
 
 For an unsupported terminal agent, pass the exact command after `--`:
 
 ```sh
-crabdb agent start --provider custom -- my-agent --flag
+trail agent start --provider custom -- my-agent --flag
 ```
 
 ### After the agent runs
 
 ```sh
-crabdb agent
-crabdb agent next
-crabdb agent dashboard latest
-crabdb agent review latest
-crabdb agent validate latest
-crabdb agent land latest --dry-run
+trail agent
+trail agent next
+trail agent dashboard latest
+trail agent review latest
+trail agent validate latest
+trail agent land latest --dry-run
 ```
 
 These commands are intentionally state-aware. If no task exists, they show setup
@@ -82,7 +82,7 @@ validation, apply, or recovery step.
 | `mcp` | MCP stdio server for agent context tools |
 | `git` | Export, import, and inspect Git mappings |
 | `api` | Generate OpenAPI output |
-| `daemon` | Run CrabDB as a local HTTP service |
+| `daemon` | Run Trail as a local HTTP service |
 | `doctor` | Workspace and integration diagnostics |
 | `backup` | Create, verify, and restore backups |
 | `fsck` | Verify repository integrity |
@@ -95,8 +95,8 @@ validation, apply, or recovery step.
 
 | Term | Meaning |
 | --- | --- |
-| Task | One unit of agent work tracked by CrabDB |
-| Lane | Isolated CrabDB branch-like workspace for the task |
+| Task | One unit of agent work tracked by Trail |
+| Lane | Isolated Trail branch-like workspace for the task |
 | Workdir | Filesystem directory where a terminal agent edits; usually full-cow, optionally overlay-cow |
 | Turn | One prompt or response cycle captured from ACP |
 | Checkpoint | Recorded code state that can be reviewed, applied, or rewound |
@@ -122,20 +122,20 @@ The high-level workflow is:
 | `opencode` | No | No | `opencode` | Terminal-first provider |
 | Custom | Command required | Depends on agent | Command required | Pass the command after `--` |
 
-ACP mode gives CrabDB the richest live capture. Terminal mode works with any CLI
+ACP mode gives Trail the richest live capture. Terminal mode works with any CLI
 agent and records the final checkpoint after the process exits. MCP gives native
-agents direct CrabDB context tools when they support MCP.
+agents direct Trail context tools when they support MCP.
 
 ### Setup and diagnostics
 
 | Command | Use it when |
 | --- | --- |
-| `crabdb agent setup` | Print the default Claude Code + VS Code setup |
-| `crabdb agent setup --provider codex` | Print Codex setup |
-| `crabdb agent setup --provider cursor` | Print Cursor setup |
-| `crabdb agent setup --provider gemini` | Print Gemini setup notes |
-| `crabdb agent doctor --provider <PROVIDER>` | Check workspace and provider readiness |
-| `crabdb agent action` | Show runnable setup, review, validation, apply, and recovery actions |
+| `trail agent setup` | Print the default Claude Code + VS Code setup |
+| `trail agent setup --provider codex` | Print Codex setup |
+| `trail agent setup --provider cursor` | Print Cursor setup |
+| `trail agent setup --provider gemini` | Print Gemini setup notes |
+| `trail agent doctor --provider <PROVIDER>` | Check workspace and provider readiness |
+| `trail agent action` | Show runnable setup, review, validation, apply, and recovery actions |
 
 `agent setup` output includes:
 
@@ -147,14 +147,14 @@ agents direct CrabDB context tools when they support MCP.
 ### Start or continue work
 
 ```text
-crabdb agent acp --provider <claude-code|codex|cursor> \
+trail agent acp --provider <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
-crabdb agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
+trail agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
   [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|overlay-cow] \
   [-- <COMMAND>...]
 
-crabdb agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
+trail agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
   [--provider <PROVIDER>] [--name <NAME>] \
   [--workdir-mode full-cow|overlay-cow] [-- <COMMAND>...]
 ```
@@ -176,12 +176,12 @@ edits from a known checkpoint. `agent follow-up` is an alias.
 
 | Command | Output |
 | --- | --- |
-| `crabdb agent` | Current task dashboard, grouped inbox, or setup guidance |
-| `crabdb agent next` | One recommended next command |
-| `crabdb agent status` | Latest task status and risk signal |
-| `crabdb agent guide latest` | Short state-aware workflow |
-| `crabdb agent dashboard latest` | Task board with next action, risk, and readiness |
-| `crabdb agent action latest` | Runnable command palette for the task |
+| `trail agent` | Current task dashboard, grouped inbox, or setup guidance |
+| `trail agent next` | One recommended next command |
+| `trail agent status` | Latest task status and risk signal |
+| `trail agent guide latest` | Short state-aware workflow |
+| `trail agent dashboard latest` | Task board with next action, risk, and readiness |
+| `trail agent action latest` | Runnable command palette for the task |
 
 Readable aliases:
 
@@ -196,38 +196,38 @@ Readable aliases:
 Use `agent ask` when you remember the question but not the command.
 
 ```sh
-crabdb agent ask what should I do next
-crabdb agent ask what changed
-crabdb agent ask what did the agent do
-crabdb agent ask what should I review
-crabdb agent ask what tests should I run
-crabdb agent ask is it safe to land
-crabdb agent ask why did it fail
-crabdb agent ask explain README.md
+trail agent ask what should I do next
+trail agent ask what changed
+trail agent ask what did the agent do
+trail agent ask what should I review
+trail agent ask what tests should I run
+trail agent ask is it safe to land
+trail agent ask why did it fail
+trail agent ask explain README.md
 ```
 
 Add `--selector <TASK>` to ask about a specific task:
 
 ```sh
-crabdb agent ask --selector agent-claude-code-a1b2c3 what changed
+trail agent ask --selector agent-claude-code-a1b2c3 what changed
 ```
 
 ### Review the work
 
 | Need | Command |
 | --- | --- |
-| One compact review dashboard | `crabdb agent review latest` |
-| File-by-file review checklist | `crabdb agent review-map latest` |
-| First file to inspect | `crabdb agent focus latest` |
-| Open the focus file | `crabdb agent open latest` |
-| Changed files with provenance | `crabdb agent files latest` |
-| Why one file changed | `crabdb agent why latest README.md` |
-| Focused context for one file | `crabdb agent file latest README.md` |
-| One ranked change card | `crabdb agent change latest 1` |
-| Chronological timeline | `crabdb agent timeline latest` |
-| One prompt-sized receipt | `crabdb agent turn latest 2` |
-| Latest prompt-sized diff | `crabdb agent turn-diff latest --patch` |
-| Whole task or checkpoint diff | `crabdb agent diff latest --patch` |
+| One compact review dashboard | `trail agent review latest` |
+| File-by-file review checklist | `trail agent review-map latest` |
+| First file to inspect | `trail agent focus latest` |
+| Open the focus file | `trail agent open latest` |
+| Changed files with provenance | `trail agent files latest` |
+| Why one file changed | `trail agent why latest README.md` |
+| Focused context for one file | `trail agent file latest README.md` |
+| One ranked change card | `trail agent change latest 1` |
+| Chronological timeline | `trail agent timeline latest` |
+| One prompt-sized receipt | `trail agent turn latest 2` |
+| Latest prompt-sized diff | `trail agent turn-diff latest --patch` |
+| Whole task or checkpoint diff | `trail agent diff latest --patch` |
 
 Readable aliases:
 
@@ -242,9 +242,9 @@ Readable aliases:
 
 | Command | Use it when |
 | --- | --- |
-| `crabdb agent new latest` | Show changes since the task was last marked reviewed |
-| `crabdb agent mark-reviewed latest` | Mark the current task checkpoint as reviewed |
-| `crabdb agent mark-file-reviewed latest README.md` | Mark one file as reviewed |
+| `trail agent new latest` | Show changes since the task was last marked reviewed |
+| `trail agent mark-reviewed latest` | Mark the current task checkpoint as reviewed |
+| `trail agent mark-file-reviewed latest README.md` | Mark one file as reviewed |
 
 Readable aliases:
 
@@ -256,10 +256,10 @@ Readable aliases:
 
 | Command | Use it when |
 | --- | --- |
-| `crabdb agent validate latest` | Check latest gates and suggested validation |
-| `crabdb agent test-plan latest` | Get a ranked validation checklist |
-| `crabdb agent test latest -- cargo test` | Run and record a test gate |
-| `crabdb agent eval latest -- <COMMAND>` | Run and record an evaluation gate |
+| `trail agent validate latest` | Check latest gates and suggested validation |
+| `trail agent test-plan latest` | Get a ranked validation checklist |
+| `trail agent test latest -- cargo test` | Run and record a test gate |
+| `trail agent eval latest -- <COMMAND>` | Run and record an evaluation gate |
 
 Readable aliases:
 
@@ -270,12 +270,12 @@ Readable aliases:
 
 | Command | Use it when |
 | --- | --- |
-| `crabdb agent risk latest` | Inspect deterministic risk reasons |
-| `crabdb agent confidence latest` | Get the go/no-go verdict |
-| `crabdb agent ready latest` | Check readiness and Git preflight |
-| `crabdb agent land latest --dry-run` | Preview the safe apply path |
-| `crabdb agent land latest` | Apply the task as a Git commit |
-| `crabdb agent finish latest` | Apply and archive the task after success |
+| `trail agent risk latest` | Inspect deterministic risk reasons |
+| `trail agent confidence latest` | Get the go/no-go verdict |
+| `trail agent ready latest` | Check readiness and Git preflight |
+| `trail agent land latest --dry-run` | Preview the safe apply path |
+| `trail agent land latest` | Apply the task as a Git commit |
+| `trail agent finish latest` | Apply and archive the task after success |
 
 Readable aliases:
 
@@ -292,13 +292,13 @@ generated message.
 
 | Command | Use it when |
 | --- | --- |
-| `crabdb agent diagnose latest` | Explain likely failure modes and safe options |
-| `crabdb agent checkpoints latest` | List rewind targets and checkpoint ids |
-| `crabdb agent undo latest` | Undo the latest completed turn |
-| `crabdb agent undo latest --turn 2` | Undo a specific turn |
-| `crabdb agent rewind latest --to before-turn:2` | Rewind to a friendly target |
-| `crabdb agent archive latest` | Hide a completed or irrelevant task |
-| `crabdb agent unarchive <TASK>` | Restore an archived task |
+| `trail agent diagnose latest` | Explain likely failure modes and safe options |
+| `trail agent checkpoints latest` | List rewind targets and checkpoint ids |
+| `trail agent undo latest` | Undo the latest completed turn |
+| `trail agent undo latest --turn 2` | Undo a specific turn |
+| `trail agent rewind latest --to before-turn:2` | Rewind to a friendly target |
+| `trail agent archive latest` | Hide a completed or irrelevant task |
+| `trail agent unarchive <TASK>` | Restore an archived task |
 
 Readable aliases:
 
@@ -311,11 +311,11 @@ Readable aliases:
 
 | Command | Use it when |
 | --- | --- |
-| `crabdb agent inbox` | Group tasks by what needs attention |
-| `crabdb agent board` | Show a low-noise multi-task board |
-| `crabdb agent stack` | Find overlap and safe apply order |
-| `crabdb agent compare <A> <B>` | Compare two tasks directly |
-| `crabdb agent list --all` | List tasks, including archived tasks |
+| `trail agent inbox` | Group tasks by what needs attention |
+| `trail agent board` | Show a low-noise multi-task board |
+| `trail agent stack` | Find overlap and safe apply order |
+| `trail agent compare <A> <B>` | Compare two tasks directly |
+| `trail agent list --all` | List tasks, including archived tasks |
 
 Readable aliases:
 
@@ -326,15 +326,15 @@ Readable aliases:
 
 | Command | Output |
 | --- | --- |
-| `crabdb agent story latest` | Plain-language explanation of what happened |
-| `crabdb agent summary latest` | Post-run cockpit with readiness, risk, and PR draft |
-| `crabdb agent receipt latest` | Copyable Markdown receipt |
-| `crabdb agent handoff latest` | Markdown handoff for another human or agent |
-| `crabdb agent pr latest` | Pull request title and body draft |
-| `crabdb agent report latest --markdown` | Deeper review source bundle |
-| `crabdb agent brief latest` | Compact review packet |
-| `crabdb agent tools latest` | Tool-call audit |
-| `crabdb agent impact latest` | Blast-radius summary |
+| `trail agent story latest` | Plain-language explanation of what happened |
+| `trail agent summary latest` | Post-run cockpit with readiness, risk, and PR draft |
+| `trail agent receipt latest` | Copyable Markdown receipt |
+| `trail agent handoff latest` | Markdown handoff for another human or agent |
+| `trail agent pr latest` | Pull request title and body draft |
+| `trail agent report latest --markdown` | Deeper review source bundle |
+| `trail agent brief latest` | Compact review packet |
+| `trail agent tools latest` | Tool-call audit |
+| `trail agent impact latest` | Blast-radius summary |
 
 Readable aliases:
 
@@ -368,28 +368,28 @@ Use `acp` when you need the low-level ACP relay rather than the higher-level
 task workflow.
 
 ```text
-crabdb acp relay [--lane <LANE>] [--from <REF>] \
+trail acp relay [--lane <LANE>] [--from <REF>] \
   [--materialize[=true|false]] [--no-materialize] [--workdir <PATH>] \
   [--provider <NAME>] [--model <NAME>] [--no-mcp] -- <COMMAND>...
 
-crabdb acp install --agent <claude-code|codex|cursor> \
+trail acp install --agent <claude-code|codex|cursor> \
   [--editor generic|zed] [--dry-run] [--print]
 
-crabdb acp doctor --agent <claude-code|codex|cursor> \
+trail acp doctor --agent <claude-code|codex|cursor> \
   [--relay-command <COMMAND>...]
 
-crabdb acp list
-crabdb acp sessions [--lane <LANE>]
+trail acp list
+trail acp sessions [--lane <LANE>]
 ```
 
 Built-in ACP upstream commands:
 
 ```sh
-crabdb acp relay --provider claude-code --materialize -- \
+trail acp relay --provider claude-code --materialize -- \
   npx -y @agentclientprotocol/claude-agent-acp@latest
 
-crabdb acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
-crabdb acp relay --provider cursor --materialize -- agent acp
+trail acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
+trail acp relay --provider cursor --materialize -- agent acp
 ```
 
 Use `acp install` to print setup snippets. It does not mutate editor
@@ -398,35 +398,35 @@ configuration. Use `acp sessions` to inspect captured ACP sessions.
 ## MCP
 
 ```text
-crabdb mcp
+trail mcp
 ```
 
 Starts the MCP stdio server.
 
 Register this command in agents that support MCP when you want the agent to ask
-CrabDB for workspace context. `agent setup --provider gemini --editor generic`
+Trail for workspace context. `agent setup --provider gemini --editor generic`
 prints the same command as part of the Gemini setup notes.
 
 ## Git Integration
 
 ```text
-crabdb git export <RANGE> [-m <MESSAGE>] [--output <PATH>]
-crabdb git import-update [-m <MESSAGE>]
-crabdb git mappings [--limit <N>]
+trail git export <RANGE> [-m <MESSAGE>] [--output <PATH>]
+trail git import-update [-m <MESSAGE>]
+trail git mappings [--limit <N>]
 ```
 
 | Command | Use it when |
 | --- | --- |
-| `git export` | Convert a CrabDB range to a Git patch or commit-like export |
-| `git import-update` | Pull the current Git working tree back into CrabDB |
-| `git mappings` | Inspect recorded Git-to-CrabDB mappings |
+| `git export` | Convert a Trail range to a Git patch or commit-like export |
+| `git import-update` | Pull the current Git working tree back into Trail |
+| `git mappings` | Inspect recorded Git-to-Trail mappings |
 
 `git mappings` defaults to 30 rows.
 
 ## API
 
 ```text
-crabdb api openapi [--output <PATH>]
+trail api openapi [--output <PATH>]
 ```
 
 Writes the OpenAPI description to stdout or to `--output`.
@@ -434,7 +434,7 @@ Writes the OpenAPI description to stdout or to `--output`.
 ## Daemon
 
 ```text
-crabdb daemon [--host <HOST>] [--port <PORT>] [--once] \
+trail daemon [--host <HOST>] [--port <PORT>] [--once] \
   [--max-requests <N>] [--rate-limit-requests <N>] \
   [--rate-limit-window-secs <SECONDS>] \
   [--connection-timeout-secs <SECONDS>] \
@@ -460,7 +460,7 @@ Rate-limit and timeout values must be greater than zero.
 ## Doctor
 
 ```text
-crabdb doctor
+trail doctor
 ```
 
 Runs workspace and integration diagnostics.
@@ -468,16 +468,16 @@ Runs workspace and integration diagnostics.
 Use provider-specific diagnostics when the question is about agent setup:
 
 ```sh
-crabdb agent doctor --provider claude-code
-crabdb acp doctor --agent claude-code
+trail agent doctor --provider claude-code
+trail acp doctor --agent claude-code
 ```
 
 ## Backup
 
 ```text
-crabdb backup create <OUTPUT> [--overwrite]
-crabdb backup verify <PATH>
-crabdb backup restore <PATH> [--force]
+trail backup create <OUTPUT> [--overwrite]
+trail backup verify <PATH>
+trail backup restore <PATH> [--force]
 ```
 
 | Command | Use it when |
@@ -489,7 +489,7 @@ crabdb backup restore <PATH> [--force]
 ## Fsck
 
 ```text
-crabdb fsck
+trail fsck
 ```
 
 Verifies repository integrity.
@@ -497,8 +497,8 @@ Verifies repository integrity.
 ## Index
 
 ```text
-crabdb index rebuild [--rich-text]
-crabdb index watch [--once] [--iterations <N>] [--interval-ms <MS>]
+trail index rebuild [--rich-text]
+trail index watch [--once] [--iterations <N>] [--interval-ms <MS>]
 ```
 
 | Command | Use it when |
@@ -511,7 +511,7 @@ crabdb index watch [--once] [--iterations <N>] [--interval-ms <MS>]
 ## Garbage Collection
 
 ```text
-crabdb gc [--dry-run]
+trail gc [--dry-run]
 ```
 
 Use `--dry-run` to preview cleanup before deleting unused data.
@@ -520,6 +520,6 @@ Use `--dry-run` to preview cleanup before deleting unused data.
 
 Use these files when you need to verify the CLI surface from code:
 
-- `crates/crabdb/src/cli/command/maintenance_args.rs`
-- `crates/crabdb/src/cli/command/handler/maintenance.rs`
-- `crates/crabdb/src/model/reports/maintenance.rs`
+- `crates/trail/src/cli/command/maintenance_args.rs`
+- `crates/trail/src/cli/command/handler/maintenance.rs`
+- `crates/trail/src/model/reports/maintenance.rs`

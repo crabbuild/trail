@@ -183,13 +183,13 @@ test("replaces same-id live nodes with hydrated nodes without duplicating", () =
   };
   const hydrated = {
     ...live,
-    source: "crabdb" as const
+    source: "trail" as const
   };
 
   const nodes = applyRenderPatchesLocally([live], [{ type: "replace", node: hydrated }]);
   const changes = changedRenderNodesFromPatches([live], [{ type: "replace", node: hydrated }]);
 
-  assert.deepEqual(nodes.map((node) => `${node.id}:${node.source}`), ["message:assistant:msg-hydrated:crabdb"]);
+  assert.deepEqual(nodes.map((node) => `${node.id}:${node.source}`), ["message:assistant:msg-hydrated:trail"]);
   assert.deepEqual([...changes.addedNodeIds], []);
   assert.deepEqual([...changes.removedNodeIds], []);
   assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-hydrated"]);
@@ -207,8 +207,8 @@ test("reconciles cross-source hydrated message replacements by message identity 
   };
   const hydrated = {
     ...live,
-    id: "crabdb-message:turn-1:msg-hydrated-cross-source",
-    source: "crabdb" as const,
+    id: "trail-message:turn-1:msg-hydrated-cross-source",
+    source: "trail" as const,
     timelineOrder: 4,
     updatedAt: "2026-06-27T00:01:00.000Z"
   };
@@ -217,7 +217,7 @@ test("reconciles cross-source hydrated message replacements by message identity 
   const changes = changedRenderNodesFromPatches([live], [{ type: "replace", node: hydrated }]);
 
   assert.deepEqual(nodes.map((node) => `${node.id}:${node.source}`), [
-    "message:assistant:msg-hydrated-cross-source:crabdb"
+    "message:assistant:msg-hydrated-cross-source:trail"
   ]);
   assert.equal(nodes[0]?.timelineOrder, 1);
   assert.deepEqual([...changes.addedNodeIds], []);
@@ -225,7 +225,7 @@ test("reconciles cross-source hydrated message replacements by message identity 
   assert.deepEqual([...changes.changedNodeIds], ["message:assistant:msg-hydrated-cross-source"]);
 });
 
-test("reconciles hydrated prompt turn replacements across CrabDB turn ids locally", () => {
+test("reconciles hydrated prompt turn replacements across Trail turn ids locally", () => {
   const liveUser: Extract<RenderNode, { kind: "message" }> = {
     ...base,
     id: "message:user:turn-live",
@@ -260,23 +260,23 @@ test("reconciles hydrated prompt turn replacements across CrabDB turn ids locall
   };
   const hydratedUser: Extract<RenderNode, { kind: "message" }> = {
     ...liveUser,
-    id: "crabdb-message:turn-crabdb:msg-user",
-    turnId: "turn-crabdb",
-    source: "crabdb",
+    id: "trail-message:turn-trail:msg-user",
+    turnId: "turn-trail",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:00.000Z"
   };
   const hydratedTool: Extract<RenderNode, { kind: "tool" }> = {
     ...liveTool,
     id: "tool:list-files",
-    turnId: "turn-crabdb",
-    source: "crabdb",
+    turnId: "turn-trail",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:01.000Z"
   };
   const hydratedAssistant: Extract<RenderNode, { kind: "message" }> = {
     ...liveAssistant,
-    id: "crabdb-message:turn-crabdb:msg-summary",
-    turnId: "turn-crabdb",
-    source: "crabdb",
+    id: "trail-message:turn-trail:msg-summary",
+    turnId: "turn-trail",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:02.000Z"
   };
   const before = [liveUser, liveTool, liveAssistant];
@@ -292,9 +292,9 @@ test("reconciles hydrated prompt turn replacements across CrabDB turn ids locall
   assert.deepEqual(
     nodes.map((node) => `${node.id}:${node.source}:${node.turnId}`),
     [
-      "message:user:turn-live:crabdb:turn-crabdb",
-      "tool:list-files:live:crabdb:turn-crabdb",
-      "message:assistant:msg-summary:crabdb:turn-crabdb"
+      "message:user:turn-live:trail:turn-trail",
+      "tool:list-files:live:trail:turn-trail",
+      "message:assistant:msg-summary:trail:turn-trail"
     ]
   );
   assert.deepEqual(nodes.map((node) => node.timelineOrder), [1, 2, 3]);
@@ -1193,10 +1193,10 @@ test("keeps local hydrated checkpoints after late live assistant chunks", () => 
   const checkpoint: RenderNode = {
     taskId: "task-1",
     lane: "lane-1",
-    id: "crabdb-checkpoint:turn-1",
+    id: "trail-checkpoint:turn-1",
     kind: "checkpoint",
     turnId: "turn-1",
-    source: "crabdb",
+    source: "trail",
     status: "completed",
     checkpointId: "ch_late",
     label: "Checkpoint ch_late",
@@ -1219,13 +1219,13 @@ test("keeps local hydrated checkpoints after late live assistant chunks", () => 
       "message:assistant:msg-late-hydrated",
       "tool:tool-before-hydrated-checkpoint",
       "message:assistant:msg-late-hydrated:2",
-      "crabdb-checkpoint:turn-1"
+      "trail-checkpoint:turn-1"
     ]
   );
   assert.equal(nodes[2]?.kind === "message" ? nodes[2].text : undefined, "Final persisted answer.");
   assert.equal((nodes[3]?.timelineOrder ?? 0) > (nodes[2]?.timelineOrder ?? 0), true);
   assert.deepEqual([...changes.addedNodeIds], ["message:assistant:msg-late-hydrated:2"]);
-  assert.deepEqual([...changes.changedNodeIds].sort(), ["crabdb-checkpoint:turn-1", "message:assistant:msg-late-hydrated:2"].sort());
+  assert.deepEqual([...changes.changedNodeIds].sort(), ["trail-checkpoint:turn-1", "message:assistant:msg-late-hydrated:2"].sort());
 });
 
 test("keeps reused unknown provider event ids distinct after timeline boundaries", () => {

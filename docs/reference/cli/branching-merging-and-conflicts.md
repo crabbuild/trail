@@ -3,7 +3,7 @@
 ## `checkout`
 
 ```text
-crabdb checkout <TARGET> [--force] [--record-dirty] [--dry-run] [--workdir <PATH>]
+trail checkout <TARGET> [--force] [--record-dirty] [--dry-run] [--workdir <PATH>]
 ```
 
 Materializes a branch, ref, operation, or root into the workspace or alternate workdir.
@@ -11,16 +11,16 @@ Materializes a branch, ref, operation, or root into the workspace or alternate w
 ## `branch`
 
 ```text
-crabdb branch
-crabdb branch <NAME> [--from <REF>]
-crabdb branch --delete <NAME>
-crabdb branch --rename <OLD> --to <NEW>
+trail branch
+trail branch <NAME> [--from <REF>]
+trail branch --delete <NAME>
+trail branch --rename <OLD> --to <NEW>
 ```
 
 ## `merge`
 
 ```text
-crabdb merge <SOURCE> --into <TARGET> [--strategy <STRATEGY>] [--dry-run]
+trail merge <SOURCE> --into <TARGET> [--strategy <STRATEGY>] [--dry-run]
 ```
 
 Allowed strategies are `conservative`, `line-id-aware`, and `line_id_aware`.
@@ -28,7 +28,7 @@ Allowed strategies are `conservative`, `line-id-aware`, and `line_id_aware`.
 ## `merge-lane`
 
 ```text
-crabdb merge-lane <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [--direct]
+trail merge-lane <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [--direct]
 ```
 
 Default target is `main`. Non-dry-run direct merges into the workspace default
@@ -39,11 +39,11 @@ merge.
 ## `merge-queue`
 
 ```text
-crabdb merge-queue add <SOURCE> --into <TARGET> [--priority <N>]
-crabdb merge-queue list
-crabdb merge-queue explain <SELECTOR>
-crabdb merge-queue run [--limit <N>]
-crabdb merge-queue remove <SELECTOR>
+trail merge-queue add <SOURCE> --into <TARGET> [--priority <N>]
+trail merge-queue list
+trail merge-queue explain <SELECTOR>
+trail merge-queue run [--limit <N>]
+trail merge-queue remove <SELECTOR>
 ```
 
 Default priority is 0.
@@ -55,11 +55,11 @@ and suggested next steps without mutating refs or recording conflict state.
 ## `conflicts`
 
 ```text
-crabdb conflicts list
-crabdb conflicts show <CONFLICT_SET_ID> [--limit <N>]
-crabdb conflicts resolve <CONFLICT_SET_ID> --take source
-crabdb conflicts resolve <CONFLICT_SET_ID> --take target
-crabdb conflicts resolve <CONFLICT_SET_ID> --manual <JSON_FILE>
+trail conflicts list
+trail conflicts show <CONFLICT_SET_ID> [--limit <N>]
+trail conflicts resolve <CONFLICT_SET_ID> --take source
+trail conflicts resolve <CONFLICT_SET_ID> --take target
+trail conflicts resolve <CONFLICT_SET_ID> --manual <JSON_FILE>
 ```
 
 `conflicts show` includes a deterministic explanation section with source/target operation provenance, best-effort logical line evidence, conservative resolution recommendations, and next steps. The default explanation limit is 50. Each path also includes a conflict class such as `modify/modify`, `delete/modify`, `rename/modify`, `binary`, `mode`, or `same_insertion_gap`, so reviewers can triage by risk.
@@ -72,6 +72,6 @@ rejected rather than ignored.
 
 ## Code Facts Used
 
-- Args: `crates/crabdb/src/cli/command/worktree_args.rs`, `crates/crabdb/src/cli/command/collaboration_args/merge.rs`
-- Merge logic: `crates/crabdb/src/db/merge`
-- Conflict reports: `crates/crabdb/src/model/reports/merge.rs`
+- Args: `crates/trail/src/cli/command/worktree_args.rs`, `crates/trail/src/cli/command/collaboration_args/merge.rs`
+- Merge logic: `crates/trail/src/db/merge`
+- Conflict reports: `crates/trail/src/model/reports/merge.rs`

@@ -138,17 +138,17 @@ test("keeps failed and destructive tools collapsed without details actions", () 
   );
 });
 
-test("uses CrabDB-specific empty text for persisted tool events", () => {
+test("uses Trail-specific empty text for persisted tool events", () => {
   const model = buildToolPresentation({
     title: "Persisted read",
     toolKind: "read",
     toolStatus: "completed",
     locations: [],
     content: [],
-    source: "crabdb"
+    source: "trail"
   });
 
-  assert.match(model.emptyText, /CrabDB persisted/);
+  assert.match(model.emptyText, /Trail persisted/);
   assert.equal(model.actions.length, 0);
 });
 
@@ -319,7 +319,7 @@ test("normalizes wrapped provider command arguments before rendering", () => {
     rawInput: {
       name: "call_tool",
       arguments: JSON.stringify({
-        command: "npm test --token secret --workspace crabdb",
+        command: "npm test --token secret --workspace trail",
         cwd: "/repo"
       })
     },

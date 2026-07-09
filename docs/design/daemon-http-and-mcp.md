@@ -1,28 +1,28 @@
 # Daemon, HTTP, and MCP
 
-This design section is advanced/internal. It explains how CrabDB exposes the same local database through the daemon, HTTP API, OpenAPI, and MCP stdio server.
+This design section is advanced/internal. It explains how Trail exposes the same local database through the daemon, HTTP API, OpenAPI, and MCP stdio server.
 
 ## Integration Goals
 
-CrabDB has several integration surfaces because different hosts need different tradeoffs:
+Trail has several integration surfaces because different hosts need different tradeoffs:
 
 - CLI: best for humans and shell scripts.
 - HTTP daemon: best for editor integrations and repeated local automation.
 - MCP stdio server: best for agent hosts that can discover tools/resources/prompts.
 - Rust API: best for typed in-process use.
 
-The daemon and MCP layers are adapters over `CrabDb`. They should not develop separate semantics from the core library.
+The daemon and MCP layers are adapters over `Trail`. They should not develop separate semantics from the core library.
 
 ## Daemon Lifecycle
 
-`crabdb daemon` flow:
+`trail daemon` flow:
 
-1. Resolve runtime context and open `CrabDb`.
+1. Resolve runtime context and open `Trail`.
 2. Resolve daemon auth.
 3. Start daemon worktree cache warmup.
 4. Bind a TCP listener.
 5. Compute a local daemon URL.
-6. Prepare endpoint registration under `.crabdb/daemon.json`.
+6. Prepare endpoint registration under `.trail/daemon.json`.
 7. Write endpoint registration after cache warmup if the daemon is still alive.
 8. Serve HTTP requests until `--once`, `--max-requests`, or process exit.
 9. Remove endpoint registration on drop if it still matches this daemon.
@@ -31,12 +31,12 @@ This design lets CLI auto-discovery find the daemon without an external service 
 
 ```mermaid
 flowchart TB
-    Start["crabdb daemon"]
-    Context["Resolve RuntimeContext<br/>and open CrabDb"]
+    Start["trail daemon"]
+    Context["Resolve RuntimeContext<br/>and open Trail"]
     Auth["Resolve auth token<br/>or --no-auth"]
     Cache["Warm daemon worktree cache"]
     Bind["Bind TCP listener"]
-    Register["Write .crabdb/daemon.json<br/>after cache warmup"]
+    Register["Write .trail/daemon.json<br/>after cache warmup"]
     Serve["Serve HTTP requests"]
     Stop{"--once, --max-requests,<br/>or process exit?"}
     Cleanup["Remove matching endpoint registration"]
@@ -61,7 +61,7 @@ The endpoint file contains:
 - process ID
 - auth enabled flag
 
-The CLI reads `.crabdb/daemon.json` during auto-discovery. Invalid, stale, or unsupported endpoint data is ignored.
+The CLI reads `.trail/daemon.json` during auto-discovery. Invalid, stale, or unsupported endpoint data is ignored.
 
 ## Auth Model
 
@@ -70,9 +70,9 @@ Daemon auth defaults to enabled.
 Auth sources in priority order:
 
 1. `--auth-token`
-2. `CRABDB_DAEMON_TOKEN`
+2. `TRAIL_DAEMON_TOKEN`
 3. `--auth-token-file`
-4. `.crabdb/daemon.token`
+4. `.trail/daemon.token`
 
 Token files must be regular files; symlink token files are rejected. If the
 token file does not exist, the daemon generates a 32-byte random token encoded
@@ -87,7 +87,7 @@ daemon while auth is disabled.
 At request time:
 
 - `/v1/health` bypasses auth.
-- Other routes require bearer auth or `x-crabdb-token`.
+- Other routes require bearer auth or `x-trail-token`.
 
 ## HTTP Transport
 
@@ -101,10 +101,10 @@ The HTTP transport is intentionally small and local:
   before routing.
 - It applies 30-second read and write timeouts to accepted TCP connections.
   Slow requests receive `408 Request Timeout` without stopping the listener.
-  `crabdb daemon --connection-timeout-secs` can override the listener timeout;
+  `trail daemon --connection-timeout-secs` can override the listener timeout;
   the value must be greater than zero.
 - It applies a per-peer rate limit on accepted listener connections. The
-  default is 600 requests per 60-second window. `crabdb daemon` exposes
+  default is 600 requests per 60-second window. `trail daemon` exposes
   `--rate-limit-requests` and `--rate-limit-window-secs`, and callers embedding
   the listener can provide a different `ServerRateLimit`. Limit values must be
   greater than zero. Rate-limited responses include `Retry-After`.
@@ -115,7 +115,7 @@ The HTTP transport is intentionally small and local:
   header terminators, duplicate or non-decimal `Content-Length`, bodies without
   `Content-Length`, body length mismatches, and `Transfer-Encoding` requests
   are rejected before routing. Duplicate
-  `Authorization`, `X-CrabDB-Token`, `Origin`, `Host`, and `Idempotency-Key`
+  `Authorization`, `X-Trail-Token`, `Origin`, `Host`, and `Idempotency-Key`
   headers are also rejected so security and retry behavior cannot depend on
   header order.
 - It rejects requests with an `Origin` header unless the origin is well-formed,
@@ -130,7 +130,7 @@ The HTTP transport is intentionally small and local:
 - It dispatches to route handlers.
 - It serializes JSON responses with status, reason, and `Content-Length`.
 
-This is not a general web framework. It is a simple local JSON transport for CrabDB integrations.
+This is not a general web framework. It is a simple local JSON transport for Trail integrations.
 
 ## HTTP Routing
 
@@ -157,12 +157,12 @@ flowchart TB
     Host{"Loopback Host?"}
     Origin{"Loopback Origin<br/>if present?"}
     Health{"GET /v1/health?"}
-    Auth{"Authorized?<br/>Bearer or x-crabdb-token"}
+    Auth{"Authorized?<br/>Bearer or x-trail-token"}
     System{"System route?"}
     Lane{"Lane/collaboration route?"}
-    Core["Call CrabDb method"]
+    Core["Call Trail method"]
     Json["Serialize report JSON"]
-    Error["Error JSON<br/>with CrabDB code"]
+    Error["Error JSON<br/>with Trail code"]
 
     Request --> Normalize
     Normalize --> Host
@@ -183,10 +183,10 @@ flowchart TB
 
 ## Request and Response Shape
 
-HTTP route handlers parse request bodies into typed request structs from `server/request_types`. They call `CrabDb` methods and return report structs serialized as JSON.
-Mutation request bodies use strict typed deserialization: unknown fields are rejected instead of ignored. This catches misspelled keys and prevents clients from believing CrabDB accepted options that were never evaluated.
+HTTP route handlers parse request bodies into typed request structs from `server/request_types`. They call `Trail` methods and return report structs serialized as JSON.
+Mutation request bodies use strict typed deserialization: unknown fields are rejected instead of ignored. This catches misspelled keys and prevents clients from believing Trail accepted options that were never evaluated.
 
-Mutating HTTP requests may include `Idempotency-Key`. CrabDB stores the first
+Mutating HTTP requests may include `Idempotency-Key`. Trail stores the first
 response for a key in `http_idempotency_keys` with method, path, request hash,
 status, and body. A later request with the same key, method, path, and body
 hash replays the stored response without dispatching the mutation again. A
@@ -227,7 +227,7 @@ table.
 
 Audit rows store:
 
-- actor: `http:bearer`, `http:x-crabdb-token`, `http:no-auth`, or `mcp:stdio`
+- actor: `http:bearer`, `http:x-trail-token`, `http:no-auth`, or `mcp:stdio`
 - surface: `http` or `mcp`
 - command: HTTP method/path or MCP tool name
 - lane id and target ref when they can be inferred from structured output,
@@ -246,19 +246,19 @@ The CLI can route supported hot commands through the daemon.
 Explicit routing:
 
 ```sh
-crabdb --daemon-url http://127.0.0.1:8765 --daemon-token "$TOKEN" status
+trail --daemon-url http://127.0.0.1:8765 --daemon-token "$TOKEN" status
 ```
 
 Environment routing:
 
 ```sh
-CRABDB_DAEMON_URL=http://127.0.0.1:8765
-CRABDB_DAEMON_TOKEN=...
+TRAIL_DAEMON_URL=http://127.0.0.1:8765
+TRAIL_DAEMON_TOKEN=...
 ```
 
 Auto-discovery:
 
-- Find `.crabdb/daemon.json`.
+- Find `.trail/daemon.json`.
 - Parse endpoint URL.
 - Resolve token from explicit/env/token file.
 - Try daemon command.
@@ -272,9 +272,9 @@ sequenceDiagram
     participant Discovery as Auto-discovery
     participant Token as Token resolver
     participant Daemon as HTTP daemon
-    participant Local as Local CrabDb
+    participant Local as Local Trail
 
-    CLI->>Discovery: read .crabdb/daemon.json
+    CLI->>Discovery: read .trail/daemon.json
     Discovery-->>CLI: daemon URL if valid
     CLI->>Token: explicit/env/token file
     Token-->>CLI: optional token
@@ -308,15 +308,15 @@ Path groups:
 
 The contract is available through:
 
-- `crabdb api openapi`
+- `trail api openapi`
 - `GET /v1/openapi.json`
-- MCP `crabdb://openapi` resource
+- MCP `trail://openapi` resource
 
 Because OpenAPI is generated from source, docs should describe groups and route intent, while the generated JSON remains the precise route/schema contract.
 
 ## MCP Server
 
-`crabdb mcp` opens a `CrabDb` and serves JSON-RPC over stdio.
+`trail mcp` opens a `Trail` and serves JSON-RPC over stdio.
 Stdio messages are newline-delimited UTF-8 JSON-RPC objects. Each input line is
 bounded to 16 MiB; oversized or non-UTF-8 lines receive JSON-RPC parse errors
 and are drained so the server can continue with the next request.
@@ -329,7 +329,7 @@ Capabilities include:
 - Prompts.
 - Completion.
 
-MCP tool calls dispatch into `CrabDb` methods through `mcp/tool_call` modules. Tools return MCP tool results with structured content and error flags.
+MCP tool calls dispatch into `Trail` methods through `mcp/tool_call` modules. Tools return MCP tool results with structured content and error flags.
 
 ## MCP Tool Organization
 
@@ -341,7 +341,7 @@ Tool groups mirror product workflows:
 - Merge: merge queue and conflicts.
 - Turns: begin/end turn, messages, events, spans, patch application, lane diff, tests/evals, workdir sync/read.
 
-Risk annotations mark tools as read-only, workspace write, destructive write, or open-world write. This helps MCP hosts make safer decisions before calling tools. The MCP dispatcher enforces read-only annotations with a read-only database guard and a storage fingerprint check, so annotated read-only tools fail if they attempt to persist CrabDB state. The workspace status resource also uses a non-mutating status path instead of refreshing persistent index caches. MCP JSON-RPC request envelopes, tool-call params, tool arguments, resource params, prompt params, and completion params reject unknown fields while accepting the reserved `_meta` object where MCP hosts may send it. Mutating MCP tools are audited through `external_mutation_audit`.
+Risk annotations mark tools as read-only, workspace write, destructive write, or open-world write. This helps MCP hosts make safer decisions before calling tools. The MCP dispatcher enforces read-only annotations with a read-only database guard and a storage fingerprint check, so annotated read-only tools fail if they attempt to persist Trail state. The workspace status resource also uses a non-mutating status path instead of refreshing persistent index caches. MCP JSON-RPC request envelopes, tool-call params, tool arguments, resource params, prompt params, and completion params reject unknown fields while accepting the reserved `_meta` object where MCP hosts may send it. Mutating MCP tools are audited through `external_mutation_audit`.
 
 ## MCP Resources and Prompts
 
@@ -373,12 +373,12 @@ The prompts are procedural guidance for hosts; the tools are the executable inte
 ```mermaid
 flowchart LR
     Host["MCP host"]
-    Server["crabdb mcp<br/>stdio JSON-RPC"]
-    Tools["Tools<br/>call CrabDb methods"]
+    Server["trail mcp<br/>stdio JSON-RPC"]
+    Tools["Tools<br/>call Trail methods"]
     Resources["Resources<br/>status, doctor, lanes, OpenAPI, docs"]
     Templates["Resource templates<br/>lane/session/turn/conflict/etc."]
     Prompts["Prompts<br/>execution, review, conflict resolution"]
-    DB["CrabDb"]
+    DB["Trail"]
 
     Host --> Server
     Server --> Tools --> DB
@@ -391,7 +391,7 @@ flowchart LR
 
 When adding a new core behavior:
 
-- Add or update the `CrabDb` method and report type first.
+- Add or update the `Trail` method and report type first.
 - Add CLI args/handler/rendering if human/shell use matters.
 - Add HTTP request/route/OpenAPI schema if editor/API use matters.
 - Add MCP tool/resource/prompt coverage if agent hosts need it.
@@ -408,10 +408,10 @@ When adding a new core behavior:
 
 ## Code Facts Used
 
-- Daemon handler/auth: `crates/crabdb/src/cli/command/handler/maintenance.rs`
-- Daemon routing: `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
-- HTTP transport: `crates/crabdb/src/server/transport.rs`
-- HTTP routes: `crates/crabdb/src/server/route`
-- OpenAPI: `crates/crabdb/src/server/openapi`
-- MCP protocol/capabilities/tools: `crates/crabdb/src/mcp`
+- Daemon handler/auth: `crates/trail/src/cli/command/handler/maintenance.rs`
+- Daemon routing: `crates/trail/src/cli/command/handler/daemon_rpc.rs`
+- HTTP transport: `crates/trail/src/server/transport.rs`
+- HTTP routes: `crates/trail/src/server/route`
+- OpenAPI: `crates/trail/src/server/openapi`
+- MCP protocol/capabilities/tools: `crates/trail/src/mcp`
 - Tests: `cli_daemon_url_routes_hot_lane_commands`, `local_api_and_cli_export_openapi_contract`, `mcp_stdio_tools_drive_lane_turn_workflow`

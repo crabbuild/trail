@@ -2,49 +2,49 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { TaskRepository } from "../../../crabdb/TaskRepository";
+import { TaskRepository } from "../../../trail/TaskRepository";
 import { ChatPanel } from "../../../views/ChatPanel";
 import { DiffContentProvider } from "../../../views/DiffContentProvider";
 
 export async function run(): Promise<void> {
-  const extension = vscode.extensions.getExtension("crabdb.crabdb-vscode");
-  assert.ok(extension, "CrabDB extension should be discoverable by VS Code");
+  const extension = vscode.extensions.getExtension("trail.trail-vscode");
+  assert.ok(extension, "Trail extension should be discoverable by VS Code");
 
   await extension.activate();
   assert.equal(extension.isActive, true);
 
   const commands = await vscode.commands.getCommands(true);
   for (const command of [
-    "crabdb.initWorkspace",
-    "crabdb.newAgentTask",
-    "crabdb.openAgentChat",
-    "crabdb.openLatestReview",
-    "crabdb.applyLatestDryRun",
-    "crabdb.queueMerge",
-    "crabdb.explainQueueEntry",
-    "crabdb.runMergeQueue",
-    "crabdb.removeQueueEntry",
-    "crabdb.rewindTask",
-    "crabdb.preserveFailedAttempt",
-    "crabdb.removeAgentTask",
-    "crabdb.runLaneTest",
-    "crabdb.runLaneEval",
-    "crabdb.openLaneWorkdir",
-    "crabdb.compareTasks",
-    "crabdb.refreshTasks",
-    "crabdb.startDaemon",
-    "crabdb.doctor",
-    "crabdb.openSettings",
-    "crabdb.addAcpProvider",
-    "crabdb.askSelection",
-    "crabdb.attachSelection",
-    "crabdb.showLineHistory",
-    "crabdb.showFileChanges"
+    "trail.initWorkspace",
+    "trail.newAgentTask",
+    "trail.openAgentChat",
+    "trail.openLatestReview",
+    "trail.applyLatestDryRun",
+    "trail.queueMerge",
+    "trail.explainQueueEntry",
+    "trail.runMergeQueue",
+    "trail.removeQueueEntry",
+    "trail.rewindTask",
+    "trail.preserveFailedAttempt",
+    "trail.removeAgentTask",
+    "trail.runLaneTest",
+    "trail.runLaneEval",
+    "trail.openLaneWorkdir",
+    "trail.compareTasks",
+    "trail.refreshTasks",
+    "trail.startDaemon",
+    "trail.doctor",
+    "trail.openSettings",
+    "trail.addAcpProvider",
+    "trail.askSelection",
+    "trail.attachSelection",
+    "trail.showLineHistory",
+    "trail.showFileChanges"
   ]) {
     assert.ok(commands.includes(command), `${command} should be contributed`);
   }
 
-  const config = vscode.workspace.getConfiguration("crabdb");
+  const config = vscode.workspace.getConfiguration("trail");
   assert.equal(typeof config.get("path"), "string");
   assert.equal(typeof config.get("defaultProvider"), "string");
   assertSplitWebviewAssets(extension);
@@ -54,17 +54,17 @@ export async function run(): Promise<void> {
 }
 
 async function runFakeAcpChatSmoke(extension: vscode.Extension<unknown>): Promise<void> {
-  const workspaceRoot = process.env.CRABDB_VSCODE_TEST_WORKSPACE;
-  assert.ok(workspaceRoot, "CRABDB_VSCODE_TEST_WORKSPACE should point at the disposable workspace");
+  const workspaceRoot = process.env.TRAIL_VSCODE_TEST_WORKSPACE;
+  assert.ok(workspaceRoot, "TRAIL_VSCODE_TEST_WORKSPACE should point at the disposable workspace");
 
-  const output = vscode.window.createOutputChannel("CrabDB Agents Test");
+  const output = vscode.window.createOutputChannel("Trail Agents Test");
   const repository = new TaskRepository(workspaceRoot, output);
   const diffProvider = new DiffContentProvider();
   const agent = writeStubAcpAgent(workspaceRoot);
   const provider = {
     id: "vscode-smoke",
-    label: "VS Code Smoke via CrabDB",
-    command: "crabdb",
+    label: "VS Code Smoke via Trail",
+    command: "trail",
     args: [
       "--workspace",
       workspaceRoot,
@@ -77,7 +77,7 @@ async function runFakeAcpChatSmoke(extension: vscode.Extension<unknown>): Promis
       process.execPath,
       agent
     ],
-    crabdbBacked: true,
+    trailBacked: true,
     supportsTaskName: false,
     supportsFromRef: false
   };
@@ -100,23 +100,23 @@ async function runFakeAcpChatSmoke(extension: vscode.Extension<unknown>): Promis
     const task = await waitForValue(async () => {
       const latest = await repository.latestTask();
       return latest?.changedPaths.includes("README.md") ? latest : undefined;
-    }, "CrabDB should record a task with README.md changed");
+    }, "Trail should record a task with README.md changed");
     const view = await repository.viewTask(task.lane);
     const diff = await repository.diffTask(task.lane);
     const workdir = view.task.workdir ?? (await repository.laneWorkdir(view.task.lane));
     const state = (chat as unknown as { stateMessage(): Record<string, unknown> }).stateMessage();
     const stateNodes = Array.isArray(state.nodes) ? state.nodes : [];
 
-    assert.ok(workdir, "CrabDB should expose the materialized lane workdir");
+    assert.ok(workdir, "Trail should expose the materialized lane workdir");
     assert.equal(state.sending, false);
     assert.equal(state.permissionPending, false);
     assert.ok(typeof state.acpSessionId === "string" && state.acpSessionId.length > 0);
     assert.ok(stateNodes.some((node) => isNodeKind(node, "message")), "chat state should include transcript messages");
-    assert.ok(stateNodes.some((node) => isNodeSource(node, "crabdb")), "chat state should include CrabDB-hydrated transcript nodes");
+    assert.ok(stateNodes.some((node) => isNodeSource(node, "trail")), "chat state should include Trail-hydrated transcript nodes");
     assert.equal(
       stateNodes.some((node) => isNodeKind(node, "completion") && Boolean((node as { checkpointPending?: unknown }).checkpointPending)),
       false,
-      "chat state should drop pending live completion placeholders after CrabDB hydration"
+      "chat state should drop pending live completion placeholders after Trail hydration"
     );
     assert.match(JSON.stringify(view.raw), /VS Code ACP chat smoke test/);
     assert.match(JSON.stringify(diff), /README\.md/);
@@ -138,10 +138,10 @@ async function runFakeAcpChatSmoke(extension: vscode.Extension<unknown>): Promis
 }
 
 async function runPermissionAcpChatSmoke(extension: vscode.Extension<unknown>): Promise<void> {
-  const workspaceRoot = process.env.CRABDB_VSCODE_TEST_WORKSPACE;
-  assert.ok(workspaceRoot, "CRABDB_VSCODE_TEST_WORKSPACE should point at the disposable workspace");
+  const workspaceRoot = process.env.TRAIL_VSCODE_TEST_WORKSPACE;
+  assert.ok(workspaceRoot, "TRAIL_VSCODE_TEST_WORKSPACE should point at the disposable workspace");
 
-  const output = vscode.window.createOutputChannel("CrabDB Agents Permission Test");
+  const output = vscode.window.createOutputChannel("Trail Agents Permission Test");
   const repository = new TaskRepository(workspaceRoot, output);
   const diffProvider = new DiffContentProvider();
   const agent = writePermissionStubAcpAgent(workspaceRoot);
@@ -152,8 +152,8 @@ async function runPermissionAcpChatSmoke(extension: vscode.Extension<unknown>): 
     diffProvider,
     {
       id: "vscode-permission-smoke",
-      label: "VS Code Permission Smoke via CrabDB",
-      command: "crabdb",
+      label: "VS Code Permission Smoke via Trail",
+      command: "trail",
       args: [
         "--workspace",
         workspaceRoot,
@@ -168,7 +168,7 @@ async function runPermissionAcpChatSmoke(extension: vscode.Extension<unknown>): 
         process.execPath,
         agent
       ],
-      crabdbBacked: true,
+      trailBacked: true,
       supportsTaskName: false,
       supportsFromRef: false
     }
@@ -223,7 +223,7 @@ async function runPermissionAcpChatSmoke(extension: vscode.Extension<unknown>): 
         }
       }
       return undefined;
-    }, "CrabDB should record the approved permission write");
+    }, "Trail should record the approved permission write");
     const workdir = view.task.workdir ?? (await repository.laneWorkdir(view.task.lane));
 
     assert.ok(workdir, "permission smoke should expose the lane workdir");

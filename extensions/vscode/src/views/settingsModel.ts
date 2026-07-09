@@ -58,7 +58,7 @@ export interface ProviderCapabilityView {
   detail: string;
   command: string;
   isDefault: boolean;
-  crabdbBacked: boolean;
+  trailBacked: boolean;
   supportsTaskName: boolean;
   supportsFromRef: boolean;
   tone: SettingsTone;
@@ -123,10 +123,10 @@ export function buildSettingsViewModel(config: ExtensionConfig, providers: AcpPr
   const providerViews = providers.map((provider) => providerCapabilityView(provider, defaultProvider?.id || config.defaultProvider));
   const providerRouting = providerRoutingSummary(config, providers, configuredDefaultProvider, coverage);
   const secondaryActions = [
-    { type: "doctor", label: "Run doctor", detail: "Check the local CrabDB toolchain." },
-    { type: "startDaemon", label: "Start daemon", detail: "Bring up CrabDB services for review and queue state." },
-    { type: "openSettings", scope: "workspace", label: "Workspace settings", detail: "Edit CrabDB settings for this repository." },
-    { type: "openSettings", scope: "user", label: "User settings", detail: "Edit global CrabDB defaults." }
+    { type: "doctor", label: "Run doctor", detail: "Check the local Trail toolchain." },
+    { type: "startDaemon", label: "Start daemon", detail: "Bring up Trail services for review and queue state." },
+    { type: "openSettings", scope: "workspace", label: "Workspace settings", detail: "Edit Trail settings for this repository." },
+    { type: "openSettings", scope: "user", label: "User settings", detail: "Edit global Trail defaults." }
   ] satisfies SettingsAction[];
   const primaryAction = primarySettingsAction(issues, config);
   return {
@@ -223,16 +223,16 @@ function providerRoutingSummary(
       tone: "warn",
       label: "Default provider is unavailable",
       detail: "Choose one of the configured providers so new tasks start predictably.",
-      action: editSettingAction("crabdb.defaultProvider", "Choose provider", "Select an available ACP provider."),
+      action: editSettingAction("trail.defaultProvider", "Choose provider", "Select an available ACP provider."),
       facts: providerRoutingFacts(config, configuredDefaultProvider, coverage)
     };
   }
-  if (!configuredDefaultProvider.crabdbBacked) {
+  if (!configuredDefaultProvider.trailBacked) {
     return {
       tone: "warn",
       label: "Default route is raw ACP",
-      detail: "Raw providers can run, but durable transcript, checkpoint, and review state need a CrabDB relay route.",
-      action: editSettingAction("crabdb.defaultProvider", "Use durable route", "Route the default provider through CrabDB."),
+      detail: "Raw providers can run, but durable transcript, checkpoint, and review state need a Trail relay route.",
+      action: editSettingAction("trail.defaultProvider", "Use durable route", "Route the default provider through Trail."),
       facts: providerRoutingFacts(config, configuredDefaultProvider, coverage)
     };
   }
@@ -240,9 +240,9 @@ function providerRoutingSummary(
     tone: coverage.checkpoints ? "ok" : "neutral",
     label: "Default route is durable",
     detail: coverage.checkpoints
-      ? "New tasks can start through CrabDB and recover from checkpoints."
+      ? "New tasks can start through Trail and recover from checkpoints."
       : "The default provider is durable; checkpoint-start support is not advertised by any provider.",
-    action: editSettingAction("crabdb.defaultProvider", "Change default", "Choose a different default provider."),
+    action: editSettingAction("trail.defaultProvider", "Change default", "Choose a different default provider."),
     facts: providerRoutingFacts(config, configuredDefaultProvider, coverage)
   };
 }
@@ -257,7 +257,7 @@ function providerRoutingFacts(
     {
       label: "Default",
       value: configuredDefaultProvider?.label || config.defaultProvider || "Missing",
-      tone: configuredDefaultProvider?.crabdbBacked ? "ok" : "warn"
+      tone: configuredDefaultProvider?.trailBacked ? "ok" : "warn"
     },
     {
       label: "Durable",
@@ -280,8 +280,8 @@ function providerRoutingFacts(
 function providerCoverage(config: ExtensionConfig, providers: AcpProviderProfile[]): SettingsViewModel["providerCoverage"] {
   return {
     total: providers.length,
-    durable: providers.filter((provider) => provider.crabdbBacked).length,
-    raw: providers.filter((provider) => !provider.crabdbBacked).length,
+    durable: providers.filter((provider) => provider.trailBacked).length,
+    raw: providers.filter((provider) => !provider.trailBacked).length,
     taskNames: providers.filter((provider) => provider.supportsTaskName).length,
     checkpoints: providers.filter((provider) => provider.supportsFromRef).length,
     custom: config.customProviders.length
@@ -322,12 +322,12 @@ function settingsHealthDetail(
     return `Default provider ${configuredProviderId || "provider"} is not available. Update provider routing before starting a task.`;
   }
   if (tone === "healthy") {
-    return `${defaultProvider.label} is routed through CrabDB with durable transcript, checkpoint, review, and merge state.`;
+    return `${defaultProvider.label} is routed through Trail with durable transcript, checkpoint, review, and merge state.`;
   }
   if (tone === "limited") {
     return "Provider routing can start tasks, but durability and checkpoint coverage need review.";
   }
-  return "Review the highlighted settings before relying on CrabDB coordination for production work.";
+  return "Review the highlighted settings before relying on Trail coordination for production work.";
 }
 
 function primarySettingsAction(issues: SettingsIssue[], config: ExtensionConfig): SettingsAction {
@@ -339,13 +339,13 @@ function primarySettingsAction(issues: SettingsIssue[], config: ExtensionConfig)
     return {
       type: "startDaemon",
       label: "Start daemon",
-      detail: "Run CrabDB services now."
+      detail: "Run Trail services now."
     };
   }
   return {
     type: "doctor",
     label: "Run doctor",
-    detail: "Verify the current CrabDB setup."
+    detail: "Verify the current Trail setup."
   };
 }
 
@@ -367,12 +367,12 @@ function settingsIssues(
       }
     });
   }
-  if (!config.crabdbPath.trim()) {
+  if (!config.trailPath.trim()) {
     issues.push({
-      label: "CrabDB CLI path is empty",
+      label: "Trail CLI path is empty",
       detail: "Set the executable path so daemon, review, queue, and ACP relay commands can run.",
       tone: "warn",
-      action: editSettingAction("crabdb.path", "Set CLI path", "Choose the CrabDB executable.")
+      action: editSettingAction("trail.path", "Set CLI path", "Choose the Trail executable.")
     });
   }
   if (!configuredDefaultProvider && providers.length) {
@@ -380,14 +380,14 @@ function settingsIssues(
       label: "Default provider is unavailable",
       detail: `${config.defaultProvider || "The configured provider"} does not match a known built-in or custom provider.`,
       tone: "warn",
-      action: editSettingAction("crabdb.defaultProvider", "Choose provider", "Select an available ACP provider.")
+      action: editSettingAction("trail.defaultProvider", "Choose provider", "Select an available ACP provider.")
     });
-  } else if (configuredDefaultProvider && !configuredDefaultProvider.crabdbBacked) {
+  } else if (configuredDefaultProvider && !configuredDefaultProvider.trailBacked) {
     issues.push({
       label: "Default provider is not durable",
-      detail: "Raw ACP providers can run, but CrabDB cannot guarantee checkpoint and review state unless the command relays through CrabDB.",
+      detail: "Raw ACP providers can run, but Trail cannot guarantee checkpoint and review state unless the command relays through Trail.",
       tone: "warn",
-      action: editSettingAction("crabdb.defaultProvider", "Use durable provider", "Route the default provider through CrabDB.")
+      action: editSettingAction("trail.defaultProvider", "Use durable provider", "Route the default provider through Trail.")
     });
   }
   if (!config.autoStartDaemon) {
@@ -395,7 +395,7 @@ function settingsIssues(
       label: "Daemon auto-start is off",
       detail: "Manual daemon startup is fine for controlled workspaces, but review and queue features need the service available.",
       tone: "ok",
-      action: editSettingAction("crabdb.autoStartDaemon", "Review daemon setting", "Decide how CrabDB services should start.")
+      action: editSettingAction("trail.autoStartDaemon", "Review daemon setting", "Decide how Trail services should start.")
     });
   }
   return issues;
@@ -410,7 +410,7 @@ function settingsMetrics(
   return [
     {
       label: "Provider durability",
-      value: `${coverage.durable}/${Math.max(coverage.total, 1)} CrabDB-backed`,
+      value: `${coverage.durable}/${Math.max(coverage.total, 1)} Trail-backed`,
       detail: coverage.raw ? `${coverage.raw} raw ACP provider${coverage.raw === 1 ? "" : "s"} need caution.` : "All providers are durable.",
       tone: coverage.durable ? "ok" : "warn"
     },
@@ -418,12 +418,12 @@ function settingsMetrics(
       label: "Default provider",
       value: configuredDefaultProvider?.id || config.defaultProvider || "missing",
       detail: configuredDefaultProvider?.label || "No matching provider profile was found.",
-      tone: configuredDefaultProvider?.crabdbBacked ? "ok" : "warn"
+      tone: configuredDefaultProvider?.trailBacked ? "ok" : "warn"
     },
     {
       label: "Daemon",
       value: config.autoStartDaemon ? "Auto-starts" : "Manual start",
-      detail: config.autoStartDaemon ? "The extension starts CrabDB services when needed." : "Start the daemon before queue or review work.",
+      detail: config.autoStartDaemon ? "The extension starts Trail services when needed." : "Start the daemon before queue or review work.",
       tone: config.autoStartDaemon ? "ok" : "neutral"
     },
     {
@@ -438,34 +438,34 @@ function settingsMetrics(
 function settingsRows(config: ExtensionConfig, configuredDefaultProvider: AcpProviderProfile | undefined): SettingsRow[] {
   return [
     {
-      key: "crabdb.path",
-      label: "CrabDB CLI",
-      value: config.crabdbPath,
+      key: "trail.path",
+      label: "Trail CLI",
+      value: config.trailPath,
       detail: "Executable used for daemon, ACP provider relay, review, queue, and diagnostics commands.",
-      tone: config.crabdbPath.trim() ? "ok" : "warn"
+      tone: config.trailPath.trim() ? "ok" : "warn"
     },
     {
-      key: "crabdb.defaultProvider",
+      key: "trail.defaultProvider",
       label: "Default provider",
       value: configuredDefaultProvider
         ? `${configuredDefaultProvider.label} (${configuredDefaultProvider.id})`
         : config.defaultProvider || "Not configured",
-      detail: configuredDefaultProvider?.crabdbBacked
-        ? "Default provider runs through CrabDB, so transcript, checkpoint, and review state stay durable."
-        : "Default provider is not CrabDB-backed. Use a CrabDB relay command when durability matters.",
-      tone: configuredDefaultProvider?.crabdbBacked ? "ok" : "warn"
+      detail: configuredDefaultProvider?.trailBacked
+        ? "Default provider runs through Trail, so transcript, checkpoint, and review state stay durable."
+        : "Default provider is not Trail-backed. Use a Trail relay command when durability matters.",
+      tone: configuredDefaultProvider?.trailBacked ? "ok" : "warn"
     },
     {
-      key: "crabdb.autoStartDaemon",
+      key: "trail.autoStartDaemon",
       label: "Daemon auto-start",
       value: config.autoStartDaemon ? "Enabled" : "Disabled",
       detail: config.autoStartDaemon
-        ? "The extension starts CrabDB daemon when no endpoint is discovered."
+        ? "The extension starts Trail daemon when no endpoint is discovered."
         : "Start the daemon manually before agent review and queue features can use the daemon endpoint.",
       tone: config.autoStartDaemon ? "ok" : "neutral"
     },
     {
-      key: "crabdb.customProviders",
+      key: "trail.customProviders",
       label: "Custom providers",
       value: `${config.customProviders.length} configured`,
       detail: "Custom ACP commands can be added for local tools, hosted gateways, or provider experiments.",
@@ -479,18 +479,18 @@ function providerCapabilityView(provider: AcpProviderProfile, defaultProviderId:
   return {
     id: provider.id,
     label: provider.label,
-    detail: provider.crabdbBacked
-      ? "Durable route with CrabDB transcript, checkpoint, review, and merge coordination."
-      : "Raw ACP route. Use a CrabDB relay command when this provider needs durable state.",
+    detail: provider.trailBacked
+      ? "Durable route with Trail transcript, checkpoint, review, and merge coordination."
+      : "Raw ACP route. Use a Trail relay command when this provider needs durable state.",
     command: [provider.command, ...provider.args].join(" "),
     isDefault,
-    crabdbBacked: provider.crabdbBacked,
+    trailBacked: provider.trailBacked,
     supportsTaskName: provider.supportsTaskName,
     supportsFromRef: provider.supportsFromRef,
-    tone: provider.crabdbBacked ? "ok" : "warn",
+    tone: provider.trailBacked ? "ok" : "warn",
     badges: [
       ...(isDefault ? [{ label: "Default", tone: "ok" as const }] : []),
-      { label: provider.crabdbBacked ? "Durable" : "Raw ACP", tone: provider.crabdbBacked ? "ok" : "warn" },
+      { label: provider.trailBacked ? "Durable" : "Raw ACP", tone: provider.trailBacked ? "ok" : "warn" },
       { label: provider.supportsTaskName ? "Task names" : "No task names", tone: provider.supportsTaskName ? "ok" : "neutral" },
       { label: provider.supportsFromRef ? "Checkpoint start" : "No checkpoint start", tone: provider.supportsFromRef ? "ok" : "neutral" }
     ]
@@ -509,14 +509,14 @@ function settingsSections(
 ): SettingsSectionView[] {
   const warnIssues = issues.filter((issue) => issue.tone === "warn").length;
   const warnRows = rows.filter((row) => row.tone === "warn").length;
-  const providerNeedsReview = !providers.length || !configuredDefaultProvider || !configuredDefaultProvider.crabdbBacked;
+  const providerNeedsReview = !providers.length || !configuredDefaultProvider || !configuredDefaultProvider.trailBacked;
   const checkpointNeedsReview = providers.length > 0 && coverage.checkpoints === 0;
   const healthDetail = settingsHealthDetail(healthTone, configuredDefaultProvider ?? providers[0], config.defaultProvider);
   return [
     {
       id: "overview",
       label: "Overview",
-      detail: warnIssues ? `${warnIssues} setup issue${warnIssues === 1 ? "" : "s"} need review.` : "CrabDB workflow readiness at a glance.",
+      detail: warnIssues ? `${warnIssues} setup issue${warnIssues === 1 ? "" : "s"} need review.` : "Trail workflow readiness at a glance.",
       icon: "display",
       tone: healthTone === "healthy" ? "ok" : healthTone === "attention" ? "warn" : "neutral",
       searchText: settingsSearchText(
@@ -547,7 +547,7 @@ function settingsSections(
           provider.detail,
           provider.command,
           provider.isDefault ? "default provider" : "",
-          provider.crabdbBacked ? "CrabDB durable route" : "raw ACP route",
+          provider.trailBacked ? "Trail durable route" : "raw ACP route",
           provider.supportsTaskName ? "task names supported" : "no task names",
           provider.supportsFromRef ? "checkpoint start supported" : "no checkpoint start",
           ...provider.badges.map((badge) => badge.label)
@@ -558,7 +558,7 @@ function settingsSections(
     {
       id: "configuration",
       label: "Configuration",
-      detail: warnRows ? `${warnRows} setting${warnRows === 1 ? "" : "s"} need edits.` : "Core CrabDB settings are ready.",
+      detail: warnRows ? `${warnRows} setting${warnRows === 1 ? "" : "s"} need edits.` : "Core Trail settings are ready.",
       icon: "review",
       tone: warnRows ? "warn" : "ok",
       searchText: settingsSearchText(
@@ -592,7 +592,7 @@ function settingsSections(
     {
       id: "review",
       label: "Review",
-      detail: coverage.durable ? "Review, queue, and coordination surfaces can use durable CrabDB state." : "Durable review state needs a CrabDB-backed provider.",
+      detail: coverage.durable ? "Review, queue, and coordination surfaces can use durable Trail state." : "Durable review state needs a Trail-backed provider.",
       icon: "review",
       tone: coverage.durable ? "ok" : "warn",
       searchText: settingsSearchText(
@@ -633,9 +633,9 @@ function settingsSections(
       searchText: settingsSearchText(
         "diagnostics advanced configuration workspace facts support provider durability capability coverage configuration keys",
         config.defaultProvider,
-        config.crabdbPath,
+        config.trailPath,
         config.autoStartDaemon ? "auto-start daemon enabled" : "auto-start daemon disabled",
-        "crabdb.path crabdb.defaultProvider crabdb.autoStartDaemon crabdb.customProviders"
+        "trail.path trail.defaultProvider trail.autoStartDaemon trail.customProviders"
       )
     }
   ];

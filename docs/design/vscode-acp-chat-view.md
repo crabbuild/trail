@@ -2,8 +2,8 @@
 
 Status: proposed.
 
-This document designs the CrabDB VS Code extension chat surface. The goal is a
-single editor UI that can drive any Agent Client Protocol agent while CrabDB
+This document designs the Trail VS Code extension chat surface. The goal is a
+single editor UI that can drive any Agent Client Protocol agent while Trail
 remains the durable source of truth for agent tasks, transcripts, turns,
 events, checkpoints, diffs, readiness, merge state, and recovery.
 
@@ -16,32 +16,32 @@ Let a user run Claude Code, Codex, Gemini, OpenCode, Goose, or another ACP
 agent through one VS Code interface:
 
 ```text
-VS Code CrabDB extension
+VS Code Trail extension
     |
     | ACP JSON-RPC stdio
     v
-crabdb agent acp --provider <provider>
+trail agent acp --provider <provider>
     |
-    | CrabDB ACP relay
+    | Trail ACP relay
     v
 real ACP agent or provider adapter
 ```
 
-In parallel, the extension talks to the CrabDB daemon:
+In parallel, the extension talks to the Trail daemon:
 
 ```text
-VS Code CrabDB extension
+VS Code Trail extension
     |
     | local HTTP JSON
     v
-crabdb daemon
+trail daemon
 ```
 
 The split is intentional:
 
 - ACP is the live interaction stream.
-- CrabDB HTTP is the persisted task model.
-- CrabDB lanes are the safety boundary.
+- Trail HTTP is the persisted task model.
+- Trail lanes are the safety boundary.
 - The selected provider remains replaceable.
 
 ## User Model
@@ -57,8 +57,8 @@ Primary users:
 Core vocabulary:
 
 - **Task**: the user-facing unit of work in VS Code.
-- **Lane**: the CrabDB branch-like ref backing a task.
-- **Session**: the ACP and CrabDB conversation container.
+- **Lane**: the Trail branch-like ref backing a task.
+- **Session**: the ACP and Trail conversation container.
 - **Turn**: one user prompt and one agent response cycle.
 - **Checkpoint**: recorded lane state after a turn.
 - **Review**: diff, gates, transcript, changed paths, and apply plan.
@@ -72,14 +72,14 @@ ACP IDs should be visible in details, logs, and troubleshooting.
    Render ACP content and update variants through a registry. Provider-specific
    fields are metadata, not top-level UI concepts.
 
-2. CrabDB is the truth.
+2. Trail is the truth.
    The live stream can be dropped, replayed, or corrupted by a provider. The
-   extension uses CrabDB for persisted history, checkpoints, review, readiness,
+   extension uses Trail for persisted history, checkpoints, review, readiness,
    and apply state.
 
 3. The editor remains the control point.
    Permissions, cancellation, prompt composition, file opening, and review
-   actions happen in VS Code. CrabDB records decisions but does not hide them.
+   actions happen in VS Code. Trail records decisions but does not hide them.
 
 4. Every task is reviewable before it touches the main worktree.
    Default to materialized lane workdirs and dry-run apply. Direct apply must be
@@ -105,7 +105,7 @@ small set of commands.
 
 ```text
 Activity Bar
-+-- CrabDB Agents
++-- Trail Agents
     +-- Tasks                 Tree view
     +-- Reviews               Tree view or filtered task view
     +-- Queue                 Tree view
@@ -148,12 +148,12 @@ Semantic accents:
 
 | Token | Hex fallback | Use |
 | --- | --- | --- |
-| `--crabdb-lane` | `var(--vscode-textLink-foreground, #4F8EA3)` | Active task, lane identity, current turn rail. |
-| `--crabdb-checkpoint` | `var(--vscode-testing-iconPassed, #4D8D55)` | Recorded checkpoint, ready state, successful tool. |
-| `--crabdb-review` | `var(--vscode-editorWarning-foreground, #9A6A23)` | Needs review, stale base, waiting state. |
-| `--crabdb-risk` | `var(--vscode-errorForeground, #B0525C)` | Permission risk, blocked gate, destructive action. |
-| `--crabdb-provider` | `var(--vscode-badge-background, #62628F)` | Provider badge, model identity. |
-| `--crabdb-muted` | `var(--vscode-descriptionForeground)` | Metadata and secondary labels. |
+| `--trail-lane` | `var(--vscode-textLink-foreground, #4F8EA3)` | Active task, lane identity, current turn rail. |
+| `--trail-checkpoint` | `var(--vscode-testing-iconPassed, #4D8D55)` | Recorded checkpoint, ready state, successful tool. |
+| `--trail-review` | `var(--vscode-editorWarning-foreground, #9A6A23)` | Needs review, stale base, waiting state. |
+| `--trail-risk` | `var(--vscode-errorForeground, #B0525C)` | Permission risk, blocked gate, destructive action. |
+| `--trail-provider` | `var(--vscode-badge-background, #62628F)` | Provider badge, model identity. |
+| `--trail-muted` | `var(--vscode-descriptionForeground)` | Metadata and secondary labels. |
 
 Typography:
 
@@ -166,7 +166,7 @@ Signature element: the **checkpoint rail**.
 Each turn has a vertical rail in the left gutter. User prompt, agent response,
 tools, diff previews, approvals, and the final checkpoint attach to the same
 rail. The rail makes it visually obvious which artifacts belong to the same
-turn and whether the turn produced a durable CrabDB checkpoint.
+turn and whether the turn produced a durable Trail checkpoint.
 
 ```text
 | user prompt
@@ -247,7 +247,7 @@ Header responsibilities:
 
 ### Transcript Timeline
 
-The timeline is append-only during a live turn and hydrated from CrabDB when a
+The timeline is append-only during a live turn and hydrated from Trail when a
 task is reopened.
 
 Default density:
@@ -274,7 +274,7 @@ Controls:
   - diagnostics
   - terminal output
   - changed files
-  - CrabDB history or previous checkpoint
+  - Trail history or previous checkpoint
 - Prompt field.
 - Send and stop icon buttons with tooltips.
 
@@ -319,9 +319,9 @@ Owns:
 This store is disposable. Closing VS Code or losing the ACP process should not
 destroy the durable task.
 
-### `CrabDbStore`
+### `TrailStore`
 
-Durable state loaded through CrabDB HTTP and CLI fallback.
+Durable state loaded through Trail HTTP and CLI fallback.
 
 Owns:
 
@@ -337,16 +337,16 @@ apply.
 
 ### `RenderStore`
 
-A derived store that merges live ACP updates with durable CrabDB records.
+A derived store that merges live ACP updates with durable Trail records.
 
 Rules:
 
-- Prefer CrabDB for completed turns.
+- Prefer Trail for completed turns.
 - Prefer live ACP for the current in-flight turn.
-- Correlate by `_meta.crabdb`, ACP session ID, CrabDB session ID, turn ID,
+- Correlate by `_meta.trail`, ACP session ID, Trail session ID, turn ID,
   message ID, tool call ID, and checkpoint change ID.
 - Mark unpersisted live items as "streaming" or "pending checkpoint".
-- Replace live provisional items when CrabDB confirms the durable record.
+- Replace live provisional items when Trail confirms the durable record.
 
 ## Render Model
 
@@ -376,7 +376,7 @@ interface RenderNodeBase {
   acpMessageId?: string;
   acpToolCallId?: string;
   provider?: string;
-  source: "acp-live" | "crabdb" | "merged";
+  source: "acp-live" | "trail" | "merged";
   status: "pending" | "in_progress" | "completed" | "failed" | "cancelled";
   createdAt?: string;
   updatedAt?: string;
@@ -384,7 +384,7 @@ interface RenderNodeBase {
 }
 ```
 
-Each ACP update becomes one or more render nodes. Each CrabDB event/message can
+Each ACP update becomes one or more render nodes. Each Trail event/message can
 also become a render node. The registry decides how to display a node, not how
 to persist it.
 
@@ -399,7 +399,7 @@ Behavior:
 - Aggregate by `messageId`.
 - Render text as markdown.
 - Render non-text content through the content block registry.
-- When CrabDB has the persisted user prompt, replace the live aggregate.
+- When Trail has the persisted user prompt, replace the live aggregate.
 
 ### `agent_message_chunk`
 
@@ -412,7 +412,7 @@ Behavior:
   scrolled away.
 - Render markdown incrementally, but debounce expensive syntax highlighting.
 - Show a small streaming indicator in the message chrome, not inside the text.
-- On prompt completion, wait for CrabDB confirmation and mark as checkpointed.
+- On prompt completion, wait for Trail confirmation and mark as checkpointed.
 
 ### `agent_thought_chunk`
 
@@ -426,7 +426,7 @@ Optional developer mode:
 
 - If enabled, show a redacted ephemeral panel labeled "Provider reasoning
   stream".
-- Never include this panel in task export, review packets, or CrabDB records
+- Never include this panel in task export, review packets, or Trail records
   unless a future policy explicitly allows it.
 
 ### `plan`
@@ -490,7 +490,7 @@ Behavior:
 - Update a command menu in the composer.
 - Show a brief header note only if commands appear or disappear while the user
   is actively composing.
-- Store a summarized event through CrabDB if the relay already captures it.
+- Store a summarized event through Trail if the relay already captures it.
 
 ### `current_mode_update`
 
@@ -522,7 +522,7 @@ Behavior:
 - Use title updates to rename the task after user confirmation or with an
   undoable toast.
 - Use timestamps to refresh task ordering.
-- Preserve CrabDB identifiers as stable metadata even if the provider title
+- Preserve Trail identifiers as stable metadata even if the provider title
   changes.
 
 ### `usage_update`
@@ -549,7 +549,7 @@ Behavior:
 - Show permission options exactly as protocol choices, with safer options first
   if the protocol order is not meaningful.
 - Return the selected ACP response to the agent.
-- Mirror the decision through CrabDB approval records.
+- Mirror the decision through Trail approval records.
 
 Approval panel:
 
@@ -557,8 +557,8 @@ Approval panel:
 Permission required
 Run command in lane workdir
 
-Command: cargo test -p crabdb
-Scope: .crabdb/worktrees/acp-claude-42
+Command: cargo test -p trail
+Scope: .trail/worktrees/acp-claude-42
 
 [Allow once] [Reject] [Show details]
 ```
@@ -570,7 +570,7 @@ Render a turn footer.
 Behavior:
 
 - Show stop reason.
-- If completed, show pending checkpoint until CrabDB confirms the workdir
+- If completed, show pending checkpoint until Trail confirms the workdir
   record or structured patch.
 - If cancelled, preserve partial transcript and show whether changes were
   recorded.
@@ -664,7 +664,7 @@ Behavior:
 - For small diffs, show a collapsed inline preview.
 - For large diffs, show path, additions/deletions, and an "Open diff" action.
 - Prefer native VS Code diff editors for full review.
-- Correlate with CrabDB change IDs once persisted.
+- Correlate with Trail change IDs once persisted.
 
 ### Terminal
 
@@ -678,7 +678,7 @@ Behavior:
 - Keep failed command output expanded.
 - Offer "Open in Terminal" for long-running interactive commands.
 
-## CrabDB Source of Truth Contract
+## Trail Source of Truth Contract
 
 The extension should use the daemon when available and CLI fallback when not.
 
@@ -697,9 +697,9 @@ Required reads:
 
 Required mutations:
 
-- create/start task through `crabdb agent acp`
+- create/start task through `trail agent acp`
 - cancel prompt through ACP
-- approval decision through ACP and CrabDB mirror
+- approval decision through ACP and Trail mirror
 - record/refresh lane workdir when explicitly requested
 - run tests/evals
 - dry-run apply
@@ -709,13 +709,13 @@ Required mutations:
 
 The extension should not store durable transcripts in VS Code global state.
 Global state may cache UI preferences, last selected provider, and recent task
-IDs, but all task facts must reload from CrabDB.
+IDs, but all task facts must reload from Trail.
 
 ## Reopen and Resume
 
 When the user opens a task:
 
-1. Load the task, lane, session, turns, events, and latest review from CrabDB.
+1. Load the task, lane, session, turns, events, and latest review from Trail.
 2. Render persisted turns as completed nodes.
 3. If an ACP session is still active, attach live stream state.
 4. If the provider supports resume/load, offer "Resume".
@@ -728,7 +728,7 @@ The UI should distinguish:
 - "start same task with another provider"
 
 Switching providers should be explicit because the new provider may not inherit
-the old provider's private context. CrabDB can provide the durable transcript,
+the old provider's private context. Trail can provide the durable transcript,
 diffs, and checkpoint as context.
 
 ## Multi-Agent Coordination
@@ -754,8 +754,8 @@ Review actions:
 - compare two agent tasks
 - show shared changed paths
 - queue one task behind another
-- open conflict set when CrabDB reports one
-- render task-local buttons from `crabdb agent review-data --json`
+- open conflict set when Trail reports one
+- render task-local buttons from `trail agent review-data --json`
   `actions[]`; use each action's stable id, label, safety class, enabled state,
   disabled reason, exact command, optional path/open path, MCP tool, and MCP
   arguments instead of parsing free-form suggestions or shell strings.
@@ -796,7 +796,7 @@ Protocol:
 
 Filesystem:
 
-- Respect CrabDB ignore policy.
+- Respect Trail ignore policy.
 - Open lane files from materialized lane workdirs or virtual readonly docs.
 - Require explicit action before applying lane changes to the main worktree.
 
@@ -812,13 +812,13 @@ extensions/vscode/src/
     AcpProcess.ts
     AcpMessageRouter.ts
     ProviderRegistry.ts
-  crabdb/
-    CrabDbDaemonClient.ts
-    CrabDbCliFallback.ts
+  trail/
+    TrailDaemonClient.ts
+    TrailCliFallback.ts
     TaskRepository.ts
   state/
     LiveAcpStore.ts
-    CrabDbStore.ts
+    TrailStore.ts
     RenderStore.ts
     Correlator.ts
   views/
@@ -883,13 +883,13 @@ Benefits:
 No workspace:
 
 ```text
-Open a folder to use CrabDB agents.
+Open a folder to use Trail agents.
 ```
 
-No CrabDB workspace:
+No Trail workspace:
 
 ```text
-Initialize CrabDB to record agent tasks, checkpoints, and review state.
+Initialize Trail to record agent tasks, checkpoints, and review state.
 [Initialize workspace]
 ```
 
@@ -903,7 +903,7 @@ Add an ACP agent provider.
 Daemon unavailable:
 
 ```text
-CrabDB daemon is not running. The extension can start it for faster status and
+Trail daemon is not running. The extension can start it for faster status and
 review updates.
 [Start daemon] [Use CLI fallback]
 ```
@@ -920,22 +920,22 @@ workdir changes remain in the task lane.
 
 Command palette:
 
-- `CrabDB: New Agent Task`
-- `CrabDB: Open Agent Chat`
-- `CrabDB: Open Latest Agent Review`
-- `CrabDB: Apply Latest Agent Task Dry Run`
-- `CrabDB: Queue Agent Task Merge`
-- `CrabDB: Rewind Agent Task`
-- `CrabDB: Compare Agent Tasks`
-- `CrabDB: Start Daemon`
-- `CrabDB: Doctor`
-- `CrabDB: Add ACP Provider`
+- `Trail: New Agent Task`
+- `Trail: Open Agent Chat`
+- `Trail: Open Latest Agent Review`
+- `Trail: Apply Latest Agent Task Dry Run`
+- `Trail: Queue Agent Task Merge`
+- `Trail: Rewind Agent Task`
+- `Trail: Compare Agent Tasks`
+- `Trail: Start Daemon`
+- `Trail: Doctor`
+- `Trail: Add ACP Provider`
 
 Inline editor commands:
 
 - `Ask Agent About Selection`
 - `Attach Selection to Agent Task`
-- `Show CrabDB History for Line`
+- `Show Trail History for Line`
 - `Show Agent Changes for File`
 
 ## Delivery Phases
@@ -946,28 +946,28 @@ Deliver:
 
 - VS Code extension scaffold.
 - Daemon discovery and CLI fallback.
-- Task tree from CrabDB.
+- Task tree from Trail.
 - Read-only transcript/review webview for existing ACP sessions.
 
 Acceptance:
 
 - A user can run an ACP task externally and inspect it in VS Code.
-- The extension stores no durable transcript outside CrabDB.
+- The extension stores no durable transcript outside Trail.
 
 ### Phase 2: Native ACP Chat MVP
 
 Deliver:
 
 - Provider registry with `claude-code` and custom command.
-- ACP stdio client over `crabdb agent acp`.
+- ACP stdio client over `trail agent acp`.
 - Chat panel with text messages, plan, tool rows, usage meter, and cancel.
 - Basic permission prompt.
 
 Acceptance:
 
 - The user can start and complete a task from VS Code.
-- CrabDB records the turn, transcript, tools, and checkpoint.
-- Reopening VS Code hydrates the completed turn from CrabDB.
+- Trail records the turn, transcript, tools, and checkpoint.
+- Reopening VS Code hydrates the completed turn from Trail.
 
 ### Phase 3: Review and Apply
 
@@ -1024,7 +1024,7 @@ Unit tests:
   resource, and unknown content.
 - Tool content renderers for standard content, diff, terminal, and unknown
   content.
-- Correlation between ACP message IDs, tool call IDs, CrabDB turn IDs, and
+- Correlation between ACP message IDs, tool call IDs, Trail turn IDs, and
   checkpoint IDs.
 - Markdown sanitization.
 - Permission response mapping.
@@ -1033,9 +1033,9 @@ Integration tests:
 
 - Stub ACP provider streaming text, plan, tools, permission, diff, and prompt
   completion.
-- CrabDB daemon fixture returning lanes, turns, events, diffs, and readiness.
-- Reopen completed task from CrabDB only.
-- Active turn live stream replaced by CrabDB persisted turn.
+- Trail daemon fixture returning lanes, turns, events, diffs, and readiness.
+- Reopen completed task from Trail only.
+- Active turn live stream replaced by Trail persisted turn.
 - Provider crash leaves recoverable task state.
 
 Visual tests:
@@ -1058,11 +1058,11 @@ Manual compatibility tests:
 - Should the first extension release bundle an ACP TypeScript SDK dependency or
   keep a small local JSON-RPC client until SDK stability is proven?
 - Which provider-specific metadata should be elevated into first-class UI?
-- Should provider titles be allowed to rename CrabDB tasks automatically?
+- Should provider titles be allowed to rename Trail tasks automatically?
 - Should terminal output live inside the webview, native VS Code terminals, or
   both?
 - What is the right retention policy for raw ACP compatibility logs?
-- How should remote ACP transports map to local CrabDB workspaces once the
+- How should remote ACP transports map to local Trail workspaces once the
   remote transport is stable?
 
 ## References
@@ -1073,5 +1073,5 @@ Manual compatibility tests:
 - ACP extensibility and `_meta`: https://agentclientprotocol.com/protocol/v1/extensibility
 - VS Code Webview API: https://code.visualstudio.com/api/extension-guides/webview
 - VS Code view guidelines: https://code.visualstudio.com/api/ux-guidelines/views
-- CrabDB ACP relay: [ACP relay design](./acp-relay.md)
-- CrabDB HTTP routes: [HTTP API reference](../reference/http-api.md)
+- Trail ACP relay: [ACP relay design](./acp-relay.md)
+- Trail HTTP routes: [HTTP API reference](../reference/http-api.md)

@@ -1,18 +1,18 @@
 # Use Case: Local Code History
 
-Use CrabDB to keep operation-level history for a local worktree, even before changes become Git commits.
+Use Trail to keep operation-level history for a local worktree, even before changes become Git commits.
 
 ## Flow
 
 ```sh
-crabdb init --working-tree
-crabdb status
-crabdb record -m "start docs"
-crabdb timeline --limit 10
-crabdb diff <previous>..<current> --patch
+trail init --working-tree
+trail status
+trail record -m "start docs"
+trail timeline --limit 10
+trail diff <previous>..<current> --patch
 ```
 
-## Why CrabDB Helps
+## Why Trail Helps
 
 - Records partial path selections without staging through Git.
 - Stores operation messages and actor metadata.
@@ -25,7 +25,7 @@ This is useful for iterative local work, editor automation, and change review be
 
 ## Code Facts Used
 
-- Worktree commands: `crates/crabdb/src/cli/command/worktree_args.rs`
-- Git export: `crates/crabdb/src/db/merge/git_export.rs`
+- Worktree commands: `crates/trail/src/cli/command/worktree_args.rs`
+- Git export: `crates/trail/src/db/merge/git_export.rs`
 - Tests: `record_paths_records_only_selected_changes`, `git_export_with_message_creates_commit_object_and_mapping`
 

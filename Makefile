@@ -1,5 +1,5 @@
 # ┌──────────────────────────────────────────────────────────────┐
-# │  CrabDB — Local-first prolly-tree operation database         │
+# │  Trail — Local-first prolly-tree operation database         │
 # │  Makefile: build · test · install · release · dev · ci       │
 # └──────────────────────────────────────────────────────────────┘
 
@@ -7,14 +7,14 @@
 
 PREFIX       ?= $(HOME)/.cargo
 BINDIR       ?= $(PREFIX)/bin
-DATADIR      ?= $(PREFIX)/share/crabdb
+DATADIR      ?= $(PREFIX)/share/trail
 MANDIR       ?= $(PREFIX)/share/man/man1
 CARGO        ?= cargo
 RUSTC        ?= rustc
 
 # Binary / package names
-BIN_NAME     := crabdb
-WORKSPACE_MEMBERS := crabdb prolly
+BIN_NAME     := trail
+WORKSPACE_MEMBERS := trail prolly
 
 # Feature flags for the main binary
 FEATURES     ?= sqlite
@@ -47,7 +47,7 @@ CHECK        := $(GREEN)✓$(RESET)
 
 .PHONY: help
 help: ## Show this help
-	@printf "$(BOLD)CrabDB $(VERSION)$(RESET) — Makefile targets\n\n"
+	@printf "$(BOLD)Trail $(VERSION)$(RESET) — Makefile targets\n\n"
 	@grep -E '^[a-zA-Z_-]+.*:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | sort \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-24s$(RESET) %s\n", $$1, $$2}'
@@ -86,9 +86,9 @@ test: ## Run all tests
 test-release: ## Run tests in release mode
 	$(CARGO) test --workspace --release $(TEST_FLAGS) -- --nocapture
 
-.PHONY: test-crabdb
-test-crabdb: ## Run crabdb crate tests
-	$(CARGO) test -p crabdb $(TEST_FLAGS) -- --nocapture
+.PHONY: test-trail
+test-trail: ## Run trail crate tests
+	$(CARGO) test -p trail $(TEST_FLAGS) -- --nocapture
 
 .PHONY: test-prolly
 test-prolly: ## Run prolly crate tests
@@ -96,7 +96,7 @@ test-prolly: ## Run prolly crate tests
 
 .PHONY: test-e2e
 test-e2e: ## Run only end-to-end tests
-	$(CARGO) test -p crabdb e2e -- --nocapture
+	$(CARGO) test -p trail e2e -- --nocapture
 
 # ── Benchmarks ─────────────────────────────────────────────────────
 
@@ -110,41 +110,41 @@ bench-prolly: ## Run prolly tree benchmarks
 
 .PHONY: bench-cli-scale-smoke
 bench-cli-scale-smoke: ## Run small CLI scale benchmark suitable for CI
-	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-1000} \
-	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/tmp} \
-	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-ci-smoke} \
-	CRABDB_SCALE_MATERIALIZED=$${CRABDB_SCALE_MATERIALIZED:-1} \
-	CRABDB_SCALE_BACKUP=$${CRABDB_SCALE_BACKUP:-1} \
+	TRAIL_SCALE_FILES=$${TRAIL_SCALE_FILES:-1000} \
+	TRAIL_SCALE_BASE=$${TRAIL_SCALE_BASE:-/tmp} \
+	TRAIL_SCALE_LABEL=$${TRAIL_SCALE_LABEL:-ci-smoke} \
+	TRAIL_SCALE_MATERIALIZED=$${TRAIL_SCALE_MATERIALIZED:-1} \
+	TRAIL_SCALE_BACKUP=$${TRAIL_SCALE_BACKUP:-1} \
 	scripts/cli-scale-bench.sh
 
 .PHONY: bench-cli-scale
 bench-cli-scale: ## Run local 10k CLI scale benchmark
-	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-10000} \
-	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/Volumes/Workspace} \
-	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-local-10k} \
+	TRAIL_SCALE_FILES=$${TRAIL_SCALE_FILES:-10000} \
+	TRAIL_SCALE_BASE=$${TRAIL_SCALE_BASE:-/Volumes/Workspace} \
+	TRAIL_SCALE_LABEL=$${TRAIL_SCALE_LABEL:-local-10k} \
 	scripts/cli-scale-bench.sh
 
 .PHONY: bench-cli-scale-large
-bench-cli-scale-large: ## Run large manual CLI scale benchmark (override CRABDB_SCALE_FILES for 1M)
-	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-100000} \
-	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/Volumes/Workspace} \
-	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-manual-large} \
+bench-cli-scale-large: ## Run large manual CLI scale benchmark (override TRAIL_SCALE_FILES for 1M)
+	TRAIL_SCALE_FILES=$${TRAIL_SCALE_FILES:-100000} \
+	TRAIL_SCALE_BASE=$${TRAIL_SCALE_BASE:-/Volumes/Workspace} \
+	TRAIL_SCALE_LABEL=$${TRAIL_SCALE_LABEL:-manual-large} \
 	scripts/cli-scale-bench.sh
 
 .PHONY: bench-cli-scale-nightly
 bench-cli-scale-nightly: ## Run manual/nightly 10k, 100k, and 1M CLI scale benchmark
-	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-10000,100000,1000000} \
-	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/Volumes/Workspace} \
-	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-nightly-scale} \
+	TRAIL_SCALE_FILES=$${TRAIL_SCALE_FILES:-10000,100000,1000000} \
+	TRAIL_SCALE_BASE=$${TRAIL_SCALE_BASE:-/Volumes/Workspace} \
+	TRAIL_SCALE_LABEL=$${TRAIL_SCALE_LABEL:-nightly-scale} \
 	scripts/cli-scale-bench.sh
 
 .PHONY: bench-cli-scale-1m-headless
 bench-cli-scale-1m-headless: ## Run 1M no-materialize scale benchmark without backup/materialized workdirs
-	CRABDB_SCALE_FILES=$${CRABDB_SCALE_FILES:-1000000} \
-	CRABDB_SCALE_BASE=$${CRABDB_SCALE_BASE:-/Volumes/Workspace} \
-	CRABDB_SCALE_LABEL=$${CRABDB_SCALE_LABEL:-manual-1m-headless} \
-	CRABDB_SCALE_MATERIALIZED=$${CRABDB_SCALE_MATERIALIZED:-0} \
-	CRABDB_SCALE_BACKUP=$${CRABDB_SCALE_BACKUP:-0} \
+	TRAIL_SCALE_FILES=$${TRAIL_SCALE_FILES:-1000000} \
+	TRAIL_SCALE_BASE=$${TRAIL_SCALE_BASE:-/Volumes/Workspace} \
+	TRAIL_SCALE_LABEL=$${TRAIL_SCALE_LABEL:-manual-1m-headless} \
+	TRAIL_SCALE_MATERIALIZED=$${TRAIL_SCALE_MATERIALIZED:-0} \
+	TRAIL_SCALE_BACKUP=$${TRAIL_SCALE_BACKUP:-0} \
 	scripts/cli-scale-bench.sh
 
 # ── Lint & Format ──────────────────────────────────────────────────
@@ -178,14 +178,14 @@ docs: ## Generate rustdocs
 
 .PHONY: docs-open
 docs-open: docs ## Open rustdocs in browser
-	open target/doc/crabdb/index.html 2>/dev/null \
-	  || xdg-open target/doc/crabdb/index.html 2>/dev/null \
-	  || @printf "Open target/doc/crabdb/index.html manually\n"
+	open target/doc/trail/index.html 2>/dev/null \
+	  || xdg-open target/doc/trail/index.html 2>/dev/null \
+	  || @printf "Open target/doc/trail/index.html manually\n"
 
 # ── Install / Uninstall ────────────────────────────────────────────
 
 .PHONY: install
-install: release ## Install crabdb to $(BINDIR)
+install: release ## Install trail to $(BINDIR)
 	@printf "$(BOLD)Installing $(BIN_NAME) $(VERSION) to $(BINDIR)...$(RESET)\n"
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m 755 "target/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
@@ -198,7 +198,7 @@ install-debug: build ## Install debug binary to $(BINDIR)
 	install -m 755 "target/debug/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)-debug"
 
 .PHONY: uninstall
-uninstall: ## Uninstall crabdb
+uninstall: ## Uninstall trail
 	@printf "$(BOLD)Uninstalling $(BIN_NAME)...$(RESET)\n"
 	rm -f "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 	@printf "  $(CHECK) removed $(DESTDIR)$(BINDIR)/$(BIN_NAME)\n"
@@ -311,7 +311,7 @@ version: ## Print version
 
 .PHONY: info
 info: ## Show build environment info
-	@printf "$(BOLD)CrabDB $(VERSION)$(RESET)\n\n"
+	@printf "$(BOLD)Trail $(VERSION)$(RESET)\n\n"
 	@printf "  Rust toolchain:  $(shell $(RUSTC) --version 2>/dev/null || echo 'not found')\n"
 	@printf "  Cargo:           $(shell $(CARGO) --version 2>/dev/null || echo 'not found')\n"
 	@printf "  Target:          $(or $(TARGET),host)\n"

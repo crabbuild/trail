@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { shellCommandForPlatform } from "../crabdb/ShellCommand";
+import { shellCommandForPlatform } from "../trail/ShellCommand";
 
 test("shellCommandForPlatform preserves POSIX command lines", () => {
   assert.deepEqual(shellCommandForPlatform("npm test -- --runInBand", "darwin"), [

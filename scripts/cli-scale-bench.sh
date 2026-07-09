@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN="${CRABDB_BIN:-}"
-SCALES="${CRABDB_SCALE_FILES:-10000}"
-BASE_DIR="${CRABDB_SCALE_BASE:-/Volumes/Workspace}"
-RUN_LABEL="${CRABDB_SCALE_LABEL:-$(date +%Y%m%d-%H%M%S)}"
-RUN_MATERIALIZED="${CRABDB_SCALE_MATERIALIZED:-1}"
-RUN_BACKUP="${CRABDB_SCALE_BACKUP:-1}"
-RUN_DAEMON="${CRABDB_SCALE_DAEMON:-1}"
-RUN_GIT_IMPORT="${CRABDB_SCALE_GIT_IMPORT:-1}"
+BIN="${TRAIL_BIN:-}"
+SCALES="${TRAIL_SCALE_FILES:-10000}"
+BASE_DIR="${TRAIL_SCALE_BASE:-/Volumes/Workspace}"
+RUN_LABEL="${TRAIL_SCALE_LABEL:-$(date +%Y%m%d-%H%M%S)}"
+RUN_MATERIALIZED="${TRAIL_SCALE_MATERIALIZED:-1}"
+RUN_BACKUP="${TRAIL_SCALE_BACKUP:-1}"
+RUN_DAEMON="${TRAIL_SCALE_DAEMON:-1}"
+RUN_GIT_IMPORT="${TRAIL_SCALE_GIT_IMPORT:-1}"
 
 if [ -z "$BIN" ]; then
-  cargo build -p crabdb --release >/dev/null
-  BIN="$(pwd)/target/release/crabdb"
+  cargo build -p trail --release >/dev/null
+  BIN="$(pwd)/target/release/trail"
 fi
 
 if [ ! -x "$BIN" ]; then
-  printf 'crabdb binary is not executable: %s\n' "$BIN" >&2
+  printf 'trail binary is not executable: %s\n' "$BIN" >&2
   exit 2
 fi
 
-RUN_ROOT="$BASE_DIR/crabdb-cli-scale-$RUN_LABEL"
+RUN_ROOT="$BASE_DIR/trail-cli-scale-$RUN_LABEL"
 mkdir -p "$RUN_ROOT"
 
 run_timed() {
@@ -65,7 +65,7 @@ root = pathlib.Path(sys.argv[1])
 total = 0
 count = 0
 for path in root.rglob("*"):
-    if ".crabdb" in path.parts or ".git" in path.parts:
+    if ".trail" in path.parts or ".git" in path.parts:
         continue
     if path.is_file():
         total += path.stat().st_size
@@ -75,7 +75,7 @@ PY
 }
 
 sqlite_bytes() {
-  local db="$1/.crabdb/index/crabdb.sqlite"
+  local db="$1/.trail/index/trail.sqlite"
   python3 - "$db" <<'PY'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -84,7 +84,7 @@ PY
 }
 
 object_count() {
-  local db="$1/.crabdb/index/crabdb.sqlite"
+  local db="$1/.trail/index/trail.sqlite"
   if [ -f "$db" ]; then
     sqlite3 "$db" 'SELECT COUNT(*) FROM objects;' 2>/dev/null || printf '0'
   else
@@ -95,7 +95,7 @@ object_count() {
 object_kind_stats() {
   local repo="$1"
   local prefix="$2"
-  local db="$repo/.crabdb/index/crabdb.sqlite"
+  local db="$repo/.trail/index/trail.sqlite"
   if [ -f "$db" ]; then
     sqlite3 "$db" \
       'SELECT kind, COUNT(*), COALESCE(SUM(size_bytes), 0) FROM objects GROUP BY kind ORDER BY kind;' \
@@ -112,7 +112,7 @@ object_kind_stats() {
 dbstat_bytes() {
   local repo="$1"
   local prefix="$2"
-  local db="$repo/.crabdb/index/crabdb.sqlite"
+  local db="$repo/.trail/index/trail.sqlite"
   if [ -f "$db" ]; then
     sqlite3 "$db" \
       'SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC;' \
@@ -133,12 +133,12 @@ import pathlib, sys
 repo = pathlib.Path(sys.argv[1])
 prefix = sys.argv[2]
 patterns = {
-    "clean_workdir": ".crabdb/workdir-manifest.json",
-    "sparse_workdir": ".crabdb/sparse-workdir.json",
+    "clean_workdir": ".trail/workdir-manifest.json",
+    "sparse_workdir": ".trail/sparse-workdir.json",
 }
 counts = {name: 0 for name in patterns}
 sizes = {name: 0 for name in patterns}
-worktrees = repo / ".crabdb" / "worktrees"
+worktrees = repo / ".trail" / "worktrees"
 if worktrees.exists():
     for path in worktrees.rglob("*.json"):
         for name, suffix in patterns.items():
@@ -234,8 +234,8 @@ set -euo pipefail
 bin="$1"
 repo="$2"
 shift 2
-endpoint="$repo/.crabdb/daemon.json"
-hidden="$repo/.crabdb/daemon.json.persisted-snapshot-bench"
+endpoint="$repo/.trail/daemon.json"
+hidden="$repo/.trail/daemon.json.persisted-snapshot-bench"
 restore_endpoint() {
   if [ -f "$hidden" ]; then
     mv "$hidden" "$endpoint"
@@ -306,7 +306,7 @@ if files > 2:
         "    helper::helper_value()\n"
         "}\n"
     )
-(root / "README.md").write_text(f"# CrabDB CLI scale {files}\n")
+(root / "README.md").write_text(f"# Trail CLI scale {files}\n")
 (root / ".gitignore").write_text("target/\nnode_modules/\n.DS_Store\n")
 PY
 
@@ -359,13 +359,13 @@ for d in range(dirs):
             f"    {idx}\n"
             "}\n"
         )
-(root / "README.md").write_text(f"# CrabDB Git import scale {files}\n")
+(root / "README.md").write_text(f"# Trail Git import scale {files}\n")
 (root / ".gitignore").write_text("target/\nnode_modules/\n.DS_Store\n")
 PY
       run_timed "$scale" git_init git -C "$GIT_REPO" init
       run_timed "$scale" git_add_tracked git -C "$GIT_REPO" add .
-      git -C "$GIT_REPO" config user.email "crabdb@example.com"
-      git -C "$GIT_REPO" config user.name "CrabDB"
+      git -C "$GIT_REPO" config user.email "trail@example.com"
+      git -C "$GIT_REPO" config user.name "Trail"
       run_timed "$scale" git_commit_initial git -C "$GIT_REPO" commit -m "scale initial"
       run_timed "$scale" git_init_from_git "$BIN" --workspace "$GIT_REPO" --json init --from-git
       run_timed "$scale" git_mutate_tracked python3 - "$GIT_REPO" "$scale" <<'PY'
@@ -436,7 +436,7 @@ while time.time() < deadline:
 print("daemon did not become ready", file=sys.stderr)
 sys.exit(1)
 PY
-    run_timed "$scale" daemon_wait_for_hot_cache python3 - "$REPO/.crabdb/daemon.json" "$DAEMON_URL" <<'PY'
+    run_timed "$scale" daemon_wait_for_hot_cache python3 - "$REPO/.trail/daemon.json" "$DAEMON_URL" <<'PY'
 import json, pathlib, sys, time
 endpoint = pathlib.Path(sys.argv[1])
 url = sys.argv[2]
@@ -563,7 +563,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
     "edits": [{
         "op": "write",
         "path": "README.md",
-        "content": "# CrabDB daemon CLI turn scale\n",
+        "content": "# Trail daemon CLI turn scale\n",
     }],
 }))
 PY
@@ -703,8 +703,8 @@ PY
   run_timed "$scale" index_rebuild "$BIN" --workspace "$REPO" --json index rebuild
   run_timed "$scale" gc_dry_run "$BIN" --workspace "$REPO" --json gc --dry-run
   if [ "$RUN_BACKUP" = "1" ]; then
-    run_timed "$scale" backup_create "$BIN" --workspace "$REPO" --json backup create --overwrite "$WORK/crabdb-backup"
-    run_timed "$scale" backup_verify "$BIN" --workspace "$REPO" --json backup verify "$WORK/crabdb-backup"
+    run_timed "$scale" backup_create "$BIN" --workspace "$REPO" --json backup create --overwrite "$WORK/trail-backup"
+    run_timed "$scale" backup_verify "$BIN" --workspace "$REPO" --json backup verify "$WORK/trail-backup"
   fi
 
   read -r source_file_count source_bytes < <(repo_source_bytes "$REPO")
@@ -716,7 +716,7 @@ PY
     object_kind_stats "$REPO" "repo"
     dbstat_bytes "$REPO" "repo"
     workdir_manifest_bytes "$REPO" "repo"
-    if [ -d "$GIT_REPO/.crabdb" ]; then
+    if [ -d "$GIT_REPO/.trail" ]; then
       read -r git_source_file_count git_source_bytes < <(repo_source_bytes "$GIT_REPO")
       printf 'git_source_file_count\t%s\n' "$git_source_file_count"
       printf 'git_source_bytes\t%s\n' "$git_source_bytes"
@@ -727,7 +727,7 @@ PY
       workdir_manifest_bytes "$GIT_REPO" "git"
     fi
     printf 'daemon_rss_bytes\t%s\n' "$DAEMON_RSS"
-    du -sk "$REPO" "$REPO/.crabdb" 2>/dev/null | awk '{print "du_kb_" $2 "\t" $1}'
+    du -sk "$REPO" "$REPO/.trail" 2>/dev/null | awk '{print "du_kb_" $2 "\t" $1}'
   } > "$WORK/metrics.tsv"
 
   printf 'scale=%s results=%s metrics=%s\n' "$scale" "$RESULTS" "$WORK/metrics.tsv"

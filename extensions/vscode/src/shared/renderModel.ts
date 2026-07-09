@@ -11,7 +11,7 @@ import type {
   ToolKind
 } from "./acpTypes";
 
-export type RenderSource = "acp-live" | "crabdb" | "merged";
+export type RenderSource = "acp-live" | "trail" | "merged";
 export type RenderStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
 
 export interface RenderNodeBase {

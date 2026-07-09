@@ -105,7 +105,7 @@ if (watch) {
   const contexts = await Promise.all(builds.map((options) => esbuild.context(options)));
   await Promise.all(contexts.map((context) => context.watch()));
   await buildCss({ watch: true });
-  console.log("Watching CrabDB VS Code extension sources...");
+  console.log("Watching Trail VS Code extension sources...");
 } else {
   await Promise.all([...builds.map((options) => esbuild.build(options)), buildCss()]);
 }

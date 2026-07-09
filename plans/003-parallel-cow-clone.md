@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Follow this plan step by step. Run each verification command before moving to the next step. If a STOP condition occurs, stop and report instead of broadening scope. When done, update the status row for this plan in `plans/README.md`.
 >
-> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- crates/crabdb/src/db/util/fs_cow.rs crates/crabdb/src/db/lane/lifecycle.rs crates/crabdb/src/db/lane/workdir/manifest.rs`
+> **Drift check (run first)**: `git diff --stat 6bb6fa7..HEAD -- crates/trail/src/db/util/fs_cow.rs crates/trail/src/db/lane/lifecycle.rs crates/trail/src/db/lane/workdir/manifest.rs`
 >
 > If any in-scope file changed since this plan was written, compare the "Current state" section against live code before proceeding. Treat a semantic mismatch as a STOP condition.
 
@@ -21,9 +21,9 @@ After source and destination full scans are removed, serial file cloning becomes
 
 ## Current state
 
-- `crates/crabdb/src/db/util/fs_cow.rs` owns CoW cloning. Around lines 10-37, `materialize_from_workspace_cow` loops serially over the target entries.
+- `crates/trail/src/db/util/fs_cow.rs` owns CoW cloning. Around lines 10-37, `materialize_from_workspace_cow` loops serially over the target entries.
 - The same file has per-file stamped validation around lines 61-83 and clone implementation around lines 124-160.
-- The `crabdb` crate already depends on workspace `rayon`, so no new dependency should be needed.
+- The `trail` crate already depends on workspace `rayon`, so no new dependency should be needed.
 - Plan 002 should have introduced a materialization report or equivalent stamp return path that parallel workers can populate.
 
 ## Commands you will need
@@ -31,18 +31,18 @@ After source and destination full scans are removed, serial file cloning becomes
 | Purpose | Command | Expected on success |
 | --- | --- | --- |
 | Format | `make fmt-check` | exit 0 |
-| Check | `cargo check -p crabdb` | exit 0, no compiler errors |
-| Focused tests | `cargo test -p crabdb parallel_cow_clone` | all new tests pass |
-| Lane regression | `cargo test -p crabdb lane` | all matching lane tests pass |
+| Check | `cargo check -p trail` | exit 0, no compiler errors |
+| Focused tests | `cargo test -p trail parallel_cow_clone` | all new tests pass |
+| Lane regression | `cargo test -p trail lane` | all matching lane tests pass |
 | Smoke benchmark | `make bench-cli-scale-smoke` | exit 0 and prints benchmark summary |
 
 ## Scope
 
 **In scope**:
 
-- `crates/crabdb/src/db/util/fs_cow.rs`
-- small call-site adjustments in `crates/crabdb/src/db/lane/lifecycle.rs`
-- materialization report integration in `crates/crabdb/src/db/lane/workdir/manifest.rs` if needed
+- `crates/trail/src/db/util/fs_cow.rs`
+- small call-site adjustments in `crates/trail/src/db/lane/lifecycle.rs`
+- materialization report integration in `crates/trail/src/db/lane/workdir/manifest.rs` if needed
 - focused lane/CoW tests
 
 **Out of scope**:
@@ -70,7 +70,7 @@ The helper should return a per-path result containing:
 - optional destination stamp if plan 002's report path exists
 - enough path context for deterministic error reporting
 
-**Verify**: `cargo check -p crabdb` -> exit 0.
+**Verify**: `cargo check -p trail` -> exit 0.
 
 ### Step 2: Add a serial capability probe
 
@@ -78,7 +78,7 @@ Before spawning parallel work, choose the first eligible file and run the clone 
 
 Keep behavior for zero-file targets unchanged.
 
-**Verify**: `cargo test -p crabdb parallel_cow_clone_probe` -> new probe tests pass after they are added.
+**Verify**: `cargo test -p trail parallel_cow_clone_probe` -> new probe tests pass after they are added.
 
 ### Step 3: Clone remaining files with Rayon
 
@@ -90,7 +90,7 @@ On any worker error:
 - do not write a clean manifest
 - return the existing error/fallback shape expected by callers
 
-**Verify**: `cargo check -p crabdb` -> exit 0.
+**Verify**: `cargo check -p trail` -> exit 0.
 
 ### Step 4: Add focused tests
 
@@ -103,7 +103,7 @@ Add tests with prefix `parallel_cow_clone` covering:
 
 Use platform guards if the existing CoW tests already have them.
 
-**Verify**: `cargo test -p crabdb parallel_cow_clone` -> all new tests pass.
+**Verify**: `cargo test -p trail parallel_cow_clone` -> all new tests pass.
 
 ### Step 5: Run the production gate and benchmark
 
@@ -111,21 +111,21 @@ Run:
 
 ```sh
 make fmt-check
-cargo check -p crabdb
-cargo test -p crabdb
+cargo check -p trail
+cargo test -p trail
 make bench-cli-scale-smoke
-CRABDB_SCALE_MATERIALIZED=1 CRABDB_SCALE_FILES=100000 make bench-cli-scale-smoke
+TRAIL_SCALE_MATERIALIZED=1 TRAIL_SCALE_FILES=100000 make bench-cli-scale-smoke
 ```
 
-If the smoke target ignores `CRABDB_SCALE_FILES`, use the nearest existing scale target from the Makefile and record that substitution.
+If the smoke target ignores `TRAIL_SCALE_FILES`, use the nearest existing scale target from the Makefile and record that substitution.
 
 **Verify**: all commands exit 0. Materialized startup should improve relative to the post-plan-002 baseline, or the executor must report the measured numbers and likely reason.
 
 ## Test plan
 
 - New tests with prefix `parallel_cow_clone`.
-- Existing lane regression via `cargo test -p crabdb lane`.
-- Full crate tests before DONE: `cargo test -p crabdb`.
+- Existing lane regression via `cargo test -p trail lane`.
+- Full crate tests before DONE: `cargo test -p trail`.
 - Scale smoke with materialized workdir enabled.
 
 ## Done criteria

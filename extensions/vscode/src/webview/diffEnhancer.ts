@@ -155,7 +155,7 @@ function templateText(root: Element | null | undefined, selector: string): strin
 }
 
 function fileDiffFromPatch(path: string, patchText: string): FileDiffMetadata | undefined {
-  const parsed = parsePatchFiles(patchText, `crabdb-${path}`, false);
+  const parsed = parsePatchFiles(patchText, `trail-${path}`, false);
   return parsed.flatMap((patch) => patch.files).find((file) => file.name === path || file.prevName === path) || parsed[0]?.files[0];
 }
 

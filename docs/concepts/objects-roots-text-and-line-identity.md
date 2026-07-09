@@ -1,6 +1,6 @@
 # Objects, Roots, Text, and Line Identity
 
-CrabDB stores content-addressed objects and uses stable IDs for files and lines.
+Trail stores content-addressed objects and uses stable IDs for files and lines.
 
 ## Object Kinds
 
@@ -45,16 +45,16 @@ Lines have `LineId` values with an origin operation and local sequence. Line cha
 Use line IDs when an agent needs precise edits:
 
 ```sh
-crabdb diff --dirty --show-line-ids
-crabdb lane diff doc-bot --patch --show-line-ids
+trail diff --dirty --show-line-ids
+trail lane diff doc-bot --patch --show-line-ids
 ```
 
 Structured patches can replace a specific line by `line_id` and optional `expected_text`.
 
 ## Code Facts Used
 
-- Object model: `crates/crabdb/src/model/domain/objects.rs`
-- IDs: `crates/crabdb/src/ids.rs`
-- Line changes: `crates/crabdb/src/model/lane/changes.rs`
+- Object model: `crates/trail/src/model/domain/objects.rs`
+- IDs: `crates/trail/src/ids.rs`
+- Line changes: `crates/trail/src/model/lane/changes.rs`
 - Tests: `same_position_rewrite_preserves_line_identity`, `copying_a_file_allocates_a_new_file_identity`, `small_text_policy_avoids_prolly_text_maps_for_tiny_files`
 

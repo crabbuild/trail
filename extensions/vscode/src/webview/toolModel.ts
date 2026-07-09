@@ -234,8 +234,8 @@ function toolEmptyText(source: string | undefined, kind: ToolPresentationKind): 
   if (kind === "edit") {
     return "No diff preview available for this edit.";
   }
-  return source === "crabdb"
-    ? "CrabDB persisted this tool event without rendered output."
+  return source === "trail"
+    ? "Trail persisted this tool event without rendered output."
     : "No rendered output for tool call.";
 }
 

@@ -37,18 +37,18 @@ jobs:
       - name: Run CLI scale benchmark
         run: scripts/cli-scale-bench.sh
         env:
-          CRABDB_SCALE_BASE: ${{ runner.temp }}
-          CRABDB_SCALE_LABEL: scale-${{ github.run_id }}
-          CRABDB_SCALE_FILES: ${{ github.event.inputs.scale_files || '10000,100000,1000000' }}
-          CRABDB_SCALE_MATERIALIZED: ${{ github.event.inputs.run_materialized || '0' }}
-          CRABDB_SCALE_BACKUP: ${{ github.event.inputs.run_backup || '0' }}
-          CRABDB_SCALE_DAEMON: ${{ github.event.inputs.run_daemon || '1' }}
-          CRABDB_SCALE_GIT_IMPORT: ${{ github.event.inputs.run_git_import || '1' }}
+          TRAIL_SCALE_BASE: ${{ runner.temp }}
+          TRAIL_SCALE_LABEL: scale-${{ github.run_id }}
+          TRAIL_SCALE_FILES: ${{ github.event.inputs.scale_files || '10000,100000,1000000' }}
+          TRAIL_SCALE_MATERIALIZED: ${{ github.event.inputs.run_materialized || '0' }}
+          TRAIL_SCALE_BACKUP: ${{ github.event.inputs.run_backup || '0' }}
+          TRAIL_SCALE_DAEMON: ${{ github.event.inputs.run_daemon || '1' }}
+          TRAIL_SCALE_GIT_IMPORT: ${{ github.event.inputs.run_git_import || '1' }}
       - name: Summarize scale results
         if: always()
         run: |
-          find "${{ runner.temp }}/crabdb-cli-scale-scale-${{ github.run_id }}" -name results.tsv -print -exec cat {} \; || true
-          find "${{ runner.temp }}/crabdb-cli-scale-scale-${{ github.run_id }}" -name metrics.tsv -print -exec cat {} \; || true
+          find "${{ runner.temp }}/trail-cli-scale-scale-${{ github.run_id }}" -name results.tsv -print -exec cat {} \; || true
+          find "${{ runner.temp }}/trail-cli-scale-scale-${{ github.run_id }}" -name metrics.tsv -print -exec cat {} \; || true
       - name: Check large-agent hot path thresholds
         if: always()
         run: |
@@ -56,7 +56,7 @@ jobs:
             echo "skipping daemon hot-path thresholds because run_daemon is disabled"
             exit 0
           fi
-          root="${{ runner.temp }}/crabdb-cli-scale-scale-${{ github.run_id }}"
+          root="${{ runner.temp }}/trail-cli-scale-scale-${{ github.run_id }}"
           mapfile -t result_files < <(find "$root" -name results.tsv -print | sort)
           if [ "${#result_files[@]}" -eq 0 ]; then
             echo "no scale benchmark results found under $root" >&2
@@ -128,5 +128,5 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: crabdb-cli-scale-results
-          path: ${{ runner.temp }}/crabdb-cli-scale-scale-${{ github.run_id }}
+          name: trail-cli-scale-results
+          path: ${{ runner.temp }}/trail-cli-scale-scale-${{ github.run_id }}

@@ -17,20 +17,20 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Check
-        run: cargo check -p crabdb
+        run: cargo check -p trail
       - name: Test
-        run: cargo test -p crabdb
+        run: cargo test -p trail
       - name: Scale Benchmark Syntax
         run: bash -n scripts/cli-scale-bench.sh
       - name: Scale Benchmark Smoke
         run: make bench-cli-scale-smoke
         env:
-          CRABDB_SCALE_BASE: ${{ runner.temp }}
-          CRABDB_SCALE_LABEL: ci-${{ github.run_id }}
+          TRAIL_SCALE_BASE: ${{ runner.temp }}
+          TRAIL_SCALE_LABEL: ci-${{ github.run_id }}
       - name: Scale Benchmark Thresholds
         run: >
           python3 scripts/check-cli-scale-thresholds.py
-          "${{ runner.temp }}/crabdb-cli-scale-ci-${{ github.run_id }}/1000/results.tsv"
+          "${{ runner.temp }}/trail-cli-scale-ci-${{ github.run_id }}/1000/results.tsv"
           init_working_tree=60
           status_clean=15
           status_dirty=20
@@ -63,7 +63,7 @@ jobs:
           backup_create=30
           backup_verify=30
           --metrics
-          "${{ runner.temp }}/crabdb-cli-scale-ci-${{ github.run_id }}/1000/metrics.tsv"
+          "${{ runner.temp }}/trail-cli-scale-ci-${{ github.run_id }}/1000/metrics.tsv"
           sqlite_bytes=64000000
           dbstat_repo_prolly_nodes=32000000
           object_kind_repo_TextContent_bytes=16000000

@@ -20,7 +20,7 @@ if (!fs.existsSync(chromePath)) {
   throw new Error(`Chrome not found at ${chromePath}. Set CHROME_PATH to a Chromium executable.`);
 }
 
-const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-stream-replay-"));
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-stream-replay-"));
 const profileDir = path.join(tempRoot, "profile");
 const htmlPath = path.join(tempRoot, "index.html");
 const html = `<!doctype html>
@@ -29,10 +29,10 @@ const html = `<!doctype html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="${pathToFileURL(path.join(webviewDist, "main.css")).href}">
-  <title>CrabDB Stream Replay</title>
+  <title>Trail Stream Replay</title>
 </head>
 <body>
-  <main id="app" aria-label="CrabDB agent chat"></main>
+  <main id="app" aria-label="Trail agent chat"></main>
   <script>
     window.__vscodeMessages = [];
     window.__vscodeState = undefined;
@@ -547,7 +547,7 @@ function replaySource() {
 
     const streamingMarkdownText = (id) => {
       const target = document.getElementById(domId(id))?.querySelector("[data-streaming-markdown]");
-      return target?.__crabdbStreamingText || target?.textContent || "";
+      return target?.__trailStreamingText || target?.textContent || "";
     };
     const finalText = streamingMarkdownText(ids.assistant);
     const finalThought = streamingMarkdownText(ids.thought);

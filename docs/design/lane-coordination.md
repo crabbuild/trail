@@ -1,6 +1,6 @@
 # Lane Coordination
 
-This design section is advanced/internal. It explains how CrabDB coordinates multiple lane branches, workdirs, sessions, gates, approvals, and merges.
+This design section is advanced/internal. It explains how Trail coordinates multiple lane branches, workdirs, sessions, gates, approvals, and merges.
 
 ## Coordination Goals
 
@@ -312,10 +312,10 @@ This avoids silent overwrites and gives humans and lane-running hosts an explici
 
 ## Code Facts Used
 
-- Lane lifecycle: `crates/crabdb/src/db/lane/lifecycle.rs`
-- Lane workdirs: `crates/crabdb/src/db/lane/workdir`
-- Lane identity/status: `crates/crabdb/src/db/lane/identity.rs`
-- Lane control: `crates/crabdb/src/db/lane/control`
-- Leases: `crates/crabdb/src/db/lane/leases.rs`
-- Readiness/handoff: `crates/crabdb/src/db/lane/readiness.rs`
-- Merge queue: `crates/crabdb/src/db/merge`
+- Lane lifecycle: `crates/trail/src/db/lane/lifecycle.rs`
+- Lane workdirs: `crates/trail/src/db/lane/workdir`
+- Lane identity/status: `crates/trail/src/db/lane/identity.rs`
+- Lane control: `crates/trail/src/db/lane/control`
+- Leases: `crates/trail/src/db/lane/leases.rs`
+- Readiness/handoff: `crates/trail/src/db/lane/readiness.rs`
+- Merge queue: `crates/trail/src/db/merge`

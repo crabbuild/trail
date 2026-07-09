@@ -19,16 +19,16 @@
   --sidebar-ring: var(--focus);
   --accent: var(--vscode-list-hoverBackground, var(--muted));
   --accent-foreground: var(--vscode-list-hoverForeground, var(--foreground));
-  --destructive: var(--crabdb-risk);
+  --destructive: var(--trail-risk);
   --input: var(--input-border);
   --ring: var(--focus);
   --radius: 6px;
-  --crabdb-lane: #4f8ea3;
-  --crabdb-checkpoint: #4d8d55;
-  --crabdb-review: #9a6a23;
-  --crabdb-risk: #b0525c;
-  --crabdb-provider: #62628f;
-  --crabdb-muted: var(--vscode-descriptionForeground);
+  --trail-lane: #4f8ea3;
+  --trail-checkpoint: #4d8d55;
+  --trail-review: #9a6a23;
+  --trail-risk: #b0525c;
+  --trail-provider: #62628f;
+  --trail-muted: var(--vscode-descriptionForeground);
   --surface: var(--vscode-editor-background);
   --surface-raised: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
   --surface-canvas: color-mix(in srgb, var(--surface) 98%, var(--surface-raised));
@@ -40,7 +40,7 @@
   --surface-bubble: color-mix(in srgb, var(--surface-raised) 42%, var(--surface));
   --surface-hover: var(--vscode-toolbar-hoverBackground, color-mix(in srgb, var(--text) 7%, transparent));
   --input-border: var(--vscode-input-border, var(--border));
-  --input-active-border: var(--vscode-focusBorder, var(--crabdb-lane));
+  --input-active-border: var(--vscode-focusBorder, var(--trail-lane));
   --border: var(
     --vscode-widget-border,
     var(--vscode-panel-border, color-mix(in srgb, var(--vscode-foreground) 22%, transparent))
@@ -48,17 +48,17 @@
   --border-subtle: color-mix(in srgb, var(--border) 54%, transparent);
   --border-quiet: color-mix(in srgb, var(--border) 30%, transparent);
   --text: var(--vscode-foreground);
-  --focus: var(--vscode-focusBorder, var(--crabdb-lane));
+  --focus: var(--vscode-focusBorder, var(--trail-lane));
   --focus-ring: 0 0 0 2px color-mix(in srgb, var(--focus) 24%, transparent);
-  --state-lane-border: color-mix(in srgb, var(--crabdb-lane) 34%, var(--border));
-  --state-provider-border: color-mix(in srgb, var(--crabdb-provider) 32%, var(--border));
-  --state-success-border: color-mix(in srgb, var(--crabdb-checkpoint) 40%, var(--border));
-  --state-warning-border: color-mix(in srgb, var(--crabdb-review) 42%, var(--border));
-  --state-danger-border: color-mix(in srgb, var(--crabdb-risk) 46%, var(--border));
-  --state-danger-hover: color-mix(in srgb, var(--crabdb-risk) 8%, transparent);
-  --state-warning-bg: color-mix(in srgb, var(--crabdb-review) 10%, var(--surface-subtle));
-  --crabdb-warning: var(--crabdb-review);
-  --button-primary-bg: color-mix(in srgb, var(--crabdb-lane) 86%, #0d252b);
+  --state-lane-border: color-mix(in srgb, var(--trail-lane) 34%, var(--border));
+  --state-provider-border: color-mix(in srgb, var(--trail-provider) 32%, var(--border));
+  --state-success-border: color-mix(in srgb, var(--trail-checkpoint) 40%, var(--border));
+  --state-warning-border: color-mix(in srgb, var(--trail-review) 42%, var(--border));
+  --state-danger-border: color-mix(in srgb, var(--trail-risk) 46%, var(--border));
+  --state-danger-hover: color-mix(in srgb, var(--trail-risk) 8%, transparent);
+  --state-warning-bg: color-mix(in srgb, var(--trail-review) 10%, var(--surface-subtle));
+  --trail-warning: var(--trail-review);
+  --button-primary-bg: color-mix(in srgb, var(--trail-lane) 86%, #0d252b);
   --button-primary-hover: color-mix(in srgb, var(--button-primary-bg) 88%, var(--text));
   --button-primary-fg: #ffffff;
   --syntax-default: var(--vscode-editor-foreground, var(--text));
@@ -77,26 +77,26 @@
   --radius-bar: 999px;
   --shadow-soft: 0 1px 2px rgb(0 0 0 / 0.06);
   --shadow-elevated: 0 6px 18px rgb(0 0 0 / 0.16);
-  --crabdb-ui-font-size: max(13px, var(--vscode-font-size, 13px));
-  --crabdb-copy-font-size: max(14px, calc(var(--vscode-font-size, 13px) + 1px));
-  --crabdb-caption-font-size: max(12px, calc(var(--vscode-font-size, 13px) - 1px));
+  --trail-ui-font-size: max(13px, var(--vscode-font-size, 13px));
+  --trail-copy-font-size: max(14px, calc(var(--vscode-font-size, 13px) + 1px));
+  --trail-caption-font-size: max(12px, calc(var(--vscode-font-size, 13px) - 1px));
   --composer-control-size: 30px;
   --composer-control-icon-size: 15px;
   color-scheme: light dark;
   color: var(--text);
   background: var(--surface);
   font-family: var(--vscode-font-family);
-  font-size: var(--crabdb-ui-font-size);
+  font-size: var(--trail-ui-font-size);
   line-height: 1.45;
 }
 
 body.vscode-light {
   color-scheme: light;
-  --crabdb-lane: #397f8d;
-  --crabdb-checkpoint: #3f8663;
-  --crabdb-review: #9a712f;
-  --crabdb-risk: #b45f6a;
-  --crabdb-provider: #6f6ca4;
+  --trail-lane: #397f8d;
+  --trail-checkpoint: #3f8663;
+  --trail-review: #9a712f;
+  --trail-risk: #b45f6a;
+  --trail-provider: #6f6ca4;
   --button-primary-bg: #367f8d;
   --button-primary-hover: #2f717e;
   --button-primary-fg: #ffffff;
@@ -116,11 +116,11 @@ body.vscode-light {
 
 body.vscode-dark {
   color-scheme: dark;
-  --crabdb-lane: #84cbd6;
-  --crabdb-checkpoint: #8bcf9f;
-  --crabdb-review: #d8b678;
-  --crabdb-risk: #ef9ca8;
-  --crabdb-provider: #b7b1ff;
+  --trail-lane: #84cbd6;
+  --trail-checkpoint: #8bcf9f;
+  --trail-review: #d8b678;
+  --trail-risk: #ef9ca8;
+  --trail-provider: #b7b1ff;
   --button-primary-bg: #2f737c;
   --button-primary-hover: #37848e;
   --button-primary-fg: #f8ffff;
@@ -262,7 +262,7 @@ button.primary:hover {
 
 button.danger {
   border-color: var(--state-danger-border);
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
   background: transparent;
 }
 
@@ -314,7 +314,7 @@ button.danger:hover {
 
 .provider-title {
   margin: 3px 0 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -334,7 +334,7 @@ button.danger:hover {
   min-height: 32px;
   border: 1px solid transparent;
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: transparent;
   padding: 0;
   cursor: pointer;
@@ -465,39 +465,39 @@ button.danger:hover {
 
 .header-action-group button[data-header-icon-only="true"][data-action="toggleReview"],
 .header-action-group button[data-header-icon-only="true"][data-action="openDiff"] {
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .header-action-group button[data-header-icon-only="true"][data-lane-map-trigger="true"] {
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .header-action-group button[data-header-icon-only="true"][data-lane-map-trigger="true"].active {
   border-color: var(--state-lane-border);
-  background: color-mix(in srgb, var(--crabdb-lane) 10%, transparent);
+  background: color-mix(in srgb, var(--trail-lane) 10%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--state-lane-border) 54%, transparent);
 }
 
 .header-action-group button[data-header-icon-only="true"][data-action="toggleReview"].active {
   border-color: var(--state-warning-border);
-  background: color-mix(in srgb, var(--crabdb-review) 10%, transparent);
+  background: color-mix(in srgb, var(--trail-review) 10%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--state-warning-border) 54%, transparent);
 }
 
 .header-action-group button[data-header-icon-only="true"][data-action="openSettings"] {
-  color: var(--crabdb-provider);
+  color: var(--trail-provider);
 }
 
 .header-action-group button[data-header-icon-only="true"][data-action="refresh"] {
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .header-action-group button[data-header-icon-only="true"][data-action="cancel"] {
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .header-action-group button[data-header-icon-only="true"]:disabled {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .header-action-group button[data-header-icon-only="true"]:disabled::after {
@@ -548,8 +548,8 @@ button.danger:hover {
   width: 7px;
   height: 7px;
   border-radius: 999px;
-  background: var(--crabdb-muted);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--crabdb-muted) 14%, transparent);
+  background: var(--trail-muted);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--trail-muted) 14%, transparent);
 }
 
 .toolbar-run-ok,
@@ -608,42 +608,42 @@ button.danger:hover {
 }
 
 .toolbar-chip-ok {
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 7%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-checkpoint) 7%, var(--surface-subtle));
 }
 
 .toolbar-chip-ok::before {
-  background: var(--crabdb-checkpoint);
+  background: var(--trail-checkpoint);
 }
 
 .toolbar-chip-warning {
-  background: color-mix(in srgb, var(--crabdb-review) 8%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-review) 8%, var(--surface-subtle));
 }
 
 .toolbar-chip-warning::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .toolbar-chip-blocked {
-  background: color-mix(in srgb, var(--crabdb-risk) 8%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-risk) 8%, var(--surface-subtle));
 }
 
 .toolbar-chip-blocked::before {
-  background: var(--crabdb-risk);
+  background: var(--trail-risk);
 }
 
 .toolbar-chip-active {
-  background: color-mix(in srgb, var(--crabdb-lane) 7%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-lane) 7%, var(--surface-subtle));
 }
 
 .toolbar-chip-active::before {
-  background: var(--crabdb-lane);
+  background: var(--trail-lane);
 }
 
 .toolbar-chip span {
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -672,7 +672,7 @@ button.danger:hover {
   max-width: 32px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 28%, transparent);
   padding: 0;
   cursor: pointer;
@@ -685,8 +685,8 @@ button.danger:hover {
 .toolbar-capabilities-trigger:hover,
 .toolbar-capabilities-trigger[aria-expanded="true"] {
   border-color: var(--state-lane-border);
-  color: var(--crabdb-lane);
-  background: color-mix(in srgb, var(--crabdb-lane) 8%, var(--surface-subtle));
+  color: var(--trail-lane);
+  background: color-mix(in srgb, var(--trail-lane) 8%, var(--surface-subtle));
 }
 
 .toolbar-capabilities-trigger [data-icon="inline-start"],
@@ -698,7 +698,7 @@ button.danger:hover {
 .toolbar-capabilities-trigger b {
   min-width: 0;
   overflow: hidden;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -741,7 +741,7 @@ button.danger:hover {
 }
 
 .toolbar-capability-group-label {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 10px;
   font-weight: 650;
   letter-spacing: 0;
@@ -779,11 +779,11 @@ button.danger:hover {
 
 .toolbar-capability.on {
   border-color: color-mix(in srgb, var(--state-success-border) 46%, var(--border-subtle));
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 7%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-checkpoint) 7%, var(--surface-subtle));
 }
 
 .toolbar-capability.on::before {
-  background: var(--crabdb-checkpoint);
+  background: var(--trail-checkpoint);
 }
 
 .toolbar-capability.off {
@@ -791,7 +791,7 @@ button.danger:hover {
 }
 
 .toolbar-capability.off::before {
-  background: var(--crabdb-muted);
+  background: var(--trail-muted);
 }
 
 .toolbar-capability strong,
@@ -812,7 +812,7 @@ button.danger:hover {
   max-height: min(46px, 12vh);
   overflow: auto;
   overscroll-behavior: contain;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   scrollbar-gutter: stable;
   scrollbar-width: thin;
@@ -871,7 +871,7 @@ button.danger:hover {
   flex: 0 0 auto;
   width: 14px;
   height: 14px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .toolbar-capability-actions button span {
@@ -883,28 +883,28 @@ button.danger:hover {
 
 .toolbar-capability-actions button[data-action="toggleReview"] {
   border-color: var(--state-warning-border);
-  background: color-mix(in srgb, var(--crabdb-review) 8%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-review) 8%, var(--surface-subtle));
 }
 
 .toolbar-capability-actions button[data-action="toggleReview"]::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .toolbar-capability-actions button[data-action="toggleReview"] [data-icon="inline-start"] {
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .toolbar-capability-actions button[data-action="openSettings"] {
   border-color: var(--state-provider-border);
-  background: color-mix(in srgb, var(--crabdb-provider) 7%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-provider) 7%, var(--surface-subtle));
 }
 
 .toolbar-capability-actions button[data-action="openSettings"]::before {
-  background: var(--crabdb-provider);
+  background: var(--trail-provider);
 }
 
 .toolbar-capability-actions button[data-action="openSettings"] [data-icon="inline-start"] {
-  color: var(--crabdb-provider);
+  color: var(--trail-provider);
 }
 
 .toolbar-action-button {
@@ -946,22 +946,22 @@ button.danger:hover {
   flex: 0 0 auto;
   width: 15px;
   height: 15px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .toolbar-action-button.primary {
   border-color: var(--state-lane-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-lane) 12%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-lane) 12%, var(--surface-muted));
 }
 
 .toolbar-action-button.primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--crabdb-lane) 18%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-lane) 18%, var(--surface-muted));
 }
 
 .toolbar-action-button.danger {
   border-color: var(--state-danger-border);
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
   background: transparent;
 }
 
@@ -971,52 +971,52 @@ button.danger:hover {
 
 .toolbar-action-button[data-action="focusComposer"]::before,
 .toolbar-action-button[data-action="refresh"]::before {
-  background: var(--crabdb-lane);
+  background: var(--trail-lane);
 }
 
 .toolbar-action-button[data-action="focusComposer"] [data-icon="inline-start"],
 .toolbar-action-button[data-action="refresh"] [data-icon="inline-start"] {
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .toolbar-action-button[data-action="dryRunApply"],
 .toolbar-action-button[data-action="startFollowUp"] {
   border-color: var(--state-success-border);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 8%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-checkpoint) 8%, var(--surface-muted));
 }
 
 .toolbar-action-button[data-action="dryRunApply"]::before,
 .toolbar-action-button[data-action="startFollowUp"]::before {
-  background: var(--crabdb-checkpoint);
+  background: var(--trail-checkpoint);
 }
 
 .toolbar-action-button[data-action="dryRunApply"] [data-icon="inline-start"],
 .toolbar-action-button[data-action="startFollowUp"] [data-icon="inline-start"] {
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .toolbar-action-button[data-action="focusReview"],
 .toolbar-action-button[data-action="focusTranscript"] {
   border-color: var(--state-warning-border);
-  background: color-mix(in srgb, var(--crabdb-review) 9%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-review) 9%, var(--surface-muted));
 }
 
 .toolbar-action-button[data-action="focusReview"]::before,
 .toolbar-action-button[data-action="focusTranscript"]::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .toolbar-action-button[data-action="focusReview"] [data-icon="inline-start"],
 .toolbar-action-button[data-action="focusTranscript"] [data-icon="inline-start"] {
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .toolbar-action-button[data-action="cancel"]::before {
-  background: var(--crabdb-risk);
+  background: var(--trail-risk);
 }
 
 .toolbar-action-button[data-action="cancel"] [data-icon="inline-start"] {
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .toolbar-action-button span {
@@ -1075,7 +1075,7 @@ button.danger:hover {
 }
 
 .capability-chip.off {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   opacity: 0.62;
 }
 
@@ -1113,7 +1113,7 @@ button.danger:hover {
   gap: 5px;
   min-width: 0;
   max-width: 100%;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -1174,7 +1174,7 @@ button.danger:hover {
   text-overflow: ellipsis;
   vertical-align: middle;
   white-space: nowrap;
-  font-size: var(--crabdb-caption-font-size);
+  font-size: var(--trail-caption-font-size);
 }
 
 .status-ready,
@@ -1202,28 +1202,28 @@ button.danger:hover {
 
 h1 {
   margin: 2px 0;
-  font-size: var(--crabdb-copy-font-size);
+  font-size: var(--trail-copy-font-size);
   line-height: 20px;
   font-weight: 650;
 }
 
 h2 {
   margin: 0 0 8px;
-  font-size: var(--crabdb-copy-font-size);
+  font-size: var(--trail-copy-font-size);
 }
 
 h3 {
   margin: 16px 0 8px;
-  font-size: var(--crabdb-caption-font-size);
+  font-size: var(--trail-caption-font-size);
   text-transform: uppercase;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .muted,
 .meta-row,
 .composer-actions,
 .review-drawer p {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .context-meter {
@@ -1231,8 +1231,8 @@ h3 {
   grid-template-columns: auto 64px;
   align-items: center;
   gap: 6px;
-  color: var(--crabdb-muted);
-  font-size: var(--crabdb-caption-font-size);
+  color: var(--trail-muted);
+  font-size: var(--trail-caption-font-size);
 }
 
 .meter {
@@ -1242,7 +1242,7 @@ h3 {
   border: 0;
   border-radius: var(--radius-bar);
   background: var(--surface-muted);
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .meter::-webkit-progress-bar {
@@ -1252,28 +1252,28 @@ h3 {
 
 .meter::-webkit-progress-value {
   border-radius: var(--radius-bar);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 46%, var(--text));
+  background: color-mix(in srgb, var(--trail-checkpoint) 46%, var(--text));
 }
 
 .meter.review::-webkit-progress-value {
-  background: color-mix(in srgb, var(--crabdb-review) 48%, var(--text));
+  background: color-mix(in srgb, var(--trail-review) 48%, var(--text));
 }
 
 .meter.risk::-webkit-progress-value {
-  background: color-mix(in srgb, var(--crabdb-risk) 52%, var(--text));
+  background: color-mix(in srgb, var(--trail-risk) 52%, var(--text));
 }
 
 .meter::-moz-progress-bar {
   border-radius: var(--radius-bar);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 46%, var(--text));
+  background: color-mix(in srgb, var(--trail-checkpoint) 46%, var(--text));
 }
 
 .meter.review::-moz-progress-bar {
-  background: color-mix(in srgb, var(--crabdb-review) 48%, var(--text));
+  background: color-mix(in srgb, var(--trail-review) 48%, var(--text));
 }
 
 .meter.risk::-moz-progress-bar {
-  background: color-mix(in srgb, var(--crabdb-risk) 52%, var(--text));
+  background: color-mix(in srgb, var(--trail-risk) 52%, var(--text));
 }
 
 .timeline-shell {
@@ -1335,7 +1335,7 @@ h3 {
 .timeline-filter-trigger[aria-expanded="true"],
 .timeline-toolbar.filtered .timeline-filter-trigger {
   border-color: var(--state-provider-border);
-  background: color-mix(in srgb, var(--crabdb-provider) 8%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-provider) 8%, var(--surface-subtle));
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--state-provider-border) 42%, transparent);
 }
 
@@ -1348,11 +1348,11 @@ h3 {
 }
 
 .timeline-filter-trigger [data-icon="inline-start"] {
-  color: var(--crabdb-provider);
+  color: var(--trail-provider);
 }
 
 .timeline-filter-trigger [data-icon="inline-end"] {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   transition: transform 120ms ease-out;
 }
 
@@ -1382,7 +1382,7 @@ h3 {
 }
 
 .timeline-filter-trigger-detail {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   line-height: 13px;
   font-variant-numeric: tabular-nums;
@@ -1444,7 +1444,7 @@ h3 {
 }
 
 .timeline-filter-popover-head span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   font-weight: 650;
   text-transform: uppercase;
@@ -1496,21 +1496,21 @@ button.timeline-filter span {
 button.timeline-filter:hover {
   border-color: var(--state-provider-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-provider) 6%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-provider) 6%, var(--surface-subtle));
 }
 
 button.timeline-filter.active {
   border-color: var(--state-provider-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-provider) 10%, var(--surface));
-  box-shadow: inset 3px 0 0 var(--crabdb-provider);
+  background: color-mix(in srgb, var(--trail-provider) 10%, var(--surface));
+  box-shadow: inset 3px 0 0 var(--trail-provider);
 }
 
 button.timeline-filter b {
   flex: 0 0 auto;
   min-width: 18px;
   border-radius: var(--radius-chip);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: var(--surface-muted);
   padding: 1px 5px;
   font-variant-numeric: tabular-nums;
@@ -1528,7 +1528,7 @@ button.timeline-filter b {
   min-height: 28px;
   border: 1px solid var(--input-border);
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: var(--vscode-input-background, color-mix(in srgb, var(--surface) 88%, var(--surface-raised)));
   padding: 0 8px;
 }
@@ -1615,7 +1615,7 @@ button.timeline-filter b {
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   font-weight: 650;
 }
@@ -1668,7 +1668,7 @@ button.timeline-filter b {
   grid-area: 1 / 1;
   width: 14px;
   height: 14px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .timeline-group-disclosure-up {
@@ -1710,7 +1710,7 @@ button.timeline-filter b {
 .composer-controls-title small,
 .timeline-group-detail {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
   font-size: 11px;
 }
@@ -1771,7 +1771,7 @@ button.timeline-filter b {
 }
 
 .tool-activity-title small {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -1823,7 +1823,7 @@ button.timeline-filter b {
 
 .tool-activity-metric span {
   align-self: center;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 10px;
 }
 
@@ -1867,7 +1867,7 @@ button.timeline-filter b {
 }
 
 .tool-activity-path span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 10px;
 }
 
@@ -1919,7 +1919,7 @@ button.timeline-filter b {
 }
 
 .session-map-turn span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
 }
@@ -2002,7 +2002,7 @@ button.timeline-filter b {
 
 .timeline-group-in_progress .timeline-group-summary,
 .timeline-scroller-row-in_progress .timeline-group-summary {
-  background: color-mix(in srgb, var(--crabdb-review) 3%, var(--surface));
+  background: color-mix(in srgb, var(--trail-review) 3%, var(--surface));
 }
 
 .timeline-group-meta {
@@ -2024,7 +2024,7 @@ button.timeline-filter b {
   height: 22px;
   min-height: 22px;
   border-color: transparent;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: transparent;
   transform: translateY(-50%);
 }
@@ -2153,7 +2153,7 @@ button.timeline-filter b {
 }
 
 .transcript-message-sticky .transcript-message-content {
-  border-color: color-mix(in srgb, var(--crabdb-lane) 30%, var(--border-subtle));
+  border-color: color-mix(in srgb, var(--trail-lane) 30%, var(--border-subtle));
 }
 
 .message .transcript-message-content > .markdown {
@@ -2212,14 +2212,14 @@ button.timeline-filter b {
 
 .transcript-message-assistant .transcript-message-content > .markdown {
   max-width: 100%;
-  color: color-mix(in srgb, var(--text) 94%, var(--crabdb-muted));
-  font-size: var(--crabdb-copy-font-size);
+  color: color-mix(in srgb, var(--text) 94%, var(--trail-muted));
+  font-size: var(--trail-copy-font-size);
   line-height: 1.62;
 }
 
 .transcript-message-user .transcript-message-content > .markdown {
   max-width: 62ch;
-  font-size: var(--crabdb-copy-font-size);
+  font-size: var(--trail-copy-font-size);
   line-height: 1.46;
 }
 
@@ -2309,7 +2309,7 @@ button.timeline-filter b {
 
 .tool-call-group .tool-group-summary .tool-summary-icon {
   border-color: color-mix(in srgb, var(--border-subtle) 42%, transparent);
-  color: color-mix(in srgb, var(--crabdb-muted) 88%, var(--text));
+  color: color-mix(in srgb, var(--trail-muted) 88%, var(--text));
   background: color-mix(in srgb, var(--surface) 96%, transparent);
 }
 
@@ -2335,7 +2335,7 @@ button.timeline-filter b {
   height: 20px;
   border: 1px solid color-mix(in srgb, var(--border-subtle) 42%, transparent);
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface) 70%, transparent);
   padding: 0 5px;
   font-size: 11px;
@@ -2349,16 +2349,16 @@ button.timeline-filter b {
 
 .tool-group-status-pending,
 .tool-group-status-in_progress {
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .tool-group-status-failed,
 .tool-group-status-cancelled {
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .tool-group-status-completed {
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .card-body.compact {
@@ -2417,17 +2417,17 @@ button.timeline-filter b {
 }
 
 .checkpoint-separator-summary[aria-expanded="true"] {
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 5%, transparent);
+  background: color-mix(in srgb, var(--trail-checkpoint) 5%, transparent);
 }
 
 .checkpoint-separator-summary [data-slot="accordion-trigger-icon"] {
   grid-column: 5;
   justify-self: center;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .checkpoint-separator-icon {
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .checkpoint-separator-main {
@@ -2532,7 +2532,7 @@ button.timeline-filter b {
 }
 
 .audit-success {
-  background: color-mix(in srgb, var(--surface-subtle) 94%, var(--crabdb-checkpoint));
+  background: color-mix(in srgb, var(--surface-subtle) 94%, var(--trail-checkpoint));
 }
 
 .audit-success::before {
@@ -2540,7 +2540,7 @@ button.timeline-filter b {
 }
 
 .audit-warning {
-  background: color-mix(in srgb, var(--surface-subtle) 94%, var(--crabdb-review));
+  background: color-mix(in srgb, var(--surface-subtle) 94%, var(--trail-review));
 }
 
 .audit-warning::before {
@@ -2548,7 +2548,7 @@ button.timeline-filter b {
 }
 
 .audit-risk {
-  background: color-mix(in srgb, var(--surface-subtle) 94%, var(--crabdb-risk));
+  background: color-mix(in srgb, var(--surface-subtle) 94%, var(--trail-risk));
 }
 
 .audit-risk::before {
@@ -2586,7 +2586,7 @@ button.timeline-filter b {
   grid-column: 4;
   grid-row: 1;
   justify-self: center;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .thought-summary[aria-expanded="true"] {
@@ -2620,7 +2620,7 @@ button.timeline-filter b {
 
 .event-detail {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
   font-size: 11px;
 }
@@ -2671,7 +2671,7 @@ button.timeline-filter b {
   min-width: 0;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 58%, transparent);
   padding: 6px 8px;
   overflow-wrap: anywhere;
@@ -2691,7 +2691,7 @@ button.timeline-filter b {
 .event-fact.active {
   border-color: var(--state-lane-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-lane) 10%, transparent);
+  background: color-mix(in srgb, var(--trail-lane) 10%, transparent);
 }
 
 .event-fact b {
@@ -2727,7 +2727,7 @@ button.timeline-filter b {
 }
 
 .event-callout span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
   font-size: 11px;
 }
@@ -2737,7 +2737,7 @@ button.timeline-filter b {
 }
 
 .event-callout-success::before {
-  background: var(--crabdb-checkpoint);
+  background: var(--trail-checkpoint);
 }
 
 .event-callout-warning {
@@ -2745,7 +2745,7 @@ button.timeline-filter b {
 }
 
 .event-callout-warning::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .event-callout-risk {
@@ -2753,7 +2753,7 @@ button.timeline-filter b {
 }
 
 .event-callout-risk::before {
-  background: var(--crabdb-risk);
+  background: var(--trail-risk);
 }
 
 .event-chip {
@@ -2764,7 +2764,7 @@ button.timeline-filter b {
   max-width: 100%;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-chip);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface) 72%, transparent);
   padding: 2px 7px;
   overflow: hidden;
@@ -2778,7 +2778,7 @@ button.timeline-filter b {
 .event-chip.active {
   border-color: var(--state-lane-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-lane) 10%, transparent);
+  background: color-mix(in srgb, var(--trail-lane) 10%, transparent);
 }
 
 .event-chip b {
@@ -2801,7 +2801,7 @@ button.timeline-filter b {
   gap: 8px;
   align-items: center;
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -2950,7 +2950,7 @@ button.timeline-filter b {
   background: color-mix(in srgb, var(--surface-muted) 58%, transparent);
   padding: 6px 8px;
   overflow-wrap: anywhere;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .overlap-paths b {
@@ -2993,40 +2993,40 @@ button.timeline-filter b {
 
 .tool-status-completed {
   border-color: var(--state-success-border);
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .tool-status-in_progress,
 .tool-status-pending {
   border-color: var(--state-warning-border);
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .tool-status-failed,
 .tool-status-cancelled {
   border-color: var(--state-danger-border);
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .tool-kind-file {
   border-color: var(--state-provider-border);
-  color: var(--crabdb-provider);
+  color: var(--trail-provider);
 }
 
 .tool-kind-change {
   border-color: var(--state-lane-border);
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .tool-kind-query,
 .tool-kind-terminal {
   border-color: var(--state-warning-border);
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .tool-kind-risk {
   border-color: var(--state-danger-border);
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .markdown {
@@ -3099,12 +3099,12 @@ button.timeline-filter b {
   height: 13px;
   margin: 0 7px 0 -20px;
   vertical-align: -2px;
-  accent-color: var(--crabdb-checkpoint);
+  accent-color: var(--trail-checkpoint);
 }
 
 .markdown blockquote {
   border-inline-start: 3px solid var(--state-lane-border);
-  color: color-mix(in srgb, var(--text) 86%, var(--crabdb-muted));
+  color: color-mix(in srgb, var(--text) 86%, var(--trail-muted));
   background: color-mix(in srgb, var(--surface-subtle) 58%, transparent);
   padding: 7px 10px;
 }
@@ -3131,7 +3131,7 @@ button.timeline-filter b {
 }
 
 .markdown del {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .markdown-table-wrap {
@@ -3244,7 +3244,7 @@ button.timeline-filter b {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow: hidden;
   font-size: 12px;
   line-height: 16px;
@@ -3263,7 +3263,7 @@ button.timeline-filter b {
 }
 
 .code-title small {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 10px;
   font-weight: 400;
 }
@@ -3280,7 +3280,7 @@ button.timeline-filter b {
   border-radius: var(--radius-chip);
   background: color-mix(in srgb, var(--surface) 58%, transparent);
   padding: 0 6px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -3413,7 +3413,7 @@ button.timeline-filter b {
 
 .tool-subtitle {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3448,7 +3448,7 @@ button.timeline-filter b {
 }
 
 .tool-meta-hover-title {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   text-transform: uppercase;
 }
@@ -3461,7 +3461,7 @@ button.timeline-filter b {
 }
 
 .tool-meta-hover-content span:last-child {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   line-height: 1.45;
 }
 
@@ -3484,23 +3484,23 @@ button.timeline-filter b {
 
 .tool-risk-badge-ok {
   border-color: var(--state-success-border);
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .tool-risk-badge-warning {
   border-color: var(--state-warning-border);
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .tool-risk-badge-risk {
   border-color: var(--state-danger-border);
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .diff-stat {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 70%, transparent);
   padding: 3px 7px;
   font-size: 11px;
@@ -3550,17 +3550,17 @@ button.timeline-filter b {
 
 .diff-stat.additions {
   border-color: var(--state-success-border);
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .diff-stat.deletions {
   border-color: var(--state-danger-border);
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .diff-stat-loading {
   border-color: var(--state-provider-border);
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .diff-preview {
@@ -3585,7 +3585,7 @@ button.timeline-filter b {
   display: grid;
   gap: 8px;
   padding: 12px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: var(--vscode-textCodeBlock-background);
   font-size: 12px;
 }
@@ -3605,11 +3605,11 @@ button.timeline-filter b {
   inset-inline-start: -32%;
   width: 32%;
   border-radius: inherit;
-  background: var(--crabdb-lane);
-  animation: crabdb-diff-loading 1.15s ease-in-out infinite;
+  background: var(--trail-lane);
+  animation: trail-diff-loading 1.15s ease-in-out infinite;
 }
 
-@keyframes crabdb-diff-loading {
+@keyframes trail-diff-loading {
   to {
     inset-inline-start: 100%;
   }
@@ -3631,9 +3631,9 @@ button.timeline-filter b {
   --diffs-dark-bg: var(--vscode-textCodeBlock-background);
   --diffs-light: var(--vscode-editor-foreground);
   --diffs-dark: var(--vscode-editor-foreground);
-  --diffs-addition-color: var(--crabdb-checkpoint);
-  --diffs-deletion-color: var(--crabdb-risk);
-  --diffs-modified-color: var(--crabdb-lane);
+  --diffs-addition-color: var(--trail-checkpoint);
+  --diffs-deletion-color: var(--trail-risk);
+  --diffs-modified-color: var(--trail-lane);
 }
 
 .diffs-mount:focus-within {
@@ -3653,7 +3653,7 @@ button.timeline-filter b {
   content: "Rendering enhanced diff...";
   display: block;
   padding: 12px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 12px;
 }
 
@@ -3715,7 +3715,7 @@ button.timeline-filter b {
 .diff-preview-meta {
   justify-content: flex-start;
   border-bottom: 1px solid var(--border-subtle);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -3755,7 +3755,7 @@ button.timeline-filter b {
   position: sticky;
   top: 0;
   z-index: 1;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 72%, var(--vscode-textCodeBlock-background));
   font-size: 11px;
   font-weight: 650;
@@ -3767,7 +3767,7 @@ button.timeline-filter b {
 
 .diff-line-number {
   user-select: none;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 60%, transparent);
   padding: 3px 8px;
   text-align: right;
@@ -3799,27 +3799,27 @@ button.timeline-filter b {
 }
 
 .diff-row-context .diff-code {
-  color: color-mix(in srgb, var(--syntax-default) 84%, var(--crabdb-muted));
+  color: color-mix(in srgb, var(--syntax-default) 84%, var(--trail-muted));
 }
 
 .diff-row-added .diff-code-new,
 .diff-row-modified .diff-code-new {
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 12%, transparent);
+  background: color-mix(in srgb, var(--trail-checkpoint) 12%, transparent);
 }
 
 .diff-row-removed .diff-code-old,
 .diff-row-modified .diff-code-old {
-  background: color-mix(in srgb, var(--crabdb-risk) 11%, transparent);
+  background: color-mix(in srgb, var(--trail-risk) 11%, transparent);
 }
 
 .diff-row-added .diff-line-number:nth-child(3),
 .diff-row-modified .diff-line-number:nth-child(3) {
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .diff-row-removed .diff-line-number:first-child,
 .diff-row-modified .diff-line-number:first-child {
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 .diff-code ins,
@@ -3831,12 +3831,12 @@ button.timeline-filter b {
 
 .diff-code ins {
   color: var(--syntax-green);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 22%, transparent);
+  background: color-mix(in srgb, var(--trail-checkpoint) 22%, transparent);
 }
 
 .diff-code del {
   color: var(--syntax-red);
-  background: color-mix(in srgb, var(--crabdb-risk) 20%, transparent);
+  background: color-mix(in srgb, var(--trail-risk) 20%, transparent);
 }
 
 .diff-row-gap {
@@ -3845,7 +3845,7 @@ button.timeline-filter b {
 }
 
 .diff-gap-message {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 66%, transparent);
   padding: 6px 10px;
   text-align: center;
@@ -3970,7 +3970,7 @@ button.icon-only.send-button {
   inset-inline-start: 0;
   width: 4ch;
   border-inline-end: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 60%, var(--vscode-textCodeBlock-background));
   padding-inline: 6px;
   text-align: right;
@@ -3984,16 +3984,16 @@ button.icon-only.send-button {
 
 .code-line-added {
   border-inline-start: 2px solid var(--state-success-border);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 10%, transparent);
+  background: color-mix(in srgb, var(--trail-checkpoint) 10%, transparent);
 }
 
 .code-line-removed {
   border-inline-start: 2px solid var(--state-danger-border);
-  background: color-mix(in srgb, var(--crabdb-risk) 10%, transparent);
+  background: color-mix(in srgb, var(--trail-risk) 10%, transparent);
 }
 
 .code-line-meta {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-raised) 70%, transparent);
 }
 
@@ -4023,19 +4023,19 @@ body.vscode-high-contrast .shiki-token {
 
 .terminal-tone-ok,
 .terminal-tone-ok .card-body {
-  --terminal-stream-color: var(--crabdb-checkpoint);
+  --terminal-stream-color: var(--trail-checkpoint);
   border-color: color-mix(in srgb, var(--state-success-border) 48%, var(--border-subtle));
 }
 
 .terminal-tone-warning,
 .terminal-tone-warning .card-body {
-  --terminal-stream-color: var(--crabdb-review);
+  --terminal-stream-color: var(--trail-review);
   border-color: color-mix(in srgb, var(--state-warning-border) 52%, var(--border-subtle));
 }
 
 .terminal-tone-risk,
 .terminal-tone-risk .card-body {
-  --terminal-stream-color: var(--crabdb-risk);
+  --terminal-stream-color: var(--trail-risk);
   border-color: color-mix(in srgb, var(--state-danger-border) 54%, var(--border-subtle));
 }
 
@@ -4046,7 +4046,7 @@ body.vscode-high-contrast .shiki-token {
 }
 
 .terminal-transcript {
-  --terminal-stream-color: var(--crabdb-lane);
+  --terminal-stream-color: var(--trail-lane);
   display: grid;
   min-width: 0;
   overflow: hidden;
@@ -4085,7 +4085,7 @@ body.vscode-high-contrast .shiki-token {
   align-items: flex-start;
   justify-content: center;
   border-inline-end: 1px solid var(--border-subtle);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 42%, transparent);
   padding: 9px 6px;
   font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
@@ -4137,7 +4137,7 @@ body.vscode-high-contrast .shiki-token {
   max-width: 42%;
   border-color: var(--border-subtle);
   background: color-mix(in srgb, var(--surface-muted) 42%, transparent);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .terminal-section-content {
@@ -4193,11 +4193,11 @@ body.vscode-high-contrast .shiki-token {
 }
 
 .terminal-transcript-out {
-  --terminal-stream-color: var(--crabdb-checkpoint);
+  --terminal-stream-color: var(--trail-checkpoint);
 }
 
 .terminal-transcript-err {
-  --terminal-stream-color: var(--crabdb-risk);
+  --terminal-stream-color: var(--trail-risk);
 }
 
 .terminal-transcript-out .terminal-transcript-label,
@@ -4208,13 +4208,13 @@ body.vscode-high-contrast .shiki-token {
 .terminal-transcript-note {
   min-width: 0;
   padding: 0 12px 8px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
 
 .terminal-transcript-empty {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .terminal-transcript-actions {
@@ -4225,7 +4225,7 @@ body.vscode-high-contrast .shiki-token {
 }
 
 .ansi-fg-muted {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .ansi-fg-red {
@@ -4374,7 +4374,7 @@ body.vscode-high-contrast .shiki-token {
   border: 1px solid var(--border);
   border-radius: var(--radius-chip);
   padding: 2px 8px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
   background: transparent;
 }
@@ -4406,7 +4406,7 @@ button.chip-button:hover {
 
 .resource-chip small {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 11px;
@@ -4454,13 +4454,13 @@ button.chip-button:hover {
 }
 
 .tool-location-breadcrumb [data-slot="breadcrumb-link"] {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .tool-location-breadcrumb [data-slot="breadcrumb-separator"],
 .tool-location-ellipsis {
   flex: 0 0 auto;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .tool-location-line {
@@ -4501,7 +4501,7 @@ button.chip-button:hover {
 
 .attachment-chip small {
   flex: 0 0 auto;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -4611,34 +4611,34 @@ button.chip-button:hover {
 .inline-actions button[data-action="runEvals"],
 .inline-actions button[data-action="queueMerge"] {
   border-color: var(--state-lane-border);
-  background: color-mix(in srgb, var(--crabdb-lane) 7%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-lane) 7%, var(--surface-muted));
 }
 
 .inline-actions button[data-action="refresh"]::before,
 .inline-actions button[data-action="runTests"]::before,
 .inline-actions button[data-action="runEvals"]::before,
 .inline-actions button[data-action="queueMerge"]::before {
-  background: var(--crabdb-lane);
+  background: var(--trail-lane);
 }
 
 .inline-actions button[data-action="startFollowUp"] {
   border-color: var(--state-success-border);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 8%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-checkpoint) 8%, var(--surface-muted));
 }
 
 .inline-actions button[data-action="startFollowUp"]::before {
-  background: var(--crabdb-checkpoint);
+  background: var(--trail-checkpoint);
 }
 
 .inline-actions button[data-action="focusReview"],
 .inline-actions button[data-action="showConflict"] {
   border-color: var(--state-warning-border);
-  background: color-mix(in srgb, var(--crabdb-review) 7%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-review) 7%, var(--surface-muted));
 }
 
 .inline-actions button[data-action="focusReview"]::before,
 .inline-actions button[data-action="showConflict"]::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .inline-actions button[data-action="compareTasks"],
@@ -4646,14 +4646,14 @@ button.chip-button:hover {
 .inline-actions button[data-action="openMediaPreview"],
 .inline-actions button[data-action="showAcpLogs"] {
   border-color: var(--state-provider-border);
-  background: color-mix(in srgb, var(--crabdb-provider) 6%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-provider) 6%, var(--surface-muted));
 }
 
 .inline-actions button[data-action="compareTasks"]::before,
 .inline-actions button[data-action="openResource"]::before,
 .inline-actions button[data-action="openMediaPreview"]::before,
 .inline-actions button[data-action="showAcpLogs"]::before {
-  background: var(--crabdb-provider);
+  background: var(--trail-provider);
 }
 
 :is(.resource, .media-preview, .unsupported, .raw) {
@@ -4712,7 +4712,7 @@ button.chip-button:hover {
 .payload-summary [data-slot="accordion-trigger-icon"],
 .raw-summary [data-slot="accordion-trigger-icon"] {
   justify-self: center;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .tool-summary,
@@ -4844,7 +4844,7 @@ button.chip-button:hover {
   grid-column: 4;
   grid-row: 1;
   justify-self: center;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .diff-summary[aria-expanded="true"] {
@@ -4985,12 +4985,12 @@ button.chip-button:hover {
   margin: 0;
   border-inline-start: 2px solid var(--border-subtle);
   padding: 2px 0 2px 8px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
 .edit-lifecycle {
-  --edit-lifecycle-accent: var(--crabdb-review);
+  --edit-lifecycle-accent: var(--trail-review);
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
@@ -5004,21 +5004,21 @@ button.chip-button:hover {
 .edit-lifecycle-approval,
 .edit-lifecycle-pending,
 .edit-lifecycle-running {
-  --edit-lifecycle-accent: var(--crabdb-review);
+  --edit-lifecycle-accent: var(--trail-review);
 }
 
 .edit-lifecycle-ready {
-  --edit-lifecycle-accent: var(--crabdb-lane);
+  --edit-lifecycle-accent: var(--trail-lane);
 }
 
 .edit-lifecycle-complete,
 .edit-lifecycle-recorded {
-  --edit-lifecycle-accent: var(--crabdb-checkpoint);
+  --edit-lifecycle-accent: var(--trail-checkpoint);
 }
 
 .edit-lifecycle-failed,
 .edit-lifecycle-cancelled {
-  --edit-lifecycle-accent: var(--crabdb-risk);
+  --edit-lifecycle-accent: var(--trail-risk);
 }
 
 .edit-lifecycle-icon {
@@ -5055,7 +5055,7 @@ button.chip-button:hover {
 
 .edit-lifecycle-copy span {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -5063,7 +5063,7 @@ button.chip-button:hover {
   display: grid;
   gap: 8px;
   min-width: 0;
-  color: color-mix(in srgb, var(--text) 92%, var(--crabdb-muted));
+  color: color-mix(in srgb, var(--text) 92%, var(--trail-muted));
   overflow-wrap: anywhere;
 }
 
@@ -5174,7 +5174,7 @@ button.chip-button:hover {
 
 .tool-summary .tool-summary-icon {
   border-color: color-mix(in srgb, var(--border-subtle) 42%, transparent);
-  color: color-mix(in srgb, var(--crabdb-muted) 88%, var(--text));
+  color: color-mix(in srgb, var(--trail-muted) 88%, var(--text));
   background: color-mix(in srgb, var(--surface) 96%, transparent);
 }
 
@@ -5183,7 +5183,7 @@ button.chip-button:hover {
 }
 
 .tool-structured-details {
-  --tool-structured-accent: var(--crabdb-provider);
+  --tool-structured-accent: var(--trail-provider);
   display: grid;
   gap: 8px;
   min-width: 0;
@@ -5194,11 +5194,11 @@ button.chip-button:hover {
 }
 
 .tool-structured-background_process {
-  --tool-structured-accent: var(--crabdb-review);
+  --tool-structured-accent: var(--trail-review);
 }
 
 .tool-structured-task {
-  --tool-structured-accent: var(--crabdb-provider);
+  --tool-structured-accent: var(--trail-provider);
 }
 
 .tool-structured-heading {
@@ -5234,7 +5234,7 @@ button.chip-button:hover {
 
 .tool-structured-copy span {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -5256,7 +5256,7 @@ button.chip-button:hover {
 
 .tool-structured-field dt {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5295,7 +5295,7 @@ button.chip-button:hover {
 }
 
 .tool-approval {
-  --approval-accent: var(--crabdb-review);
+  --approval-accent: var(--trail-review);
   display: grid;
   gap: 8px;
   min-width: 0;
@@ -5353,15 +5353,15 @@ button.chip-button:hover {
 }
 
 .approval-tone-info {
-  --approval-accent: var(--crabdb-lane);
+  --approval-accent: var(--trail-lane);
 }
 
 .approval-tone-risk {
-  --approval-accent: var(--crabdb-risk);
+  --approval-accent: var(--trail-risk);
 }
 
 .approval-tone-success {
-  --approval-accent: var(--crabdb-checkpoint);
+  --approval-accent: var(--trail-checkpoint);
 }
 
 .tool-approval-heading {
@@ -5457,7 +5457,7 @@ button.chip-button:hover {
 
 .approval-resolved-note,
 .approval-muted {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .approval-meta {
@@ -5476,7 +5476,7 @@ button.chip-button:hover {
   overflow: hidden;
   border: 0;
   border-radius: var(--radius-chip);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: transparent;
   padding: 0;
   text-overflow: ellipsis;
@@ -5511,7 +5511,7 @@ button.chip-button:hover {
   width: fit-content;
   max-width: 100%;
   border-radius: var(--radius-control);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   padding: 3px 5px;
   cursor: pointer;
   font-size: 11px;
@@ -5584,7 +5584,7 @@ button.chip-button:hover {
 }
 
 .approval-detail-list dt {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -5695,20 +5695,20 @@ button.approval-option.primary:not(:disabled):hover {
 }
 
 button.approval-option-risk:not(:disabled) {
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
 }
 
 button.approval-reject {
   flex: 0 1 104px;
   min-width: 0;
   border-color: color-mix(in srgb, var(--state-danger-border) 58%, var(--border-subtle));
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
   background: transparent;
 }
 
 button.approval-reject:not(:disabled):hover {
-  border-color: color-mix(in srgb, var(--crabdb-risk) 72%, var(--border-subtle));
-  background: color-mix(in srgb, var(--crabdb-risk) 8%, transparent);
+  border-color: color-mix(in srgb, var(--trail-risk) 72%, var(--border-subtle));
+  background: color-mix(in srgb, var(--trail-risk) 8%, transparent);
 }
 
 .inline-image {
@@ -5790,22 +5790,22 @@ button.approval-reject:not(:disabled):hover {
   height: 36px;
   margin-block-end: 2px;
   border: 1px solid color-mix(in srgb, var(--state-lane-border) 54%, transparent);
-  color: var(--crabdb-lane);
-  background: color-mix(in srgb, var(--crabdb-lane) 7%, transparent);
+  color: var(--trail-lane);
+  background: color-mix(in srgb, var(--trail-lane) 7%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--surface) 62%, transparent);
 }
 
 .empty-state-filtered .empty-state-media {
   border-color: color-mix(in srgb, var(--state-provider-border) 54%, transparent);
-  color: var(--crabdb-provider);
-  background: color-mix(in srgb, var(--crabdb-provider) 7%, transparent);
+  color: var(--trail-provider);
+  background: color-mix(in srgb, var(--trail-provider) 7%, transparent);
 }
 
 .empty-state-role {
   justify-self: center;
   min-width: 0;
   max-width: 100%;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface) 70%, transparent);
 }
 
@@ -5813,7 +5813,7 @@ button.approval-reject:not(:disabled):hover {
 .empty-state [data-slot="empty-title"] {
   margin: 0;
   overflow-wrap: anywhere;
-  font-size: clamp(16px, calc(var(--crabdb-copy-font-size) + 1px), 18px);
+  font-size: clamp(16px, calc(var(--trail-copy-font-size) + 1px), 18px);
   line-height: 1.28;
   font-weight: 680;
 }
@@ -5822,7 +5822,7 @@ button.approval-reject:not(:disabled):hover {
 .empty-state [data-slot="empty-description"] {
   max-width: 56ch;
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   line-height: 1.5;
 }
 
@@ -5894,7 +5894,7 @@ button.empty-action-primary:not(:disabled):hover {
 button.empty-action[data-action="focusReview"] {
   border-color: var(--state-warning-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-review) 12%, var(--surface));
+  background: color-mix(in srgb, var(--trail-review) 12%, var(--surface));
 }
 
 .empty-action [data-icon="inline-start"] {
@@ -6014,7 +6014,7 @@ button.composer-preset {
   max-width: min(148px, 42vw);
   min-height: 27px;
   border-color: transparent;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 44%, transparent);
   padding: 3px 8px;
   overflow: hidden;
@@ -6054,7 +6054,7 @@ button.composer-preset:not(:disabled):hover {
 button.composer-mode-button {
   min-height: 24px;
   border: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: transparent;
   padding: 2px 8px;
   font-size: 11px;
@@ -6199,7 +6199,7 @@ button.composer-mode-button:not(:disabled):hover {
 }
 
 .composer-state-copy span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -6243,7 +6243,7 @@ button.composer-mode-button:not(:disabled):hover {
 
 .composer-context-chip span {
   flex: 0 0 auto;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-weight: 500;
 }
 
@@ -6296,7 +6296,7 @@ button.composer-mode-button:not(:disabled):hover {
 
 .attachment-shelf-header small {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -6376,7 +6376,7 @@ button.composer-mode-button:not(:disabled):hover {
   color: var(--vscode-input-foreground);
   background: transparent;
   padding: 0;
-  font-size: var(--crabdb-copy-font-size);
+  font-size: var(--trail-copy-font-size);
   line-height: 1.55;
   overflow: auto;
   overscroll-behavior: contain;
@@ -6411,8 +6411,8 @@ button.composer-mode-button:not(:disabled):hover {
   min-width: 0;
   border-top: 1px solid var(--border-subtle);
   padding-top: 6px;
-  color: var(--crabdb-muted);
-  font-size: var(--crabdb-caption-font-size);
+  color: var(--trail-muted);
+  font-size: var(--trail-caption-font-size);
   font-variant-numeric: tabular-nums;
 }
 
@@ -6480,11 +6480,11 @@ button.composer-mode-button:not(:disabled):hover {
   border-radius: 0;
   background: transparent;
   padding: 6px 0 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .composer-context-gauge {
-  --context-gauge-color: var(--crabdb-checkpoint);
+  --context-gauge-color: var(--trail-checkpoint);
   --context-gauge-track: color-mix(in srgb, var(--border) 44%, transparent);
   display: inline-grid;
   place-items: center;
@@ -6515,12 +6515,12 @@ button.composer-mode-button:not(:disabled):hover {
 }
 
 .composer-context-gauge-warning {
-  --context-gauge-color: var(--crabdb-review);
+  --context-gauge-color: var(--trail-review);
   border-color: color-mix(in srgb, var(--state-warning-border) 54%, var(--border-subtle));
 }
 
 .composer-context-gauge-risk {
-  --context-gauge-color: var(--crabdb-risk);
+  --context-gauge-color: var(--trail-risk);
   border-color: color-mix(in srgb, var(--state-danger-border) 58%, var(--border-subtle));
 }
 
@@ -6543,7 +6543,7 @@ button.composer-mode-button:not(:disabled):hover {
 }
 
 .composer-send-hint {
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .composer-icon-tools {
@@ -6651,20 +6651,20 @@ button.composer-mode-button:not(:disabled):hover {
 
 .composer [data-action="attachSelection"],
 .composer [data-action="attachChangedFiles"] {
-  color: var(--crabdb-lane);
-  background: color-mix(in srgb, var(--crabdb-lane) 7%, transparent);
+  color: var(--trail-lane);
+  background: color-mix(in srgb, var(--trail-lane) 7%, transparent);
 }
 
 .composer [data-action="attachFile"],
 .composer [data-action="attachHistory"] {
-  color: var(--crabdb-provider);
-  background: color-mix(in srgb, var(--crabdb-provider) 7%, transparent);
+  color: var(--trail-provider);
+  background: color-mix(in srgb, var(--trail-provider) 7%, transparent);
 }
 
 .composer [data-action="attachDiagnostics"],
 .composer [data-action="rewind"] {
-  color: var(--crabdb-review);
-  background: color-mix(in srgb, var(--crabdb-review) 8%, transparent);
+  color: var(--trail-review);
+  background: color-mix(in srgb, var(--trail-review) 8%, transparent);
 }
 
 .composer [data-action="attachTerminalOutput"] {
@@ -6673,7 +6673,7 @@ button.composer-mode-button:not(:disabled):hover {
 }
 
 .composer button[data-composer-icon-only="true"]:disabled {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: transparent;
 }
 
@@ -6774,7 +6774,7 @@ button.composer-mode-button:not(:disabled):hover {
 }
 
 .review-kicker {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0;
@@ -6950,7 +6950,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 }
 
 .review-metric span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -6996,8 +6996,8 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
   height: 8px;
   margin-top: 4px;
   border-radius: 999px;
-  background: var(--crabdb-muted);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--crabdb-muted) 14%, transparent);
+  background: var(--trail-muted);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--trail-muted) 14%, transparent);
 }
 
 .review-gate-copy {
@@ -7019,7 +7019,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 }
 
 .review-gate-copy small {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -7117,7 +7117,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 
 .coordination-card span {
   display: block;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -7143,7 +7143,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
   overflow: hidden;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-chip);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 48%, transparent);
   padding: 1px 7px;
   text-overflow: ellipsis;
@@ -7171,7 +7171,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 }
 
 .overlap-list span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .review-facts {
@@ -7187,7 +7187,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 }
 
 .review-facts dt {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .review-facts dd {
@@ -7243,7 +7243,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 
 .review-action-group-next {
   border-color: var(--state-lane-border);
-  background: color-mix(in srgb, var(--crabdb-lane) 8%, var(--surface-subtle));
+  background: color-mix(in srgb, var(--trail-lane) 8%, var(--surface-subtle));
 }
 
 .review-action-group-heading {
@@ -7269,7 +7269,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 }
 
 .review-action-group-heading span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 10px;
 }
 
@@ -7310,20 +7310,20 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 .review-action-list button[data-action="compareTasks"]::before,
 .review-action-list button[data-action="openWorkdir"]::before,
 .review-action-list button[data-action="focusTranscript"]::before {
-  background: var(--crabdb-provider);
+  background: var(--trail-provider);
 }
 
 .review-action-list button[data-action="runTests"]::before,
 .review-action-list button[data-action="runEvals"]::before,
 .review-action-list button[data-action="dryRunApply"]::before,
 .review-action-list button[data-action="queueMerge"]::before {
-  background: var(--crabdb-lane);
+  background: var(--trail-lane);
 }
 
 .review-action-list button[data-action="rewind"]::before,
 .review-action-list button[data-action="preserveFailedAttempt"]::before,
 .review-action-list button[data-action="removeTask"]::before {
-  background: var(--crabdb-risk);
+  background: var(--trail-risk);
 }
 
 .review-action-list .review-action-copy > span,
@@ -7477,7 +7477,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 
 .result-drawer-title [data-slot="drawer-description"] {
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -7524,7 +7524,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 
 .diff-review-header p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -7611,7 +7611,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 }
 
 .diff-review-stats small {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .diff-review-layout {
@@ -7641,7 +7641,7 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 .diff-review-panel-heading small {
   flex: 0 1 auto;
   min-width: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -7702,38 +7702,38 @@ button[data-review-icon-only="true"] [data-icon="inline-start"] > .icon {
 
 .diff-review-status-added {
   border-color: color-mix(in srgb, var(--state-success-border) 54%, var(--border-subtle));
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 8%, transparent);
+  background: color-mix(in srgb, var(--trail-checkpoint) 8%, transparent);
 }
 
 .diff-review-status-added::before {
-  background: var(--crabdb-checkpoint);
+  background: var(--trail-checkpoint);
 }
 
 .diff-review-status-deleted {
   border-color: color-mix(in srgb, var(--state-danger-border) 58%, var(--border-subtle));
-  background: color-mix(in srgb, var(--crabdb-risk) 8%, transparent);
+  background: color-mix(in srgb, var(--trail-risk) 8%, transparent);
 }
 
 .diff-review-status-deleted::before {
-  background: var(--crabdb-risk);
+  background: var(--trail-risk);
 }
 
 .diff-review-status-renamed {
   border-color: color-mix(in srgb, var(--state-provider-border) 52%, var(--border-subtle));
-  background: color-mix(in srgb, var(--crabdb-provider) 7%, transparent);
+  background: color-mix(in srgb, var(--trail-provider) 7%, transparent);
 }
 
 .diff-review-status-renamed::before {
-  background: var(--crabdb-provider);
+  background: var(--trail-provider);
 }
 
 .diff-review-status-untracked {
   border-color: color-mix(in srgb, var(--state-warning-border) 54%, var(--border-subtle));
-  background: color-mix(in srgb, var(--crabdb-review) 7%, transparent);
+  background: color-mix(in srgb, var(--trail-review) 7%, transparent);
 }
 
 .diff-review-status-untracked::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .diff-review-file-tree {
@@ -7799,7 +7799,7 @@ button.diff-review-file-button small {
 }
 
 button.diff-review-file-button small {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-variant-numeric: tabular-nums;
 }
 
@@ -7853,7 +7853,7 @@ button.diff-review-file-button small {
 
 .diff-review-suggestion p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -7939,7 +7939,7 @@ button.diff-review-file-button small {
 }
 
 .compare-metric span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -7975,7 +7975,7 @@ button.diff-review-file-button small {
 
 .compare-paths-summary,
 .conflict-details-summary {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 12px;
   text-decoration: none;
 }
@@ -8027,7 +8027,7 @@ button.diff-review-file-button small {
 .compare-paths small,
 .compare-suggestions span {
   display: block;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .compare-command {
@@ -8088,7 +8088,7 @@ button.diff-review-file-button small {
   border: 1px solid var(--state-danger-border);
   border-radius: var(--radius-chip);
   padding: 2px 8px;
-  color: var(--crabdb-risk);
+  color: var(--trail-risk);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
@@ -8117,7 +8117,7 @@ button.diff-review-file-button small {
 }
 
 .conflict-list span {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .settings-shell {
@@ -8146,7 +8146,7 @@ button.diff-review-file-button small {
 
 .settings-header p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8221,7 +8221,7 @@ button.diff-review-file-button small {
   flex: 0 0 auto;
   width: 13px;
   height: 13px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .settings-action-button span {
@@ -8243,49 +8243,49 @@ button.diff-review-file-button small {
 .settings-action-button.primary {
   border-color: var(--state-success-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-checkpoint) 8%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-checkpoint) 8%, var(--surface-muted));
 }
 
 .settings-action-button.settings-action-opensettings,
 .settings-action-button.settings-action-customproviders {
   border-color: var(--state-provider-border);
-  background: color-mix(in srgb, var(--crabdb-provider) 6%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-provider) 6%, var(--surface-muted));
 }
 
 .settings-action-opensettings::before,
 .settings-action-customproviders::before {
-  background: var(--crabdb-provider);
+  background: var(--trail-provider);
 }
 
 .settings-action-opensettings .settings-action-icon,
 .settings-action-customproviders .settings-action-icon {
-  color: var(--crabdb-provider);
+  color: var(--trail-provider);
 }
 
 .settings-action-button.settings-action-doctor {
   border-color: var(--state-warning-border);
-  background: color-mix(in srgb, var(--crabdb-review) 7%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-review) 7%, var(--surface-muted));
 }
 
 .settings-action-doctor::before {
-  background: var(--crabdb-review);
+  background: var(--trail-review);
 }
 
 .settings-action-doctor .settings-action-icon {
-  color: var(--crabdb-review);
+  color: var(--trail-review);
 }
 
 .settings-action-button.settings-action-startdaemon {
   border-color: var(--state-lane-border);
-  background: color-mix(in srgb, var(--crabdb-lane) 7%, var(--surface-muted));
+  background: color-mix(in srgb, var(--trail-lane) 7%, var(--surface-muted));
 }
 
 .settings-action-startdaemon::before {
-  background: var(--crabdb-lane);
+  background: var(--trail-lane);
 }
 
 .settings-action-startdaemon .settings-action-icon {
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .settings-search {
@@ -8361,12 +8361,12 @@ button.diff-review-file-button small {
   border-color: color-mix(in srgb, var(--state-lane-border) 55%, var(--border-subtle));
   border-inline-start-color: var(--state-lane-border);
   color: var(--text);
-  background: color-mix(in srgb, var(--crabdb-lane) 10%, var(--surface-raised));
+  background: color-mix(in srgb, var(--trail-lane) 10%, var(--surface-raised));
 }
 
 .settings-nav-active .settings-nav-icon,
 .settings-nav a[aria-current="page"] .settings-nav-icon {
-  color: var(--crabdb-lane);
+  color: var(--trail-lane);
 }
 
 .settings-nav-filtered {
@@ -8381,7 +8381,7 @@ button.diff-review-file-button small {
   flex: 0 0 auto;
   width: 16px;
   height: 16px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .settings-nav-label {
@@ -8397,7 +8397,7 @@ button.diff-review-file-button small {
   overflow: hidden;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-chip);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface) 72%, transparent);
   padding: 1px 5px;
   text-overflow: ellipsis;
@@ -8417,7 +8417,7 @@ button.diff-review-file-button small {
 
 .settings-nav-warn .settings-nav-icon,
 .settings-nav-warn .settings-nav-badge {
-  color: var(--crabdb-warning);
+  color: var(--trail-warning);
 }
 
 .settings-nav-neutral {
@@ -8434,7 +8434,7 @@ button.diff-review-file-button small {
 
 .settings-filter-status {
   margin: -6px 0 -8px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
   font-size: 11px;
 }
@@ -8458,7 +8458,7 @@ button.diff-review-file-button small {
 
 .settings-filter-empty p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8474,7 +8474,7 @@ button.diff-review-file-button small {
   border: 1px solid var(--state-lane-border);
   border-inline-start: 3px solid var(--state-lane-border);
   border-radius: var(--radius-card);
-  background: color-mix(in srgb, var(--surface-subtle) 84%, var(--crabdb-lane));
+  background: color-mix(in srgb, var(--surface-subtle) 84%, var(--trail-lane));
   padding: 14px;
 }
 
@@ -8498,7 +8498,7 @@ button.diff-review-file-button small {
   margin-bottom: 7px;
   border: 1px solid var(--state-lane-border);
   border-radius: var(--radius-chip);
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface) 68%, transparent);
   padding: 2px 7px;
   font-size: 11px;
@@ -8512,7 +8512,7 @@ button.diff-review-file-button small {
 
 .settings-hero-card p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8536,7 +8536,7 @@ button.diff-review-file-button small {
 }
 
 .settings-next-count {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
   white-space: nowrap;
 }
@@ -8582,7 +8582,7 @@ button.diff-review-file-button small {
 
 .settings-next-step p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8621,7 +8621,7 @@ button.diff-review-file-button small {
 
 .settings-health-list-empty p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8650,7 +8650,7 @@ button.diff-review-file-button small {
 
 .settings-health-item p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8724,7 +8724,7 @@ button.diff-review-file-button small {
 
 .settings-config-row p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8761,7 +8761,7 @@ button.diff-review-file-button small {
 
 .settings-metric span {
   display: block;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -8778,7 +8778,7 @@ button.diff-review-file-button small {
   display: block;
   min-width: 0;
   margin-top: 5px;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
   font-size: 11px;
 }
@@ -8802,7 +8802,7 @@ button.diff-review-file-button small {
 .settings-card p,
 .provider-card p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8856,7 +8856,7 @@ button.diff-review-file-button small {
 
 .provider-routing-main p {
   margin: 0;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   overflow-wrap: anywhere;
 }
 
@@ -8885,7 +8885,7 @@ button.diff-review-file-button small {
 }
 
 .provider-routing-fact dt {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   font-size: 11px;
 }
 
@@ -8993,7 +8993,7 @@ button.diff-review-file-button small {
   position: sticky;
   top: 0;
   z-index: 1;
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
   background: color-mix(in srgb, var(--surface-muted) 72%, transparent);
   box-shadow: 0 1px 0 var(--border-subtle);
   font-size: 11px;
@@ -9006,11 +9006,11 @@ button.diff-review-file-button small {
 }
 
 .capability-cell.on {
-  color: var(--crabdb-checkpoint);
+  color: var(--trail-checkpoint);
 }
 
 .capability-cell.off {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .settings-facts {
@@ -9030,7 +9030,7 @@ button.diff-review-file-button small {
 }
 
 .settings-facts dt {
-  color: var(--crabdb-muted);
+  color: var(--trail-muted);
 }
 
 .settings-facts dd {
@@ -9799,12 +9799,12 @@ button.diff-review-file-button small {
 
 @media (forced-colors: active) {
   :root {
-    --crabdb-lane: Highlight;
-    --crabdb-checkpoint: Highlight;
-    --crabdb-review: CanvasText;
-    --crabdb-risk: CanvasText;
-    --crabdb-provider: CanvasText;
-    --crabdb-muted: GrayText;
+    --trail-lane: Highlight;
+    --trail-checkpoint: Highlight;
+    --trail-review: CanvasText;
+    --trail-risk: CanvasText;
+    --trail-provider: CanvasText;
+    --trail-muted: GrayText;
     --surface: Canvas;
     --surface-raised: Canvas;
     --surface-subtle: Canvas;

@@ -1,11 +1,11 @@
 # Distributed Prolly VCS
 
 This document proposes a Git-like distributed version-control engine built on
-CrabDB's prolly maps, content-addressed objects, SlateDB/object-store storage,
+Trail's prolly maps, content-addressed objects, SlateDB/object-store storage,
 and existing Git import/export primitives.
 
 The design is intentionally implementable in stages. It keeps today's local
-CrabDB `Operation` graph and SQLite indexes useful, while adding a portable
+Trail `Operation` graph and SQLite indexes useful, while adding a portable
 distributed commit/ref layer that can live in an object store and interoperate
 with Git repositories.
 
@@ -62,12 +62,12 @@ The key idea is:
 - A push uploads immutable object closure first, then CAS-updates the remote ref.
 - A pull downloads remote commit closure, creates remote-tracking refs, then
   fast-forwards or merges local refs.
-- Git compatibility is a projection between CrabDB commits/snapshots and Git
+- Git compatibility is a projection between Trail commits/snapshots and Git
   commits/trees/blobs.
 
 ## Current System Fit
 
-CrabDB already has most of the local pieces:
+Trail already has most of the local pieces:
 
 - `WorktreeRoot` points at prolly map roots and stores snapshot summary counts.
 - `FileEntry` stores stable file identity, kind, mode, content reference, size,
@@ -75,10 +75,10 @@ CrabDB already has most of the local pieces:
 - `Operation` forms the current local history graph through parent
   `ChangeId`s.
 - Refs point at operation/root pairs with generation-based CAS.
-- Git import reads Git-tracked files into CrabDB.
+- Git import reads Git-tracked files into Trail.
 - Git export can write Git blobs, trees, and commit objects through `git
   hash-object`, `git mktree`, and `git commit-tree`.
-- `git_mappings` records Git head, dirty state, CrabDB change, and CrabDB root.
+- `git_mappings` records Git head, dirty state, Trail change, and Trail root.
 - The `prolly` crate already supports immutable roots, named roots, CAS-able
   manifests, diff, merge, GC reachability, large-value offload, and a SlateDB
   backend.
@@ -206,7 +206,7 @@ struct RootManifestRef {
 }
 ```
 
-The snapshot points at the same structures CrabDB already uses:
+The snapshot points at the same structures Trail already uses:
 
 - `path -> FileEntry`
 - `FileId -> path/metadata`
@@ -222,7 +222,7 @@ the local compatibility object.
 ## File Entry Model
 
 The distributed file-entry payload should cover Git-representable files and
-CrabDB provenance:
+Trail provenance:
 
 ```rust
 struct VersionFileEntry {
@@ -267,7 +267,7 @@ Git mode mapping:
 040000 -> tree, represented implicitly by path prefixes
 ```
 
-CrabDB currently handles regular files. Symlink and submodule support can be
+Trail currently handles regular files. Symlink and submodule support can be
 added later, but the distributed format should reserve the kinds now so Git
 round-tripping has a clear target.
 
@@ -561,7 +561,7 @@ Pull:
 
 Clone from object store:
 
-1. Create local `.crabdb`.
+1. Create local `.trail`.
 2. Open local SlateDB or SQLite-backed store.
 3. Read remote `format.json`.
 4. Fetch remote refs and default branch.
@@ -606,7 +606,7 @@ Three-way merge uses the commit DAG and prolly map merge:
 6. Create merge commit with parents `[ours, theirs]`.
 7. CAS target branch from ours to merge commit.
 
-Text merge should use CrabDB's line model when available:
+Text merge should use Trail's line model when available:
 
 - match stable `LineId`s first
 - fall back to Myers/patience diff for imported Git files
@@ -763,11 +763,11 @@ This is the current direction.
 Commands:
 
 ```sh
-crabdb init --from-git
-crabdb git import-update -m "sync git state"
-crabdb git export main..scratch
-crabdb git export main..scratch -m "export CrabDB change"
-crabdb git mappings --limit 30
+trail init --from-git
+trail git import-update -m "sync git state"
+trail git export main..scratch
+trail git export main..scratch -m "export Trail change"
+trail git mappings --limit 30
 ```
 
 Enhancements:
@@ -781,42 +781,42 @@ Enhancements:
 
 ### Level 2: Bidirectional Branch Mirror
 
-CrabDB maintains mappings between:
+Trail maintains mappings between:
 
 ```text
-Git refs/heads/main         <-> CrabDB refs/heads/main
-Git refs/crabdb/heads/main  <-> CrabDB refs/heads/main
+Git refs/heads/main         <-> Trail refs/heads/main
+Git refs/trail/heads/main  <-> Trail refs/heads/main
 ```
 
-Default behavior should write Git projections under `refs/crabdb/heads/*` so
-CrabDB does not unexpectedly move the user's checked-out Git branch.
+Default behavior should write Git projections under `refs/trail/heads/*` so
+Trail does not unexpectedly move the user's checked-out Git branch.
 
 Commands:
 
 ```sh
-crabdb git mirror create main
-crabdb git mirror pull main
-crabdb git mirror push main --to refs/crabdb/heads/main
-crabdb git mirror status
+trail git mirror create main
+trail git mirror pull main
+trail git mirror push main --to refs/trail/heads/main
+trail git mirror status
 ```
 
 Mirror status reports:
 
 - Git head
 - Git dirty state
-- CrabDB head commit
+- Trail head commit
 - last mapped Git commit
-- whether Git can fast-forward to CrabDB
-- whether CrabDB can fast-forward to Git
+- whether Git can fast-forward to Trail
+- whether Trail can fast-forward to Git
 - divergent commits
 
 ### Level 3: Git Object Projection
 
-Every CrabDB commit can be projected to a Git commit:
+Every Trail commit can be projected to a Git commit:
 
 ```text
-CrabDB VersionCommit -> Git commit
-CrabDB SnapshotRef   -> Git tree
+Trail VersionCommit -> Git commit
+Trail SnapshotRef   -> Git tree
 VersionContentRef    -> Git blob
 ```
 
@@ -826,15 +826,15 @@ Projection rules:
 - Regular file modes become `100644` or `100755`.
 - Symlink entries become `120000` blobs containing target bytes.
 - Submodule entries become `160000` gitlinks.
-- CrabDB author maps to Git author.
-- CrabDB committer maps to Git committer.
+- Trail author maps to Git author.
+- Trail committer maps to Git committer.
 - First parent maps to first Git parent.
 - Merge parents preserve order.
 - Commit message is copied as UTF-8 bytes when valid, otherwise sanitized or
   encoded by policy.
-- CrabDB metadata is stored in optional Git trailers:
-  - `CrabDB-Commit: <commit-id>`
-  - `CrabDB-Root: <root-id>`
+- Trail metadata is stored in optional Git trailers:
+  - `Trail-Commit: <commit-id>`
+  - `Trail-Root: <root-id>`
 
 Projection cache:
 
@@ -843,36 +843,36 @@ v1:git:crab-to-git:<commit-id>:sha1   -> GitProjection
 v1:git:git-to-crab:<git-oid>          -> CrabProjection
 ```
 
-The Git OID is not the CrabDB commit ID. Git's OID depends on Git's object
+The Git OID is not the Trail commit ID. Git's OID depends on Git's object
 format and exact commit serialization.
 
 ### Level 4: Git Remote Helper
 
-Implement `git-remote-crabdb` so users can run:
+Implement `git-remote-trail` so users can run:
 
 ```sh
-git remote add crabdb crabdb::s3://bucket/repo
-git fetch crabdb
-git push crabdb main
+git remote add trail trail::s3://bucket/repo
+git fetch trail
+git push trail main
 ```
 
-The helper translates between Git's remote-helper protocol and CrabDB remote
+The helper translates between Git's remote-helper protocol and Trail remote
 storage.
 
 Fetch:
 
 1. Advertise projected refs.
-2. Project CrabDB commits to Git commits and trees.
+2. Project Trail commits to Git commits and trees.
 3. Stream a Git pack to Git.
 4. Store projection mappings.
 
 Push:
 
 1. Receive Git pack.
-2. Import Git commits/trees/blobs into CrabDB snapshots and commits.
-3. Validate fast-forward against CrabDB ref.
-4. Upload missing CrabDB object closure.
-5. CAS CrabDB ref.
+2. Import Git commits/trees/blobs into Trail snapshots and commits.
+3. Validate fast-forward against Trail ref.
+4. Upload missing Trail object closure.
+5. CAS Trail ref.
 6. Update projection mappings.
 
 This makes Git clients work without knowing about prolly trees.
@@ -910,7 +910,7 @@ After import:
 - Create `VersionCommit` whose parent maps to the previous imported Git commit
   when known.
 - Store `GitProjection` with Git commit and tree OIDs.
-- Advance CrabDB import branch by CAS.
+- Advance Trail import branch by CAS.
 
 ## Git Export Details
 
@@ -933,34 +933,34 @@ Export should never update the user's current Git branch unless explicitly
 requested. Safer defaults:
 
 ```sh
-crabdb git export-commit main --to-ref refs/crabdb/heads/main
-crabdb git checkout-projection main --detach
-crabdb git apply main..feature --worktree
+trail git export-commit main --to-ref refs/trail/heads/main
+trail git checkout-projection main --detach
+trail git apply main..feature --worktree
 ```
 
 ## Working Tree Interop
 
-When both Git and CrabDB share a worktree:
+When both Git and Trail share a worktree:
 
 - Detect Git dirty state before materialization.
 - Refuse destructive checkout if Git has uncommitted changes unless `--force`.
 - Prefer writing through a temporary index when creating Git objects.
-- Preserve `.gitignore` behavior only for Git import; CrabDB's own ignore rules
+- Preserve `.gitignore` behavior only for Git import; Trail's own ignore rules
   remain separate.
-- Record a mapping whenever a clean Git HEAD exactly matches a CrabDB root.
-- If Git's index matches CrabDB root but Git HEAD mapping is absent, add a
+- Record a mapping whenever a clean Git HEAD exactly matches a Trail root.
+- If Git's index matches Trail root but Git HEAD mapping is absent, add a
   `verify-index` mapping.
 
 Checkout policy:
 
 ```text
-crabdb checkout main
-  - updates CrabDB worktree
+trail checkout main
+  - updates Trail worktree
   - does not move Git branch
   - warns if inside Git and Git dirty
 
-crabdb git checkout main
-  - projects CrabDB commit to Git
+trail git checkout main
+  - projects Trail commit to Git
   - checks out projected Git commit or ref
   - updates mapping
 ```
@@ -993,7 +993,7 @@ commit, not the derived row.
 New modules:
 
 ```text
-crates/crabdb/src/db/version/
+crates/trail/src/db/version/
   mod.rs
   commit.rs
   refs.rs
@@ -1055,31 +1055,31 @@ The first remote backend should use:
 New commands should avoid breaking existing commands:
 
 ```sh
-crabdb vcs init-remote s3://bucket/path
-crabdb vcs remote add origin s3://bucket/path
-crabdb vcs clone s3://bucket/path ./repo
-crabdb vcs commit -m "message"
-crabdb vcs fetch origin
-crabdb vcs pull origin main
-crabdb vcs push origin main
-crabdb vcs branch feature
-crabdb vcs switch feature
-crabdb vcs merge main
-crabdb vcs fsck --full
-crabdb vcs gc --dry-run
-crabdb vcs log
-crabdb vcs show <commit>
+trail vcs init-remote s3://bucket/path
+trail vcs remote add origin s3://bucket/path
+trail vcs clone s3://bucket/path ./repo
+trail vcs commit -m "message"
+trail vcs fetch origin
+trail vcs pull origin main
+trail vcs push origin main
+trail vcs branch feature
+trail vcs switch feature
+trail vcs merge main
+trail vcs fsck --full
+trail vcs gc --dry-run
+trail vcs log
+trail vcs show <commit>
 ```
 
 Git-focused commands:
 
 ```sh
-crabdb git import-update -m "sync git"
-crabdb git export main..feature
-crabdb git export-commit feature --to-ref refs/crabdb/heads/feature
-crabdb git mirror create main
-crabdb git mirror status
-crabdb git remote-helper install
+trail git import-update -m "sync git"
+trail git export main..feature
+trail git export-commit feature --to-ref refs/trail/heads/feature
+trail git mirror create main
+trail git mirror status
+trail git remote-helper install
 ```
 
 ## HTTP and MCP Plan
@@ -1263,7 +1263,7 @@ Phase 6: Git projection hardening
 
 Phase 7: Git remote helper
 
-- Implement `git-remote-crabdb`.
+- Implement `git-remote-trail`.
 - Support fetch first.
 - Support push after import validation and ref CAS.
 
@@ -1308,10 +1308,10 @@ Chaos tests:
 
 Compatibility tests:
 
-- compare `git diff` against `crabdb git export`
+- compare `git diff` against `trail git export`
 - compare Git tree OID after import/export round trip
 - verify `git fsck` on projected Git objects
-- verify CrabDB fsck on imported Git history
+- verify Trail fsck on imported Git history
 
 ## Open Decisions
 
@@ -1321,7 +1321,7 @@ Compatibility tests:
   mirror objects.
 - Whether content IDs should use SHA-256 only or allow BLAKE3 as an optional
   repository format.
-- Whether Git projection should store CrabDB metadata in commit trailers by
+- Whether Git projection should store Trail metadata in commit trailers by
   default.
 - How much raw path byte support is required before Git remote-helper support.
 - Whether pack files should use a custom format or Git pack format for projected
@@ -1346,13 +1346,13 @@ Compatibility tests:
 - Prolly tree handles: `crates/prolly/src/prolly/tree.rs`
 - Prolly named root manifests: `crates/prolly/src/prolly/manifest.rs`
 - Prolly large value/blob helpers: `crates/prolly/src/prolly/blob.rs`
-- CrabDB storage design: `docs/design/storage-and-indexing.md`
-- CrabDB data model: `docs/design/data-model.md`
+- Trail storage design: `docs/design/storage-and-indexing.md`
+- Trail data model: `docs/design/data-model.md`
 - Git interop guide: `docs/guides/git-interop.md`
 - Git integration overview: `docs/integrations/git.md`
-- Git storage helpers: `crates/crabdb/src/db/storage/git.rs`
-- Git import/update: `crates/crabdb/src/db/record/recording/git.rs`
-- Git export: `crates/crabdb/src/db/merge/git_export.rs`
-- Local refs and CAS: `crates/crabdb/src/db/storage/refs.rs`
-- Domain objects: `crates/crabdb/src/model/domain/objects.rs`
-- Domain operations: `crates/crabdb/src/model/domain/operations.rs`
+- Git storage helpers: `crates/trail/src/db/storage/git.rs`
+- Git import/update: `crates/trail/src/db/record/recording/git.rs`
+- Git export: `crates/trail/src/db/merge/git_export.rs`
+- Local refs and CAS: `crates/trail/src/db/storage/refs.rs`
+- Domain objects: `crates/trail/src/model/domain/objects.rs`
+- Domain operations: `crates/trail/src/model/domain/operations.rs`

@@ -867,7 +867,7 @@ function compatibleSnapshotTurnScope(left: RenderNode, right: RenderNode): boole
 
 function isCompletedLiveHydrationReplacement(left: RenderNode, right: RenderNode): boolean {
   const live = left.source === "acp-live" ? left : right.source === "acp-live" ? right : undefined;
-  const hydrated = left.source === "crabdb" ? left : right.source === "crabdb" ? right : undefined;
+  const hydrated = left.source === "trail" ? left : right.source === "trail" ? right : undefined;
   return Boolean(live && hydrated && !isActiveReplacementNode(live));
 }
 

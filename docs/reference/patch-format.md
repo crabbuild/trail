@@ -2,11 +2,11 @@
 
 Structured patches are used by:
 
-- `crabdb lane apply-patch`
-- `crabdb lane turn apply-patch`
+- `trail lane apply-patch`
+- `trail lane turn apply-patch`
 - HTTP `POST /v1/lanes/{lane_or_id}/patches`
 - HTTP `POST /v1/lane/turns/{turn_id}/patches`
-- MCP `crabdb.apply_patch`
+- MCP `trail.apply_patch`
 
 ## Patch Document
 
@@ -135,7 +135,7 @@ Patch messages and edit payloads are secret-scanned before storage. Assignment-s
 
 ## Code Facts Used
 
-- Public patch schema: `crates/crabdb/src/model/inspect/patch.rs`
-- HTTP patch schema: `crates/crabdb/src/server/request_types/patches.rs`
-- HTTP parser: `crates/crabdb/src/server/route/utils.rs`
-- Patch policy: `crates/crabdb/src/db/lane/patch_policy.rs`
+- Public patch schema: `crates/trail/src/model/inspect/patch.rs`
+- HTTP patch schema: `crates/trail/src/server/request_types/patches.rs`
+- HTTP parser: `crates/trail/src/server/route/utils.rs`
+- Patch policy: `crates/trail/src/db/lane/patch_policy.rs`

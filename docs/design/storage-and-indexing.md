@@ -4,10 +4,10 @@ This design section is advanced/internal. It describes the current storage archi
 
 ## Storage Overview
 
-CrabDB stores workspace state in three places:
+Trail stores workspace state in three places:
 
-- Files under `.crabdb` for config, HEAD, refs, worktree manifests, daemon discovery, and daemon tokens.
-- SQLite under `.crabdb/index/crabdb.sqlite` for durable tables and derived indexes.
+- Files under `.trail` for config, HEAD, refs, worktree manifests, daemon discovery, and daemon tokens.
+- SQLite under `.trail/index/trail.sqlite` for durable tables and derived indexes.
 - Prolly-backed object/map storage for ordered maps and content-addressed structures.
 
 The central design choice is that durable history lives in objects and refs, while many query tables are derived and rebuildable.
@@ -15,8 +15,8 @@ The central design choice is that durable history lives in objects and refs, whi
 ```mermaid
 flowchart TB
     Workspace["Workspace files"] --> Scanner["status/record scanners"]
-    Sidecars[".crabdb sidecars<br/>config, HEAD, refs, daemon"]
-    Runtime["CrabDb open/runtime"]
+    Sidecars[".trail sidecars<br/>config, HEAD, refs, daemon"]
+    Runtime["Trail open/runtime"]
 
     Sidecars --> Runtime
     Scanner --> Runtime
@@ -32,10 +32,10 @@ flowchart TB
 Initialization creates:
 
 ```text
-.crabdb/
+.trail/
   config.toml
   HEAD
-  index/crabdb.sqlite
+  index/trail.sqlite
   refs/branches/
   refs/lanes/
   worktrees/
@@ -43,12 +43,12 @@ Initialization creates:
 
 Additional files may appear later:
 
-- `.crabdb/daemon.json`: daemon endpoint registration.
-- `.crabdb/daemon.token`: generated token file when daemon auth creates one.
+- `.trail/daemon.json`: daemon endpoint registration.
+- `.trail/daemon.token`: generated token file when daemon auth creates one.
 - Lane workdir manifests inside materialized workdirs.
 - Sparse workdir manifests inside sparse materializations.
 
-The `.crabignore` file lives at the workspace root, not inside `.crabdb`.
+The `.trailignore` file lives at the workspace root, not inside `.trail`.
 
 ## SQLite Schema Responsibilities
 
@@ -88,7 +88,7 @@ Schema versioning has two layers:
 - SQLite `PRAGMA user_version`.
 - Rows in `schema_meta`, including schema and app version metadata.
 
-Opening a workspace with `user_version` greater than the supported `CRABDB_SCHEMA_VERSION` fails. Initialization and opening call schema setup/validation, and schema setup also uses `ensure_column` for additive compatibility columns.
+Opening a workspace with `user_version` greater than the supported `TRAIL_SCHEMA_VERSION` fails. Initialization and opening call schema setup/validation, and schema setup also uses `ensure_column` for additive compatibility columns.
 
 ## Object Storage
 
@@ -103,20 +103,20 @@ Objects are stored by:
 - bytes
 - creation time
 
-The typed object helpers serialize values to CBOR and deserialize by kind. The object cache inside `CrabDb` avoids repeated decode/read work for frequently used objects. It is capped by entry count and total bytes.
+The typed object helpers serialize values to CBOR and deserialize by kind. The object cache inside `Trail` avoids repeated decode/read work for frequently used objects. It is capped by entry count and total bytes.
 
 ## Prolly Maps
 
-The `prolly` crate stores ordered map structures used by CrabDB roots and text.
+The `prolly` crate stores ordered map structures used by Trail roots and text.
 
-CrabDB uses prolly maps for:
+Trail uses prolly maps for:
 
 - Root path map.
 - Root file index map.
 - Text order map.
 - Line index map.
 
-The design gives efficient range scans and diffs over sorted keys. Low-level inspection is exposed by `crabdb map range` and `crabdb map diff`, with map decoders for raw, path, file-index, text-order, and line-index map types.
+The design gives efficient range scans and diffs over sorted keys. Low-level inspection is exposed by `trail map range` and `trail map diff`, with map decoders for raw, path, file-index, text-order, and line-index map types.
 
 ## Worktree File Index
 
@@ -132,7 +132,7 @@ The design gives efficient range scans and diffs over sorted keys. Low-level ins
 - last scan marker
 - update time
 
-This index lets status and daemon-backed status avoid fully hashing every file on every request. It is refreshed by normal status/record paths and explicitly by `crabdb index watch`.
+This index lets status and daemon-backed status avoid fully hashing every file on every request. It is refreshed by normal status/record paths and explicitly by `trail index watch`.
 
 The daemon worktree cache adds another layer for live file-event-driven dirty path tracking. It is reconciled against the worktree index and full status paths when needed.
 
@@ -205,7 +205,7 @@ Garbage collection works from reachability:
 
 ## Backup and Restore
 
-Backups include SQLite data and worktree-related state. Restore can rewrite materialized lane workdir paths so restored lane workdirs point inside the restored workspace. Backup creation rejects output inside `.crabdb` to avoid recursive or unsafe backups.
+Backups include SQLite data and worktree-related state. Restore can rewrite materialized lane workdir paths so restored lane workdirs point inside the restored workspace. Backup creation rejects output inside `.trail` to avoid recursive or unsafe backups.
 
 ## Failure Modes
 
@@ -229,9 +229,9 @@ Review this design before changing:
 
 ## Code Facts Used
 
-- Schema DDL/versioning: `crates/crabdb/src/db/storage/schema`
-- Object storage: `crates/crabdb/src/db/storage/objects`
-- Worktree index: `crates/crabdb/src/db/storage/worktree_index.rs`
-- Rebuild/GC: `crates/crabdb/src/db/storage/lifecycle`
-- Backup/restore: `crates/crabdb/src/db/core/backup`
-- Prolly config: `crates/crabdb/src/db/util/prolly.rs`
+- Schema DDL/versioning: `crates/trail/src/db/storage/schema`
+- Object storage: `crates/trail/src/db/storage/objects`
+- Worktree index: `crates/trail/src/db/storage/worktree_index.rs`
+- Rebuild/GC: `crates/trail/src/db/storage/lifecycle`
+- Backup/restore: `crates/trail/src/db/core/backup`
+- Prolly config: `crates/trail/src/db/util/prolly.rs`

@@ -1,11 +1,11 @@
 # CLI Global Options and Environment
 
-All commands share the global options defined on the top-level `crabdb` parser.
+All commands share the global options defined on the top-level `trail` parser.
 
 ## Usage
 
 ```text
-crabdb [OPTIONS] <COMMAND>
+trail [OPTIONS] <COMMAND>
 ```
 
 ## Global Options
@@ -13,7 +13,7 @@ crabdb [OPTIONS] <COMMAND>
 | Option | Purpose |
 | --- | --- |
 | `--workspace <WORKSPACE>` | Select the workspace root. |
-| `--db <DB>` | Select the `.crabdb` database directory directly. |
+| `--db <DB>` | Select the `.trail` database directory directly. |
 | `--branch <BRANCH>` | Select the default branch for commands that use branch context. |
 | `--json` | Render structured JSON output and JSON errors. |
 | `--quiet` | Suppress human-oriented success output where renderers support it. |
@@ -28,22 +28,22 @@ crabdb [OPTIONS] <COMMAND>
 
 | Variable | Used For |
 | --- | --- |
-| `CRABDB_WORKSPACE` | Default workspace root. |
-| `CRABDB_DIR` | Default `.crabdb` directory. |
-| `CRABDB_BRANCH` | Default branch. |
-| `CRABDB_FORMAT` | `human`, `json`, or `ndjson`; `json` also enables JSON errors. |
-| `CRABDB_DAEMON_URL` | Default daemon URL. |
-| `CRABDB_DAEMON_TOKEN` | Default daemon token and daemon startup token source. |
+| `TRAIL_WORKSPACE` | Default workspace root. |
+| `TRAIL_DIR` | Default `.trail` directory. |
+| `TRAIL_BRANCH` | Default branch. |
+| `TRAIL_FORMAT` | `human`, `json`, or `ndjson`; `json` also enables JSON errors. |
+| `TRAIL_DAEMON_URL` | Default daemon URL. |
+| `TRAIL_DAEMON_TOKEN` | Default daemon token and daemon startup token source. |
 
 ## Workspace Discovery
 
-If neither `--workspace` nor `--db` is supplied, CrabDB discovers a workspace by walking upward from the current directory until it finds `.crabdb`.
+If neither `--workspace` nor `--db` is supplied, Trail discovers a workspace by walking upward from the current directory until it finds `.trail`.
 
 If `--db` is supplied without `--workspace`, the parent directory of the database directory is treated as the workspace.
 
 ## JSON Errors
 
-Parse errors and runtime errors are rendered as JSON when `--json`, `--format json`, or `CRABDB_FORMAT=json` is used.
+Parse errors and runtime errors are rendered as JSON when `--json`, `--format json`, or `TRAIL_FORMAT=json` is used.
 
 ```json
 {
@@ -57,12 +57,12 @@ Parse errors and runtime errors are rendered as JSON when `--json`, `--format js
 
 ## NDJSON
 
-`--format ndjson` is accepted globally. The current command path that emits newline-delimited JSON is `crabdb index watch`, which prints one `WorktreeIndexReport` per iteration.
+`--format ndjson` is accepted globally. The current command path that emits newline-delimited JSON is `trail index watch`, which prints one `WorktreeIndexReport` per iteration.
 
 ## Code Facts Used
 
-- Parser: `crates/crabdb/src/cli/command.rs`
-- Runtime resolution: `crates/crabdb/src/cli/command/handler/runtime.rs`
-- Error rendering: `crates/crabdb/src/cli/command/handler/errors.rs`
+- Parser: `crates/trail/src/cli/command.rs`
+- Runtime resolution: `crates/trail/src/cli/command/handler/runtime.rs`
+- Error rendering: `crates/trail/src/cli/command/handler/errors.rs`
 - Tests: `cli_json_errors_are_machine_readable`, `cli_env_defaults_select_workspace_db_branch_and_format`
 

@@ -7,7 +7,7 @@ function toolbarInput(overrides: Partial<Parameters<typeof buildToolbarModel>[0]
     taskStatus: "ready",
     lane: "agent-1",
     changedPaths: 1,
-    providerLabel: "Claude Code via CrabDB",
+    providerLabel: "Claude Code via Trail",
     providerCrabdbBacked: true,
     sending: false,
     permissionPending: false,
@@ -105,7 +105,7 @@ test("focuses the composer for empty idle tasks", () => {
   assert.equal(model.capabilities.find((capability) => capability.id === "commands")?.enabled, false);
 });
 
-test("summarizes CrabDB workflow capabilities separately from prompt input", () => {
+test("summarizes Trail workflow capabilities separately from prompt input", () => {
   const model = buildToolbarModel(toolbarInput());
 
   assert.equal(model.capabilities.find((capability) => capability.id === "durable-state")?.group, "workflow");

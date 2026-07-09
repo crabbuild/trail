@@ -1,9 +1,9 @@
 # Install and Build
 
-CrabDB is a Rust workspace with two crates:
+Trail is a Rust workspace with two crates:
 
-- `crabdb`: the CLI, library API, HTTP daemon, and MCP server.
-- `prolly`: the prolly-tree storage library used by CrabDB.
+- `trail`: the CLI, library API, HTTP daemon, and MCP server.
+- `prolly`: the prolly-tree storage library used by Trail.
 
 The workspace declares Rust 1.81 in `Cargo.toml`.
 
@@ -18,14 +18,14 @@ make install
 By default this builds an optimized release binary and installs it to:
 
 ```text
-$HOME/.cargo/bin/crabdb
+$HOME/.cargo/bin/trail
 ```
 
 Verify the installed command and the lane command group:
 
 ```sh
-crabdb --help
-crabdb lane --help
+trail --help
+trail lane --help
 ```
 
 If `$HOME/.cargo/bin` is not on your `PATH`, either add it or call the binary
@@ -33,7 +33,7 @@ directly from that directory. For a project-local install, override `PREFIX`:
 
 ```sh
 make install PREFIX="$PWD/.local"
-./.local/bin/crabdb --help
+./.local/bin/trail --help
 ```
 
 ## Build from Source
@@ -41,32 +41,32 @@ make install PREFIX="$PWD/.local"
 From the repository root:
 
 ```sh
-cargo build -p crabdb
+cargo build -p trail
 ```
 
 Run the CLI through Cargo:
 
 ```sh
-cargo run -p crabdb -- --help
+cargo run -p trail -- --help
 ```
 
 After a debug build, the binary is also available at:
 
 ```sh
-target/debug/crabdb --help
+target/debug/trail --help
 ```
 
 ## Initialize a Project
 
-Run this once from the project you want CrabDB to track:
+Run this once from the project you want Trail to track:
 
 ```sh
 cd /path/to/project
-crabdb init --working-tree
-crabdb status
+trail init --working-tree
+trail status
 ```
 
-`--working-tree` imports the visible current files as the initial CrabDB root.
+`--working-tree` imports the visible current files as the initial Trail root.
 Use `--from-git` instead when the initial root should include only Git-tracked
 paths.
 
@@ -75,41 +75,41 @@ paths.
 Create a lane for one task:
 
 ```sh
-crabdb lane spawn docs-lane --from main --materialize=true
-crabdb lane status docs-lane
+trail lane spawn docs-lane --from main --materialize=true
+trail lane status docs-lane
 ```
 
 Use the lane workdir for normal editing tools or an external coding agent:
 
 ```sh
-LANE_DIR="$(crabdb lane workdir docs-lane)"
+LANE_DIR="$(trail lane workdir docs-lane)"
 cd "$LANE_DIR"
 # Edit files here, or point Claude Code, Codex, Cursor, or another tool here.
 ```
 
-Record the lane work back into CrabDB from the original project workspace:
+Record the lane work back into Trail from the original project workspace:
 
 ```sh
 cd /path/to/project
-crabdb lane record docs-lane -m "record docs update"
-crabdb lane diff docs-lane --patch
-crabdb lane readiness docs-lane
+trail lane record docs-lane -m "record docs update"
+trail lane diff docs-lane --patch
+trail lane readiness docs-lane
 ```
 
 Merge only after review and readiness checks:
 
 ```sh
-crabdb merge-lane docs-lane --into main --dry-run
-crabdb merge-queue add docs-lane --into main
-crabdb merge-queue run
+trail merge-lane docs-lane --into main --dry-run
+trail merge-queue add docs-lane --into main
+trail merge-queue run
 ```
 
 ## Validate the Local Build
 
-Run the CrabDB test suite:
+Run the Trail test suite:
 
 ```sh
-cargo test -p crabdb
+cargo test -p trail
 ```
 
 Run the prolly crate tests separately when changing storage internals:
@@ -120,10 +120,10 @@ cargo test -p prolly-map
 
 ## What Gets Installed
 
-CrabDB does not require a background service to use the basic CLI. The daemon is started explicitly with `crabdb daemon`, and the MCP server is started explicitly with `crabdb mcp`.
+Trail does not require a background service to use the basic CLI. The daemon is started explicitly with `trail daemon`, and the MCP server is started explicitly with `trail mcp`.
 
 ## Code Facts Used
 
 - Workspace members and Rust version: `Cargo.toml`
-- Binary entrypoint: `crates/crabdb/src/main.rs`
-- CLI command surface: `crates/crabdb/src/cli/command.rs`
+- Binary entrypoint: `crates/trail/src/main.rs`
+- CLI command surface: `crates/trail/src/cli/command.rs`

@@ -5,7 +5,7 @@ Accepted HTTP connections use 30-second read/write timeouts; slow requests
 receive `408 Request Timeout` without stopping the listener. Total
 requests larger than 16 MiB, including headers and body, are rejected before
 routing.
-CrabDB accepts origin-form `HTTP/1.0` or `HTTP/1.1` request lines and
+Trail accepts origin-form `HTTP/1.0` or `HTTP/1.1` request lines and
 fixed-length requests only: malformed request lines, malformed or unterminated
 header lines, bare CR/LF request-head line endings, header names with
 surrounding whitespace, missing header terminators, duplicate or non-decimal
@@ -34,7 +34,7 @@ For retry-safe mutation requests, send:
 Idempotency-Key: <stable unique key>
 ```
 
-CrabDB replays the first stored response when the same key is reused with the
+Trail replays the first stored response when the same key is reused with the
 same method, path, and body. Reusing the key for different request content
 returns `400 Bad Request`. Keys must be 1-200 non-control characters.
 Unauthorized and forbidden responses are not cached.
@@ -46,7 +46,7 @@ recorded in the local `external_mutation_audit` table with actor label,
 method/path, status, inferred lane/ref when available, and a small redacted
 result summary. Turn-scoped mutation failures can still be attributed through
 the turn id in the request path. Actor labels identify the HTTP auth path, such
-as `http:bearer`, `http:x-crabdb-token`, or `http:no-auth`; raw request bodies
+as `http:bearer`, `http:x-trail-token`, or `http:no-auth`; raw request bodies
 and tokens are not stored.
 
 ## Auth
@@ -57,7 +57,7 @@ Headers:
 
 ```text
 Authorization: Bearer <token>
-x-crabdb-token: <token>
+x-trail-token: <token>
 ```
 
 ## Core Routes
@@ -112,7 +112,7 @@ x-crabdb-token: <token>
 Patch requests accept either native `edits` or compatibility `files`; provide
 one non-empty array, not both.
 
-`GET /v1/lanes/{lane_or_id}/status` includes `base_status` when CrabDB can
+`GET /v1/lanes/{lane_or_id}/status` includes `base_status` when Trail can
 resolve the workspace default branch. It reports the target branch/ref, target
 change, lane base change, `operations_behind`, and whether the lane base is
 stale.
@@ -121,7 +121,7 @@ stale.
 `full-cow`, and `overlay-cow`. `virtual` creates no workdir, `sparse` requires
 `paths`, and `full-cow` creates a full materialized workdir using filesystem
 clone COW when available. `overlay-cow` creates an empty workdir mountpoint and
-records an overlay backend; a runtime such as `crabdb agent start
+records an overlay backend; a runtime such as `trail agent start
 --workdir-mode overlay-cow` mounts the FUSE view and keeps it alive while the
 agent runs. The response includes `workdir_mode`, `cow_backend`, `sparse_paths`,
 and `overlay_available`.
@@ -209,6 +209,6 @@ merge-queue removal.
 
 ## Code Facts Used
 
-- OpenAPI paths: `crates/crabdb/src/server/openapi/paths`
-- Route handlers: `crates/crabdb/src/server/route`
-- Request types: `crates/crabdb/src/server/request_types`
+- OpenAPI paths: `crates/trail/src/server/openapi/paths`
+- Route handlers: `crates/trail/src/server/route`
+- Request types: `crates/trail/src/server/request_types`

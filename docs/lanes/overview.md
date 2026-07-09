@@ -1,6 +1,6 @@
 # Lane Overview
 
-A CrabDB lane is a branch-backed work container. It has the normal code-state
+A Trail lane is a branch-backed work container. It has the normal code-state
 properties of a branch, plus the activity records needed to understand how the
 work happened: sessions, turns, messages, events, spans, gates, approvals,
 workdirs, and rewind checkpoints.
@@ -15,14 +15,14 @@ such as Claude Code, Codex, or Cursor.
 ## Core Commands
 
 ```sh
-crabdb lane spawn doc-bot --from main --materialize=true
-crabdb lane workdir doc-bot
-crabdb lane status doc-bot
-crabdb lane diff doc-bot --patch
-crabdb lane review doc-bot
-crabdb lane readiness doc-bot
-crabdb lane handoff doc-bot
-crabdb lane rewind doc-bot --to <change-or-root> --record-current --sync-workdir
+trail lane spawn doc-bot --from main --materialize=true
+trail lane workdir doc-bot
+trail lane status doc-bot
+trail lane diff doc-bot --patch
+trail lane review doc-bot
+trail lane readiness doc-bot
+trail lane handoff doc-bot
+trail lane rewind doc-bot --to <change-or-root> --record-current --sync-workdir
 ```
 
 ## Lane Branches
@@ -41,16 +41,16 @@ Create one lane per task, use its workdir for normal tools, then record,
 review, and merge the lane:
 
 ```sh
-crabdb lane spawn docs-lane --from main --materialize=true
-LANE_DIR="$(crabdb lane workdir docs-lane)"
+trail lane spawn docs-lane --from main --materialize=true
+LANE_DIR="$(trail lane workdir docs-lane)"
 cd "$LANE_DIR"
 # Edit files or run an external coding agent here.
 
 cd /path/to/project
-crabdb lane record docs-lane -m "record task work"
-crabdb lane diff docs-lane --patch
-crabdb lane readiness docs-lane
-crabdb merge-lane docs-lane --into main --dry-run
+trail lane record docs-lane -m "record task work"
+trail lane diff docs-lane --patch
+trail lane readiness docs-lane
+trail merge-lane docs-lane --into main --dry-run
 ```
 
 See [First lane workflow](../getting-started/first-lane-workflow.md) for the
@@ -61,14 +61,14 @@ full daily command sequence.
 Structured patches:
 
 ```sh
-crabdb lane apply-patch doc-bot --patch patch.json
+trail lane apply-patch doc-bot --patch patch.json
 ```
 
 Materialized workdir recording:
 
 ```sh
-crabdb lane workdir doc-bot
-crabdb lane record doc-bot -m "record workdir edits"
+trail lane workdir doc-bot
+trail lane record doc-bot -m "record workdir edits"
 ```
 
 ## Review and Merge
@@ -76,8 +76,8 @@ crabdb lane record doc-bot -m "record workdir edits"
 Before merge, inspect contribution, readiness, gates, approvals, and diff.
 
 ```sh
-crabdb lane contribution doc-bot
-crabdb merge-lane doc-bot --into main --dry-run
+trail lane contribution doc-bot
+trail merge-lane doc-bot --into main --dry-run
 ```
 
 If the branch should be abandoned back to a known-good state, use `lane rewind`
@@ -86,6 +86,6 @@ preserve the current head for later inspection.
 
 ## Code Facts Used
 
-- Lane CLI surface: `crates/crabdb/src/cli/command/lane_args.rs`
-- Lane models: `crates/crabdb/src/model/lane`
+- Lane CLI surface: `crates/trail/src/cli/command/lane_args.rs`
+- Lane models: `crates/trail/src/model/lane`
 - Tests: `lane_management_commands_have_backing_apis`, `lane_patch_can_merge_into_main`

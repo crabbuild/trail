@@ -249,7 +249,7 @@
     <text x="18" y="24" class="note">Routing slot convention</text>
     <text x="18" y="43" class="muted">Visual slots are intervals between boundary values, like a B+tree drawing.</text>
     <text x="18" y="59" class="muted">Level-1 fanout: A = 2 slots / 1 value, M = 4 slots / 3 values, T = 3 slots / 2 values.</text>
-    <text x="18" y="75" class="muted">CrabDB stores child intervals as start-key/CID pairs in parallel arrays.</text>
+    <text x="18" y="75" class="muted">Trail stores child intervals as start-key/CID pairs in parallel arrays.</text>
   </g>
 
   <g transform="translate(730,700)">

@@ -1,14 +1,14 @@
-# CrabDB
+# Trail
 
-CrabDB gives AI coding agents branch-like memory, transcripts, checkpoints, and
+Trail gives AI coding agents branch-like memory, transcripts, checkpoints, and
 rewind without polluting your active Git branch.
 
-CrabDB is a local-first operation database for code and text worktrees. It records
+Trail is a local-first operation database for code and text worktrees. It records
 the meaningful work that happens between Git commits: local edits, recorded
 operations, branch movement, lane patches, review handoffs, merges, and
 line-level provenance.
 
-Git remains the source of shared repository history. CrabDB adds a local layer for
+Git remains the source of shared repository history. Trail adds a local layer for
 questions Git does not answer well by itself:
 
 - What operation introduced this current line?
@@ -19,14 +19,14 @@ questions Git does not answer well by itself:
 - Can an editor, agent host, or local service query the same state through CLI,
   HTTP, MCP, or Rust?
 
-CrabDB stores its local state under `.crabdb/`, uses `.crabignore` and Git ignore
+Trail stores its local state under `.trail/`, uses `.trailignore` and Git ignore
 files to avoid accidental private/generated captures, and can run fully through
 the CLI without a background service. The HTTP daemon and MCP stdio server are
 opt-in integration surfaces.
 
-## CrabDB vs Git
+## Trail vs Git
 
-CrabDB is not a Git replacement. It sits next to Git as a local operation,
+Trail is not a Git replacement. It sits next to Git as a local operation,
 provenance, and lane-coordination layer.
 
 ```text
@@ -34,7 +34,7 @@ provenance, and lane-coordination layer.
                          |
                          v
   +---------------------------------------------------------+
-  | CrabDB                                                  |
+  | Trail                                                  |
   | record operations, preserve line identity, isolate      |
   | lane branches, run guardrails, check readiness,        |
   | produce review and handoff reports                      |
@@ -51,10 +51,10 @@ provenance, and lane-coordination layer.
   +---------------------------------------------------------+
 ```
 
-Use Git for durable shared source-control history. Use CrabDB for the messy,
+Use Git for durable shared source-control history. Use Trail for the messy,
 high-frequency, local work that happens before a commit is ready.
 
-| Need | Git | CrabDB |
+| Need | Git | Trail |
 | --- | --- | --- |
 | Shared project history | Excellent: commits, branches, remotes, tags, PR workflows | Complements Git and can import/export mappings |
 | Local in-between work | Mostly unstaged/staged diffs, stash, reflog | First-class recorded operations with messages, actors, roots, and parents |
@@ -67,9 +67,9 @@ high-frequency, local work that happens before a commit is ready.
 The practical position is:
 
 - Git is the publication and synchronization layer.
-- CrabDB is the local operational memory and coordination layer.
+- Trail is the local operational memory and coordination layer.
 - Git answers "what committed snapshot did the project accept?"
-- CrabDB answers "what happened locally, why did it happen, which lane contains it,
+- Trail answers "what happened locally, why did it happen, which lane contains it,
   is it safe to accept, and what still blocks merge?"
 
 ## Why This Matters for AI Agents
@@ -79,9 +79,9 @@ intermediate patches, tool calls, test runs, review notes, approvals, and
 handoffs. Treating all of that as either "unstaged changes" or "a Git commit"
 loses important context.
 
-CrabDB gives lane workflows a native coordination layer:
+Trail gives lane workflows a native coordination layer:
 
-- Each external agent can work inside an isolated CrabDB lane without
+- Each external agent can work inside an isolated Trail lane without
   immediately touching `main`.
 - Structured patches can target stable file and line identity instead of fragile
   line numbers.
@@ -96,13 +96,13 @@ CrabDB gives lane workflows a native coordination layer:
 - Merge queues serialize accepted lane work so parallel agents do not silently
   overwrite each other.
 
-In short: Git is where accepted code history lives. CrabDB is where local and
+In short: Git is where accepted code history lives. Trail is where local and
 lane work becomes understandable, reviewable, and mergeable before it becomes
 Git history.
 
 ## Who It Is For
 
-CrabDB is useful for several overlapping audiences.
+Trail is useful for several overlapping audiences.
 
 **Developers working locally:** record useful worktree operations before they
 become commits, inspect branch history, ask why a line exists, and safely
@@ -118,9 +118,9 @@ merge queues.
 
 **Tool and integration authors:** use human/JSON CLI output, a loopback HTTP API
 with OpenAPI 3.1, an MCP stdio server with tools/resources/prompts, or the Rust
-`CrabDb` API and exported model/report types.
+`Trail` API and exported model/report types.
 
-## What CrabDB Provides
+## What Trail Provides
 
 - Local operation history with content-addressed objects, refs, roots, and
   rebuildable indexes.
@@ -144,11 +144,11 @@ with OpenAPI 3.1, an MCP stdio server with tools/resources/prompts, or the Rust
 
 ## Architecture at a Glance
 
-CrabDB is organized around one core library object, `CrabDb`. The CLI, HTTP
+Trail is organized around one core library object, `Trail`. The CLI, HTTP
 daemon, MCP server, tests, and Rust callers all route through that same core so
 they can share behavior and report types.
 
-![CrabDB architecture diagram](diagram/crabdb-architecture/crabdb-architecture@2x.png)
+![Trail architecture diagram](diagram/trail-architecture/trail-architecture@2x.png)
 
 The same architecture in text form:
 
@@ -156,20 +156,20 @@ The same architecture in text form:
                          entry points
   +-----------+   +---------------+   +--------------+   +-------------+
   | CLI       |   | HTTP daemon   |   | MCP stdio    |   | Rust API    |
-  | crabdb    |   | /v1 JSON API  |   | tools/docs   |   | CrabDb      |
+  | trail    |   | /v1 JSON API  |   | tools/docs   |   | Trail      |
   +-----+-----+   +-------+-------+   +------+-------+   +------+------+
         |                 |                  |                  |
         +-----------------+------------------+------------------+
                                      |
                                      v
   +-------------------------------------------------------------------+
-  | CrabDb core                                                       |
+  | Trail core                                                       |
   | workspace policy, refs, objects, records, lanes, merges, reports |
   +-----------+------------------+--------------------+---------------+
               |                  |                    |
               v                  v                    v
   +-------------------+  +------------------+  +----------------------+
-  | SQLite            |  | Prolly maps      |  | .crabdb sidecars     |
+  | SQLite            |  | Prolly maps      |  | .trail sidecars     |
   | objects, refs,    |  | path maps, file  |  | config, HEAD, refs,  |
   | indexes, queues,  |  | indexes, text    |  | daemon files,        |
   | lane state        |  | and line order   |  | workdir manifests    |
@@ -179,23 +179,23 @@ The same architecture in text form:
 ### Command Flow
 
 Most commands run directly against the local database. Selected hot paths can
-use the daemon when a daemon URL is supplied or when `.crabdb/daemon.json` is
+use the daemon when a daemon URL is supplied or when `.trail/daemon.json` is
 auto-discovered.
 
 ```text
   user or host
       |
       v
-  crabdb CLI
+  trail CLI
       |
       v
   parse command + build RuntimeContext
       |
       +--> daemon-capable command and daemon available?
       |        |
-      |        +-- yes --> HTTP daemon --> CrabDb core --> report JSON
+      |        +-- yes --> HTTP daemon --> Trail core --> report JSON
       |
-      +-- no or fallback --> local CrabDb core --> report struct
+      +-- no or fallback --> local Trail core --> report struct
                                       |
                                       v
                          human output, JSON, or NDJSON
@@ -207,7 +207,7 @@ without learning separate data models for each surface.
 
 ### Durable History Model
 
-CrabDB records operations as durable history. Refs point to operation/root pairs;
+Trail records operations as durable history. Refs point to operation/root pairs;
 operations point to parent operations and before/after roots; roots point to
 ordered maps and content objects.
 
@@ -305,7 +305,7 @@ available when tools need real files and command execution.
 
 ### Safety Boundaries
 
-CrabDB's safety checks sit between user, automation, or agent requests and workspace mutation.
+Trail's safety checks sit between user, automation, or agent requests and workspace mutation.
 
 ```text
   request
@@ -314,10 +314,10 @@ CrabDB's safety checks sit between user, automation, or agent requests and works
   normalize paths
      |
      v
-  block .crabdb/.git/private hardcoded paths
+  block .trail/.git/private hardcoded paths
      |
      v
-  apply .crabignore and .gitignore policy
+  apply .trailignore and .gitignore policy
      |
      v
   guardrail risk check + workspace policy
@@ -329,47 +329,47 @@ CrabDB's safety checks sit between user, automation, or agent requests and works
   allowed operation, approval_required report, or blocked report
 ```
 
-These checks are deliberately local and explainable. They protect CrabDB/Git
+These checks are deliberately local and explainable. They protect Trail/Git
 internals, ignored/private paths, risky lane actions, dirty materialized
 workdirs, stale refs, and conflicted merges before changes are accepted.
 
 ## Quick Start
 
-CrabDB is a Rust workspace. The repository declares Rust 1.81 in `Cargo.toml`.
+Trail is a Rust workspace. The repository declares Rust 1.81 in `Cargo.toml`.
 Build from source with the Makefile:
 
 ```sh
-# Build the debug binary at target/debug/crabdb.
+# Build the debug binary at target/debug/trail.
 make build
 
 # Print CLI help from the local debug binary.
-target/debug/crabdb --help
+target/debug/trail --help
 ```
 
 Install a local optimized binary with the Makefile. By default this installs to
-`$HOME/.cargo/bin/crabdb`:
+`$HOME/.cargo/bin/trail`:
 
 ```sh
-# Build the release binary and install crabdb locally.
+# Build the release binary and install trail locally.
 make install
 
-# Verify the installed crabdb command is on your PATH.
-crabdb --help
+# Verify the installed trail command is on your PATH.
+trail --help
 ```
 
-For ACP coding-agent setup, keep installation simple and use the guided CrabDB
+For ACP coding-agent setup, keep installation simple and use the guided Trail
 commands after the binary is installed:
 
 ```sh
-crabdb agent doctor --provider claude-code
-crabdb agent doctor --provider codex
-crabdb agent setup
+trail agent doctor --provider claude-code
+trail agent doctor --provider codex
+trail agent setup
 ```
 
 For a project-local install directory, override `PREFIX`:
 
 ```sh
-# Install to ./.local/bin/crabdb instead of $HOME/.cargo/bin/crabdb.
+# Install to ./.local/bin/trail instead of $HOME/.cargo/bin/trail.
 make install PREFIX="$PWD/.local"
 ```
 
@@ -377,62 +377,62 @@ The equivalent direct Cargo build command is:
 
 ```sh
 # Build the debug binary without using the Makefile.
-cargo build -p crabdb
+cargo build -p trail
 
 # Print CLI help from the Cargo-built debug binary.
-target/debug/crabdb --help
+target/debug/trail --help
 ```
 
 Initialize a workspace from the current working tree:
 
 ```sh
-# Import visible working tree files into .crabdb/.
-crabdb init --working-tree
+# Import visible working tree files into .trail/.
+trail init --working-tree
 ```
 
 Inspect and record an edit:
 
 ```sh
-# Show whether the current worktree differs from CrabDB's recorded root.
-crabdb status
+# Show whether the current worktree differs from Trail's recorded root.
+trail status
 
 # Record the current edit as a named local operation.
-crabdb record -m "record current edit"
+trail record -m "record current edit"
 
 # List recent recorded operations.
-crabdb timeline --limit 10
+trail timeline --limit 10
 
 # Inspect one recorded operation from the timeline output.
-crabdb show <change-id>
+trail show <change-id>
 ```
 
 Ask provenance questions:
 
 ```sh
 # Explain what operation introduced the current README.md line 2.
-crabdb why README.md:2
+trail why README.md:2
 
 # Show recorded history for README.md.
-crabdb history README.md
+trail history README.md
 
 # Show the current unrecorded worktree diff as a patch.
-crabdb diff --dirty --patch
+trail diff --dirty --patch
 ```
 
 Start a lane for task work:
 
 ```sh
 # Create an isolated lane branch with its own materialized workdir.
-crabdb lane spawn docs-lane --from main --materialize=true
+trail lane spawn docs-lane --from main --materialize=true
 
 # Print the path to that workdir, then edit there or point a coding agent there.
-crabdb lane workdir docs-lane
+trail lane workdir docs-lane
 
 # Record, review, and check readiness before merge.
-crabdb lane record docs-lane -m "record docs update"
-crabdb lane diff docs-lane --patch
-crabdb lane readiness docs-lane
-crabdb merge-lane docs-lane --into main --dry-run
+trail lane record docs-lane -m "record docs update"
+trail lane diff docs-lane --patch
+trail lane readiness docs-lane
+trail merge-lane docs-lane --into main --dry-run
 ```
 
 Example CLI output from a tiny workspace looks like this. IDs, object hashes,
@@ -442,8 +442,8 @@ workspace IDs, and actor names will differ on your machine.
 
 | Prefix | Meaning | Example use |
 | --- | --- | --- |
-| `wk_` | Workspace ID derived when `.crabdb/` is initialized | Identifies one local CrabDB workspace |
-| `ch_` | Change/operation ID allocated when CrabDB records an operation | Appears as `Head`, `Initial operation`, timeline entries, and `show` selectors |
+| `wk_` | Workspace ID derived when `.trail/` is initialized | Identifies one local Trail workspace |
+| `ch_` | Change/operation ID allocated when Trail records an operation | Appears as `Head`, `Initial operation`, timeline entries, and `show` selectors |
 | `obj_` | Content-addressed object ID | Identifies stored roots, operations, text objects, blobs, and other durable objects |
 | `msg_` | Message ID | Used for durable operation, agent, or review messages |
 | `anc_` | Anchor ID | Used for durable labels tied to file and line identity |
@@ -451,13 +451,13 @@ workspace IDs, and actor names will differ on your machine.
 
 ## Example output
 
-1. Initialize CrabDB from the visible files in the current working tree. The
+1. Initialize Trail from the visible files in the current working tree. The
    output shows the workspace ID, active branch, initial operation ID, and import
    summary.
 
 ```text
-$ crabdb init --working-tree
-Initialized CrabDB workspace
+$ trail init --working-tree
+Initialized Trail workspace
 Workspace: wk_24ec99f68d1db8716f4df8a87580e3da
 Branch: main
 Initial operation: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
@@ -468,18 +468,18 @@ Imported: 1 files (1 text, 0 opaque, 0 binary)
    initialization, the worktree is clean.
 
 ```text
-$ crabdb status
+$ trail status
 Branch: main
 Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
 Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
 Worktree: clean
 ```
 
-3. After editing `README.md`, run `status` again. CrabDB reports the worktree as
+3. After editing `README.md`, run `status` again. Trail reports the worktree as
    dirty and lists the modified path.
 
 ```text
-$ crabdb status
+$ trail status
 Branch: main
 Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
 Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
@@ -491,7 +491,7 @@ Worktree: dirty
    operation ID and the changed path summary.
 
 ```text
-$ crabdb record -m "record current edit"
+$ trail record -m "record current edit"
 Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
   Modified README.md
 ```
@@ -500,16 +500,16 @@ Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
    by the initial import operation.
 
 ```text
-$ crabdb timeline --limit 10
+$ trail timeline --limit 10
 ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa ManualRecord main record current edit
-ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize CrabDB workspace
+ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize Trail workspace
 ```
 
 6. Inspect one operation from the timeline. `show` expands the operation kind,
    actor, message, parent, before/after roots, and path-level summary.
 
 ```text
-$ crabdb show ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+$ trail show ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
 Operation: ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
 Kind: ManualRecord
 Branch: main
@@ -527,7 +527,7 @@ After root: obj_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
    operation that changed its content.
 
 ```text
-$ crabdb why README.md:2
+$ trail why README.md:2
 README.md:2 First recorded line
 Line ID: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6:2
 Introduced by: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
@@ -538,193 +538,193 @@ Last content change: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f
    file.
 
 ```text
-$ crabdb history README.md
+$ trail history README.md
 README.md
 ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 Added README.md
 ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa Modified README.md
 ```
 
 9. After making another edit without recording it, inspect the dirty diff. The
-   patch shows what is currently in the worktree but not yet recorded by CrabDB.
+   patch shows what is currently in the worktree but not yet recorded by Trail.
 
 ```text
-$ crabdb diff --dirty --patch
+$ trail diff --dirty --patch
 Diff main..dirty
   Modified README.md (+1 -0)
-diff --crabdb a/README.md b/README.md
+diff --trail a/README.md b/README.md
 --- a/README.md
 +++ b/README.md
- CrabDB sample
+ Trail sample
  First recorded line
  Second recorded line
 +Unrecorded working tree line
 ```
 
-Initialization creates `.crabdb/` state and a `.crabignore` file when needed.
-Default ignore patterns protect CrabDB/Git internals, environment files, private
+Initialization creates `.trail/` state and a `.trailignore` file when needed.
+Default ignore patterns protect Trail/Git internals, environment files, private
 key/certificate files, dependency folders, build output, and coverage output.
 
-Later examples use `crabdb` for readability. If the binary is not on your PATH,
-install it with `make install` or replace `crabdb` with `target/debug/crabdb`.
+Later examples use `trail` for readability. If the binary is not on your PATH,
+install it with `make install` or replace `trail` with `target/debug/trail`.
 
 ## Common CLI Reference
 
 | Command | Description |
 | --- | --- |
-| `crabdb init --working-tree` | Initialize `.crabdb/` from visible working tree files |
-| `crabdb status` | Show branch head, root object, cleanliness, and changed paths |
-| `crabdb record -m "<message>"` | Record current worktree changes as a named local operation |
-| `crabdb record --paths <path>... -m "<message>"` | Record only selected paths |
-| `crabdb watch --once` | Watch for changes and record once after debounce |
-| `crabdb timeline --limit <n>` | List recent operations, newest first |
-| `crabdb show <selector>` | Inspect an operation, message, ref, or object |
-| `crabdb diff --dirty --patch` | Show unrecorded worktree changes as a patch |
-| `crabdb why <path:line>` | Explain which operation introduced a current line |
-| `crabdb history <path>` | Show recorded history for a file or selector |
-| `crabdb code-from <selector>` | Find changed paths connected to a message, session, or agent |
-| `crabdb branch` | List local CrabDB branches |
-| `crabdb branch <name> --from <ref>` | Create a branch from another ref |
-| `crabdb checkout <branch> --dry-run` | Preview checkout effects before changing the worktree |
-| `crabdb merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
-| `crabdb ignore check <path>` | Check whether ignore policy records or skips a path |
-| `crabdb guardrails check --action <action>` | Preflight a risky action against workspace policy |
-| `crabdb agent setup` | Print editor config for fresh CrabDB agent tasks |
-| `crabdb agent continue latest` | Start a fresh follow-up task from the latest task checkpoint |
-| `crabdb agent` | Open the agent inbox home view with grouped tasks, review-first hints, and one next action |
-| `crabdb agent board` | Show a multi-agent board with low-noise columns and one next action |
-| `crabdb agent ask show agent board` | Route a plain-language question to the multi-agent board |
-| `crabdb agent ask what needs attention` | Route a plain-language question to the inbox home view |
-| `crabdb agent ask what changed` | Route a plain-language question to the right task view |
-| `crabdb agent ask show actions` | Route a plain-language question to the action palette |
-| `crabdb agent ask last prompt` | Route a plain-language question to the latest prompt turn |
-| `crabdb agent ask what changed in the last prompt` | Route a plain-language question to the newest prompt delta |
-| `crabdb agent ask what changed in README.md in the last prompt` | Route a plain-language question to a file-scoped prompt delta |
-| `crabdb agent ask show transcript` | Route a plain-language question to the task transcript |
-| `crabdb agent ask what should I put in the PR` | Route to a read-only pull request draft |
-| `crabdb agent ask give me a summary to share` | Route to the copyable task receipt |
-| `crabdb agent ask handoff this to another agent` | Route to the copyable handoff packet |
-| `crabdb agent ask what commit message should I use` | Route to apply readiness and the generated commit message |
-| `crabdb agent ask which task first` | Route to overlap checks and safe apply order |
-| `crabdb agent` | Show the current task dashboard, or grouped inbox when there are multiple tasks |
-| `crabdb agent guide` | Show the shortest state-aware workflow for setup, review, apply, or recovery |
-| `crabdb agent help-me` | Friendly alias for the agent guide |
-| `crabdb agent home` | Alias for the agent inbox home view |
-| `crabdb agent inbox` | Group all agent tasks by attention state, new changes, and review-first file |
-| `crabdb agent board` | Group all agent tasks as a low-noise board for multiple agents or tasks |
-| `crabdb agent tasks` | Friendly alias for the multi-agent board |
-| `crabdb agent stack` | Show shared files and a safe apply order across agent tasks |
-| `crabdb agent next` | Show the one next useful action for the latest agent task |
-| `crabdb agent todo` | Friendly alias for the one next useful action |
-| `crabdb agent status` | Show the latest agent task, risk, and next useful action |
-| `crabdb agent dashboard latest` | Show one compact task board with next action, focus, validation, and apply readiness |
-| `crabdb agent review-data latest` | Show one structured review packet for editor panels and integrations |
-| `crabdb agent action` | Show runnable review actions for the latest task |
-| `crabdb agent action inspect_focus_file` | Run one published review action for the latest task |
-| `crabdb agent review-flow latest` | Walk review, validation, and finish as one guided checklist |
-| `crabdb agent walkthrough latest` | Friendly alias for the guided review checklist |
-| `crabdb agent brief latest` | Show a compact task brief with risk, next action, changes, and tools |
-| `crabdb agent summary latest` | Show one post-run cockpit with readiness, risk, receipt, PR draft, and next command |
-| `crabdb agent validate latest` | Show latest gates and suggested validation commands without running anything |
-| `crabdb agent test-plan latest` | Show a prioritized test/eval checklist with exact commands |
-| `crabdb agent receipt latest` | Print a copyable post-run receipt with validation, changes, risk, and next command |
-| `crabdb agent handoff latest` | Print a copyable handoff packet for another human or agent |
-| `crabdb agent share latest` | Friendly alias for the handoff packet |
-| `crabdb agent pr latest` | Print a pull request draft title and body without creating a remote PR |
-| `crabdb agent report latest --markdown` | Print the deeper review bundle behind a task |
-| `crabdb agent story latest` | Explain what happened in plain language |
-| `crabdb agent tools latest` | Show tool calls, available commands, and the turns/checkpoints around them |
-| `crabdb agent impact latest` | Show changed areas, blast radius, and recommended review/test checks |
-| `crabdb agent review-map latest` | Show a file-by-file review checklist grouped by changed area |
-| `crabdb agent risk latest` | Show apply risk, reasons, and concrete mitigations |
-| `crabdb agent confidence latest` | Show one go/no-go verdict across review, validation, risk, and apply preflight |
-| `crabdb agent go-no-go latest` | Friendly alias for the confidence verdict |
-| `crabdb agent ready latest` | Check apply readiness without mutating Git |
-| `crabdb agent can-land latest` | Friendly alias for safe apply readiness |
-| `crabdb agent diagnose latest` | Explain likely issues and safe recovery options before undo/rewind |
-| `crabdb agent recover latest` | Friendly alias for recovery diagnosis |
-| `crabdb agent compare <TASK_A> <TASK_B>` | Compare two agent tasks, shared files, risk, and next action |
-| `crabdb agent test latest -- cargo test` | Run and record a test gate in the task workdir |
-| `crabdb agent eval latest -- <command>` | Run and record an eval gate in the task workdir |
-| `crabdb agent workdir latest` | Print the task workdir and a copyable `cd` command |
-| `crabdb agent view latest` | Inspect transcript, tools, changed paths, and checkpoint |
-| `crabdb agent changes latest` | Show high-level change cards plus turn/checkpoint details |
-| `crabdb agent delta latest` | Show the newest completed turn or operation delta |
-| `crabdb agent last latest` | Friendly alias for the newest completed turn or operation delta |
-| `crabdb agent new latest` | Show changes since the task was last marked reviewed |
-| `crabdb agent what-changed latest` | Friendly alias for changes since the last reviewed checkpoint |
-| `crabdb agent mark-reviewed latest` | Mark the current task checkpoint as reviewed |
-| `crabdb agent mark-file-reviewed latest README.md` | Mark one changed file reviewed in the review map |
-| `crabdb agent done latest` | Friendly alias for marking the current checkpoint reviewed |
-| `crabdb agent archive latest` | Hide a finished or irrelevant task from default inbox/list/latest views |
-| `crabdb agent close latest` | Friendly alias for archiving an agent task |
-| `crabdb agent unarchive <TASK>` | Restore an archived task to the default agent inbox |
-| `crabdb agent turn` | Inspect the latest completed turn with prompt, tools, checkpoint, and files |
-| `crabdb agent turn-diff latest --patch` | Show the latest or selected turn diff without spelling out diff flags |
-| `crabdb agent files latest` | Show changed files with the turns and commands behind each file |
-| `crabdb agent changed-files latest` | Friendly alias for changed files with provenance |
-| `crabdb agent inspect README.md` | Friendly alias for file-centered agent context |
-| `crabdb agent checkpoints latest` | List friendly rewind targets and checkpoint ids |
-| `crabdb agent rewind-points latest` | Friendly alias for checkpoint and rewind targets |
-| `crabdb agent why latest README.md` | Explain which prompt, turn, tools, and checkpoint changed a file |
-| `crabdb agent explain README.md` | Friendly alias for explaining why a file changed |
-| `crabdb agent review-plan latest` | Show readiness, risk, review-priority files, and next commands |
-| `crabdb agent review latest` | Short alias for the review-priority dashboard |
-| `crabdb agent focus latest` | Inspect the next file to review with why, a materialized-task open command, and focused diff summary |
-| `crabdb agent open latest` | Open the focused file in `$EDITOR` for a materialized task |
-| `crabdb agent apply latest --dry-run` | Preview safe Git apply for an agent task |
-| `crabdb agent apply latest` | Record, merge, export, and fast-forward with a task-title commit message |
-| `crabdb agent land latest` | Friendly alias for applying an agent task safely |
-| `crabdb agent finish latest` | Apply the task and hide it from the default inbox after success |
-| `crabdb agent undo latest` | Undo the latest agent turn without copying checkpoint ids |
-| `crabdb agent undo-last latest` | Friendly alias for undoing the latest agent turn |
-| `crabdb lane spawn <name> --from <ref>` | Create an isolated lane branch |
-| `crabdb lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
-| `crabdb lane review <name>` | Produce a compact review packet for a lane branch |
-| `crabdb lane readiness <name>` | Report blockers before merging a lane branch |
-| `crabdb lane handoff <name>` | Produce a review and continuation packet for a lane |
-| `crabdb merge-lane <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
-| `crabdb merge-queue run` | Run queued lane merges with readiness and conflict checks |
-| `crabdb daemon` | Start the loopback HTTP daemon for editor and automation integrations |
-| `crabdb mcp` | Start the MCP stdio server for agent hosts |
-| `crabdb acp install --agent claude-code` | Print an ACP relay command and editor snippet |
-| `crabdb acp install --agent codex` | Print the Codex ACP relay command and editor snippet |
-| `crabdb acp doctor --agent claude-code` | Check ACP provider and relay readiness |
-| `crabdb acp sessions` | List captured ACP sessions |
-| `crabdb transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
-| `crabdb doctor` | Run workspace and integration diagnostics |
-| `crabdb backup create <output>` | Create a CrabDB workspace backup |
-| `crabdb fsck` | Verify repository integrity |
+| `trail init --working-tree` | Initialize `.trail/` from visible working tree files |
+| `trail status` | Show branch head, root object, cleanliness, and changed paths |
+| `trail record -m "<message>"` | Record current worktree changes as a named local operation |
+| `trail record --paths <path>... -m "<message>"` | Record only selected paths |
+| `trail watch --once` | Watch for changes and record once after debounce |
+| `trail timeline --limit <n>` | List recent operations, newest first |
+| `trail show <selector>` | Inspect an operation, message, ref, or object |
+| `trail diff --dirty --patch` | Show unrecorded worktree changes as a patch |
+| `trail why <path:line>` | Explain which operation introduced a current line |
+| `trail history <path>` | Show recorded history for a file or selector |
+| `trail code-from <selector>` | Find changed paths connected to a message, session, or agent |
+| `trail branch` | List local Trail branches |
+| `trail branch <name> --from <ref>` | Create a branch from another ref |
+| `trail checkout <branch> --dry-run` | Preview checkout effects before changing the worktree |
+| `trail merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
+| `trail ignore check <path>` | Check whether ignore policy records or skips a path |
+| `trail guardrails check --action <action>` | Preflight a risky action against workspace policy |
+| `trail agent setup` | Print editor config for fresh Trail agent tasks |
+| `trail agent continue latest` | Start a fresh follow-up task from the latest task checkpoint |
+| `trail agent` | Open the agent inbox home view with grouped tasks, review-first hints, and one next action |
+| `trail agent board` | Show a multi-agent board with low-noise columns and one next action |
+| `trail agent ask show agent board` | Route a plain-language question to the multi-agent board |
+| `trail agent ask what needs attention` | Route a plain-language question to the inbox home view |
+| `trail agent ask what changed` | Route a plain-language question to the right task view |
+| `trail agent ask show actions` | Route a plain-language question to the action palette |
+| `trail agent ask last prompt` | Route a plain-language question to the latest prompt turn |
+| `trail agent ask what changed in the last prompt` | Route a plain-language question to the newest prompt delta |
+| `trail agent ask what changed in README.md in the last prompt` | Route a plain-language question to a file-scoped prompt delta |
+| `trail agent ask show transcript` | Route a plain-language question to the task transcript |
+| `trail agent ask what should I put in the PR` | Route to a read-only pull request draft |
+| `trail agent ask give me a summary to share` | Route to the copyable task receipt |
+| `trail agent ask handoff this to another agent` | Route to the copyable handoff packet |
+| `trail agent ask what commit message should I use` | Route to apply readiness and the generated commit message |
+| `trail agent ask which task first` | Route to overlap checks and safe apply order |
+| `trail agent` | Show the current task dashboard, or grouped inbox when there are multiple tasks |
+| `trail agent guide` | Show the shortest state-aware workflow for setup, review, apply, or recovery |
+| `trail agent help-me` | Friendly alias for the agent guide |
+| `trail agent home` | Alias for the agent inbox home view |
+| `trail agent inbox` | Group all agent tasks by attention state, new changes, and review-first file |
+| `trail agent board` | Group all agent tasks as a low-noise board for multiple agents or tasks |
+| `trail agent tasks` | Friendly alias for the multi-agent board |
+| `trail agent stack` | Show shared files and a safe apply order across agent tasks |
+| `trail agent next` | Show the one next useful action for the latest agent task |
+| `trail agent todo` | Friendly alias for the one next useful action |
+| `trail agent status` | Show the latest agent task, risk, and next useful action |
+| `trail agent dashboard latest` | Show one compact task board with next action, focus, validation, and apply readiness |
+| `trail agent review-data latest` | Show one structured review packet for editor panels and integrations |
+| `trail agent action` | Show runnable review actions for the latest task |
+| `trail agent action inspect_focus_file` | Run one published review action for the latest task |
+| `trail agent review-flow latest` | Walk review, validation, and finish as one guided checklist |
+| `trail agent walkthrough latest` | Friendly alias for the guided review checklist |
+| `trail agent brief latest` | Show a compact task brief with risk, next action, changes, and tools |
+| `trail agent summary latest` | Show one post-run cockpit with readiness, risk, receipt, PR draft, and next command |
+| `trail agent validate latest` | Show latest gates and suggested validation commands without running anything |
+| `trail agent test-plan latest` | Show a prioritized test/eval checklist with exact commands |
+| `trail agent receipt latest` | Print a copyable post-run receipt with validation, changes, risk, and next command |
+| `trail agent handoff latest` | Print a copyable handoff packet for another human or agent |
+| `trail agent share latest` | Friendly alias for the handoff packet |
+| `trail agent pr latest` | Print a pull request draft title and body without creating a remote PR |
+| `trail agent report latest --markdown` | Print the deeper review bundle behind a task |
+| `trail agent story latest` | Explain what happened in plain language |
+| `trail agent tools latest` | Show tool calls, available commands, and the turns/checkpoints around them |
+| `trail agent impact latest` | Show changed areas, blast radius, and recommended review/test checks |
+| `trail agent review-map latest` | Show a file-by-file review checklist grouped by changed area |
+| `trail agent risk latest` | Show apply risk, reasons, and concrete mitigations |
+| `trail agent confidence latest` | Show one go/no-go verdict across review, validation, risk, and apply preflight |
+| `trail agent go-no-go latest` | Friendly alias for the confidence verdict |
+| `trail agent ready latest` | Check apply readiness without mutating Git |
+| `trail agent can-land latest` | Friendly alias for safe apply readiness |
+| `trail agent diagnose latest` | Explain likely issues and safe recovery options before undo/rewind |
+| `trail agent recover latest` | Friendly alias for recovery diagnosis |
+| `trail agent compare <TASK_A> <TASK_B>` | Compare two agent tasks, shared files, risk, and next action |
+| `trail agent test latest -- cargo test` | Run and record a test gate in the task workdir |
+| `trail agent eval latest -- <command>` | Run and record an eval gate in the task workdir |
+| `trail agent workdir latest` | Print the task workdir and a copyable `cd` command |
+| `trail agent view latest` | Inspect transcript, tools, changed paths, and checkpoint |
+| `trail agent changes latest` | Show high-level change cards plus turn/checkpoint details |
+| `trail agent delta latest` | Show the newest completed turn or operation delta |
+| `trail agent last latest` | Friendly alias for the newest completed turn or operation delta |
+| `trail agent new latest` | Show changes since the task was last marked reviewed |
+| `trail agent what-changed latest` | Friendly alias for changes since the last reviewed checkpoint |
+| `trail agent mark-reviewed latest` | Mark the current task checkpoint as reviewed |
+| `trail agent mark-file-reviewed latest README.md` | Mark one changed file reviewed in the review map |
+| `trail agent done latest` | Friendly alias for marking the current checkpoint reviewed |
+| `trail agent archive latest` | Hide a finished or irrelevant task from default inbox/list/latest views |
+| `trail agent close latest` | Friendly alias for archiving an agent task |
+| `trail agent unarchive <TASK>` | Restore an archived task to the default agent inbox |
+| `trail agent turn` | Inspect the latest completed turn with prompt, tools, checkpoint, and files |
+| `trail agent turn-diff latest --patch` | Show the latest or selected turn diff without spelling out diff flags |
+| `trail agent files latest` | Show changed files with the turns and commands behind each file |
+| `trail agent changed-files latest` | Friendly alias for changed files with provenance |
+| `trail agent inspect README.md` | Friendly alias for file-centered agent context |
+| `trail agent checkpoints latest` | List friendly rewind targets and checkpoint ids |
+| `trail agent rewind-points latest` | Friendly alias for checkpoint and rewind targets |
+| `trail agent why latest README.md` | Explain which prompt, turn, tools, and checkpoint changed a file |
+| `trail agent explain README.md` | Friendly alias for explaining why a file changed |
+| `trail agent review-plan latest` | Show readiness, risk, review-priority files, and next commands |
+| `trail agent review latest` | Short alias for the review-priority dashboard |
+| `trail agent focus latest` | Inspect the next file to review with why, a materialized-task open command, and focused diff summary |
+| `trail agent open latest` | Open the focused file in `$EDITOR` for a materialized task |
+| `trail agent apply latest --dry-run` | Preview safe Git apply for an agent task |
+| `trail agent apply latest` | Record, merge, export, and fast-forward with a task-title commit message |
+| `trail agent land latest` | Friendly alias for applying an agent task safely |
+| `trail agent finish latest` | Apply the task and hide it from the default inbox after success |
+| `trail agent undo latest` | Undo the latest agent turn without copying checkpoint ids |
+| `trail agent undo-last latest` | Friendly alias for undoing the latest agent turn |
+| `trail lane spawn <name> --from <ref>` | Create an isolated lane branch |
+| `trail lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
+| `trail lane review <name>` | Produce a compact review packet for a lane branch |
+| `trail lane readiness <name>` | Report blockers before merging a lane branch |
+| `trail lane handoff <name>` | Produce a review and continuation packet for a lane |
+| `trail merge-lane <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
+| `trail merge-queue run` | Run queued lane merges with readiness and conflict checks |
+| `trail daemon` | Start the loopback HTTP daemon for editor and automation integrations |
+| `trail mcp` | Start the MCP stdio server for agent hosts |
+| `trail acp install --agent claude-code` | Print an ACP relay command and editor snippet |
+| `trail acp install --agent codex` | Print the Codex ACP relay command and editor snippet |
+| `trail acp doctor --agent claude-code` | Check ACP provider and relay readiness |
+| `trail acp sessions` | List captured ACP sessions |
+| `trail transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
+| `trail doctor` | Run workspace and integration diagnostics |
+| `trail backup create <output>` | Create a Trail workspace backup |
+| `trail fsck` | Verify repository integrity |
 
 ## Core Local Workflows
 
 Record the whole worktree:
 
 ```sh
-crabdb record -m "describe the operation"
+trail record -m "describe the operation"
 ```
 
 Record only selected paths:
 
 ```sh
-crabdb record --paths README.md docs/ -m "record docs only"
+trail record --paths README.md docs/ -m "record docs only"
 ```
 
 Manage branches and merges:
 
 ```sh
-crabdb branch
-crabdb branch experiment --from main
-crabdb checkout experiment --dry-run
-crabdb merge experiment --into main --dry-run
+trail branch
+trail branch experiment --from main
+trail checkout experiment --dry-run
+trail merge experiment --into main --dry-run
 ```
 
 Run safety and maintenance checks:
 
 ```sh
-crabdb ignore check README.md
-crabdb guardrails check --action shell.exec --summary "Run smoke tests"
-crabdb doctor
-crabdb fsck
+trail ignore check README.md
+trail guardrails check --action shell.exec --summary "Run smoke tests"
+trail doctor
+trail fsck
 ```
 
 Use `--json` or `--format json` on commands when a script, editor, or agent
@@ -732,7 +732,7 @@ needs machine-readable output.
 
 ## Agent Workflow
 
-Use `crabdb agent` when you want CrabDB to hide lane names, ACP sessions, export
+Use `trail agent` when you want Trail to hide lane names, ACP sessions, export
 ranges, and Git handoff details. Each task gets a fresh lane by default.
 Task lists and summaries show a human title first, derived from the prompt or
 from `--name`; the stable task id is still shown when you need precision.
@@ -742,18 +742,18 @@ exact directory where the agent edited files.
 Configure an ACP editor once:
 
 ```sh
-crabdb agent setup
+trail agent setup
 ```
 
 `agent setup` defaults to Claude Code plus VS Code, and Codex is also available
-with `crabdb agent setup --provider codex`. Use `--editor zed` or
+with `trail agent setup --provider codex`. Use `--editor zed` or
 `--editor generic` when you want another snippet. It prints the editor snippet
 plus the next verification and review commands.
 Paste the printed snippet into the editor's ACP custom-agent settings. After one
-prompt, ask CrabDB what needs attention:
+prompt, ask Trail what needs attention:
 
 ```sh
-crabdb agent
+trail agent
 ```
 
 Bare `agent` is the inbox home view. It shows the task queue, the attention
@@ -770,7 +770,7 @@ the current task state, prints one next command, shows a short setup/review/appl
 or recovery workflow, and keeps the public mental model to agent task, changes,
 apply, and recover.
 
-`crabdb agent --help` intentionally shows the common path first. Specialist
+`trail agent --help` intentionally shows the common path first. Specialist
 inspection commands still exist, but the first screen points you toward
 `agent guide`, `agent ask ...`, `agent action`, `agent changes`, and safe
 `agent apply --dry-run` instead of making you choose from every low-level view.
@@ -779,142 +779,142 @@ If no task exists yet, daily-path commands such as `agent view latest`,
 and first-run actions instead of a dead-end error.
 
 ```sh
-crabdb agent
-crabdb agent board
-crabdb agent stack
-crabdb agent guide
-crabdb agent ask help me
-crabdb agent ask what needs attention
-crabdb agent ask what should I do next
-crabdb agent ask what did the agent do
-crabdb agent ask where is the workdir
-crabdb agent ask where did the agent edit
-crabdb agent ask which prompt changed README.md
-crabdb agent ask last prompt
-crabdb agent ask what changed in the last prompt
-crabdb agent ask what changed in README.md in the last prompt
-crabdb agent ask show transcript
-crabdb agent ask show dashboard
-crabdb agent ask show actions
-crabdb agent ask what should I review
-crabdb agent ask what should I review first
-crabdb agent ask what file should I review first
-crabdb agent ask what file should I open
-crabdb agent ask where should I look first
-crabdb agent ask open review
-crabdb agent ask review this task
-crabdb agent ask what tools were used
-crabdb agent tools latest
-crabdb agent ask what is the blast radius
-crabdb agent impact latest
-crabdb agent ask review map
-crabdb agent review-map latest
-crabdb agent ask what did the agent change
-crabdb agent ask what files did it touch
-crabdb agent ask can I merge
-crabdb agent ask why can't I apply
-crabdb agent ask what is blocking this task
-crabdb agent ask why did it fail
-crabdb agent ask what went wrong
-crabdb agent ask any red flags
-crabdb agent ask what should I worry about
-crabdb agent ask which files are risky
-crabdb agent ask what changed since I looked
-crabdb agent ask what should I put in the PR
-crabdb agent ask give me a summary to share
-crabdb agent ask what commit message should I use
-crabdb agent ask explain README.md
-crabdb agent ask show the diff
-crabdb agent ask show changes by file
-crabdb agent ask show patch for README.md
-crabdb agent ask show turn diff
-crabdb agent story latest
-crabdb agent summary latest
-crabdb agent ask what tests should I run
-crabdb agent ask is it tested
-crabdb agent ask how should I test this
-crabdb agent test-plan latest
-crabdb agent validate latest
-crabdb agent risk latest
-crabdb agent confidence latest
-crabdb agent ask final check, am I good?
-crabdb agent can-land latest
-crabdb agent recover latest
-crabdb agent compare <TASK_A> <TASK_B>
-crabdb agent stack
-crabdb agent receipt latest
-crabdb agent handoff latest
-crabdb agent pr latest
-crabdb agent report latest --markdown
-crabdb agent test latest -- cargo test
-crabdb agent brief latest
-crabdb agent dashboard latest
-crabdb agent review-flow latest
-crabdb agent ask walk me through review
-crabdb agent workdir latest
-crabdb agent last latest
-crabdb agent what-changed latest
-crabdb agent mark-file-reviewed latest README.md
-crabdb agent done latest
-crabdb agent close latest
-crabdb agent inbox --all
-crabdb agent unarchive <TASK>
-crabdb agent changes latest
-crabdb agent changes latest --by-file
-crabdb agent turn
-crabdb agent turn-diff latest --patch
-crabdb agent changed-files latest
-crabdb agent rewind-points latest
-crabdb agent explain README.md
-crabdb agent turn-diff latest --file README.md --patch
-crabdb agent review-plan latest
-crabdb agent focus latest
-crabdb agent open latest
-crabdb agent view latest
-crabdb agent land latest --dry-run
-crabdb agent land latest
-crabdb agent finish latest
+trail agent
+trail agent board
+trail agent stack
+trail agent guide
+trail agent ask help me
+trail agent ask what needs attention
+trail agent ask what should I do next
+trail agent ask what did the agent do
+trail agent ask where is the workdir
+trail agent ask where did the agent edit
+trail agent ask which prompt changed README.md
+trail agent ask last prompt
+trail agent ask what changed in the last prompt
+trail agent ask what changed in README.md in the last prompt
+trail agent ask show transcript
+trail agent ask show dashboard
+trail agent ask show actions
+trail agent ask what should I review
+trail agent ask what should I review first
+trail agent ask what file should I review first
+trail agent ask what file should I open
+trail agent ask where should I look first
+trail agent ask open review
+trail agent ask review this task
+trail agent ask what tools were used
+trail agent tools latest
+trail agent ask what is the blast radius
+trail agent impact latest
+trail agent ask review map
+trail agent review-map latest
+trail agent ask what did the agent change
+trail agent ask what files did it touch
+trail agent ask can I merge
+trail agent ask why can't I apply
+trail agent ask what is blocking this task
+trail agent ask why did it fail
+trail agent ask what went wrong
+trail agent ask any red flags
+trail agent ask what should I worry about
+trail agent ask which files are risky
+trail agent ask what changed since I looked
+trail agent ask what should I put in the PR
+trail agent ask give me a summary to share
+trail agent ask what commit message should I use
+trail agent ask explain README.md
+trail agent ask show the diff
+trail agent ask show changes by file
+trail agent ask show patch for README.md
+trail agent ask show turn diff
+trail agent story latest
+trail agent summary latest
+trail agent ask what tests should I run
+trail agent ask is it tested
+trail agent ask how should I test this
+trail agent test-plan latest
+trail agent validate latest
+trail agent risk latest
+trail agent confidence latest
+trail agent ask final check, am I good?
+trail agent can-land latest
+trail agent recover latest
+trail agent compare <TASK_A> <TASK_B>
+trail agent stack
+trail agent receipt latest
+trail agent handoff latest
+trail agent pr latest
+trail agent report latest --markdown
+trail agent test latest -- cargo test
+trail agent brief latest
+trail agent dashboard latest
+trail agent review-flow latest
+trail agent ask walk me through review
+trail agent workdir latest
+trail agent last latest
+trail agent what-changed latest
+trail agent mark-file-reviewed latest README.md
+trail agent done latest
+trail agent close latest
+trail agent inbox --all
+trail agent unarchive <TASK>
+trail agent changes latest
+trail agent changes latest --by-file
+trail agent turn
+trail agent turn-diff latest --patch
+trail agent changed-files latest
+trail agent rewind-points latest
+trail agent explain README.md
+trail agent turn-diff latest --file README.md --patch
+trail agent review-plan latest
+trail agent focus latest
+trail agent open latest
+trail agent view latest
+trail agent land latest --dry-run
+trail agent land latest
+trail agent finish latest
 ```
 
 If the latest prompt went sideways, undo by task language instead of copying a
 checkpoint id:
 
 ```sh
-crabdb agent rewind-points latest
-crabdb agent undo-last latest
-crabdb agent undo-last latest --turn 2
-crabdb agent undo-last latest --prompt 'Add hook support'
+trail agent rewind-points latest
+trail agent undo-last latest
+trail agent undo-last latest --turn 2
+trail agent undo-last latest --prompt 'Add hook support'
 ```
 
 For terminal-first work, create a fresh materialized lane and launch Claude Code
 inside it:
 
 ```sh
-crabdb agent start --provider claude-code --name docs-edit
-crabdb agent
-crabdb agent ask what should I do next
-crabdb agent todo
-crabdb agent last latest
-crabdb agent what-changed latest
-crabdb agent changes latest
-crabdb agent changes latest --by-file
-crabdb agent change latest 1
-crabdb agent inspect README.md
-crabdb agent timeline latest
-crabdb agent turn
-crabdb agent turn-diff latest --patch
-crabdb agent validate latest
-crabdb agent test latest -- cargo test
-crabdb agent can-land latest
-crabdb agent explain README.md
-crabdb agent turn-diff latest --file README.md --patch
-crabdb agent finish latest
-crabdb agent continue latest
+trail agent start --provider claude-code --name docs-edit
+trail agent
+trail agent ask what should I do next
+trail agent todo
+trail agent last latest
+trail agent what-changed latest
+trail agent changes latest
+trail agent changes latest --by-file
+trail agent change latest 1
+trail agent inspect README.md
+trail agent timeline latest
+trail agent turn
+trail agent turn-diff latest --patch
+trail agent validate latest
+trail agent test latest -- cargo test
+trail agent can-land latest
+trail agent explain README.md
+trail agent turn-diff latest --file README.md --patch
+trail agent finish latest
+trail agent continue latest
 ```
 
 `agent land` is an alias for `agent apply`; use whichever verb feels more
 natural. Both record dirty lane workdirs first, check that the current Git tree
-matches CrabDB's internal apply base, merges the task into CrabDB, creates a Git
+matches Trail's internal apply base, merges the task into Trail, creates a Git
 commit using the task title by default, and fast-forwards the current Git branch
 only when safe. Use `-m` only when you want to override the generated commit
 message. If the task has already been applied, `agent land` reports
@@ -947,7 +947,7 @@ to execute one for the latest task, `agent action <task> <id>` for a specific
 task, or add `--print` to show the exact command without running it.
 Before the first task exists, `agent action` shows runnable setup, doctor, and
 terminal-start actions instead of failing; for example,
-`crabdb agent action setup_vscode` prints the VS Code setup report.
+`trail agent action setup_vscode` prints the VS Code setup report.
 Confirmation-required actions still need `--confirm`. `agent cockpit latest`
 and `agent side-panel latest` are aliases.
 
@@ -1031,7 +1031,7 @@ inspection/recovery commands before you run destructive undo or rewind actions.
 assistant responses, tool summaries, checkpoints, changed files, and exact
 follow-up commands so you can understand what happened without chasing turn ids
 or operation ids manually. Use `--by-operation` when you need the lower-level
-CrabDB operation timeline.
+Trail operation timeline.
 
 `agent last latest` starts with the newest completed turn. It is the fastest
 way to answer "what just changed?" after an editor or terminal agent finishes a
@@ -1054,7 +1054,7 @@ it, but it does not delete the lane, transcript, checkpoints, or provenance. Use
 `agent changes latest` is the start-here review map for the whole task. It
 prints one `Next` command, then ranks change cards by likely review importance.
 Use `--by-file` when you want one card per changed file, or `--by-operation`
-when you want raw CrabDB checkpoint operations. Each card includes ready
+when you want raw Trail checkpoint operations. Each card includes ready
 `Review`, `Focus`, `Why`, and `Diff` commands so you can open the card, inspect
 the first file, explain provenance, or jump straight to a patch without copying
 turn ids or checkpoint ids.
@@ -1107,62 +1107,62 @@ default; pass `--turn` or `--prompt` when you need a specific prompt-sized undo.
 
 ## Lane Workflow
 
-Lanes work on isolated CrabDB refs instead of immediately changing `main`.
+Lanes work on isolated Trail refs instead of immediately changing `main`.
 External coding agents such as Claude Code or Codex can work inside these lanes,
-but `crabdb lane` itself is the lower-level workflow. Prefer `crabdb agent` for
+but `trail lane` itself is the lower-level workflow. Prefer `trail agent` for
 day-to-day agent tasks.
 
 ```sh
-crabdb lane spawn doc-bot --from main --materialize=true
-crabdb lane status doc-bot
-crabdb lane workdir doc-bot
+trail lane spawn doc-bot --from main --materialize=true
+trail lane status doc-bot
+trail lane workdir doc-bot
 ```
 
 The printed workdir path is where you edit files or run an external coding
-agent. CrabDB keeps that work isolated until you record it into the lane.
+agent. Trail keeps that work isolated until you record it into the lane.
 
 Apply a structured patch directly to the lane branch:
 
 ```sh
-crabdb lane apply-patch doc-bot --patch patch.json
+trail lane apply-patch doc-bot --patch patch.json
 ```
 
 Review and gate the work:
 
 ```sh
-crabdb lane diff doc-bot --patch --show-line-ids
-crabdb lane review doc-bot
-crabdb lane contribution doc-bot
-crabdb lane readiness doc-bot
-crabdb lane handoff doc-bot
+trail lane diff doc-bot --patch --show-line-ids
+trail lane review doc-bot
+trail lane contribution doc-bot
+trail lane readiness doc-bot
+trail lane handoff doc-bot
 ```
 
 When a tool needs a filesystem checkout, create or sync a materialized workdir:
 
 ```sh
-crabdb lane spawn doc-bot --from main --materialize=true
-LANE_DIR="$(crabdb lane workdir doc-bot)"
+trail lane spawn doc-bot --from main --materialize=true
+LANE_DIR="$(trail lane workdir doc-bot)"
 cd "$LANE_DIR"
 # Edit files or run external tooling here.
 
 cd /path/to/project
-crabdb lane record doc-bot -m "record workdir changes"
-crabdb lane sync-workdir doc-bot
+trail lane record doc-bot -m "record workdir changes"
+trail lane sync-workdir doc-bot
 ```
 
 Merge only after review and readiness checks:
 
 ```sh
-crabdb merge-lane doc-bot --into main --dry-run
-crabdb merge-queue add doc-bot --into main
-crabdb merge-queue run
+trail merge-lane doc-bot --into main --dry-run
+trail merge-queue add doc-bot --into main
+trail merge-queue run
 ```
 
 If a merge opens conflicts, inspect and resolve them explicitly:
 
 ```sh
-crabdb conflicts list
-crabdb conflicts show <conflict-set-id>
+trail conflicts list
+trail conflicts show <conflict-set-id>
 ```
 
 ## Integrations
@@ -1170,30 +1170,30 @@ crabdb conflicts show <conflict-set-id>
 Start the local HTTP daemon for editor and automation integrations:
 
 ```sh
-crabdb daemon
+trail daemon
 ```
 
 The daemon defaults to `127.0.0.1:8765`. `GET /v1/health` is unauthenticated;
-other routes require bearer auth or `x-crabdb-token` unless the daemon is started
-with `--no-auth`. When no token is supplied, CrabDB creates or reads
-`.crabdb/daemon.token`, and daemon discovery uses `.crabdb/daemon.json`.
+other routes require bearer auth or `x-trail-token` unless the daemon is started
+with `--no-auth`. When no token is supplied, Trail creates or reads
+`.trail/daemon.token`, and daemon discovery uses `.trail/daemon.json`.
 
 Export the OpenAPI contract:
 
 ```sh
-crabdb api openapi --output crabdb.openapi.json
+trail api openapi --output trail.openapi.json
 ```
 
 Start the MCP stdio server for agent hosts:
 
 ```sh
-crabdb mcp
+trail mcp
 ```
 
 MCP exposes tools, resources, resource templates, prompts, completions, and risk
 annotations for host permission UX. The MCP and HTTP layers call the same
-`CrabDb` methods and return the same report shapes used by CLI JSON output.
-Editor hosts can call `crabdb.agent_ask` with plain-language questions such as
+`Trail` methods and return the same report shapes used by CLI JSON output.
+Editor hosts can call `trail.agent_ask` with plain-language questions such as
 `what needs attention`, `what changed since I looked`,
 `show editor panel data`,
 `what did the agent do`, `where is the workdir`, `where did the agent edit`,
@@ -1211,20 +1211,20 @@ Editor hosts can call `crabdb.agent_ask` with plain-language questions such as
 `what commit message should I use`,
 or `explain README.md`; it routes to the
 matching read-only agent report and includes the routed tool name.
-For side panels, call `crabdb.agent_review_data` or read
-`crabdb://workspace/agent-tasks/latest/review-data`.
-Agent-focused MCP prompts include `crabdb.review_agent`,
-`crabdb.recover_agent`, and `crabdb.apply_agent` for editor hosts that want a
+For side panels, call `trail.agent_review_data` or read
+`trail://workspace/agent-tasks/latest/review-data`.
+Agent-focused MCP prompts include `trail.review_agent`,
+`trail.recover_agent`, and `trail.apply_agent` for editor hosts that want a
 guided workflow instead of making users choose individual tools.
 
-Rust callers can depend on the `crabdb` crate and use exported types such as
-`CrabDb`, `InitImportMode`, IDs, `PatchDocument`, and report structs through the
+Rust callers can depend on the `trail` crate and use exported types such as
+`Trail`, `InitImportMode`, IDs, `PatchDocument`, and report structs through the
 library prelude.
 
 ## Repository Layout
 
 ```text
-crates/crabdb/   CLI, library API, HTTP daemon, MCP server, models, storage
+crates/trail/   CLI, library API, HTTP daemon, MCP server, models, storage
 crates/prolly/   Ordered map storage used by roots and text indexes
 docs/            User, operator, integration, reference, and design docs
 scripts/         Local helper and benchmark scripts
@@ -1234,7 +1234,7 @@ scripts/         Local helper and benchmark scripts
 
 Start with the docs home:
 
-- [CrabDB documentation](docs/README.md)
+- [Trail documentation](docs/README.md)
 - [Roadmap](ROADMAP.md)
 - [Install and build](docs/getting-started/install-and-build.md)
 - [Initialize a workspace](docs/getting-started/initialize-a-workspace.md)
@@ -1261,7 +1261,7 @@ Read by topic:
 Run the main test suite:
 
 ```sh
-cargo test -p crabdb
+cargo test -p trail
 ```
 
 Run the storage crate tests when changing prolly-tree behavior:
@@ -1273,24 +1273,24 @@ cargo test -p prolly
 Useful validation commands while editing docs or examples:
 
 ```sh
-cargo run -p crabdb -- --help
-cargo run -p crabdb -- agent --help
-cargo run -p crabdb -- api openapi --output /tmp/crabdb.openapi.json
+cargo run -p trail -- --help
+cargo run -p trail -- agent --help
+cargo run -p trail -- api openapi --output /tmp/trail.openapi.json
 ```
 
 ## License
 
-CrabDB is distributed under the terms in [LICENSE](LICENSE). The checked-in
+Trail is distributed under the terms in [LICENSE](LICENSE). The checked-in
 license file contains the MIT License; the Rust workspace metadata currently
 declares `MIT OR Apache-2.0`.
 
 ## Current Boundaries
 
-CrabDB is local-first. It does not require a hosted service, and its HTTP daemon
+Trail is local-first. It does not require a hosted service, and its HTTP daemon
 is a loopback integration surface rather than a cloud API.
 
-CrabDB complements Git rather than replacing it. Use Git for shared commit
-history; use CrabDB for local operation history, provenance, agent coordination,
+Trail complements Git rather than replacing it. Use Git for shared commit
+history; use Trail for local operation history, provenance, agent coordination,
 and review signals before or around commits.
 
 Safety features are conservative but not magic. Keep secrets ignored, review

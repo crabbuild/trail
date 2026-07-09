@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AgentTask, MergeQueueEntry } from "../crabdb/TaskRepository";
+import type { AgentTask, MergeQueueEntry } from "../trail/TaskRepository";
 import {
   buildEmptyTreePresentation,
   buildGroupTreePresentation,
@@ -16,7 +16,7 @@ function task(overrides: Partial<AgentTask> = {}): AgentTask {
     lane: "agent-claude-code-54129f3b1bf8",
     title: "Improve VS Code extension polish",
     status: "ready",
-    provider: "Claude Code via CrabDB",
+    provider: "Claude Code via Trail",
     model: "claude-sonnet",
     sessionId: "session-1",
     acpSessionId: "acp-1",
@@ -162,11 +162,11 @@ test("separates empty states from load failures", () => {
   assert.equal(empty.label, "No tasks need review");
   assert.equal(empty.description, "Start a task to create review evidence");
   assert.equal(empty.icon.id, "info");
-  assert.equal(empty.command?.command, "crabdb.newAgentTask");
+  assert.equal(empty.command?.command, "trail.newAgentTask");
   assert.equal(empty.accessibilityLabel, "No tasks need review, Start a task to create review evidence");
-  assert.equal(error.label, "CrabDB data unavailable");
+  assert.equal(error.label, "Trail data unavailable");
   assert.equal(error.description, "Refresh or open settings");
-  assert.equal(error.command?.command, "crabdb.refreshTasks");
+  assert.equal(error.command?.command, "trail.refreshTasks");
   assert.match(error.tooltip, /daemon unavailable/);
   assert.equal(error.icon.id, "warning");
 });
@@ -176,7 +176,7 @@ test("makes queue empty state route users to review before queueing", () => {
 
   assert.equal(empty.label, "No queued merges");
   assert.equal(empty.description, "Open review to queue a lane");
-  assert.equal(empty.command?.command, "crabdb.openLatestReview");
+  assert.equal(empty.command?.command, "trail.openLatestReview");
   assert.equal(empty.command?.title, "Open Latest Review");
 });
 

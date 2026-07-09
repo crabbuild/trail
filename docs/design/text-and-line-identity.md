@@ -1,17 +1,17 @@
 # Text and Line Identity
 
-This design section is advanced/internal. It explains how CrabDB classifies file content, stores text, and preserves line identity for provenance and lane patching.
+This design section is advanced/internal. It explains how Trail classifies file content, stores text, and preserves line identity for provenance and lane patching.
 
 ## Why Line Identity Exists
 
-Traditional line numbers are unstable. Adding one line near the top of a file shifts every later line number. CrabDB instead assigns stable `LineId` values so it can answer questions such as:
+Traditional line numbers are unstable. Adding one line near the top of a file shifts every later line number. Trail instead assigns stable `LineId` values so it can answer questions such as:
 
 - Which operation introduced this current line?
 - Did a line move or change content?
 - Can an agent replace this exact line safely?
 - Did two branches edit the same logical line?
 
-Line identity is one of the main reasons CrabDB stores text as structured content rather than only raw file snapshots.
+Line identity is one of the main reasons Trail stores text as structured content rather than only raw file snapshots.
 
 ## File Classification
 
@@ -130,7 +130,7 @@ The line ID makes the patch target stable. `expected_text` is required as a cont
 sequenceDiagram
     participant Host as Agent host
     participant Patch as patch JSON
-    participant DB as CrabDb
+    participant DB as Trail
     participant Text as TextContent
     participant Branch as Lane branch
 
@@ -178,10 +178,10 @@ The current merge strategy validator accepts `conservative`, `line-id-aware`, an
 
 ## Code Facts Used
 
-- Text model: `crates/crabdb/src/model/domain/objects.rs`
-- Line IDs: `crates/crabdb/src/ids.rs`
-- Text building: `crates/crabdb/src/db/storage/file_build/text.rs`
-- Content loading/materialization: `crates/crabdb/src/db/storage/content.rs`
-- Line utilities: `crates/crabdb/src/db/util/line_ops.rs`
-- Patch schema: `crates/crabdb/src/model/inspect/patch.rs`
+- Text model: `crates/trail/src/model/domain/objects.rs`
+- Line IDs: `crates/trail/src/ids.rs`
+- Text building: `crates/trail/src/db/storage/file_build/text.rs`
+- Content loading/materialization: `crates/trail/src/db/storage/content.rs`
+- Line utilities: `crates/trail/src/db/util/line_ops.rs`
+- Patch schema: `crates/trail/src/model/inspect/patch.rs`
 - Tests: `same_position_rewrite_preserves_line_identity`, `minimal_text_policy_uses_lazy_line_trackable_text`, `lane_patch_can_replace_stable_line_with_expected_text`

@@ -59,7 +59,7 @@ function baseProps(overrides: Partial<ReviewDrawerProps> = {}): ReviewDrawerProp
             {
               action: "refresh",
               label: "Refresh",
-              description: "Fetch the latest CrabDB review state.",
+              description: "Fetch the latest Trail review state.",
               tone: "default"
             }
           ]
@@ -72,7 +72,7 @@ function baseProps(overrides: Partial<ReviewDrawerProps> = {}): ReviewDrawerProp
             {
               action: "removeTask",
               label: "Remove task",
-              description: "Delete this task record from the CrabDB view.",
+              description: "Delete this task record from the Trail view.",
               tone: "danger"
             }
           ]

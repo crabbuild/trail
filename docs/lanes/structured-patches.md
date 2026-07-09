@@ -5,8 +5,8 @@ Structured patches let tools and agents edit a lane branch without directly touc
 ## CLI
 
 ```sh
-crabdb lane apply-patch doc-bot --patch patch.json
-crabdb lane turn apply-patch <turn-id> --patch patch.json
+trail lane apply-patch doc-bot --patch patch.json
+trail lane turn apply-patch <turn-id> --patch patch.json
 ```
 
 Use `--allow-ignored` only for intentional ignored fixtures.
@@ -76,7 +76,7 @@ Direct lane patches require `base_change` to match the current lane head. Turn-l
 
 The HTTP and MCP patch parsers also accept a `files` array with `add_text`, `modify_text`, `write_bytes`, `delete`, and `rename` entries. The parser converts these entries into the same patch edits. External patch requests must use either a non-empty `edits` array or a non-empty `files` array, not both.
 
-Structured patch messages and edit payloads are secret-scanned before storage. Assignment-style credentials, bearer tokens, and private-key PEM blocks reject the patch rather than writing those bytes into CrabDB objects.
+Structured patch messages and edit payloads are secret-scanned before storage. Assignment-style credentials, bearer tokens, and private-key PEM blocks reject the patch rather than writing those bytes into Trail objects.
 Patch paths are normalized and reject parent-directory escapes, absolute paths,
 backslash separators on non-Windows platforms, non-NFC Unicode spellings, slash
 lookalikes, invisible Unicode format controls, Windows-reserved device names and
@@ -84,7 +84,7 @@ aliases, internal paths, and hardcoded private paths.
 
 ## Code Facts Used
 
-- Patch schema: `crates/crabdb/src/model/inspect/patch.rs`
-- HTTP patch request schema: `crates/crabdb/src/server/request_types/patches.rs`
-- Patch policy: `crates/crabdb/src/db/lane/patch_policy.rs`
+- Patch schema: `crates/trail/src/model/inspect/patch.rs`
+- HTTP patch request schema: `crates/trail/src/server/request_types/patches.rs`
+- Patch policy: `crates/trail/src/db/lane/patch_policy.rs`
 - Tests: `lane_patch_incrementally_handles_rename_delete_and_write`, `lane_patch_can_replace_stable_line_with_expected_text`, `lane_payload_secret_scan_rejects_patch_content_and_redacts_stored_payloads`

@@ -55,7 +55,7 @@ function baseProps(overrides: Partial<HeaderBarProps> = {}): HeaderBarProps {
     toolbar: {
       runState: {
         label: "Needs review",
-        detail: "CrabDB has warnings for this lane.",
+        detail: "Trail has warnings for this lane.",
         tone: "warning"
       },
       primaryAction: {
@@ -68,10 +68,10 @@ function baseProps(overrides: Partial<HeaderBarProps> = {}): HeaderBarProps {
         {
           id: "provider",
           label: "Provider",
-          value: "Claude Code via CrabDB",
-          displayValue: "Claude Code via CrabDB",
+          value: "Claude Code via Trail",
+          displayValue: "Claude Code via Trail",
           tone: "ok",
-          accessibilityLabel: "Provider: Claude Code via CrabDB"
+          accessibilityLabel: "Provider: Claude Code via Trail"
         },
         {
           id: "lane",
@@ -88,7 +88,7 @@ function baseProps(overrides: Partial<HeaderBarProps> = {}): HeaderBarProps {
           label: "Durable state",
           group: "workflow",
           enabled: true,
-          detail: "CrabDB persists transcript, checkpoints, review, and queue state."
+          detail: "Trail persists transcript, checkpoints, review, and queue state."
         },
         {
           id: "image",
@@ -111,7 +111,7 @@ function baseProps(overrides: Partial<HeaderBarProps> = {}): HeaderBarProps {
         ariaControls: "review"
       },
       { action: "openDiff", label: "Open diff", iconHtml },
-      { action: "openSettings", label: "Open CrabDB settings", iconHtml }
+      { action: "openSettings", label: "Open Trail settings", iconHtml }
     ],
     runActions: [
       { action: "refresh", label: "Refresh task", iconHtml },
@@ -183,7 +183,7 @@ test("renders context usage and capability action details accessibly", () => {
   const html = renderHeader(baseProps());
 
   assert.match(html, /Context usage 70%/);
-  assert.match(html, /CrabDB capabilities/);
+  assert.match(html, /Trail capabilities/);
   assert.match(html, /1\/2 ready/);
   assert.match(html, /data-capability="durable-state"/);
   assert.match(html, /aria-label="Durable state: ready"/);

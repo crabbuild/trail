@@ -238,7 +238,7 @@ function ToolbarCapabilities({
   toolbar: ToolbarModel
 }) {
   const disclosure = useFloatingDisclosure()
-  const label = `CrabDB capabilities: ${toolbar.capabilitySummary}`
+  const label = `Trail capabilities: ${toolbar.capabilitySummary}`
   return (
     <Collapsible
       className="toolbar-capabilities"
@@ -257,11 +257,11 @@ function ToolbarCapabilities({
           data-icon="inline-start"
           dangerouslySetInnerHTML={{ __html: iconHtml }}
         />
-        <span className="sr-only">CrabDB capabilities</span>
+        <span className="sr-only">Trail capabilities</span>
         <b className="sr-only">{toolbar.capabilitySummary}</b>
       </CollapsibleTrigger>
       <CollapsibleContent keepMounted>
-        <Card className="toolbar-capability-grid" size="sm" aria-label="CrabDB capability matrix">
+        <Card className="toolbar-capability-grid" size="sm" aria-label="Trail capability matrix">
           <CardContent className="toolbar-capability-content">
             <ToolbarCapabilityGroup toolbar={toolbar} group="workflow" label="Workflow" />
             <ToolbarCapabilityGroup toolbar={toolbar} group="input" label="Input" />

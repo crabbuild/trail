@@ -1003,13 +1003,13 @@ test("keeps hydrated turn checkpoints after late live assistant chunks", () => {
     )
   );
   const checkpoint: RenderNode = {
-    id: "crabdb-checkpoint:turn-1",
+    id: "trail-checkpoint:turn-1",
     kind: "checkpoint",
     taskId: "task-1",
     lane: "lane-1",
     turnId: "turn-1",
     provider: "test-provider",
-    source: "crabdb",
+    source: "trail",
     status: "completed",
     checkpointId: "ch_late",
     label: "Checkpoint ch_late",
@@ -1037,7 +1037,7 @@ test("keeps hydrated turn checkpoints after late live assistant chunks", () => {
       "message:assistant:msg-late-hydrated",
       "tool:tool-before-hydrated-checkpoint",
       "message:assistant:msg-late-hydrated:2",
-      "crabdb-checkpoint:turn-1"
+      "trail-checkpoint:turn-1"
     ]
   );
   const lateMessage = nodes[2];
@@ -1117,7 +1117,7 @@ test("skips snapshot patches for semantically identical render nodes", () => {
     kind: "message",
     taskId: "task-1",
     lane: "lane-1",
-    source: "crabdb",
+    source: "trail",
     status: "completed",
     raw: { z: 2, a: 1 },
     role: "assistant",
@@ -1350,8 +1350,8 @@ test("converts live-to-hydrated message snapshot ids into replacements without r
   };
   const hydrated: RenderNode = {
     ...live,
-    id: "crabdb-message:turn-final-message:msg-final",
-    source: "crabdb",
+    id: "trail-message:turn-final-message:msg-final",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:00.000Z"
   };
 
@@ -1359,10 +1359,10 @@ test("converts live-to-hydrated message snapshot ids into replacements without r
   const applied = applyRenderPatchesAndCollect([live], patches);
 
   assert.deepEqual(patches.map((patch) => `${patch.type}:${patch.node?.id || patch.id}`), [
-    "replace:crabdb-message:turn-final-message:msg-final"
+    "replace:trail-message:turn-final-message:msg-final"
   ]);
   assert.deepEqual(applied.nodes.map((node) => `${node.id}:${node.source}`), [
-    "message:assistant:msg-final:crabdb"
+    "message:assistant:msg-final:trail"
   ]);
   assert.equal(applied.nodes[0]?.timelineOrder, 1);
   assert.deepEqual(applied.patches.map((patch) => `${patch.type}:${patch.node?.id || patch.id}`), [
@@ -1370,7 +1370,7 @@ test("converts live-to-hydrated message snapshot ids into replacements without r
   ]);
 });
 
-test("converts live-to-hydrated prompt turn snapshots into replacements across CrabDB turn ids", () => {
+test("converts live-to-hydrated prompt turn snapshots into replacements across Trail turn ids", () => {
   const liveUser: RenderNode = {
     id: "message:user:turn-live",
     kind: "message",
@@ -1425,23 +1425,23 @@ test("converts live-to-hydrated prompt turn snapshots into replacements across C
   };
   const hydratedUser: RenderNode = {
     ...liveUser,
-    id: "crabdb-message:turn-crabdb:msg-user",
-    turnId: "turn-crabdb",
-    source: "crabdb",
+    id: "trail-message:turn-trail:msg-user",
+    turnId: "turn-trail",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:00.000Z"
   };
   const hydratedTool: RenderNode = {
     ...liveTool,
     id: "tool:list-files",
-    turnId: "turn-crabdb",
-    source: "crabdb",
+    turnId: "turn-trail",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:01.000Z"
   };
   const hydratedAssistant: RenderNode = {
     ...liveAssistant,
-    id: "crabdb-message:turn-crabdb:msg-summary",
-    turnId: "turn-crabdb",
-    source: "crabdb",
+    id: "trail-message:turn-trail:msg-summary",
+    turnId: "turn-trail",
+    source: "trail",
     updatedAt: "2026-06-27T00:01:02.000Z"
   };
 
@@ -1451,16 +1451,16 @@ test("converts live-to-hydrated prompt turn snapshots into replacements across C
   const applied = applyRenderPatchesAndCollect(before, patches);
 
   assert.deepEqual(patches.map((patch) => `${patch.type}:${patch.node?.id || patch.id}`), [
-    "replace:crabdb-message:turn-crabdb:msg-user",
+    "replace:trail-message:turn-trail:msg-user",
     "replace:tool:list-files",
-    "replace:crabdb-message:turn-crabdb:msg-summary"
+    "replace:trail-message:turn-trail:msg-summary"
   ]);
   assert.deepEqual(
     applied.nodes.map((node) => `${node.id}:${node.source}:${node.turnId}`),
     [
-      "message:user:turn-live:crabdb:turn-crabdb",
-      "tool:list-files:live:crabdb:turn-crabdb",
-      "message:assistant:msg-summary:crabdb:turn-crabdb"
+      "message:user:turn-live:trail:turn-trail",
+      "tool:list-files:live:trail:turn-trail",
+      "message:assistant:msg-summary:trail:turn-trail"
     ]
   );
   assert.deepEqual(applied.nodes.map((node) => node.timelineOrder), [1, 2, 3]);
@@ -1499,17 +1499,17 @@ test("converts refreshed render snapshots into applicable patches", () => {
   };
   const completedTool: RenderNode = {
     ...tool,
-    source: "crabdb",
+    source: "trail",
     status: "completed",
     toolStatus: "completed"
   };
   const checkpoint: RenderNode = {
-    id: "crabdb-checkpoint:turn-1",
+    id: "trail-checkpoint:turn-1",
     kind: "checkpoint",
     taskId: "task-1",
     lane: "lane-1",
     turnId: "turn-1",
-    source: "crabdb",
+    source: "trail",
     status: "completed",
     checkpointId: "ch_1",
     label: "Checkpoint ch_1",
@@ -1522,7 +1522,7 @@ test("converts refreshed render snapshots into applicable patches", () => {
 
   assert.deepEqual(
     patches.map((patch) => `${patch.type}:${patch.node?.id || patch.id}`),
-    ["remove:message:assistant:live", "replace:tool:run-tests", "upsert:crabdb-checkpoint:turn-1"]
+    ["remove:message:assistant:live", "replace:tool:run-tests", "upsert:trail-checkpoint:turn-1"]
   );
   assert.deepEqual(applyRenderPatches(before, patches), next);
 });

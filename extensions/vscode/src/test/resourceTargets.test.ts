@@ -5,7 +5,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { classifyResourceTarget, isPathInsideWorkspace } from "../shared/resourceTargets";
 
-const workspaceRoot = path.join(os.tmpdir(), "crabdb-resource-targets", "workspace");
+const workspaceRoot = path.join(os.tmpdir(), "trail-resource-targets", "workspace");
 
 test("classifies relative workspace paths as workspace files", () => {
   const target = classifyResourceTarget("src/index.ts", workspaceRoot);

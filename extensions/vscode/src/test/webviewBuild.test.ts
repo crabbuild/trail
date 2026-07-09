@@ -307,7 +307,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(messageCardSourceTs, /props\.contentMode === "stream-text"[\s\S]*<StreamdownMarkdown[\s\S]*streaming=\{props\.streaming\}[\s\S]*text=\{props\.contentText \|\| ""\}/, "streaming messages should keep Streamdown mounted behind a stable wrapper");
   assert.doesNotMatch(streamdownMarkdownSourceTs, /@streamdown\/code|plugins=\{streamdownPlugins\}/, "streaming markdown should keep the optional Shiki code plugin out of the live hot path");
   assert.match(streamdownMarkdownSourceTs, /const streamdownControls: ControlsConfig = false/, "streaming markdown should disable controls during live rendering to avoid button churn");
-  assert.match(streamdownMarkdownSourceTs, /React\.memo\(function StreamdownMarkdown[\s\S]*requestAnimationFrame[\s\S]*__crabdbQueueStreamdownText[\s\S]*<Streamdown[\s\S]*parseIncompleteMarkdown=\{streaming\}/, "streaming markdown should coalesce updates per frame while using Streamdown incomplete-block parsing");
+  assert.match(streamdownMarkdownSourceTs, /React\.memo\(function StreamdownMarkdown[\s\S]*requestAnimationFrame[\s\S]*__trailQueueStreamdownText[\s\S]*<Streamdown[\s\S]*parseIncompleteMarkdown=\{streaming\}/, "streaming markdown should coalesce updates per frame while using Streamdown incomplete-block parsing");
   assert.match(streamdownMarkdownSourceTs, /data-streamdown-markdown=""[\s\S]*data-streaming-markdown=""/, "streaming markdown should preserve the patchable DOM affordance");
   assert.match(tailwindSource, /@source "\.\.\/\.\.\/node_modules\/streamdown\/dist\/\*\.js";/, "webview styles should scan Streamdown utilities");
   assert.doesNotMatch(tailwindSource, /@streamdown\/code/, "webview styles should not scan the optional code plugin when it is not mounted");
@@ -474,7 +474,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.doesNotMatch(mainBundleSource, /function splitPatchFiles\(patch\)/, "main bundle should not include diff review patch parsing");
   assert.doesNotMatch(mainSource, /skip-links|Chat landmarks|Alt\+1\/2\/3/, "webview should not render the retired visible landmark strip in the toolbar");
   assert.match(mainSource, /event\.altKey[\s\S]*event\.key === "1"[\s\S]*focusTranscript\(\)[\s\S]*event\.key === "2"[\s\S]*focusComposer\(\)[\s\S]*event\.key === "3"[\s\S]*focusReview\(\)/, "webview should keep Alt+1/2/3 keyboard landmark navigation without visible toolbar links");
-  assert.match(headerBarSourceTs, /<span className="sr-only">CrabDB capabilities<\/span>/, "top toolbar should keep CrabDB capabilities accessible");
+  assert.match(headerBarSourceTs, /<span className="sr-only">Trail capabilities<\/span>/, "top toolbar should keep Trail capabilities accessible");
   assert.match(headerBarSourceTs, /toolbar-capability-grid/, "capabilities should open as a structured toolbar menu");
   assert.match(headerBarSourceTs, /group="workflow" label="Workflow"/, "capability inspector should group workflow capability state");
   assert.match(headerBarSourceTs, /group="input" label="Input"/, "capability inspector should group prompt input capability state");
@@ -519,7 +519,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.doesNotMatch(
     mainStyleSource,
-    /crabdb-stream-sheen|will-change: opacity, transform|animation: crabdb-stream-sheen/,
+    /trail-stream-sheen|will-change: opacity, transform|animation: trail-stream-sheen/,
     "streaming assistant live affordance should not animate while tokens are arriving"
   );
   assert.doesNotMatch(
@@ -635,12 +635,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-actions button\[data-action="?toggleReview"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 8%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?toggleReview"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-review\)/s,
+    /\.toolbar-capability-actions button\[data-action="?toggleReview"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--trail-review\) 8%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?toggleReview"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--trail-review\)/s,
     "toolbar review capability action should carry review-gate semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability-actions button\[data-action="?openSettings"?\]\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 7%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?openSettings"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-provider\)/s,
+    /\.toolbar-capability-actions button\[data-action="?openSettings"?\]\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--trail-provider\) 7%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability-actions button\[data-action="?openSettings"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--trail-provider\)/s,
     "toolbar settings capability action should carry provider/config semantics"
   );
   assert.match(
@@ -685,17 +685,17 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?toggleReview"?\],[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?openDiff"?\]\s*{[^}]*color: var\(--crabdb-review\)/s,
+    /\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?toggleReview"?\],[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?openDiff"?\]\s*{[^}]*color: var\(--trail-review\)/s,
     "review and diff header icons should carry review/change semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?openSettings"?\]\s*{[^}]*color: var\(--crabdb-provider\)[^}]*\}[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?refresh"?\]\s*{[^}]*color: var\(--crabdb-lane\)[^}]*\}[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?cancel"?\]\s*{[^}]*color: var\(--crabdb-risk\)/s,
+    /\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?openSettings"?\]\s*{[^}]*color: var\(--trail-provider\)[^}]*\}[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?refresh"?\]\s*{[^}]*color: var\(--trail-lane\)[^}]*\}[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]\[data-action="?cancel"?\]\s*{[^}]*color: var\(--trail-risk\)/s,
     "settings, refresh, and cancel header icons should carry provider, lane, and risk semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.header-action-group button\[data-header-icon-only="true"\]:disabled\s*{[^}]*color: var\(--crabdb-muted\)[^}]*\}[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]:disabled:{1,2}after\s*{[^}]*opacity: (?:0)?\.14[^}]*transform: scaleX\((?:0)?\.32\)/s,
+    /\.header-action-group button\[data-header-icon-only="true"\]:disabled\s*{[^}]*color: var\(--trail-muted\)[^}]*\}[\s\S]*\.header-action-group button\[data-header-icon-only="true"\]:disabled:{1,2}after\s*{[^}]*opacity: (?:0)?\.14[^}]*transform: scaleX\((?:0)?\.32\)/s,
     "disabled header icon commands should visibly damp both icon and meter"
   );
   assert.match(
@@ -710,22 +710,22 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button\[data-action="?dryRunApply"?\],[\s\S]*\.toolbar-action-button\[data-action="?startFollowUp"?\]\s*{[^}]*border-color: var\(--state-success-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-checkpoint\) 8%, var\(--surface-muted\)\)/s,
+    /\.toolbar-action-button\[data-action="?dryRunApply"?\],[\s\S]*\.toolbar-action-button\[data-action="?startFollowUp"?\]\s*{[^}]*border-color: var\(--state-success-border\)[^}]*background: color-mix\(in srgb, var\(--trail-checkpoint\) 8%, var\(--surface-muted\)\)/s,
     "dry-run and follow-up toolbar actions should read as checkpoint-backed workflow controls"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button\[data-action="?focusReview"?\],[\s\S]*\.toolbar-action-button\[data-action="?focusTranscript"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 9%, var\(--surface-muted\)\)/s,
+    /\.toolbar-action-button\[data-action="?focusReview"?\],[\s\S]*\.toolbar-action-button\[data-action="?focusTranscript"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--trail-review\) 9%, var\(--surface-muted\)\)/s,
     "review and approval toolbar actions should carry a review-gate surface"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button\[data-action="?focusComposer"?\] \[data-icon="inline-start"\],[\s\S]*\.toolbar-action-button\[data-action="?refresh"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-lane\)/s,
+    /\.toolbar-action-button\[data-action="?focusComposer"?\] \[data-icon="inline-start"\],[\s\S]*\.toolbar-action-button\[data-action="?refresh"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--trail-lane\)/s,
     "compose and refresh toolbar actions should carry a lane icon accent"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-action-button\[data-action="?cancel"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--crabdb-risk\)/s,
+    /\.toolbar-action-button\[data-action="?cancel"?\] \[data-icon="inline-start"\]\s*{[^}]*color: var\(--trail-risk\)/s,
     "cancel toolbar actions should keep a distinct risk accent"
   );
   assert.match(
@@ -745,8 +745,8 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-chip-ok:{1,2}before\s*{[^}]*background: var\(--crabdb-checkpoint\)[^}]*\}[\s\S]*\.toolbar-chip-warning:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)[^}]*\}[\s\S]*\.toolbar-chip-blocked:{1,2}before\s*{[^}]*background: var\(--crabdb-risk\)[^}]*\}[\s\S]*\.toolbar-chip-active:{1,2}before\s*{[^}]*background: var\(--crabdb-lane\)/s,
-    "toolbar chip meters should map CrabDB states to distinct operational colors"
+    /\.toolbar-chip-ok:{1,2}before\s*{[^}]*background: var\(--trail-checkpoint\)[^}]*\}[\s\S]*\.toolbar-chip-warning:{1,2}before\s*{[^}]*background: var\(--trail-review\)[^}]*\}[\s\S]*\.toolbar-chip-blocked:{1,2}before\s*{[^}]*background: var\(--trail-risk\)[^}]*\}[\s\S]*\.toolbar-chip-active:{1,2}before\s*{[^}]*background: var\(--trail-lane\)/s,
+    "toolbar chip meters should map Trail states to distinct operational colors"
   );
   assert.match(
     mainStyleSource,
@@ -765,7 +765,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.toolbar-capability\.on\s*{[^}]*background: color-mix\(in srgb, var\(--crabdb-checkpoint\) 7%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability\.on:{1,2}before\s*{[^}]*background: var\(--crabdb-checkpoint\)/s,
+    /\.toolbar-capability\.on\s*{[^}]*background: color-mix\(in srgb, var\(--trail-checkpoint\) 7%, var\(--surface-subtle\)\)[^}]*\}[\s\S]*\.toolbar-capability\.on:{1,2}before\s*{[^}]*background: var\(--trail-checkpoint\)/s,
     "ready toolbar capabilities should carry a success surface and meter"
   );
   assert.match(
@@ -1044,7 +1044,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(
     mainStyleSource,
     /\.composer button\[data-composer-icon-only="true"\]\s*{[^}]*width: var\(--composer-control-size\)[^}]*height: var\(--composer-control-size\)[^}]*background: transparent/s,
-    "composer icon controls should share the standard CrabDB control size"
+    "composer icon controls should share the standard Trail control size"
   );
   assert.match(
     mainStyleSource,
@@ -1058,17 +1058,17 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.composer \[data-action="?attachSelection"?\],[\s\S]*\.composer \[data-action="?attachChangedFiles"?\]\s*{[^}]*color: var\(--crabdb-lane\)[^}]*background: color-mix\(in srgb, var\(--crabdb-lane\) 7%, transparent\)/s,
+    /\.composer \[data-action="?attachSelection"?\],[\s\S]*\.composer \[data-action="?attachChangedFiles"?\]\s*{[^}]*color: var\(--trail-lane\)[^}]*background: color-mix\(in srgb, var\(--trail-lane\) 7%, transparent\)/s,
     "selection and changed-file composer controls should carry a lane/workspace accent"
   );
   assert.match(
     mainStyleSource,
-    /\.composer \[data-action="?attachFile"?\],[\s\S]*\.composer \[data-action="?attachHistory"?\]\s*{[^}]*color: var\(--crabdb-provider\)[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 7%, transparent\)/s,
+    /\.composer \[data-action="?attachFile"?\],[\s\S]*\.composer \[data-action="?attachHistory"?\]\s*{[^}]*color: var\(--trail-provider\)[^}]*background: color-mix\(in srgb, var\(--trail-provider\) 7%, transparent\)/s,
     "file and history composer controls should carry a provider/context accent"
   );
   assert.match(
     mainStyleSource,
-    /\.composer button\[data-composer-icon-only="true"\]:disabled\s*{[^}]*color: var\(--crabdb-muted\)[^}]*background: transparent/s,
+    /\.composer button\[data-composer-icon-only="true"\]:disabled\s*{[^}]*color: var\(--trail-muted\)[^}]*background: transparent/s,
     "disabled composer icon controls should remain inert after action-specific accents"
   );
   assert.match(
@@ -1215,7 +1215,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.result-drawer-title\s*{[^}]*display:\s*grid[^}]*min-width:\s*0[\s\S]*\.result-drawer-title \[data-slot="drawer-description"\]\s*{[^}]*color:\s*var\(--crabdb-muted\)[^}]*overflow-wrap:\s*anywhere/s,
+    /\.result-drawer-title\s*{[^}]*display:\s*grid[^}]*min-width:\s*0[\s\S]*\.result-drawer-title \[data-slot="drawer-description"\]\s*{[^}]*color:\s*var\(--trail-muted\)[^}]*overflow-wrap:\s*anywhere/s,
     "shadcn result drawer titles and descriptions should stay readable for long provider labels"
   );
   assert.match(
@@ -1235,7 +1235,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.compare-paths-summary,\s*\.conflict-details-summary\s*{[^}]*color:\s*var\(--crabdb-muted\)[^}]*font-size:\s*12px/s,
+    /\.compare-paths-summary,\s*\.conflict-details-summary\s*{[^}]*color:\s*var\(--trail-muted\)[^}]*font-size:\s*12px/s,
     "compare and conflict drawer accordion triggers should inherit compact helper disclosure styling"
   );
   assert.match(
@@ -1416,7 +1416,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(
     mainStyleSource,
     /\.review-action-list\s*{[^}]*max-height: min\(160px, 30vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "review action groups should stay bounded when CrabDB exposes many commands"
+    "review action groups should stay bounded when Trail exposes many commands"
   );
   assert.match(
     mainStyleSource,
@@ -1519,7 +1519,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(
     mainStyleSource,
     /\.review-issue-list\s*{[^}]*max-height: min\(220px, 36vh\)[^}]*overflow: auto[^}]*overscroll-behavior: contain[^}]*scrollbar-gutter: stable[^}]*scrollbar-width: thin/s,
-    "review issue lists should stay bounded when CrabDB reports many blockers and warnings"
+    "review issue lists should stay bounded when Trail reports many blockers and warnings"
   );
   assert.match(
     mainStyleSource,
@@ -1569,12 +1569,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.inline-actions button\[data-action="?startFollowUp"?\]\s*{[^}]*border-color: var\(--state-success-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-checkpoint\) 8%, var\(--surface-muted\)\)[^}]*\}[\s\S]*\.inline-actions button\[data-action="?startFollowUp"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-checkpoint\)/s,
+    /\.inline-actions button\[data-action="?startFollowUp"?\]\s*{[^}]*border-color: var\(--state-success-border\)[^}]*background: color-mix\(in srgb, var\(--trail-checkpoint\) 8%, var\(--surface-muted\)\)[^}]*\}[\s\S]*\.inline-actions button\[data-action="?startFollowUp"?\]:{1,2}before\s*{[^}]*background: var\(--trail-checkpoint\)/s,
     "start-follow-up recovery actions should read as checkpoint-backed workflow controls"
   );
   assert.match(
     mainStyleSource,
-    /\.inline-actions button\[data-action="?focusReview"?\],[\s\S]*\.inline-actions button\[data-action="?showConflict"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 7%, var\(--surface-muted\)\)[^}]*\}[\s\S]*\.inline-actions button\[data-action="?focusReview"?\]:{1,2}before,[\s\S]*\.inline-actions button\[data-action="?showConflict"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)/s,
+    /\.inline-actions button\[data-action="?focusReview"?\],[\s\S]*\.inline-actions button\[data-action="?showConflict"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--trail-review\) 7%, var\(--surface-muted\)\)[^}]*\}[\s\S]*\.inline-actions button\[data-action="?focusReview"?\]:{1,2}before,[\s\S]*\.inline-actions button\[data-action="?showConflict"?\]:{1,2}before\s*{[^}]*background: var\(--trail-review\)/s,
     "review recovery actions should carry review-gate semantics"
   );
   assert.match(
@@ -1604,17 +1604,17 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.inline-actions button\[data-action="?refresh"?\],[\s\S]*\.inline-actions button\[data-action="?queueMerge"?\]\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-lane\) 7%, var\(--surface-muted\)\)/s,
+    /\.inline-actions button\[data-action="?refresh"?\],[\s\S]*\.inline-actions button\[data-action="?queueMerge"?\]\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background: color-mix\(in srgb, var\(--trail-lane\) 7%, var\(--surface-muted\)\)/s,
     "inline refresh, test, eval, and queue actions should carry lane semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.inline-actions button\[data-action="?showConflict"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 7%, var\(--surface-muted\)\)[^}]*\}[\s\S]*\.inline-actions button\[data-action="?showConflict"?\]:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)/s,
+    /\.inline-actions button\[data-action="?showConflict"?\]\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--trail-review\) 7%, var\(--surface-muted\)\)[^}]*\}[\s\S]*\.inline-actions button\[data-action="?showConflict"?\]:{1,2}before\s*{[^}]*background: var\(--trail-review\)/s,
     "inline conflict actions should read as review-gate controls"
   );
   assert.match(
     mainStyleSource,
-    /\.inline-actions button\[data-action="?compareTasks"?\],[\s\S]*\.inline-actions button\[data-action="?openResource"?\],[\s\S]*\.inline-actions button\[data-action="?showAcpLogs"?\]\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 6%, var\(--surface-muted\)\)/s,
+    /\.inline-actions button\[data-action="?compareTasks"?\],[\s\S]*\.inline-actions button\[data-action="?openResource"?\],[\s\S]*\.inline-actions button\[data-action="?showAcpLogs"?\]\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--trail-provider\) 6%, var\(--surface-muted\)\)/s,
     "inline compare, resource, preview, and log actions should carry provider/file semantics"
   );
   assert.match(
@@ -1805,7 +1805,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   assert.match(
     mainStyleSource,
     /button\.approval-option\.primary\s*{[^}]*color: var\(--button-primary-fg\)[^}]*background: var\(--button-primary-bg\)/s,
-    "the one-time approve action should keep the CrabDB primary button fill"
+    "the one-time approve action should keep the Trail primary button fill"
   );
   assert.match(
     mainStyleSource,
@@ -1829,7 +1829,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /button\.approval-reject\s*{[^}]*border-color: color-mix\(in srgb, var\(--state-danger-border\) 58%, var\(--border-subtle\)\)[^}]*color: var\(--crabdb-risk\)/s,
+    /button\.approval-reject\s*{[^}]*border-color: color-mix\(in srgb, var\(--state-danger-border\) 58%, var\(--border-subtle\)\)[^}]*color: var\(--trail-risk\)/s,
     "reject actions should keep a quiet but explicit danger border"
   );
   assert.match(
@@ -1949,12 +1949,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.tool-kind-file\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*color: var\(--crabdb-provider\)/s,
+    /\.tool-kind-file\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*color: var\(--trail-provider\)/s,
     "read tool kind chips should use the provider/file tone"
   );
   assert.match(
     mainStyleSource,
-    /\.tool-kind-change\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*color: var\(--crabdb-lane\)/s,
+    /\.tool-kind-change\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*color: var\(--trail-lane\)/s,
     "change tool kind chips should use the lane tone"
   );
   assert.match(
@@ -2314,12 +2314,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.terminal-transcript-out\s*{[^}]*--terminal-stream-color: var\(--crabdb-checkpoint\)/s,
+    /\.terminal-transcript-out\s*{[^}]*--terminal-stream-color: var\(--trail-checkpoint\)/s,
     "stdout rows should use a success-colored stream accent"
   );
   assert.match(
     mainStyleSource,
-    /\.terminal-transcript-err\s*{[^}]*--terminal-stream-color: var\(--crabdb-risk\)/s,
+    /\.terminal-transcript-err\s*{[^}]*--terminal-stream-color: var\(--trail-risk\)/s,
     "stderr rows should use a risk-colored stream accent"
   );
   assert.match(
@@ -2419,12 +2419,12 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.timeline-group-disclosure\s*{[^}]*inset-inline-end: 8px[^}]*pointer-events: none[\s\S]*\.timeline-group-disclosure \[data-slot="accordion-trigger-icon"\]\s*{[^}]*width: 14px[^}]*height: 14px[^}]*color: var\(--crabdb-muted\)/s,
+    /\.timeline-group-disclosure\s*{[^}]*inset-inline-end: 8px[^}]*pointer-events: none[\s\S]*\.timeline-group-disclosure \[data-slot="accordion-trigger-icon"\]\s*{[^}]*width: 14px[^}]*height: 14px[^}]*color: var\(--trail-muted\)/s,
     "timeline group summaries should use a quiet icon-only disclosure affordance"
   );
   assert.match(
     mainStyleSource,
-    /\.header-action-group button\[data-header-icon-only="true"\]\[data-lane-map-trigger="true"\]\.active\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background:\s*color-mix\(in srgb, var\(--crabdb-lane\) 10%, transparent\)/s,
+    /\.header-action-group button\[data-header-icon-only="true"\]\[data-lane-map-trigger="true"\]\.active\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background:\s*color-mix\(in srgb, var\(--trail-lane\) 10%, transparent\)/s,
     "open lane map trigger should keep a clear active state in the toolbar"
   );
   assert.doesNotMatch(
@@ -2604,7 +2604,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.transcript-message-assistant \.transcript-message-content > \.markdown\s*{[^}]*max-width:\s*100%[^}]*font-size:\s*var\(--crabdb-copy-font-size\)[^}]*line-height:\s*1\.62/s,
+    /\.transcript-message-assistant \.transcript-message-content > \.markdown\s*{[^}]*max-width:\s*100%[^}]*font-size:\s*var\(--trail-copy-font-size\)[^}]*line-height:\s*1\.62/s,
     "assistant markdown should use the full content width with more readable type"
   );
   assert.match(
@@ -2654,7 +2654,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.payload-summary \[data-slot="accordion-trigger-icon"\],\s*\.raw-summary \[data-slot="accordion-trigger-icon"\]\s*{[^}]*color: var\(--crabdb-muted\)/s,
+    /\.payload-summary \[data-slot="accordion-trigger-icon"\],\s*\.raw-summary \[data-slot="accordion-trigger-icon"\]\s*{[^}]*color: var\(--trail-muted\)/s,
     "React raw-detail summaries should use the shadcn accordion icon affordance"
   );
   assert.match(
@@ -2759,7 +2759,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.thought-summary \[data-slot="accordion-trigger-icon"\]\s*{[^}]*grid-column: 4[^}]*color: var\(--crabdb-muted\)/s,
+    /\.thought-summary \[data-slot="accordion-trigger-icon"\]\s*{[^}]*grid-column: 4[^}]*color: var\(--trail-muted\)/s,
     "thought accordion summaries should use the shadcn trigger icon as the disclosure affordance"
   );
   assert.doesNotMatch(
@@ -2809,7 +2809,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.event-callout-success:{1,2}before\s*{[^}]*background: var\(--crabdb-checkpoint\)[\s\S]*\.event-callout-warning:{1,2}before\s*{[^}]*background: var\(--crabdb-review\)[\s\S]*\.event-callout-risk:{1,2}before\s*{[^}]*background: var\(--crabdb-risk\)/s,
+    /\.event-callout-success:{1,2}before\s*{[^}]*background: var\(--trail-checkpoint\)[\s\S]*\.event-callout-warning:{1,2}before\s*{[^}]*background: var\(--trail-review\)[\s\S]*\.event-callout-risk:{1,2}before\s*{[^}]*background: var\(--trail-risk\)/s,
     "event callout meters should carry checkpoint, warning, and risk semantics"
   );
   assert.doesNotMatch(
@@ -2984,7 +2984,7 @@ test("webview build keeps chat startup bundle small and lazy-loads highlighting"
   );
   assert.match(
     mainStyleSource,
-    /\.empty-state-media\s*{[^}]*justify-self: center[^}]*width: 36px[^}]*height: 36px[^}]*color: var\(--crabdb-lane\)/s,
+    /\.empty-state-media\s*{[^}]*justify-self: center[^}]*width: 36px[^}]*height: 36px[^}]*color: var\(--trail-lane\)/s,
     "empty transcript states should position shadcn EmptyMedia as a restrained centered mark"
   );
   assert.match(
@@ -3433,17 +3433,17 @@ test("settings panel keeps search resilient for production configuration surface
   );
   assert.match(
     mainStyleSource,
-    /\.settings-action-opensettings,[\s\S]*\.settings-action-customproviders\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-provider\) 6%, var\(--surface-muted\)\)/s,
+    /\.settings-action-opensettings,[\s\S]*\.settings-action-customproviders\s*{[^}]*border-color: var\(--state-provider-border\)[^}]*background: color-mix\(in srgb, var\(--trail-provider\) 6%, var\(--surface-muted\)\)/s,
     "settings edit and provider actions should carry provider/config semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.settings-action-doctor\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-review\) 7%, var\(--surface-muted\)\)/s,
+    /\.settings-action-doctor\s*{[^}]*border-color: var\(--state-warning-border\)[^}]*background: color-mix\(in srgb, var\(--trail-review\) 7%, var\(--surface-muted\)\)/s,
     "settings doctor actions should carry review/diagnostic semantics"
   );
   assert.match(
     mainStyleSource,
-    /\.settings-action-startdaemon\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background: color-mix\(in srgb, var\(--crabdb-lane\) 7%, var\(--surface-muted\)\)/s,
+    /\.settings-action-startdaemon\s*{[^}]*border-color: var\(--state-lane-border\)[^}]*background: color-mix\(in srgb, var\(--trail-lane\) 7%, var\(--surface-muted\)\)/s,
     "settings daemon actions should carry lane/workflow semantics"
   );
   assert.match(
@@ -3726,7 +3726,7 @@ test("webview streaming state updates refresh existing islands instead of tearin
   );
 	  assert.match(
 	    source,
-	    /function updateStreamingTextTarget\(streamTarget: HTMLElement, streamText: string\): void \{[\s\S]*dataset\.streamdownMarkdown !== undefined[\s\S]*__crabdbQueueStreamdownText\(streamText\)[\s\S]*dispatchEvent\(new CustomEvent\(CRABDB_STREAMDOWN_UPDATE_EVENT[\s\S]*streamText\.startsWith\(current\)[\s\S]*\(firstChild as Text\)\.appendData\(streamText\.slice\(current\.length\)\)[\s\S]*streamTarget\.textContent = streamText/,
+	    /function updateStreamingTextTarget\(streamTarget: HTMLElement, streamText: string\): void \{[\s\S]*dataset\.streamdownMarkdown !== undefined[\s\S]*__trailQueueStreamdownText\(streamText\)[\s\S]*dispatchEvent\(new CustomEvent\(TRAIL_STREAMDOWN_UPDATE_EVENT[\s\S]*streamText\.startsWith\(current\)[\s\S]*\(firstChild as Text\)\.appendData\(streamText\.slice\(current\.length\)\)[\s\S]*streamTarget\.textContent = streamText/,
 	    "streaming DOM fast path should queue mounted Streamdown updates and keep text-node append as a fallback"
 	  );
 		  assert.match(
@@ -3877,7 +3877,7 @@ test("extension host streams applied patches without rescanning the transcript",
   assert.match(
     source,
     /transport: "patch"/,
-    "post-prompt task refresh should merge durable CrabDB state through render patches"
+    "post-prompt task refresh should merge durable Trail state through render patches"
   );
   assert.match(
     source,

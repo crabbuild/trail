@@ -5,15 +5,15 @@ Use separate lane branches and advisory leases when multiple agents may work on 
 ## Spawn Lanes
 
 ```sh
-crabdb lane spawn docs-bot --from main
-crabdb lane spawn tests-bot --from main
+trail lane spawn docs-bot --from main
+trail lane spawn tests-bot --from main
 ```
 
 ## Claim Paths
 
 ```sh
-crabdb lane claim docs-bot README.md --ttl-secs 600
-crabdb lease list
+trail lane claim docs-bot README.md --ttl-secs 600
+trail lease list
 ```
 
 `lane claim` creates a best-effort write lease. Conflicting claims return conflict information instead of silently taking ownership.
@@ -27,24 +27,24 @@ safety checks before accepting work.
 Lanes can apply patches to their own branch-backed refs:
 
 ```sh
-crabdb lane apply-patch docs-bot --patch docs.patch
-crabdb lane apply-patch tests-bot --patch tests.patch
+trail lane apply-patch docs-bot --patch docs.patch
+trail lane apply-patch tests-bot --patch tests.patch
 ```
 
 Or use materialized workdirs:
 
 ```sh
-crabdb lane spawn docs-bot --materialize=true --paths docs
-crabdb lane workdir docs-bot
-crabdb lane record docs-bot -m "record docs workdir"
+trail lane spawn docs-bot --materialize=true --paths docs
+trail lane workdir docs-bot
+trail lane record docs-bot -m "record docs workdir"
 ```
 
 ## Merge Safely
 
 ```sh
-crabdb merge-queue add docs-bot --into main
-crabdb merge-queue add tests-bot --into main
-crabdb merge-queue run
+trail merge-queue add docs-bot --into main
+trail merge-queue add tests-bot --into main
+trail merge-queue run
 ```
 
 ## Recover a Bad Attempt
@@ -53,7 +53,7 @@ If an agent goes sideways, rewind it to a known-good change or root while keepin
 the failed attempt inspectable:
 
 ```sh
-crabdb lane rewind docs-bot --to <known-good-change> --record-current --sync-workdir
+trail lane rewind docs-bot --to <known-good-change> --record-current --sync-workdir
 ```
 
 The preserved branch keeps the bad attempt available for review without moving
@@ -61,7 +61,7 @@ the shared target branch.
 
 ## Code Facts Used
 
-- Lane lifecycle: `crates/crabdb/src/db/lane/lifecycle.rs`
-- Leases: `crates/crabdb/src/db/lane/leases.rs`
-- Rewind: `crates/crabdb/src/db/lane/rewind.rs`
+- Lane lifecycle: `crates/trail/src/db/lane/lifecycle.rs`
+- Leases: `crates/trail/src/db/lane/leases.rs`
+- Rewind: `crates/trail/src/db/lane/rewind.rs`
 - Tests: `advisory_leases_coordinate_lane_paths`, `lane_claims_are_soft_leases_across_cli_api_and_mcp`

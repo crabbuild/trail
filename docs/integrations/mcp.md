@@ -1,11 +1,11 @@
 # MCP
 
-CrabDB provides an MCP stdio server for agent hosts.
+Trail provides an MCP stdio server for agent hosts.
 
 ## Start
 
 ```sh
-crabdb mcp
+trail mcp
 ```
 
 The server implements JSON-RPC methods for tools, resources, resource templates, prompts, and completion.
@@ -34,31 +34,31 @@ Resource templates expose agent details, review-data packets, status, review pac
 
 Built-in prompts:
 
-- `crabdb.lane_task`
-- `crabdb.review_lane`
-- `crabdb.resolve_conflict`
+- `trail.lane_task`
+- `trail.review_lane`
+- `trail.resolve_conflict`
 
 These guide hosts through safe agent tasks, review, and conflict resolution.
 
 ## Host Capture Contract
 
-CrabDB cannot capture a coding agent transcript unless the host calls the MCP
+Trail cannot capture a coding agent transcript unless the host calls the MCP
 tools. Hosts such as Codex, Claude, Cursor, or custom runners should wrap each
 task with:
 
 ```text
-crabdb.begin_turn -> crabdb.add_message -> crabdb.span_start/span_end or crabdb.add_event -> crabdb.apply_patch or crabdb.sync_workdir -> crabdb.end_turn
+trail.begin_turn -> trail.add_message -> trail.span_start/span_end or trail.add_event -> trail.apply_patch or trail.sync_workdir -> trail.end_turn
 ```
 
-When a run pauses for approval or interruption, use `crabdb.run_pause` and later
-`crabdb.run_resume`. If a branch goes sideways, use `crabdb.lane_rewind` with
+When a run pauses for approval or interruption, use `trail.run_pause` and later
+`trail.run_resume`. If a branch goes sideways, use `trail.lane_rewind` with
 `record_current=true` to preserve the failed head before returning to a
 known-good state.
 
 ## Code Facts Used
 
-- MCP server: `crates/crabdb/src/mcp`
-- Tools: `crates/crabdb/src/mcp/tools`
-- Resources: `crates/crabdb/src/mcp/capabilities/resources.rs`
-- Prompts: `crates/crabdb/src/mcp/capabilities/prompts.rs`
+- MCP server: `crates/trail/src/mcp`
+- Tools: `crates/trail/src/mcp/tools`
+- Resources: `crates/trail/src/mcp/capabilities/resources.rs`
+- Prompts: `crates/trail/src/mcp/capabilities/prompts.rs`
 - Tests: `mcp_stdio_tools_drive_lane_turn_workflow`, `local_api_and_mcp_drive_merge_queue_and_conflicts`

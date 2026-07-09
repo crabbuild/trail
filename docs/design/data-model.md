@@ -32,7 +32,7 @@ Core IDs are newtype wrappers or structured IDs:
 - `FileId` has an origin change and local sequence.
 - `LineId` has an origin change and local sequence.
 
-That design lets CrabDB track continuity across renames, line rewrites, and merges.
+That design lets Trail track continuity across renames, line rewrites, and merges.
 
 ## Operation Graph
 
@@ -102,7 +102,7 @@ File entries contain stable identity and content metadata:
 - creating and last-changing operations
 - optional path-change operation
 
-This gives CrabDB both snapshot materialization and provenance.
+This gives Trail both snapshot materialization and provenance.
 
 ```mermaid
 flowchart TB
@@ -206,7 +206,7 @@ This keeps command/API consumers from having to join internal tables themselves.
 
 ```mermaid
 flowchart LR
-    Rows["SQLite rows<br/>refs, indexes, coordination"] --> Core["CrabDb methods<br/>load + join + derive"]
+    Rows["SQLite rows<br/>refs, indexes, coordination"] --> Core["Trail methods<br/>load + join + derive"]
     Objects["Stored objects<br/>operations, roots, messages"] --> Core
     Config["Config and runtime inputs"] --> Core
 
@@ -227,9 +227,9 @@ flowchart LR
 
 ## Code Facts Used
 
-- Domain objects: `crates/crabdb/src/model/domain`
-- Lane models: `crates/crabdb/src/model/lane`
-- Reports: `crates/crabdb/src/model/reports`
-- Inspection models: `crates/crabdb/src/model/inspect`
-- IDs: `crates/crabdb/src/ids.rs`
-- Object storage: `crates/crabdb/src/db/storage/objects`
+- Domain objects: `crates/trail/src/model/domain`
+- Lane models: `crates/trail/src/model/lane`
+- Reports: `crates/trail/src/model/reports`
+- Inspection models: `crates/trail/src/model/inspect`
+- IDs: `crates/trail/src/ids.rs`
+- Object storage: `crates/trail/src/db/storage/objects`

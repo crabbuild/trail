@@ -6,10 +6,10 @@ import { buildSettingsViewModel } from "../views/settingsModel";
 
 const durableProvider: AcpProviderProfile = {
   id: "claude-code",
-  label: "Claude Code via CrabDB",
-  command: "crabdb",
+  label: "Claude Code via Trail",
+  command: "trail",
   args: ["--workspace", "/repo", "agent", "acp", "--provider", "claude-code"],
-  crabdbBacked: true,
+  trailBacked: true,
   supportsTaskName: true,
   supportsFromRef: true
 };
@@ -19,13 +19,13 @@ const rawProvider: AcpProviderProfile = {
   label: "Raw ACP Provider",
   command: "raw-acp",
   args: ["--serve"],
-  crabdbBacked: false,
+  trailBacked: false,
   supportsTaskName: false,
   supportsFromRef: false
 };
 
 const baseConfig: ExtensionConfig = {
-  crabdbPath: "crabdb",
+  trailPath: "trail",
   defaultProvider: "claude-code",
   autoStartDaemon: true,
   customProviders: []
@@ -41,12 +41,12 @@ test("builds a healthy settings model for a durable default provider", () => {
   assert.equal(model.nextSteps.some((step) => step.label === "Workspace settings"), true);
   assert.equal(new Set(model.nextSteps.map((step) => `${step.action.type}:${step.action.key || ""}:${step.action.scope || ""}`)).size, model.nextSteps.length);
   assert.equal(model.providerRouting.tone, "ok");
-  assert.equal(model.providerRouting.action.key, "crabdb.defaultProvider");
+  assert.equal(model.providerRouting.action.key, "trail.defaultProvider");
   assert.equal(model.providerRouting.facts.find((fact) => fact.label === "Durable")?.value, "1/1");
   assert.equal(model.providerCoverage.durable, 1);
   assert.equal(model.sections.find((section) => section.id === "providers")?.tone, "ok");
   assert.equal(model.sections.find((section) => section.id === "checkpoints")?.tone, "ok");
-  assert.equal(model.rows.find((row) => row.key === "crabdb.defaultProvider")?.tone, "ok");
+  assert.equal(model.rows.find((row) => row.key === "trail.defaultProvider")?.tone, "ok");
   assert.match(model.sections.find((section) => section.id === "overview")?.searchText || "", /doctor daemon/);
   assert.match(model.sections.find((section) => section.id === "display")?.searchText || "", /Shiki tokenization/);
 });
@@ -61,7 +61,7 @@ test("flags raw default providers as attention states", () => {
   );
 
   assert.equal(model.healthTone, "attention");
-  assert.equal(model.primaryAction.key, "crabdb.defaultProvider");
+  assert.equal(model.primaryAction.key, "trail.defaultProvider");
   assert.equal(model.nextSteps[0]?.label, "Use durable provider");
   assert.equal(model.nextSteps[0]?.tone, "warn");
   assert.equal(model.nextSteps.some((step) => step.label === "Run doctor"), true);
@@ -95,14 +95,14 @@ test("surfaces missing default provider and empty CLI path", () => {
   const model = buildSettingsViewModel(
     {
       ...baseConfig,
-      crabdbPath: "",
+      trailPath: "",
       defaultProvider: "missing-provider"
     },
     [durableProvider]
   );
 
   assert.equal(model.healthTone, "attention");
-  assert.equal(model.primaryAction.key, "crabdb.path");
+  assert.equal(model.primaryAction.key, "trail.path");
   assert.equal(model.nextSteps[0]?.label, "Set CLI path");
   assert.equal(model.nextSteps[1]?.label, "Choose provider");
   assert.equal(model.nextSteps.length, 4);
@@ -110,10 +110,10 @@ test("surfaces missing default provider and empty CLI path", () => {
   assert.equal(model.providerRouting.label, "Default provider is unavailable");
   assert.equal(model.providerRouting.facts.find((fact) => fact.label === "Default")?.tone, "warn");
   assert.equal(model.issues.some((issue) => issue.label === "Default provider is unavailable"), true);
-  assert.equal(model.rows.find((row) => row.key === "crabdb.path")?.tone, "warn");
+  assert.equal(model.rows.find((row) => row.key === "trail.path")?.tone, "warn");
   assert.equal(model.sections.find((section) => section.id === "overview")?.badge, "2");
   assert.equal(model.sections.find((section) => section.id === "providers")?.badge, "Review");
-  assert.match(model.sections.find((section) => section.id === "configuration")?.searchText || "", /crabdb.path/);
+  assert.match(model.sections.find((section) => section.id === "configuration")?.searchText || "", /trail.path/);
   assert.match(model.sections.find((section) => section.id === "diagnostics")?.searchText || "", /missing-provider/);
 });
 

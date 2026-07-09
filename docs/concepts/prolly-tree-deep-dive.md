@@ -11,7 +11,7 @@ chunk boundaries with an expected average size. Given the same sorted entries
 and the same chunking configuration, a prolly tree builds the same structure
 and the same root identifier.
 
-CrabDB uses this property for versioned workspace roots and text indexes. A
+Trail uses this property for versioned workspace roots and text indexes. A
 root can be represented by a small handle, while the backing tree nodes live in
 a content-addressed store. Unchanged subtrees keep the same content ID across
 versions, so diff, merge, history, and provenance operations can skip large
@@ -68,7 +68,7 @@ and replication.
 
 ## Architecture
 
-CrabDB's `prolly` crate exposes a small persistent `Tree` handle and stores
+Trail's `prolly` crate exposes a small persistent `Tree` handle and stores
 actual nodes through a pluggable `Store`.
 
 ![Prolly tree architecture](diagram/prolly-architecture.svg)
@@ -89,7 +89,7 @@ the top node in the store.
 
 ## Node Layout and Tree Hierarchy
 
-CrabDB's implementation stores sorted byte keys and parallel byte values:
+Trail's implementation stores sorted byte keys and parallel byte values:
 
 ```text
 Leaf node, level = 0
@@ -113,12 +113,12 @@ Other prolly tree implementations may store separator keys differently, but the
 purpose is the same: route a sorted key search through content-addressed
 children.
 
-CrabDB numbers levels from the leaves upward: leaf nodes are `level = 0`,
+Trail numbers levels from the leaves upward: leaf nodes are `level = 0`,
 parents of leaves are `level = 1`, and the root has the highest level in that
 tree.
 
 The hierarchy diagram uses the usual B+ tree visual convention: child pointers
-leave from routing intervals between boundary keys, while CrabDB stores those
+leave from routing intervals between boundary keys, while Trail stores those
 children as parallel start-key and CID arrays.
 
 ![Prolly tree node hierarchy](diagram/prolly-node-layout.svg)
@@ -148,7 +148,7 @@ This gives the tree Merkle identity:
 - Equal child CIDs let diff and merge skip whole subtrees.
 - Updating one leaf can preserve all untouched sibling subtrees.
 
-CrabDB's current compact node format starts with a `CRAB` magic header, records
+Trail's current compact node format starts with a `CRAB` magic header, records
 node metadata with varints, prefix-compresses sorted keys against the previous
 key, and stores internal child CIDs with a compact tag. Legacy CBOR node bytes
 remain readable.
@@ -162,7 +162,7 @@ they have different CIDs even if a human would consider them logically similar.
 The defining feature of a prolly tree is that it chooses chunk boundaries from
 entry content.
 
-CrabDB's boundary predicate is:
+Trail's boundary predicate is:
 
 1. If the current chunk has fewer than `min_chunk_size` entries, do not split.
 2. If the current chunk is at or above `max_chunk_size`, force a split.
@@ -194,7 +194,7 @@ With a chunking factor of `128`, the expected boundary probability is about
 `1 / 128`. Lower factors make smaller average nodes. Higher factors make larger
 average nodes.
 
-CrabDB uses two relevant configurations:
+Trail uses two relevant configurations:
 
 - General text/index maps use `min=4`, `max=1024`, `factor=128`,
   `seed=0xC0DB`, and raw values.
@@ -275,7 +275,7 @@ subtree, that subtree has the same identity.
 Batch updates matter because prolly trees are often used for snapshots: record a
 workspace root, ingest many rows, update an index, or apply a remote change set.
 
-CrabDB's batch path:
+Trail's batch path:
 
 1. Sorts mutations by key.
 2. Deduplicates repeated keys with last-write-wins semantics.
@@ -359,7 +359,7 @@ assert_eq!(
 );
 ```
 
-CrabDB also exposes streaming diff APIs so large comparisons do not need to
+Trail also exposes streaming diff APIs so large comparisons do not need to
 materialize every change up front.
 
 ## Merge
@@ -484,11 +484,11 @@ Store keys are CID bytes. Store values are serialized node bytes. That means
 the storage backend does not need to understand the logical key-value data. It
 only needs to persist content-addressed blobs.
 
-CrabDB can store prolly nodes in SQLite by default. New workspaces can choose
+Trail can store prolly nodes in SQLite by default. New workspaces can choose
 SlateDB-backed node storage:
 
 ```sh
-crabdb init --working-tree --prolly-backend slatedb
+trail init --working-tree --prolly-backend slatedb
 ```
 
 SQLite remains the metadata store for refs, operations, derived indexes, and
@@ -511,10 +511,10 @@ with node writes. A fresh manager can hydrate that append anchor using ordered
 batch reads. Hints are performance metadata only. Correctness always requires a
 normal traversal fallback.
 
-## How CrabDB Uses Prolly Maps
+## How Trail Uses Prolly Maps
 
-CrabDB is a local-first operation database for code and text worktrees. Prolly
-maps are used where CrabDB needs ordered, versioned, content-addressed indexes:
+Trail is a local-first operation database for code and text worktrees. Prolly
+maps are used where Trail needs ordered, versioned, content-addressed indexes:
 
 - Root path map.
 - Root file index map.
@@ -532,14 +532,14 @@ Text storage uses prolly maps for larger `TreeText` content:
 - One map represents line order.
 - Another map indexes line identity.
 
-That lets CrabDB reason about line movement and line history without treating a
+That lets Trail reason about line movement and line history without treating a
 file as only one opaque blob.
 
 Low-level inspection commands expose this machinery for debugging:
 
 ```sh
-crabdb map range <root> --type path
-crabdb map diff <base-root> <other-root> --type path
+trail map range <root> --type path
+trail map diff <base-root> <other-root> --type path
 ```
 
 Those commands are internal/debugging tools, but they are useful for
@@ -549,7 +549,7 @@ understanding how root and text maps are actually stored.
 
 ### Recording a Workspace Snapshot
 
-When CrabDB records a workspace, it can build or update ordered maps from paths
+When Trail records a workspace, it can build or update ordered maps from paths
 to file entries and from file identities to index entries. Most files do not
 change between snapshots. Their map entries and surrounding subtrees can retain
 the same CIDs, so the new root shares structure with the previous root.
@@ -607,13 +607,13 @@ Larger average chunks:
 - Improve broad scan and storage overhead.
 - Can make small edits rewrite larger local regions.
 
-The right values depend on workload. CrabDB uses wider chunks for root maps
+The right values depend on workload. Trail uses wider chunks for root maps
 than for general text/index maps because root maps benefit from reduced node
 amplification at large workspace sizes.
 
 ### Key-Value Boundary Hashing
 
-CrabDB hashes `key || value` for boundary placement. That means a value change
+Trail hashes `key || value` for boundary placement. That means a value change
 can move a local chunk boundary even when the key stays the same. The upside is
 that boundaries are derived from full entry content. The tradeoff is that value
 updates may perturb nearby structure more than key-only chunking would.
@@ -625,7 +625,7 @@ changes when values dominate the logical data.
 ### Append-Heavy Optimization
 
 Content-defined trees can be expensive if append workloads repeatedly traverse
-from the root to the right edge. CrabDB handles this with append-batch detection,
+from the root to the right edge. Trail handles this with append-batch detection,
 an in-process rightmost-path cache, and optional persisted rightmost-path hints.
 
 This is a practical storage-engine lesson: the abstract data structure gives
@@ -658,7 +658,7 @@ costs are:
 - Store indexing overhead.
 - Caches, hints, and backend metadata.
 
-CrabDB tracks this in benchmarks with metrics such as SQLite bytes,
+Trail tracks this in benchmarks with metrics such as SQLite bytes,
 `repo_prolly_nodes` bytes, text-content bytes, and operation latency. Compact
 node encoding and wider root-map fanout are examples of practical changes aimed
 at reducing amplification.
@@ -672,7 +672,7 @@ garbage collection is a graph problem, not a key deletion problem.
 
 ### Hash Choice
 
-CrabDB uses xxHash64 for fast boundary detection and SHA-256 for content IDs.
+Trail uses xxHash64 for fast boundary detection and SHA-256 for content IDs.
 Those jobs are different:
 
 - Boundary detection needs speed and stable distribution.
@@ -712,16 +712,16 @@ The ordered map gives useful database operations. Deterministic chunking makes
 the shape stable across replicas and rebuilds. Merkle identity makes equality,
 diff, merge, and sync efficient.
 
-That combination is why prolly trees show up in systems like CrabDB: they are a
+That combination is why prolly trees show up in systems like Trail: they are a
 storage primitive for data that is not just queried, but also versioned,
 compared, merged, and synchronized.
 
 ## Further Reading
 
-- [CrabDB prolly crate README](../../crates/prolly/README.md)
-- [CrabDB prolly performance guide](../../crates/prolly/docs/performance.md)
-- [CrabDB storage and indexing design](../design/storage-and-indexing.md)
-- [CrabDB objects, roots, text, and line identity](objects-roots-text-and-line-identity.md)
+- [Trail prolly crate README](../../crates/prolly/README.md)
+- [Trail prolly performance guide](../../crates/prolly/docs/performance.md)
+- [Trail storage and indexing design](../design/storage-and-indexing.md)
+- [Trail objects, roots, text, and line identity](objects-roots-text-and-line-identity.md)
 - [Dolt prolly tree storage-engine docs](https://www.dolthub.com/docs/architecture/storage-engine/prolly-tree/)
 - [Noms introduction](https://github.com/attic-labs/noms/blob/master/doc/intro.md)
 - [Accelerating Prolly Trees: Simplified Chunking for Rapid Updates](https://ceur-ws.org/Vol-3791/paper8.pdf)

@@ -4,71 +4,71 @@ This map records the source files used to write the docs. The rewritten docs int
 
 ## Global Sources
 
-- CLI parser and commands: `crates/crabdb/src/cli/command.rs`
-- CLI args: `crates/crabdb/src/cli/command/*_args.rs`
-- CLI handlers: `crates/crabdb/src/cli/command/handler`
-- CLI renderers: `crates/crabdb/src/cli/command/render`
-- Error categories and exit codes: `crates/crabdb/src/error.rs`
-- Public library exports: `crates/crabdb/src/lib.rs`
-- Public models: `crates/crabdb/src/model`
-- Public reports: `crates/crabdb/src/model/reports`
-- e2e tests: `crates/crabdb/tests/e2e.rs`
+- CLI parser and commands: `crates/trail/src/cli/command.rs`
+- CLI args: `crates/trail/src/cli/command/*_args.rs`
+- CLI handlers: `crates/trail/src/cli/command/handler`
+- CLI renderers: `crates/trail/src/cli/command/render`
+- Error categories and exit codes: `crates/trail/src/error.rs`
+- Public library exports: `crates/trail/src/lib.rs`
+- Public models: `crates/trail/src/model`
+- Public reports: `crates/trail/src/model/reports`
+- e2e tests: `crates/trail/tests/e2e.rs`
 
 ## Getting Started
 
-- Install/build: `Cargo.toml`, `crates/crabdb/Cargo.toml`, `crates/crabdb/src/main.rs`
-- Init: `crates/crabdb/src/db/core/init.rs`, `crates/crabdb/src/db/util/config/policy.rs`
-- First record/query: `crates/crabdb/src/db/record`, `crates/crabdb/src/db/storage/query.rs`
-- First lane workflow: `crates/crabdb/src/db/lane`, `crates/crabdb/src/db/merge`
+- Install/build: `Cargo.toml`, `crates/trail/Cargo.toml`, `crates/trail/src/main.rs`
+- Init: `crates/trail/src/db/core/init.rs`, `crates/trail/src/db/util/config/policy.rs`
+- First record/query: `crates/trail/src/db/record`, `crates/trail/src/db/storage/query.rs`
+- First lane workflow: `crates/trail/src/db/lane`, `crates/trail/src/db/merge`
 
 ## Concepts
 
-- Operation database: `crates/crabdb/src/model/domain/operations.rs`
-- Workspaces/refs/branches: `crates/crabdb/src/db/storage/refs.rs`, `crates/crabdb/src/db/record/branches.rs`
-- Objects/text/line identity: `crates/crabdb/src/model/domain/objects.rs`, `crates/crabdb/src/ids.rs`
-- Selectors: `crates/crabdb/src/db/storage/refs.rs`, `crates/crabdb/src/cli/command/handler/inspect.rs`
-- Ignore/guardrails: `crates/crabdb/src/db/core/workspace`, `crates/crabdb/src/db/util/guardrails`
-- Lanes/sessions/traces: `crates/crabdb/src/db/lane/control`, `crates/crabdb/src/model/lane`
-- Readiness/gates: `crates/crabdb/src/db/lane/readiness.rs`, `crates/crabdb/src/db/lane/gates`
-- Storage/indexes/backups: `crates/crabdb/src/db/storage`, `crates/crabdb/src/db/core/backup`
+- Operation database: `crates/trail/src/model/domain/operations.rs`
+- Workspaces/refs/branches: `crates/trail/src/db/storage/refs.rs`, `crates/trail/src/db/record/branches.rs`
+- Objects/text/line identity: `crates/trail/src/model/domain/objects.rs`, `crates/trail/src/ids.rs`
+- Selectors: `crates/trail/src/db/storage/refs.rs`, `crates/trail/src/cli/command/handler/inspect.rs`
+- Ignore/guardrails: `crates/trail/src/db/core/workspace`, `crates/trail/src/db/util/guardrails`
+- Lanes/sessions/traces: `crates/trail/src/db/lane/control`, `crates/trail/src/model/lane`
+- Readiness/gates: `crates/trail/src/db/lane/readiness.rs`, `crates/trail/src/db/lane/gates`
+- Storage/indexes/backups: `crates/trail/src/db/storage`, `crates/trail/src/db/core/backup`
 
 ## Guides and Use Cases
 
-- Recording: `crates/crabdb/src/db/record/recording`
-- Inspection/provenance: `crates/crabdb/src/db/record/inspection`, `crates/crabdb/src/db/storage/query.rs`
-- Branch/checkout/merge: `crates/crabdb/src/db/record/branches.rs`, `crates/crabdb/src/db/record/checkout.rs`, `crates/crabdb/src/db/merge`
-- Config: `crates/crabdb/src/db/util/config`
-- Git interop: `crates/crabdb/src/db/storage/git.rs`, `crates/crabdb/src/db/record/recording/git.rs`, `crates/crabdb/src/db/merge/git_export.rs`
-- Maintenance: `crates/crabdb/src/db/core/doctor*.rs`, `crates/crabdb/src/db/storage/lifecycle`
+- Recording: `crates/trail/src/db/record/recording`
+- Inspection/provenance: `crates/trail/src/db/record/inspection`, `crates/trail/src/db/storage/query.rs`
+- Branch/checkout/merge: `crates/trail/src/db/record/branches.rs`, `crates/trail/src/db/record/checkout.rs`, `crates/trail/src/db/merge`
+- Config: `crates/trail/src/db/util/config`
+- Git interop: `crates/trail/src/db/storage/git.rs`, `crates/trail/src/db/record/recording/git.rs`, `crates/trail/src/db/merge/git_export.rs`
+- Maintenance: `crates/trail/src/db/core/doctor*.rs`, `crates/trail/src/db/storage/lifecycle`
 
 ## Lane Docs
 
-- Lifecycle/workdirs: `crates/crabdb/src/db/lane/lifecycle.rs`, `crates/crabdb/src/db/lane/workdir`
-- Structured patches: `crates/crabdb/src/model/inspect/patch.rs`, `crates/crabdb/src/db/lane/patching.rs`
-- Sessions/turns/runs: `crates/crabdb/src/db/lane/control`
-- Events/traces: `crates/crabdb/src/db/lane/control/traces`
-- Gates/readiness: `crates/crabdb/src/db/lane/gates`, `crates/crabdb/src/db/lane/readiness.rs`
-- Handoff/review/merge: `crates/crabdb/src/db/lane/readiness.rs`, `crates/crabdb/src/db/merge`
+- Lifecycle/workdirs: `crates/trail/src/db/lane/lifecycle.rs`, `crates/trail/src/db/lane/workdir`
+- Structured patches: `crates/trail/src/model/inspect/patch.rs`, `crates/trail/src/db/lane/patching.rs`
+- Sessions/turns/runs: `crates/trail/src/db/lane/control`
+- Events/traces: `crates/trail/src/db/lane/control/traces`
+- Gates/readiness: `crates/trail/src/db/lane/gates`, `crates/trail/src/db/lane/readiness.rs`
+- Handoff/review/merge: `crates/trail/src/db/lane/readiness.rs`, `crates/trail/src/db/merge`
 
 ## Integrations and Reference
 
-- HTTP daemon: `crates/crabdb/src/server`, `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
-- OpenAPI: `crates/crabdb/src/server/openapi`
-- MCP: `crates/crabdb/src/mcp`
+- HTTP daemon: `crates/trail/src/server`, `crates/trail/src/cli/command/handler/daemon_rpc.rs`
+- OpenAPI: `crates/trail/src/server/openapi`
+- MCP: `crates/trail/src/mcp`
 - ACP relay design: `docs/design/acp-relay.md`
-- Config reference: `crates/crabdb/src/db/util/config`, `crates/crabdb/src/db/util/config_parse.rs`
-- Patch reference: `crates/crabdb/src/model/inspect/patch.rs`, `crates/crabdb/src/server/request_types/patches.rs`
-- Data types: `crates/crabdb/src/model`, `crates/crabdb/src/ids.rs`
+- Config reference: `crates/trail/src/db/util/config`, `crates/trail/src/db/util/config_parse.rs`
+- Patch reference: `crates/trail/src/model/inspect/patch.rs`, `crates/trail/src/server/request_types/patches.rs`
+- Data types: `crates/trail/src/model`, `crates/trail/src/ids.rs`
 
 ## Verification Commands
 
 Useful commands after docs changes:
 
 ```sh
-cargo run -p crabdb -- --help
-cargo run -p crabdb -- lane --help
-cargo run -p crabdb -- merge-queue --help
-cargo run -p crabdb -- daemon --help
+cargo run -p trail -- --help
+cargo run -p trail -- lane --help
+cargo run -p trail -- merge-queue --help
+cargo run -p trail -- daemon --help
 rg -n "\\]\\(" docs
-cargo test -p crabdb
+cargo test -p trail
 ```

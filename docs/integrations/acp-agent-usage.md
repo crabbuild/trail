@@ -1,21 +1,21 @@
 # ACP Agent Usage Runbook
 
-CrabDB can run in front of a real ACP coding agent and record the agent's work
+Trail can run in front of a real ACP coding agent and record the agent's work
 as lane sessions, turns, tool events, and checkpoints. This runbook is for
 humans and automation agents that need to verify ACP behavior end to end.
 
-The examples use Claude Code through the ACP adapter, but CrabDB also ships a
+The examples use Claude Code through the ACP adapter, but Trail also ships a
 Codex profile and the relay side is provider-neutral.
 
 ## Mental Model
 
 - **Agent task**: the easy-path unit a user starts, views, applies, or rewinds.
-  CrabDB backs each task with a fresh lane by default.
+  Trail backs each task with a fresh lane by default.
 - **ACP agent**: the real coding agent, such as Claude Code or Codex.
 - **ACP client/editor**: the process that sends `initialize`, `session/new`,
   `session/prompt`, permission responses, and cancellation messages.
-- **CrabDB ACP relay**: the process between the client and the real agent.
-- **Lane**: CrabDB's branch-like workspace for one agent or task.
+- **Trail ACP relay**: the process between the client and the real agent.
+- **Lane**: Trail's branch-like workspace for one agent or task.
 - **Turn**: one prompt/response/tool cycle.
 - **Checkpoint**: the recorded lane state after a completed, cancelled, or
   failed turn.
@@ -23,19 +23,19 @@ Codex profile and the relay side is provider-neutral.
 For day-to-day editor use, generate a stable high-level command:
 
 ```sh
-crabdb agent setup
+trail agent setup
 ```
 
 The generated editor entry runs:
 
 ```sh
-crabdb --workspace /path/to/repo agent acp --provider claude-code
+trail --workspace /path/to/repo agent acp --provider claude-code
 ```
 
 Use `--provider codex` for the built-in Codex ACP adapter:
 
 ```sh
-crabdb --workspace /path/to/repo agent acp --provider codex
+trail --workspace /path/to/repo agent acp --provider codex
 ```
 
 That command creates a fresh lane for the ACP session, launches the real
@@ -44,41 +44,41 @@ provider, captures the transcript and tools, and records the workdir checkpoint.
 For Claude Code the low-level relay command is:
 
 ```sh
-crabdb acp relay --provider claude-code --materialize -- \
+trail acp relay --provider claude-code --materialize -- \
   npx -y @agentclientprotocol/claude-agent-acp@latest
 ```
 
 For Codex the low-level relay command is:
 
 ```sh
-crabdb acp relay --provider codex --materialize -- \
+trail acp relay --provider codex --materialize -- \
   npx -y @agentclientprotocol/codex-acp@latest
 ```
 
-`--materialize` is the default mode for practical coding-agent work. CrabDB
-creates a lane workdir under `.crabdb/worktrees/<lane>` and points the upstream
-ACP session `cwd` there. The agent edits normal files, and CrabDB records the
+`--materialize` is the default mode for practical coding-agent work. Trail
+creates a lane workdir under `.trail/worktrees/<lane>` and points the upstream
+ACP session `cwd` there. The agent edits normal files, and Trail records the
 lane checkpoint at the end of the prompt.
 
 ## Prerequisites
 
-Build or install CrabDB:
+Build or install Trail:
 
 ```sh
 make install
-crabdb --help
+trail --help
 ```
 
 Confirm the provider profile:
 
 ```sh
-crabdb agent doctor --provider claude-code
-crabdb agent doctor --provider codex
-crabdb agent setup
-crabdb acp list
+trail agent doctor --provider claude-code
+trail agent doctor --provider codex
+trail agent setup
+trail acp list
 ```
 
-Provider doctor validates the CrabDB workspace, the provider profile, the relay
+Provider doctor validates the Trail workspace, the provider profile, the relay
 command shape, and upstream command availability.
 
 ## Create a Playground Repo
@@ -86,11 +86,11 @@ command shape, and upstream command availability.
 Use a disposable copy for real-agent experiments:
 
 ```sh
-PLAYGROUND="$(mktemp -d "${TMPDIR:-/tmp}/crabdb-acp-playground.XXXXXX")"
+PLAYGROUND="$(mktemp -d "${TMPDIR:-/tmp}/trail-acp-playground.XXXXXX")"
 rsync -a \
   --exclude target \
   --exclude .git \
-  --exclude .crabdb \
+  --exclude .trail \
   --exclude prolly-tree-paper.pdf \
   ./ "$PLAYGROUND/"
 
@@ -98,8 +98,8 @@ git -C "$PLAYGROUND" init
 git -C "$PLAYGROUND" add .
 git -C "$PLAYGROUND" commit -m "baseline playground copy"
 
-crabdb --workspace "$PLAYGROUND" init --working-tree
-crabdb --workspace "$PLAYGROUND" agent doctor --provider claude-code
+trail --workspace "$PLAYGROUND" init --working-tree
+trail --workspace "$PLAYGROUND" agent doctor --provider claude-code
 ```
 
 This gives the real agent a large enough repository to exercise file discovery
@@ -110,22 +110,22 @@ and editing without touching your active branch.
 Prefer the high-level setup command:
 
 ```sh
-crabdb agent setup
-crabdb agent setup --provider claude-code --editor zed
-crabdb agent setup --provider codex --editor zed
+trail agent setup
+trail agent setup --provider claude-code --editor zed
+trail agent setup --provider codex --editor zed
 ```
 
-These snippets use `crabdb agent acp`, so users do not hard-code or rotate lane
-names manually. Use `crabdb acp install` only when you intentionally want the
+These snippets use `trail agent acp`, so users do not hard-code or rotate lane
+names manually. Use `trail acp install` only when you intentionally want the
 lower-level relay command.
 
 ### Zed
 
-Zed supports ACP External Agents natively. Generate the CrabDB custom-agent
+Zed supports ACP External Agents natively. Generate the Trail custom-agent
 snippet:
 
 ```sh
-crabdb agent setup --provider claude-code --editor zed
+trail agent setup --provider claude-code --editor zed
 ```
 
 The generated shape is:
@@ -133,9 +133,9 @@ The generated shape is:
 ```json
 {
   "agent_servers": {
-    "crabdb-claude-code": {
+    "trail-claude-code": {
       "type": "custom",
-      "command": "crabdb",
+      "command": "trail",
       "args": [
         "--workspace",
         "/path/to/repo",
@@ -149,106 +149,106 @@ The generated shape is:
 }
 ```
 
-If Zed cannot find `crabdb`, replace `"command": "crabdb"` with the absolute
-path from `which crabdb`.
+If Zed cannot find `trail`, replace `"command": "trail"` with the absolute
+path from `which trail`.
 
 In Zed, open `agent: open settings`, add the `agent_servers` entry, then start
-a new External Agent thread for `crabdb-claude-code`. After the prompt finishes,
+a new External Agent thread for `trail-claude-code`. After the prompt finishes,
 run:
 
 ```sh
-crabdb agent
-crabdb agent board
-crabdb agent stack
-crabdb agent ask what needs attention
-crabdb agent ask what should I do next
-crabdb agent ask what did the agent do
-crabdb agent ask where is the workdir
-crabdb agent ask where did the agent edit
-crabdb agent ask which prompt changed README.md
-crabdb agent ask last prompt
-crabdb agent ask what changed in the last prompt
-crabdb agent ask what changed in README.md in the last prompt
-crabdb agent ask show transcript
-crabdb agent ask show dashboard
-crabdb agent ask show actions
-crabdb agent ask what should I review
-crabdb agent ask what should I review first
-crabdb agent ask what file should I review first
-crabdb agent ask what file should I open
-crabdb agent ask where should I look first
-crabdb agent ask open review
-crabdb agent ask review this task
-crabdb agent ask what tools were used
-crabdb agent tools latest
-crabdb agent ask what is the blast radius
-crabdb agent impact latest
-crabdb agent ask review map
-crabdb agent review-map latest
-crabdb agent ask what did the agent change
-crabdb agent ask what files did it touch
-crabdb agent ask can I merge
-crabdb agent ask why can't I apply
-crabdb agent ask what is blocking this task
-crabdb agent ask why did it fail
-crabdb agent ask what went wrong
-crabdb agent ask any red flags
-crabdb agent ask what should I worry about
-crabdb agent ask which files are risky
-crabdb agent todo
-crabdb agent ask what changed since I looked
-crabdb agent ask what should I put in the PR
-crabdb agent ask give me a summary to share
-crabdb agent ask handoff this to another agent
-crabdb agent ask what commit message should I use
-crabdb agent ask explain README.md
-crabdb agent ask show the diff
-crabdb agent ask show changes by file
-crabdb agent ask show patch for README.md
-crabdb agent ask show turn diff
-crabdb agent story latest
-crabdb agent dashboard latest
-crabdb agent review-data latest
-crabdb agent review-flow latest
-crabdb agent ask walk me through review
-crabdb agent risk latest
-crabdb agent confidence latest
-crabdb agent ask final check, am I good?
-crabdb agent can-land latest
-crabdb agent ask what tests should I run
-crabdb agent ask is it tested
-crabdb agent ask how should I test this
-crabdb agent test-plan latest
-crabdb agent validate latest
-crabdb agent test latest -- cargo test
-crabdb agent brief latest
-crabdb agent workdir latest
-crabdb agent changes latest
-crabdb agent changes latest --by-file
-crabdb agent last latest
-crabdb agent what-changed latest
-crabdb agent mark-file-reviewed latest README.md
-crabdb agent turn
-crabdb agent turn-diff latest --patch
-crabdb agent changed-files latest
-crabdb agent explain README.md
-crabdb agent turn-diff latest --file README.md --patch
-crabdb agent review-plan latest
-crabdb agent focus latest
-crabdb agent open latest
-crabdb agent view latest
-crabdb agent can-land latest
-crabdb agent land latest
-crabdb agent finish latest
+trail agent
+trail agent board
+trail agent stack
+trail agent ask what needs attention
+trail agent ask what should I do next
+trail agent ask what did the agent do
+trail agent ask where is the workdir
+trail agent ask where did the agent edit
+trail agent ask which prompt changed README.md
+trail agent ask last prompt
+trail agent ask what changed in the last prompt
+trail agent ask what changed in README.md in the last prompt
+trail agent ask show transcript
+trail agent ask show dashboard
+trail agent ask show actions
+trail agent ask what should I review
+trail agent ask what should I review first
+trail agent ask what file should I review first
+trail agent ask what file should I open
+trail agent ask where should I look first
+trail agent ask open review
+trail agent ask review this task
+trail agent ask what tools were used
+trail agent tools latest
+trail agent ask what is the blast radius
+trail agent impact latest
+trail agent ask review map
+trail agent review-map latest
+trail agent ask what did the agent change
+trail agent ask what files did it touch
+trail agent ask can I merge
+trail agent ask why can't I apply
+trail agent ask what is blocking this task
+trail agent ask why did it fail
+trail agent ask what went wrong
+trail agent ask any red flags
+trail agent ask what should I worry about
+trail agent ask which files are risky
+trail agent todo
+trail agent ask what changed since I looked
+trail agent ask what should I put in the PR
+trail agent ask give me a summary to share
+trail agent ask handoff this to another agent
+trail agent ask what commit message should I use
+trail agent ask explain README.md
+trail agent ask show the diff
+trail agent ask show changes by file
+trail agent ask show patch for README.md
+trail agent ask show turn diff
+trail agent story latest
+trail agent dashboard latest
+trail agent review-data latest
+trail agent review-flow latest
+trail agent ask walk me through review
+trail agent risk latest
+trail agent confidence latest
+trail agent ask final check, am I good?
+trail agent can-land latest
+trail agent ask what tests should I run
+trail agent ask is it tested
+trail agent ask how should I test this
+trail agent test-plan latest
+trail agent validate latest
+trail agent test latest -- cargo test
+trail agent brief latest
+trail agent workdir latest
+trail agent changes latest
+trail agent changes latest --by-file
+trail agent last latest
+trail agent what-changed latest
+trail agent mark-file-reviewed latest README.md
+trail agent turn
+trail agent turn-diff latest --patch
+trail agent changed-files latest
+trail agent explain README.md
+trail agent turn-diff latest --file README.md --patch
+trail agent review-plan latest
+trail agent focus latest
+trail agent open latest
+trail agent view latest
+trail agent can-land latest
+trail agent land latest
+trail agent finish latest
 ```
 
 ### VS Code
 
 VS Code needs an ACP client extension. Configure the extension's custom ACP
-agent command to launch CrabDB:
+agent command to launch Trail:
 
 ```text
-command: crabdb
+command: trail
 args:
   --workspace
   /path/to/repo
@@ -259,7 +259,7 @@ args:
 ```
 
 The exact settings key depends on the ACP extension. The important boundary is
-the same: VS Code or the extension is the ACP client, CrabDB is the ACP relay,
+the same: VS Code or the extension is the ACP client, Trail is the ACP relay,
 and Claude Code remains the real ACP agent.
 
 ## Run a Real Claude Code ACP Prompt
@@ -303,13 +303,13 @@ relay  -> client: final session/prompt response
 Use a bounded prompt for the first real edit:
 
 ```text
-Make one small real edit in this CrabDB playground repo.
+Make one small real edit in this Trail playground repo.
 
 Edit exactly one file: docs/integrations/acp.md.
 Add a short section titled "Playground smoke test" near the setup or
 troubleshooting area.
 Mention that a real Claude Code ACP run can be verified with
-`crabdb agent view latest` and `crabdb agent ready latest`.
+`trail agent view latest` and `trail agent ready latest`.
 Keep it concise: 2-4 sentences.
 Do not modify any other files.
 After editing, reply with a brief summary and the file path changed.
@@ -318,7 +318,7 @@ After editing, reply with a brief summary and the file path changed.
 Launch the high-level ACP entrypoint:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" agent acp --provider claude-code
+trail --workspace "$PLAYGROUND" agent acp --provider claude-code
 ```
 
 Then drive the relay over JSON-RPC stdio from your editor or test client.
@@ -328,53 +328,53 @@ Then drive the relay over JSON-RPC stdio from your editor or test client.
 After the prompt completes:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" agent board
-crabdb --workspace "$PLAYGROUND" agent stack
-crabdb --workspace "$PLAYGROUND" agent ask what needs attention
-crabdb --workspace "$PLAYGROUND" agent ask what should I do next
-crabdb --workspace "$PLAYGROUND" agent summary latest
-crabdb --workspace "$PLAYGROUND" agent ask what did the agent do
-crabdb --workspace "$PLAYGROUND" agent ask where is the workdir
-crabdb --workspace "$PLAYGROUND" agent ask where did the agent edit
-crabdb --workspace "$PLAYGROUND" agent ask which prompt changed README.md
-crabdb --workspace "$PLAYGROUND" agent ask last prompt
-crabdb --workspace "$PLAYGROUND" agent ask what changed in the last prompt
-crabdb --workspace "$PLAYGROUND" agent ask what changed in README.md in the last prompt
-crabdb --workspace "$PLAYGROUND" agent ask show transcript
-crabdb --workspace "$PLAYGROUND" agent ask what should I review
-crabdb --workspace "$PLAYGROUND" agent ask what should I review first
-crabdb --workspace "$PLAYGROUND" agent ask what file should I review first
-crabdb --workspace "$PLAYGROUND" agent ask what file should I open
-crabdb --workspace "$PLAYGROUND" agent ask where should I look first
-crabdb --workspace "$PLAYGROUND" agent ask open review
-crabdb --workspace "$PLAYGROUND" agent ask review this task
-crabdb --workspace "$PLAYGROUND" agent ask what tools were used
-crabdb --workspace "$PLAYGROUND" agent ask can I merge
-crabdb --workspace "$PLAYGROUND" agent ask why can't I apply
-crabdb --workspace "$PLAYGROUND" agent ask what is blocking this task
-crabdb --workspace "$PLAYGROUND" agent ask why did it fail
-crabdb --workspace "$PLAYGROUND" agent ask what went wrong
-crabdb --workspace "$PLAYGROUND" agent ask any red flags
-crabdb --workspace "$PLAYGROUND" agent ask what should I worry about
-crabdb --workspace "$PLAYGROUND" agent ask which files are risky
-crabdb --workspace "$PLAYGROUND" agent ask what changed since I looked
-crabdb --workspace "$PLAYGROUND" agent ask explain README.md
-crabdb --workspace "$PLAYGROUND" agent ask show changes by file
-crabdb --workspace "$PLAYGROUND" agent ask show patch for README.md
-crabdb --workspace "$PLAYGROUND" agent ask show turn diff
-crabdb --workspace "$PLAYGROUND" agent changes latest
-crabdb --workspace "$PLAYGROUND" agent last latest
-crabdb --workspace "$PLAYGROUND" agent what-changed latest
-crabdb --workspace "$PLAYGROUND" agent can-land latest
-crabdb --workspace "$PLAYGROUND" agent recover latest
-crabdb --workspace "$PLAYGROUND" agent handoff latest
-crabdb --workspace "$PLAYGROUND" agent receipt latest
-crabdb --workspace "$PLAYGROUND" agent pr latest
-crabdb --workspace "$PLAYGROUND" agent turn-diff latest --file README.md --patch
-crabdb --workspace "$PLAYGROUND" agent review-plan latest
-crabdb --workspace "$PLAYGROUND" agent view latest
-crabdb --workspace "$PLAYGROUND" agent land latest --dry-run
-crabdb --workspace "$PLAYGROUND" agent finish latest --dry-run
+trail --workspace "$PLAYGROUND" agent board
+trail --workspace "$PLAYGROUND" agent stack
+trail --workspace "$PLAYGROUND" agent ask what needs attention
+trail --workspace "$PLAYGROUND" agent ask what should I do next
+trail --workspace "$PLAYGROUND" agent summary latest
+trail --workspace "$PLAYGROUND" agent ask what did the agent do
+trail --workspace "$PLAYGROUND" agent ask where is the workdir
+trail --workspace "$PLAYGROUND" agent ask where did the agent edit
+trail --workspace "$PLAYGROUND" agent ask which prompt changed README.md
+trail --workspace "$PLAYGROUND" agent ask last prompt
+trail --workspace "$PLAYGROUND" agent ask what changed in the last prompt
+trail --workspace "$PLAYGROUND" agent ask what changed in README.md in the last prompt
+trail --workspace "$PLAYGROUND" agent ask show transcript
+trail --workspace "$PLAYGROUND" agent ask what should I review
+trail --workspace "$PLAYGROUND" agent ask what should I review first
+trail --workspace "$PLAYGROUND" agent ask what file should I review first
+trail --workspace "$PLAYGROUND" agent ask what file should I open
+trail --workspace "$PLAYGROUND" agent ask where should I look first
+trail --workspace "$PLAYGROUND" agent ask open review
+trail --workspace "$PLAYGROUND" agent ask review this task
+trail --workspace "$PLAYGROUND" agent ask what tools were used
+trail --workspace "$PLAYGROUND" agent ask can I merge
+trail --workspace "$PLAYGROUND" agent ask why can't I apply
+trail --workspace "$PLAYGROUND" agent ask what is blocking this task
+trail --workspace "$PLAYGROUND" agent ask why did it fail
+trail --workspace "$PLAYGROUND" agent ask what went wrong
+trail --workspace "$PLAYGROUND" agent ask any red flags
+trail --workspace "$PLAYGROUND" agent ask what should I worry about
+trail --workspace "$PLAYGROUND" agent ask which files are risky
+trail --workspace "$PLAYGROUND" agent ask what changed since I looked
+trail --workspace "$PLAYGROUND" agent ask explain README.md
+trail --workspace "$PLAYGROUND" agent ask show changes by file
+trail --workspace "$PLAYGROUND" agent ask show patch for README.md
+trail --workspace "$PLAYGROUND" agent ask show turn diff
+trail --workspace "$PLAYGROUND" agent changes latest
+trail --workspace "$PLAYGROUND" agent last latest
+trail --workspace "$PLAYGROUND" agent what-changed latest
+trail --workspace "$PLAYGROUND" agent can-land latest
+trail --workspace "$PLAYGROUND" agent recover latest
+trail --workspace "$PLAYGROUND" agent handoff latest
+trail --workspace "$PLAYGROUND" agent receipt latest
+trail --workspace "$PLAYGROUND" agent pr latest
+trail --workspace "$PLAYGROUND" agent turn-diff latest --file README.md --patch
+trail --workspace "$PLAYGROUND" agent review-plan latest
+trail --workspace "$PLAYGROUND" agent view latest
+trail --workspace "$PLAYGROUND" agent land latest --dry-run
+trail --workspace "$PLAYGROUND" agent finish latest --dry-run
 ```
 
 Expected signals:
@@ -442,10 +442,10 @@ Expected signals:
   inspect the command and `--confirm` for validation/apply actions that require
   explicit confirmation. Before the first task exists, `agent action` shows
   runnable setup, doctor, and terminal-start actions instead of failing; for
-  example, `crabdb agent action setup_vscode` prints the VS Code setup report.
+  example, `trail agent action setup_vscode` prints the VS Code setup report.
 - `agent review-flow latest` walks the task through inspect, mark reviewed,
   validate, and finish as one checklist. Use this after an editor agent finishes
-  when you do not want to remember which CrabDB command comes next.
+  when you do not want to remember which Trail command comes next.
 - `agent summary latest` shows the fuller one-page post-run cockpit with readiness,
   risk, validation, Git preflight, receipt Markdown, PR draft, and next command.
 - `agent story latest` explains what happened in one plain-language task
@@ -532,7 +532,7 @@ Expected signals:
 - `agent can-land latest` shows the safe Git apply preflight.
 - `agent land latest` applies using a generated Git commit message from the task
   title. It is an alias for `agent apply latest`; pass `-m` only when you want
-  to override it. If the task has already been applied, CrabDB reports
+  to override it. If the task has already been applied, Trail reports
   `already_applied` and points you to `agent continue` for follow-up work.
 - `agent finish latest` applies with the same safety checks as `agent land`,
   then hides the finished task from the default inbox. Use it when you do not
@@ -544,101 +544,101 @@ Expected signals:
 When in doubt, start with:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" agent todo
+trail --workspace "$PLAYGROUND" agent todo
 ```
 
 It prints one primary command for the current task and a few alternatives.
 
-Inside an ACP editor chat, ask the real agent to use CrabDB's injected MCP tools:
+Inside an ACP editor chat, ask the real agent to use Trail's injected MCP tools:
 
 ```text
-Ask CrabDB what changed since I looked.
-Ask CrabDB what the agent did.
-Ask CrabDB what needs attention.
-Ask CrabDB where the workdir is.
-Ask CrabDB where the agent edited files.
-Ask CrabDB which prompt changed README.md.
-Ask CrabDB for the last prompt.
-Ask CrabDB what changed in the last prompt.
-Ask CrabDB what changed in README.md in the last prompt.
-Ask CrabDB to show the transcript.
-Ask CrabDB what I should review first.
-Ask CrabDB what file I should review first.
-Ask CrabDB what file I should open.
-Ask CrabDB where I should look first.
-Ask CrabDB to open review.
-Ask CrabDB to review this task.
-Ask CrabDB what tools were used.
-Ask CrabDB to show tool activity.
-Ask CrabDB if I can merge.
-Ask CrabDB why I can't apply.
-Ask CrabDB what is blocking this task.
-Ask CrabDB why it failed.
-Ask CrabDB what went wrong.
-Ask CrabDB if the latest task is safe to land.
-Ask CrabDB to explain README.md.
-Ask CrabDB to show the patch for README.md.
-What should I do next in CrabDB?
-Show CrabDB agent status.
-Show my CrabDB agent inbox.
-Show a CrabDB brief for the latest agent task.
-Create a CrabDB Markdown report for the latest agent task.
-Show what changed in the latest CrabDB agent task.
-Show files changed by the latest CrabDB agent task.
-Show CrabDB rewind targets for the latest agent task.
-Explain why README.md changed in the latest CrabDB agent task.
-Compare two CrabDB agent tasks.
-Ask CrabDB what tests I should run.
-Show CrabDB validation guidance for the latest agent task.
-Run a CrabDB test gate for the latest agent task with cargo test.
-Show the latest CrabDB agent turn diff.
-Ask CrabDB to show the latest turn diff.
-Show the patch for the last CrabDB agent turn.
-Show the CrabDB review plan for the latest agent task.
-Review whether the latest CrabDB agent task is ready to apply.
+Ask Trail what changed since I looked.
+Ask Trail what the agent did.
+Ask Trail what needs attention.
+Ask Trail where the workdir is.
+Ask Trail where the agent edited files.
+Ask Trail which prompt changed README.md.
+Ask Trail for the last prompt.
+Ask Trail what changed in the last prompt.
+Ask Trail what changed in README.md in the last prompt.
+Ask Trail to show the transcript.
+Ask Trail what I should review first.
+Ask Trail what file I should review first.
+Ask Trail what file I should open.
+Ask Trail where I should look first.
+Ask Trail to open review.
+Ask Trail to review this task.
+Ask Trail what tools were used.
+Ask Trail to show tool activity.
+Ask Trail if I can merge.
+Ask Trail why I can't apply.
+Ask Trail what is blocking this task.
+Ask Trail why it failed.
+Ask Trail what went wrong.
+Ask Trail if the latest task is safe to land.
+Ask Trail to explain README.md.
+Ask Trail to show the patch for README.md.
+What should I do next in Trail?
+Show Trail agent status.
+Show my Trail agent inbox.
+Show a Trail brief for the latest agent task.
+Create a Trail Markdown report for the latest agent task.
+Show what changed in the latest Trail agent task.
+Show files changed by the latest Trail agent task.
+Show Trail rewind targets for the latest agent task.
+Explain why README.md changed in the latest Trail agent task.
+Compare two Trail agent tasks.
+Ask Trail what tests I should run.
+Show Trail validation guidance for the latest agent task.
+Run a Trail test gate for the latest agent task with cargo test.
+Show the latest Trail agent turn diff.
+Ask Trail to show the latest turn diff.
+Show the patch for the last Trail agent turn.
+Show the Trail review plan for the latest agent task.
+Review whether the latest Trail agent task is ready to apply.
 ```
 
-ACP/MCP hosts can also expose CrabDB prompts directly:
+ACP/MCP hosts can also expose Trail prompts directly:
 
 ```text
-Use the crabdb.review_agent prompt for latest.
-Use the crabdb.recover_agent prompt for latest.
-Use the crabdb.apply_agent prompt for latest.
+Use the trail.review_agent prompt for latest.
+Use the trail.recover_agent prompt for latest.
+Use the trail.apply_agent prompt for latest.
 ```
 
-Plain-language "Ask CrabDB..." requests should use `crabdb.agent_ask`, which
+Plain-language "Ask Trail..." requests should use `trail.agent_ask`, which
 routes to read-only task reports such as next actions, task story, review focus,
 tools used, changes, readiness, recovery, file explanations, checkpoint targets,
 focused patch/diff views, test plans, pull request drafts, and copyable
-receipts. For validation guidance, editors should call `crabdb.agent_test_plan`
-and present its checklist before calling `crabdb.agent_test` or
-`crabdb.agent_eval`. For gate status, use `crabdb.agent_validate`.
+receipts. For validation guidance, editors should call `trail.agent_test_plan`
+and present its checklist before calling `trail.agent_test` or
+`trail.agent_eval`. For gate status, use `trail.agent_validate`.
 
-Those map to `crabdb.agent_ask`, `crabdb.agent_next`, `crabdb.agent_status`,
-`crabdb.agent_inbox`, `crabdb.agent_story`, `crabdb.agent_brief`, `crabdb.agent_report`, `crabdb.agent_workdir`,
-`crabdb.agent_risk`, `crabdb.agent_confidence`, `crabdb.agent_ready`, `crabdb.agent_validate`, `crabdb.agent_test_plan`, `crabdb.agent_test`, `crabdb.agent_review_data`, `crabdb.agent_changes`, `crabdb.agent_delta`, `crabdb.agent_new`, `crabdb.agent_mark_reviewed`, `crabdb.agent_mark_file_reviewed`, `crabdb.agent_files`, `crabdb.agent_checkpoints`, `crabdb.agent_why`,
-`crabdb.agent_turn`, `crabdb.agent_compare`, `crabdb.agent_stack`, `crabdb.agent_diff`, `crabdb.agent_review_flow`, `crabdb.agent_review`,
-`crabdb.agent_focus`, and
-`crabdb.agent_apply`.
+Those map to `trail.agent_ask`, `trail.agent_next`, `trail.agent_status`,
+`trail.agent_inbox`, `trail.agent_story`, `trail.agent_brief`, `trail.agent_report`, `trail.agent_workdir`,
+`trail.agent_risk`, `trail.agent_confidence`, `trail.agent_ready`, `trail.agent_validate`, `trail.agent_test_plan`, `trail.agent_test`, `trail.agent_review_data`, `trail.agent_changes`, `trail.agent_delta`, `trail.agent_new`, `trail.agent_mark_reviewed`, `trail.agent_mark_file_reviewed`, `trail.agent_files`, `trail.agent_checkpoints`, `trail.agent_why`,
+`trail.agent_turn`, `trail.agent_compare`, `trail.agent_stack`, `trail.agent_diff`, `trail.agent_review_flow`, `trail.agent_review`,
+`trail.agent_focus`, and
+`trail.agent_apply`.
 
 Editors can also render dashboards directly from MCP resources:
 
 ```text
-crabdb://workspace/agent-tasks
-crabdb://workspace/agent-tasks/latest/review
-crabdb://workspace/agent-tasks/latest/review-data
-crabdb://workspace/agent-tasks/latest/changes
-crabdb://workspace/agent-tasks/latest/files
-crabdb://workspace/agent-tasks/latest/focus
-crabdb://workspace/agent-tasks/<task-or-lane>/changes
-crabdb://workspace/agent-tasks/<task-or-lane>/report
+trail://workspace/agent-tasks
+trail://workspace/agent-tasks/latest/review
+trail://workspace/agent-tasks/latest/review-data
+trail://workspace/agent-tasks/latest/changes
+trail://workspace/agent-tasks/latest/files
+trail://workspace/agent-tasks/latest/focus
+trail://workspace/agent-tasks/<task-or-lane>/changes
+trail://workspace/agent-tasks/<task-or-lane>/report
 ```
 
 For a direct file diff against the playground baseline:
 
 ```sh
-LANE="$(crabdb --workspace "$PLAYGROUND" --json agent view latest | jq -r .task.lane)"
-LANE_WORKDIR="$PLAYGROUND/.crabdb/worktrees/$LANE"
+LANE="$(trail --workspace "$PLAYGROUND" --json agent view latest | jq -r .task.lane)"
+LANE_WORKDIR="$PLAYGROUND/.trail/worktrees/$LANE"
 git -C "$PLAYGROUND" show HEAD:docs/integrations/acp.md > /tmp/acp-baseline.md
 diff -u /tmp/acp-baseline.md "$LANE_WORKDIR/docs/integrations/acp.md"
 ```
@@ -646,7 +646,7 @@ diff -u /tmp/acp-baseline.md "$LANE_WORKDIR/docs/integrations/acp.md"
 For structured verification:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" --json agent view latest | jq '{
+trail --workspace "$PLAYGROUND" --json agent view latest | jq '{
   title: .task.title,
   task_id: .task.name,
   workdir: .task.workdir,
@@ -681,18 +681,18 @@ chunks in the live ACP stream, but those chunks must not be persisted.
 Inspect the prompt-to-checkpoint timeline:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" agent next
-crabdb --workspace "$PLAYGROUND" agent changes latest
-crabdb --workspace "$PLAYGROUND" agent turn
-crabdb --workspace "$PLAYGROUND" agent turn-diff latest --file README.md --patch
+trail --workspace "$PLAYGROUND" agent next
+trail --workspace "$PLAYGROUND" agent changes latest
+trail --workspace "$PLAYGROUND" agent turn
+trail --workspace "$PLAYGROUND" agent turn-diff latest --file README.md --patch
 ```
 
 If the agent went sideways, undo the task with a friendly target:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" agent undo-last latest
-crabdb --workspace "$PLAYGROUND" agent undo-last latest --turn 2
-crabdb --workspace "$PLAYGROUND" agent undo-last latest --prompt 'Add hook support'
+trail --workspace "$PLAYGROUND" agent undo-last latest
+trail --workspace "$PLAYGROUND" agent undo-last latest --turn 2
+trail --workspace "$PLAYGROUND" agent undo-last latest --prompt 'Add hook support'
 ```
 
 Direct `agent rewind --to <CHECKPOINT_OR_LABEL>` still works, but
@@ -701,7 +701,7 @@ Direct `agent rewind --to <CHECKPOINT_OR_LABEL>` still works, but
 If the task is ready, check apply readiness:
 
 ```sh
-crabdb --workspace "$PLAYGROUND" agent can-land latest
+trail --workspace "$PLAYGROUND" agent can-land latest
 ```
 
 ## Troubleshooting
@@ -710,8 +710,8 @@ crabdb --workspace "$PLAYGROUND" agent can-land latest
 
 The doctor checks the provider profile and launch command. Run a real ACP
 prompt through your editor or JSON-RPC driver, then inspect it with
-`crabdb acp sessions`, `crabdb transcript <lane>`, and
-`crabdb lane review <lane>`.
+`trail acp sessions`, `trail transcript <lane>`, and
+`trail lane review <lane>`.
 
 ### The agent says permission was refused
 
@@ -755,10 +755,10 @@ client-to-agent request ids.
 With `--materialize`, the real edit is in the lane workdir:
 
 ```sh
-echo "$PLAYGROUND/.crabdb/worktrees/<lane>"
+echo "$PLAYGROUND/.trail/worktrees/<lane>"
 ```
 
-Use `crabdb lane review <lane>` or diff the materialized lane workdir against
+Use `trail lane review <lane>` or diff the materialized lane workdir against
 the playground baseline.
 
 ### The transcript shows a cancelled turn
@@ -767,8 +767,8 @@ That means the relay flushed the open turn and checkpointed the lane when the
 client disconnected or cancelled. Inspect it:
 
 ```sh
-crabdb transcript <lane>
-crabdb turn show <turn-id>
+trail transcript <lane>
+trail turn show <turn-id>
 ```
 
 Then start a fresh lane or fresh turn.

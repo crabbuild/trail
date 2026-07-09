@@ -8,7 +8,7 @@ interface DiffDocument {
 }
 
 export class DiffContentProvider implements vscode.TextDocumentContentProvider {
-  static readonly scheme = "crabdb-diff";
+  static readonly scheme = "trail-diff";
 
   private readonly changed = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange = this.changed.event;
@@ -27,7 +27,7 @@ export class DiffContentProvider implements vscode.TextDocumentContentProvider {
       "vscode.diff",
       oldUri,
       newUri,
-      `${path} (CrabDB agent diff)`
+      `${path} (Trail agent diff)`
     );
   }
 

@@ -1,12 +1,12 @@
 # SQLite Vector Memory Direction
 
-CrabDB should build the agent memory layer on SQLite first. PGlite remains useful
+Trail should build the agent memory layer on SQLite first. PGlite remains useful
 as an experimental comparison point, but it should not be the default semantic
 memory backend unless later benchmarks overturn the current storage results.
 
 ## Direction
 
-- Store memory metadata and embedding rows in `.crabdb/index/crabdb.sqlite`.
+- Store memory metadata and embedding rows in `.trail/index/trail.sqlite`.
 - Keep structured memory rows as durable truth.
 - Treat `sqlite-vec` `vec0` tables as the preferred local vector accelerator.
 - Keep a portable exact-scan backend that stores embeddings as little-endian
@@ -135,19 +135,19 @@ Use `sqlite_vec0` as the target backend and `sqlite_exact_blob_scan` as the
 control backend:
 
 ```sh
-cargo bench -p crabdb --bench sqlite_vector_memory_bench
-CRABDB_SQLITE_VECTOR_BACKEND=exact cargo bench -p crabdb --bench sqlite_vector_memory_bench
+cargo bench -p trail --bench sqlite_vector_memory_bench
+TRAIL_SQLITE_VECTOR_BACKEND=exact cargo bench -p trail --bench sqlite_vector_memory_bench
 ```
 
 Useful environment variables:
 
 ```text
-CRABDB_SQLITE_VECTOR_ROWS=100000
-CRABDB_SQLITE_VECTOR_DIMS=768
-CRABDB_SQLITE_VECTOR_QUERIES=50
-CRABDB_SQLITE_VECTOR_TOP_K=20
-CRABDB_SQLITE_VECTOR_KEEP_DB=1
-CRABDB_SQLITE_VECTOR_BACKEND=sqlite_vec0
+TRAIL_SQLITE_VECTOR_ROWS=100000
+TRAIL_SQLITE_VECTOR_DIMS=768
+TRAIL_SQLITE_VECTOR_QUERIES=50
+TRAIL_SQLITE_VECTOR_TOP_K=20
+TRAIL_SQLITE_VECTOR_KEEP_DB=1
+TRAIL_SQLITE_VECTOR_BACKEND=sqlite_vec0
 ```
 
 The benchmark intentionally measures:

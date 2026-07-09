@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildEventPresentation } from "../webview/eventModel";
 
-test("presents checkpoints as durable CrabDB recovery points", () => {
+test("presents checkpoints as durable Trail recovery points", () => {
   const event = buildEventPresentation({
     kind: "checkpoint",
     label: "Checkpoint ch_123",

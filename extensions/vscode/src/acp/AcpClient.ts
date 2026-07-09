@@ -94,7 +94,7 @@ export class AcpClient {
     const initialize = await this.rpc.request("initialize", {
       protocolVersion: ACP_PROTOCOL_VERSION,
       clientInfo: {
-        name: "CrabDB VS Code",
+        name: "Trail VS Code",
         version: "0.1.0"
       },
       clientCapabilities: {
@@ -105,7 +105,7 @@ export class AcpClient {
         terminal: false
       },
       _meta: {
-        crabdb: {
+        trail: {
           client: "vscode"
         }
       }
@@ -161,7 +161,7 @@ export class AcpClient {
       cwd: this.workspaceRoot,
       mcpServers: [],
       _meta: {
-        crabdb: {
+        trail: {
           client: "vscode"
         }
       }
@@ -356,12 +356,12 @@ export class AcpClient {
     }
 
     if (message.method?.startsWith("fs/")) {
-      this.rpc.respondError(message.id, "CrabDB VS Code does not expose direct filesystem mutation in this build.");
+      this.rpc.respondError(message.id, "Trail VS Code does not expose direct filesystem mutation in this build.");
       return;
     }
 
     if (message.method?.startsWith("terminal/")) {
-      this.rpc.respondError(message.id, "CrabDB VS Code does not expose direct terminal execution in this build.");
+      this.rpc.respondError(message.id, "Trail VS Code does not expose direct terminal execution in this build.");
       return;
     }
 
@@ -515,7 +515,7 @@ function ensureSupportedProtocolVersion(initialize: unknown): void {
     throw new Error("ACP initialize response did not include a valid protocol version.");
   }
   if (version !== ACP_PROTOCOL_VERSION) {
-    throw new Error(`Unsupported ACP protocol version ${version}; CrabDB VS Code supports ${ACP_PROTOCOL_VERSION}.`);
+    throw new Error(`Unsupported ACP protocol version ${version}; Trail VS Code supports ${ACP_PROTOCOL_VERSION}.`);
   }
 }
 

@@ -155,7 +155,7 @@ interface WebviewState {
     | Array<{
         id: string;
         label: string;
-        crabdbBacked?: boolean | undefined;
+        trailBacked?: boolean | undefined;
         supportsFromRef?: boolean | undefined;
       }>
     | undefined;
@@ -212,8 +212,8 @@ interface PendingDiffPreview {
 }
 
 type StreamingMarkdownTarget = HTMLElement & {
-  __crabdbQueueStreamdownText?: ((text: string) => void) | undefined;
-  __crabdbStreamingText?: string | undefined;
+  __trailQueueStreamdownText?: ((text: string) => void) | undefined;
+  __trailStreamingText?: string | undefined;
 }
 
 const vscode = acquireVsCodeApi();
@@ -226,7 +226,7 @@ const FLOATING_DETAILS_SELECTOR = ".composer-controls,.header-details,.toolbar-c
 const DRAWER_FOCUSABLE_SELECTOR =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),audio[controls],video[controls],[tabindex]:not([tabindex="-1"])';
 const STREAM_RENDER_INTERVAL_MS = 80;
-const CRABDB_STREAMDOWN_UPDATE_EVENT = "crabdb-streamdown-update";
+const TRAIL_STREAMDOWN_UPDATE_EVENT = "trail-streamdown-update";
 
 installFrameBatchedResizeObserver();
 
@@ -367,7 +367,7 @@ if (typeof restoredState?.timelineQuery === "string") {
 
 interface FrameBatchedResizeObserverConstructor {
   new (callback: ResizeObserverCallback): ResizeObserver;
-  __crabdbFrameBatched?: true | undefined;
+  __trailFrameBatched?: true | undefined;
 }
 
 function installFrameBatchedResizeObserver(): void {
@@ -375,7 +375,7 @@ function installFrameBatchedResizeObserver(): void {
     return;
   }
   const NativeResizeObserver = window.ResizeObserver as FrameBatchedResizeObserverConstructor;
-  if (NativeResizeObserver.__crabdbFrameBatched) {
+  if (NativeResizeObserver.__trailFrameBatched) {
     return;
   }
   class FrameBatchedResizeObserver implements ResizeObserver {
@@ -420,7 +420,7 @@ function installFrameBatchedResizeObserver(): void {
       this.nativeObserver.disconnect();
     }
   }
-  (FrameBatchedResizeObserver as FrameBatchedResizeObserverConstructor).__crabdbFrameBatched = true;
+  (FrameBatchedResizeObserver as FrameBatchedResizeObserverConstructor).__trailFrameBatched = true;
   window.ResizeObserver = FrameBatchedResizeObserver as unknown as typeof ResizeObserver;
 }
 
@@ -1382,15 +1382,15 @@ function applyStreamingTextDomPatch(node: RenderNode): boolean {
 function updateStreamingTextTarget(streamTarget: HTMLElement, streamText: string): void {
   const streamdownTarget = streamTarget as StreamingMarkdownTarget;
   if (streamTarget.dataset.streamdownMarkdown !== undefined) {
-    if (streamdownTarget.__crabdbStreamingText === streamText) {
+    if (streamdownTarget.__trailStreamingText === streamText) {
       return;
     }
-    streamdownTarget.__crabdbStreamingText = streamText;
-    if (streamdownTarget.__crabdbQueueStreamdownText) {
-      streamdownTarget.__crabdbQueueStreamdownText(streamText);
+    streamdownTarget.__trailStreamingText = streamText;
+    if (streamdownTarget.__trailQueueStreamdownText) {
+      streamdownTarget.__trailQueueStreamdownText(streamText);
       return;
     }
-    streamTarget.dispatchEvent(new CustomEvent(CRABDB_STREAMDOWN_UPDATE_EVENT, { detail: { text: streamText } }));
+    streamTarget.dispatchEvent(new CustomEvent(TRAIL_STREAMDOWN_UPDATE_EVENT, { detail: { text: streamText } }));
     return;
   }
   const current = streamTarget.textContent || "";
@@ -2391,7 +2391,7 @@ function providerFailureBanner(failure: NonNullable<WebviewState["providerFailur
     ariaLive: "assertive",
     eyebrow: "Agent interrupted",
     title: failure.message,
-    description: "Partial transcript and lane changes remain in CrabDB. Review the task or start a follow-up from the latest checkpoint.",
+    description: "Partial transcript and lane changes remain in Trail. Review the task or start a follow-up from the latest checkpoint.",
     detail: failure.detail,
     badges: [
       failure.code !== undefined && failure.code !== null ? `exit ${failure.code}` : "",
@@ -2422,7 +2422,7 @@ function overlapWarningBanner(): string {
     ariaLive: "polite",
     eyebrow: "Parallel work overlap",
     title: top ? `${top.title} also changes ${top.sharedPaths[0] || "this task's files"}` : "Another task changes the same files",
-    description: "Compare tasks or refresh CrabDB state before applying this lane.",
+    description: "Compare tasks or refresh Trail state before applying this lane.",
     badges: [
       `${overlaps.length} task${overlaps.length === 1 ? "" : "s"}`,
       `${sharedCount} shared path${sharedCount === 1 ? "" : "s"}`
@@ -2489,7 +2489,7 @@ function header(task: WebviewState["task"], timelineNavigationHtml = ""): string
     lane: task?.lane,
     changedPaths: changed,
     providerLabel: state.provider || currentProvider?.label || task?.provider,
-    providerCrabdbBacked: currentProvider?.crabdbBacked,
+    providerCrabdbBacked: currentProvider?.trailBacked,
     sending: state.sending,
     permissionPending: state.permissionPending,
     providerFailure: Boolean(state.providerFailure),
@@ -2529,7 +2529,7 @@ function header(task: WebviewState["task"], timelineNavigationHtml = ""): string
         ariaControls: "review"
       },
       { action: "openDiff", label: "Open diff", iconHtml: iconSvg("diff") },
-      { action: "openSettings", label: "Open CrabDB settings", iconHtml: iconSvg("settings") }
+      { action: "openSettings", label: "Open Trail settings", iconHtml: iconSvg("settings") }
     ],
     runActions: [
       { action: "refresh", label: "Refresh task", iconHtml: iconSvg("refresh") },
@@ -2687,11 +2687,11 @@ function emptyTimeline(): string {
     variant: "ready",
     ariaLabel: "Empty transcript",
     iconHtml: iconSvg(blocked ? "review" : "message"),
-    roleLabel: "CrabDB workspace",
-    title: blocked ? "Permission needed before the next turn" : "Ready for a CrabDB turn",
+    roleLabel: "Trail workspace",
+    title: blocked ? "Permission needed before the next turn" : "Ready for a Trail turn",
     description: blocked
       ? "Resolve the pending tool request, then continue from the preserved transcript."
-      : "Message the agent or attach editor context. CrabDB will record checkpoints, tool evidence, and review state.",
+      : "Message the agent or attach editor context. Trail will record checkpoints, tool evidence, and review state.",
     actions: [
       emptyStateAction(blocked ? "focusReview" : "focusComposer", blocked ? "Open review" : "Write a message", blocked ? "review" : "message", "primary", running),
       emptyStateAction("attachSelection", "Attach selection", "selection", "secondary", blocked || running),
@@ -4180,7 +4180,7 @@ function looksLikeTerminalOutput(lines: string[]): boolean {
 }
 
 function looksLikeShellCommand(value: string): boolean {
-  return /^(?:\.\/|\/|[A-Z_][A-Z0-9_]*=|(?:npm|pnpm|yarn|bun|npx|node|git|rg|grep|find|ls|cat|sed|awk|python3?|pytest|go|cargo|make|bash|sh|zsh|cd|mkdir|rm|cp|mv|curl|docker|kubectl|tsc|crabdb)\b)/.test(value) || /\s(?:--?[A-Za-z0-9]|&&|\|\s|2>)/.test(value);
+  return /^(?:\.\/|\/|[A-Z_][A-Z0-9_]*=|(?:npm|pnpm|yarn|bun|npx|node|git|rg|grep|find|ls|cat|sed|awk|python3?|pytest|go|cargo|make|bash|sh|zsh|cd|mkdir|rm|cp|mv|curl|docker|kubectl|tsc|trail)\b)/.test(value) || /\s(?:--?[A-Za-z0-9]|&&|\|\s|2>)/.test(value);
 }
 
 function terminalHasOutput(record: Record<string, unknown>): boolean {
@@ -4413,7 +4413,7 @@ function openTextPreview(action: HTMLElement): void {
   vscode.postMessage({
     type: "openTextPreview",
     text,
-    title: action.dataset.title || "CrabDB preview",
+    title: action.dataset.title || "Trail preview",
     language: action.dataset.language || "plaintext"
   });
 }
@@ -4426,7 +4426,7 @@ function openDiffPreview(action: HTMLElement): void {
   vscode.postMessage({
     type: "openTextPreview",
     text,
-    title: action.dataset.title || "CrabDB unified diff",
+    title: action.dataset.title || "Trail unified diff",
     language: action.dataset.language || "diff"
   });
 }
@@ -4568,7 +4568,7 @@ function composer(): string {
     statusLabel: status.label,
     attachmentModes: attachments.map(attachmentMode),
     sendMode: composerSendMode,
-    providerCrabdbBacked: provider?.crabdbBacked
+    providerCrabdbBacked: provider?.trailBacked
   });
   composerCardProps = {
     id: "composer",
@@ -4606,7 +4606,7 @@ function composer(): string {
       composerIconAction("attachDiagnostics", "Attach diagnostics for the active file", "diagnostics", controlsDisabled),
       composerIconAction("attachTerminalOutput", "Attach the latest terminal output from this chat", "terminal", controlsDisabled),
       composerIconAction("attachChangedFiles", "Attach the changed file list for this task", "changed", controlsDisabled),
-      composerIconAction("attachHistory", "Attach CrabDB history for the active file", "history", controlsDisabled)
+      composerIconAction("attachHistory", "Attach Trail history for the active file", "history", controlsDisabled)
     ],
     rewindIconHtml: iconSvg("rewind"),
     sendIconHtml: iconSvg("send"),
@@ -4690,7 +4690,7 @@ function composerStatus(attachments: PromptAttachmentView[]): ComposerStatus {
     return {
       tone: "warning",
       label: "Follow-up recommended",
-      detail: "The last provider turn stopped early. Start a follow-up from CrabDB's latest checkpoint when ready."
+      detail: "The last provider turn stopped early. Start a follow-up from Trail's latest checkpoint when ready."
     };
   }
   if (attachments.length) {
@@ -4824,7 +4824,7 @@ function reviewDrawer(task: WebviewState["task"]): string {
     conflictIds.length
       ? `<section class="review-section">
           <h3>Conflicts</h3>
-          <p class="muted">CrabDB reports ${conflictIds.length} open conflict set${conflictIds.length === 1 ? "" : "s"} for this task.</p>
+          <p class="muted">Trail reports ${conflictIds.length} open conflict set${conflictIds.length === 1 ? "" : "s"} for this task.</p>
           ${inlineActions({
             ariaLabel: "Conflict actions",
             className: "conflict-actions",
@@ -5033,7 +5033,7 @@ function coordinationPanel(summary: CoordinationSummary): string {
         .join("")}
     </div>
     ${summary.labels.length ? `<div class="chips coordination-labels">${summary.labels.map((label) => `<span class="coordination-chip coordination-${escapeClass(summary.severity)}">${escapeHtml(label)}</span>`).join("")}</div>` : ""}
-    ${issues.length ? `<ul>${issues.map((issue) => `<li><span class="coordination-issue-tone coordination-${escapeClass(issue.tone)}">${escapeHtml(issue.tone)}</span> ${escapeHtml(issue.message)}</li>`).join("")}</ul>` : `<p class="muted">No CrabDB coordination blockers reported.</p>`}
+    ${issues.length ? `<ul>${issues.map((issue) => `<li><span class="coordination-issue-tone coordination-${escapeClass(issue.tone)}">${escapeHtml(issue.tone)}</span> ${escapeHtml(issue.message)}</li>`).join("")}</ul>` : `<p class="muted">No Trail coordination blockers reported.</p>`}
     ${stale}${dirty}
   `;
 }
@@ -6432,9 +6432,9 @@ function readinessText(status: string): string {
     case "conflicted":
       return "Conflicted. Compare or rebase the lane before queueing a merge.";
     case "applied":
-      return "Applied. The review record is retained by CrabDB.";
+      return "Applied. The review record is retained by Trail.";
     default:
-      return "No readiness blockers reported by CrabDB yet.";
+      return "No readiness blockers reported by Trail yet.";
   }
 }
 
@@ -6460,7 +6460,7 @@ function testSummary(taskView: Record<string, unknown>, extraRuns: unknown[] = [
     ...extraRuns
   ];
   if (!rawTests.length) {
-    return `<p class="muted">No test or eval runs reported by CrabDB yet.</p>`;
+    return `<p class="muted">No test or eval runs reported by Trail yet.</p>`;
   }
   return `<ul>${rawTests
     .slice(0, 8)
@@ -6766,13 +6766,13 @@ function providerSelector(disabled: string): string {
     return "";
   }
   return `
-    <label class="select-control provider-control" title="Switching provider starts a new follow-up from CrabDB's current checkpoint.">
+    <label class="select-control provider-control" title="Switching provider starts a new follow-up from Trail's current checkpoint.">
       <span>Provider</span>
       <select data-action="switchProvider" aria-label="Provider" ${disabled}>
         ${providers
           .map((provider) => {
             const selected = provider.id === state.providerId ? "selected" : "";
-            const suffix = provider.crabdbBacked === false ? " (raw)" : "";
+            const suffix = provider.trailBacked === false ? " (raw)" : "";
             return `<option value="${escapeHtml(provider.id)}" ${selected}>${escapeHtml(provider.label + suffix)}</option>`;
           })
           .join("")}

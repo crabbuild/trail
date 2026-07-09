@@ -1,0 +1,52 @@
+[package]
+name = "trail"
+description = "Local-first operation database for code and text worktrees."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+ignore.workspace = true
+libc.workspace = true
+notify.workspace = true
+prolly = { package = "prolly-map", path = "../prolly", features = ["slatedb", "sqlite"] }
+rayon.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_cbor.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+slatedb.workspace = true
+similar.workspace = true
+sqlite-vec.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+unicode-normalization.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.15.1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.15.1", features = ["macfuse-4-compat"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dokan = "0.3.1"
+dokan-sys = "0.3.1"
+widestring = "0.4.3"
+winapi = { version = "0.3", features = ["fileapi", "minwinbase", "ntdef", "ntstatus", "winnt"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "sqlite_vector_memory_bench"
+harness = false

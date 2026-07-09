@@ -26,8 +26,8 @@ export class SettingsPanel {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      "crabdb.settings",
-      "CrabDB Settings",
+      "trail.settings",
+      "Trail Settings",
       vscode.ViewColumn.Active,
       {
         enableScripts: true,
@@ -65,29 +65,29 @@ export class SettingsPanel {
         return;
       }
       if (message.scope === "workspace") {
-        await vscode.commands.executeCommand("workbench.action.openWorkspaceSettings", "crabdb");
+        await vscode.commands.executeCommand("workbench.action.openWorkspaceSettings", "trail");
         return;
       }
       if (message.scope === "user") {
-        await vscode.commands.executeCommand("workbench.action.openGlobalSettings", "crabdb");
+        await vscode.commands.executeCommand("workbench.action.openGlobalSettings", "trail");
         return;
       }
-      await vscode.commands.executeCommand("workbench.action.openSettings", "crabdb");
+      await vscode.commands.executeCommand("workbench.action.openSettings", "trail");
       return;
     }
 
     if (message.type === "customProviders") {
-      await vscode.commands.executeCommand("workbench.action.openSettings", "crabdb.customProviders");
+      await vscode.commands.executeCommand("workbench.action.openSettings", "trail.customProviders");
       return;
     }
 
     if (message.type === "doctor") {
-      await vscode.commands.executeCommand("crabdb.doctor");
+      await vscode.commands.executeCommand("trail.doctor");
       return;
     }
 
     if (message.type === "startDaemon") {
-      await vscode.commands.executeCommand("crabdb.startDaemon");
+      await vscode.commands.executeCommand("trail.startDaemon");
     }
   }
 
@@ -111,7 +111,7 @@ export class SettingsPanel {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="${escapeHtml(csp)}">
   <link rel="stylesheet" href="${style}">
-  <title>CrabDB Settings</title>
+  <title>Trail Settings</title>
 </head>
 <body>
   <main class="settings-shell">
@@ -144,7 +144,7 @@ export class SettingsPanel {
         <section ${settingsSectionAttrs(sectionMap.get("overview"))} class="settings-section">
           <div class="settings-overview">
             <article class="settings-hero-card settings-health-${escapeClass(model.healthTone)}">
-              <span class="settings-kicker">CrabDB control plane</span>
+              <span class="settings-kicker">Trail control plane</span>
               <h2>${escapeHtml(model.healthLabel)}</h2>
               <p>${escapeHtml(model.healthDetail)}</p>
               <div class="settings-hero-actions">
@@ -163,16 +163,16 @@ export class SettingsPanel {
           <div class="settings-section-heading">
             <h2>Providers</h2>
             <div class="settings-inline-actions">
-              ${settingsActionButton({ type: "openSettings", key: "crabdb.defaultProvider", label: "Change default", detail: "Choose the default ACP provider." })}
+              ${settingsActionButton({ type: "openSettings", key: "trail.defaultProvider", label: "Change default", detail: "Choose the default ACP provider." })}
               ${settingsActionButton({ type: "customProviders", label: "Edit custom providers", detail: "Open custom provider configuration." })}
             </div>
           </div>
           ${providerRoutingPanel(model.providerRouting)}
           <div class="settings-metrics">
             ${metricCard({ label: "Configured providers", value: String(model.providerCoverage.total), detail: "Built-in and custom ACP provider routes.", tone: model.providerCoverage.total ? "ok" : "warn" })}
-            ${metricCard({ label: "Durable routes", value: String(model.providerCoverage.durable), detail: "Providers routed through CrabDB.", tone: model.providerCoverage.durable ? "ok" : "warn" })}
+            ${metricCard({ label: "Durable routes", value: String(model.providerCoverage.durable), detail: "Providers routed through Trail.", tone: model.providerCoverage.durable ? "ok" : "warn" })}
             ${metricCard({ label: "Custom providers", value: String(model.providerCoverage.custom), detail: "Workspace or user supplied provider commands.", tone: model.providerCoverage.custom ? "ok" : "neutral" })}
-            ${metricCard({ label: "CrabDB CLI", value: config.crabdbPath || "missing", detail: "Executable used by relay and daemon commands.", tone: config.crabdbPath ? "ok" : "warn" })}
+            ${metricCard({ label: "Trail CLI", value: config.trailPath || "missing", detail: "Executable used by relay and daemon commands.", tone: config.trailPath ? "ok" : "warn" })}
           </div>
           <div class="provider-list">
             ${model.providers.map(providerCard).join("") || emptyPanel("No ACP providers are configured. Add a provider before starting an agent task.")}
@@ -180,7 +180,7 @@ export class SettingsPanel {
           <div class="provider-matrix" role="table" aria-label="Provider capability matrix">
             <div class="provider-matrix-row provider-matrix-head" role="row">
               <span role="columnheader">Provider</span>
-              <span role="columnheader">CrabDB durable</span>
+              <span role="columnheader">Trail durable</span>
               <span role="columnheader">Task names</span>
               <span role="columnheader">Checkpoint start</span>
             </div>
@@ -190,7 +190,7 @@ export class SettingsPanel {
         <section ${settingsSectionAttrs(sectionMap.get("configuration"))} class="settings-section">
           <div class="settings-section-heading">
             <h2>Configuration</h2>
-            ${settingsActionButton({ type: "openSettings", label: "Open all CrabDB settings", detail: "Open the CrabDB settings query." })}
+            ${settingsActionButton({ type: "openSettings", label: "Open all Trail settings", detail: "Open the Trail settings query." })}
           </div>
           <div class="settings-config-list">
             ${model.rows.map(settingRow).join("")}
@@ -199,19 +199,19 @@ export class SettingsPanel {
         <section ${settingsSectionAttrs(sectionMap.get("agent-behavior"))} class="settings-section">
           <h2>Agent behavior</h2>
           <div class="settings-card-grid">
-            ${settingsCard("Session routing", "Provider sessions resume when supported; otherwise CrabDB starts a follow-up from the latest checkpoint.")}
+            ${settingsCard("Session routing", "Provider sessions resume when supported; otherwise Trail starts a follow-up from the latest checkpoint.")}
             ${settingsCard("Modes and slash commands", "Live ACP modes, config options, and commands appear in the chat composer when the provider advertises them.")}
-            ${settingsCard("Daemon", config.autoStartDaemon ? "CrabDB daemon starts automatically when no endpoint is discovered." : "Daemon auto-start is disabled for this workspace.")}
+            ${settingsCard("Daemon", config.autoStartDaemon ? "Trail daemon starts automatically when no endpoint is discovered." : "Daemon auto-start is disabled for this workspace.")}
           </div>
           <div class="settings-inline-actions">
-            ${settingsActionButton({ type: "doctor", label: "Run doctor", detail: "Check the local CrabDB toolchain." })}
-            ${settingsActionButton({ type: "startDaemon", label: "Start daemon", detail: "Bring up CrabDB services for review and queue state." })}
+            ${settingsActionButton({ type: "doctor", label: "Run doctor", detail: "Check the local Trail toolchain." })}
+            ${settingsActionButton({ type: "startDaemon", label: "Start daemon", detail: "Bring up Trail services for review and queue state." })}
           </div>
         </section>
         <section ${settingsSectionAttrs(sectionMap.get("context"))} class="settings-section">
           <h2>Context and attachments</h2>
           <div class="settings-card-grid">
-            ${settingsCard("Editor context", "Attach selection, active file, diagnostics, changed files, terminal output, and CrabDB history directly from the composer.")}
+            ${settingsCard("Editor context", "Attach selection, active file, diagnostics, changed files, terminal output, and Trail history directly from the composer.")}
             ${settingsCard("Capability aware", "Image, audio, and embedded context controls are shown according to the active provider capabilities.")}
             ${settingsCard("Redaction", "Raw details, terminal snippets, and command payloads are redacted before rendering in the webview.")}
           </div>
@@ -228,7 +228,7 @@ export class SettingsPanel {
           <h2>Checkpoints</h2>
           <div class="settings-card-grid">
             ${settingsCard("Turn checkpoint", "Completed turns show checkpoint status so a reviewer can tell whether work is durable or still provisional.")}
-            ${settingsCard("Follow-up start", "Failed or switched-provider turns start from the current CrabDB checkpoint instead of assuming private provider context transfers.")}
+            ${settingsCard("Follow-up start", "Failed or switched-provider turns start from the current Trail checkpoint instead of assuming private provider context transfers.")}
             ${settingsCard("Rewind", "Rewind and preserve failed attempt actions remain explicit and available from review surfaces.")}
           </div>
         </section>
@@ -249,7 +249,7 @@ export class SettingsPanel {
             <div><dt>Auto-start daemon</dt><dd>${config.autoStartDaemon ? "enabled" : "disabled"}</dd></div>
             <div><dt>Provider durability</dt><dd>${model.providerCoverage.durable} durable of ${model.providerCoverage.total} configured</dd></div>
             <div><dt>Capability coverage</dt><dd>${model.providerCoverage.taskNames} task-name routes, ${model.providerCoverage.checkpoints} checkpoint-start routes</dd></div>
-            <div><dt>Configuration keys</dt><dd><code>crabdb.path</code>, <code>crabdb.defaultProvider</code>, <code>crabdb.autoStartDaemon</code>, <code>crabdb.customProviders</code></dd></div>
+            <div><dt>Configuration keys</dt><dd><code>trail.path</code>, <code>trail.defaultProvider</code>, <code>trail.autoStartDaemon</code>, <code>trail.customProviders</code></dd></div>
           </dl>
         </section>
       </section>
@@ -463,7 +463,7 @@ function settingsIssuePanel(issues: Array<{ label: string; detail: string; tone:
     return `
       <div class="settings-health-list settings-health-list-empty">
         <span class="status status-ready">Ready</span>
-        <p>No settings issues are blocking CrabDB agent workflows.</p>
+        <p>No settings issues are blocking Trail agent workflows.</p>
       </div>
     `;
   }
@@ -599,7 +599,7 @@ function providerMatrixRow(provider: ProviderCapabilityView): string {
   return `
     <div class="provider-matrix-row" role="row">
       <span role="cell">${escapeHtml(provider.label)}</span>
-      ${capabilityCell(provider.crabdbBacked, provider.crabdbBacked ? "Durable" : "Raw ACP")}
+      ${capabilityCell(provider.trailBacked, provider.trailBacked ? "Durable" : "Raw ACP")}
       ${capabilityCell(provider.supportsTaskName, provider.supportsTaskName ? "Supported" : "No signal")}
       ${capabilityCell(provider.supportsFromRef, provider.supportsFromRef ? "Supported" : "No signal")}
     </div>

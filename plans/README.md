@@ -34,7 +34,7 @@ Every plan has narrower checks. Before marking any plan DONE, also run:
 
 ```sh
 make fmt-check
-cargo check -p crabdb
-cargo test -p crabdb
+cargo check -p trail
+cargo test -p trail
 make bench-cli-scale-smoke
 ```

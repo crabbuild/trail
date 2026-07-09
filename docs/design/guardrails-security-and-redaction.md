@@ -1,10 +1,10 @@
 # Guardrails, Security, and Redaction
 
-This design section is advanced/internal. It describes CrabDB's local safety mechanisms for paths, ignored files, guardrail decisions, daemon auth, and sensitive metadata redaction.
+This design section is advanced/internal. It describes Trail's local safety mechanisms for paths, ignored files, guardrail decisions, daemon auth, and sensitive metadata redaction.
 
 ## Safety Model
 
-CrabDB is local-first, but it still handles risky workflows:
+Trail is local-first, but it still handles risky workflows:
 
 - Recording files from a workspace.
 - Materializing roots into directories.
@@ -16,7 +16,7 @@ The safety model is layered:
 
 1. Normalize paths and keep them inside the workspace.
 2. Block internal/private paths.
-3. Respect `.crabignore` and `.gitignore`.
+3. Respect `.trailignore` and `.gitignore`.
 4. Require explicit opt-in for ignored paths.
 5. Preflight risky agent actions with guardrails.
 6. Persist human approvals and paused run state.
@@ -27,8 +27,8 @@ The safety model is layered:
 flowchart TB
     Input["User, agent, CLI, HTTP, or MCP request"]
     Normalize["Normalize and validate paths"]
-    Internal["Block .crabdb/.git and private hardcoded paths"]
-    Ignore["Apply .crabignore and .gitignore policy"]
+    Internal["Block .trail/.git and private hardcoded paths"]
+    Ignore["Apply .trailignore and .gitignore policy"]
     Guardrails["Classify action risk and workspace policy"]
     Approval["Match pending/approved/rejected approvals"]
     Redact["Redact summaries, payloads, events, traces"]
@@ -42,7 +42,7 @@ flowchart TB
 
 Relative paths are normalized by:
 
-- Rejecting backslash separators on non-Windows platforms; use `/` for logical CrabDB paths.
+- Rejecting backslash separators on non-Windows platforms; use `/` for logical Trail paths.
 - Removing current-directory components.
 - Rejecting parent directory components.
 - Rejecting root directories and platform prefixes.
@@ -56,12 +56,12 @@ Relative paths are normalized by:
 This prevents commands and patch payloads from escaping the workspace with paths like `../secret` or absolute paths.
 It also avoids ambiguous path aliases such as decomposed Unicode filenames and
 separator lookalikes. On Windows, native filesystem paths may still be normalized
-from OS separators when CrabDB scans disk, but external patch and API paths
+from OS separators when Trail scans disk, but external patch and API paths
 should use `/`.
 
 ## Internal Paths
 
-Internal path checks treat `.crabdb` and `.git` as protected components. Materialization and patch code also include symlink and case-collision protections where relevant.
+Internal path checks treat `.trail` and `.git` as protected components. Materialization and patch code also include symlink and case-collision protections where relevant.
 
 Materialization helpers validate:
 
@@ -72,9 +72,9 @@ Materialization helpers validate:
 
 ## Default Ignored Paths
 
-Initialization writes `.crabignore` with default private/generated patterns, including:
+Initialization writes `.trailignore` with default private/generated patterns, including:
 
-- `.crabdb/`
+- `.trail/`
 - `.git/`
 - `.env`
 - `.env.*`
@@ -85,14 +85,14 @@ Initialization writes `.crabignore` with default private/generated patterns, inc
 - `build/`
 - `coverage/`
 
-Even if `.crabignore` is missing, hardcoded denylist checks still protect internal/private paths.
+Even if `.trailignore` is missing, hardcoded denylist checks still protect internal/private paths.
 
 ## Ignore Sources
 
 `ignore_check` returns an ignored flag and source:
 
 - `hardcoded`: default private/internal denylist.
-- `workspace`: `.crabignore` or `.gitignore` match.
+- `workspace`: `.trailignore` or `.gitignore` match.
 - absent source: not ignored.
 
 Hardcoded ignored paths become blocked guardrail reasons. Workspace ignored paths become approval-required guardrail reasons and require explicit `allow_ignored` for selected record or lane patch flows.
@@ -182,7 +182,7 @@ Policy block rules add blocked reasons. Policy approval rules add approval-requi
 
 ## Approval Matching
 
-For agent-scoped guardrail checks, CrabDB loads approvals for the agent:
+For agent-scoped guardrail checks, Trail loads approvals for the agent:
 
 - Matching pending approvals add a `pending_approval` approval-required reason.
 - Latest matching approved approvals can convert approval-required reasons to allowed and add `approval_satisfied`.
@@ -231,7 +231,7 @@ It is a safety net, not a guarantee that arbitrary secrets can never be stored. 
 The HTTP daemon requires auth by default:
 
 - `GET /v1/health` is always unauthenticated.
-- Other routes require `Authorization: Bearer <token>` or `x-crabdb-token`.
+- Other routes require `Authorization: Bearer <token>` or `x-trail-token`.
 - `--no-auth` disables auth explicitly, is allowed only with a loopback
   listener, and prints a stderr `WARNING` even with `--quiet` because any local
   process can mutate the workspace through that daemon.
@@ -247,11 +247,11 @@ The HTTP daemon requires auth by default:
 - HTTP request framing is fixed-length only: malformed request lines, malformed
   header lines, duplicate `Content-Length`, body length mismatches, and
   `Transfer-Encoding` are rejected before routing.
-- Duplicate `Authorization`, `X-CrabDB-Token`, `Origin`, `Host`, and
+- Duplicate `Authorization`, `X-Trail-Token`, `Origin`, `Host`, and
   `Idempotency-Key` headers are rejected before routing so security decisions
   and idempotency replay cannot depend on header order.
 
-CLI daemon routing can read the token from `--daemon-token`, `CRABDB_DAEMON_TOKEN`, or `.crabdb/daemon.token`.
+CLI daemon routing can read the token from `--daemon-token`, `TRAIL_DAEMON_TOKEN`, or `.trail/daemon.token`.
 
 ## Failure Modes
 
@@ -263,10 +263,10 @@ CLI daemon routing can read the token from `--daemon-token`, `CRABDB_DAEMON_TOKE
 
 ## Code Facts Used
 
-- Path safety: `crates/crabdb/src/db/util/path.rs`
-- Materialization safety: `crates/crabdb/src/db/util/materialize.rs`
-- Ignore handling: `crates/crabdb/src/db/core/workspace/ignore.rs`
-- Patch policy: `crates/crabdb/src/db/lane/patch_policy.rs`
-- Guardrails: `crates/crabdb/src/db/core/workspace/guardrails.rs`, `crates/crabdb/src/db/util/guardrails`
-- Redaction: `crates/crabdb/src/db/util/redaction.rs`
-- Daemon auth: `crates/crabdb/src/server/route/utils.rs`, `crates/crabdb/src/cli/command/handler/maintenance.rs`
+- Path safety: `crates/trail/src/db/util/path.rs`
+- Materialization safety: `crates/trail/src/db/util/materialize.rs`
+- Ignore handling: `crates/trail/src/db/core/workspace/ignore.rs`
+- Patch policy: `crates/trail/src/db/lane/patch_policy.rs`
+- Guardrails: `crates/trail/src/db/core/workspace/guardrails.rs`, `crates/trail/src/db/util/guardrails`
+- Redaction: `crates/trail/src/db/util/redaction.rs`
+- Daemon auth: `crates/trail/src/server/route/utils.rs`, `crates/trail/src/cli/command/handler/maintenance.rs`

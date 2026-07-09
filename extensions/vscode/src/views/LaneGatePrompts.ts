@@ -1,13 +1,13 @@
 import * as vscode from "vscode";
-import { shellCommandForPlatform } from "../crabdb/ShellCommand";
-import type { LaneGateRequest } from "../crabdb/TaskRepository";
+import { shellCommandForPlatform } from "../trail/ShellCommand";
+import type { LaneGateRequest } from "../trail/TaskRepository";
 
 export type LaneGateKind = "test" | "eval";
 
 export async function promptLaneGateRequest(kind: LaneGateKind): Promise<LaneGateRequest | undefined> {
   const label = laneGateLabel(kind);
   const commandLine = await vscode.window.showInputBox({
-    prompt: `Command to run as a CrabDB lane ${label}`,
+    prompt: `Command to run as a Trail lane ${label}`,
     placeHolder: kind === "test" ? "npm test" : "npm run eval",
     validateInput: (value) => (value.trim() ? undefined : "Enter a command to run.")
   });

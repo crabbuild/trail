@@ -133,7 +133,7 @@ export function composerDraftState(text: string, attachmentCount: number, maxCha
 export function composerRailItems(input: ComposerRailInput): ComposerRailItem[] {
   const attachmentSummary = attachmentModeSummary(input.attachmentModes);
   const routeValue =
-    input.providerCrabdbBacked === true ? "CrabDB route" : input.providerCrabdbBacked === false ? "Raw provider" : "Provider route";
+    input.providerCrabdbBacked === true ? "Trail route" : input.providerCrabdbBacked === false ? "Raw provider" : "Provider route";
   return [
     {
       id: "state",

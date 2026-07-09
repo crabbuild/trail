@@ -1,6 +1,6 @@
 # Lane Work Model
 
-A CrabDB lane is a branch-backed work container. It stores code state like a
+A Trail lane is a branch-backed work container. It stores code state like a
 branch, but also stores the operational context around the work: sessions,
 turns, messages, events, patches, workdir records, gates, approvals, readiness
 reports, handoff packets, and rewind checkpoints.
@@ -94,7 +94,7 @@ lane_branches
   status
 ```
 
-The ref still points at normal CrabDB operation/root history. The lane records
+The ref still points at normal Trail operation/root history. The lane records
 add task and activity context around that ref.
 
 ## Lanes, Sessions, Turns, Messages, and Events
@@ -135,35 +135,35 @@ The practical meaning:
 Sessions are not required for simple manual work:
 
 ```sh
-crabdb lane spawn docs-lane --from main --materialize=true
-crabdb lane record docs-lane -m "manual docs edit"
-crabdb lane readiness docs-lane
+trail lane spawn docs-lane --from main --materialize=true
+trail lane record docs-lane -m "manual docs edit"
+trail lane readiness docs-lane
 ```
 
 Sessions are the right default when work should preserve transcript context:
 
 ```sh
-crabdb session start docs-lane --title "Docs update" --id session-docs
-crabdb lane turn start docs-lane --title "Handle user request"
+trail session start docs-lane --title "Docs update" --id session-docs
+trail lane turn start docs-lane --title "Handle user request"
 ```
 
-## What CrabDB Records Automatically vs Explicitly
+## What Trail Records Automatically vs Explicitly
 
-CrabDB records code-state changes when a command applies or records them. It
+Trail records code-state changes when a command applies or records them. It
 does not magically see prompts or transcripts from Codex, Claude Code, Cursor,
-or another host unless that host sends the activity to CrabDB.
+or another host unless that host sends the activity to Trail.
 
 Manual or direct integration recording looks like this:
 
 ```text
 real agent or host
       |
-      +-- crabdb lane turn message ... --role user
-      +-- crabdb lane turn message ... --role assistant
-      +-- crabdb lane turn event ... --event-type tool_call
-      +-- crabdb lane record ... or lane turn apply-patch ...
-      +-- crabdb lane test/eval ...
-      +-- crabdb lane turn end ...
+      +-- trail lane turn message ... --role user
+      +-- trail lane turn message ... --role assistant
+      +-- trail lane turn event ... --event-type tool_call
+      +-- trail lane record ... or lane turn apply-patch ...
+      +-- trail lane test/eval ...
+      +-- trail lane turn end ...
 ```
 
 Relay-style automation should make that invisible to the user:
@@ -175,7 +175,7 @@ editor or agent host
 ACP/MCP/CLI integration
       |
       v
-CrabDB Relay
+Trail Relay
       |
       +-- forwards prompts to the real agent
       +-- mirrors prompts into lane messages/events
@@ -186,7 +186,7 @@ CrabDB Relay
       +-- exposes readiness/review/handoff back to the host
 ```
 
-Without such a relay, the host or script must call CrabDB explicitly.
+Without such a relay, the host or script must call Trail explicitly.
 
 ## Two Ways to Change a Lane
 
@@ -199,7 +199,7 @@ MCP, ACP relay, or script-driven integrations.
 patch.json
    |
    v
-crabdb lane apply-patch docs-lane --patch patch.json
+trail lane apply-patch docs-lane --patch patch.json
    |
    v
 validate base_change, paths, ignored files, root, line guards
@@ -214,9 +214,9 @@ refs/lanes/docs-lane points at new head
 Example:
 
 ```sh
-crabdb lane spawn docs-lane --from main --no-materialize
-crabdb lane apply-patch docs-lane --patch patch.json
-crabdb lane diff docs-lane --patch
+trail lane spawn docs-lane --from main --no-materialize
+trail lane apply-patch docs-lane --patch patch.json
+trail lane diff docs-lane --patch
 ```
 
 For direct lane patches, `patch.json` must include a `base_change` matching the
@@ -228,11 +228,11 @@ acts as the freshness guard.
 Turn-linked patch flow:
 
 ```sh
-crabdb lane turn start docs-lane --title "Apply docs patch"
+trail lane turn start docs-lane --title "Apply docs patch"
 # Use the printed turn id in the next commands.
-crabdb lane turn message <turn-id> --role user --text "Update the docs"
-crabdb lane turn apply-patch <turn-id> --patch patch.json
-crabdb lane turn end <turn-id> --status completed
+trail lane turn message <turn-id> --role user --text "Update the docs"
+trail lane turn apply-patch <turn-id> --patch patch.json
+trail lane turn end <turn-id> --status completed
 ```
 
 ### Materialized Workdir Flow
@@ -250,7 +250,7 @@ materialized workdir
 human/editor/agent edits files
         |
         v
-crabdb lane record docs-lane -m "record workdir changes"
+trail lane record docs-lane -m "record workdir changes"
         |
         v
 record LaneRecord operation
@@ -262,21 +262,21 @@ refs/lanes/docs-lane points at new head
 Example:
 
 ```sh
-crabdb lane spawn docs-lane --from main --materialize=true
-LANE_DIR="$(crabdb lane workdir docs-lane)"
+trail lane spawn docs-lane --from main --materialize=true
+LANE_DIR="$(trail lane workdir docs-lane)"
 cd "$LANE_DIR"
 
 # Edit files manually or run an external coding agent here.
 
 cd /path/to/project
-crabdb lane status docs-lane
-crabdb lane record docs-lane -m "record docs update"
+trail lane status docs-lane
+trail lane record docs-lane -m "record docs update"
 ```
 
 For large repositories, prefer sparse materialization:
 
 ```sh
-crabdb lane spawn docs-lane \
+trail lane spawn docs-lane \
   --from main \
   --materialize=true \
   --paths docs README.md
@@ -286,8 +286,8 @@ Only selected paths are written into the lane workdir. More paths can be read or
 hydrated later:
 
 ```sh
-crabdb lane read docs-lane docs/guide.md
-crabdb lane sync-workdir docs-lane --paths docs --include-neighbors
+trail lane read docs-lane docs/guide.md
+trail lane sync-workdir docs-lane --paths docs --include-neighbors
 ```
 
 ## Daily Human or Agent Workflow
@@ -324,34 +324,34 @@ Concrete command flow:
 cd /path/to/project
 
 # One-time per project.
-crabdb init --working-tree
+trail init --working-tree
 
 # One lane per task.
-crabdb lane spawn docs-lane --from main --materialize=true
+trail lane spawn docs-lane --from main --materialize=true
 
 # Optional but recommended for agent work.
-crabdb session start docs-lane --title "Docs update" --id session-docs
-crabdb lane turn start docs-lane --title "Handle user request"
+trail session start docs-lane --title "Docs update" --id session-docs
+trail lane turn start docs-lane --title "Handle user request"
 
 # Work in the lane workdir.
-LANE_DIR="$(crabdb lane workdir docs-lane)"
+LANE_DIR="$(trail lane workdir docs-lane)"
 cd "$LANE_DIR"
 # edit files or run Codex/Claude/Cursor here
 
 # Record from the original project workspace.
 cd /path/to/project
-crabdb lane record docs-lane -m "record docs update"
+trail lane record docs-lane -m "record docs update"
 
 # Inspect and gate.
-crabdb lane diff docs-lane --patch --show-line-ids
-crabdb lane review docs-lane
-crabdb lane test docs-lane --suite unit -- cargo test
-crabdb lane readiness docs-lane
+trail lane diff docs-lane --patch --show-line-ids
+trail lane review docs-lane
+trail lane test docs-lane --suite unit -- cargo test
+trail lane readiness docs-lane
 
 # Merge when ready.
-crabdb merge-lane docs-lane --into main --dry-run
-crabdb merge-queue add docs-lane --into main
-crabdb merge-queue run
+trail merge-lane docs-lane --into main --dry-run
+trail merge-queue add docs-lane --into main
+trail merge-queue run
 ```
 
 ## Readiness Model
@@ -409,12 +409,12 @@ Lane isolation is permissive by default for compatibility. Workspaces can opt
 into stricter boundaries:
 
 ```sh
-crabdb config set lane.claim_enforcement reject
-crabdb config set lane.enforce_sparse_paths true
-crabdb config set lane.max_changed_paths 25
-crabdb config set lane.max_patch_bytes 1048576
-crabdb config set lane.max_event_payload_bytes 65536
-crabdb config set lane.max_trace_payload_bytes 65536
+trail config set lane.claim_enforcement reject
+trail config set lane.enforce_sparse_paths true
+trail config set lane.max_changed_paths 25
+trail config set lane.max_patch_bytes 1048576
+trail config set lane.max_event_payload_bytes 65536
+trail config set lane.max_trace_payload_bytes 65536
 ```
 
 `lane.claim_enforcement=warn` records a `lane_policy_warning` event when a lane
@@ -428,7 +428,7 @@ hard write boundary for lane patches and materialized workdir records.
 Review summarizes the lane:
 
 ```sh
-crabdb lane review docs-lane --limit 50
+trail lane review docs-lane --limit 50
 ```
 
 It includes readiness, changed paths, recent operations, sessions, events, trace
@@ -437,14 +437,14 @@ spans, approvals, conflicts, and gates.
 Handoff packages context for another host or reviewer:
 
 ```sh
-crabdb lane handoff docs-lane --limit 50
+trail lane handoff docs-lane --limit 50
 ```
 
 Rewind moves a lane back to a known-good change/root while preserving audit
 history:
 
 ```sh
-crabdb lane rewind docs-lane \
+trail lane rewind docs-lane \
   --to <change-or-root> \
   --record-current \
   --sync-workdir
@@ -453,24 +453,24 @@ crabdb lane rewind docs-lane \
 Merge uses the lane ref as source:
 
 ```sh
-crabdb merge-lane docs-lane --into main --dry-run
+trail merge-lane docs-lane --into main --dry-run
 ```
 
 Use the merge queue for shared targets:
 
 ```sh
-crabdb merge-queue add docs-lane --into main
-crabdb merge-queue run
+trail merge-queue add docs-lane --into main
+trail merge-queue run
 ```
 
-The merge updates CrabDB's target branch ref. Git history remains separate until
+The merge updates Trail's target branch ref. Git history remains separate until
 you export, checkout, or commit through the Git workflow.
 
-If a merge pauses on conflict, CrabDB records the base, target, and source root
+If a merge pauses on conflict, Trail records the base, target, and source root
 snapshots for that merge. Conflict explanations and resolutions use those stored
 roots and label each path with a conservative conflict class, so later source
 lane movement does not change what is being resolved. If the target ref moves,
-CrabDB rejects the stale resolution instead of overwriting newer target work.
+Trail rejects the stale resolution instead of overwriting newer target work.
 
 ```text
 refs/lanes/docs-lane              refs/branches/main
@@ -479,7 +479,7 @@ refs/lanes/docs-lane              refs/branches/main
   lane head operation  ---- merge ---->  new main operation
         |                                  |
         v                                  v
-  lane activity remains             accepted CrabDB branch state
+  lane activity remains             accepted Trail branch state
 ```
 
 ## Large Repo Example: Sparse Lane on Svelte
@@ -490,9 +490,9 @@ This example was run against `sveltejs/svelte`, a real framework repository with
 Clone and initialize:
 
 ```sh
-git clone --depth 1 https://github.com/sveltejs/svelte /tmp/crabdb-svelte-lane-demo
-cd /tmp/crabdb-svelte-lane-demo
-crabdb init --from-git
+git clone --depth 1 https://github.com/sveltejs/svelte /tmp/trail-svelte-lane-demo
+cd /tmp/trail-svelte-lane-demo
+trail init --from-git
 ```
 
 Observed output:
@@ -505,41 +505,41 @@ Worktree: clean
 Create a sparse lane for a README-only task:
 
 ```sh
-crabdb lane spawn svelte-readme \
+trail lane spawn svelte-readme \
   --from main \
   --materialize=true \
   --paths README.md
 
-crabdb lane workdir svelte-readme
+trail lane workdir svelte-readme
 ```
 
 The materialized lane workdir contained only:
 
 ```text
 README.md
-.crabdb/sparse-workdir.json
-.crabdb/workdir-manifest.json
+.trail/sparse-workdir.json
+.trail/workdir-manifest.json
 ```
 
 Record the run context:
 
 ```sh
-crabdb session start svelte-readme \
+trail session start svelte-readme \
   --title "README clarity pass" \
   --id session-svelte-readme
 
-crabdb lane turn start svelte-readme \
+trail lane turn start svelte-readme \
   --title "Handle user README prompt"
 
-crabdb lane turn message <turn-id> \
+trail lane turn message <turn-id> \
   --role user \
   --text "In this large repo, add a tiny README note."
 
-crabdb lane turn message <turn-id> \
+trail lane turn message <turn-id> \
   --role assistant \
   --text "I will edit only README.md in the sparse lane workdir."
 
-crabdb lane turn event <turn-id> \
+trail lane turn event <turn-id> \
   --event-type prompt_received \
   --payload-json '{"repo":"sveltejs/svelte","mode":"sparse-lane"}'
 ```
@@ -547,8 +547,8 @@ crabdb lane turn event <turn-id> \
 Edit `README.md` in the sparse lane workdir, then record:
 
 ```sh
-crabdb lane status svelte-readme
-crabdb lane record svelte-readme -m "record README demo note"
+trail lane status svelte-readme
+trail lane record svelte-readme -m "record README demo note"
 ```
 
 Observed status before recording:
@@ -569,11 +569,11 @@ Recorded lane workdir ch_4ee8...
 Run gates:
 
 ```sh
-crabdb lane test svelte-readme \
+trail lane test svelte-readme \
   --suite readme-smoke \
   -- sh -c 'grep -q "Demo note" README.md'
 
-crabdb lane eval svelte-readme \
+trail lane eval svelte-readme \
   --suite sparse-policy \
   --score 1.0 \
   --threshold 1.0 \
@@ -590,9 +590,9 @@ eval_passed suite=sparse-policy score=1 threshold=1
 Review and readiness:
 
 ```sh
-crabdb lane review svelte-readme
-crabdb lane readiness svelte-readme
-crabdb lane diff svelte-readme --patch
+trail lane review svelte-readme
+trail lane readiness svelte-readme
+trail lane diff svelte-readme --patch
 ```
 
 Observed readiness:
@@ -618,9 +618,9 @@ Changed paths:
 Merge through the queue:
 
 ```sh
-crabdb session end session-svelte-readme --status completed
-crabdb merge-queue add svelte-readme --into main
-crabdb merge-queue run
+trail session end session-svelte-readme --status completed
+trail merge-queue add svelte-readme --into main
+trail merge-queue run
 ```
 
 Observed merge result:
@@ -677,7 +677,7 @@ lane + session + turns + messages + events + patches/records + gates + readiness
 For an automated agent product experience:
 
 ```text
-editor/agent host + CrabDB Relay + lane
+editor/agent host + Trail Relay + lane
 ```
 
 The relay/integration layer should handle session creation, turn creation,
@@ -686,9 +686,9 @@ checks automatically.
 
 ## Code Facts Used
 
-- Lane CLI surface: `crates/crabdb/src/cli/command/lane_args.rs`
-- Session and approvals CLI: `crates/crabdb/src/cli/command/collaboration_args`
-- Lane models: `crates/crabdb/src/model/lane`
-- Lane storage and lifecycle: `crates/crabdb/src/db/lane`
-- Readiness and handoff: `crates/crabdb/src/db/lane/readiness.rs`
-- Merge queue: `crates/crabdb/src/db/merge`
+- Lane CLI surface: `crates/trail/src/cli/command/lane_args.rs`
+- Session and approvals CLI: `crates/trail/src/cli/command/collaboration_args`
+- Lane models: `crates/trail/src/model/lane`
+- Lane storage and lifecycle: `crates/trail/src/db/lane`
+- Readiness and handoff: `crates/trail/src/db/lane/readiness.rs`
+- Merge queue: `crates/trail/src/db/merge`

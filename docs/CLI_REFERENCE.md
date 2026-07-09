@@ -1,6 +1,6 @@
-# CrabDB CLI Reference
+# Trail CLI Reference
 
-The CrabDB CLI supports workspace initialization, recording, inspection, branching, lanes, sessions, approvals, leases, daemon operation, Git interop, and maintenance commands.
+The Trail CLI supports workspace initialization, recording, inspection, branching, lanes, sessions, approvals, leases, daemon operation, Git interop, and maintenance commands.
 
 Reference sections:
 

@@ -132,7 +132,7 @@ function reviewActionGroups(
         nextAction,
         ...(nextAction.action === "refresh"
           ? []
-          : [{ action: "refresh", label: "Refresh", description: "Fetch the latest CrabDB review state.", tone: "default" as const }])
+          : [{ action: "refresh", label: "Refresh", description: "Fetch the latest Trail review state.", tone: "default" as const }])
       ]
     },
     {
@@ -187,9 +187,9 @@ function reviewActionGroups(
       label: "Recover",
       detail: "Explicit recovery actions for this lane.",
       actions: [
-        { action: "rewind", label: "Rewind", description: "Return the lane to a previous CrabDB checkpoint.", tone: "default" },
+        { action: "rewind", label: "Rewind", description: "Return the lane to a previous Trail checkpoint.", tone: "default" },
         { action: "preserveFailedAttempt", label: "Preserve and rewind", description: "Keep failed work as evidence before rewinding.", tone: "default" },
-        { action: "removeTask", label: "Remove task", description: "Delete this task record from the CrabDB view.", tone: "danger" }
+        { action: "removeTask", label: "Remove task", description: "Delete this task record from the Trail view.", tone: "danger" }
       ]
     }
   ];
@@ -233,13 +233,13 @@ function description(tone: ReviewTone, input: ReviewReadinessInput): string {
     case "blocked":
       return "Resolve blockers, approvals, conflicts, or dirty worktree state before changing the main workspace.";
     case "warning":
-      return "The lane can be inspected, but CrabDB still has warnings worth clearing before queueing a merge.";
+      return "The lane can be inspected, but Trail still has warnings worth clearing before queueing a merge.";
     case "ready":
       return input.changedPaths > 0
         ? "No blocking gates are reported. Run a dry-run apply before making workspace changes."
         : "No file changes are recorded. Review the transcript before starting the next turn.";
     default:
-      return "Start a prompt or attach context so CrabDB can build a reviewable task record.";
+      return "Start a prompt or attach context so Trail can build a reviewable task record.";
   }
 }
 
@@ -308,7 +308,7 @@ function primaryAction(
   return {
     action: "refresh",
     label: "Refresh status",
-    description: "Ask CrabDB for the latest task state",
+    description: "Ask Trail for the latest task state",
     tone: "primary"
   };
 }
@@ -329,7 +329,7 @@ function coordinationGate(summary: CoordinationSummary): ReviewGate {
       id: "coordination",
       label: "Coordination",
       value: "Blocked",
-      detail: "CrabDB reports a blocker in the lane coordination state.",
+      detail: "Trail reports a blocker in the lane coordination state.",
       tone: "blocked"
     };
   }
@@ -338,7 +338,7 @@ function coordinationGate(summary: CoordinationSummary): ReviewGate {
       id: "coordination",
       label: "Coordination",
       value: "Warning",
-      detail: "CrabDB reports coordination warnings for this lane.",
+      detail: "Trail reports coordination warnings for this lane.",
       tone: "warning"
     };
   }
@@ -346,7 +346,7 @@ function coordinationGate(summary: CoordinationSummary): ReviewGate {
     id: "coordination",
     label: "Coordination",
     value: "Clear",
-    detail: "No CrabDB coordination blockers are reported.",
+    detail: "No Trail coordination blockers are reported.",
     tone: "ok"
   };
 }
@@ -385,7 +385,7 @@ function testGate(status: string | undefined, runCount: number, changedPaths: nu
     id: "tests",
     label: "Tests",
     value: status,
-    detail: "Latest test gate status reported by CrabDB.",
+    detail: "Latest test gate status reported by Trail.",
     tone: gateStatusTone(status)
   };
 }
@@ -404,7 +404,7 @@ function evalGate(status: string | undefined, runCount: number, changedPaths: nu
     id: "evals",
     label: "Evals",
     value: status,
-    detail: "Latest eval gate status reported by CrabDB.",
+    detail: "Latest eval gate status reported by Trail.",
     tone: gateStatusTone(status)
   };
 }

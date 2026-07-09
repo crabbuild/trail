@@ -7,7 +7,7 @@ import {
 
 import { cn } from "@/webview/lib/utils"
 
-export const CRABDB_STREAMDOWN_UPDATE_EVENT = "crabdb-streamdown-update"
+export const TRAIL_STREAMDOWN_UPDATE_EVENT = "trail-streamdown-update"
 
 export interface StreamdownMarkdownProps {
   className?: string | undefined
@@ -16,8 +16,8 @@ export interface StreamdownMarkdownProps {
 }
 
 export type StreamdownMarkdownElement = HTMLDivElement & {
-  __crabdbQueueStreamdownText?: ((text: string) => void) | undefined
-  __crabdbStreamingText?: string | undefined
+  __trailQueueStreamdownText?: ((text: string) => void) | undefined
+  __trailStreamingText?: string | undefined
 }
 
 type StreamdownUpdateEvent = CustomEvent<{ text?: unknown }>
@@ -92,7 +92,7 @@ export const StreamdownMarkdown = React.memo(function StreamdownMarkdown({
     }
     queuedTextRef.current = nextText
     if (rootRef.current) {
-      rootRef.current.__crabdbStreamingText = nextText
+      rootRef.current.__trailStreamingText = nextText
     }
     if (frameRef.current !== undefined) {
       return
@@ -106,13 +106,13 @@ export const StreamdownMarkdown = React.memo(function StreamdownMarkdown({
 
   const setRoot = React.useCallback((node: StreamdownMarkdownElement | null) => {
     if (rootRef.current && rootRef.current !== node) {
-      rootRef.current.__crabdbQueueStreamdownText = undefined
-      rootRef.current.__crabdbStreamingText = undefined
+      rootRef.current.__trailQueueStreamdownText = undefined
+      rootRef.current.__trailStreamingText = undefined
     }
     rootRef.current = node
     if (node) {
-      node.__crabdbStreamingText = queuedTextRef.current
-      node.__crabdbQueueStreamdownText = queueText
+      node.__trailStreamingText = queuedTextRef.current
+      node.__trailQueueStreamdownText = queueText
     }
   }, [queueText])
 
@@ -131,9 +131,9 @@ export const StreamdownMarkdown = React.memo(function StreamdownMarkdown({
         queueText(nextText)
       }
     }
-    root.addEventListener(CRABDB_STREAMDOWN_UPDATE_EVENT, onUpdate)
+    root.addEventListener(TRAIL_STREAMDOWN_UPDATE_EVENT, onUpdate)
     return () => {
-      root.removeEventListener(CRABDB_STREAMDOWN_UPDATE_EVENT, onUpdate)
+      root.removeEventListener(TRAIL_STREAMDOWN_UPDATE_EVENT, onUpdate)
     }
   }, [queueText])
 
@@ -143,8 +143,8 @@ export const StreamdownMarkdown = React.memo(function StreamdownMarkdown({
         window.cancelAnimationFrame(frameRef.current)
       }
       if (rootRef.current) {
-        rootRef.current.__crabdbQueueStreamdownText = undefined
-        rootRef.current.__crabdbStreamingText = undefined
+        rootRef.current.__trailQueueStreamdownText = undefined
+        rootRef.current.__trailStreamingText = undefined
       }
     }
   }, [])

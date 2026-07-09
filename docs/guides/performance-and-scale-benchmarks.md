@@ -33,18 +33,18 @@ Defaults:
 Override scale and location with:
 
 ```sh
-CRABDB_SCALE_FILES=10000,100000,1000000 \
-CRABDB_SCALE_BASE=/Volumes/Workspace \
-CRABDB_SCALE_LABEL=manual-scale \
+TRAIL_SCALE_FILES=10000,100000,1000000 \
+TRAIL_SCALE_BASE=/Volumes/Workspace \
+TRAIL_SCALE_LABEL=manual-scale \
 scripts/cli-scale-bench.sh
 ```
 
 Optional toggles:
 
-- `CRABDB_SCALE_MATERIALIZED=0|1`
-- `CRABDB_SCALE_BACKUP=0|1`
-- `CRABDB_SCALE_DAEMON=0|1`
-- `CRABDB_SCALE_GIT_IMPORT=0|1`
+- `TRAIL_SCALE_MATERIALIZED=0|1`
+- `TRAIL_SCALE_BACKUP=0|1`
+- `TRAIL_SCALE_DAEMON=0|1`
+- `TRAIL_SCALE_GIT_IMPORT=0|1`
 
 ## Output
 
@@ -90,7 +90,7 @@ Important hot-path rows:
 - `daemon_cli_history`
 - `daemon_cli_code_from`
 
-`git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_persisted_snapshot_*` rows hide daemon endpoint discovery while keeping the live daemon process and persisted watcher snapshot, so they verify separate CrabDB handles can avoid the full direct fallback without using HTTP RPC. Use `daemon_cli_*` rows for repeated agent-command hot paths.
+`git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_persisted_snapshot_*` rows hide daemon endpoint discovery while keeping the live daemon process and persisted watcher snapshot, so they verify separate Trail handles can avoid the full direct fallback without using HTTP RPC. Use `daemon_cli_*` rows for repeated agent-command hot paths.
 
 ## Current Evidence
 
@@ -102,13 +102,13 @@ The latest local `/Volumes/Workspace` runs were measured on June 25, 2026 with t
 | 100k files | 29.59s | 0.43s | 1.86s | 1.65s | 0.07s | 0.67s | 0.63s | 0.03s | 0.30s |
 | 1M files | 418.39s | 24.94s | 31.16s | 30.55s | 0.11s | 0.80s | 0.78s | 0.05s | 0.44s |
 
-The fresh 100k run at `/Volumes/Workspace/crabdb-cli-scale-codex-100k-git-daemon-20260625/100000` used no backup or materialized-workdir cases and passed 31 threshold checks. Its Git fallback rows measured `git_dirty_status=1.52s`, `git_dirty_diff=2.52s`, `git_dirty_record=1.86s`, and `git_status_after_dirty_record=0.90s`. Its persisted daemon snapshot rows measured `daemon_persisted_snapshot_status=0.01s`, `daemon_persisted_snapshot_record_clean=0.01s`, and `daemon_persisted_snapshot_diff_dirty=0.65s`.
+The fresh 100k run at `/Volumes/Workspace/trail-cli-scale-codex-100k-git-daemon-20260625/100000` used no backup or materialized-workdir cases and passed 31 threshold checks. Its Git fallback rows measured `git_dirty_status=1.52s`, `git_dirty_diff=2.52s`, `git_dirty_record=1.86s`, and `git_status_after_dirty_record=0.90s`. Its persisted daemon snapshot rows measured `daemon_persisted_snapshot_status=0.01s`, `daemon_persisted_snapshot_record_clean=0.01s`, and `daemon_persisted_snapshot_diff_dirty=0.65s`.
 
-The fresh 1M Git+daemon run at `/Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000` used no backup or materialized-workdir cases. It produced 1,000,029 source files, 75.9 MiB source bytes, 1.46 GiB SQLite, 1,000,460 objects, 452.5 MiB `TextContent` object bytes, and 667.5 MiB `repo_prolly_nodes` bytes. It passed 31 calibrated hot-path and storage threshold checks:
+The fresh 1M Git+daemon run at `/Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000` used no backup or materialized-workdir cases. It produced 1,000,029 source files, 75.9 MiB source bytes, 1.46 GiB SQLite, 1,000,460 objects, 452.5 MiB `TextContent` object bytes, and 667.5 MiB `repo_prolly_nodes` bytes. It passed 31 calibrated hot-path and storage threshold checks:
 
 ```sh
 python3 scripts/check-cli-scale-thresholds.py \
-  /Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000/results.tsv \
+  /Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000/results.tsv \
   daemon_wait_for_health=60 daemon_wait_for_hot_cache=120 \
   daemon_status=5 daemon_persisted_snapshot_status=5 \
   daemon_persisted_snapshot_record_clean=5 daemon_persisted_snapshot_diff_dirty=10 \
@@ -121,7 +121,7 @@ python3 scripts/check-cli-scale-thresholds.py \
   merge_lane_dry_run=10 merge_lane_apply=10 merge_queue_run=10 \
   git_dirty_status=120 git_dirty_diff=120 git_dirty_record=120 \
   git_status_after_dirty_record=90 \
-  --metrics /Volumes/Workspace/crabdb-cli-scale-codex-1m-git-daemon-20260625/1000000/metrics.tsv \
+  --metrics /Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000/metrics.tsv \
   sqlite_bytes=4000000000 dbstat_repo_prolly_nodes=2500000000 \
   object_kind_repo_TextContent_bytes=1200000000 object_count=2000000
 ```
@@ -150,7 +150,7 @@ Large agent orchestration should use the daemon and no-materialize/sparse workdi
 - Prefer structured patches, MCP/API file reads, readiness, merge preflight, and merge queue operations over full worktree scans.
 - If filesystem access is needed, materialize selected paths with `--paths` and hydrate more paths lazily through `lane read`.
 - Keep the daemon running for repeated CLI calls so status, record, trace, gate, handoff, and merge queue commands use a hot SQLite connection and watcher-backed dirty path cache.
-- Separate CrabDB handles can reuse the daemon's watcher-backed dirty snapshot only while the persisted snapshot is initialized, belongs to the same workspace, and the daemon PID is still alive. If the snapshot is missing, stale, overflowed, or too large, commands fall back to Git dirty paths when a committed Git baseline is available, then to the full persisted-index scan.
+- Separate Trail handles can reuse the daemon's watcher-backed dirty snapshot only while the persisted snapshot is initialized, belongs to the same workspace, and the daemon PID is still alive. If the snapshot is missing, stale, overflowed, or too large, commands fall back to Git dirty paths when a committed Git baseline is available, then to the full persisted-index scan.
 
 ## Known Limits
 

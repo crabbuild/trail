@@ -1,22 +1,22 @@
 # Use Case: Provenance for Review
 
-Use CrabDB provenance before editing or approving a change.
+Use Trail provenance before editing or approving a change.
 
 ## Questions to Ask
 
 ```sh
-crabdb why src/lib.rs:42
-crabdb history src/lib.rs
-crabdb code-from session-docs
-crabdb show <change-id>
+trail why src/lib.rs:42
+trail history src/lib.rs
+trail code-from session-docs
+trail show <change-id>
 ```
 
 For a lane branch:
 
 ```sh
-crabdb lane review doc-bot
-crabdb lane contribution doc-bot
-crabdb lane diff doc-bot --patch --show-line-ids
+trail lane review doc-bot
+trail lane contribution doc-bot
+trail lane diff doc-bot --patch --show-line-ids
 ```
 
 ## Review Signals
@@ -32,6 +32,6 @@ Look for:
 
 ## Code Facts Used
 
-- Provenance commands: `crates/crabdb/src/cli/command/inspect_args.rs`
-- Lane review reports: `crates/crabdb/src/model/lane/core.rs`
+- Provenance commands: `crates/trail/src/cli/command/inspect_args.rs`
+- Lane review reports: `crates/trail/src/model/lane/core.rs`
 - Tests: `show_history_and_code_from_use_recorded_indexes`, `lane_management_commands_have_backing_apis`

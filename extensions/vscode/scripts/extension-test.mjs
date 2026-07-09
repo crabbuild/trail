@@ -7,18 +7,18 @@ import esbuild from "esbuild";
 import { runTests } from "@vscode/test-electron";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const testOut = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-vscode-extension-test-"));
-const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "crabdb-vscode-test-"));
+const testOut = fs.mkdtempSync(path.join(os.tmpdir(), "trail-vscode-extension-test-"));
+const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trail-vscode-test-"));
 
 sanitizeElectronHostEnv();
 
 fs.writeFileSync(path.join(workspaceRoot, "README.md"), "hello from vscode extension test\n");
-const init = spawnSync("crabdb", ["--workspace", workspaceRoot, "init", "--quiet"], {
+const init = spawnSync("trail", ["--workspace", workspaceRoot, "init", "--quiet"], {
   encoding: "utf8"
 });
 if (init.status !== 0) {
   fs.rmSync(workspaceRoot, { recursive: true, force: true });
-  throw new Error(`Failed to initialize CrabDB test workspace:\n${init.stdout}\n${init.stderr}`);
+  throw new Error(`Failed to initialize Trail test workspace:\n${init.stdout}\n${init.stderr}`);
 }
 
 await esbuild.build({
@@ -39,7 +39,7 @@ try {
     extensionTestsPath: path.join(testOut, "index.js"),
     launchArgs: [workspaceRoot, "--disable-extensions"],
     extensionTestsEnv: {
-      CRABDB_VSCODE_TEST_WORKSPACE: workspaceRoot
+      TRAIL_VSCODE_TEST_WORKSPACE: workspaceRoot
     }
   });
 } finally {

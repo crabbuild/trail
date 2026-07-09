@@ -1,4 +1,4 @@
-import type { AgentTask, AgentTaskStatus, MergeQueueEntry } from "../crabdb/TaskRepository";
+import type { AgentTask, AgentTaskStatus, MergeQueueEntry } from "../trail/TaskRepository";
 import type { CoordinationSeverity } from "../shared/coordinationSummary";
 
 export type TaskTreeMode = "tasks" | "reviews" | "queue";
@@ -139,22 +139,22 @@ export function buildEmptyTreePresentation(mode: TaskTreeMode, error?: string | 
   if (cleanText(error)) {
     const viewLabel = mode === "queue" ? "merge queue" : mode === "reviews" ? "reviews" : "agent tasks";
     return {
-      label: "CrabDB data unavailable",
+      label: "Trail data unavailable",
       description: "Refresh or open settings",
       tooltip: compactLines([`Could not load ${viewLabel}.`, cleanText(error)]),
       icon: { id: "warning", color: "charts.yellow" },
-      accessibilityLabel: `CrabDB data unavailable, ${viewLabel}`,
+      accessibilityLabel: `Trail data unavailable, ${viewLabel}`,
       command: {
-        command: "crabdb.refreshTasks",
-        title: "Refresh CrabDB views"
+        command: "trail.refreshTasks",
+        title: "Refresh Trail views"
       }
     };
   }
 
   const labels: Record<TaskTreeMode, [string, string, TreeCommandPresentation]> = {
-    tasks: ["No agent tasks yet", "Start a new task", { command: "crabdb.newAgentTask", title: "New Agent Task" }],
-    reviews: ["No tasks need review", "Start a task to create review evidence", { command: "crabdb.newAgentTask", title: "New Agent Task" }],
-    queue: ["No queued merges", "Open review to queue a lane", { command: "crabdb.openLatestReview", title: "Open Latest Review" }]
+    tasks: ["No agent tasks yet", "Start a new task", { command: "trail.newAgentTask", title: "New Agent Task" }],
+    reviews: ["No tasks need review", "Start a task to create review evidence", { command: "trail.newAgentTask", title: "New Agent Task" }],
+    queue: ["No queued merges", "Open review to queue a lane", { command: "trail.openLatestReview", title: "Open Latest Review" }]
   };
   const [label, description, command] = labels[mode];
   return {

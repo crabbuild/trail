@@ -65,7 +65,7 @@
 
   <rect x="65" y="128" width="170" height="62" rx="6" fill="#0f172a"/>
   <rect x="65" y="128" width="170" height="62" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
-  <text x="150" y="153" class="label" text-anchor="middle">CrabDB storage</text>
+  <text x="150" y="153" class="label" text-anchor="middle">Trail storage</text>
   <text x="150" y="169" class="small" text-anchor="middle">roots, text, indexes</text>
 
   <rect x="65" y="260" width="170" height="62" rx="6" fill="#0f172a"/>

@@ -1,6 +1,6 @@
-# CrabDB Lane Workflows
+# Trail Lane Workflows
 
-CrabDB lanes should default to structured, no-materialize workflows for large repositories. Use patches, MCP/API reads, readiness checks, merge preflight, and the merge queue before creating filesystem workdirs.
+Trail lanes should default to structured, no-materialize workflows for large repositories. Use patches, MCP/API reads, readiness checks, merge preflight, and the merge queue before creating filesystem workdirs.
 
 Lane workflow references:
 

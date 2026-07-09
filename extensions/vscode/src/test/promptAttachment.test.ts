@@ -114,7 +114,7 @@ test("turns history attachment into text when embedded context is unavailable", 
     {
       id: "att-5",
       kind: "history",
-      label: "CrabDB history for README.md",
+      label: "Trail history for README.md",
       uri: "file:///repo/README.md",
       mimeType: "application/json",
       text: "{\"history\":[]}"
@@ -128,5 +128,5 @@ test("turns history attachment into text when embedded context is unavailable", 
   if (block.type !== "text") {
     throw new Error("Expected text content block.");
   }
-  assert.match(String(block.text), /CrabDB history for README\.md/);
+  assert.match(String(block.text), /Trail history for README\.md/);
 });

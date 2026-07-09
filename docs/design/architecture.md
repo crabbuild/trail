@@ -4,7 +4,7 @@ This design section is advanced/internal. It describes the implementation shape 
 
 ## Goals
 
-CrabDB is built as a local-first operation database for code and text worktrees. The main architectural goals visible in the code are:
+Trail is built as a local-first operation database for code and text worktrees. The main architectural goals visible in the code are:
 
 - Keep the workspace local and usable without a daemon.
 - Record operations as durable history, not only snapshots.
@@ -15,16 +15,16 @@ CrabDB is built as a local-first operation database for code and text worktrees.
 
 ## Main Layers
 
-CrabDB is split into these layers:
+Trail is split into these layers:
 
-- CLI: `crates/crabdb/src/cli`
-- Core library API: `crates/crabdb/src/lib.rs` and `crates/crabdb/src/db`
-- Domain and report models: `crates/crabdb/src/model`
-- HTTP daemon and OpenAPI: `crates/crabdb/src/server`
-- MCP stdio server: `crates/crabdb/src/mcp`
+- CLI: `crates/trail/src/cli`
+- Core library API: `crates/trail/src/lib.rs` and `crates/trail/src/db`
+- Domain and report models: `crates/trail/src/model`
+- HTTP daemon and OpenAPI: `crates/trail/src/server`
+- MCP stdio server: `crates/trail/src/mcp`
 - Ordered map storage: `crates/prolly`
 
-The `crabdb` binary is intentionally thin: `src/main.rs` calls `cli::run()`. The core behavior lives in the library so the CLI, HTTP server, MCP server, tests, and external Rust callers can use the same implementation.
+The `trail` binary is intentionally thin: `src/main.rs` calls `cli::run()`. The core behavior lives in the library so the CLI, HTTP server, MCP server, tests, and external Rust callers can use the same implementation.
 
 ```mermaid
 flowchart TB
@@ -32,17 +32,17 @@ flowchart TB
         CLI["CLI<br/>clap commands and renderers"]
         HTTP["HTTP daemon<br/>/v1 JSON routes"]
         MCP["MCP stdio<br/>JSON-RPC tools/resources/prompts"]
-        Rust["Rust API<br/>CrabDb callers"]
+        Rust["Rust API<br/>Trail callers"]
     end
 
-    Core["CrabDb core<br/>workspace, refs, objects, agents, merge"]
-    Reports["Serializable report structs<br/>crates/crabdb/src/model/reports"]
+    Core["Trail core<br/>workspace, refs, objects, agents, merge"]
+    Reports["Serializable report structs<br/>crates/trail/src/model/reports"]
 
     subgraph State["Durable local state"]
         SQLite["SQLite<br/>objects, refs, indexes, coordination"]
         Objects["CBOR objects<br/>operations, roots, text, messages"]
         Prolly["Prolly maps<br/>path maps, file indexes, line order"]
-        Sidecars[".crabdb sidecars<br/>config, HEAD, refs, daemon files"]
+        Sidecars[".trail sidecars<br/>config, HEAD, refs, daemon files"]
     end
 
     CLI --> Core
@@ -64,12 +64,12 @@ CLI command flow is:
 2. `run_cli` decides whether parse/runtime errors should be JSON.
 3. A `RuntimeContext` resolves workspace, database directory, branch, output format, quiet mode, and JSON mode.
 4. Supported hot commands may route to a daemon through `daemon_rpc`.
-5. Otherwise the handler opens a local `CrabDb` and calls the corresponding typed method.
+5. Otherwise the handler opens a local `Trail` and calls the corresponding typed method.
 6. Renderers print either human output or JSON serialized from report structs.
 
 This means CLI behavior usually has two paths:
 
-- Local execution through `CrabDb`.
+- Local execution through `Trail`.
 - Daemon-backed execution for selected hot commands, returning the same report shapes.
 
 The daemon path is intentionally partial. It handles `status`, `record`, `diff`, selected `lane` commands, `merge-lane`, and `merge-queue`. Unsupported commands fall back to local execution unless the user explicitly supplied a daemon URL and the command is not daemon-capable.
@@ -77,13 +77,13 @@ The daemon path is intentionally partial. It handles `status`, `record`, `diff`,
 ```mermaid
 sequenceDiagram
     participant User as User or host
-    participant CLI as crabdb CLI
+    participant CLI as trail CLI
     participant Runtime as RuntimeContext
     participant Daemon as daemon_rpc
-    participant DB as CrabDb
+    participant DB as Trail
     participant Render as Renderer
 
-    User->>CLI: crabdb <command>
+    User->>CLI: trail <command>
     CLI->>Runtime: parse globals, workspace, branch, output
     alt daemon-capable and daemon reachable
         Runtime->>Daemon: send HTTP request
@@ -96,16 +96,16 @@ sequenceDiagram
     Render-->>User: printed result
 ```
 
-## `CrabDb` Object Boundary
+## `Trail` Object Boundary
 
-`CrabDb` owns the live state needed by the library:
+`Trail` owns the live state needed by the library:
 
 - `workspace_root`
 - `db_dir`
 - SQLite connection
 - shared `SqliteStore` for prolly objects
 - regular and root prolly clients
-- parsed `CrabConfig`
+- parsed `TrailConfig`
 - in-process object cache
 - optional daemon worktree cache
 
@@ -113,12 +113,12 @@ The object is not only a storage handle. It also enforces workspace path policy,
 
 ## Storage Boundary
 
-CrabDB uses a hybrid storage model:
+Trail uses a hybrid storage model:
 
 - SQLite tables store refs, indexes, queue state, coordination records, and object metadata.
 - CBOR-encoded content-addressed objects store roots, operations, text content, messages, blobs, anchors, and conflict sets.
 - Prolly maps store ordered key-value structures for path maps, file indexes, text order, and line indexes.
-- Filesystem sidecars under `.crabdb` store config, HEAD, ref files, daemon discovery files, daemon token files, and materialized workdir manifests.
+- Filesystem sidecars under `.trail` store config, HEAD, ref files, daemon discovery files, daemon token files, and materialized workdir manifests.
 
 The design separates durable object truth from derived indexes. If derived indexes are damaged or stale, `index rebuild` reconstructs them from reachable operation and message objects.
 
@@ -151,13 +151,13 @@ This report boundary is a practical architecture choice. Raw SQLite rows, object
 
 Initialization creates:
 
-- `.crabdb/index`
-- `.crabdb/refs/branches`
-- `.crabdb/refs/lanes`
-- `.crabdb/worktrees`
+- `.trail/index`
+- `.trail/refs/branches`
+- `.trail/refs/lanes`
+- `.trail/worktrees`
 - `config.toml`
 - `HEAD`
-- `.crabignore`
+- `.trailignore`
 - initial schema and refs
 
 Opening a workspace applies SQLite pragmas, constructs prolly clients, initializes or validates schema, and refuses schema versions newer than the binary supports.
@@ -198,10 +198,10 @@ Inspect the architecture layer when adding:
 
 ## Code Facts Used
 
-- CLI runtime: `crates/crabdb/src/cli/command/handler.rs`
-- Runtime context: `crates/crabdb/src/cli/command/handler/runtime.rs`
-- Daemon routing: `crates/crabdb/src/cli/command/handler/daemon_rpc.rs`
-- `CrabDb`: `crates/crabdb/src/db/mod.rs`
-- Initialization/opening: `crates/crabdb/src/db/core/init.rs`
-- Library exports: `crates/crabdb/src/lib.rs`
-- Error model: `crates/crabdb/src/error.rs`
+- CLI runtime: `crates/trail/src/cli/command/handler.rs`
+- Runtime context: `crates/trail/src/cli/command/handler/runtime.rs`
+- Daemon routing: `crates/trail/src/cli/command/handler/daemon_rpc.rs`
+- `Trail`: `crates/trail/src/db/mod.rs`
+- Initialization/opening: `crates/trail/src/db/core/init.rs`
+- Library exports: `crates/trail/src/lib.rs`
+- Error model: `crates/trail/src/error.rs`

@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import { AcpClient, type AcpAuthMethod } from "../acp/AcpClient";
 import { defaultAgentCapabilities, type AgentCapabilities } from "../acp/AcpCapabilities";
 import { ProviderRegistry, type AcpProviderProfile } from "../acp/ProviderRegistry";
-import type { AgentTask, TaskRepository, TaskView } from "../crabdb/TaskRepository";
+import type { AgentTask, TaskRepository, TaskView } from "../trail/TaskRepository";
 import { attachmentToContentBlock, type PromptAttachment } from "../model/PromptAttachment";
 import {
   attachmentFromActiveFile,
@@ -24,7 +24,7 @@ import type { RenderNode, RenderPatch, RenderReduceContext } from "../shared/ren
 import { RenderStreamScheduler } from "../shared/renderStreamScheduler";
 import { redactedJson, redactString } from "../shared/securityRedaction";
 import { findTaskOverlaps, type TaskOverlap } from "../shared/taskOverlaps";
-import { hydrateTaskView, mergeHydratedNodes } from "../state/crabDbHydration";
+import { hydrateTaskView, mergeHydratedNodes } from "../state/trailHydration";
 import type { DiffContentProvider } from "./DiffContentProvider";
 import { laneGateLabel, promptLaneGateRequest } from "./LaneGatePrompts";
 import { ResourceOpener } from "./ResourceOpener";
@@ -87,7 +87,7 @@ export class ChatPanel {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      "crabdb.agentChat",
+      "trail.agentChat",
       task ? `Agent: ${task.title}` : "New Agent Task",
       vscode.ViewColumn.Beside,
       {
@@ -254,7 +254,7 @@ export class ChatPanel {
         this.output.show(true);
         break;
       case "openSettings":
-        await vscode.commands.executeCommand("crabdb.openSettings");
+        await vscode.commands.executeCommand("trail.openSettings");
         break;
       case "cancel":
         this.cancelCurrentTurn();
@@ -287,11 +287,11 @@ export class ChatPanel {
         );
         break;
       case "preserveFailedAttempt":
-        await vscode.commands.executeCommand("crabdb.preserveFailedAttempt", this.task);
+        await vscode.commands.executeCommand("trail.preserveFailedAttempt", this.task);
         await this.refresh();
         break;
       case "removeTask":
-        await vscode.commands.executeCommand("crabdb.removeAgentTask", this.task);
+        await vscode.commands.executeCommand("trail.removeAgentTask", this.task);
         break;
       case "openDiff":
         await this.runAndShow("diff", () => this.repository.diffTask(this.task?.lane || "latest"));
@@ -394,7 +394,7 @@ export class ChatPanel {
   private async attachHistory(): Promise<void> {
     const active = activeRelativeFilePath();
     if (!active) {
-      this.post({ type: "status", message: "Open a workspace file before attaching CrabDB history." });
+      this.post({ type: "status", message: "Open a workspace file before attaching Trail history." });
       return;
     }
     try {
@@ -403,7 +403,7 @@ export class ChatPanel {
         {
           id: stableAttachmentId("history", active, redactedJson(history)),
           kind: "history",
-          label: `CrabDB history for ${active}`,
+          label: `Trail history for ${active}`,
           mimeType: "application/json",
           text: redactedJson(history)
         }
@@ -439,7 +439,7 @@ export class ChatPanel {
     this.providerSwitchFrom = previous;
     this.forceCheckpointFollowUp = true;
     this.providerFailure = undefined;
-    this.post({ type: "status", message: `Switched provider to ${next.label}. The next prompt starts from the current CrabDB checkpoint.` });
+    this.post({ type: "status", message: `Switched provider to ${next.label}. The next prompt starts from the current Trail checkpoint.` });
     this.applyAndPostRenderPatches([], { force: true });
   }
 
@@ -490,7 +490,7 @@ export class ChatPanel {
     if (!trimmed && this.attachments.length === 0) {
       return;
     }
-    if (this.provider.crabdbBacked && !(await this.ensureCrabDbWorkspaceInitialized())) {
+    if (this.provider.trailBacked && !(await this.ensureTrailWorkspaceInitialized())) {
       return;
     }
     this.sending = true;
@@ -502,10 +502,10 @@ export class ChatPanel {
 
     try {
       if (!this.acp) {
-        if (!this.provider.crabdbBacked) {
+        if (!this.provider.trailBacked) {
           this.post({
             type: "status",
-            message: "This custom ACP command is not recognized as CrabDB-backed. Use a CrabDB relay command to keep durable task state."
+            message: "This custom ACP command is not recognized as Trail-backed. Use a Trail relay command to keep durable task state."
           });
         }
         this.recentAcpStderr = [];
@@ -544,7 +544,7 @@ export class ChatPanel {
           if (session.requestedSessionId && session.startMode === "new") {
             this.post({
               type: "status",
-              message: "Provider cannot resume this ACP session; starting a follow-up from the latest CrabDB checkpoint."
+              message: "Provider cannot resume this ACP session; starting a follow-up from the latest Trail checkpoint."
             });
           } else if (session.startMode === "load") {
             this.post({ type: "status", message: "Loaded the existing ACP session." });
@@ -597,7 +597,7 @@ export class ChatPanel {
         clearedAttachments = true;
       }
       await this.refresh({
-        claimLatestTask: this.provider.crabdbBacked && !this.task,
+        claimLatestTask: this.provider.trailBacked && !this.task,
         transport: "patch"
       });
       clearedAttachments = false;
@@ -634,18 +634,18 @@ export class ChatPanel {
     vscode.window.showWarningMessage(`Agent permission required: ${title}`);
   }
 
-  private async ensureCrabDbWorkspaceInitialized(): Promise<boolean> {
+  private async ensureTrailWorkspaceInitialized(): Promise<boolean> {
     if (this.repository.isWorkspaceInitialized()) {
       return true;
     }
-    const message = `CrabDB is not initialized for ${this.repository.workspaceRoot}.`;
+    const message = `Trail is not initialized for ${this.repository.workspaceRoot}.`;
     const action = await vscode.window.showErrorMessage(
-      `${message} Initialize the workspace before starting a CrabDB-backed agent.`,
-      "Initialize CrabDB"
+      `${message} Initialize the workspace before starting a Trail-backed agent.`,
+      "Initialize Trail"
     );
-    if (action === "Initialize CrabDB") {
+    if (action === "Initialize Trail") {
       try {
-        await vscode.commands.executeCommand("crabdb.initWorkspace");
+        await vscode.commands.executeCommand("trail.initWorkspace");
         if (this.repository.isWorkspaceInitialized()) {
           return true;
         }
@@ -656,11 +656,11 @@ export class ChatPanel {
     }
     this.post({
       type: "error",
-      message: "Initialize the CrabDB workspace before sending a prompt."
+      message: "Initialize the Trail workspace before sending a prompt."
     });
     this.providerFailure = {
-      message: "CrabDB workspace is not initialized.",
-      detail: `${message} Run the "CrabDB: Initialize Workspace" command, then retry the prompt.`,
+      message: "Trail workspace is not initialized.",
+      detail: `${message} Run the "Trail: Initialize Workspace" command, then retry the prompt.`,
       occurredAt: new Date().toISOString()
     };
     this.applyAndPostRenderPatches([], { force: true });
@@ -785,7 +785,7 @@ export class ChatPanel {
     this.acp = undefined;
     this.forceCheckpointFollowUp = true;
     this.providerFailure = undefined;
-    this.post({ type: "status", message: "The next prompt will start a follow-up from the latest CrabDB checkpoint." });
+    this.post({ type: "status", message: "The next prompt will start a follow-up from the latest Trail checkpoint." });
     this.applyAndPostRenderPatches([], { force: true });
   }
 
@@ -827,7 +827,7 @@ export class ChatPanel {
       }
       await vscode.workspace.fs.stat(vscode.Uri.file(cwd));
       const terminal = vscode.window.createTerminal({
-        name: node.title || node.terminalId || "CrabDB Agent",
+        name: node.title || node.terminalId || "Trail Agent",
         cwd
       });
       terminal.show();
@@ -899,7 +899,7 @@ export class ChatPanel {
     try {
       const tasks = await this.repository.listTasks();
       if (tasks.length < 2) {
-        this.post({ type: "status", message: "At least two CrabDB agent tasks are required to compare." });
+        this.post({ type: "status", message: "At least two Trail agent tasks are required to compare." });
         return;
       }
       const left = this.task ?? (await pickTask(tasks, "Choose left agent task"));
@@ -1053,7 +1053,7 @@ export class ChatPanel {
       providers: new ProviderRegistry(this.repository.workspaceRoot).profiles().map((profile) => ({
         id: profile.id,
         label: profile.label,
-        crabdbBacked: profile.crabdbBacked,
+        trailBacked: profile.trailBacked,
         supportsFromRef: profile.supportsFromRef
       })),
       acpSessionId: this.acpSessionId,
@@ -1095,7 +1095,7 @@ export class ChatPanel {
       providers: new ProviderRegistry(this.repository.workspaceRoot).profiles().map((profile) => ({
         id: profile.id,
         label: profile.label,
-        crabdbBacked: profile.crabdbBacked,
+        trailBacked: profile.trailBacked,
         supportsFromRef: profile.supportsFromRef
       })),
       acpSessionId: this.acpSessionId,
@@ -1175,10 +1175,10 @@ export class ChatPanel {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="${escapeHtml(csp)}">
   <link rel="stylesheet" href="${style}">
-  <title>CrabDB Agent Chat</title>
+  <title>Trail Agent Chat</title>
 </head>
 <body>
-  <main id="app" aria-label="CrabDB agent chat"></main>
+  <main id="app" aria-label="Trail agent chat"></main>
   <script nonce="${nonce}" type="module" src="${script}"></script>
 </body>
 </html>`;
@@ -1273,7 +1273,7 @@ function normalizeFilePath(filePath: string): string {
 }
 
 function terminalAttachmentText(node: Extract<RenderNode, { kind: "terminal" }>): string {
-  const lines = ["Terminal output from CrabDB ACP transcript"];
+  const lines = ["Terminal output from Trail ACP transcript"];
   if (node.title) {
     lines.push(`Title: ${node.title}`);
   }
@@ -1311,7 +1311,7 @@ function truncateAttachmentText(text: string, limit: number): string {
   if (text.length <= limit) {
     return text;
   }
-  return `${text.slice(0, limit)}\n\n[CrabDB VS Code truncated this attachment to ${limit} characters.]`;
+  return `${text.slice(0, limit)}\n\n[Trail VS Code truncated this attachment to ${limit} characters.]`;
 }
 
 function stableAttachmentId(...parts: string[]): string {

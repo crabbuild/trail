@@ -1,19 +1,19 @@
 # ACP Agent Integration
 
-CrabDB can sit between an ACP-capable editor and a real ACP coding agent. The
+Trail can sit between an ACP-capable editor and a real ACP coding agent. The
 relay is neutral: Claude Code, Codex, or another ACP agent remains the real
-agent, while CrabDB records lanes, turns, transcripts, events, and checkpoints.
+agent, while Trail records lanes, turns, transcripts, events, and checkpoints.
 
 ## Provider Modes
 
-CrabDB now treats code-agent integration as three complementary paths:
+Trail now treats code-agent integration as three complementary paths:
 
-- **ACP relay**: best capture path. CrabDB creates a fresh lane per prompt
+- **ACP relay**: best capture path. Trail creates a fresh lane per prompt
   session, injects its MCP server into the ACP initialize params, and records
   turns/tool events as they stream through the relay.
-- **MCP server**: context-tool path. Register `crabdb mcp` in the native agent
-  when the agent supports MCP so it can inspect CrabDB state directly.
-- **Terminal task**: universal CLI path. `crabdb agent start --provider <NAME>`
+- **MCP server**: context-tool path. Register `trail mcp` in the native agent
+  when the agent supports MCP so it can inspect Trail state directly.
+- **Terminal task**: universal CLI path. `trail agent start --provider <NAME>`
   creates a task lane workdir, runs the provider command there, and records the
   final checkpoint when the process exits. Use `--workdir-mode overlay-cow` to
   mount a transparent COW view for large repositories instead of creating a full
@@ -21,7 +21,7 @@ CrabDB now treats code-agent integration as three complementary paths:
 
 ## Built-In Providers
 
-CrabDB ships provider profiles for:
+Trail ships provider profiles for:
 
 - `claude-code`, via `@agentclientprotocol/claude-agent-acp`
 - `codex`, via `@agentclientprotocol/codex-acp`
@@ -31,13 +31,13 @@ CrabDB ships provider profiles for:
 - `opencode`, terminal mode
 
 Any other ACP-compatible agent can still be used by passing its upstream ACP
-command after `--` to `crabdb agent acp` or `crabdb acp relay`.
+command after `--` to `trail agent acp` or `trail acp relay`.
 Any terminal agent can be used by passing its command after `--` to
-`crabdb agent start`.
+`trail agent start`.
 
 ## Quickstart
 
-Install CrabDB normally:
+Install Trail normally:
 
 ```sh
 make install
@@ -46,105 +46,105 @@ make install
 Check the agent setup:
 
 ```sh
-crabdb agent doctor --provider claude-code
-crabdb agent doctor --provider codex
-crabdb agent doctor --provider cursor
-crabdb agent doctor --provider gemini
+trail agent doctor --provider claude-code
+trail agent doctor --provider codex
+trail agent doctor --provider cursor
+trail agent doctor --provider gemini
 ```
 
-Print editor configuration that creates a fresh CrabDB task lane for each ACP
+Print editor configuration that creates a fresh Trail task lane for each ACP
 session:
 
 ```sh
-crabdb agent setup
+trail agent setup
 ```
 
 After one prompt:
 
 ```sh
-crabdb agent next
+trail agent next
 ```
 
 Then inspect or apply as needed:
 
 ```sh
-crabdb agent
-crabdb agent board
-crabdb agent stack
-crabdb agent summary latest
-crabdb agent review-data latest
-crabdb agent story latest
-crabdb agent tools latest
-crabdb agent impact latest
-crabdb agent review-map latest
-crabdb agent mark-file-reviewed latest README.md
-crabdb agent risk latest
-crabdb agent confidence latest
-crabdb agent test-plan latest
-crabdb agent ready latest
-crabdb agent diagnose latest
-crabdb agent compare <TASK_A> <TASK_B>
-crabdb agent handoff latest
-crabdb agent receipt latest
-crabdb agent pr latest
-crabdb agent report latest --markdown
-crabdb agent validate latest
-crabdb agent test latest -- cargo test
-crabdb agent brief latest
-crabdb agent workdir latest
-crabdb agent delta latest
-crabdb agent new latest
-crabdb agent changes latest
-crabdb agent review-flow latest
-crabdb agent ask walk me through review
-crabdb agent turn
-crabdb agent turn-diff latest --patch
-crabdb agent files latest
-crabdb agent checkpoints latest
-crabdb agent why README.md
-crabdb agent turn-diff latest --file README.md --patch
-crabdb agent review-plan latest
-crabdb agent focus latest
-crabdb agent view latest
-crabdb agent ready latest
-crabdb agent apply latest
+trail agent
+trail agent board
+trail agent stack
+trail agent summary latest
+trail agent review-data latest
+trail agent story latest
+trail agent tools latest
+trail agent impact latest
+trail agent review-map latest
+trail agent mark-file-reviewed latest README.md
+trail agent risk latest
+trail agent confidence latest
+trail agent test-plan latest
+trail agent ready latest
+trail agent diagnose latest
+trail agent compare <TASK_A> <TASK_B>
+trail agent handoff latest
+trail agent receipt latest
+trail agent pr latest
+trail agent report latest --markdown
+trail agent validate latest
+trail agent test latest -- cargo test
+trail agent brief latest
+trail agent workdir latest
+trail agent delta latest
+trail agent new latest
+trail agent changes latest
+trail agent review-flow latest
+trail agent ask walk me through review
+trail agent turn
+trail agent turn-diff latest --patch
+trail agent files latest
+trail agent checkpoints latest
+trail agent why README.md
+trail agent turn-diff latest --file README.md --patch
+trail agent review-plan latest
+trail agent focus latest
+trail agent view latest
+trail agent ready latest
+trail agent apply latest
 ```
 
 The lower-level Claude Code ACP profile still uses:
 
 ```sh
-crabdb acp relay --provider claude-code --materialize -- npx -y @agentclientprotocol/claude-agent-acp@latest
+trail acp relay --provider claude-code --materialize -- npx -y @agentclientprotocol/claude-agent-acp@latest
 ```
 
 The lower-level Codex ACP profile uses:
 
 ```sh
-crabdb acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
+trail acp relay --provider codex --materialize -- npx -y @agentclientprotocol/codex-acp@latest
 ```
 
 The lower-level Cursor ACP profile uses:
 
 ```sh
-crabdb acp relay --provider cursor --materialize -- agent acp
+trail acp relay --provider cursor --materialize -- agent acp
 ```
 
 Terminal-first agents use fresh task lanes:
 
 ```sh
-crabdb agent start --provider gemini
-crabdb agent start --provider aider
-crabdb agent start --provider opencode
-crabdb agent start --provider custom -- my-agent --flag
+trail agent start --provider gemini
+trail agent start --provider aider
+trail agent start --provider opencode
+trail agent start --provider custom -- my-agent --flag
 ```
 
 For large repositories, terminal agents can use the overlay COW workdir mode:
 
 ```sh
-crabdb agent start --provider codex --workdir-mode overlay-cow
-crabdb agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+trail agent start --provider codex --workdir-mode overlay-cow
+trail agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
 ```
 
-The overlay mount is held only while the terminal process runs and while CrabDB
+The overlay mount is held only while the terminal process runs and while Trail
 records the checkpoint afterward. On macOS it requires macFUSE; on Linux it
 requires FUSE access such as `/dev/fuse`.
 
@@ -157,53 +157,53 @@ edit verification and ACP permission responses, see
 For day-to-day use, prefer the task-oriented commands:
 
 ```sh
-crabdb agent
-crabdb agent next
-crabdb agent stack
-crabdb agent summary latest
-crabdb agent review-data latest
-crabdb agent story latest
-crabdb agent tools latest
-crabdb agent impact latest
-crabdb agent review-map latest
-crabdb agent mark-file-reviewed latest README.md
-crabdb agent risk latest
-crabdb agent confidence latest
-crabdb agent test-plan latest
-crabdb agent ready latest
-crabdb agent diagnose latest
-crabdb agent compare <TASK_A> <TASK_B>
-crabdb agent receipt latest
-crabdb agent pr latest
-crabdb agent report latest --markdown
-crabdb agent validate latest
-crabdb agent test latest -- cargo test
-crabdb agent brief latest
-crabdb agent workdir latest
-crabdb agent delta latest
-crabdb agent new latest
-crabdb agent changes latest
-crabdb agent review-flow latest
-crabdb agent ask walk me through review
-crabdb agent turn
-crabdb agent turn-diff latest --patch
-crabdb agent files latest
-crabdb agent checkpoints latest
-crabdb agent why README.md
-crabdb agent turn-diff latest --file README.md --patch
-crabdb agent review-plan latest
-crabdb agent focus latest
-crabdb agent view latest
-crabdb agent ready latest
-crabdb agent apply latest
+trail agent
+trail agent next
+trail agent stack
+trail agent summary latest
+trail agent review-data latest
+trail agent story latest
+trail agent tools latest
+trail agent impact latest
+trail agent review-map latest
+trail agent mark-file-reviewed latest README.md
+trail agent risk latest
+trail agent confidence latest
+trail agent test-plan latest
+trail agent ready latest
+trail agent diagnose latest
+trail agent compare <TASK_A> <TASK_B>
+trail agent receipt latest
+trail agent pr latest
+trail agent report latest --markdown
+trail agent validate latest
+trail agent test latest -- cargo test
+trail agent brief latest
+trail agent workdir latest
+trail agent delta latest
+trail agent new latest
+trail agent changes latest
+trail agent review-flow latest
+trail agent ask walk me through review
+trail agent turn
+trail agent turn-diff latest --patch
+trail agent files latest
+trail agent checkpoints latest
+trail agent why README.md
+trail agent turn-diff latest --file README.md --patch
+trail agent review-plan latest
+trail agent focus latest
+trail agent view latest
+trail agent ready latest
+trail agent apply latest
 ```
 
 For low-level ACP inspection:
 
 ```sh
-crabdb acp sessions
-crabdb transcript <lane>
-crabdb lane review <lane>
+trail acp sessions
+trail transcript <lane>
+trail lane review <lane>
 ```
 
 The core terms are:
@@ -216,7 +216,7 @@ If an agent goes sideways, use task-level undo instead of copying checkpoint
 ids:
 
 ```sh
-crabdb agent undo latest
-crabdb agent undo latest --turn 2
-crabdb agent undo latest --prompt 'Add hook support'
+trail agent undo latest
+trail agent undo latest --turn 2
+trail agent undo latest --prompt 'Add hook support'
 ```

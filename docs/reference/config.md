@@ -1,6 +1,6 @@
 # Configuration Reference
 
-Use `crabdb config list`, `get`, and `set` to inspect and edit workspace config.
+Use `trail config list`, `get`, and `set` to inspect and edit workspace config.
 
 ## Keys
 
@@ -59,13 +59,13 @@ False values:
 
 ## Text Policies at Init
 
-`crabdb init --text-policy minimal|balanced|full` applies preset text thresholds before the config is written.
+`trail init --text-policy minimal|balanced|full` applies preset text thresholds before the config is written.
 
 ## Prolly Storage Backend
 
-`crabdb init --prolly-backend sqlite|slatedb` chooses where Prolly tree nodes are stored for a new workspace. `sqlite` keeps nodes in `.crabdb/index/crabdb.sqlite`. `slatedb` stores nodes in SlateDB backed by the configured S3-compatible object store.
+`trail init --prolly-backend sqlite|slatedb` chooses where Prolly tree nodes are stored for a new workspace. `sqlite` keeps nodes in `.trail/index/trail.sqlite`. `slatedb` stores nodes in SlateDB backed by the configured S3-compatible object store.
 
-When initialized with `--prolly-backend slatedb`, CrabDB writes a workspace-scoped default `storage.slatedb_path` of `crabdb/workspaces/<workspace-id>/prolly`. The default S3-compatible settings target local RustFS-compatible development:
+When initialized with `--prolly-backend slatedb`, Trail writes a workspace-scoped default `storage.slatedb_path` of `trail/workspaces/<workspace-id>/prolly`. The default S3-compatible settings target local RustFS-compatible development:
 
 ```text
 storage.slatedb_s3_endpoint = "http://localhost:9000"
@@ -82,7 +82,7 @@ storage.slatedb_s3_allow_http = true
 as a policy boundary for lane patches and materialized workdir records:
 
 - `off`: claims and leases remain advisory only.
-- `warn`: mutations outside active write claims/leases are allowed, but CrabDB
+- `warn`: mutations outside active write claims/leases are allowed, but Trail
   records a `lane_policy_warning` event.
 - `reject`: mutations outside active write claims/leases are rejected.
 
@@ -110,13 +110,13 @@ limit.
 Example hardened profile:
 
 ```sh
-crabdb config set lane.claim_enforcement warn
-crabdb config set lane.enforce_sparse_paths true
-crabdb config set lane.max_changed_paths 25
-crabdb config set lane.max_patch_bytes 1048576
-crabdb config set lane.max_patch_file_bytes 262144
-crabdb config set lane.max_event_payload_bytes 65536
-crabdb config set lane.max_trace_payload_bytes 65536
+trail config set lane.claim_enforcement warn
+trail config set lane.enforce_sparse_paths true
+trail config set lane.max_changed_paths 25
+trail config set lane.max_patch_bytes 1048576
+trail config set lane.max_patch_file_bytes 262144
+trail config set lane.max_event_payload_bytes 65536
+trail config set lane.max_trace_payload_bytes 65536
 ```
 
 ## Guardrail Policy Grammar
@@ -141,8 +141,8 @@ Scopes:
 
 ## Code Facts Used
 
-- Config model: `crates/crabdb/src/model/domain/config.rs`
-- Config entries: `crates/crabdb/src/db/util/config/entries.rs`
-- Config validation: `crates/crabdb/src/db/util/config/set.rs`
-- Parsing helpers: `crates/crabdb/src/db/util/config_parse.rs`
-- Guardrail policy parser: `crates/crabdb/src/db/util/guardrails/policy.rs`
+- Config model: `crates/trail/src/model/domain/config.rs`
+- Config entries: `crates/trail/src/db/util/config/entries.rs`
+- Config validation: `crates/trail/src/db/util/config/set.rs`
+- Parsing helpers: `crates/trail/src/db/util/config_parse.rs`
+- Guardrail policy parser: `crates/trail/src/db/util/guardrails/policy.rs`

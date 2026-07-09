@@ -31,7 +31,7 @@
   <rect width="900" height="800" fill="url(#grid)"/>
 
   <text x="30" y="34" class="title">Content-Defined Boundary Predicate</text>
-  <text x="30" y="52" class="subtitle">CrabDB's prolly chunks split only after min size, always at max size, otherwise by deterministic entry hash.</text>
+  <text x="30" y="52" class="subtitle">Trail's prolly chunks split only after min size, always at max size, otherwise by deterministic entry hash.</text>
 
   <rect x="330" y="86" width="240" height="54" rx="25" fill="#0f172a"/>
   <rect x="330" y="86" width="240" height="54" rx="25" fill="rgba(59,130,246,0.3)" stroke="#60a5fa" stroke-width="1.5"/>

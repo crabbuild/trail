@@ -1,7 +1,7 @@
 # Hardening Agent Workflows
 
 This guide collects the production hardening controls for running humans,
-automation, and coding agents against the same CrabDB workspace. The defaults
+automation, and coding agents against the same Trail workspace. The defaults
 stay compatible with lightweight local use, while config flags can turn
 coordination hints into enforceable boundaries.
 
@@ -10,52 +10,52 @@ coordination hints into enforceable boundaries.
 Start with warnings, then move to rejection after existing workflows are clean.
 
 ```sh
-crabdb config set lane.claim_enforcement warn
-crabdb config set lane.enforce_sparse_paths true
-crabdb config set lane.max_changed_paths 25
-crabdb config set lane.max_patch_bytes 1048576
-crabdb config set lane.max_patch_file_bytes 262144
-crabdb config set lane.max_event_payload_bytes 65536
-crabdb config set lane.max_trace_payload_bytes 65536
+trail config set lane.claim_enforcement warn
+trail config set lane.enforce_sparse_paths true
+trail config set lane.max_changed_paths 25
+trail config set lane.max_patch_bytes 1048576
+trail config set lane.max_patch_file_bytes 262144
+trail config set lane.max_event_payload_bytes 65536
+trail config set lane.max_trace_payload_bytes 65536
 ```
 
 After agents consistently claim or lease their intended paths:
 
 ```sh
-crabdb config set lane.claim_enforcement reject
+trail config set lane.claim_enforcement reject
 ```
 
 Use merge queue for shared targets instead of direct merges:
 
 ```sh
-crabdb merge-queue add docs-lane --into main
-crabdb merge-queue explain docs-lane
-crabdb merge-queue run
+trail merge-queue add docs-lane --into main
+trail merge-queue explain docs-lane
+trail merge-queue run
 ```
 
 ## Lane Isolation
 
 Path claims and leases are advisory by default. With
-`lane.claim_enforcement=warn`, CrabDB records a `lane_policy_warning` event when
+`lane.claim_enforcement=warn`, Trail records a `lane_policy_warning` event when
 a lane patch or materialized workdir record touches a path outside active write
 claims/leases. With `reject`, the same mutation is blocked. Read leases do not
 grant write permission.
 
 ```sh
-crabdb lane claim docs-lane docs README.md --ttl-secs 1800
-crabdb lane record docs-lane --preview
+trail lane claim docs-lane docs README.md --ttl-secs 1800
+trail lane record docs-lane --preview
 ```
 
 Sparse materialization can also become a hard boundary. When a lane is spawned
 with selected paths and `lane.enforce_sparse_paths=true`, lane patches and
 workdir records must stay inside those selected paths. Rename source and
-destination paths are checked. CrabDB persists the sparse boundary in lane
-metadata, so enforcement survives a missing `.crabdb/sparse-workdir.json` and
+destination paths are checked. Trail persists the sparse boundary in lane
+metadata, so enforcement survives a missing `.trail/sparse-workdir.json` and
 can recreate the manifest after a valid sparse update.
 
 ```sh
-crabdb lane spawn docs-lane --from main --materialize=true --paths docs README.md
-crabdb config set lane.enforce_sparse_paths true
+trail lane spawn docs-lane --from main --materialize=true --paths docs README.md
+trail config set lane.enforce_sparse_paths true
 ```
 
 Quotas provide blast-radius limits:
@@ -86,7 +86,7 @@ set deliberately. Turn-linked patches may omit `base_change` because the turn's
 ```
 
 For sensitive text edits, prefer `replace_line` with both `line_id` and
-`expected_text`. CrabDB rejects missing or mismatched expected text before
+`expected_text`. Trail rejects missing or mismatched expected text before
 mutating the lane.
 
 ```json
@@ -104,10 +104,10 @@ mutating the lane.
 }
 ```
 
-Patch paths are normalized before use. CrabDB rejects parent-directory escapes,
+Patch paths are normalized before use. Trail rejects parent-directory escapes,
 absolute paths, backslash separators on non-Windows external paths, non-NFC
 Unicode, invisible Unicode format controls, separator lookalikes,
-case-insensitive collisions, Windows reserved names/aliases, `.crabdb`, `.git`,
+case-insensitive collisions, Windows reserved names/aliases, `.trail`, `.git`,
 hardcoded private paths, and ignored paths unless explicitly allowed.
 
 Patch messages and edit payloads are secret-scanned before storage. Event and
@@ -119,19 +119,19 @@ large secret-bearing payload cannot bypass quotas by shrinking after redaction.
 Before recording a materialized lane workdir, preview it:
 
 ```sh
-crabdb lane record docs-lane --preview --json
+trail lane record docs-lane --preview --json
 ```
 
 The preview reports:
 
 - `changed_paths`: additions, modifications, deletes, renames, and mode changes.
-- `ignored_paths`: paths matched by `.crabignore` or `.gitignore`.
-- `risky_paths`: nested `.git`, nested `.crabdb`, symlinks, hardlinks, and
+- `ignored_paths`: paths matched by `.trailignore` or `.gitignore`.
+- `risky_paths`: nested `.git`, nested `.trail`, symlinks, hardlinks, and
   best-effort external mount/device boundaries.
 - `oversized_files`: changed files over `lane.max_patch_file_bytes`.
 - `policy`: whether the current record would pass path and quota policy.
 
-Workdir sync and force refresh are transactional: CrabDB stages the new workdir
+Workdir sync and force refresh are transactional: Trail stages the new workdir
 contents, verifies the manifest, then swaps or updates. If force refresh must
 replace an existing non-directory or symlink workdir path, it writes a rescue
 copy beside the workdir before promotion.
@@ -154,7 +154,7 @@ example `lane started 14 operations behind main`.
 Before merging, inspect the queue item:
 
 ```sh
-crabdb merge-queue explain docs-lane
+trail merge-queue explain docs-lane
 ```
 
 `merge-queue explain` includes readiness blockers, dry-run conflicts, preflight
@@ -168,7 +168,7 @@ suggestions from earlier resolutions.
 Use refresh preview to understand a stale lane before merging:
 
 ```sh
-crabdb lane refresh-preview docs-lane --target main
+trail lane refresh-preview docs-lane --target main
 ```
 
 It reports operations behind, incoming target changes, conflicts, changed paths,

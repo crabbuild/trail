@@ -1,21 +1,21 @@
 # Integration Overview
 
-CrabDB exposes five integration surfaces:
+Trail exposes five integration surfaces:
 
 - CLI: primary human and scripting interface.
 - HTTP daemon: JSON API for editor and automation integrations.
 - MCP server: stdio server with tools, resources, prompts, and completions for agent hosts.
 - ACP relay: stdio relay in front of ACP-capable coding agents.
-- Rust library: public `CrabDb` API and exported model/report types.
+- Rust library: public `Trail` API and exported model/report types.
 
 Git interop is also available through the CLI and library.
 
 The [ACP integration guide](./acp.md) and
-[ACP Agent Usage Runbook](./acp-agent-usage.md) show how CrabDB sits between
+[ACP Agent Usage Runbook](./acp-agent-usage.md) show how Trail sits between
 ACP-capable editors and real coding agents while mirroring sessions, turns,
-prompts, tool events, and edits into CrabDB.
+prompts, tool events, and edits into Trail.
 The [VS Code ACP chat view design](../design/vscode-acp-chat-view.md) describes
-how a VS Code extension can render ACP chat components while treating CrabDB as
+how a VS Code extension can render ACP chat components while treating Trail as
 the durable source of truth for tasks, turns, checkpoints, review, and recovery.
 The initial extension implementation lives in
 [`extensions/vscode`](../../extensions/vscode/README.md).
@@ -42,21 +42,21 @@ Use MCP when:
 Use the ACP relay when:
 
 - An editor speaks Agent Client Protocol.
-- You want the editor to keep its normal agent UX while CrabDB records the run.
-- The real coding agent should receive CrabDB MCP tools automatically.
+- You want the editor to keep its normal agent UX while Trail records the run.
+- The real coding agent should receive Trail MCP tools automatically.
 
 Use the Rust library when:
 
-- You are embedding CrabDB in another Rust process.
-- You need direct typed access to `CrabDb` methods and reports.
+- You are embedding Trail in another Rust process.
+- You need direct typed access to `Trail` methods and reports.
 
 ## Code Facts Used
 
-- CLI entrypoint: `crates/crabdb/src/cli`
-- HTTP server: `crates/crabdb/src/server`
-- MCP server: `crates/crabdb/src/mcp`
+- CLI entrypoint: `crates/trail/src/cli`
+- HTTP server: `crates/trail/src/server`
+- MCP server: `crates/trail/src/mcp`
 - ACP usage: `docs/integrations/acp-agent-usage.md`
-- Library exports: `crates/crabdb/src/lib.rs`
+- Library exports: `crates/trail/src/lib.rs`
 - ACP relay proposal: `docs/design/acp-relay.md`
 - VS Code ACP chat view: `docs/design/vscode-acp-chat-view.md`
 - VS Code extension implementation: `extensions/vscode`

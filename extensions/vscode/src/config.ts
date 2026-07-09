@@ -8,16 +8,16 @@ export interface CustomProviderConfig {
 }
 
 export interface ExtensionConfig {
-  crabdbPath: string;
+  trailPath: string;
   defaultProvider: string;
   autoStartDaemon: boolean;
   customProviders: CustomProviderConfig[];
 }
 
 export function getExtensionConfig(): ExtensionConfig {
-  const config = vscode.workspace.getConfiguration("crabdb");
+  const config = vscode.workspace.getConfiguration("trail");
   return {
-    crabdbPath: config.get<string>("path", "crabdb"),
+    trailPath: config.get<string>("path", "trail"),
     defaultProvider: config.get<string>("defaultProvider", "claude-code"),
     autoStartDaemon: config.get<boolean>("autoStartDaemon", true),
     customProviders: config.get<CustomProviderConfig[]>("customProviders", [])
@@ -31,7 +31,7 @@ export function getWorkspaceRoot(): string | undefined {
 export function requireWorkspaceRoot(): string {
   const root = getWorkspaceRoot();
   if (!root) {
-    throw new Error("Open a folder to use CrabDB agents.");
+    throw new Error("Open a folder to use Trail agents.");
   }
   return root;
 }

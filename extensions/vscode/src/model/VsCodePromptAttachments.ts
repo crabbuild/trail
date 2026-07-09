@@ -75,7 +75,7 @@ function truncateAttachmentText(text: string): string {
   if (text.length <= limit) {
     return text;
   }
-  return `${text.slice(0, limit)}\n\n[CrabDB VS Code truncated this attachment to ${limit} characters.]`;
+  return `${text.slice(0, limit)}\n\n[Trail VS Code truncated this attachment to ${limit} characters.]`;
 }
 
 function mimeTypeForDocument(document: vscode.TextDocument): string {

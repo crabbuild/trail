@@ -5,20 +5,20 @@
 Human output is the default:
 
 ```sh
-crabdb status
+trail status
 ```
 
 JSON output:
 
 ```sh
-crabdb --json status
-crabdb --format json status
+trail --json status
+trail --format json status
 ```
 
 NDJSON is accepted by the global formatter and currently used by `index watch`:
 
 ```sh
-crabdb --format ndjson index watch --iterations 3
+trail --format ndjson index watch --iterations 3
 ```
 
 ## Error Shape
@@ -88,8 +88,8 @@ The HTTP daemon maps selected errors to:
 
 ## Code Facts Used
 
-- Error enum and exit codes: `crates/crabdb/src/error.rs`
-- CLI rendering: `crates/crabdb/src/cli/command/handler/errors.rs`
-- HTTP error responses: `crates/crabdb/src/server/route/utils.rs`
+- Error enum and exit codes: `crates/trail/src/error.rs`
+- CLI rendering: `crates/trail/src/cli/command/handler/errors.rs`
+- HTTP error responses: `crates/trail/src/server/route/utils.rs`
 - Tests: `cli_json_errors_are_machine_readable`
 

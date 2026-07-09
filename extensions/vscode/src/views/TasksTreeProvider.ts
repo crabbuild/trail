@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { AgentTask, MergeQueueEntry, TaskRepository } from "../crabdb/TaskRepository";
+import type { AgentTask, MergeQueueEntry, TaskRepository } from "../trail/TaskRepository";
 import {
   buildEmptyTreePresentation,
   buildGroupTreePresentation,
@@ -99,9 +99,9 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
       const entry = element.entry;
       const item = treeItemFromPresentation(buildQueueItemTreePresentation(entry));
       item.id = entry.id;
-      item.contextValue = "crabdbQueueEntry";
+      item.contextValue = "trailQueueEntry";
       item.command = {
-        command: "crabdb.explainQueueEntry",
+        command: "trail.explainQueueEntry",
         title: "Explain Merge Queue Entry",
         arguments: [entry]
       };
@@ -111,9 +111,9 @@ export class TasksTreeProvider implements vscode.TreeDataProvider<TreeEntry> {
     const task = element.task;
     const item = treeItemFromPresentation(buildTaskTreePresentation(task, this.mode === "reviews" ? "reviews" : "tasks"));
     item.id = task.id;
-    item.contextValue = "crabdbTask";
+    item.contextValue = "trailTask";
     item.command = {
-      command: "crabdb.openAgentChat",
+      command: "trail.openAgentChat",
       title: "Open Agent Chat",
       arguments: [task]
     };
