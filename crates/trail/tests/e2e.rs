@@ -2831,6 +2831,42 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     let turn_latest = run_trail_json(temp.path(), &["agent", "turn"]);
     assert_eq!(turn_latest["task"]["lane"], lane);
     assert_eq!(turn_latest["index"], 1);
+    assert_eq!(
+        turn_latest["turn_envelope"]["schema"],
+        "trail.turn_envelope"
+    );
+    assert_eq!(turn_latest["turn_envelope"]["version"], 1);
+    assert_eq!(turn_latest["turn_envelope"]["provider"], "claude-code");
+    assert_eq!(turn_latest["turn_envelope"]["kind"], "acp_prompt");
+    assert_eq!(turn_latest["turn_envelope"]["protocol"], "acp");
+    assert_eq!(
+        turn_latest["turn_envelope"]["session"]["upstream_session_id"],
+        "sess_agent_stub_b"
+    );
+    assert!(
+        turn_latest["turn_envelope"]["prompt"]["hash"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 8
+    );
+    assert_eq!(
+        turn_latest["turn_envelope"]["outcome"]["checkpoint"],
+        turn_latest["checkpoint"]
+    );
+    assert_eq!(turn_latest["turn_envelope"]["outcome"]["no_changes"], false);
+    assert!(
+        turn_latest["turn_envelope"]["capture"]["event_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        turn_latest["turn_envelope"]["capture"]["tool_event_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert!(turn_latest["prompt_preview"]
         .as_str()
         .unwrap()
@@ -2844,6 +2880,9 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
             .as_str()
             .unwrap()
             .contains("agent turn")));
+    let turn_id = turn_latest["turn_id"].as_str().unwrap();
+    let lane_turn = run_trail_json(temp.path(), &["lane", "turn", "show", turn_id]);
+    assert_eq!(lane_turn["turn_envelope"], turn_latest["turn_envelope"]);
     let ask_last_prompt = run_trail_json(temp.path(), &["agent", "ask", "last", "prompt"]);
     assert_eq!(ask_last_prompt["task"]["lane"], lane);
     assert_eq!(ask_last_prompt["index"], 1);

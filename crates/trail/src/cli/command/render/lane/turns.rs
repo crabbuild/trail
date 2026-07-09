@@ -57,6 +57,17 @@ pub(crate) fn render_lane_turn_details(
         if let Some(after) = &details.turn.after_change {
             println!("After: {}", after.0);
         }
+        if let Some(envelope) = &details.turn_envelope {
+            if let Some(provider) = &envelope.provider {
+                println!("Provider: {provider}");
+            }
+            if let Some(model) = &envelope.model {
+                println!("Model: {model}");
+            }
+            if envelope.outcome.no_changes {
+                println!("Outcome: no changes");
+            }
+        }
         println!("Messages: {}", details.messages.len());
         println!("Events: {}", details.events.len());
         println!("Operations: {}", details.operations.len());

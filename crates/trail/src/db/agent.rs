@@ -2732,15 +2732,23 @@ impl Trail {
             checkpoint,
             before_change,
             after_change,
+            turn_envelope,
             messages,
             event_count,
             tool_summaries,
         ) = {
             let (index, turn) = agent_turn_by_user_selector(&view, turn_selector)?;
-            let checkpoint = turn
-                .checkpoint
-                .clone()
-                .or_else(|| turn.turn.after_change.clone());
+            let checkpoint = if turn
+                .turn_envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.outcome.no_changes)
+            {
+                None
+            } else {
+                turn.checkpoint
+                    .clone()
+                    .or_else(|| turn.turn.after_change.clone())
+            };
             (
                 index,
                 turn.turn.turn_id.clone(),
@@ -2751,6 +2759,7 @@ impl Trail {
                 checkpoint.clone(),
                 turn.turn.before_change.clone(),
                 checkpoint,
+                turn.turn_envelope.clone(),
                 turn.messages.clone(),
                 turn.events.len(),
                 turn.tool_summaries.clone(),
@@ -2786,6 +2795,7 @@ impl Trail {
             id,
             turn_id,
             status,
+            turn_envelope,
             prompt_preview,
             assistant_preview,
             checkpoint,

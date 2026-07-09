@@ -167,12 +167,20 @@ impl Trail {
         let mut turns = Vec::new();
         for turn in details.turns {
             let turn_details = self.show_lane_turn(&turn.turn_id)?;
-            let checkpoint = turn_details.turn.after_change.clone().or_else(|| {
-                turn_details
-                    .operations
-                    .last()
-                    .map(|operation| operation.change_id.clone())
-            });
+            let turn_envelope = turn_details.turn_envelope;
+            let checkpoint = if turn_envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.outcome.no_changes)
+            {
+                None
+            } else {
+                turn_details.turn.after_change.clone().or_else(|| {
+                    turn_details
+                        .operations
+                        .last()
+                        .map(|operation| operation.change_id.clone())
+                })
+            };
             let tool_summaries = turn_details
                 .events
                 .iter()
@@ -185,6 +193,7 @@ impl Trail {
                 .filter_map(tool_summary_for_event)
                 .collect();
             turns.push(TranscriptTurn {
+                turn_envelope,
                 turn: turn_details.turn,
                 messages: turn_details
                     .messages

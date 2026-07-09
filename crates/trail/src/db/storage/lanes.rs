@@ -142,6 +142,18 @@ impl Trail {
         Ok(())
     }
 
+    pub(crate) fn update_lane_turn_metadata(
+        &self,
+        turn_id: &str,
+        metadata_json: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE lane_turns SET metadata_json = ?1 WHERE turn_id = ?2",
+            params![serde_json::to_string(metadata_json)?, turn_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn lane_turn(&self, turn_id: &str) -> Result<LaneTurn> {
         self.conn
             .query_row(

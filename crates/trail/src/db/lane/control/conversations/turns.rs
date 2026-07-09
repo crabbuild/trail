@@ -220,6 +220,7 @@ impl Trail {
             .map(|session_id| self.lane_session(session_id))
             .transpose()?;
         Ok(LaneTurnDetails {
+            turn_envelope: TurnEnvelope::from_metadata_json(turn.metadata_json.as_deref()),
             messages: self.lane_turn_messages(turn_id)?,
             events: self.lane_turn_events(turn_id)?,
             operations: self.lane_turn_operations(turn_id)?,

@@ -2096,6 +2096,32 @@ pub(crate) fn render_agent_turn(report: &AgentTurnReport, json: bool, quiet: boo
         print_agent_task_workdir(&report.task);
         println!("Status: {}", report.status);
         println!("Turn id: {}", report.turn_id);
+        if let Some(envelope) = &report.turn_envelope {
+            if let Some(provider) = &envelope.provider {
+                println!("Provider: {provider}");
+            }
+            if let Some(model) = &envelope.model {
+                println!("Model: {model}");
+            }
+            if envelope.outcome.no_changes {
+                println!("Outcome: no changes");
+            }
+            if envelope.usage.used.is_some() || envelope.usage.size.is_some() {
+                println!(
+                    "Usage: used {} / size {}",
+                    envelope
+                        .usage
+                        .used
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    envelope
+                        .usage
+                        .size
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                );
+            }
+        }
         if let Some(prompt) = &report.prompt_preview {
             println!("Prompt: {prompt}");
         }

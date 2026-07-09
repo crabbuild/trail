@@ -531,6 +531,7 @@ fn copy_upstream_stderr<R: Read>(reader: R) -> io::Result<()> {
 #[derive(Clone, Debug)]
 struct SessionState {
     acp_session_id: String,
+    upstream_session_id: Option<String>,
     lane_name: String,
     trail_session_id: String,
     original_cwd: String,
@@ -567,6 +568,11 @@ struct ActiveTurn {
     tool_spans: HashMap<String, String>,
     structured_diff_keys: HashSet<String>,
     pending_events: Vec<BufferedTurnEvent>,
+    usage: TurnEnvelopeUsage,
+    event_count: u64,
+    tool_event_count: u64,
+    structured_diff_count: u64,
+    redaction_applied: bool,
     assistant_buffer_bytes: usize,
     capture_truncated: bool,
 }
@@ -614,8 +620,19 @@ impl ActiveTurn {
     }
 
     fn push_event(&mut self, event_type: impl Into<String>, payload: Option<Value>) {
+        let event_type = event_type.into();
+        if payload.as_ref().is_some_and(value_has_redaction_marker) {
+            self.redaction_applied = true;
+        }
+        self.event_count += 1;
+        if matches!(
+            event_type.as_str(),
+            "tool_call" | "tool_call_update" | "span_started" | "span_ended"
+        ) {
+            self.tool_event_count += 1;
+        }
         self.pending_events.push(BufferedTurnEvent {
-            event_type: event_type.into(),
+            event_type,
             payload,
             change_id: None,
             message_id: None,
@@ -868,6 +885,7 @@ impl CaptureCoordinator {
                     self.materialized_cwd_for_existing_lane(&lane_name, original_cwd)?;
                 let state = SessionState {
                     acp_session_id: acp_session_id.to_string(),
+                    upstream_session_id: mapping.upstream_session_id,
                     lane_name,
                     trail_session_id: mapping.trail_session_id,
                     original_cwd: original_cwd.to_string(),
@@ -934,6 +952,7 @@ impl CaptureCoordinator {
                     crate::ids::short_hash(session.session_id.as_bytes(), 8)
                 )
             }),
+            upstream_session_id: None,
             lane_name,
             trail_session_id: session.session_id,
             original_cwd: original_cwd.to_string(),
@@ -975,6 +994,7 @@ impl CaptureCoordinator {
             .to_string();
         let mut session = pending.session.clone();
         session.acp_session_id = acp_session_id.clone();
+        session.upstream_session_id = response_session_id(message).map(str::to_string);
 
         let mut db = self.open_db()?;
         db.upsert_lane_acp_session(
@@ -1023,21 +1043,37 @@ impl CaptureCoordinator {
         let session = self.resolve_session_state(acp_session_id)?;
         let prompt_text = prompt_text(params.get("prompt"));
         let mut db = self.open_db()?;
+        let branch = db.lane_branch(&session.lane_name)?;
+        let initial_envelope = TurnEnvelope::new_acp_prompt(TurnEnvelopeAcpPromptInput {
+            provider: self.options.provider.clone(),
+            model: self.options.model.clone(),
+            trail_session_id: session.trail_session_id.clone(),
+            acp_session_id: acp_session_id.to_string(),
+            upstream_session_id: session.upstream_session_id.clone(),
+            upstream_command_hash: self.upstream_command_hash(),
+            prompt_hash: prompt_hash(&prompt_text),
+            prompt_summary: summarize_text(&prompt_text),
+            user_message_id: None,
+            lane: session.lane_name.clone(),
+            cwd: session.original_cwd.clone(),
+            effective_cwd: session.effective_cwd.clone(),
+            workdir_mode: if session.materialized {
+                "materialized".to_string()
+            } else {
+                "virtual".to_string()
+            },
+            base_change: branch.base_change.clone(),
+            before_change: branch.head_change.clone(),
+        });
         let turn = db.begin_lane_session_turn(
             &session.lane_name,
             &session.trail_session_id,
-            Some(redact_json(serde_json::json!({
-                "kind": "acp_prompt",
-                "protocol": "acp",
-                "acp_session_id": acp_session_id,
-                "provider": self.options.provider,
-                "model": self.options.model,
-                "cwd": session.original_cwd,
-                "effective_cwd": session.effective_cwd,
-                "upstream_command_hash": self.upstream_command_hash()
-            }))),
+            Some(initial_envelope.to_metadata_value()),
         )?;
-        db.add_lane_turn_message(&turn.turn.turn_id, "user", &prompt_text)?;
+        let user_message = db.add_lane_turn_message(&turn.turn.turn_id, "user", &prompt_text)?;
+        let mut envelope = initial_envelope;
+        envelope.prompt.user_message_id = Some(user_message.message_id.clone());
+        db.update_lane_turn_metadata(&turn.turn.turn_id, &envelope.to_metadata_value())?;
         db.add_lane_turn_event(
             &turn.turn.turn_id,
             "acp_prompt_started",
@@ -1090,6 +1126,11 @@ impl CaptureCoordinator {
                 tool_spans: HashMap::new(),
                 structured_diff_keys: HashSet::new(),
                 pending_events: Vec::new(),
+                usage: TurnEnvelopeUsage::default(),
+                event_count: 0,
+                tool_event_count: 0,
+                structured_diff_count: 0,
+                redaction_applied: false,
                 assistant_buffer_bytes: 0,
                 capture_truncated: false,
             },
@@ -1139,6 +1180,14 @@ impl CaptureCoordinator {
             );
         }
         db.end_lane_turn(&pending.turn_id, status)?;
+        self.finalize_turn_envelope(
+            &mut db,
+            &pending.turn_id,
+            status,
+            stop_reason(message).map(str::to_string),
+            error_summary(message),
+            active.as_ref(),
+        )?;
         Ok(())
     }
 
@@ -1203,6 +1252,16 @@ impl CaptureCoordinator {
                 active.push_event(
                     "acp_available_commands_update",
                     Some(summarize_available_commands(update)),
+                );
+                Ok(())
+            }
+            "usage_update" => {
+                active.usage = turn_envelope_usage(update);
+                self.flush_turn_events(&mut active)?;
+                self.flush_assistant_messages(&mut active, "before_usage_update")?;
+                active.push_event(
+                    "acp_usage_update",
+                    Some(redact_json(Value::Object(update.clone()))),
                 );
                 Ok(())
             }
@@ -1373,6 +1432,7 @@ impl CaptureCoordinator {
         if edits.is_empty() {
             return;
         }
+        let edit_count = edits.len() as u64;
         let patch = PatchDocument {
             base_change: None,
             message: Some("ACP structured diff update".to_string()),
@@ -1385,7 +1445,9 @@ impl CaptureCoordinator {
             .open_db()
             .and_then(|mut db| db.apply_lane_turn_patch(&active.turn_id, patch))
         {
-            Ok(_) => {}
+            Ok(_) => {
+                active.structured_diff_count += edit_count;
+            }
             Err(err) => {
                 eprintln!(
                     "trail acp relay capture warning: structured diff capture for lane `{}` failed: {err}",
@@ -1545,14 +1607,22 @@ impl CaptureCoordinator {
                 None,
                 None,
             )?;
-            if let Some(span_id) = active.root_span_id {
+            if let Some(span_id) = &active.root_span_id {
                 let _ = db.end_lane_trace_span(
-                    &span_id,
+                    span_id,
                     status,
                     Some(redact_json(serde_json::json!({ "reason": reason }))),
                 );
             }
             let _ = db.end_lane_turn(&active.turn_id, status);
+            let _ = self.finalize_turn_envelope(
+                &mut db,
+                &active.turn_id,
+                status,
+                None,
+                Some(summarize_text(reason)),
+                Some(&active),
+            );
             let _ = db.update_lane_acp_session_status(&acp_session_id, status);
             self.pending_prompts
                 .retain(|_, pending| pending.acp_session_id != acp_session_id);
@@ -1580,6 +1650,7 @@ impl CaptureCoordinator {
         let lane_name = db.resolve_lane_handle(&mapping.lane_id)?;
         Ok(Some(SessionState {
             acp_session_id: mapping.acp_session_id,
+            upstream_session_id: mapping.upstream_session_id,
             lane_name,
             trail_session_id: mapping.trail_session_id,
             original_cwd: mapping.cwd.clone(),
@@ -1620,6 +1691,58 @@ impl CaptureCoordinator {
         self.upstream_command_json
             .as_ref()
             .map(|value| crate::ids::short_hash(value.as_bytes(), 16))
+    }
+
+    fn finalize_turn_envelope(
+        &self,
+        db: &mut Trail,
+        turn_id: &str,
+        status: &str,
+        stop_reason: Option<String>,
+        error_summary: Option<String>,
+        active: Option<&ActiveTurn>,
+    ) -> Result<()> {
+        let turn = db.lane_turn(turn_id)?;
+        let Some(mut envelope) = TurnEnvelope::from_metadata_json(turn.metadata_json.as_deref())
+        else {
+            return Ok(());
+        };
+        if let Some(active) = active {
+            envelope.usage = active.usage.clone();
+            envelope.capture = TurnEnvelopeCapture {
+                event_count: active.event_count,
+                tool_event_count: active.tool_event_count,
+                structured_diff_count: active.structured_diff_count,
+                assistant_truncated: active.capture_truncated,
+                redaction_applied: active.redaction_applied,
+            };
+        }
+        let stored_events = db.lane_turn_events(turn_id)?;
+        envelope.capture.event_count = stored_events.len() as u64;
+        envelope.capture.tool_event_count = stored_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "tool_call" | "tool_call_update" | "span_started" | "span_ended"
+                )
+            })
+            .count() as u64;
+        if stored_events
+            .iter()
+            .filter_map(|event| event.payload.as_ref())
+            .any(value_has_redaction_marker)
+        {
+            envelope.capture.redaction_applied = true;
+        }
+        envelope.finalize_outcome(
+            status.to_string(),
+            stop_reason,
+            &turn.before_change,
+            turn.after_change.as_ref(),
+            error_summary,
+        );
+        db.update_lane_turn_metadata(turn_id, &envelope.to_metadata_value())
     }
 }
 
@@ -1726,6 +1849,58 @@ fn stop_reason(message: &Value) -> Option<&str> {
         .get("result")
         .and_then(|result| result.get("stopReason"))
         .and_then(Value::as_str)
+}
+
+fn error_summary(message: &Value) -> Option<String> {
+    message
+        .get("error")
+        .map(|error| summarize_text(&redact_json(error.clone()).to_string()))
+}
+
+fn prompt_hash(prompt: &str) -> String {
+    crate::ids::short_hash(prompt.as_bytes(), 32)
+}
+
+fn turn_envelope_usage(update: &Map<String, Value>) -> TurnEnvelopeUsage {
+    TurnEnvelopeUsage {
+        used: usage_number_field(
+            update,
+            &[
+                "used",
+                "usedTokens",
+                "used_tokens",
+                "tokensUsed",
+                "tokens_used",
+                "totalTokens",
+                "total_tokens",
+            ],
+        ),
+        size: usage_number_field(
+            update,
+            &[
+                "size",
+                "contextSize",
+                "context_size",
+                "contextWindow",
+                "context_window",
+                "limit",
+                "maxTokens",
+                "max_tokens",
+            ],
+        ),
+        cost: update.get("cost").cloned().map(redact_json),
+    }
+}
+
+fn usage_number_field(update: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        update.get(*key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+        })
+    })
 }
 
 fn prompt_status(message: &Value) -> &'static str {
@@ -2074,6 +2249,15 @@ fn redact_json(value: Value) -> Value {
     }
 }
 
+fn value_has_redaction_marker(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains("<redacted>") || text.contains("[REDACTED]"),
+        Value::Array(items) => items.iter().any(value_has_redaction_marker),
+        Value::Object(object) => object.values().any(value_has_redaction_marker),
+        _ => false,
+    }
+}
+
 fn secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     lower.contains("token")
@@ -2109,6 +2293,8 @@ fn redact_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InitImportMode;
+    use std::fs;
 
     #[test]
     fn json_line_round_trips_single_message() {
@@ -2245,5 +2431,246 @@ mod tests {
         assert!(ignore_session_update("agent_thought_chunk"));
         assert!(!ignore_session_update("agent_message_chunk"));
         assert!(!ignore_session_update("tool_call"));
+    }
+
+    #[test]
+    fn turn_envelope_legacy_metadata_returns_none() {
+        let metadata = serde_json::json!({
+            "kind": "acp_prompt",
+            "protocol": "acp"
+        })
+        .to_string();
+        assert!(TurnEnvelope::from_metadata_json(Some(&metadata)).is_none());
+    }
+
+    #[test]
+    fn turn_envelope_usage_update_captured() {
+        let update = serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "used": 42,
+            "size": "100",
+            "cost": {
+                "usd": "0.01",
+                "token": "secret"
+            }
+        });
+        let usage = turn_envelope_usage(update.as_object().unwrap());
+        assert_eq!(usage.used, Some(42));
+        assert_eq!(usage.size, Some(100));
+        assert_eq!(usage.cost.unwrap()["token"], "<redacted>");
+    }
+
+    #[test]
+    fn turn_envelope_acp_prompt_finish_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db_dir = temp.path().join(".trail");
+        let cwd = temp.path().to_string_lossy().to_string();
+        let mut coordinator = CaptureCoordinator::new(AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir,
+            lane: Some("agent-test".to_string()),
+            from_ref: None,
+            provider: Some("codex".to_string()),
+            model: Some("gpt-test".to_string()),
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec![
+                "codex".to_string(),
+                "--api-key".to_string(),
+                "secret".to_string(),
+            ],
+        })
+        .unwrap();
+
+        let mut session_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "sessionId": "client-session",
+                "cwd": cwd
+            }
+        });
+        coordinator
+            .before_client_message(&mut session_request)
+            .unwrap();
+        let mut session_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "sessionId": "upstream-session"
+            }
+        });
+        coordinator
+            .before_agent_message(&mut session_response)
+            .unwrap();
+
+        let mut prompt_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "upstream-session",
+                "prompt": [
+                    { "type": "text", "text": "Write src/lib.rs" }
+                ]
+            }
+        });
+        coordinator
+            .before_client_message(&mut prompt_request)
+            .unwrap();
+        let mut usage_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "upstream-session",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 42,
+                    "size": 100
+                }
+            }
+        });
+        coordinator.before_agent_message(&mut usage_update).unwrap();
+        let mut diff_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "upstream-session",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "edit-1",
+                    "title": "Edit src/lib.rs",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "diff",
+                            "path": "src/lib.rs",
+                            "newText": "pub fn generated() {}\n"
+                        }
+                    ]
+                }
+            }
+        });
+        coordinator.before_agent_message(&mut diff_update).unwrap();
+        let mut prompt_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "stopReason": "end_turn"
+            }
+        });
+        coordinator
+            .before_agent_message(&mut prompt_response)
+            .unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let transcript = db.transcript("agent-test").unwrap();
+        assert_eq!(transcript.turns.len(), 1);
+        let turn = &transcript.turns[0];
+        let envelope = turn.turn_envelope.as_ref().unwrap();
+        assert_eq!(envelope.schema, TURN_ENVELOPE_SCHEMA);
+        assert_eq!(envelope.version, TURN_ENVELOPE_VERSION);
+        assert_eq!(envelope.provider.as_deref(), Some("codex"));
+        assert_eq!(envelope.model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            envelope.session.upstream_session_id.as_deref(),
+            Some("upstream-session")
+        );
+        assert!(envelope.prompt.hash.is_some());
+        assert!(envelope.prompt.user_message_id.is_some());
+        assert_eq!(envelope.usage.used, Some(42));
+        assert_eq!(envelope.usage.size, Some(100));
+        assert_eq!(envelope.capture.structured_diff_count, 1);
+        assert!(envelope.capture.event_count > 0);
+        assert!(envelope.capture.tool_event_count > 0);
+        assert!(!envelope.outcome.no_changes);
+        assert!(envelope.outcome.checkpoint.is_some());
+        assert_eq!(turn.checkpoint, envelope.outcome.checkpoint);
+
+        let report = db.agent_turn("agent-test", "1", None, false).unwrap();
+        assert_eq!(
+            report.turn_envelope.as_ref().unwrap().outcome.checkpoint,
+            envelope.outcome.checkpoint
+        );
+    }
+
+    #[test]
+    fn turn_envelope_acp_prompt_finish_no_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let cwd = temp.path().to_string_lossy().to_string();
+        let mut coordinator = CaptureCoordinator::new(AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: Some("agent-no-change".to_string()),
+            from_ref: None,
+            provider: Some("codex".to_string()),
+            model: Some("gpt-test".to_string()),
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["codex".to_string()],
+        })
+        .unwrap();
+
+        let mut session_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "sessionId": "client-session",
+                "cwd": cwd
+            }
+        });
+        coordinator
+            .before_client_message(&mut session_request)
+            .unwrap();
+        let mut session_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "sessionId": "upstream-session"
+            }
+        });
+        coordinator
+            .before_agent_message(&mut session_response)
+            .unwrap();
+        let mut prompt_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "upstream-session",
+                "prompt": [
+                    { "type": "text", "text": "Inspect only" }
+                ]
+            }
+        });
+        coordinator
+            .before_client_message(&mut prompt_request)
+            .unwrap();
+        let mut prompt_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "stopReason": "end_turn"
+            }
+        });
+        coordinator
+            .before_agent_message(&mut prompt_response)
+            .unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let transcript = db.transcript("agent-no-change").unwrap();
+        let turn = &transcript.turns[0];
+        let envelope = turn.turn_envelope.as_ref().unwrap();
+        assert!(envelope.outcome.no_changes);
+        assert!(envelope.outcome.checkpoint.is_none());
+        assert!(turn.checkpoint.is_none());
     }
 }

@@ -103,6 +103,8 @@ pub struct TranscriptTurn {
     pub events: Vec<LaneEventRecord>,
     pub checkpoint: Option<ChangeId>,
     pub tool_summaries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_envelope: Option<TurnEnvelope>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1055,6 +1057,8 @@ pub struct AgentTurnReport {
     pub id: String,
     pub turn_id: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_envelope: Option<TurnEnvelope>,
     pub prompt_preview: Option<String>,
     pub assistant_preview: Option<String>,
     pub checkpoint: Option<ChangeId>,
@@ -1250,6 +1254,181 @@ pub struct LaneTurn {
     pub metadata_json: Option<String>,
 }
 
+pub const TURN_ENVELOPE_SCHEMA: &str = "trail.turn_envelope";
+pub const TURN_ENVELOPE_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TurnEnvelope {
+    pub schema: String,
+    pub version: u16,
+    pub kind: String,
+    pub protocol: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session: TurnEnvelopeSession,
+    pub prompt: TurnEnvelopePrompt,
+    pub workspace: TurnEnvelopeWorkspace,
+    pub usage: TurnEnvelopeUsage,
+    pub capture: TurnEnvelopeCapture,
+    pub outcome: TurnEnvelopeOutcome,
+    pub review: TurnEnvelopeReview,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnEnvelopeSession {
+    pub trail_session_id: Option<String>,
+    pub acp_session_id: Option<String>,
+    pub upstream_session_id: Option<String>,
+    pub upstream_command_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnEnvelopePrompt {
+    pub hash: Option<String>,
+    pub summary: Option<String>,
+    pub user_message_id: Option<MessageId>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnEnvelopeWorkspace {
+    pub lane: Option<String>,
+    pub cwd: Option<String>,
+    pub effective_cwd: Option<String>,
+    pub workdir_mode: Option<String>,
+    pub base_change: Option<ChangeId>,
+    pub before_change: Option<ChangeId>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnEnvelopeUsage {
+    pub used: Option<u64>,
+    pub size: Option<u64>,
+    pub cost: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnEnvelopeCapture {
+    pub event_count: u64,
+    pub tool_event_count: u64,
+    pub structured_diff_count: u64,
+    pub assistant_truncated: bool,
+    pub redaction_applied: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnEnvelopeOutcome {
+    pub status: Option<String>,
+    pub stop_reason: Option<String>,
+    pub checkpoint: Option<ChangeId>,
+    pub no_changes: bool,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnEnvelopeReview {
+    pub approval_ids: Vec<String>,
+    pub gate_ids: Vec<String>,
+}
+
+impl TurnEnvelope {
+    pub fn new_acp_prompt(input: TurnEnvelopeAcpPromptInput) -> Self {
+        Self {
+            schema: TURN_ENVELOPE_SCHEMA.to_string(),
+            version: TURN_ENVELOPE_VERSION,
+            kind: "acp_prompt".to_string(),
+            protocol: "acp".to_string(),
+            provider: input.provider,
+            model: input.model,
+            session: TurnEnvelopeSession {
+                trail_session_id: Some(input.trail_session_id),
+                acp_session_id: Some(input.acp_session_id),
+                upstream_session_id: input.upstream_session_id,
+                upstream_command_hash: input.upstream_command_hash,
+            },
+            prompt: TurnEnvelopePrompt {
+                hash: Some(input.prompt_hash),
+                summary: Some(input.prompt_summary),
+                user_message_id: input.user_message_id,
+            },
+            workspace: TurnEnvelopeWorkspace {
+                lane: Some(input.lane),
+                cwd: Some(input.cwd),
+                effective_cwd: Some(input.effective_cwd),
+                workdir_mode: Some(input.workdir_mode),
+                base_change: Some(input.base_change),
+                before_change: Some(input.before_change),
+            },
+            usage: TurnEnvelopeUsage::default(),
+            capture: TurnEnvelopeCapture::default(),
+            outcome: TurnEnvelopeOutcome::default(),
+            review: TurnEnvelopeReview::default(),
+        }
+    }
+
+    pub fn from_metadata_json(metadata: Option<&str>) -> Option<Self> {
+        let value = serde_json::from_str::<serde_json::Value>(metadata?).ok()?;
+        if value
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|schema| schema == TURN_ENVELOPE_SCHEMA)
+            && value
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|version| version == u64::from(TURN_ENVELOPE_VERSION))
+        {
+            serde_json::from_value(value).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn to_metadata_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+
+    pub fn finalize_outcome(
+        &mut self,
+        status: impl Into<String>,
+        stop_reason: Option<String>,
+        before_change: &ChangeId,
+        after_change: Option<&ChangeId>,
+        error_summary: Option<String>,
+    ) {
+        self.outcome.status = Some(status.into());
+        self.outcome.stop_reason = stop_reason;
+        self.outcome.error_summary = error_summary;
+        match after_change {
+            Some(after_change) if after_change != before_change => {
+                self.outcome.checkpoint = Some(after_change.clone());
+                self.outcome.no_changes = false;
+            }
+            _ => {
+                self.outcome.checkpoint = None;
+                self.outcome.no_changes = true;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnEnvelopeAcpPromptInput {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub trail_session_id: String,
+    pub acp_session_id: String,
+    pub upstream_session_id: Option<String>,
+    pub upstream_command_hash: Option<String>,
+    pub prompt_hash: String,
+    pub prompt_summary: String,
+    pub user_message_id: Option<MessageId>,
+    pub lane: String,
+    pub cwd: String,
+    pub effective_cwd: String,
+    pub workdir_mode: String,
+    pub base_change: ChangeId,
+    pub before_change: ChangeId,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneTurnStartReport {
     pub turn: LaneTurn,
@@ -1264,6 +1443,8 @@ pub struct LaneTurnDetails {
     pub messages: Vec<Message>,
     pub events: Vec<LaneEventRecord>,
     pub operations: Vec<TimelineEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_envelope: Option<TurnEnvelope>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

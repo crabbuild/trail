@@ -42,6 +42,17 @@ trail lane turn apply-patch <turn-id> --patch patch.json
 trail lane turn end <turn-id> --status completed
 ```
 
+Agent-hosted turns can also carry a typed `TurnEnvelope` in turn metadata. The
+envelope is a compact receipt for one prompt/tool/checkpoint cycle: provider,
+model, Trail and upstream session IDs, prompt hash and summary, workspace
+context, usage, capture counters, and outcome. Full assistant text remains in
+message/transcript records; the envelope stores only compact metadata.
+
+Completed agent turns resolve to either an outcome checkpoint or an explicit
+`no_changes` outcome. This lets review, handoff, and rewind views distinguish a
+real checkpoint from a prompt that inspected or reasoned without changing lane
+state.
+
 ## Events and Spans
 
 Events are structured records linked to lanes, sessions, turns, changes, and
