@@ -2993,6 +2993,7 @@ impl Trail {
         } else {
             None
         };
+        self.ensure_agent_checkpoint_reviewed(&lane)?;
 
         let merge = self.merge_lane_user_with_options(&lane, &crab_branch, dry_run, true)?;
         let range = if merge.changed_paths.is_empty() {
@@ -3632,6 +3633,21 @@ impl Trail {
             .map(|event| self.agent_review_marker_from_event(event))
             .transpose()
             .map(Option::flatten)
+    }
+
+    fn ensure_agent_checkpoint_reviewed(&self, lane: &str) -> Result<()> {
+        let branch = self.lane_branch(lane)?;
+        let reviewed = self.latest_agent_review_marker(lane)?;
+        if reviewed
+            .as_ref()
+            .is_some_and(|marker| marker.checkpoint == branch.head_change)
+        {
+            return Ok(());
+        }
+        Err(Error::InvalidInput(format!(
+            "agent task `{lane}` has not been reviewed at its current checkpoint `{}`; inspect the changes and run `trail agent mark-reviewed {lane}` before landing",
+            branch.head_change.0
+        )))
     }
 
     fn latest_agent_file_review_marker(
@@ -7192,6 +7208,9 @@ fn agent_ready_status(
     if !view.review.readiness.ready {
         return view.review.readiness.status.clone();
     }
+    if apply_error.is_some_and(|error| error.contains("has not been reviewed")) {
+        return "review_blocked".to_string();
+    }
     if apply_error.is_some() {
         return "git_blocked".to_string();
     }
@@ -7218,6 +7237,11 @@ fn agent_ready_summary(
             view.task.changed_paths.len(),
             risk.level,
             risk.score
+        );
+    }
+    if status == "review_blocked" {
+        return format!(
+            "`{title}` is not ready to apply because its current checkpoint has not been reviewed."
         );
     }
     if let Some(error) = apply_error {
@@ -7270,6 +7294,13 @@ fn agent_ready_next(
         return StatusSuggestion {
             command: format!("trail agent finish {lane}"),
             reason: "hide the applied task from the default inbox when you are done".to_string(),
+        };
+    }
+    if status == "review_blocked" {
+        return StatusSuggestion {
+            command: format!("trail agent review-flow {lane}"),
+            reason: "inspect the current checkpoint and mark it reviewed before landing"
+                .to_string(),
         };
     }
     if let Some(error) = apply_error {

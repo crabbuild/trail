@@ -197,6 +197,47 @@ pub(super) fn handle_system_route(
         return Ok(Some(utils::json_response(200, "OK", &report)?));
     }
 
+    if request.method == "GET" && path == "/v1/cache/layers" {
+        let report = db.list_workspace_layers()?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "GET"
+        && parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "cache"
+        && parts[2] == "layers"
+    {
+        let report = db.verify_workspace_layer(parts[3])?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "POST"
+        && parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "cache"
+        && parts[2] == "layers"
+        && parts[4] == "verify"
+    {
+        utils::reject_unexpected_body(request, "POST /v1/cache/layers/{layer}/verify")?;
+        let report = db.verify_workspace_layer(parts[3])?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
+    if request.method == "POST" && path == "/v1/cache/gc" {
+        use crate::server::request_types::CacheGcRequest;
+        let body: CacheGcRequest = if request.body.is_empty() {
+            CacheGcRequest {
+                dry_run: false,
+                retention_secs: None,
+            }
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.workspace_cache_gc(body.dry_run, body.retention_secs)?;
+        return Ok(Some(utils::json_response(200, "OK", &report)?));
+    }
+
     Ok(None)
 }
 

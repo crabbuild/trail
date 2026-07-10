@@ -126,6 +126,12 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.lane_readiness"
         | "trail.lane_refresh_preview"
         | "trail.lane_handoff"
+        | "trail.lane_workspace"
+        | "trail.lane_space"
+        | "trail.deps_status"
+        | "trail.cache_list"
+        | "trail.cache_inspect"
+        | "trail.cache_verify"
         | "trail.config_list"
         | "trail.config_get"
         | "trail.session_list"
@@ -152,7 +158,7 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.ignore_list"
         | "trail.ignore_check"
         | "trail.guardrail_check" => Some(ToolRiskClass::ReadOnly),
-        "trail.config_set" | "trail.ignore_add" | "trail.ignore_remove" => {
+        "trail.config_set" | "trail.ignore_add" | "trail.ignore_remove" | "trail.lane_unmount" => {
             Some(ToolRiskClass::IdempotentWrite)
         }
         "trail.session_start"
@@ -170,6 +176,9 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.anchor_create"
         | "trail.lane_spawn"
         | "trail.lane_claim"
+        | "trail.lane_checkpoint"
+        | "trail.lane_update"
+        | "trail.lane_mount"
         | "trail.merge_queue_add"
         | "trail.begin_turn"
         | "trail.add_message"
@@ -191,9 +200,9 @@ fn classified_tool_risk_class(name: &str) -> Option<ToolRiskClass> {
         | "trail.read_file"
         | "trail.lane_hydrate"
         | "trail.sync_workdir" => Some(ToolRiskClass::DestructiveWrite),
-        "trail.agent_test" | "trail.agent_eval" | "trail.run_test" | "trail.run_eval" => {
-            Some(ToolRiskClass::OpenWorldWrite)
-        }
+        "trail.cache_gc" => Some(ToolRiskClass::DestructiveWrite),
+        "trail.agent_test" | "trail.agent_eval" | "trail.run_test" | "trail.run_eval"
+        | "trail.lane_exec" | "trail.deps_sync" => Some(ToolRiskClass::OpenWorldWrite),
         _ => None,
     }
 }

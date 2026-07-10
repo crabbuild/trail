@@ -31,6 +31,20 @@ impl Trail {
         let _lock = self.acquire_write_lock()?;
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
+        let preserved_view = self.lane_workspace_view(lane)?;
+        if let Some(view) = &preserved_view {
+            if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
+                if process_matches_start_token(pid, token) {
+                    return Err(Error::InvalidInput(format!(
+                        "lane `{lane}` has an active workspace writer in process {pid}; unmount or stop it before removal"
+                    )));
+                }
+            }
+        }
+        let preserved_space = preserved_view
+            .as_ref()
+            .map(|_| self.lane_workspace_space(lane))
+            .transpose()?;
         if branch.status != "merged" && branch.head_change != branch.base_change && !force {
             return Err(Error::InvalidInput(format!(
                 "lane `{lane}` has unmerged changes; pass --force to remove"
@@ -62,7 +76,10 @@ impl Trail {
             None,
             &serde_json::json!({
                 "ref_name": branch.ref_name.clone(),
-                "forced": force
+                "forced": force,
+                "preserved_view_id": preserved_view.as_ref().map(|view| view.view_id.as_str()),
+                "preserved_source_bytes": preserved_space.as_ref().map(|space| space.uncheckpointed_source_bytes),
+                "preserved_generated_bytes": preserved_space.as_ref().map(|space| space.generated_upper_bytes),
             }),
         )?;
         Ok(LaneRemoveReport {

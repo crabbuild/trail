@@ -813,6 +813,7 @@ impl DaemonWorktreeCache {
             path: daemon_worktree_snapshot_path(db_dir),
             workspace_root: workspace_root.to_path_buf(),
             pid: std::process::id(),
+            active: Arc::new(AtomicBool::new(true)),
         };
         persist_daemon_worktree_state(&persist, &state);
         let state_for_watcher = Arc::clone(&state);
@@ -835,7 +836,7 @@ impl DaemonWorktreeCache {
         Ok(Self {
             state,
             persist: Some(persist),
-            _watcher: watcher,
+            watcher: Some(watcher),
         })
     }
 
@@ -1149,6 +1150,9 @@ fn persist_daemon_worktree_state(
     persist: &DaemonWorktreeCachePersist,
     state: &Arc<Mutex<DaemonWorktreeCacheState>>,
 ) {
+    if !persist.active.load(Ordering::Acquire) {
+        return;
+    }
     let snapshot = {
         let state = state.lock().expect("daemon worktree cache poisoned");
         PersistedDaemonWorktreeSnapshot {
@@ -1163,9 +1167,24 @@ fn persist_daemon_worktree_state(
             updated_ns: worktree_scan_id(),
         }
     };
-    let _ = write_persisted_daemon_worktree_snapshot(&persist.path, &snapshot, persist.pid);
+    let tmp = persist.path.with_file_name(format!(
+        "{DAEMON_WORKTREE_SNAPSHOT_FILE}.{}.tmp",
+        persist.pid
+    ));
+    let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+        return;
+    };
+    if fs::write(&tmp, bytes).is_err() {
+        return;
+    }
+    if !persist.active.load(Ordering::Acquire) {
+        let _ = fs::remove_file(tmp);
+        return;
+    }
+    let _ = fs::rename(tmp, &persist.path);
 }
 
+#[cfg(all(test, unix))]
 fn write_persisted_daemon_worktree_snapshot(
     path: &Path,
     snapshot: &PersistedDaemonWorktreeSnapshot,
@@ -1180,7 +1199,15 @@ fn write_persisted_daemon_worktree_snapshot(
 impl Drop for DaemonWorktreeCache {
     fn drop(&mut self) {
         if let Some(persist) = &self.persist {
+            persist.active.store(false, Ordering::Release);
+        }
+        drop(self.watcher.take());
+        if let Some(persist) = &self.persist {
             let _ = fs::remove_file(&persist.path);
+            let _ = fs::remove_file(persist.path.with_file_name(format!(
+                "{DAEMON_WORKTREE_SNAPSHOT_FILE}.{}.tmp",
+                persist.pid
+            )));
         }
     }
 }
@@ -1562,7 +1589,7 @@ mod tests {
                 generation: 1,
             })),
             persist: None,
-            _watcher: watcher,
+            watcher: Some(watcher),
         });
     }
 }

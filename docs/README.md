@@ -78,6 +78,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [MCP tools](reference/mcp-tools.md)
 - [Data types](reference/data-types.md)
 - [Design notes](design/architecture.md)
+- [Layered lane workspaces for large-repository multi-agent development](design/layered-lane-workspaces.md)
 - [Distributed Prolly VCS design](design/distributed-prolly-vcs.md)
 - [ACP relay design](design/acp-relay.md)
 - [VS Code ACP chat view design](design/vscode-acp-chat-view.md)

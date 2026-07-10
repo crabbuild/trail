@@ -51,7 +51,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "sync"] }
 dokan = "0.3.1"
 dokan-sys = "0.3.1"
 widestring = "0.4.3"
-winapi = { version = "0.3", features = ["fileapi", "minwinbase", "ntdef", "ntstatus", "winnt"] }
+winapi = { version = "0.3", features = ["fileapi", "handleapi", "minwinbase", "ntdef", "ntstatus", "processthreadsapi", "winnt"] }
 
 [dev-dependencies]
 tempfile.workspace = true

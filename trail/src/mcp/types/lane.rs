@@ -58,6 +58,17 @@ pub(crate) struct LaneRefreshPreviewArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct LaneUpdateArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default, alias = "source")]
+    pub(crate) from: Option<String>,
+    #[serde(default)]
+    pub(crate) checkpoint: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaneRemoveArgs {
     #[serde(alias = "lane_or_id", alias = "name")]
     pub(crate) lane: String,
@@ -163,6 +174,48 @@ pub(crate) struct SyncWorkdirArgs {
     pub(crate) paths: Vec<String>,
     #[serde(default, alias = "include_neighborhood")]
     pub(crate) include_neighbors: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceCheckpointArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceExecArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    pub(crate) command: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DependencySyncArgs {
+    #[serde(alias = "lane_or_id", alias = "name")]
+    pub(crate) lane: String,
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheLayerArgs {
+    #[serde(alias = "layer_id")]
+    pub(crate) layer: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheGcArgs {
+    #[serde(default)]
+    pub(crate) dry_run: bool,
+    #[serde(default)]
+    pub(crate) retention_secs: Option<u64>,
 }
 
 pub(crate) fn default_lease_mode() -> String {

@@ -28,7 +28,9 @@ impl Trail {
         custom_workdir: bool,
         sparse_paths: &[String],
     ) -> Result<LaneWorkdirMode> {
-        let mode = if let Some(requested_mode) = requested_mode {
+        let mode = if let Some("auto") = requested_mode {
+            self.resolve_automatic_lane_workdir_mode(from)?
+        } else if let Some(requested_mode) = requested_mode {
             parse_lane_workdir_mode(requested_mode)?
         } else if no_materialize || materialize == Some(false) {
             LaneWorkdirMode::Virtual
@@ -59,6 +61,41 @@ impl Trail {
         }
         validate_lane_workdir_mode_request(&mode, custom_workdir, sparse_paths)?;
         Ok(mode)
+    }
+
+    fn resolve_automatic_lane_workdir_mode(&self, from: Option<&str>) -> Result<LaneWorkdirMode> {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = from;
+            Ok(LaneWorkdirMode::OverlayCow)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            #[cfg(target_os = "macos")]
+            {
+                if Path::new("/sbin/mount_nfs").is_file() {
+                    return Ok(LaneWorkdirMode::NfsCow);
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if Path::new("/dev/fuse").exists() {
+                    return Ok(LaneWorkdirMode::OverlayCow);
+                }
+            }
+            let source = match from {
+                Some(refish) => self.resolve_refish(refish)?,
+                None => self.resolve_branch_ref(&self.current_branch()?)?,
+            };
+            let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &source.root_id)?;
+            if root.file_count > LARGE_LANE_MATERIALIZE_FILE_THRESHOLD {
+                return Err(Error::InvalidInput(format!(
+                    "automatic layered workdir selection found no available mount backend for a {}-path root; install/enable FUSE, use nfs-cow on macOS, Dokan on Windows, or explicitly accept full-cow",
+                    root.file_count
+                )));
+            }
+            Ok(LaneWorkdirMode::FullCow)
+        }
     }
 
     pub fn spawn_lane(
@@ -239,6 +276,18 @@ impl Trail {
                 now
             ],
         )?;
+        if workdir_mode.is_transparent_cow() {
+            let mountpoint = materialized_workdir.as_deref().ok_or_else(|| {
+                Error::Corrupt("transparent COW lane has no mountpoint".to_string())
+            })?;
+            self.create_workspace_view(
+                &lane_id,
+                &source.change_id,
+                &source.root_id,
+                platform_workspace_backend(&workdir_mode),
+                Path::new(mountpoint),
+            )?;
+        }
         self.insert_lane_event(
             &lane_id,
             "lane_spawned",
@@ -691,9 +740,19 @@ impl Trail {
 fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
     LaneWorkdirMode::parse(value).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unknown lane workdir mode `{value}`; expected virtual, sparse, full-cow, overlay-cow, or nfs-cow"
+            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, full-cow, overlay-cow, or nfs-cow"
         ))
     })
+}
+
+fn platform_workspace_backend(mode: &LaneWorkdirMode) -> &'static str {
+    match mode {
+        LaneWorkdirMode::NfsCow => "nfs",
+        LaneWorkdirMode::OverlayCow if cfg!(target_os = "windows") => "dokan",
+        LaneWorkdirMode::OverlayCow => "fuse",
+        LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => "clone",
+        LaneWorkdirMode::Virtual => "virtual",
+    }
 }
 
 fn validate_lane_workdir_mode_request(

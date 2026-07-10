@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use crate::model::LaneGateOptions;
 use crate::server::request_types::{
-    LaneClaimRequest, LaneReadFileRequest, LaneRecordRequest, LaneRewindRequest, LaneTestRequest,
-    SpawnLaneRequest, SyncWorkdirRequest,
+    DependencySyncRequest, LaneClaimRequest, LaneReadFileRequest, LaneRecordRequest,
+    LaneRewindRequest, LaneTestRequest, LaneUpdateRequest, SpawnLaneRequest, SyncWorkdirRequest,
+    WorkspaceCheckpointRequest, WorkspaceExecRequest,
 };
 use crate::server::route::utils::{
     json_response, parse_patch_request, query_flag, query_line_ids_flag, query_usize, query_value,
@@ -112,6 +113,18 @@ pub(super) fn handle_lane_resources(
                 let report = db.lane_workdir(&lane)?;
                 json_response(200, "OK", &report)?
             }
+            "workspace" => {
+                let report = db.lane_workspace_view(&lane)?;
+                json_response(200, "OK", &report)?
+            }
+            "space" => {
+                let report = db.lane_workspace_space(&lane)?;
+                json_response(200, "OK", &report)?
+            }
+            "dependencies" => {
+                let report = db.workspace_environment_status(&lane)?;
+                json_response(200, "OK", &report)?
+            }
             "diff" => {
                 let diff = db.diff_lane_with_options(
                     &lane,
@@ -149,6 +162,83 @@ pub(super) fn handle_lane_resources(
             return Ok(Some(json_response(200, "OK", &report)?));
         }
         let report = db.record_lane_workdir(&lane, body.message)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "update"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: LaneUpdateRequest = if request.body.is_empty() {
+            serde_json::from_slice(b"{}")?
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.update_layered_lane_from(&lane, &body.from, body.checkpoint)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && matches!(parts[3], "mount" | "unmount")
+        && request.method == "POST"
+    {
+        reject_unexpected_body(request, "POST /v1/lanes/{lane_or_id}/mount lifecycle")?;
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report = if parts[3] == "mount" {
+            db.start_lane_workspace_mount(&lane)?
+        } else {
+            db.request_lane_workspace_unmount(&lane)?
+        };
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "checkpoint"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: WorkspaceCheckpointRequest = if request.body.is_empty() {
+            WorkspaceCheckpointRequest { message: None }
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.checkpoint_lane_workspace(&lane, body.message)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "exec"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: WorkspaceExecRequest = serde_json::from_slice(&request.body)?;
+        let report = db.exec_lane_workspace(&lane, &body.command)?;
+        return Ok(Some(json_response(200, "OK", &report)?));
+    }
+
+    if parts.len() == 5
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && parts[3] == "dependencies"
+        && parts[4] == "sync"
+        && request.method == "POST"
+    {
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let body: DependencySyncRequest = if request.body.is_empty() {
+            DependencySyncRequest { path: None }
+        } else {
+            serde_json::from_slice(&request.body)?
+        };
+        let report = db.sync_node_dependencies(&lane, body.path.as_deref())?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

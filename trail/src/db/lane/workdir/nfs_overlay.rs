@@ -10,620 +10,23 @@ mod macos {
     };
     use nfsserve::tcp::{NFSTcp, NFSTcpListener};
     use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    #[cfg(test)]
+    use std::collections::BTreeSet;
     use std::ffi::{CStr, CString, OsStr};
-    use std::fs::{self, File, OpenOptions};
-    use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::fs::{self, OpenOptions};
+    #[cfg(test)]
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::Mutex;
     use std::thread::{self, JoinHandle};
 
     const ROOT_INO: u64 = 1;
     const OVERLAY_META_DIR: &str = ".trail";
-    const WHITEOUTS_FILE: &str = "overlay-whiteouts.json";
     const MOUNT_STATE_FILE: &str = "mount.json";
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum NodeKind {
-        File,
-        Directory,
-    }
-
-    #[derive(Clone, Debug)]
-    struct NodeAttr {
-        ino: u64,
-        kind: NodeKind,
-        mode: u32,
-        size: u64,
-        modified: SystemTime,
-    }
-
-    struct CowCore {
-        db: Trail,
-        upperdir: PathBuf,
-        lower_files: BTreeMap<String, FileEntry>,
-        lower_dirs: BTreeSet<String>,
-        whiteouts: BTreeSet<String>,
-        ino_by_path: HashMap<String, u64>,
-        path_by_ino: HashMap<u64, String>,
-        dir_mtime: HashMap<String, SystemTime>,
-        dir_epoch: SystemTime,
-        next_ino: u64,
-    }
-
-    impl CowCore {
-        fn new(
-            db: Trail,
-            upperdir: PathBuf,
-            lower_files: BTreeMap<String, FileEntry>,
-        ) -> Result<Self> {
-            let dir_epoch = SystemTime::now();
-            let mut core = Self {
-                db,
-                upperdir,
-                lower_files,
-                lower_dirs: BTreeSet::from([String::new()]),
-                whiteouts: BTreeSet::new(),
-                ino_by_path: HashMap::from([(String::new(), ROOT_INO)]),
-                path_by_ino: HashMap::from([(ROOT_INO, String::new())]),
-                dir_mtime: HashMap::from([(String::new(), dir_epoch)]),
-                dir_epoch,
-                next_ino: ROOT_INO + 1,
-            };
-            for path in core.lower_files.keys().cloned().collect::<Vec<_>>() {
-                let mut parent = Path::new(&path).parent();
-                while let Some(dir) = parent {
-                    let text = dir.to_string_lossy();
-                    if text.is_empty() {
-                        break;
-                    }
-                    core.lower_dirs.insert(text.into_owned());
-                    parent = dir.parent();
-                }
-            }
-            core.whiteouts = core.load_whiteouts()?;
-            let mut paths = BTreeSet::from([String::new()]);
-            paths.extend(core.lower_dirs.iter().cloned());
-            paths.extend(core.lower_files.keys().cloned());
-            paths.extend(core.upper_paths()?);
-            for path in paths {
-                core.ensure_ino(&path);
-                if core.node_kind(&path) == Some(NodeKind::Directory) {
-                    core.dir_mtime.entry(path).or_insert(core.dir_epoch);
-                }
-            }
-            Ok(core)
-        }
-
-        fn ensure_ino(&mut self, path: &str) -> u64 {
-            if let Some(ino) = self.ino_by_path.get(path) {
-                return *ino;
-            }
-            let ino = self.next_ino;
-            self.next_ino += 1;
-            self.ino_by_path.insert(path.to_string(), ino);
-            self.path_by_ino.insert(ino, path.to_string());
-            ino
-        }
-
-        fn path_for_ino(&self, ino: u64) -> std::result::Result<String, i32> {
-            self.path_by_ino.get(&ino).cloned().ok_or(libc::ENOENT)
-        }
-
-        fn child_path(&self, parent: u64, name: &str) -> std::result::Result<String, i32> {
-            let parent = self.path_for_ino(parent)?;
-            if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-                return Err(libc::EINVAL);
-            }
-            if is_macos_junk(name) {
-                return Err(libc::ENOENT);
-            }
-            Ok(if parent.is_empty() {
-                name.to_string()
-            } else {
-                format!("{parent}/{name}")
-            })
-        }
-
-        fn upper_path(&self, path: &str) -> std::result::Result<PathBuf, i32> {
-            if path.is_empty() {
-                return Ok(self.upperdir.clone());
-            }
-            let normalized = normalize_relative_path(path).map_err(|_| libc::EINVAL)?;
-            let mut current = self.upperdir.clone();
-            for component in Path::new(&normalized).components() {
-                let std::path::Component::Normal(name) = component else {
-                    return Err(libc::EINVAL);
-                };
-                current.push(name);
-                match fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => return Err(libc::EPERM),
-                    Ok(_) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(io_errno(err)),
-                }
-            }
-            Ok(current)
-        }
-
-        fn upper_metadata(&self, path: &str) -> Option<fs::Metadata> {
-            self.upper_path(path)
-                .ok()
-                .and_then(|path| fs::symlink_metadata(path).ok())
-        }
-
-        fn is_whiteouted(&self, path: &str) -> bool {
-            self.whiteouts.iter().any(|item| {
-                path == item
-                    || path
-                        .strip_prefix(item)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
-        }
-
-        fn node_kind(&self, path: &str) -> Option<NodeKind> {
-            if path.is_empty() {
-                return Some(NodeKind::Directory);
-            }
-            if path == OVERLAY_META_DIR || path.starts_with(".trail/") || self.is_whiteouted(path) {
-                return None;
-            }
-            if let Some(metadata) = self.upper_metadata(path) {
-                if metadata.is_file() {
-                    return Some(NodeKind::File);
-                }
-                if metadata.is_dir() {
-                    return Some(NodeKind::Directory);
-                }
-                return None;
-            }
-            if self.lower_files.contains_key(path) {
-                Some(NodeKind::File)
-            } else if self.lower_dirs.contains(path) {
-                Some(NodeKind::Directory)
-            } else {
-                None
-            }
-        }
-
-        fn attr(&mut self, path: &str) -> std::result::Result<NodeAttr, i32> {
-            let kind = self.node_kind(path).ok_or(libc::ENOENT)?;
-            let ino = self.ensure_ino(path);
-            if kind == NodeKind::Directory {
-                let mode = self
-                    .upper_metadata(path)
-                    .map(|metadata| metadata.mode() as u32 & 0o777)
-                    .unwrap_or(0o755);
-                return Ok(NodeAttr {
-                    ino,
-                    kind,
-                    mode,
-                    size: 0,
-                    modified: self
-                        .dir_mtime
-                        .get(path)
-                        .copied()
-                        .unwrap_or(SystemTime::UNIX_EPOCH),
-                });
-            }
-            if let Some(metadata) = self.upper_metadata(path) {
-                return Ok(NodeAttr {
-                    ino,
-                    kind,
-                    mode: metadata.mode() as u32 & 0o777,
-                    size: metadata.len(),
-                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                });
-            }
-            if let Some(entry) = self.lower_files.get(path) {
-                return Ok(NodeAttr {
-                    ino,
-                    kind,
-                    mode: if entry.executable {
-                        0o755
-                    } else {
-                        entry.mode & 0o777
-                    },
-                    size: entry.size_bytes,
-                    modified: SystemTime::UNIX_EPOCH,
-                });
-            }
-            Err(libc::ENOENT)
-        }
-
-        fn lookup(&mut self, parent: u64, name: &str) -> std::result::Result<u64, i32> {
-            if name == "." {
-                return Ok(parent);
-            }
-            if name == ".." {
-                let path = self.path_for_ino(parent)?;
-                let parent_path = Path::new(&path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                return Ok(self.ensure_ino(&parent_path));
-            }
-            let path = self.child_path(parent, name)?;
-            self.attr(&path).map(|attr| attr.ino)
-        }
-
-        fn children(&mut self, dir_ino: u64) -> std::result::Result<Vec<(String, NodeAttr)>, i32> {
-            let path = self.path_for_ino(dir_ino)?;
-            if self.node_kind(&path) != Some(NodeKind::Directory) {
-                return Err(libc::ENOTDIR);
-            }
-            let mut names = BTreeSet::new();
-            for candidate in self.lower_dirs.iter().chain(self.lower_files.keys()) {
-                if !self.is_whiteouted(candidate) && parent_of(candidate) == path {
-                    if let Some(name) = Path::new(candidate).file_name().and_then(OsStr::to_str) {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-            if let Ok(dir) = self
-                .upper_path(&path)
-                .and_then(|path| fs::read_dir(path).map_err(io_errno))
-            {
-                for entry in dir.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if path.is_empty() && name == OVERLAY_META_DIR {
-                        continue;
-                    }
-                    names.insert(name);
-                }
-            }
-            let mut result = Vec::new();
-            for name in names {
-                let child = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}/{name}")
-                };
-                if let Ok(attr) = self.attr(&child) {
-                    result.push((name, attr));
-                }
-            }
-            Ok(result)
-        }
-
-        fn read(
-            &mut self,
-            ino: u64,
-            offset: u64,
-            count: u32,
-        ) -> std::result::Result<(Vec<u8>, bool), i32> {
-            let path = self.path_for_ino(ino)?;
-            if self.node_kind(&path) != Some(NodeKind::File) {
-                return Err(libc::EISDIR);
-            }
-            let bytes = if let Some(metadata) = self.upper_metadata(&path) {
-                if !metadata.is_file() {
-                    return Err(libc::EINVAL);
-                }
-                fs::read(self.upper_path(&path)?).map_err(io_errno)?
-            } else {
-                let entry = self.lower_files.get(&path).ok_or(libc::ENOENT)?;
-                self.db
-                    .materialize_entry_bytes(entry)
-                    .map_err(|_| libc::EIO)?
-            };
-            let start = (offset as usize).min(bytes.len());
-            let end = start.saturating_add(count as usize).min(bytes.len());
-            Ok((bytes[start..end].to_vec(), end == bytes.len()))
-        }
-
-        fn ensure_upper_parent(&self, path: &str) -> std::result::Result<(), i32> {
-            let upper = self.upper_path(path)?;
-            if let Some(parent) = upper.parent() {
-                fs::create_dir_all(parent).map_err(io_errno)?;
-            }
-            Ok(())
-        }
-
-        fn touch_dir(&mut self, path: String) {
-            let previous = self.dir_mtime.get(&path).copied().unwrap_or(self.dir_epoch);
-            let now = SystemTime::now();
-            self.dir_mtime.insert(
-                path,
-                if now > previous {
-                    now
-                } else {
-                    previous + Duration::from_nanos(1)
-                },
-            );
-        }
-
-        fn touch_parent(&mut self, path: &str) {
-            self.touch_dir(parent_of(path));
-        }
-
-        fn ensure_upper_file(
-            &mut self,
-            path: &str,
-            truncate: bool,
-        ) -> std::result::Result<File, i32> {
-            if self.node_kind(path) == Some(NodeKind::Directory) {
-                return Err(libc::EISDIR);
-            }
-            self.ensure_upper_parent(path)?;
-            let upper = self.upper_path(path)?;
-            if !upper.exists() {
-                if !truncate && self.lower_files.contains_key(path) {
-                    let entry = self.lower_files.get(path).ok_or(libc::ENOENT)?;
-                    let bytes = self
-                        .db
-                        .materialize_entry_bytes(entry)
-                        .map_err(|_| libc::EIO)?;
-                    fs::write(&upper, bytes).map_err(io_errno)?;
-                    fs::set_permissions(
-                        &upper,
-                        fs::Permissions::from_mode(if entry.executable {
-                            0o755
-                        } else {
-                            entry.mode & 0o777
-                        }),
-                    )
-                    .map_err(io_errno)?;
-                } else {
-                    File::create(&upper).map_err(io_errno)?;
-                }
-            }
-            self.whiteouts.remove(path);
-            self.save_whiteouts().map_err(|_| libc::EIO)?;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .truncate(truncate)
-                .open(upper)
-                .map_err(io_errno)
-        }
-
-        fn copy_lower_file(&self, source: &str, target: &str) -> std::result::Result<(), i32> {
-            let entry = self.lower_files.get(source).ok_or(libc::ENOENT)?;
-            self.ensure_upper_parent(target)?;
-            let bytes = self
-                .db
-                .materialize_entry_bytes(entry)
-                .map_err(|_| libc::EIO)?;
-            let target_path = self.upper_path(target)?;
-            fs::write(&target_path, bytes).map_err(io_errno)?;
-            fs::set_permissions(
-                target_path,
-                fs::Permissions::from_mode(if entry.executable {
-                    0o755
-                } else {
-                    entry.mode & 0o777
-                }),
-            )
-            .map_err(io_errno)
-        }
-
-        fn merge_lower_subtree_into_upper(&self, root: &str) -> std::result::Result<(), i32> {
-            fs::create_dir_all(self.upper_path(root)?).map_err(io_errno)?;
-            let prefix = format!("{root}/");
-            for path in self
-                .lower_dirs
-                .iter()
-                .filter(|path| path.starts_with(&prefix) && !self.is_whiteouted(path))
-            {
-                fs::create_dir_all(self.upper_path(path)?).map_err(io_errno)?;
-            }
-            for path in self
-                .lower_files
-                .keys()
-                .filter(|path| path.starts_with(&prefix) && !self.is_whiteouted(path))
-            {
-                if self.upper_metadata(path).is_none() {
-                    self.copy_lower_file(path, path)?;
-                }
-            }
-            Ok(())
-        }
-
-        fn write(
-            &mut self,
-            ino: u64,
-            offset: u64,
-            data: &[u8],
-        ) -> std::result::Result<NodeAttr, i32> {
-            let path = self.path_for_ino(ino)?;
-            let file = self.ensure_upper_file(&path, false)?;
-            file.write_at(data, offset).map_err(io_errno)?;
-            file.sync_data().map_err(io_errno)?;
-            self.attr(&path)
-        }
-
-        fn create(
-            &mut self,
-            parent: u64,
-            name: &str,
-            mode: u32,
-            exclusive: bool,
-        ) -> std::result::Result<NodeAttr, i32> {
-            let path = self.child_path(parent, name)?;
-            if exclusive && self.node_kind(&path).is_some() {
-                return Err(libc::EEXIST);
-            }
-            self.ensure_upper_parent(&path)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(!exclusive)
-                .create_new(exclusive)
-                .mode(mode & 0o777)
-                .open(self.upper_path(&path)?)
-                .map_err(io_errno)?;
-            file.sync_data().map_err(io_errno)?;
-            self.whiteouts.remove(&path);
-            self.save_whiteouts().map_err(|_| libc::EIO)?;
-            self.touch_parent(&path);
-            self.attr(&path)
-        }
-
-        fn mkdir(
-            &mut self,
-            parent: u64,
-            name: &str,
-            mode: u32,
-        ) -> std::result::Result<NodeAttr, i32> {
-            let path = self.child_path(parent, name)?;
-            if self.node_kind(&path).is_some() {
-                return Err(libc::EEXIST);
-            }
-            fs::create_dir_all(self.upper_path(&path)?).map_err(io_errno)?;
-            fs::set_permissions(
-                self.upper_path(&path)?,
-                fs::Permissions::from_mode(mode & 0o777),
-            )
-            .map_err(io_errno)?;
-            self.whiteouts.remove(&path);
-            self.save_whiteouts().map_err(|_| libc::EIO)?;
-            self.touch_parent(&path);
-            self.touch_dir(path.clone());
-            self.attr(&path)
-        }
-
-        fn setattr(
-            &mut self,
-            ino: u64,
-            size: Option<u64>,
-            mode: Option<u32>,
-        ) -> std::result::Result<NodeAttr, i32> {
-            let path = self.path_for_ino(ino)?;
-            if let Some(size) = size {
-                self.ensure_upper_file(&path, false)?
-                    .set_len(size)
-                    .map_err(io_errno)?;
-            }
-            if let Some(mode) = mode {
-                if self.node_kind(&path) == Some(NodeKind::File) {
-                    let _ = self.ensure_upper_file(&path, false)?;
-                }
-                fs::set_permissions(
-                    self.upper_path(&path)?,
-                    fs::Permissions::from_mode(mode & 0o777),
-                )
-                .map_err(io_errno)?;
-            }
-            self.attr(&path)
-        }
-
-        fn remove(&mut self, parent: u64, name: &str) -> std::result::Result<(), i32> {
-            let path = self.child_path(parent, name)?;
-            let kind = self.node_kind(&path).ok_or(libc::ENOENT)?;
-            let ino = self.ensure_ino(&path);
-            if kind == NodeKind::Directory && !self.children(ino)?.is_empty() {
-                return Err(libc::ENOTEMPTY);
-            }
-            if let Some(metadata) = self.upper_metadata(&path) {
-                if metadata.is_dir() {
-                    fs::remove_dir(self.upper_path(&path)?).map_err(io_errno)?;
-                } else {
-                    fs::remove_file(self.upper_path(&path)?).map_err(io_errno)?;
-                }
-            }
-            if self.lower_files.contains_key(&path) || self.lower_dirs.contains(&path) {
-                self.whiteouts.insert(path.clone());
-            }
-            self.save_whiteouts().map_err(|_| libc::EIO)?;
-            self.touch_parent(&path);
-            Ok(())
-        }
-
-        fn rename(
-            &mut self,
-            from_parent: u64,
-            from_name: &str,
-            to_parent: u64,
-            to_name: &str,
-        ) -> std::result::Result<(), i32> {
-            let old = self.child_path(from_parent, from_name)?;
-            let new = self.child_path(to_parent, to_name)?;
-            let kind = self.node_kind(&old).ok_or(libc::ENOENT)?;
-            self.ensure_upper_parent(&new)?;
-            if self.upper_metadata(&new).is_some() {
-                let metadata = self.upper_metadata(&new).unwrap();
-                if metadata.is_dir() {
-                    fs::remove_dir_all(self.upper_path(&new)?).map_err(io_errno)?;
-                } else {
-                    fs::remove_file(self.upper_path(&new)?).map_err(io_errno)?;
-                }
-            }
-            if kind == NodeKind::Directory {
-                self.merge_lower_subtree_into_upper(&old)?;
-            }
-            if self.upper_metadata(&old).is_some() {
-                fs::rename(self.upper_path(&old)?, self.upper_path(&new)?).map_err(io_errno)?;
-            } else if kind == NodeKind::File {
-                self.copy_lower_file(&old, &new)?;
-            } else {
-                unreachable!("directory sources are copied up before rename")
-            }
-            self.whiteouts.insert(old.clone());
-            self.whiteouts.remove(&new);
-            self.save_whiteouts().map_err(|_| libc::EIO)?;
-            self.touch_parent(&old);
-            self.touch_parent(&new);
-            let old_prefix = format!("{old}/");
-            let moved_inodes = self
-                .ino_by_path
-                .iter()
-                .filter(|(path, _)| *path == &old || path.starts_with(&old_prefix))
-                .map(|(path, ino)| (path.clone(), *ino))
-                .collect::<Vec<_>>();
-            for (path, ino) in moved_inodes {
-                self.ino_by_path.remove(&path);
-                let suffix = path.strip_prefix(&old).unwrap();
-                let moved = format!("{new}{suffix}");
-                self.ino_by_path.insert(moved.clone(), ino);
-                self.path_by_ino.insert(ino, moved);
-            }
-            Ok(())
-        }
-
-        fn load_whiteouts(&self) -> Result<BTreeSet<String>> {
-            match fs::read(self.upperdir.join(OVERLAY_META_DIR).join(WHITEOUTS_FILE)) {
-                Ok(bytes) => Ok(serde_json::from_slice::<Vec<String>>(&bytes)?
-                    .into_iter()
-                    .collect()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-                Err(err) => Err(Error::Io(err)),
-            }
-        }
-
-        fn save_whiteouts(&self) -> Result<()> {
-            let path = self.upperdir.join(OVERLAY_META_DIR).join(WHITEOUTS_FILE);
-            fs::create_dir_all(path.parent().unwrap())?;
-            write_file_atomic(
-                &path,
-                &serde_json::to_vec(&self.whiteouts.iter().collect::<Vec<_>>())?,
-                false,
-            )
-        }
-
-        fn upper_paths(&self) -> Result<Vec<String>> {
-            let mut paths = Vec::new();
-            for entry in walkdir::WalkDir::new(&self.upperdir) {
-                let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
-                if entry.path() == self.upperdir {
-                    continue;
-                }
-                let path = normalize_relative_path(
-                    &entry
-                        .path()
-                        .strip_prefix(&self.upperdir)
-                        .map_err(|err| Error::InvalidInput(err.to_string()))?
-                        .to_string_lossy(),
-                )?;
-                if path == OVERLAY_META_DIR || path.starts_with(".trail/") {
-                    continue;
-                }
-                paths.push(path);
-            }
-            Ok(paths)
-        }
-    }
+    type CowCore = ViewCore;
+    type NodeKind = ViewNodeKind;
+    type NodeAttr = ViewNodeAttr;
 
     struct NfsAdapter {
         core: Mutex<CowCore>,
@@ -836,6 +239,8 @@ mod macos {
         state_path: PathBuf,
         shutdown: Option<tokio::sync::oneshot::Sender<()>>,
         worker: Option<JoinHandle<()>>,
+        #[allow(dead_code)]
+        lease: WorkspaceMountLease,
     }
 
     impl Drop for NfsCowMount {
@@ -858,68 +263,36 @@ mod macos {
         custom: bool,
     ) -> Result<PathBuf> {
         prepare_lane_workdir(dir, custom)?;
-        let upper = nfs_upperdir(db, lane)?;
-        if upper.exists() {
-            fs::remove_dir_all(&upper)?;
-        }
+        let upper = db
+            .prepare_workspace_view_storage_for_lane_name(lane)?
+            .source_upper;
         fs::create_dir_all(upper.join(OVERLAY_META_DIR))?;
         Ok(upper)
     }
 
     pub(crate) fn nfs_clean_manifest_path(db: &Trail, lane: &str) -> Result<PathBuf> {
-        Ok(nfs_upperdir(db, lane)?
-            .join(OVERLAY_META_DIR)
+        Ok(db
+            .workspace_view_paths_for_lane_name(lane)
+            .meta_dir
             .join("workdir-manifest.json"))
     }
 
     pub(crate) fn nfs_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
         let upper = nfs_upperdir(db, lane)?;
-        let mut paths = BTreeSet::new();
-        for entry in walkdir::WalkDir::new(&upper) {
-            let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = normalize_relative_path(
-                &entry
-                    .path()
-                    .strip_prefix(&upper)
-                    .map_err(|err| Error::InvalidInput(err.to_string()))?
-                    .to_string_lossy(),
-            )?;
-            if path == OVERLAY_META_DIR
-                || path.starts_with(".trail/")
-                || Path::new(&path)
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(is_macos_junk)
-            {
-                continue;
-            }
-            paths.insert(path);
-        }
-        let whiteouts_path = upper.join(OVERLAY_META_DIR).join(WHITEOUTS_FILE);
-        let whiteouts = match fs::read(whiteouts_path) {
-            Ok(bytes) => serde_json::from_slice::<Vec<String>>(&bytes)?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => return Err(Error::Io(err)),
-        };
         let branch = db.lane_branch(lane)?;
         let head = db.get_ref(&branch.ref_name)?;
-        let lower = db.load_root_files(&head.root_id)?;
-        for whiteout in whiteouts {
-            if lower.contains_key(&whiteout) {
-                paths.insert(whiteout.clone());
-            }
-            let prefix = format!("{whiteout}/");
-            paths.extend(
-                lower
-                    .keys()
-                    .filter(|path| path.starts_with(&prefix))
-                    .cloned(),
-            );
-        }
-        Ok(paths.into_iter().collect())
+        Ok(
+            recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?
+                .paths
+                .into_iter()
+                .filter(|path| {
+                    !Path::new(path)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(is_macos_junk)
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn mount_nfs_cow_for_lane(db: &Trail, lane: &str) -> Result<NfsCowMount> {
@@ -939,16 +312,19 @@ mod macos {
                 "nfs-cow requires /sbin/mount_nfs on macOS".to_string(),
             ));
         }
+        let mut lease = db.acquire_workspace_mount_lease(lane, "nfs")?;
         fs::create_dir_all(&mountpoint)?;
         let upper = nfs_upperdir(db, lane)?;
         fs::create_dir_all(upper.join(OVERLAY_META_DIR))?;
-        let state_path = upper.parent().unwrap().join(MOUNT_STATE_FILE);
+        let state_path = db
+            .workspace_view_paths_for_lane_name(lane)
+            .meta_dir
+            .join(MOUNT_STATE_FILE);
         let head = db.get_ref(&branch.ref_name)?;
-        let lower = db.load_root_files(&head.root_id)?;
-        let core = CowCore::new(
+        let core = CowCore::new_lazy(
             Trail::open_with_db_dir(db.workspace_root.clone(), db.db_dir.clone())?,
             upper.clone(),
-            lower.clone(),
+            head.root_id,
         )?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1005,20 +381,19 @@ mod macos {
                 mountpoint.display()
             )));
         }
+        lease.mark_mounted()?;
         Ok(NfsCowMount {
             mountpoint,
             state_path,
             shutdown: Some(shutdown_tx),
             worker: Some(worker),
+            lease,
         })
     }
 
     fn nfs_upperdir(db: &Trail, lane: &str) -> Result<PathBuf> {
-        Ok(db
-            .db_dir
-            .join("nfs-cow")
-            .join(path_from_rel(&normalize_relative_path(lane)?))
-            .join("upper"))
+        validate_ref_segment(lane)?;
+        Ok(db.workspace_view_paths_for_lane_name(lane).source_upper)
     }
 
     fn recover_stale_mount(mountpoint: &Path, state: &Path) -> Result<()> {
@@ -1124,15 +499,6 @@ mod macos {
             libc::ENOSPC => nfsstat3::NFS3ERR_NOSPC,
             _ => nfsstat3::NFS3ERR_IO,
         }
-    }
-    fn io_errno(error: std::io::Error) -> i32 {
-        error.raw_os_error().unwrap_or(libc::EIO)
-    }
-    fn parent_of(path: &str) -> String {
-        Path::new(path)
-            .parent()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default()
     }
     fn is_macos_junk(name: &str) -> bool {
         name.starts_with("._")
@@ -1365,6 +731,145 @@ mod macos {
         }
 
         #[test]
+        fn nfs_adapter_runs_shared_mounted_view_suite() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("src")).unwrap();
+            for (path, bytes) in [
+                ("README.md", b"baseline\n".as_slice()),
+                ("src/lower.txt", b"lower\n".as_slice()),
+                ("script.sh", b"abcdef\n".as_slice()),
+                ("delete.txt", b"delete\n".as_slice()),
+            ] {
+                fs::write(temp.path().join(path), bytes).unwrap();
+            }
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "nfs-conformance",
+                Some("main"),
+                LaneWorkdirMode::NfsCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let mount = db
+                .mount_nfs_cow_workdir_for_lane("nfs-conformance")
+                .unwrap();
+            let workdir =
+                PathBuf::from(db.lane_workdir("nfs-conformance").unwrap().workdir.unwrap());
+            let expected = run_mounted_view_conformance(&workdir).unwrap();
+            let record = db
+                .record_lane_workdir("nfs-conformance", Some("conformance".to_string()))
+                .unwrap();
+            let actual = record
+                .changed_paths
+                .into_iter()
+                .flat_map(|path| path.old_path.into_iter().chain(std::iter::once(path.path)))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected.changed_paths);
+            assert_eq!(
+                fs::read(temp.path().join("README.md")).unwrap(),
+                b"baseline\n"
+            );
+            drop(mount);
+        }
+
+        #[test]
+        fn foreground_nfs_mount_stops_through_a_separate_trail_handle() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            let spawned = db
+                .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    "foreground-nfs",
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            let workdir = PathBuf::from(spawned.workdir.unwrap());
+            drop(db);
+
+            let workspace = temp.path().to_path_buf();
+            let owner = thread::spawn(move || {
+                Trail::open(&workspace)
+                    .unwrap()
+                    .mount_lane_workspace_until_requested("foreground-nfs")
+                    .unwrap()
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !is_nfs_mount(&workdir) {
+                assert!(
+                    Instant::now() < deadline,
+                    "foreground NFS mount did not start"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+            fs::write(workdir.join("foreground.txt"), "owned\n").unwrap();
+            let requester = Trail::open(temp.path()).unwrap();
+            let stopped = requester
+                .request_lane_workspace_unmount("foreground-nfs")
+                .unwrap();
+            assert!(stopped.healthy);
+            let owned = owner.join().unwrap();
+            assert_eq!(owned.view_id, stopped.view_id);
+            assert!(!is_nfs_mount(&workdir));
+            let mut reopened = Trail::open(temp.path()).unwrap();
+            let checkpoint = reopened
+                .checkpoint_lane_workspace("foreground-nfs", None)
+                .unwrap();
+            assert_eq!(checkpoint.source_paths, vec!["foreground.txt"]);
+        }
+
+        #[test]
+        fn daemon_owned_nfs_mount_returns_ready_and_unmounts_asynchronously() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            let spawned = db
+                .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    "daemon-nfs",
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            let workdir = PathBuf::from(spawned.workdir.unwrap());
+            let mounted = db.start_lane_workspace_mount("daemon-nfs").unwrap();
+            assert!(mounted.healthy);
+            assert!(mounted.owner_pid.is_some());
+            fs::write(workdir.join("daemon.txt"), "owned\n").unwrap();
+            let stopped = db.request_lane_workspace_unmount("daemon-nfs").unwrap();
+            assert_eq!(mounted.view_id, stopped.view_id);
+            assert_eq!(stopped.owner_pid, None);
+            assert!(!is_nfs_mount(&workdir));
+            let checkpoint = db.checkpoint_lane_workspace("daemon-nfs", None).unwrap();
+            assert_eq!(checkpoint.source_paths, vec!["daemon.txt"]);
+        }
+
+        #[test]
         fn real_nfs_mount_records_new_modified_and_renamed_files() {
             if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
                 return;
@@ -1422,6 +927,241 @@ mod macos {
             drop(remount);
             assert!(!is_nfs_mount(&workdir));
         }
+
+        #[test]
+        fn nfs_exec_checkpoint_and_recovery_are_fully_local() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "local-exec",
+                Some("main"),
+                LaneWorkdirMode::NfsCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+            let exec = db
+                .exec_lane_workspace(
+                    "local-exec",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf 'local\\n' > local.txt".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(exec.exit_code, 0);
+            let workdir = PathBuf::from(db.lane_workdir("local-exec").unwrap().workdir.unwrap());
+            assert!(!is_nfs_mount(&workdir));
+            let checkpoint = db
+                .checkpoint_lane_workspace("local-exec", Some("local".to_string()))
+                .unwrap();
+            assert_eq!(checkpoint.source_paths, vec!["local.txt"]);
+            let built = tempfile::tempdir().unwrap();
+            fs::write(built.path().join("tool"), "shared\n").unwrap();
+            let key = WorkspaceLayerKeyV1 {
+                kind: "tool".to_string(),
+                adapter: "manual".to_string(),
+                adapter_version: 1,
+                inputs: BTreeMap::from([("fixture".to_string(), "v1".to_string())]),
+                tool_versions: BTreeMap::new(),
+                platform: std::env::consts::OS.to_string(),
+                architecture: std::env::consts::ARCH.to_string(),
+                portability_scope: "test".to_string(),
+                strategy: "fixture".to_string(),
+            };
+            let layer = db
+                .publish_workspace_layer_from_directory(&key, built.path())
+                .unwrap();
+            db.attach_workspace_layer(
+                "local-exec",
+                &layer.layer_id,
+                "vendor-cache",
+                "manual",
+                &layer.cache_key,
+            )
+            .unwrap();
+            let gate = db
+                .run_lane_test(
+                    "local-exec",
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "test -f vendor-cache/tool".to_string(),
+                    ],
+                    None,
+                    10,
+                )
+                .unwrap();
+            assert!(gate.success);
+            assert_eq!(gate.source_root, checkpoint.root_id);
+            assert_eq!(gate.environment_keys, vec![layer.cache_key.clone()]);
+            assert_eq!(gate.layer_ids, vec![layer.layer_id]);
+
+            db.exec_lane_workspace(
+                "local-exec",
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'newer\\n' > local.txt".to_string(),
+                ],
+            )
+            .unwrap();
+            let newer = db.checkpoint_lane_workspace("local-exec", None).unwrap();
+            assert_ne!(newer.root_id, gate.source_root);
+            let readiness = db.lane_readiness("local-exec").unwrap();
+            assert!(readiness
+                .blockers
+                .iter()
+                .any(|issue| issue.code == "test_gate_stale_source_root"));
+            drop(db);
+            let reopened = Trail::open(temp.path()).unwrap();
+            reopened.recover_workspace_views().unwrap();
+            let entry = reopened
+                .root_file_entry(&checkpoint.root_id, "local.txt")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reopened.materialize_entry_bytes(&entry).unwrap(),
+                b"local\n"
+            );
+        }
+
+        #[test]
+        fn nfs_git_checkout_reset_and_clean_are_lane_local() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            for args in [
+                vec!["init", "--quiet"],
+                vec!["config", "user.name", "Trail Test"],
+                vec!["config", "user.email", "trail@example.invalid"],
+            ] {
+                assert!(Command::new("git")
+                    .arg("-C")
+                    .arg(temp.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(["commit", "--quiet", "-m", "base"])
+                .status()
+                .unwrap()
+                .success());
+            let real_head = Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout;
+            let real_index = fs::read(temp.path().join(".git/index")).unwrap();
+
+            Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            for lane in ["git-a", "git-b"] {
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    lane,
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            }
+            let run = db
+                .exec_lane_workspace(
+                    "git-a",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        r#"
+set -eu
+test "$(cat README.md)" = baseline
+printf 'staged\n' > README.md
+git add README.md
+git reset --hard HEAD
+test "$(cat README.md)" = baseline
+git checkout -b agent-local
+printf 'dirty\n' > README.md
+git checkout -- README.md
+test "$(cat README.md)" = baseline
+mkdir -p node_modules/pkg target/debug
+printf 'dependency\n' > node_modules/pkg/index.js
+printf 'artifact\n' > target/debug/artifact
+git clean -fdx
+test ! -e node_modules
+test ! -e target
+"#
+                        .to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(run.exit_code, 0);
+            let other = db
+                .exec_lane_workspace(
+                    "git-b",
+                    &[
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "test \"$(cat README.md)\" = baseline; test ! -e node_modules; test ! -e target/debug/artifact"
+                            .to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(other.exit_code, 0);
+
+            let real_after = Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(real_after, real_head);
+            assert_eq!(
+                fs::read(temp.path().join(".git/index")).unwrap(),
+                real_index
+            );
+            assert_eq!(
+                fs::read_to_string(temp.path().join("README.md")).unwrap(),
+                "baseline\n"
+            );
+            assert!(!temp.path().join(".git/refs/heads/agent-local").exists());
+            let view = db.lane_workspace_view("git-a").unwrap().unwrap();
+            let shadow = db.workspace_git_shadow(&view).unwrap().unwrap();
+            let refs = Command::new("git")
+                .env("GIT_DIR", &shadow.git_dir)
+                .args(["show-ref", "--verify", "refs/heads/agent-local"])
+                .status()
+                .unwrap();
+            assert!(refs.success());
+            assert!(db.lane_readiness("git-a").unwrap().ready);
+        }
     }
 }
 
@@ -1430,6 +1170,11 @@ pub(crate) use macos::*;
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct NfsCowMount;
+
+#[cfg(not(target_os = "macos"))]
+impl Drop for NfsCowMount {
+    fn drop(&mut self) {}
+}
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn prepare_nfs_cow_workdir(

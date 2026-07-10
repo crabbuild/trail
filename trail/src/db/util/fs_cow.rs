@@ -8,6 +8,35 @@ pub(crate) enum WorkspaceCowMaterializeStatus {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileProjectionCopy {
+    Cloned,
+    Copied,
+}
+
+/// Copy an immutable projected file into a private upper, preferring a native
+/// copy-on-write clone when source and destination storage support it.
+pub(crate) fn clone_or_copy_projected_file(
+    source: &Path,
+    destination: &Path,
+) -> Result<FileProjectionCopy> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match cow_clone_file(source, destination) {
+        Ok(true) => Ok(FileProjectionCopy::Cloned),
+        Ok(false) => {
+            let _ = fs::remove_file(destination);
+            fs::copy(source, destination)?;
+            Ok(FileProjectionCopy::Copied)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(destination);
+            Err(Error::Io(err))
+        }
+    }
+}
+
 pub(crate) fn materialize_from_workspace_cow(
     workspace_root: &Path,
     output_root: &Path,

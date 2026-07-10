@@ -107,12 +107,35 @@ impl Trail {
         let is_sparse = sparse_paths.is_some();
         let workdir_mode =
             self.lane_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
+        let _mutation_barrier = if workdir_mode.is_transparent_cow() {
+            let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "layered lane `{lane}` has no persisted workspace view"
+                ))
+            })?;
+            Some(ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?)
+        } else {
+            None
+        };
+        let source_upper = if workdir_mode.is_transparent_cow() {
+            Some(self.workspace_view_paths_for_lane(lane)?.source_upper)
+        } else {
+            None
+        };
+        let record_scan_root = source_upper.as_deref().unwrap_or(&workdir_path);
         let overlay_manifest_path = self.lane_overlay_clean_manifest_path(&branch)?;
-        let cached_status = if workdir_mode == LaneWorkdirMode::NfsCow {
+        let cached_status = if matches!(
+            &workdir_mode,
+            LaneWorkdirMode::OverlayCow | LaneWorkdirMode::NfsCow
+        ) {
             // Derive the delta from the persistent upper layer instead of an
-            // NFS READDIR result, which macOS may cache across a create.
-            let candidate_paths = self.nfs_cow_candidate_paths_for_lane(lane)?;
-            let disk_files = self.scan_files_under_for_paths(&workdir_path, &candidate_paths)?;
+            // FUSE/NFS READDIR result or a scan of the composed repository.
+            let candidate_paths = if workdir_mode == LaneWorkdirMode::NfsCow {
+                self.nfs_cow_candidate_paths_for_lane(lane)?
+            } else {
+                self.overlay_cow_candidate_paths_for_lane(lane)?
+            };
+            let disk_files = self.scan_files_under_for_paths(record_scan_root, &candidate_paths)?;
             CachedWorkdirManifestStatus::Dirty {
                 disk_manifest: self.disk_manifest(&disk_files),
                 candidate_paths: Some(candidate_paths),
@@ -125,6 +148,9 @@ impl Trail {
             )?
         };
         if matches!(cached_status, CachedWorkdirManifestStatus::Clean) {
+            if workdir_mode.is_transparent_cow() {
+                self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+            }
             return Ok(LaneRecordReport {
                 lane_id: branch.lane_id,
                 operation: None,
@@ -202,6 +228,9 @@ impl Trail {
                             materialized_paths.iter(),
                         )?;
                     }
+                    if workdir_mode.is_transparent_cow() {
+                        self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+                    }
                     return Ok(LaneRecordReport {
                         lane_id: branch.lane_id,
                         operation: None,
@@ -213,7 +242,8 @@ impl Trail {
                     .iter()
                     .map(|summary| summary.path.clone())
                     .collect::<Vec<_>>();
-                let disk_files = self.scan_files_under_for_paths(&workdir_path, &selected_paths)?;
+                let disk_files =
+                    self.scan_files_under_for_paths(record_scan_root, &selected_paths)?;
                 let built = self.build_root_for_selected_disk_files_incremental(
                     &head.root_id,
                     &previous_files,
@@ -313,6 +343,9 @@ impl Trail {
                     materialized_paths.iter(),
                 )?;
             }
+            if workdir_mode.is_transparent_cow() {
+                self.complete_workspace_checkpoint(lane, &head.root_id, None)?;
+            }
             return Ok(LaneRecordReport {
                 lane_id: branch.lane_id,
                 operation: None,
@@ -356,6 +389,7 @@ impl Trail {
         };
         let operation_id = self.store_operation(&operation)?;
         self.advance_ref_cas(&head, &change_id, &built.root_id, &operation_id)?;
+        test_crash_point("checkpoint_after_ref_advance");
         let message_id = if let Some(message) = message {
             Some(self.store_message(
                 "lane",
@@ -372,6 +406,7 @@ impl Trail {
             "UPDATE lane_branches SET head_change = ?1, head_root = ?2, updated_at = ?3 WHERE lane_id = ?4",
             params![change_id.0, built.root_id.0, now_ts(), branch.lane_id],
         )?;
+        test_crash_point("checkpoint_after_lane_head_update");
         if is_sparse {
             self.write_sparse_workdir_manifest(&workdir_path, materialized_paths.iter())?;
         }
@@ -410,6 +445,9 @@ impl Trail {
             self.update_lane_turn_progress(&turn_id, "workdir_recorded", Some(&change_id))?;
         } else {
             self.finish_lane_turn(&turn_id, "completed", Some(&change_id))?;
+        }
+        if workdir_mode.is_transparent_cow() {
+            self.complete_workspace_checkpoint(lane, &built.root_id, Some(&change_id))?;
         }
         Ok(LaneRecordReport {
             lane_id: branch.lane_id,
@@ -501,12 +539,32 @@ impl Trail {
         }
     }
 
-    fn lane_workdir_record_changed_paths(
+    pub(crate) fn lane_workdir_record_changed_paths(
         &self,
         branch: &LaneBranch,
         head: &RefRecord,
         workdir_path: &Path,
     ) -> Result<Vec<FileDiffSummary>> {
+        let lane_record = self.lane_record(&branch.lane_id)?;
+        let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
+        if workdir_mode.is_transparent_cow() {
+            let candidate_paths = if workdir_mode == LaneWorkdirMode::NfsCow {
+                self.nfs_cow_candidate_paths_for_lane(&lane_record.name)?
+            } else {
+                self.overlay_cow_candidate_paths_for_lane(&lane_record.name)?
+            };
+            let source_upper = self
+                .workspace_view_paths_for_lane(&lane_record.name)?
+                .source_upper;
+            let disk_files = self.scan_files_under_for_paths(&source_upper, &candidate_paths)?;
+            let disk_manifest = self.disk_manifest(&disk_files);
+            let previous_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
+            return Ok(self.diff_file_maps_to_manifest_for_paths(
+                &previous_files,
+                &disk_manifest,
+                &candidate_paths,
+            ));
+        }
         let sparse_paths = self.lane_sparse_workdir_paths(branch, workdir_path)?;
         let overlay_manifest_path = self.lane_overlay_clean_manifest_path(branch)?;
         match self.lane_cached_workdir_manifest_status(

@@ -121,6 +121,32 @@ pub(crate) fn parse_lane_gate_summary(
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
         command,
+        source_root: payload
+            .get("source_root")
+            .and_then(|value| value.as_str())
+            .map(|value| ObjectId(value.to_string())),
+        view_id: payload
+            .get("view_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        view_generation: payload
+            .get("view_generation")
+            .and_then(|value| value.as_u64()),
+        environment_keys: json_string_array(&payload, "environment_keys"),
+        layer_ids: json_string_array(&payload, "layer_ids"),
         created_at,
     })
+}
+
+fn json_string_array(payload: &serde_json::Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }

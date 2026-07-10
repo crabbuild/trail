@@ -155,3 +155,45 @@ pub(crate) struct LaneClaimRequest {
     #[serde(default, alias = "ttl")]
     pub(crate) ttl_secs: Option<u64>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceCheckpointRequest {
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaneUpdateRequest {
+    #[serde(default = "default_update_source", alias = "source")]
+    pub(crate) from: String,
+    #[serde(default)]
+    pub(crate) checkpoint: bool,
+}
+
+fn default_update_source() -> String {
+    "main".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceExecRequest {
+    pub(crate) command: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DependencySyncRequest {
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheGcRequest {
+    #[serde(default)]
+    pub(crate) dry_run: bool,
+    #[serde(default)]
+    pub(crate) retention_secs: Option<u64>,
+}

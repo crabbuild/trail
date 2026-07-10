@@ -7,7 +7,10 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
@@ -31,7 +34,7 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
-const TRAIL_SCHEMA_VERSION: i64 = 2;
+const TRAIL_SCHEMA_VERSION: i64 = 4;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";
@@ -46,6 +49,8 @@ const OP_OBJECT_VERSION: u16 = 1;
 const BLOB_OBJECT_VERSION: u16 = 1;
 const MESSAGE_OBJECT_VERSION: u16 = 1;
 const ANCHOR_OBJECT_VERSION: u16 = 1;
+const WORKSPACE_LAYER_MANIFEST_KIND: &str = "workspace_layer_manifest";
+const WORKSPACE_LAYER_MANIFEST_VERSION: u16 = 1;
 const OBJECT_CACHE_MAX_ENTRIES: usize = 4096;
 const OBJECT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ORDER_KEY_STEP: u64 = 1024;
@@ -67,6 +72,13 @@ const DEFAULT_CRABIGNORE_PATTERNS: &[&str] = &[
     "build/",
     "coverage/",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RootDirectoryChild {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) entry: Option<FileEntry>,
+}
 
 pub struct Trail {
     workspace_root: PathBuf,
@@ -705,7 +717,7 @@ fn duration_ns(duration: Duration) -> i64 {
 pub(crate) struct DaemonWorktreeCache {
     state: Arc<Mutex<DaemonWorktreeCacheState>>,
     persist: Option<DaemonWorktreeCachePersist>,
-    _watcher: notify::RecommendedWatcher,
+    watcher: Option<notify::RecommendedWatcher>,
 }
 
 #[derive(Clone, Debug)]
@@ -713,6 +725,7 @@ pub(crate) struct DaemonWorktreeCachePersist {
     path: PathBuf,
     workspace_root: PathBuf,
     pid: u32,
+    active: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]

@@ -12,6 +12,7 @@ Execute in the order below unless dependencies say otherwise. Each executor shou
 | 002 | Write clean workdir manifests from materialization stamps | P1 | M | - | DONE |
 | 003 | Parallelize copy-on-write cloning | P1 | M | 002 | DONE |
 | 004 | Stream root materialization in chunks | P2 | L | 001, 002 | DONE |
+| 005 | Layered lane workspaces | P0 | XXL | 004 | BLOCKED — native Windows Dokan acceptance run pending |
 
 Status values: TODO, IN PROGRESS, DONE, BLOCKED with a one-line reason, or REJECTED with a one-line rationale.
 
@@ -20,6 +21,7 @@ Status values: TODO, IN PROGRESS, DONE, BLOCKED with a one-line reason, or REJEC
 - 001 and 002 are independent but should be benchmarked in this order to separate source-scan savings from destination-scan savings.
 - 003 depends on 002 so parallel clone workers can return destination stamps through the same report path.
 - 004 depends on 001 and 002 because streaming chunks need clean-index stamp reuse and final manifest assembly to avoid reintroducing full scans.
+- 005 builds on the bounded materialization work but replaces copied agent workdirs with lazy, layered views; its internal task graph and acceptance matrix live in `005-layered-lane-workspaces.md`.
 
 ## Findings considered and deferred
 

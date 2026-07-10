@@ -17,6 +17,8 @@ pub struct TrailConfig {
     pub storage: StorageConfig,
     #[serde(default = "default_guardrails_config")]
     pub guardrails: GuardrailsConfig,
+    #[serde(default = "default_workspace_views_config")]
+    pub workspace_views: WorkspaceViewsConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +102,19 @@ pub struct GuardrailsConfig {
     pub policy: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceViewsConfig {
+    /// Zero disables the corresponding limit.
+    pub upper_logical_bytes: u64,
+    pub upper_file_count: u64,
+    pub single_file_bytes: u64,
+    pub journal_bytes: u64,
+    pub cache_build_bytes: u64,
+    pub concurrent_cache_builders: u64,
+    pub cache_retention_secs: u64,
+    pub cache_max_bytes: u64,
+}
+
 fn default_storage_config() -> StorageConfig {
     StorageConfig {
         prolly_backend: default_prolly_backend(),
@@ -148,6 +163,19 @@ fn default_slatedb_s3_allow_http() -> bool {
 fn default_guardrails_config() -> GuardrailsConfig {
     GuardrailsConfig {
         policy: String::new(),
+    }
+}
+
+fn default_workspace_views_config() -> WorkspaceViewsConfig {
+    WorkspaceViewsConfig {
+        upper_logical_bytes: 0,
+        upper_file_count: 0,
+        single_file_bytes: 0,
+        journal_bytes: 0,
+        cache_build_bytes: 0,
+        concurrent_cache_builders: 4,
+        cache_retention_secs: 7 * 24 * 60 * 60,
+        cache_max_bytes: 0,
     }
 }
 
@@ -276,6 +304,7 @@ impl TrailConfig {
             },
             storage: default_storage_config(),
             guardrails: default_guardrails_config(),
+            workspace_views: default_workspace_views_config(),
         }
     }
 }

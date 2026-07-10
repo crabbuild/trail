@@ -3,6 +3,116 @@ use super::*;
 const MATERIALIZE_BATCH_FILES: usize = 1024;
 
 impl Trail {
+    pub(crate) fn root_file_entry(
+        &self,
+        root_id: &ObjectId,
+        path: &str,
+    ) -> Result<Option<FileEntry>> {
+        let path = normalize_relative_path(path)?;
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        self.root_prolly
+            .get(&tree, path.as_bytes())?
+            .map(|value| from_cbor(&value))
+            .transpose()
+    }
+
+    pub(crate) fn root_directory_exists(
+        &self,
+        root_id: &ObjectId,
+        directory: &str,
+    ) -> Result<bool> {
+        if directory.is_empty() {
+            return Ok(true);
+        }
+        let directory = normalize_relative_path(directory)?;
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let prefix = format!("{directory}/");
+        let end = prefix_upper_bound(prefix.as_bytes());
+        Ok(self
+            .root_prolly
+            .range(&tree, prefix.as_bytes(), end.as_deref())?
+            .next()
+            .transpose()?
+            .is_some())
+    }
+
+    pub(crate) fn root_immediate_children(
+        &self,
+        root_id: &ObjectId,
+        directory: &str,
+    ) -> Result<Vec<RootDirectoryChild>> {
+        let directory = if directory.is_empty() {
+            String::new()
+        } else {
+            normalize_relative_path(directory)?
+        };
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let end = if prefix.is_empty() {
+            None
+        } else {
+            prefix_upper_bound(prefix.as_bytes())
+        };
+        let mut cursor = prefix.as_bytes().to_vec();
+        let mut children = Vec::new();
+        loop {
+            let Some(item) = self
+                .root_prolly
+                .range(&tree, &cursor, end.as_deref())?
+                .next()
+            else {
+                break;
+            };
+            let (key, value) = item?;
+            let path = String::from_utf8(key.clone())
+                .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
+            let Some(remainder) = path.strip_prefix(&prefix) else {
+                break;
+            };
+            if remainder.is_empty() {
+                cursor = key;
+                cursor.push(0);
+                continue;
+            }
+            let (name, is_directory) = match remainder.split_once('/') {
+                Some((name, _)) => (name, true),
+                None => (remainder, false),
+            };
+            let child_path = if directory.is_empty() {
+                name.to_string()
+            } else {
+                format!("{directory}/{name}")
+            };
+            children.push(RootDirectoryChild {
+                name: name.to_string(),
+                path: child_path.clone(),
+                entry: if is_directory {
+                    None
+                } else {
+                    Some(from_cbor(&value)?)
+                },
+            });
+            if is_directory {
+                let child_prefix = format!("{child_path}/");
+                let Some(next) = prefix_upper_bound(child_prefix.as_bytes()) else {
+                    break;
+                };
+                cursor = next;
+            } else {
+                cursor = key;
+                cursor.push(0);
+            }
+        }
+        Ok(children)
+    }
+
     pub(crate) fn load_root_files_for_paths(
         &self,
         root_id: &ObjectId,
@@ -251,6 +361,60 @@ impl Trail {
                 Ok(blob.bytes)
             }
         }
+    }
+
+    pub(crate) fn project_entry_file(&self, entry: &FileEntry) -> Result<PathBuf> {
+        if entry.content_hash.len() != 64
+            || !entry
+                .content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Corrupt(format!(
+                "file entry has invalid content hash `{}`",
+                entry.content_hash
+            )));
+        }
+        let path = self
+            .db_dir
+            .join("cache")
+            .join("blobs")
+            .join(&entry.content_hash[..2])
+            .join(&entry.content_hash);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == entry.size_bytes
+                    && sha256_projection_file(&path)? == entry.content_hash =>
+            {
+                return Ok(path);
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Error::Corrupt(format!(
+                    "blob projection `{}` is not a regular file",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                make_projection_writable(&path)?;
+                fs::remove_file(&path)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::Io(err)),
+        }
+        let bytes = self.materialize_entry_bytes(entry)?;
+        if bytes.len() as u64 != entry.size_bytes || sha256_hex(&bytes) != entry.content_hash {
+            return Err(Error::Corrupt(format!(
+                "materialized bytes do not match file entry hash {}",
+                entry.content_hash
+            )));
+        }
+        write_file_atomic(&path, &bytes, false)?;
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions)?;
+        Ok(path)
     }
 
     pub(crate) fn materialize_entries_bytes(
@@ -531,6 +695,29 @@ impl Trail {
     }
 }
 
+fn sha256_projection_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn make_projection_writable(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn lazy_text_lines(bytes: &[u8], introduced_by: &ChangeId) -> Vec<LineEntry> {
     split_lines(bytes)
         .into_iter()
@@ -748,6 +935,62 @@ mod tests {
             fs::read_to_string(output.path().join("src/lib.rs")).unwrap(),
             "pub fn lib() {}\n"
         );
+    }
+
+    #[test]
+    fn lazy_root_lookup_lists_only_immediate_children() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+
+        let root = db.root_immediate_children(&head.root_id, "").unwrap();
+        assert_eq!(
+            root.iter()
+                .map(|child| (
+                    child.name.as_str(),
+                    child.path.as_str(),
+                    child.entry.is_some()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a.txt", "a.txt", true),
+                ("b.txt", "b.txt", true),
+                ("src", "src", false),
+            ]
+        );
+        let src = db.root_immediate_children(&head.root_id, "src").unwrap();
+        assert_eq!(src.len(), 1);
+        assert_eq!(src[0].path, "src/lib.rs");
+        assert!(src[0].entry.is_some());
+        assert!(db.root_directory_exists(&head.root_id, "src").unwrap());
+        assert!(!db.root_directory_exists(&head.root_id, "missing").unwrap());
+        assert!(db
+            .root_file_entry(&head.root_id, "a.txt")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn blob_projection_is_content_addressed_and_reused() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let entry = db.root_file_entry(&head.root_id, "a.txt").unwrap().unwrap();
+
+        let first = db.project_entry_file(&entry).unwrap();
+        let second = db.project_entry_file(&entry).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(first).unwrap(), b"a1\n");
+    }
+
+    #[test]
+    fn blob_projection_repairs_same_size_corruption_before_reuse() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let entry = db.root_file_entry(&head.root_id, "a.txt").unwrap().unwrap();
+        let path = db.project_entry_file(&entry).unwrap();
+        make_projection_writable(&path).unwrap();
+        fs::write(&path, b"bad").unwrap();
+
+        let repaired = db.project_entry_file(&entry).unwrap();
+        assert_eq!(repaired, path);
+        assert_eq!(fs::read(repaired).unwrap(), b"a1\n");
     }
 }
 

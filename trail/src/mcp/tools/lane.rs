@@ -12,7 +12,7 @@ pub(super) fn tools() -> Value {
                 "name": { "type": "string" },
                 "from_ref": { "type": "string" },
                 "materialize": { "type": "boolean" },
-                "workdir_mode": { "type": "string", "enum": ["virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"] },
+                "workdir_mode": { "type": "string", "enum": ["auto", "virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"] },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
                 "paths": { "type": "array", "items": { "type": "string" } },
@@ -113,6 +113,17 @@ pub(super) fn tools() -> Value {
             }), vec!["lane"])
         },
         {
+            "name": "trail.lane_update",
+            "title": "Update Layered Lane",
+            "description": "Three-way merge a source branch into a clean, unmounted layered lane and atomically advance its pinned view generation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "from": { "type": "string" },
+                "source": { "type": "string" },
+                "checkpoint": { "type": "boolean" }
+            }), vec!["lane"])
+        },
+        {
             "name": "trail.lane_handoff",
             "title": "Lane Handoff",
             "description": "Package one lane branch for transfer with readiness, current session context, recent events, spans, operations, and next steps.",
@@ -141,6 +152,104 @@ pub(super) fn tools() -> Value {
                 "record_current": { "type": "boolean" },
                 "sync_workdir": { "type": "boolean" }
             }), vec!["lane", "to"])
+        },
+        {
+            "name": "trail.lane_workspace",
+            "title": "Lane Workspace View",
+            "description": "Show the persisted layered workspace view, backend, uppers, generation, checkpoint, and mount owner for one lane.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_space",
+            "title": "Lane Workspace Space",
+            "description": "Report shared cache bytes and lane-exclusive source, generated, scratch, journal, and physical storage.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_mount",
+            "title": "Mount Lane Workspace",
+            "description": "Start a daemon-owned layered mount worker and return its owner, backend, mountpoint, and generation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_unmount",
+            "title": "Unmount Lane Workspace",
+            "description": "Request graceful teardown from the active mount owner and wait for its lease release.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_checkpoint",
+            "title": "Checkpoint Lane Workspace",
+            "description": "Checkpoint only durable source-upper mutations into the lane ref under a mutation barrier.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "message": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.lane_exec",
+            "title": "Execute In Lane Workspace",
+            "description": "Mount a layered lane for one open-world command with isolated cache and target variables.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+            }), vec!["lane", "command"])
+        },
+        {
+            "name": "trail.deps_status",
+            "title": "Dependency Environment Status",
+            "description": "Show expected, attached, ready, stale, building, or failed workspace environments for one lane.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.deps_sync",
+            "title": "Synchronize Dependencies",
+            "description": "Build or reuse a frozen dependency layer and attach it to the lane.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "path": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.cache_list",
+            "title": "List Workspace Cache",
+            "description": "List immutable workspace layers and their logical and physical storage accounting.",
+            "inputSchema": object_schema(json!({}), vec![])
+        },
+        {
+            "name": "trail.cache_inspect",
+            "title": "Inspect Workspace Layer",
+            "description": "Inspect and integrity-check one immutable workspace layer.",
+            "inputSchema": object_schema(json!({
+                "layer": { "type": "string" }
+            }), vec!["layer"])
+        },
+        {
+            "name": "trail.cache_verify",
+            "title": "Verify Workspace Layer",
+            "description": "Verify one immutable workspace layer against its content-addressed manifest.",
+            "inputSchema": object_schema(json!({
+                "layer": { "type": "string" }
+            }), vec!["layer"])
+        },
+        {
+            "name": "trail.cache_gc",
+            "title": "Collect Workspace Cache",
+            "description": "Preview or reclaim unpinned immutable layers and rematerializable projections.",
+            "inputSchema": object_schema(json!({
+                "dry_run": { "type": "boolean" },
+                "retention_secs": { "type": "integer", "minimum": 0 }
+            }), vec![])
         }
     ])
 }

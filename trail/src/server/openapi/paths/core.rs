@@ -79,6 +79,22 @@ pub(super) fn core_paths() -> Value {
         },
         "/v1/guardrails/check": {
             "post": openapi_operation("guardrailCheck", "Guardrail check", "Preflight a lane action and return allowed, approval_required, or blocked.", vec![], Some("GuardrailCheckRequest"), true)
+        },
+        "/v1/cache/layers": {
+            "get": openapi_operation("workspaceCacheList", "List workspace cache", "List immutable workspace layers and storage accounting.", vec![], None, true)
+        },
+        "/v1/cache/layers/{layer}": {
+            "get": openapi_operation("workspaceCacheInspect", "Inspect workspace layer", "Inspect and integrity-check one immutable workspace layer.", vec![
+                openapi_path_param("layer", "string")
+            ], None, true)
+        },
+        "/v1/cache/layers/{layer}/verify": {
+            "post": openapi_operation("workspaceCacheVerify", "Verify workspace layer", "Verify one immutable workspace layer against its content-addressed manifest.", vec![
+                openapi_path_param("layer", "string")
+            ], None, true)
+        },
+        "/v1/cache/gc": {
+            "post": openapi_operation("workspaceCacheGc", "Collect workspace cache", "Preview or reclaim unpinned immutable layers and rematerializable projections.", vec![], Some("CacheGcRequest"), true)
         }
     })
 }

@@ -270,6 +270,7 @@ impl Trail {
             daemon_worktree_cache: None,
         };
         db.init_schema()?;
+        db.recover_workspace_views()?;
         Ok(db)
     }
 

@@ -128,7 +128,14 @@ fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
 fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let lane = db.fresh_agent_lane_name(&args.provider, args.name.as_deref());
-    let workdir_mode = parse_agent_terminal_workdir_mode(&args.workdir_mode)?;
+    let workdir_mode = db.resolve_lane_spawn_workdir_mode(
+        args.from.as_deref(),
+        Some(&args.workdir_mode),
+        Some(true),
+        false,
+        false,
+        &[],
+    )?;
     let report = run_terminal_agent_task(
         ctx,
         db,
@@ -158,7 +165,14 @@ fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Resul
         .unwrap_or_else(|| format!("{} follow-up", source.task.title));
     let lane = db.fresh_agent_lane_name(&provider, Some(&name));
     let source_task = source.task.clone();
-    let workdir_mode = parse_agent_terminal_workdir_mode(&args.workdir_mode)?;
+    let workdir_mode = db.resolve_lane_spawn_workdir_mode(
+        Some(&from_change.0),
+        Some(&args.workdir_mode),
+        Some(true),
+        false,
+        false,
+        &[],
+    )?;
     let run = run_terminal_agent_task(
         ctx,
         db,
@@ -238,6 +252,7 @@ fn run_terminal_agent_task(
             "from": from
         })),
     )?;
+    let workspace_environment = db.lane_workspace_environment(&lane)?;
     drop(db);
 
     let command = if command.is_empty() {
@@ -254,6 +269,7 @@ fn run_terminal_agent_task(
     process
         .args(&command[1..])
         .current_dir(&workdir)
+        .envs(workspace_environment)
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit());
     if ctx.json {
@@ -310,14 +326,6 @@ fn run_terminal_agent_task(
     drop(overlay_mount);
     drop(nfs_mount);
     Ok(report)
-}
-
-fn parse_agent_terminal_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
-    LaneWorkdirMode::parse(value).ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "unknown terminal agent workdir mode `{value}`; expected full-cow, overlay-cow, or nfs-cow"
-        ))
-    })
 }
 
 fn push_agent_cli_suggestion(

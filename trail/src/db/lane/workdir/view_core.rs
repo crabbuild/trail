@@ -1,0 +1,1467 @@
+use super::*;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
+#[cfg(unix)]
+use libc::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, EPERM};
+#[cfg(windows)]
+const EPERM: i32 = 1;
+#[cfg(windows)]
+const ENOENT: i32 = 2;
+#[cfg(windows)]
+const EIO: i32 = 5;
+#[cfg(windows)]
+const EEXIST: i32 = 17;
+#[cfg(windows)]
+const ENOTDIR: i32 = 20;
+#[cfg(windows)]
+const EISDIR: i32 = 21;
+#[cfg(windows)]
+const EINVAL: i32 = 22;
+#[cfg(windows)]
+const ENOSPC: i32 = 28;
+#[cfg(windows)]
+const ENOTEMPTY: i32 = 39;
+
+pub(crate) const VIEW_ROOT_INO: u64 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewNodeKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ViewNodeAttr {
+    pub(crate) ino: u64,
+    pub(crate) kind: ViewNodeKind,
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) modified: SystemTime,
+}
+
+/// Backend-neutral overlay semantics for a Trail-root lower and filesystem
+/// upper. Protocol adapters translate FUSE/NFS/Dokan requests into these
+/// operations; the core owns copy-up, whiteouts, rename, inode, and visibility
+/// behavior.
+pub(crate) struct ViewCore {
+    db: Trail,
+    layout: ViewUpperLayout,
+    layers: Vec<WorkspaceLayerBinding>,
+    lower: ViewLower,
+    whiteouts: BTreeSet<String>,
+    ino_by_path: HashMap<String, u64>,
+    path_by_ino: HashMap<u64, String>,
+    dir_mtime: HashMap<String, SystemTime>,
+    dir_epoch: SystemTime,
+    next_ino: u64,
+    journal: ViewMutationJournal,
+}
+
+enum ViewLower {
+    #[cfg(test)]
+    Eager(BTreeMap<String, FileEntry>),
+    Root(ObjectId),
+}
+
+impl ViewCore {
+    #[cfg(test)]
+    pub(crate) fn new(
+        db: Trail,
+        upperdir: PathBuf,
+        lower_files: BTreeMap<String, FileEntry>,
+    ) -> Result<Self> {
+        Self::new_with_lower(db, upperdir, ViewLower::Eager(lower_files))
+    }
+
+    pub(crate) fn new_lazy(db: Trail, upperdir: PathBuf, root_id: ObjectId) -> Result<Self> {
+        Self::new_with_lower(db, upperdir, ViewLower::Root(root_id))
+    }
+
+    fn new_with_lower(db: Trail, upperdir: PathBuf, lower: ViewLower) -> Result<Self> {
+        let dir_epoch = SystemTime::now();
+        let layout = ViewUpperLayout::from_source_upper(upperdir);
+        layout.ensure()?;
+        let journal = ViewMutationJournal::open(&layout.source_upper)?;
+        let layers = db.workspace_layer_bindings_for_source_upper(&layout.source_upper)?;
+        let mut core = Self {
+            db,
+            layout,
+            layers,
+            lower,
+            whiteouts: BTreeSet::new(),
+            ino_by_path: HashMap::from([(String::new(), VIEW_ROOT_INO)]),
+            path_by_ino: HashMap::from([(VIEW_ROOT_INO, String::new())]),
+            dir_mtime: HashMap::from([(String::new(), dir_epoch)]),
+            dir_epoch,
+            next_ino: VIEW_ROOT_INO + 1,
+            journal,
+        };
+        core.whiteouts = core.load_whiteouts()?;
+        Ok(core)
+    }
+
+    fn ensure_ino(&mut self, path: &str) -> u64 {
+        if let Some(ino) = self.ino_by_path.get(path) {
+            return *ino;
+        }
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.ino_by_path.insert(path.to_string(), ino);
+        self.path_by_ino.insert(ino, path.to_string());
+        ino
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed_path_count(&self) -> usize {
+        self.ino_by_path.len()
+    }
+
+    pub(crate) fn path_for_ino(&self, ino: u64) -> std::result::Result<String, i32> {
+        self.path_by_ino.get(&ino).cloned().ok_or(ENOENT)
+    }
+
+    pub(crate) fn child_path(&self, parent: u64, name: &str) -> std::result::Result<String, i32> {
+        let parent = self.path_for_ino(parent)?;
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(EINVAL);
+        }
+        Ok(if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        })
+    }
+
+    pub(crate) fn upper_path(&self, path: &str) -> std::result::Result<PathBuf, i32> {
+        self.upper_path_in_class(classify_view_path(path), path)
+    }
+
+    fn upper_path_in_class(
+        &self,
+        class: ViewPathClass,
+        path: &str,
+    ) -> std::result::Result<PathBuf, i32> {
+        if path.is_empty() {
+            return Ok(self.layout.upper_for_class(class).to_path_buf());
+        }
+        let normalized = normalize_relative_path(path).map_err(|_| EINVAL)?;
+        let mut current = self.layout.upper_for_class(class).to_path_buf();
+        for component in Path::new(&normalized).components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(EINVAL);
+            };
+            current.push(name);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => return Err(EPERM),
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_errno(err)),
+            }
+        }
+        Ok(current)
+    }
+
+    fn upper_metadata(&self, path: &str) -> Option<fs::Metadata> {
+        self.upper_path(path)
+            .ok()
+            .and_then(|path| fs::symlink_metadata(path).ok())
+    }
+
+    pub(crate) fn is_whiteouted(&self, path: &str) -> bool {
+        self.whiteouts.iter().any(|item| {
+            path == item
+                || path
+                    .strip_prefix(item)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    fn lower_file(&self, path: &str) -> std::result::Result<Option<FileEntry>, i32> {
+        match &self.lower {
+            #[cfg(test)]
+            ViewLower::Eager(files) => Ok(files.get(path).cloned()),
+            ViewLower::Root(root_id) => self.db.root_file_entry(root_id, path).map_err(|_| EIO),
+        }
+    }
+
+    fn layer_path(&self, path: &str) -> std::result::Result<Option<PathBuf>, i32> {
+        for binding in &self.layers {
+            let suffix = if path == binding.mount_path {
+                Some("")
+            } else {
+                path.strip_prefix(&binding.mount_path)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+            };
+            let Some(suffix) = suffix else {
+                continue;
+            };
+            let candidate = if suffix.is_empty() {
+                binding.storage_path.clone()
+            } else {
+                safe_join(&binding.storage_path, suffix).map_err(|_| EINVAL)?
+            };
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_errno(err)),
+            };
+            if metadata.file_type().is_symlink() {
+                let canonical = candidate.canonicalize().map_err(io_errno)?;
+                let root = binding.storage_path.canonicalize().map_err(io_errno)?;
+                if !canonical.starts_with(root) {
+                    return Err(EPERM);
+                }
+            }
+            return Ok(Some(candidate));
+        }
+        Ok(None)
+    }
+
+    fn layer_directory_exists(&self, path: &str) -> std::result::Result<bool, i32> {
+        if self
+            .layer_path(path)?
+            .is_some_and(|path| fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+        {
+            return Ok(true);
+        }
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
+        Ok(self
+            .layers
+            .iter()
+            .any(|binding| binding.mount_path.starts_with(&prefix)))
+    }
+
+    fn lower_directory_exists(&self, path: &str) -> std::result::Result<bool, i32> {
+        match &self.lower {
+            #[cfg(test)]
+            ViewLower::Eager(files) => {
+                if path.is_empty() {
+                    return Ok(true);
+                }
+                let prefix = format!("{path}/");
+                Ok(files.keys().any(|candidate| candidate.starts_with(&prefix)))
+            }
+            ViewLower::Root(root_id) => self
+                .db
+                .root_directory_exists(root_id, path)
+                .map_err(|_| EIO),
+        }
+    }
+
+    fn lower_children(&self, path: &str) -> std::result::Result<Vec<RootDirectoryChild>, i32> {
+        match &self.lower {
+            #[cfg(test)]
+            ViewLower::Eager(files) => {
+                let prefix = if path.is_empty() {
+                    String::new()
+                } else {
+                    format!("{path}/")
+                };
+                let mut children = BTreeMap::<String, Option<FileEntry>>::new();
+                for (candidate, entry) in files {
+                    let Some(remainder) = candidate.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    let (name, direct) = match remainder.split_once('/') {
+                        Some((name, _)) => (name, false),
+                        None => (remainder, true),
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    children
+                        .entry(name.to_string())
+                        .and_modify(|value| {
+                            if !direct {
+                                *value = None;
+                            }
+                        })
+                        .or_insert_with(|| direct.then(|| entry.clone()));
+                }
+                Ok(children
+                    .into_iter()
+                    .map(|(name, entry)| RootDirectoryChild {
+                        path: if path.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{path}/{name}")
+                        },
+                        name,
+                        entry,
+                    })
+                    .collect())
+            }
+            ViewLower::Root(root_id) => self
+                .db
+                .root_immediate_children(root_id, path)
+                .map_err(|_| EIO),
+        }
+    }
+
+    fn lower_selection(&self, path: &str) -> std::result::Result<BTreeMap<String, FileEntry>, i32> {
+        match &self.lower {
+            #[cfg(test)]
+            ViewLower::Eager(files) => {
+                let prefix = format!("{path}/");
+                Ok(files
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == path || candidate.starts_with(&prefix))
+                    .map(|(path, entry)| (path.clone(), entry.clone()))
+                    .collect())
+            }
+            ViewLower::Root(root_id) => self
+                .db
+                .load_root_files_for_selections(root_id, &[path.to_string()])
+                .map_err(|_| EIO),
+        }
+    }
+
+    pub(crate) fn node_kind(&self, path: &str) -> std::result::Result<Option<ViewNodeKind>, i32> {
+        if path.is_empty() {
+            return Ok(Some(ViewNodeKind::Directory));
+        }
+        if classify_view_path(path) == ViewPathClass::Internal || self.is_whiteouted(path) {
+            return Ok(None);
+        }
+        if let Some(metadata) = self.upper_metadata(path) {
+            if metadata.is_file() {
+                return Ok(Some(ViewNodeKind::File));
+            }
+            if metadata.is_dir() {
+                return Ok(Some(ViewNodeKind::Directory));
+            }
+            return Ok(None);
+        }
+        if let Some(layer_path) = self.layer_path(path)? {
+            let metadata = fs::metadata(layer_path).map_err(io_errno)?;
+            if metadata.is_file() {
+                return Ok(Some(ViewNodeKind::File));
+            }
+            if metadata.is_dir() {
+                return Ok(Some(ViewNodeKind::Directory));
+            }
+        }
+        if self.layer_directory_exists(path)? {
+            return Ok(Some(ViewNodeKind::Directory));
+        }
+        if self.lower_file(path)?.is_some() {
+            Ok(Some(ViewNodeKind::File))
+        } else if self.lower_directory_exists(path)? {
+            Ok(Some(ViewNodeKind::Directory))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn attr(&mut self, path: &str) -> std::result::Result<ViewNodeAttr, i32> {
+        let kind = self.node_kind(path)?.ok_or(ENOENT)?;
+        let ino = self.ensure_ino(path);
+        if kind == ViewNodeKind::Directory {
+            let mode = self
+                .upper_metadata(path)
+                .map(|metadata| metadata_mode(&metadata, true))
+                .unwrap_or(0o755);
+            return Ok(ViewNodeAttr {
+                ino,
+                kind,
+                mode,
+                size: 0,
+                modified: self
+                    .dir_mtime
+                    .get(path)
+                    .copied()
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+        if let Some(metadata) = self.upper_metadata(path) {
+            return Ok(ViewNodeAttr {
+                ino,
+                kind,
+                mode: metadata_mode(&metadata, false),
+                size: metadata.len(),
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+        if let Some(layer_path) = self.layer_path(path)? {
+            let metadata = fs::metadata(layer_path).map_err(io_errno)?;
+            return Ok(ViewNodeAttr {
+                ino,
+                kind,
+                mode: metadata_mode(&metadata, kind == ViewNodeKind::Directory),
+                size: if kind == ViewNodeKind::File {
+                    metadata.len()
+                } else {
+                    0
+                },
+                modified: SystemTime::UNIX_EPOCH,
+            });
+        }
+        let entry = self.lower_file(path)?.ok_or(ENOENT)?;
+        Ok(ViewNodeAttr {
+            ino,
+            kind,
+            mode: if entry.executable {
+                0o755
+            } else {
+                entry.mode & 0o777
+            },
+            size: entry.size_bytes,
+            modified: SystemTime::UNIX_EPOCH,
+        })
+    }
+
+    pub(crate) fn lookup(&mut self, parent: u64, name: &str) -> std::result::Result<u64, i32> {
+        if name == "." {
+            return Ok(parent);
+        }
+        if name == ".." {
+            let path = self.path_for_ino(parent)?;
+            let parent_path = Path::new(&path)
+                .parent()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Ok(self.ensure_ino(&parent_path));
+        }
+        let path = self.child_path(parent, name)?;
+        self.attr(&path).map(|attr| attr.ino)
+    }
+
+    pub(crate) fn children(
+        &mut self,
+        dir_ino: u64,
+    ) -> std::result::Result<Vec<(String, ViewNodeAttr)>, i32> {
+        let path = self.path_for_ino(dir_ino)?;
+        if self.node_kind(&path)? != Some(ViewNodeKind::Directory) {
+            return Err(ENOTDIR);
+        }
+        let mut names = BTreeSet::new();
+        for child in self.lower_children(&path)? {
+            if !self.is_whiteouted(&child.path) {
+                names.insert(child.name);
+            }
+        }
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
+        for binding in &self.layers {
+            if let Some(remainder) = binding.mount_path.strip_prefix(&prefix) {
+                if let Some(name) = remainder.split('/').next() {
+                    if !name.is_empty() {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(layer_dir) = self.layer_path(&path)? {
+            if let Ok(dir) = fs::read_dir(layer_dir) {
+                for entry in dir.flatten() {
+                    names.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        for class in [
+            ViewPathClass::Source,
+            ViewPathClass::Generated,
+            ViewPathClass::Scratch,
+        ] {
+            if let Ok(dir) = self
+                .upper_path_in_class(class, &path)
+                .and_then(|path| fs::read_dir(path).map_err(io_errno))
+            {
+                for entry in dir.flatten() {
+                    names.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut result = Vec::new();
+        for name in names {
+            let child = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            if let Ok(attr) = self.attr(&child) {
+                result.push((name, attr));
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn read(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        count: u32,
+    ) -> std::result::Result<(Vec<u8>, bool), i32> {
+        let path = self.path_for_ino(ino)?;
+        if self.node_kind(&path)? != Some(ViewNodeKind::File) {
+            return Err(EISDIR);
+        }
+        if let Some(metadata) = self.upper_metadata(&path) {
+            if !metadata.is_file() {
+                return Err(EINVAL);
+            }
+            let file = File::open(self.upper_path(&path)?).map_err(io_errno)?;
+            let mut bytes = vec![0; count as usize];
+            let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
+            bytes.truncate(read);
+            Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
+        } else if let Some(layer_path) = self.layer_path(&path)? {
+            let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
+            if !metadata.is_file() {
+                return Err(EISDIR);
+            }
+            let file = File::open(layer_path).map_err(io_errno)?;
+            let mut bytes = vec![0; count as usize];
+            let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
+            bytes.truncate(read);
+            Ok((bytes, offset.saturating_add(read as u64) >= metadata.len()))
+        } else {
+            let entry = self.lower_file(&path)?.ok_or(ENOENT)?;
+            let projection = self.db.project_entry_file(&entry).map_err(|_| EIO)?;
+            let file = File::open(projection).map_err(io_errno)?;
+            let mut bytes = vec![0; count as usize];
+            let read = read_file_at(&file, &mut bytes, offset).map_err(io_errno)?;
+            bytes.truncate(read);
+            Ok((
+                bytes,
+                offset.saturating_add(read as u64) >= entry.size_bytes,
+            ))
+        }
+    }
+
+    fn ensure_upper_parent(&self, path: &str) -> std::result::Result<(), i32> {
+        let parent = parent_of(path);
+        if !parent.is_empty() && self.node_kind(&parent)? != Some(ViewNodeKind::Directory) {
+            return Err(ENOTDIR);
+        }
+        let upper = self.upper_path(path)?;
+        if let Some(parent) = upper.parent() {
+            fs::create_dir_all(parent).map_err(io_errno)?;
+        }
+        Ok(())
+    }
+
+    fn touch_dir(&mut self, path: String) {
+        let previous = self.dir_mtime.get(&path).copied().unwrap_or(self.dir_epoch);
+        let now = SystemTime::now();
+        self.dir_mtime.insert(
+            path,
+            if now > previous {
+                now
+            } else {
+                previous + Duration::from_nanos(1)
+            },
+        );
+    }
+
+    fn touch_parent(&mut self, path: &str) {
+        self.touch_dir(parent_of(path));
+    }
+
+    fn enforce_mutation_quota(
+        &self,
+        path: &str,
+        proposed_size: Option<u64>,
+        creates_file: bool,
+    ) -> std::result::Result<(), i32> {
+        let limits = &self.db.config().workspace_views;
+        if limits.upper_logical_bytes == 0
+            && limits.upper_file_count == 0
+            && limits.single_file_bytes == 0
+            && limits.journal_bytes == 0
+        {
+            return Ok(());
+        }
+        if limits.single_file_bytes > 0
+            && proposed_size.is_some_and(|size| size > limits.single_file_bytes)
+        {
+            return Err(ENOSPC);
+        }
+        if limits.journal_bytes > 0 {
+            let journal_size = fs::metadata(self.layout.journal_path())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            // Journal records are deliberately compact. Reserving 1 KiB
+            // makes the check conservative without serializing the record
+            // twice before the mutation is known to succeed.
+            if journal_size.saturating_add(1024) > limits.journal_bytes {
+                return Err(ENOSPC);
+            }
+        }
+        let usage = view_upper_usage(&self.layout).map_err(|_| EIO)?;
+        let existing = self.upper_metadata(path);
+        let previous_size = existing
+            .as_ref()
+            .filter(|metadata| metadata.is_file())
+            .map(fs::Metadata::len)
+            .unwrap_or(0);
+        let adds_file = creates_file
+            || (proposed_size.is_some()
+                && !existing.as_ref().is_some_and(|metadata| metadata.is_file()));
+        let projected_files = usage.file_count.saturating_add(u64::from(adds_file));
+        let projected_bytes = usage
+            .logical_bytes
+            .saturating_sub(previous_size)
+            .saturating_add(proposed_size.unwrap_or(previous_size));
+        if (limits.upper_file_count > 0 && projected_files > limits.upper_file_count)
+            || (limits.upper_logical_bytes > 0 && projected_bytes > limits.upper_logical_bytes)
+        {
+            return Err(ENOSPC);
+        }
+        Ok(())
+    }
+
+    fn begin_mutation(&mut self) -> std::result::Result<ViewMutationBarrier, i32> {
+        let barrier = ViewMutationBarrier::shared(&self.layout.meta_dir).map_err(|_| EIO)?;
+        self.journal
+            .observe_checkpoint(barrier.checkpoint_sequence());
+        Ok(barrier)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn ensure_upper_file(
+        &mut self,
+        path: &str,
+        truncate: bool,
+    ) -> std::result::Result<File, i32> {
+        let _barrier = self.begin_mutation()?;
+        self.ensure_upper_file_under_barrier(path, truncate)
+    }
+
+    fn ensure_upper_file_under_barrier(
+        &mut self,
+        path: &str,
+        truncate: bool,
+    ) -> std::result::Result<File, i32> {
+        if self.node_kind(path)? == Some(ViewNodeKind::Directory) {
+            return Err(EISDIR);
+        }
+        self.ensure_upper_parent(path)?;
+        let upper = self.upper_path(path)?;
+        if !upper.exists() {
+            let visible_size = if truncate {
+                0
+            } else if let Some(layer_path) = self.layer_path(path)? {
+                fs::metadata(layer_path).map_err(io_errno)?.len()
+            } else {
+                self.lower_file(path)?
+                    .map(|entry| entry.size_bytes)
+                    .unwrap_or(0)
+            };
+            self.enforce_mutation_quota(path, Some(visible_size), true)?;
+            if !truncate {
+                if let Some(layer_path) = self.layer_path(path)? {
+                    clone_or_copy_projected_file(&layer_path, &upper).map_err(|_| EIO)?;
+                    let metadata = fs::metadata(&layer_path).map_err(io_errno)?;
+                    set_file_mode(&upper, copy_up_mode(&metadata)).map_err(io_errno)?;
+                } else {
+                    let entry = self.lower_file(path)?;
+                    if let Some(entry) = entry {
+                        let projection = self.db.project_entry_file(&entry).map_err(|_| EIO)?;
+                        clone_or_copy_projected_file(&projection, &upper).map_err(|_| EIO)?;
+                        set_file_mode(
+                            &upper,
+                            if entry.executable {
+                                0o755
+                            } else {
+                                entry.mode & 0o777
+                            },
+                        )
+                        .map_err(io_errno)?;
+                    } else {
+                        File::create(&upper).map_err(io_errno)?;
+                    }
+                }
+            } else {
+                File::create(&upper).map_err(io_errno)?;
+            }
+        }
+        self.whiteouts.remove(path);
+        self.save_whiteouts().map_err(|_| EIO)?;
+        self.journal
+            .append(ViewMutationKind::Write, path, None)
+            .map_err(|_| EIO)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(truncate)
+            .open(upper)
+            .map_err(io_errno)?;
+        if truncate {
+            file.sync_data().map_err(io_errno)?;
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn write(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> std::result::Result<ViewNodeAttr, i32> {
+        let _barrier = self.begin_mutation()?;
+        let path = self.path_for_ino(ino)?;
+        let visible_size = self.attr(&path)?.size;
+        let proposed_size = visible_size.max(offset.saturating_add(data.len() as u64));
+        self.enforce_mutation_quota(&path, Some(proposed_size), false)?;
+        let file = self.ensure_upper_file_under_barrier(&path, false)?;
+        write_all_file_at(&file, data, offset).map_err(io_errno)?;
+        file.sync_data().map_err(io_errno)?;
+        test_crash_point("checkpoint_after_source_sync");
+        self.attr(&path)
+    }
+
+    pub(crate) fn create(
+        &mut self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+        exclusive: bool,
+    ) -> std::result::Result<ViewNodeAttr, i32> {
+        let _barrier = self.begin_mutation()?;
+        let path = self.child_path(parent, name)?;
+        if exclusive && self.node_kind(&path)?.is_some() {
+            return Err(EEXIST);
+        }
+        self.enforce_mutation_quota(&path, Some(0), self.upper_metadata(&path).is_none())?;
+        self.ensure_upper_parent(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(!exclusive)
+            .create_new(exclusive)
+            .open(self.upper_path(&path)?)
+            .map_err(io_errno)?;
+        set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
+        file.sync_data().map_err(io_errno)?;
+        self.whiteouts.remove(&path);
+        self.save_whiteouts().map_err(|_| EIO)?;
+        self.journal
+            .append(ViewMutationKind::Create, &path, None)
+            .map_err(|_| EIO)?;
+        self.touch_parent(&path);
+        self.attr(&path)
+    }
+
+    pub(crate) fn mkdir(
+        &mut self,
+        parent: u64,
+        name: &str,
+        mode: u32,
+    ) -> std::result::Result<ViewNodeAttr, i32> {
+        let _barrier = self.begin_mutation()?;
+        let path = self.child_path(parent, name)?;
+        if self.node_kind(&path)?.is_some() {
+            return Err(EEXIST);
+        }
+        self.enforce_mutation_quota(&path, None, false)?;
+        fs::create_dir_all(self.upper_path(&path)?).map_err(io_errno)?;
+        set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
+        self.whiteouts.remove(&path);
+        self.save_whiteouts().map_err(|_| EIO)?;
+        self.journal
+            .append(ViewMutationKind::Mkdir, &path, None)
+            .map_err(|_| EIO)?;
+        self.touch_parent(&path);
+        self.touch_dir(path.clone());
+        self.attr(&path)
+    }
+
+    pub(crate) fn setattr(
+        &mut self,
+        ino: u64,
+        size: Option<u64>,
+        mode: Option<u32>,
+    ) -> std::result::Result<ViewNodeAttr, i32> {
+        let _barrier = self.begin_mutation()?;
+        let path = self.path_for_ino(ino)?;
+        if let Some(size) = size {
+            self.enforce_mutation_quota(&path, Some(size), false)?;
+            let file = self.ensure_upper_file_under_barrier(&path, false)?;
+            file.set_len(size).map_err(io_errno)?;
+            file.sync_data().map_err(io_errno)?;
+        }
+        if let Some(mode) = mode {
+            self.enforce_mutation_quota(&path, None, false)?;
+            if self.node_kind(&path)? == Some(ViewNodeKind::File) {
+                let file = self.ensure_upper_file_under_barrier(&path, false)?;
+                set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
+                file.sync_all().map_err(io_errno)?;
+            } else {
+                set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
+            }
+        }
+        self.journal
+            .append(ViewMutationKind::Metadata, &path, None)
+            .map_err(|_| EIO)?;
+        self.attr(&path)
+    }
+
+    pub(crate) fn remove(&mut self, parent: u64, name: &str) -> std::result::Result<(), i32> {
+        let _barrier = self.begin_mutation()?;
+        let path = self.child_path(parent, name)?;
+        self.enforce_mutation_quota(&path, None, false)?;
+        let kind = self.node_kind(&path)?.ok_or(ENOENT)?;
+        let ino = self.ensure_ino(&path);
+        if kind == ViewNodeKind::Directory && !self.children(ino)?.is_empty() {
+            return Err(ENOTEMPTY);
+        }
+        if let Some(metadata) = self.upper_metadata(&path) {
+            if metadata.is_dir() {
+                fs::remove_dir(self.upper_path(&path)?).map_err(io_errno)?;
+            } else {
+                fs::remove_file(self.upper_path(&path)?).map_err(io_errno)?;
+            }
+        }
+        if self.layer_path(&path)?.is_some()
+            || self.layer_directory_exists(&path)?
+            || self.lower_file(&path)?.is_some()
+            || self.lower_directory_exists(&path)?
+        {
+            self.whiteouts.insert(path.clone());
+        }
+        self.save_whiteouts().map_err(|_| EIO)?;
+        self.journal
+            .append(ViewMutationKind::Delete, &path, None)
+            .map_err(|_| EIO)?;
+        self.touch_parent(&path);
+        Ok(())
+    }
+
+    pub(crate) fn rename(
+        &mut self,
+        from_parent: u64,
+        from_name: &str,
+        to_parent: u64,
+        to_name: &str,
+    ) -> std::result::Result<(), i32> {
+        let _barrier = self.begin_mutation()?;
+        let old = self.child_path(from_parent, from_name)?;
+        let new = self.child_path(to_parent, to_name)?;
+        if old == new {
+            return Ok(());
+        }
+        self.enforce_mutation_quota(&old, None, false)?;
+        let kind = self.node_kind(&old)?.ok_or(ENOENT)?;
+        if kind == ViewNodeKind::Directory && new.starts_with(&format!("{old}/")) {
+            return Err(EINVAL);
+        }
+        self.ensure_upper_parent(&new)?;
+        if let Some(target_kind) = self.node_kind(&new)? {
+            if kind == ViewNodeKind::File && target_kind == ViewNodeKind::Directory {
+                return Err(EISDIR);
+            }
+            if kind == ViewNodeKind::Directory && target_kind == ViewNodeKind::File {
+                return Err(ENOTDIR);
+            }
+            if target_kind == ViewNodeKind::Directory {
+                let target_ino = self.ensure_ino(&new);
+                if !self.children(target_ino)?.is_empty() {
+                    return Err(ENOTEMPTY);
+                }
+            }
+        }
+        if self.upper_metadata(&new).is_some() {
+            let metadata = self.upper_metadata(&new).unwrap();
+            if metadata.is_dir() {
+                fs::remove_dir(self.upper_path(&new)?).map_err(io_errno)?;
+            } else {
+                fs::remove_file(self.upper_path(&new)?).map_err(io_errno)?;
+            }
+        }
+        if kind == ViewNodeKind::Directory {
+            self.merge_lower_subtree_into_upper(&old)?;
+            self.move_upper_subtree(&old, &new)?;
+        } else if self.upper_metadata(&old).is_some() {
+            fs::rename(self.upper_path(&old)?, self.upper_path(&new)?).map_err(io_errno)?;
+        } else if kind == ViewNodeKind::File {
+            self.copy_lower_file(&old, &new)?;
+        }
+        self.whiteouts.insert(old.clone());
+        self.whiteouts.remove(&new);
+        self.save_whiteouts().map_err(|_| EIO)?;
+        self.journal
+            .append(ViewMutationKind::Rename, &old, Some(&new))
+            .map_err(|_| EIO)?;
+        self.touch_parent(&old);
+        self.touch_parent(&new);
+        let new_prefix = format!("{new}/");
+        let replaced_inodes = self
+            .ino_by_path
+            .keys()
+            .filter(|path| *path == &new || path.starts_with(&new_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in replaced_inodes {
+            if let Some(ino) = self.ino_by_path.remove(&path) {
+                self.path_by_ino.remove(&ino);
+            }
+        }
+        let old_prefix = format!("{old}/");
+        let moved_inodes = self
+            .ino_by_path
+            .iter()
+            .filter(|(path, _)| *path == &old || path.starts_with(&old_prefix))
+            .map(|(path, ino)| (path.clone(), *ino))
+            .collect::<Vec<_>>();
+        for (path, ino) in moved_inodes {
+            self.ino_by_path.remove(&path);
+            let suffix = path.strip_prefix(&old).unwrap();
+            let moved = format!("{new}{suffix}");
+            self.ino_by_path.insert(moved.clone(), ino);
+            self.path_by_ino.insert(ino, moved);
+        }
+        Ok(())
+    }
+
+    /// Returns the checkpoint candidate set without walking the composed view.
+    /// The journal is the fast path; upper and whiteout scans make recovery
+    /// correct after an interrupted append.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_candidates(&self) -> Result<ViewCheckpointCandidates> {
+        match &self.lower {
+            #[cfg(test)]
+            ViewLower::Eager(files) => {
+                recover_view_checkpoint_candidates(&self.layout.source_upper, files)
+            }
+            ViewLower::Root(root_id) => recover_view_checkpoint_candidates_for_root(
+                &self.db,
+                &self.layout.source_upper,
+                root_id,
+            ),
+        }
+    }
+
+    fn copy_lower_file(&self, source: &str, target: &str) -> std::result::Result<(), i32> {
+        if let Some(layer_path) = self.layer_path(source)? {
+            self.ensure_upper_parent(target)?;
+            let target_path = self.upper_path(target)?;
+            clone_or_copy_projected_file(&layer_path, &target_path).map_err(|_| EIO)?;
+            let metadata = fs::metadata(layer_path).map_err(io_errno)?;
+            return set_file_mode(&target_path, copy_up_mode(&metadata)).map_err(io_errno);
+        }
+        let entry = self.lower_file(source)?.ok_or(ENOENT)?;
+        self.ensure_upper_parent(target)?;
+        let projection = self.db.project_entry_file(&entry).map_err(|_| EIO)?;
+        let target_path = self.upper_path(target)?;
+        clone_or_copy_projected_file(&projection, &target_path).map_err(|_| EIO)?;
+        set_file_mode(
+            &target_path,
+            if entry.executable {
+                0o755
+            } else {
+                entry.mode & 0o777
+            },
+        )
+        .map_err(io_errno)
+    }
+
+    fn merge_lower_subtree_into_upper(&self, root: &str) -> std::result::Result<(), i32> {
+        fs::create_dir_all(self.upper_path(root)?).map_err(io_errno)?;
+        if let Some(layer_root) = self.layer_path(root)? {
+            for entry in walkdir::WalkDir::new(&layer_root).follow_links(false) {
+                let entry = entry.map_err(|_| EIO)?;
+                if entry.path() == layer_root {
+                    continue;
+                }
+                let suffix = entry.path().strip_prefix(&layer_root).map_err(|_| EIO)?;
+                let logical =
+                    normalize_relative_path(&Path::new(root).join(suffix).to_string_lossy())
+                        .map_err(|_| EINVAL)?;
+                if entry.file_type().is_dir() {
+                    fs::create_dir_all(self.upper_path(&logical)?).map_err(io_errno)?;
+                } else if entry.file_type().is_file()
+                    || (entry.file_type().is_symlink()
+                        && fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()))
+                {
+                    self.copy_lower_file(&logical, &logical)?;
+                }
+            }
+        }
+        for path in self.lower_selection(root)?.into_keys() {
+            if !self.is_whiteouted(&path) && self.upper_metadata(&path).is_none() {
+                self.copy_lower_file(&path, &path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_upper_subtree(&self, old: &str, new: &str) -> std::result::Result<(), i32> {
+        let mut directories = BTreeSet::new();
+        let mut leaves = Vec::new();
+        for root in [
+            &self.layout.source_upper,
+            &self.layout.generated_upper,
+            &self.layout.scratch_upper,
+        ] {
+            let physical_root = safe_join(root, old).map_err(|_| EINVAL)?;
+            if !physical_root.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&physical_root).follow_links(false) {
+                let entry = entry.map_err(|_| EIO)?;
+                let suffix = entry.path().strip_prefix(&physical_root).map_err(|_| EIO)?;
+                let source_logical = if suffix.as_os_str().is_empty() {
+                    old.to_string()
+                } else {
+                    normalize_relative_path(&Path::new(old).join(suffix).to_string_lossy())
+                        .map_err(|_| EINVAL)?
+                };
+                let destination_logical = source_logical
+                    .strip_prefix(old)
+                    .map(|suffix| format!("{new}{suffix}"))
+                    .ok_or(EINVAL)?;
+                if entry.file_type().is_dir() {
+                    directories.insert(destination_logical);
+                } else {
+                    leaves.push((entry.path().to_path_buf(), destination_logical));
+                }
+            }
+        }
+        for logical in &directories {
+            fs::create_dir_all(self.upper_path(logical)?).map_err(io_errno)?;
+        }
+        for (source, logical) in leaves {
+            let destination = self.upper_path(&logical)?;
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(io_errno)?;
+            }
+            if destination.exists() {
+                let metadata = fs::symlink_metadata(&destination).map_err(io_errno)?;
+                if metadata.is_dir() {
+                    fs::remove_dir_all(&destination).map_err(io_errno)?;
+                } else {
+                    fs::remove_file(&destination).map_err(io_errno)?;
+                }
+            }
+            fs::rename(source, destination).map_err(io_errno)?;
+        }
+        for root in [
+            &self.layout.source_upper,
+            &self.layout.generated_upper,
+            &self.layout.scratch_upper,
+        ] {
+            let physical_root = safe_join(root, old).map_err(|_| EINVAL)?;
+            if physical_root.exists() {
+                fs::remove_dir_all(physical_root).map_err(io_errno)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn load_whiteouts(&self) -> Result<BTreeSet<String>> {
+        let mut whiteouts = BTreeSet::new();
+        let classes = [
+            ViewPathClass::Source,
+            ViewPathClass::Dependency,
+            ViewPathClass::Generated,
+            ViewPathClass::Scratch,
+            ViewPathClass::Secret,
+        ];
+        for path in classes
+            .into_iter()
+            .map(|class| self.layout.whiteouts_path(class))
+            .chain(std::iter::once(self.layout.legacy_whiteouts_path()))
+        {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    for path in serde_json::from_slice::<Vec<String>>(&bytes)? {
+                        whiteouts.insert(normalize_relative_path(&path)?);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(Error::Io(err)),
+            }
+        }
+        Ok(whiteouts)
+    }
+
+    fn save_whiteouts(&self) -> Result<()> {
+        fs::create_dir_all(&self.layout.meta_dir)?;
+        for class in [
+            ViewPathClass::Source,
+            ViewPathClass::Dependency,
+            ViewPathClass::Generated,
+            ViewPathClass::Scratch,
+            ViewPathClass::Secret,
+        ] {
+            let paths = self
+                .whiteouts
+                .iter()
+                .filter(|path| classify_view_path(path) == class)
+                .collect::<Vec<_>>();
+            write_file_atomic(
+                &self.layout.whiteouts_path(class),
+                &serde_json::to_vec(&paths)?,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ViewUpperUsage {
+    logical_bytes: u64,
+    file_count: u64,
+}
+
+fn view_upper_usage(layout: &ViewUpperLayout) -> Result<ViewUpperUsage> {
+    let mut usage = ViewUpperUsage::default();
+    for root in [
+        &layout.source_upper,
+        &layout.generated_upper,
+        &layout.scratch_upper,
+    ] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
+            if entry.file_type().is_file() {
+                let metadata = entry.metadata().map_err(|err| Error::Io(err.into()))?;
+                usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
+                usage.file_count = usage.file_count.saturating_add(1);
+            }
+        }
+    }
+    Ok(usage)
+}
+
+fn parent_of(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn metadata_mode(metadata: &fs::Metadata, _directory: bool) -> u32 {
+    metadata.mode() as u32 & 0o777
+}
+
+fn copy_up_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata_mode(metadata, false) & 0o111 != 0 {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+#[cfg(windows)]
+fn metadata_mode(metadata: &fs::Metadata, directory: bool) -> u32 {
+    if directory {
+        0o755
+    } else if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+fn set_file_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(mode & 0o200 == 0);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.read_at(bytes, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    file.seek_read(bytes, offset)
+}
+
+#[cfg(unix)]
+fn write_file_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+    file.write_at(bytes, offset)
+}
+
+#[cfg(windows)]
+fn write_file_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+    file.seek_write(bytes, offset)
+}
+
+fn write_all_file_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = write_file_at(file, bytes, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write the complete view buffer",
+            ));
+        }
+        bytes = &bytes[written..];
+        offset = offset.saturating_add(written as u64);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn io_errno(error: std::io::Error) -> i32 {
+    error.raw_os_error().unwrap_or(EIO)
+}
+
+#[cfg(windows)]
+fn io_errno(error: std::io::Error) -> i32 {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ENOENT,
+        std::io::ErrorKind::AlreadyExists => EEXIST,
+        std::io::ErrorKind::PermissionDenied => EPERM,
+        std::io::ErrorKind::NotADirectory => ENOTDIR,
+        std::io::ErrorKind::IsADirectory => EISDIR,
+        std::io::ErrorKind::DirectoryNotEmpty => ENOTEMPTY,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => EINVAL,
+        _ => EIO,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Trail, ObjectId, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+        fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+        fs::write(temp.path().join("src/lower.txt"), "lower\n").unwrap();
+        fs::write(temp.path().join("src/nested/tool.sh"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            temp.path().join("src/nested/tool.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let root = db.resolve_branch_ref("main").unwrap().root_id;
+        let upper = temp.path().join("upper");
+        ViewUpperLayout::from_source_upper(upper.clone())
+            .ensure()
+            .unwrap();
+        (temp, db, root, upper)
+    }
+
+    fn core(db: &Trail, root: &ObjectId, upper: PathBuf) -> ViewCore {
+        ViewCore::new(
+            Trail::open(db.workspace_root()).unwrap(),
+            upper,
+            db.load_root_files(root).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn lazy_core(db: &Trail, root: &ObjectId, upper: PathBuf) -> ViewCore {
+        ViewCore::new_lazy(
+            Trail::open(db.workspace_root()).unwrap(),
+            upper,
+            root.clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn view_core_lazy_root_starts_without_indexing_every_path() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = lazy_core(&db, &root, upper);
+
+        assert!(matches!(view.lower, ViewLower::Root(_)));
+        assert_eq!(view.ino_by_path.len(), 1);
+        let children = view.children(VIEW_ROOT_INO).unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|(name, attr)| (name.as_str(), attr.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("README.md", ViewNodeKind::File),
+                ("src", ViewNodeKind::Directory),
+            ]
+        );
+        assert_eq!(view.ino_by_path.len(), 3);
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        let (slice, eof) = view.read(readme, 2, 3).unwrap();
+        assert_eq!(slice, b"sel");
+        assert!(!eof);
+    }
+
+    #[test]
+    fn view_core_conformance_copy_up_write_delete_and_reopen() {
+        let (temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        assert!(!upper.join("README.md").exists());
+        view.write(readme, 0, b"changed\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(upper.join("README.md")).unwrap(),
+            "changed\n\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("README.md")).unwrap(),
+            "baseline\n"
+        );
+
+        view.remove(VIEW_ROOT_INO, "README.md").unwrap();
+        assert!(view.lookup(VIEW_ROOT_INO, "README.md").is_err());
+        let reopened = core(&db, &root, upper);
+        assert!(reopened.is_whiteouted("README.md"));
+    }
+
+    #[test]
+    fn view_core_conformance_rename_directory_preserves_mixed_contents_and_mode() {
+        let (_temp, db, root, upper) = fixture();
+        fs::create_dir_all(upper.join("src")).unwrap();
+        fs::write(upper.join("src/upper.txt"), "upper\n").unwrap();
+        let mut view = core(&db, &root, upper.clone());
+
+        view.rename(VIEW_ROOT_INO, "src", VIEW_ROOT_INO, "moved")
+            .unwrap();
+
+        assert_eq!(fs::read(upper.join("moved/lower.txt")).unwrap(), b"lower\n");
+        assert_eq!(fs::read(upper.join("moved/upper.txt")).unwrap(), b"upper\n");
+        assert_eq!(
+            fs::metadata(upper.join("moved/nested/tool.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(view.lookup(VIEW_ROOT_INO, "src").is_err());
+        assert!(view.lookup(VIEW_ROOT_INO, "moved").is_ok());
+    }
+
+    #[test]
+    fn directory_rename_moves_files_from_every_classified_upper() {
+        let (temp, db, root, _legacy_upper) = fixture();
+        let view_dir = temp.path().join("view-rename");
+        let source_upper = view_dir.join("source-upper");
+        let mut view = lazy_core(&db, &root, source_upper.clone());
+        let project = view.mkdir(VIEW_ROOT_INO, "project", 0o755).unwrap();
+        let source = view.create(project.ino, "main.rs", 0o644, true).unwrap();
+        view.write(source.ino, 0, b"source\n").unwrap();
+        let target = view.mkdir(project.ino, "target", 0o755).unwrap();
+        let artifact = view.create(target.ino, "artifact", 0o644, true).unwrap();
+        view.write(artifact.ino, 0, b"generated\n").unwrap();
+
+        view.rename(VIEW_ROOT_INO, "project", VIEW_ROOT_INO, "renamed")
+            .unwrap();
+        assert!(!source_upper.join("project").exists());
+        assert!(!view_dir.join("generated-upper/project").exists());
+        assert_eq!(
+            fs::read(source_upper.join("renamed/main.rs")).unwrap(),
+            b"source\n"
+        );
+        assert_eq!(
+            fs::read(view_dir.join("generated-upper/renamed/target/artifact")).unwrap(),
+            b"generated\n"
+        );
+        assert!(view.lookup(VIEW_ROOT_INO, "project").is_err());
+        let renamed = view.lookup(VIEW_ROOT_INO, "renamed").unwrap();
+        assert!(view.lookup(renamed, "main.rs").is_ok());
+        assert!(view.lookup(renamed, "target").is_ok());
+    }
+
+    #[test]
+    fn view_core_conformance_truncate_mode_and_symlink_escape() {
+        let (temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let script = view
+            .lookup(VIEW_ROOT_INO, "src/nested/tool.sh")
+            .unwrap_err();
+        assert_eq!(script, EINVAL);
+        let src = view.lookup(VIEW_ROOT_INO, "src").unwrap();
+        let nested = view.lookup(src, "nested").unwrap();
+        let script = view.lookup(nested, "tool.sh").unwrap();
+        view.setattr(script, Some(3), Some(0o755)).unwrap();
+        assert_eq!(fs::read(upper.join("src/nested/tool.sh")).unwrap(), b"#!/");
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, upper.join("escape")).unwrap();
+        assert!(matches!(
+            view.mkdir(VIEW_ROOT_INO, "escape", 0o755),
+            Err(EPERM)
+        ));
+        assert_eq!(view.upper_path("escape/file"), Err(EPERM));
+        assert!(!outside.join("file").exists());
+    }
+
+    #[test]
+    fn view_core_checkpoint_candidates_recover_from_upper_and_whiteouts() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+        view.write(readme, 0, b"changed").unwrap();
+        view.remove(VIEW_ROOT_INO, "src").unwrap_err();
+        let src = view.lookup(VIEW_ROOT_INO, "src").unwrap();
+        let lower = view.lookup(src, "lower.txt").unwrap();
+        assert!(lower > VIEW_ROOT_INO);
+        view.remove(src, "lower.txt").unwrap();
+
+        let candidates = view.checkpoint_candidates().unwrap();
+        assert!(candidates.journal_sequence > 0);
+        assert!(candidates.paths.contains("README.md"));
+        assert!(candidates.paths.contains("src/lower.txt"));
+
+        let reopened = core(&db, &root, upper);
+        assert_eq!(reopened.checkpoint_candidates().unwrap(), candidates);
+    }
+
+    #[test]
+    fn view_core_splits_generated_dependency_secret_and_source_uppers() {
+        let (temp, db, root, _legacy_upper) = fixture();
+        let view_dir = temp.path().join("view");
+        let source_upper = view_dir.join("source-upper");
+        let mut view = lazy_core(&db, &root, source_upper.clone());
+
+        let src = view.lookup(VIEW_ROOT_INO, "src").unwrap();
+        view.create(src, "new.rs", 0o644, true).unwrap();
+        let target = view.mkdir(VIEW_ROOT_INO, "target", 0o755).unwrap();
+        view.create(target.ino, "artifact", 0o644, true).unwrap();
+        let modules = view.mkdir(VIEW_ROOT_INO, "node_modules", 0o755).unwrap();
+        view.create(modules.ino, "package.json", 0o644, true)
+            .unwrap();
+        view.create(VIEW_ROOT_INO, ".env.local", 0o600, true)
+            .unwrap();
+
+        assert!(source_upper.join("src/new.rs").is_file());
+        assert!(view_dir.join("generated-upper/target/artifact").is_file());
+        assert!(view_dir
+            .join("generated-upper/node_modules/package.json")
+            .is_file());
+        assert!(view_dir.join("scratch-upper/.env.local").is_file());
+
+        let candidates = view.checkpoint_candidates().unwrap();
+        assert!(candidates.paths.contains("src/new.rs"));
+        assert!(!candidates.paths.contains("target/artifact"));
+        assert!(!candidates.paths.contains("node_modules/package.json"));
+        assert!(!candidates.paths.contains(".env.local"));
+        assert!(
+            fs::read_to_string(view_dir.join("meta/mutation-journal.jsonl"))
+                .unwrap()
+                .contains("\"class\":\"generated\"")
+        );
+    }
+}

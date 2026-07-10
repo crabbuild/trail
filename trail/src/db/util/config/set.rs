@@ -207,6 +207,38 @@ pub(crate) fn set_config_value(
             config.guardrails.policy = value.to_string();
             Ok(())
         }
+        "workspace_views.upper_logical_bytes" => {
+            config.workspace_views.upper_logical_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.upper_file_count" => {
+            config.workspace_views.upper_file_count = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.single_file_bytes" => {
+            config.workspace_views.single_file_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.journal_bytes" => {
+            config.workspace_views.journal_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.cache_build_bytes" => {
+            config.workspace_views.cache_build_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.concurrent_cache_builders" => {
+            config.workspace_views.concurrent_cache_builders = parse_config_u64(key, value, false)?;
+            Ok(())
+        }
+        "workspace_views.cache_retention_secs" => {
+            config.workspace_views.cache_retention_secs = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
+        "workspace_views.cache_max_bytes" => {
+            config.workspace_views.cache_max_bytes = parse_config_u64(key, value, true)?;
+            Ok(())
+        }
         _ => Err(Error::InvalidInput(format!("unknown config key `{key}`"))),
     }
 }

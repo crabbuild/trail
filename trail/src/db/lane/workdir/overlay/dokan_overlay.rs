@@ -1,13 +1,9 @@
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex, Once};
+use std::sync::{mpsc, Mutex, MutexGuard, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,8 +14,7 @@ use dokan::{
 };
 use dokan_sys::win32::{
     FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_MAXIMUM_DISPOSITION,
-    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF,
-    FILE_SUPERSEDE,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE,
 };
 use widestring::{U16CStr, U16CString};
 use winapi::shared::ntdef::NTSTATUS;
@@ -29,12 +24,12 @@ use winapi::um::winnt;
 static DOKAN_INIT: Once = Once::new();
 
 const OVERLAY_META_DIR: &str = ".trail";
-const WHITEOUTS_FILE: &str = "overlay-whiteouts.json";
 
 pub(crate) struct OverlayCowMount {
     mountpoint: PathBuf,
     mount_name: U16CString,
     worker: Option<JoinHandle<()>>,
+    lease: WorkspaceMountLease,
 }
 
 impl OverlayCowMount {
@@ -60,10 +55,9 @@ pub(crate) fn prepare_overlay_cow_workdir(
     custom_workdir: bool,
 ) -> Result<PathBuf> {
     prepare_lane_workdir(dir, custom_workdir)?;
-    let upperdir = overlay_upperdir(db, lane)?;
-    if upperdir.exists() {
-        fs::remove_dir_all(&upperdir)?;
-    }
+    let upperdir = db
+        .prepare_workspace_view_storage_for_lane_name(lane)?
+        .source_upper;
     fs::create_dir_all(upperdir.join(OVERLAY_META_DIR))?;
     Ok(upperdir)
 }
@@ -88,11 +82,8 @@ pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<Overl
     prepare_overlay_mountpoint(&mountpoint, false)?;
     let upperdir = overlay_upperdir(db, lane)?;
     fs::create_dir_all(upperdir.join(OVERLAY_META_DIR))?;
-    let manifest_path = overlay_clean_manifest_path(&upperdir);
-    let write_initial_manifest = !manifest_path.is_file() && !upperdir_has_user_content(&upperdir)?;
 
     let head = db.get_ref(&branch.ref_name)?;
-    let lower_files = db.load_root_files(&head.root_id)?;
     let mount_name = U16CString::from_str(mountpoint.to_string_lossy().as_ref()).map_err(|_| {
         Error::InvalidInput(format!(
             "overlay-cow mountpoint `{}` is not a valid Windows mount string",
@@ -104,8 +95,9 @@ pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<Overl
         db.workspace_root.clone(),
         db.db_dir.clone(),
         upperdir,
-        lower_files.clone(),
+        head.root_id,
     )?;
+    let mut lease = db.acquire_workspace_mount_lease(lane, "dokan")?;
     let thread_mount_name = mount_name.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
@@ -124,7 +116,7 @@ pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<Overl
             Err(err) => {
                 let _ = tx.send(Err(err.to_string()));
             }
-        }
+        };
     });
 
     match rx.recv_timeout(Duration::from_secs(10)) {
@@ -139,22 +131,26 @@ pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<Overl
             return Err(overlay_mount_error(&mountpoint, &err.to_string()));
         }
     }
-
-    if write_initial_manifest {
-        db.write_clean_workdir_manifest_to_path(
-            &mountpoint,
-            &manifest_path,
-            &head.root_id,
-            &lower_files,
-            lower_files.keys(),
-        )?;
-    }
+    lease.mark_mounted()?;
 
     Ok(OverlayCowMount {
         mountpoint,
         mount_name,
         worker: Some(worker),
+        lease,
     })
+}
+
+pub(crate) fn overlay_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+    let upper = overlay_upperdir(db, lane)?;
+    let branch = db.lane_branch(lane)?;
+    let head = db.get_ref(&branch.ref_name)?;
+    Ok(
+        recover_view_checkpoint_candidates_for_root(db, &upper, &head.root_id)?
+            .paths
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn overlay_mount_error(mountpoint: &Path, err: &str) -> Error {
@@ -165,33 +161,8 @@ fn overlay_mount_error(mountpoint: &Path, err: &str) -> Error {
 }
 
 fn overlay_upperdir(db: &Trail, lane: &str) -> Result<PathBuf> {
-    let lane = normalize_relative_path(lane)?;
-    Ok(db
-        .db_dir
-        .join("overlay-cow")
-        .join(path_from_rel(&lane))
-        .join("upper"))
-}
-
-fn overlay_clean_manifest_path(upperdir: &Path) -> PathBuf {
-    upperdir
-        .join(OVERLAY_META_DIR)
-        .join("workdir-manifest.json")
-}
-
-fn upperdir_has_user_content(upperdir: &Path) -> Result<bool> {
-    let entries = match fs::read_dir(upperdir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(Error::Io(err)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(Error::Io)?;
-        if entry.file_name() != OsStr::new(OVERLAY_META_DIR) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    validate_ref_segment(lane)?;
+    Ok(db.workspace_view_paths_for_lane_name(lane).source_upper)
 }
 
 fn prepare_overlay_mountpoint(path: &Path, custom_workdir: bool) -> Result<()> {
@@ -220,15 +191,9 @@ fn prepare_overlay_mountpoint(path: &Path, custom_workdir: bool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NodeKind {
-    Directory,
-    File,
-}
-
 #[derive(Debug)]
 struct DokanHandle {
-    path: String,
+    path: Mutex<String>,
     is_dir: bool,
     delete_on_cleanup: AtomicBool,
 }
@@ -236,20 +201,27 @@ struct DokanHandle {
 impl DokanHandle {
     fn new(path: String, is_dir: bool, delete_on_cleanup: bool) -> Self {
         Self {
-            path,
+            path: Mutex::new(path),
             is_dir,
             delete_on_cleanup: AtomicBool::new(delete_on_cleanup),
         }
     }
+
+    fn path(&self) -> OperationResult<String> {
+        self.path
+            .lock()
+            .map(|path| path.clone())
+            .map_err(|_| STATUS_INTERNAL_ERROR)
+    }
+
+    fn set_path(&self, path: String) -> OperationResult<()> {
+        *self.path.lock().map_err(|_| STATUS_INTERNAL_ERROR)? = path;
+        Ok(())
+    }
 }
 
 struct DokanOverlayFs {
-    workspace_root: PathBuf,
-    db_dir: PathBuf,
-    upperdir: PathBuf,
-    lower_files: BTreeMap<String, FileEntry>,
-    lower_dirs: BTreeSet<String>,
-    whiteouts: Mutex<BTreeSet<String>>,
+    core: Mutex<ViewCore>,
 }
 
 impl DokanOverlayFs {
@@ -257,359 +229,46 @@ impl DokanOverlayFs {
         workspace_root: PathBuf,
         db_dir: PathBuf,
         upperdir: PathBuf,
-        lower_files: BTreeMap<String, FileEntry>,
+        root_id: ObjectId,
     ) -> Result<Self> {
-        let mut fs = Self {
-            workspace_root,
-            db_dir,
-            upperdir,
-            lower_files,
-            lower_dirs: BTreeSet::new(),
-            whiteouts: Mutex::new(BTreeSet::new()),
-        };
-        fs.rebuild_lower_dirs();
-        *fs.whiteouts.lock().unwrap() = fs.load_whiteouts()?;
-        Ok(fs)
-    }
-
-    fn rebuild_lower_dirs(&mut self) {
-        self.lower_dirs.insert(String::new());
-        for path in self.lower_files.keys() {
-            let mut current = Path::new(path).parent();
-            while let Some(parent) = current {
-                let rel = parent.to_string_lossy();
-                if rel.is_empty() {
-                    break;
-                }
-                self.lower_dirs.insert(rel.to_string());
-                current = parent.parent();
-            }
-        }
-    }
-
-    fn load_whiteouts(&self) -> Result<BTreeSet<String>> {
-        let path = self.whiteouts_path();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-            Err(err) => return Err(Error::Io(err)),
-        };
-        let paths: Vec<String> = serde_json::from_slice(&bytes)?;
-        paths
-            .into_iter()
-            .map(|path| normalize_relative_path(&path))
-            .collect()
-    }
-
-    fn save_whiteouts(&self) -> OperationResult<()> {
-        let path = self.whiteouts_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(io_status)?;
-        }
-        let paths = self
-            .whiteouts
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        write_file_atomic(
-            &path,
-            &serde_json::to_vec(&paths).map_err(error_status)?,
-            false,
-        )
-        .map_err(error_status)
-    }
-
-    fn whiteouts_path(&self) -> PathBuf {
-        self.upperdir.join(OVERLAY_META_DIR).join(WHITEOUTS_FILE)
-    }
-
-    fn is_whiteouted(&self, path: &str) -> bool {
-        self.whiteouts.lock().unwrap().iter().any(|whiteout| {
-            path == whiteout
-                || path
-                    .strip_prefix(whiteout)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+        Ok(Self {
+            core: Mutex::new(ViewCore::new_lazy(
+                Trail::open_with_db_dir(workspace_root, db_dir)?,
+                upperdir,
+                root_id,
+            )?),
         })
     }
 
-    fn upper_path(&self, path: &str) -> PathBuf {
-        if path.is_empty() {
-            return self.upperdir.clone();
-        }
-        self.upperdir.join(path_from_rel(path))
+    fn core(&self) -> OperationResult<MutexGuard<'_, ViewCore>> {
+        self.core.lock().map_err(|_| STATUS_INTERNAL_ERROR)
     }
 
-    fn upper_metadata(&self, path: &str) -> Option<fs::Metadata> {
-        fs::symlink_metadata(self.upper_path(path)).ok()
-    }
-
-    fn node_kind(&self, path: &str) -> Option<NodeKind> {
-        if path.is_empty() {
-            return Some(NodeKind::Directory);
-        }
-        if path == OVERLAY_META_DIR || path.starts_with(".trail/") {
-            return None;
-        }
-        if let Some(metadata) = self.upper_metadata(path) {
-            if metadata.is_dir() {
-                return Some(NodeKind::Directory);
-            }
-            if metadata.is_file() {
-                return Some(NodeKind::File);
-            }
-            return None;
-        }
-        if self.lower_dirs.contains(path) && !self.is_whiteouted(path) {
-            return Some(NodeKind::Directory);
-        }
-        if self.lower_files.contains_key(path) && !self.is_whiteouted(path) {
-            return Some(NodeKind::File);
-        }
-        None
-    }
-
-    fn load_lower_bytes(&self, path: &str) -> OperationResult<Vec<u8>> {
-        let entry = self
-            .lower_files
-            .get(path)
-            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-        let db =
-            Trail::open_with_db_dir(&self.workspace_root, &self.db_dir).map_err(error_status)?;
-        db.materialize_entry_bytes(entry).map_err(error_status)
-    }
-
-    fn ensure_upper_parent(&self, path: &str) -> OperationResult<()> {
-        let upper = self.upper_path(path);
-        if let Some(parent) = upper.parent() {
-            fs::create_dir_all(parent).map_err(io_status)?;
-        }
-        Ok(())
-    }
-
-    fn ensure_parent_visible(&self, path: &str) -> OperationResult<()> {
-        let parent = parent_of(path);
-        if parent.is_empty() || self.node_kind(&parent) == Some(NodeKind::Directory) {
-            Ok(())
-        } else {
-            Err(STATUS_OBJECT_PATH_NOT_FOUND)
-        }
-    }
-
-    fn ensure_upper_file(&self, path: &str, truncate: bool) -> OperationResult<File> {
-        if self.node_kind(path) == Some(NodeKind::Directory) {
-            return Err(STATUS_FILE_IS_A_DIRECTORY);
-        }
-        self.ensure_parent_visible(path)?;
-        self.ensure_upper_parent(path)?;
-        let upper = self.upper_path(path);
-        if !upper.exists() {
-            if !truncate && self.lower_files.contains_key(path) && !self.is_whiteouted(path) {
-                let bytes = self.load_lower_bytes(path)?;
-                fs::write(&upper, bytes).map_err(io_status)?;
-            } else {
-                File::create(&upper).map_err(io_status)?;
-            }
-        }
-        if truncate {
-            OpenOptions::new()
-                .write(true)
-                .open(&upper)
-                .and_then(|file| file.set_len(0))
-                .map_err(io_status)?;
-        }
-        self.whiteouts.lock().unwrap().remove(path);
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&upper)
-            .map_err(io_status)
-    }
-
-    fn create_upper_dir(&self, path: &str) -> OperationResult<()> {
-        self.ensure_parent_visible(path)?;
-        fs::create_dir_all(self.upper_path(path)).map_err(io_status)?;
-        self.whiteouts.lock().unwrap().remove(path);
-        Ok(())
-    }
-
-    fn delete_path(&self, path: &str, is_dir: bool) -> OperationResult<()> {
+    fn delete_path(&self, path: &str, expected_dir: bool) -> OperationResult<()> {
         if path.is_empty() {
             return Err(STATUS_ACCESS_DENIED);
         }
-        if self.upper_metadata(path).is_some() {
-            let upper = self.upper_path(path);
-            if is_dir {
-                fs::remove_dir(&upper).map_err(io_status)?;
+        let mut core = self.core()?;
+        let kind = core
+            .node_kind(path)
+            .map_err(view_status)?
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        if expected_dir != (kind == ViewNodeKind::Directory) {
+            return Err(if expected_dir {
+                STATUS_NOT_A_DIRECTORY
             } else {
-                fs::remove_file(&upper).map_err(io_status)?;
-            }
+                STATUS_FILE_IS_A_DIRECTORY
+            });
         }
-        if self.lower_dirs.contains(path) || self.lower_files.contains_key(path) {
-            self.whiteouts.lock().unwrap().insert(path.to_string());
-            self.save_whiteouts()?;
-        }
-        Ok(())
-    }
-
-    fn remove_existing_for_replace(&self, path: &str) -> OperationResult<()> {
-        let Some(kind) = self.node_kind(path) else {
-            return Ok(());
-        };
-        match kind {
-            NodeKind::Directory => {
-                if !self.children(path).is_empty() {
-                    return Err(STATUS_DIRECTORY_NOT_EMPTY);
-                }
-                if self.upper_metadata(path).is_some() {
-                    fs::remove_dir(self.upper_path(path)).map_err(io_status)?;
-                }
-                if self.lower_dirs.contains(path) {
-                    self.whiteouts.lock().unwrap().insert(path.to_string());
-                    self.save_whiteouts()?;
-                }
-            }
-            NodeKind::File => {
-                if self.upper_metadata(path).is_some() {
-                    fs::remove_file(self.upper_path(path)).map_err(io_status)?;
-                }
-                if self.lower_files.contains_key(path) {
-                    self.whiteouts.lock().unwrap().insert(path.to_string());
-                    self.save_whiteouts()?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn children(&self, path: &str) -> Vec<(String, NodeKind)> {
-        let mut names = BTreeMap::<String, NodeKind>::new();
-        for dir in &self.lower_dirs {
-            if dir.is_empty() || self.is_whiteouted(dir) {
-                continue;
-            }
-            if parent_of(dir) == path {
-                names.insert(file_name(dir), NodeKind::Directory);
-            }
-        }
-        for file in self.lower_files.keys() {
-            if self.is_whiteouted(file) {
-                continue;
-            }
-            if parent_of(file) == path {
-                names.insert(file_name(file), NodeKind::File);
-            }
-        }
-        if let Ok(read_dir) = fs::read_dir(self.upper_path(path)) {
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if path.is_empty() && name == OVERLAY_META_DIR {
-                    continue;
-                }
-                let child = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}/{name}")
-                };
-                if let Some(kind) = self.node_kind(&child) {
-                    names.insert(name, kind);
-                }
-            }
-        }
-        names.into_iter().collect()
+        let (parent, name) = parent_and_name(&mut core, path)?;
+        core.remove(parent, &name).map_err(view_status)
     }
 
     fn path_info(&self, path: &str) -> OperationResult<FileInfo> {
-        let Some(kind) = self.node_kind(path) else {
-            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-        };
-        if let Some(metadata) = self.upper_metadata(path) {
-            return Ok(file_info_from_metadata(path, &metadata, kind));
-        }
-        match kind {
-            NodeKind::Directory => Ok(FileInfo {
-                attributes: winnt::FILE_ATTRIBUTE_DIRECTORY,
-                creation_time: stable_time(),
-                last_access_time: stable_time(),
-                last_write_time: stable_time(),
-                file_size: 0,
-                number_of_links: 1,
-                file_index: stable_file_index(path),
-            }),
-            NodeKind::File => {
-                let entry = self
-                    .lower_files
-                    .get(path)
-                    .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-                Ok(FileInfo {
-                    attributes: winnt::FILE_ATTRIBUTE_ARCHIVE,
-                    creation_time: stable_time(),
-                    last_access_time: stable_time(),
-                    last_write_time: stable_time(),
-                    file_size: entry.size_bytes,
-                    number_of_links: 1,
-                    file_index: stable_file_index(path),
-                })
-            }
-        }
-    }
-
-    fn find_data(&self, parent: &str, name: String, kind: NodeKind) -> OperationResult<FindData> {
-        let path = if parent.is_empty() {
-            name.clone()
-        } else {
-            format!("{parent}/{name}")
-        };
-        let info = self.path_info(&path)?;
-        let attributes = match kind {
-            NodeKind::Directory => info.attributes | winnt::FILE_ATTRIBUTE_DIRECTORY,
-            NodeKind::File => info.attributes,
-        };
-        Ok(FindData {
-            attributes,
-            creation_time: info.creation_time,
-            last_access_time: info.last_access_time,
-            last_write_time: info.last_write_time,
-            file_size: info.file_size,
-            file_name: U16CString::from_str(&name).map_err(|_| STATUS_OBJECT_NAME_INVALID)?,
-        })
-    }
-
-    fn copy_lower_subtree_to_upper(&self, old_path: &str, new_path: &str) -> OperationResult<()> {
-        if self.lower_files.contains_key(old_path) {
-            let bytes = self.load_lower_bytes(old_path)?;
-            self.ensure_upper_parent(new_path)?;
-            fs::write(self.upper_path(new_path), bytes).map_err(io_status)?;
-            return Ok(());
-        }
-        if !self.lower_dirs.contains(old_path) {
-            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-        }
-        fs::create_dir_all(self.upper_path(new_path)).map_err(io_status)?;
-        let prefix = if old_path.is_empty() {
-            String::new()
-        } else {
-            format!("{old_path}/")
-        };
-        for file in self.lower_files.keys() {
-            if self.is_whiteouted(file) {
-                continue;
-            }
-            let Some(suffix) = file.strip_prefix(&prefix) else {
-                continue;
-            };
-            let target = if new_path.is_empty() {
-                suffix.to_string()
-            } else {
-                format!("{new_path}/{suffix}")
-            };
-            let bytes = self.load_lower_bytes(file)?;
-            self.ensure_upper_parent(&target)?;
-            fs::write(self.upper_path(&target), bytes).map_err(io_status)?;
-        }
-        Ok(())
+        let mut core = self.core()?;
+        core.attr(path)
+            .map(|attr| file_info_from_view(&attr))
+            .map_err(view_status)
     }
 }
 
@@ -635,13 +294,14 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         let wants_dir = create_options & FILE_DIRECTORY_FILE != 0;
         let wants_file = create_options & FILE_NON_DIRECTORY_FILE != 0;
         let delete_on_cleanup = create_options & FILE_DELETE_ON_CLOSE != 0;
-        let existing = self.node_kind(&path);
+        let mut core = self.core()?;
+        let existing = core.node_kind(&path).map_err(view_status)?;
 
         if let Some(kind) = existing {
-            if wants_dir && kind != NodeKind::Directory {
+            if wants_dir && kind != ViewNodeKind::Directory {
                 return Err(STATUS_NOT_A_DIRECTORY);
             }
-            if wants_file && kind == NodeKind::Directory {
+            if wants_file && kind == ViewNodeKind::Directory {
                 return Err(STATUS_FILE_IS_A_DIRECTORY);
             }
             if create_disposition == FILE_CREATE {
@@ -651,14 +311,14 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
                 create_disposition,
                 FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE
             ) {
-                if kind == NodeKind::Directory {
+                if kind == ViewNodeKind::Directory {
                     return Err(STATUS_FILE_IS_A_DIRECTORY);
                 }
-                self.ensure_upper_file(&path, true)?;
+                core.ensure_upper_file(&path, true).map_err(view_status)?;
             }
             return Ok(CreateFileInfo {
-                context: DokanHandle::new(path, kind == NodeKind::Directory, delete_on_cleanup),
-                is_dir: kind == NodeKind::Directory,
+                context: DokanHandle::new(path, kind == ViewNodeKind::Directory, delete_on_cleanup),
+                is_dir: kind == ViewNodeKind::Directory,
                 new_file_created: false,
             });
         }
@@ -668,7 +328,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         }
 
         if wants_dir || file_attributes & winnt::FILE_ATTRIBUTE_DIRECTORY != 0 {
-            self.create_upper_dir(&path)?;
+            let (parent, name) = parent_and_name(&mut core, &path)?;
+            core.mkdir(parent, &name, 0o755).map_err(view_status)?;
             return Ok(CreateFileInfo {
                 context: DokanHandle::new(path, true, delete_on_cleanup),
                 is_dir: true,
@@ -676,7 +337,9 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
             });
         }
 
-        self.ensure_upper_file(&path, true)?;
+        let (parent, name) = parent_and_name(&mut core, &path)?;
+        core.create(parent, &name, 0o644, true)
+            .map_err(view_status)?;
         Ok(CreateFileInfo {
             context: DokanHandle::new(path, false, delete_on_cleanup),
             is_dir: false,
@@ -691,7 +354,9 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         context: &'c Self::Context,
     ) {
         if info.delete_on_close() || context.delete_on_cleanup.load(Ordering::Relaxed) {
-            let _ = self.delete_path(&context.path, context.is_dir);
+            if let Ok(path) = context.path() {
+                let _ = self.delete_path(&path, context.is_dir);
+            }
         }
     }
 
@@ -706,23 +371,14 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         if context.is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
-        let bytes = if self.upper_metadata(&context.path).is_some() {
-            let mut bytes = Vec::new();
-            File::open(self.upper_path(&context.path))
-                .and_then(|mut file| file.read_to_end(&mut bytes).map(|_| ()))
-                .map_err(io_status)?;
-            bytes
-        } else {
-            self.load_lower_bytes(&context.path)?
-        };
-        let start = offset.max(0) as usize;
-        if start >= bytes.len() {
-            return Ok(0);
-        }
-        let end = start.saturating_add(buffer.len()).min(bytes.len());
-        let slice = &bytes[start..end];
-        buffer[..slice.len()].copy_from_slice(slice);
-        Ok(slice.len() as u32)
+        let path = context.path()?;
+        let mut core = self.core()?;
+        let ino = core.attr(&path).map_err(view_status)?.ino;
+        let (bytes, _) = core
+            .read(ino, offset.max(0) as u64, buffer.len() as u32)
+            .map_err(view_status)?;
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len() as u32)
     }
 
     fn write_file(
@@ -736,15 +392,16 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         if context.is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
-        let mut file = self.ensure_upper_file(&context.path, false)?;
+        let path = context.path()?;
+        let mut core = self.core()?;
+        let attr = core.attr(&path).map_err(view_status)?;
         let write_offset = if info.write_to_eof() {
-            file.metadata().map_err(io_status)?.len()
+            attr.size
         } else {
             offset.max(0) as u64
         };
-        file.seek(SeekFrom::Start(write_offset))
-            .map_err(io_status)?;
-        file.write_all(buffer).map_err(io_status)?;
+        core.write(attr.ino, write_offset, buffer)
+            .map_err(view_status)?;
         Ok(buffer.len() as u32)
     }
 
@@ -754,13 +411,18 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         _info: &OperationInfo<'c, 'h, Self>,
         context: &'c Self::Context,
     ) -> OperationResult<()> {
-        if !context.is_dir && self.upper_metadata(&context.path).is_some() {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(self.upper_path(&context.path))
-                .and_then(|file| file.sync_all())
-                .map_err(io_status)?;
+        if !context.is_dir {
+            let path = context.path()?;
+            let core = self.core()?;
+            let upper = core.upper_path(&path).map_err(view_status)?;
+            if upper.is_file() {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(upper)
+                    .and_then(|file| file.sync_all())
+                    .map_err(io_status)?;
+            }
         }
         Ok(())
     }
@@ -771,7 +433,7 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         _info: &OperationInfo<'c, 'h, Self>,
         context: &'c Self::Context,
     ) -> OperationResult<FileInfo> {
-        self.path_info(&context.path)
+        self.path_info(&context.path()?)
     }
 
     fn find_files(
@@ -784,8 +446,17 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         if !context.is_dir {
             return Err(STATUS_NOT_A_DIRECTORY);
         }
-        for (name, kind) in self.children(&context.path) {
-            let data = self.find_data(&context.path, name, kind)?;
+        let path = context.path()?;
+        let data = {
+            let mut core = self.core()?;
+            let ino = core.attr(&path).map_err(view_status)?.ino;
+            core.children(ino)
+                .map_err(view_status)?
+                .into_iter()
+                .map(|(name, attr)| find_data_from_view(name, &attr))
+                .collect::<OperationResult<Vec<_>>>()?
+        };
+        for data in data {
             fill_find_data(&data).map_err(fill_status)?;
         }
         Ok(())
@@ -801,7 +472,8 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
             if context.is_dir {
                 return Err(STATUS_FILE_IS_A_DIRECTORY);
             }
-            if self.node_kind(&context.path) != Some(NodeKind::File) {
+            let path = context.path()?;
+            if self.core()?.node_kind(&path).map_err(view_status)? != Some(ViewNodeKind::File) {
                 return Err(STATUS_OBJECT_NAME_NOT_FOUND);
             }
             context.delete_on_cleanup.store(true, Ordering::Relaxed);
@@ -821,7 +493,10 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
             if !context.is_dir {
                 return Err(STATUS_NOT_A_DIRECTORY);
             }
-            if !self.children(&context.path).is_empty() {
+            let path = context.path()?;
+            let mut core = self.core()?;
+            let ino = core.attr(&path).map_err(view_status)?.ino;
+            if !core.children(ino).map_err(view_status)?.is_empty() {
                 return Err(STATUS_DIRECTORY_NOT_EMPTY);
             }
             context.delete_on_cleanup.store(true, Ordering::Relaxed);
@@ -839,25 +514,18 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         _info: &OperationInfo<'c, 'h, Self>,
         context: &'c Self::Context,
     ) -> OperationResult<()> {
+        let old_path = context.path()?;
         let new_path = dokan_path_to_rel(new_file_name)?;
-        if self.node_kind(&new_path).is_some() && !replace_if_existing {
+        let mut core = self.core()?;
+        if core.node_kind(&new_path).map_err(view_status)?.is_some() && !replace_if_existing {
             return Err(STATUS_OBJECT_NAME_COLLISION);
         }
-        self.ensure_parent_visible(&new_path)?;
-        if replace_if_existing {
-            self.remove_existing_for_replace(&new_path)?;
-        }
-        if self.upper_metadata(&context.path).is_some() {
-            self.ensure_upper_parent(&new_path)?;
-            fs::rename(self.upper_path(&context.path), self.upper_path(&new_path))
-                .map_err(io_status)?;
-        } else {
-            self.copy_lower_subtree_to_upper(&context.path, &new_path)?;
-        }
-        if self.lower_dirs.contains(&context.path) || self.lower_files.contains_key(&context.path) {
-            self.whiteouts.lock().unwrap().insert(context.path.clone());
-            self.save_whiteouts()?;
-        }
+        let (old_parent, old_name) = parent_and_name(&mut core, &old_path)?;
+        let (new_parent, new_name) = parent_and_name(&mut core, &new_path)?;
+        core.rename(old_parent, &old_name, new_parent, &new_name)
+            .map_err(view_status)?;
+        drop(core);
+        context.set_path(new_path)?;
         Ok(())
     }
 
@@ -871,9 +539,12 @@ impl<'c, 'h: 'c> FileSystemHandler<'c, 'h> for DokanOverlayFs {
         if context.is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY);
         }
-        self.ensure_upper_file(&context.path, false)?
-            .set_len(offset.max(0) as u64)
-            .map_err(io_status)
+        let path = context.path()?;
+        let mut core = self.core()?;
+        let ino = core.attr(&path).map_err(view_status)?.ino;
+        core.setattr(ino, Some(offset.max(0) as u64), None)
+            .map(|_| ())
+            .map_err(view_status)
     }
 
     fn set_allocation_size(
@@ -935,43 +606,69 @@ fn dokan_path_to_rel(path: &U16CStr) -> OperationResult<String> {
     normalize_relative_path(&trimmed).map_err(error_status)
 }
 
-fn parent_of(path: &str) -> String {
-    Path::new(path)
+fn parent_and_name(core: &mut ViewCore, path: &str) -> OperationResult<(u64, String)> {
+    if path.is_empty() {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let path = Path::new(path);
+    let parent = path
         .parent()
-        .map(|parent| parent.to_string_lossy().to_string())
-        .unwrap_or_default()
-}
-
-fn file_name(path: &str) -> String {
-    Path::new(path)
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = path
         .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default()
+        .and_then(|name| name.to_str())
+        .ok_or(STATUS_OBJECT_NAME_INVALID)?
+        .to_string();
+    let parent = core.attr(&parent).map_err(view_status)?;
+    if parent.kind != ViewNodeKind::Directory {
+        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+    }
+    Ok((parent.ino, name))
 }
 
 fn stable_time() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1)
 }
 
-fn stable_file_index(path: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn file_info_from_metadata(path: &str, metadata: &fs::Metadata, kind: NodeKind) -> FileInfo {
-    let attributes = match kind {
-        NodeKind::Directory => winnt::FILE_ATTRIBUTE_DIRECTORY,
-        NodeKind::File => winnt::FILE_ATTRIBUTE_ARCHIVE,
+fn file_info_from_view(attr: &ViewNodeAttr) -> FileInfo {
+    let attributes = match attr.kind {
+        ViewNodeKind::Directory => winnt::FILE_ATTRIBUTE_DIRECTORY,
+        ViewNodeKind::File => winnt::FILE_ATTRIBUTE_ARCHIVE,
     };
     FileInfo {
         attributes,
-        creation_time: metadata.created().unwrap_or_else(|_| stable_time()),
-        last_access_time: metadata.accessed().unwrap_or_else(|_| stable_time()),
-        last_write_time: metadata.modified().unwrap_or_else(|_| stable_time()),
-        file_size: metadata.len(),
+        creation_time: stable_time(),
+        last_access_time: attr.modified,
+        last_write_time: attr.modified,
+        file_size: attr.size,
         number_of_links: 1,
-        file_index: stable_file_index(path),
+        file_index: attr.ino,
+    }
+}
+
+fn find_data_from_view(name: String, attr: &ViewNodeAttr) -> OperationResult<FindData> {
+    let info = file_info_from_view(attr);
+    Ok(FindData {
+        attributes: info.attributes,
+        creation_time: info.creation_time,
+        last_access_time: info.last_access_time,
+        last_write_time: info.last_write_time,
+        file_size: info.file_size,
+        file_name: U16CString::from_str(&name).map_err(|_| STATUS_OBJECT_NAME_INVALID)?,
+    })
+}
+
+fn view_status(err: i32) -> NTSTATUS {
+    match err {
+        1 => STATUS_ACCESS_DENIED,
+        2 => STATUS_OBJECT_NAME_NOT_FOUND,
+        17 => STATUS_OBJECT_NAME_COLLISION,
+        20 => STATUS_NOT_A_DIRECTORY,
+        21 => STATUS_FILE_IS_A_DIRECTORY,
+        22 => STATUS_INVALID_PARAMETER,
+        39 => STATUS_DIRECTORY_NOT_EMPTY,
+        _ => STATUS_UNSUCCESSFUL,
     }
 }
 
@@ -999,5 +696,151 @@ fn io_status(err: std::io::Error) -> NTSTATUS {
         std::io::ErrorKind::PermissionDenied => STATUS_ACCESS_DENIED,
         std::io::ErrorKind::InvalidInput => STATUS_INVALID_PARAMETER,
         _ => STATUS_UNSUCCESSFUL,
+    }
+}
+
+#[cfg(test)]
+mod mounted_conformance {
+    use super::*;
+
+    #[test]
+    fn dokan_adapter_runs_shared_mounted_view_suite() {
+        if std::env::var_os("TRAIL_RUN_DOKAN_COW_TESTS").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        for (path, bytes) in [
+            ("README.md", b"baseline\n".as_slice()),
+            ("src/lower.txt", b"lower\n".as_slice()),
+            ("script.sh", b"abcdef\n".as_slice()),
+            ("delete.txt", b"delete\n".as_slice()),
+        ] {
+            fs::write(temp.path().join(path), bytes).unwrap();
+        }
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "dokan-conformance",
+            Some("main"),
+            LaneWorkdirMode::OverlayCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let mount = db
+            .mount_overlay_cow_workdir_for_lane("dokan-conformance")
+            .unwrap();
+        let workdir = PathBuf::from(
+            db.lane_workdir("dokan-conformance")
+                .unwrap()
+                .workdir
+                .unwrap(),
+        );
+        let expected = run_mounted_view_conformance(&workdir).unwrap();
+        let record = db
+            .record_lane_workdir("dokan-conformance", Some("conformance".to_string()))
+            .unwrap();
+        let actual = record
+            .changed_paths
+            .into_iter()
+            .flat_map(|path| path.old_path.into_iter().chain(std::iter::once(path.path)))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected.changed_paths);
+        assert_eq!(
+            fs::read(temp.path().join("README.md")).unwrap(),
+            b"baseline\n"
+        );
+        drop(mount);
+    }
+
+    #[test]
+    fn foreground_dokan_mount_stops_through_a_separate_trail_handle() {
+        if std::env::var_os("TRAIL_RUN_DOKAN_COW_TESTS").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let spawned = db
+            .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "foreground-dokan",
+                Some("main"),
+                LaneWorkdirMode::OverlayCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        drop(db);
+
+        let workspace = temp.path().to_path_buf();
+        let owner = thread::spawn(move || {
+            Trail::open(&workspace)
+                .unwrap()
+                .mount_lane_workspace_until_requested("foreground-dokan")
+                .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !workdir.join("README.md").is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "foreground Dokan mount did not start"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        fs::write(workdir.join("foreground.txt"), "owned\n").unwrap();
+        let requester = Trail::open(temp.path()).unwrap();
+        let stopped = requester
+            .request_lane_workspace_unmount("foreground-dokan")
+            .unwrap();
+        assert!(stopped.healthy);
+        let owned = owner.join().unwrap();
+        assert_eq!(owned.view_id, stopped.view_id);
+        let mut reopened = Trail::open(temp.path()).unwrap();
+        let checkpoint = reopened
+            .checkpoint_lane_workspace("foreground-dokan", None)
+            .unwrap();
+        assert_eq!(checkpoint.source_paths, vec!["foreground.txt"]);
+    }
+
+    #[test]
+    fn daemon_owned_dokan_mount_returns_ready_and_unmounts_asynchronously() {
+        if std::env::var_os("TRAIL_RUN_DOKAN_COW_TESTS").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let spawned = db
+            .spawn_lane_with_workdir_mode_paths_and_neighbors(
+                "daemon-dokan",
+                Some("main"),
+                LaneWorkdirMode::OverlayCow,
+                None,
+                None,
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        let mounted = db.start_lane_workspace_mount("daemon-dokan").unwrap();
+        assert!(mounted.healthy);
+        assert!(mounted.owner_pid.is_some());
+        fs::write(workdir.join("daemon.txt"), "owned\n").unwrap();
+        let stopped = db.request_lane_workspace_unmount("daemon-dokan").unwrap();
+        assert_eq!(mounted.view_id, stopped.view_id);
+        assert_eq!(stopped.owner_pid, None);
+        let checkpoint = db.checkpoint_lane_workspace("daemon-dokan", None).unwrap();
+        assert_eq!(checkpoint.source_paths, vec!["daemon.txt"]);
     }
 }

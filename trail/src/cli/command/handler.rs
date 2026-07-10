@@ -132,6 +132,8 @@ fn run(cli: Cli) -> Result<()> {
         Command::History(args) => inspect::handle_history_command(&ctx, args),
         Command::CodeFrom(args) => inspect::handle_code_from_command(&ctx, args),
         Command::Lane(lane_command) => lane::handle_lane_command(&ctx, lane_command),
+        Command::Deps(deps) => handle_deps_command(&ctx, deps),
+        Command::Cache(cache) => handle_cache_command(&ctx, cache),
         Command::Acp(acp_command) => acp::handle_acp_command(&ctx, acp_command),
         Command::Agent(agent_command) => agent::handle_agent_command(&ctx, agent_command),
         Command::Transcript(args) => acp::handle_transcript_command(&ctx, args),
@@ -156,5 +158,120 @@ fn run(cli: Cli) -> Result<()> {
         Command::Fsck => maintenance::handle_fsck_command(&ctx),
         Command::Index(index) => maintenance::handle_index_command(&ctx, index),
         Command::Gc(args) => maintenance::handle_gc_command(&ctx, args),
+    }
+}
+
+fn handle_deps_command(ctx: &RuntimeContext, deps: DepsCommand) -> Result<()> {
+    match deps.command {
+        DepsSubcommand::Status(args) => {
+            let db = open_db(ctx)?;
+            db.refresh_workspace_environment_staleness(&args.lane)?;
+            let report = db.workspace_environment_status(&args.lane)?;
+            if ctx.json {
+                render_json(&report)
+            } else {
+                if !ctx.quiet {
+                    for environment in report {
+                        println!(
+                            "{} {} expected={} attached={}",
+                            environment.adapter,
+                            environment.status,
+                            environment.expected_key,
+                            environment.attached_key.as_deref().unwrap_or("-")
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        DepsSubcommand::Sync(args) => {
+            let db = open_db(ctx)?;
+            let report = db.sync_node_dependencies(&args.lane, args.path.as_deref())?;
+            if ctx.json {
+                render_json(&report)
+            } else {
+                if !ctx.quiet {
+                    println!(
+                        "Attached layer {} ({}, {} bytes)",
+                        report.layer_id, report.adapter, report.logical_bytes
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn handle_cache_command(ctx: &RuntimeContext, cache: CacheCommand) -> Result<()> {
+    let db = open_db(ctx)?;
+    match cache.command {
+        CacheSubcommand::List => {
+            let report = db.list_workspace_layers()?;
+            if ctx.json {
+                render_json(&report)
+            } else {
+                if !ctx.quiet {
+                    for layer in report {
+                        println!(
+                            "{} {} {} logical={} physical={}",
+                            layer.layer_id,
+                            layer.adapter,
+                            layer.state,
+                            layer.logical_bytes,
+                            layer
+                                .physical_bytes
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        CacheSubcommand::Verify(args) | CacheSubcommand::Inspect(args) => {
+            let report = db.verify_workspace_layer(&args.layer)?;
+            if ctx.json {
+                render_json(&report)
+            } else {
+                if !ctx.quiet {
+                    println!(
+                        "{} {} {} entries={} bytes={}",
+                        report.layer_id,
+                        report.adapter,
+                        report.state,
+                        report.entry_count,
+                        report.logical_bytes
+                    );
+                }
+                Ok(())
+            }
+        }
+        CacheSubcommand::Gc(args) => {
+            let report = db.workspace_cache_gc(args.dry_run, args.retention_secs)?;
+            if ctx.json {
+                render_json(&report)
+            } else {
+                if !ctx.quiet {
+                    println!(
+                        "cache gc {}: candidates={} reclaimable={} reclaimed={}",
+                        if report.dry_run {
+                            "dry-run"
+                        } else {
+                            "complete"
+                        },
+                        report.candidates.len(),
+                        report.reclaimable_bytes,
+                        report.reclaimed_bytes
+                    );
+                    for item in &report.candidates {
+                        println!(
+                            "{} {} bytes={} reason={}",
+                            item.kind, item.id, item.physical_bytes, item.reason
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }

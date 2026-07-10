@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 mod acp_args;
 mod agent_args;
 mod collaboration_args;
+mod environment_args;
 mod handler;
 mod inspect_args;
 mod lane_args;
@@ -16,6 +17,7 @@ mod worktree_args;
 use acp_args::*;
 use agent_args::*;
 use collaboration_args::*;
+use environment_args::*;
 use inspect_args::*;
 use lane_args::*;
 use maintenance_args::*;
@@ -120,6 +122,10 @@ enum Command {
     /// Manage lane branches, metadata, sessions, patches, tests, and traces.
     /// This command group covers the full CLI-facing lane workflow.
     Lane(LaneCommand),
+    /// Build, attach, and inspect reproducible dependency environments.
+    Deps(DepsCommand),
+    /// Inspect and verify immutable local workspace cache layers.
+    Cache(CacheCommand),
     /// Run Agent Client Protocol relay integrations for coding agents.
     Acp(AcpCommand),
     /// Run high-level agent task workflows without managing lanes directly.

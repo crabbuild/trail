@@ -325,7 +325,9 @@ pub(crate) fn is_default_ignored(path: &str) -> bool {
         return true;
     }
     let file_name = components.last().copied().unwrap_or_default();
-    file_name == ".trailignore"
+    file_name.starts_with("._")
+        || file_name == ".DS_Store"
+        || file_name == ".trailignore"
         || file_name == ".env"
         || file_name.starts_with(".env.")
         || file_name.ends_with(".pem")

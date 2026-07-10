@@ -14,3 +14,11 @@ mod readiness;
 mod rewind;
 mod turns;
 mod workdir;
+mod workspace_git;
+mod workspace_layer;
+mod workspace_node;
+mod workspace_view;
+
+pub(crate) use workdir::ViewMutationBarrier;
+pub(crate) use workspace_layer::WorkspaceLayerBinding;
+pub(crate) use workspace_view::WorkspaceMountLease;

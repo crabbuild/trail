@@ -336,6 +336,77 @@ impl Trail {
                 last_seen_scan INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS workspace_views (
+                view_id TEXT PRIMARY KEY,
+                lane_id TEXT NOT NULL UNIQUE,
+                base_change TEXT NOT NULL,
+                base_root TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                mountpoint TEXT NOT NULL,
+                source_upper TEXT NOT NULL,
+                generated_upper TEXT NOT NULL,
+                scratch_upper TEXT NOT NULL,
+                meta_dir TEXT NOT NULL,
+                journal_path TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                checkpoint_seq INTEGER NOT NULL,
+                checkpoint_root TEXT,
+                status TEXT NOT NULL,
+                owner_pid INTEGER,
+                owner_start_token TEXT,
+                heartbeat_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS workspace_views_status_idx ON workspace_views(status, updated_at);
+            CREATE TABLE IF NOT EXISTS workspace_layers (
+                layer_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                cache_key TEXT NOT NULL UNIQUE,
+                adapter TEXT NOT NULL,
+                adapter_version INTEGER NOT NULL,
+                manifest_object_id TEXT,
+                storage_path TEXT NOT NULL,
+                state TEXT NOT NULL,
+                logical_bytes INTEGER NOT NULL,
+                physical_bytes INTEGER,
+                entry_count INTEGER NOT NULL,
+                portability_scope TEXT NOT NULL,
+                builder_id TEXT,
+                lease_expires_at INTEGER,
+                last_used_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS workspace_layers_state_used_idx ON workspace_layers(state, last_used_at);
+            CREATE TABLE IF NOT EXISTS workspace_view_layers (
+                view_id TEXT NOT NULL,
+                layer_id TEXT NOT NULL,
+                mount_path TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                read_only INTEGER NOT NULL,
+                PRIMARY KEY (view_id, mount_path, priority)
+            );
+            CREATE INDEX IF NOT EXISTS workspace_view_layers_layer_idx ON workspace_view_layers(layer_id);
+            CREATE TABLE IF NOT EXISTS workspace_environment_states (
+                view_id TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                expected_key TEXT NOT NULL,
+                attached_key TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (view_id, adapter)
+            );
+            CREATE TABLE IF NOT EXISTS workspace_git_shadows (
+                view_id TEXT PRIMARY KEY,
+                git_dir TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                pinned_head TEXT NOT NULL,
+                current_head TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS memory_items (
                 memory_ord INTEGER PRIMARY KEY AUTOINCREMENT,
                 memory_id TEXT NOT NULL UNIQUE,

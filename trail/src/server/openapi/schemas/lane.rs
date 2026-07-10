@@ -193,7 +193,7 @@ pub(super) fn lane_schemas() -> Value {
                 "from_ref": { "type": "string" },
                 "branch": { "type": "string" },
                 "materialize": { "type": "boolean" },
-                "workdir_mode": { "type": "string", "enum": ["virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"] },
+                "workdir_mode": { "type": "string", "enum": ["auto", "virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"] },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
                 "paths": { "type": "array", "items": { "type": "string" } },
@@ -322,6 +322,44 @@ pub(super) fn lane_schemas() -> Value {
             "properties": {
                 "message": { "type": "string" },
                 "preview": { "type": "boolean" }
+            }
+        },
+        "WorkspaceCheckpointRequest": {
+            "type": "object",
+            "properties": {
+                "message": { "type": "string" }
+            }
+        },
+        "LaneUpdateRequest": {
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "default": "main" },
+                "source": { "type": "string" },
+                "checkpoint": { "type": "boolean", "default": false }
+            }
+        },
+        "WorkspaceExecRequest": {
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+                "command": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1
+                }
+            }
+        },
+        "DependencySyncRequest": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            }
+        },
+        "CacheGcRequest": {
+            "type": "object",
+            "properties": {
+                "dry_run": { "type": "boolean" },
+                "retention_secs": { "type": "integer", "minimum": 0 }
             }
         },
         "LaneRewindRequest": {

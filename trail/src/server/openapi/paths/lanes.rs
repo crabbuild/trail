@@ -54,6 +54,11 @@ pub(super) fn lane_paths() -> Value {
                 openapi_query("target", "string")
             ], None, "LaneRefreshPreviewReport", true)
         },
+        "/v1/lanes/{lane_or_id}/update": {
+            "post": openapi_operation("laneUpdate", "Update layered lane", "Three-way merge a source branch into a clean, unmounted layered lane and advance its pinned view generation.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("LaneUpdateRequest"), true)
+        },
         "/v1/lanes/{lane_or_id}/handoff": {
             "get": openapi_operation("laneHandoff", "Lane handoff", "Package lane branch, readiness, current session context, recent events, spans, operations, and next steps for transfer to another lane or reviewer.", vec![
                 openapi_path_param("lane_or_id", "string"),
@@ -64,6 +69,46 @@ pub(super) fn lane_paths() -> Value {
             "get": openapi_operation("laneWorkdir", "Lane workdir", "Return the materialized workdir path for a lane, if one exists.", vec![
                 openapi_path_param("lane_or_id", "string")
             ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/workspace": {
+            "get": openapi_operation("laneWorkspace", "Lane workspace view", "Return the persisted layered workspace view and mount/checkpoint state.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/space": {
+            "get": openapi_operation("laneWorkspaceSpace", "Lane workspace space", "Report shared and lane-exclusive workspace-view storage.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/mount": {
+            "post": openapi_operation("laneWorkspaceMount", "Mount lane workspace", "Start a daemon-owned layered mount worker and return its mount report.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/unmount": {
+            "post": openapi_operation("laneWorkspaceUnmount", "Unmount lane workspace", "Ask the active mount owner to release the native backend and lease safely.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/dependencies": {
+            "get": openapi_operation("laneDependencyStatus", "Dependency environment status", "Return expected, attached, ready, stale, building, or failed dependency environments.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], None, true)
+        },
+        "/v1/lanes/{lane_or_id}/dependencies/sync": {
+            "post": openapi_operation("laneDependencySync", "Synchronize dependencies", "Build or reuse a frozen dependency layer and attach it to the lane.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("DependencySyncRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/checkpoint": {
+            "post": openapi_operation("laneWorkspaceCheckpoint", "Checkpoint lane workspace", "Checkpoint source-upper mutations into the lane ref under a mutation barrier.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("WorkspaceCheckpointRequest"), true)
+        },
+        "/v1/lanes/{lane_or_id}/exec": {
+            "post": openapi_operation("laneWorkspaceExec", "Execute in lane workspace", "Mount the layered lane for one open-world command with isolated cache and target variables.", vec![
+                openapi_path_param("lane_or_id", "string")
+            ], Some("WorkspaceExecRequest"), true)
         },
         "/v1/lanes/{lane_or_id}/diff": {
             "get": openapi_operation("laneDiff", "Lane diff", "Show the diff from a lane branch base to head.", vec![

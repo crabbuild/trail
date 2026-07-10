@@ -1,0 +1,91 @@
+name: layered-workspaces
+
+on:
+  pull_request:
+    paths:
+      - "trail/**"
+      - "scripts/verify-linux-overlay-cow-docker.sh"
+      - "scripts/verify-layered-lane-scale.sh"
+      - "scripts/verify-rust-cache-isolation-docker.sh"
+      - ".github/workflows/layered-workspaces.yml"
+  workflow_dispatch:
+    inputs:
+      run_scale:
+        description: "Run the one-million-path / twenty-view acceptance test"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p trail view_core_ --no-default-features
+      - run: cargo test -p trail workspace_layer --no-default-features
+
+  fuse-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: sudo chmod 666 /dev/fuse
+      - run: cargo test -p trail fuse_adapter_runs_shared_mounted_view_suite -- --nocapture
+        env:
+          TRAIL_RUN_FUSE_COW_TESTS: "1"
+
+  rust-cache-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/verify-rust-cache-isolation-docker.sh
+
+  nfs-conformance:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p trail nfs_adapter_runs_shared_mounted_view_suite -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail real_nfs_mount_records_new_modified_and_renamed_files -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail nfs_exec_checkpoint_and_recovery_are_fully_local -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail nfs_git_checkout_reset_and_clean_are_lane_local -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+
+  dokan-conformance:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: choco install dokan -y --no-progress
+      - shell: pwsh
+        run: |
+          $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
+          cargo test -p trail dokan_adapter_runs_shared_mounted_view_suite -- --nocapture
+          cargo test -p trail foreground_dokan_mount_stops_through_a_separate_trail_handle -- --nocapture
+          cargo test -p trail daemon_owned_dokan_mount_returns_ready_and_unmounts_asynchronously -- --nocapture
+
+  million-path-scale:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_scale }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/verify-layered-lane-scale.sh

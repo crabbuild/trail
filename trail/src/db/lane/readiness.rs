@@ -2,6 +2,13 @@ use super::*;
 
 impl Trail {
     pub fn lane_readiness(&self, lane: &str) -> Result<LaneReadinessReport> {
+        let environment_refresh_error = if self.lane_workspace_view(lane)?.is_some() {
+            self.refresh_workspace_environment_staleness(lane)
+                .err()
+                .map(|err| err.to_string())
+        } else {
+            None
+        };
         let status = self.lane_status(lane)?;
         let lane_ref = status.lane.branch.ref_name.clone();
         let pending_approvals = self.list_lane_approvals(Some(lane), Some("pending"))?;
@@ -17,6 +24,144 @@ impl Trail {
 
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
+        if let Some(view) = self.lane_workspace_view(lane)? {
+            let missing_paths = [
+                &view.source_upper,
+                &view.generated_upper,
+                &view.scratch_upper,
+                &view.meta_dir,
+            ]
+            .into_iter()
+            .filter(|path| !Path::new(path).is_dir())
+            .cloned()
+            .collect::<Vec<_>>();
+            if !missing_paths.is_empty()
+                || matches!(view.status.as_str(), "failed" | "unhealthy" | "corrupt")
+            {
+                blockers.push(readiness_issue(
+                    "workspace_view_unhealthy",
+                    "layered workspace view is not healthy",
+                    Some(serde_json::json!({
+                        "view_id": view.view_id,
+                        "status": view.status,
+                        "missing_paths": missing_paths,
+                    })),
+                ));
+            }
+            if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
+                if process_matches_start_token(pid, token) {
+                    blockers.push(readiness_issue(
+                        "workspace_view_active_writers",
+                        format!("workspace view has an active writer in process {pid}"),
+                        Some(serde_json::json!({
+                            "view_id": view.view_id,
+                            "owner_pid": pid,
+                            "heartbeat_at": view.heartbeat_at,
+                        })),
+                    ));
+                } else {
+                    blockers.push(readiness_issue(
+                        "workspace_view_unhealthy",
+                        "workspace view has a stale mount lease that must be recovered",
+                        Some(serde_json::json!({
+                            "view_id": view.view_id,
+                            "stale_owner_pid": pid,
+                        })),
+                    ));
+                }
+            }
+            let journal_sequence = self.workspace_view_last_journal_sequence(&view)?;
+            if journal_sequence > view.checkpoint_seq && !status.workdir_changed_paths.is_empty() {
+                blockers.push(readiness_issue(
+                    "uncheckpointed_source_changes",
+                    "source upper contains changes newer than the last workspace checkpoint",
+                    Some(serde_json::json!({
+                        "view_id": view.view_id,
+                        "checkpoint_sequence": view.checkpoint_seq,
+                        "journal_sequence": journal_sequence,
+                        "paths": status.workdir_changed_paths.iter().map(|path| path.path.clone()).collect::<Vec<_>>(),
+                    })),
+                ));
+            }
+            if let Some(error) = &environment_refresh_error {
+                blockers.push(readiness_issue(
+                    "dependency_environment_stale",
+                    format!("dependency environment could not be refreshed: {error}"),
+                    Some(serde_json::json!({"view_id": view.view_id})),
+                ));
+            }
+            for environment in self.workspace_environment_status(lane)? {
+                match environment.status.as_str() {
+                    "ready"
+                        if environment.attached_key.as_deref()
+                            == Some(environment.expected_key.as_str()) => {}
+                    "failed" => blockers.push(readiness_issue(
+                        "dependency_layer_build_failed",
+                        format!(
+                            "dependency environment `{}` failed to build",
+                            environment.adapter
+                        ),
+                        Some(serde_json::json!({
+                            "adapter": environment.adapter,
+                            "expected_key": environment.expected_key,
+                            "reason": environment.reason,
+                        })),
+                    )),
+                    _ => blockers.push(readiness_issue(
+                        "dependency_environment_stale",
+                        format!(
+                            "dependency environment `{}` is not synchronized",
+                            environment.adapter
+                        ),
+                        Some(serde_json::json!({
+                            "adapter": environment.adapter,
+                            "status": environment.status,
+                            "expected_key": environment.expected_key,
+                            "attached_key": environment.attached_key,
+                            "reason": environment.reason,
+                        })),
+                    )),
+                }
+            }
+            for layer in self.workspace_view_layer_reports(&view.view_id)? {
+                if layer.state != "ready" || self.verify_workspace_layer(&layer.layer_id).is_err() {
+                    blockers.push(readiness_issue(
+                        "workspace_layer_corrupt",
+                        format!(
+                            "workspace layer `{}` failed integrity verification",
+                            layer.layer_id
+                        ),
+                        Some(serde_json::json!({
+                            "layer_id": layer.layer_id,
+                            "state": layer.state,
+                        })),
+                    ));
+                }
+            }
+            let quota = self.workspace_quota_status(lane)?;
+            if !quota.exceeded.is_empty() {
+                blockers.push(readiness_issue(
+                    "workspace_quota_exceeded",
+                    "workspace view or cache exceeds its configured resource quota",
+                    Some(serde_json::to_value(&quota)?),
+                ));
+            }
+            if let Some(shadow) = self.workspace_git_shadow(&view)? {
+                let shadow = self.refresh_workspace_git_shadow(&shadow)?;
+                if shadow.status != "ready" || shadow.current_head != shadow.pinned_head {
+                    blockers.push(readiness_issue(
+                        "shadow_git_head_diverged",
+                        "shadow Git HEAD diverged from the pinned workspace commit",
+                        Some(serde_json::json!({
+                            "view_id": view.view_id,
+                            "pinned_head": shadow.pinned_head,
+                            "current_head": shadow.current_head,
+                            "policy": shadow.policy,
+                        })),
+                    ));
+                }
+            }
+        }
         if status.lane.branch.status == "removed" {
             blockers.push(readiness_issue(
                 "lane_removed",
@@ -98,6 +243,49 @@ impl Trail {
                 } else {
                     warnings.push(issue);
                 }
+            }
+        }
+
+        let head = self.get_ref(&status.lane.branch.ref_name)?;
+        let expected_environment_keys = self
+            .workspace_environment_status(lane)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|environment| environment.expected_key)
+            .collect::<BTreeSet<_>>();
+        for (kind, gate) in [
+            ("test", status.latest_test.as_ref()),
+            ("eval", status.latest_eval.as_ref()),
+        ] {
+            let Some(gate) = gate.filter(|gate| gate.success) else {
+                continue;
+            };
+            if gate.source_root.as_ref() != Some(&head.root_id) {
+                blockers.push(readiness_issue(
+                    format!("{kind}_gate_stale_source_root"),
+                    format!("latest {kind} gate did not run against the current lane root"),
+                    Some(serde_json::json!({
+                        "event_id": gate.event_id,
+                        "gate_root": gate.source_root,
+                        "current_root": head.root_id,
+                    })),
+                ));
+            }
+            let gate_environment_keys = gate
+                .environment_keys
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if gate_environment_keys != expected_environment_keys {
+                blockers.push(readiness_issue(
+                    format!("{kind}_gate_stale_environment"),
+                    format!("latest {kind} gate used different workspace environment layers"),
+                    Some(serde_json::json!({
+                        "event_id": gate.event_id,
+                        "gate_environment_keys": gate_environment_keys,
+                        "current_environment_keys": expected_environment_keys,
+                    })),
+                ));
             }
         }
 

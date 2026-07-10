@@ -1,19 +1,21 @@
 use super::*;
 
-pub(crate) fn run_command_with_timeout(
+pub(crate) fn run_command_with_timeout_env(
     command: &[String],
     cwd: &Path,
     timeout: Duration,
+    environment: &[(String, String)],
 ) -> Result<CommandRunResult> {
     let started = Instant::now();
-    let mut child = match Command::new(&command[0])
+    let mut process = Command::new(&command[0]);
+    process
         .args(&command[1..])
         .current_dir(cwd)
+        .envs(environment.iter().cloned())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::piped());
+    let mut child = match process.spawn() {
         Ok(child) => child,
         Err(err) => {
             return Ok(CommandRunResult {

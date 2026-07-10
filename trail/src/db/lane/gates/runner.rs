@@ -47,10 +47,27 @@ impl Trail {
         let suite = options.suite.clone();
         let score = options.score;
         let threshold = options.threshold;
+        if self.lane_workspace_view(lane)?.is_some() {
+            self.refresh_workspace_environment_staleness(lane)?;
+        }
 
-        let (lane_id, session_id, workdir, turn_id, head_change, started_event_id) = {
+        let (
+            lane_id,
+            session_id,
+            workdir,
+            turn_id,
+            head_change,
+            source_root,
+            workdir_mode,
+            view,
+            environment_keys,
+            layer_ids,
+            started_event_id,
+        ) = {
             let _lock = self.acquire_write_lock()?;
             let branch = self.lane_branch(lane)?;
+            let lane_record = self.lane_record(&branch.lane_id)?;
+            let workdir_mode = self.lane_workdir_mode_for(&lane_record, &branch)?;
             let Some(workdir) = branch.workdir.clone() else {
                 return Err(Error::InvalidInput(format!(
                     "lane `{lane}` does not have a materialized workdir"
@@ -61,6 +78,33 @@ impl Trail {
                 return Err(Error::WorkspaceNotFound(workdir_path));
             }
             let head = self.get_ref(&branch.ref_name)?;
+            let view = self.lane_workspace_view(lane)?;
+            let environments = if view.is_some() {
+                self.workspace_environment_status(lane)?
+            } else {
+                Vec::new()
+            };
+            if let Some(environment) = environments
+                .iter()
+                .find(|environment| environment.status != "ready")
+            {
+                return Err(Error::InvalidInput(format!(
+                    "lane `{lane}` dependency environment `{}` is {}; run `trail deps sync {lane}` before validation",
+                    environment.adapter, environment.status
+                )));
+            }
+            let environment_keys = environments
+                .iter()
+                .map(|environment| environment.expected_key.clone())
+                .collect::<Vec<_>>();
+            let layer_ids = if let Some(view) = &view {
+                self.workspace_layer_bindings_for_source_upper(Path::new(&view.source_upper))?
+                    .into_iter()
+                    .map(|binding| binding.layer_id)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let (turn_id, session_id) = if let Some(turn_id) = turn_id {
                 let turn = self.lane_turn(turn_id)?;
                 if turn.lane_id != branch.lane_id {
@@ -105,7 +149,12 @@ impl Trail {
                     "threshold": threshold,
                     "workdir": workdir.clone(),
                     "timeout_secs": timeout_secs,
-                    "head_change": head.change_id.0.clone()
+                    "head_change": head.change_id.0.clone(),
+                    "source_root": head.root_id.0.clone(),
+                    "view_id": view.as_ref().map(|view| view.view_id.as_str()),
+                    "view_generation": view.as_ref().map(|view| view.generation),
+                    "environment_keys": environment_keys.clone(),
+                    "layer_ids": layer_ids.clone()
                 }),
             )?;
             (
@@ -114,15 +163,38 @@ impl Trail {
                 workdir,
                 turn_id,
                 head.change_id,
+                head.root_id,
+                workdir_mode,
+                view,
+                environment_keys,
+                layer_ids,
                 started_event_id,
             )
         };
 
-        let run = run_command_with_timeout(
+        let overlay_mount = if workdir_mode == LaneWorkdirMode::OverlayCow {
+            Some(self.mount_overlay_cow_workdir_for_lane(lane)?)
+        } else {
+            None
+        };
+        let nfs_mount = if workdir_mode == LaneWorkdirMode::NfsCow {
+            Some(self.mount_nfs_cow_workdir_for_lane(lane)?)
+        } else {
+            None
+        };
+        let environment = view
+            .as_ref()
+            .map(|view| self.workspace_command_environment(view, &source_root))
+            .transpose()?
+            .unwrap_or_default();
+        let run = run_command_with_timeout_env(
             &command,
             Path::new(&workdir),
             Duration::from_secs(timeout_secs),
+            &environment,
         )?;
+        drop(nfs_mount);
+        drop(overlay_mount);
         let threshold_met = score
             .zip(threshold)
             .map(|(score, threshold)| score >= threshold);
@@ -173,7 +245,12 @@ impl Trail {
                     "stdout_preview": stdout_preview.clone(),
                     "stderr_preview": stderr_preview.clone(),
                     "stdout_truncated": stdout_truncated,
-                    "stderr_truncated": stderr_truncated
+                    "stderr_truncated": stderr_truncated,
+                    "source_root": source_root.0.clone(),
+                    "view_id": view.as_ref().map(|view| view.view_id.as_str()),
+                    "view_generation": view.as_ref().map(|view| view.generation),
+                    "environment_keys": environment_keys.clone(),
+                    "layer_ids": layer_ids.clone()
                 }),
             )?;
             self.finish_lane_turn(&turn_id, &status, Some(&head_change))?;
@@ -185,6 +262,11 @@ impl Trail {
             turn_id,
             session_id,
             workdir,
+            source_root,
+            view_id: view.as_ref().map(|view| view.view_id.clone()),
+            view_generation: view.as_ref().map(|view| view.generation),
+            environment_keys,
+            layer_ids,
             command,
             kind: kind.to_string(),
             suite,

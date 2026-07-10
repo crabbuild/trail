@@ -69,6 +69,11 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             let report = db.preview_lane_refresh(&args.name, &args.target)?;
             render_lane_refresh_preview(&report, ctx.json, ctx.quiet)
         }
+        LaneSubcommand::Update(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.update_layered_lane_from(&args.name, &args.source, args.checkpoint)?;
+            render_merge(&report, ctx.json, ctx.quiet)
+        }
         LaneSubcommand::Handoff(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_handoff(&args.name, args.limit)?;
@@ -107,6 +112,44 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 let report = db.record_lane_workdir(&args.name, args.message)?;
                 render_lane_record(&report, ctx.json, ctx.quiet)
             }
+        }
+        LaneSubcommand::Checkpoint(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.checkpoint_lane_workspace(&args.name, args.message)?;
+            render_workspace_checkpoint(&report, ctx.json, ctx.quiet)
+        }
+        LaneSubcommand::Space(args) => {
+            let db = open_db(ctx)?;
+            let report = db.lane_workspace_space(&args.name)?;
+            render_workspace_space(&report, ctx.json, ctx.quiet)
+        }
+        LaneSubcommand::Exec(args) => {
+            let db = open_db(ctx)?;
+            let report = db.exec_lane_workspace(&args.name, &args.command)?;
+            render_workspace_exec(&report, ctx.json, ctx.quiet)
+        }
+        LaneSubcommand::Mount(args) => {
+            let db = open_db(ctx)?;
+            let _foreground = args.foreground;
+            if !ctx.json && !ctx.quiet {
+                let view = db.lane_workspace_view(&args.name)?.ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "lane `{}` does not have a layered workspace view",
+                        args.name
+                    ))
+                })?;
+                println!(
+                    "Mounting workspace view {} at {}; run `trail lane unmount {}` to stop it",
+                    view.view_id, view.mountpoint, args.name
+                );
+            }
+            let report = db.mount_lane_workspace_until_requested(&args.name)?;
+            render_workspace_mount(&report, "unmounted", ctx.json, ctx.quiet)
+        }
+        LaneSubcommand::Unmount(args) => {
+            let db = open_db(ctx)?;
+            let report = db.request_lane_workspace_unmount(&args.name)?;
+            render_workspace_mount(&report, "unmounted", ctx.json, ctx.quiet)
         }
         LaneSubcommand::Rewind(args) => {
             let mut db = open_db(ctx)?;

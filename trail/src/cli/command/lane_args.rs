@@ -30,6 +30,8 @@ pub(super) enum LaneSubcommand {
     Readiness(LaneReadinessArgs),
     /// Preview refreshing a lane onto a target branch before merge.
     RefreshPreview(LaneRefreshPreviewArgs),
+    /// Merge a branch into a layered lane and advance its pinned view generation.
+    Update(LaneUpdateArgs),
     /// Produce a handoff-ready transfer packet for a lane.
     Handoff(LaneHandoffArgs),
     /// Create a best-effort advisory claim for path-level work coordination.
@@ -46,6 +48,16 @@ pub(super) enum LaneSubcommand {
     Trace(LaneTraceCommand),
     /// Record all current lane workdir changes as one operation.
     Record(LaneRecordArgs),
+    /// Checkpoint only source-upper mutations into the lane ref.
+    Checkpoint(LaneCheckpointArgs),
+    /// Report shared and lane-exclusive workspace-view storage.
+    Space(LaneSpaceArgs),
+    /// Mount a layered lane for one command with isolated cache/target variables.
+    Exec(LaneExecArgs),
+    /// Own a layered lane mount in the foreground until `lane unmount` requests teardown.
+    Mount(LaneMountArgs),
+    /// Ask the foreground mount owner to release a layered lane safely.
+    Unmount(LaneUnmountArgs),
     /// Rewind a lane branch to a known-good change or root.
     Rewind(LaneRewindArgs),
     /// Watch and record lane workdir changes continuously.
@@ -97,7 +109,7 @@ pub(super) struct LaneSpawnArgs {
     pub(super) no_materialize: bool,
     #[arg(
         long,
-        value_parser = ["virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"]
+        value_parser = ["auto", "virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"]
     )]
     pub(super) workdir_mode: Option<String>,
     #[arg(long)]
@@ -161,6 +173,28 @@ pub(super) struct LaneRefreshPreviewArgs {
 }
 
 #[derive(Args)]
+pub(super) struct LaneUpdateArgs {
+    pub(super) name: String,
+    #[arg(long = "from", default_value = "main")]
+    pub(super) source: String,
+    #[arg(long)]
+    pub(super) checkpoint: bool,
+}
+
+#[derive(Args)]
+pub(super) struct LaneMountArgs {
+    pub(super) name: String,
+    /// Explicitly select foreground ownership (currently the only persistent mode).
+    #[arg(long)]
+    pub(super) foreground: bool,
+}
+
+#[derive(Args)]
+pub(super) struct LaneUnmountArgs {
+    pub(super) name: String,
+}
+
+#[derive(Args)]
 pub(super) struct LaneHandoffArgs {
     pub(super) name: String,
     #[arg(long, default_value_t = 50)]
@@ -201,6 +235,25 @@ pub(super) struct LaneRecordArgs {
     pub(super) message: Option<String>,
     #[arg(long)]
     pub(super) preview: bool,
+}
+
+#[derive(Args)]
+pub(super) struct LaneCheckpointArgs {
+    pub(super) name: String,
+    #[arg(short, long)]
+    pub(super) message: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct LaneSpaceArgs {
+    pub(super) name: String,
+}
+
+#[derive(Args)]
+pub(super) struct LaneExecArgs {
+    pub(super) name: String,
+    #[arg(last = true, num_args = 1.., required = true)]
+    pub(super) command: Vec<String>,
 }
 
 #[derive(Args)]

@@ -42,6 +42,16 @@ impl Trail {
         }
         let operation = self.operation(&right_ref.change_id)?;
         let branch = operation.branch.clone();
+        if let Some(lane) = branch.strip_prefix(LANE_REF_PREFIX) {
+            let lane_head = self.get_ref(&branch)?;
+            if lane_head.change_id != right_ref.change_id || lane_head.root_id != right_ref.root_id
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Git export from lane `{lane}` must use its current reviewed head, not an older or synthetic range endpoint"
+                )));
+            }
+            self.ensure_lane_merge_readiness(lane)?;
+        }
         let mut patch_left = BTreeMap::new();
         let mut patch_right = BTreeMap::new();
         let _diff = self.diff_root_file_maps(

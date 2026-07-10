@@ -22,6 +22,86 @@ pub(crate) fn render_lane_record(report: &LaneRecordReport, json: bool, quiet: b
     Ok(())
 }
 
+pub(crate) fn render_workspace_checkpoint(
+    report: &WorkspaceCheckpointReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Checkpointed view {} at {}",
+            report.view_id, report.root_id.0
+        );
+        println!("Journal sequence: {}", report.journal_sequence);
+        println!("Source paths: {}", report.source_paths.len());
+        println!("Generated dirty paths: {}", report.generated_dirty_paths);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_workspace_space(
+    report: &WorkspaceSpaceReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!("Workspace view: {}", report.view_id);
+        println!("Logical visible bytes: {}", report.logical_visible_bytes);
+        println!("Shared physical bytes: {}", report.shared_physical_bytes);
+        println!(
+            "Lane-exclusive physical bytes: {}",
+            report.lane_exclusive_physical_bytes
+        );
+        println!(
+            "Uncheckpointed source bytes: {}",
+            report.uncheckpointed_source_bytes
+        );
+        println!("Accounting: {}", report.physical_accounting);
+    }
+    Ok(())
+}
+
+pub(crate) fn render_workspace_exec(
+    report: &WorkspaceExecReport,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "View {} command exited with {} (root {}, generation {})",
+            report.view_id, report.exit_code, report.source_root.0, report.generation
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn render_workspace_mount(
+    report: &WorkspaceMountReport,
+    state: &str,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    if json {
+        return render_json(report);
+    }
+    if !quiet {
+        println!(
+            "Workspace view {} {state} at {} (backend {}, generation {})",
+            report.view_id, report.mountpoint, report.backend, report.generation
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn render_lane_record_preview(
     report: &LaneRecordPreviewReport,
     json: bool,

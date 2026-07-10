@@ -60,6 +60,158 @@ pub struct LaneSpawnReport {
     pub overlay_available: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaneWorkspaceViewReport {
+    pub view_id: String,
+    pub lane_id: String,
+    pub base_change: ChangeId,
+    pub base_root: ObjectId,
+    pub backend: String,
+    pub mountpoint: String,
+    pub source_upper: String,
+    pub generated_upper: String,
+    pub scratch_upper: String,
+    pub meta_dir: String,
+    pub journal_path: String,
+    pub generation: u64,
+    pub checkpoint_seq: u64,
+    pub checkpoint_root: Option<ObjectId>,
+    pub status: String,
+    pub owner_pid: Option<u32>,
+    pub owner_start_token: Option<String>,
+    pub heartbeat_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceLayerReport {
+    pub layer_id: String,
+    pub kind: String,
+    pub cache_key: String,
+    pub adapter: String,
+    pub state: String,
+    pub storage_path: String,
+    pub logical_bytes: u64,
+    pub physical_bytes: Option<u64>,
+    pub entry_count: u64,
+    pub portability_scope: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceEnvironmentReport {
+    pub view_id: String,
+    pub adapter: String,
+    pub expected_key: String,
+    pub attached_key: Option<String>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceCheckpointReport {
+    pub view_id: String,
+    pub operation: Option<ChangeId>,
+    pub root_id: ObjectId,
+    pub journal_sequence: u64,
+    pub source_paths: Vec<String>,
+    pub generated_dirty_paths: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSpaceReport {
+    pub view_id: String,
+    pub logical_visible_bytes: u64,
+    pub shared_physical_bytes: u64,
+    pub lane_exclusive_physical_bytes: u64,
+    pub shared_extent_bytes: Option<u64>,
+    pub reclaimable_cache_bytes: u64,
+    pub uncheckpointed_source_bytes: u64,
+    pub generated_upper_bytes: u64,
+    pub scratch_upper_bytes: u64,
+    pub physical_accounting: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMountReport {
+    pub view_id: String,
+    pub backend: String,
+    pub mountpoint: String,
+    pub generation: u64,
+    pub owner_pid: Option<u32>,
+    pub owner_start_token: Option<String>,
+    pub healthy: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceExecReport {
+    pub view_id: String,
+    pub lane_id: String,
+    pub source_root: ObjectId,
+    pub generation: u64,
+    pub backend: String,
+    pub command: Vec<String>,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceLayerKeyV1 {
+    pub kind: String,
+    pub adapter: String,
+    pub adapter_version: u32,
+    pub inputs: std::collections::BTreeMap<String, String>,
+    pub tool_versions: std::collections::BTreeMap<String, String>,
+    pub platform: String,
+    pub architecture: String,
+    pub portability_scope: String,
+    pub strategy: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceGitShadowReport {
+    pub view_id: String,
+    pub git_dir: String,
+    pub work_tree: String,
+    pub policy: String,
+    pub pinned_head: String,
+    pub current_head: String,
+    pub status: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceQuotaReport {
+    pub view_id: String,
+    pub upper_logical_bytes: u64,
+    pub upper_file_count: u64,
+    pub largest_file_bytes: u64,
+    pub journal_bytes: u64,
+    pub cache_physical_bytes: u64,
+    pub exceeded: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceCacheGcEntry {
+    pub kind: String,
+    pub id: String,
+    pub path: String,
+    pub physical_bytes: u64,
+    pub pinned: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceCacheGcReport {
+    pub dry_run: bool,
+    pub retention_secs: u64,
+    pub cache_physical_bytes_before: u64,
+    pub reclaimable_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub candidates: Vec<WorkspaceCacheGcEntry>,
+    pub deleted: Vec<WorkspaceCacheGcEntry>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LanePatchReport {
     pub lane_id: String,
@@ -198,6 +350,15 @@ pub struct LaneTestReport {
     pub turn_id: String,
     pub session_id: Option<String>,
     pub workdir: String,
+    pub source_root: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_ids: Vec<String>,
     pub command: Vec<String>,
     #[serde(default = "default_lane_gate_kind")]
     pub kind: String,
@@ -242,6 +403,16 @@ pub struct LaneTestSummary {
     pub timed_out: bool,
     pub duration_ms: u64,
     pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_ids: Vec<String>,
     pub created_at: i64,
 }
 

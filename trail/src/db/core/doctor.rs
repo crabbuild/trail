@@ -9,6 +9,7 @@ impl Trail {
         doctor_storage::push_schema_check(self, &mut checks);
         doctor_storage::push_current_branch_check(self, &mut checks);
         doctor_storage::push_ignore_policy_check(self, &mut checks);
+        doctor_storage::push_workspace_views_check(self, &mut checks);
 
         doctor_runtime::push_write_lock_check(self, &mut checks);
         doctor_runtime::push_daemon_token_check(self, &mut checks);

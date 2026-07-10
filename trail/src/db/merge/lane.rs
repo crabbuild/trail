@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::lane::ViewMutationBarrier;
 
 impl Trail {
     pub fn merge_lane(&mut self, lane: &str, into: &str) -> Result<MergeReport> {
@@ -52,6 +53,136 @@ impl Trail {
             changed_paths,
             conflicts: merged.conflicts,
             next_steps,
+        })
+    }
+
+    pub fn update_layered_lane_from(
+        &mut self,
+        lane: &str,
+        source_branch: &str,
+        checkpoint: bool,
+    ) -> Result<MergeReport> {
+        if checkpoint {
+            self.checkpoint_lane_workspace(
+                lane,
+                Some(format!("Checkpoint before updating from {source_branch}")),
+            )?;
+        }
+        let _lock = self.acquire_write_lock()?;
+        validate_ref_segment(lane)?;
+        validate_ref_segment(source_branch)?;
+        let lane_branch = self.lane_branch(lane)?;
+        let lane_record = self.lane_record(&lane_branch.lane_id)?;
+        if !self
+            .lane_workdir_mode_for(&lane_record, &lane_branch)?
+            .is_transparent_cow()
+        {
+            return Err(Error::InvalidInput(format!(
+                "lane update requires a layered workspace view; lane {lane} is not overlay-cow or nfs-cow"
+            )));
+        }
+        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "layered lane {lane} has no persisted workspace view"
+            ))
+        })?;
+        if let (Some(pid), Some(token)) = (view.owner_pid, view.owner_start_token.as_deref()) {
+            if process_matches_start_token(pid, token) {
+                return Err(Error::InvalidInput(format!(
+                    "workspace view {} has an active writer in process {pid}; unmount before updating its base",
+                    view.view_id
+                )));
+            }
+        }
+        let _barrier = ViewMutationBarrier::exclusive(Path::new(&view.meta_dir))?;
+        let lane_head = self.get_ref(&lane_branch.ref_name)?;
+        self.ensure_lane_workdir_clean(&lane_branch, &lane_head)?;
+        let source_ref_name = branch_ref(source_branch);
+        let source_ref = self.get_ref(&source_ref_name)?;
+        let base_ref = self.ref_from_change(&lane_branch.base_change)?;
+        let actor = Actor::system();
+        let change_id = self.allocate_change_id(&actor.id, "lane_update")?;
+        let merged = self.merge_root_maps_for_changed_paths(
+            &base_ref.root_id,
+            &lane_head.root_id,
+            &source_ref.root_id,
+            &change_id,
+        )?;
+        if !merged.conflicts.is_empty() {
+            self.conn.execute(
+                "UPDATE lane_branches SET status = 'conflicted', updated_at = ?1 WHERE lane_id = ?2",
+                params![now_ts(), lane_branch.lane_id],
+            )?;
+            return Err(Error::Conflict(format!(
+                "lane update from {source_branch} conflicts: {}",
+                merged.conflicts.join("; ")
+            )));
+        }
+        let diff = self.diff_file_maps(&merged.target_files, &merged.merged_files)?;
+        let root_id = if merged.merged_files == merged.target_files {
+            lane_head.root_id.clone()
+        } else {
+            self.build_root_from_touched_file_entries_incremental(
+                &lane_head.root_id,
+                &merged.target_files,
+                &merged.merged_files,
+                &change_id,
+            )?
+            .root_id
+        };
+        let operation = Operation {
+            version: OP_OBJECT_VERSION,
+            change_id: change_id.clone(),
+            kind: OperationKind::LaneMerge,
+            parents: vec![lane_head.change_id.clone(), source_ref.change_id.clone()],
+            before_root: Some(lane_head.root_id.clone()),
+            after_root: root_id.clone(),
+            branch: lane_branch.ref_name.clone(),
+            actor,
+            session_id: lane_branch.session_id,
+            message: Some(format!("Update lane {lane} from {source_branch}")),
+            changes: diff.changes,
+            created_at: now_ts(),
+        };
+        let operation_id = self.store_operation(&operation)?;
+        self.advance_ref_cas(&lane_head, &change_id, &root_id, &operation_id)?;
+        self.conn.execute(
+            "UPDATE lane_branches SET base_change = ?1, base_root = ?2, head_change = ?3, head_root = ?4, status = 'active', updated_at = ?5 WHERE lane_id = ?6",
+            params![
+                source_ref.change_id.0,
+                source_ref.root_id.0,
+                change_id.0,
+                root_id.0,
+                now_ts(),
+                lane_branch.lane_id
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE workspace_views SET base_change = ?1, base_root = ?2, generation = generation + 1, updated_at = ?3 WHERE view_id = ?4",
+            params![change_id.0, root_id.0, now_ts(), view.view_id],
+        )?;
+        self.complete_workspace_checkpoint(lane, &root_id, Some(&change_id))?;
+        self.refresh_workspace_environment_staleness(lane)?;
+        self.insert_lane_event(
+            &lane_branch.lane_id,
+            "workspace_view_updated",
+            Some(&change_id),
+            None,
+            &serde_json::json!({
+                "view_id": view.view_id,
+                "source_branch": source_branch,
+                "source_change": source_ref.change_id.0,
+                "root_id": root_id.0,
+            }),
+        )?;
+        Ok(MergeReport {
+            operation: change_id,
+            source_ref: source_ref_name,
+            target_ref: lane_branch.ref_name,
+            root_id,
+            dry_run: false,
+            changed_paths: diff.summaries,
+            conflicts: Vec::new(),
         })
     }
 
@@ -290,42 +421,11 @@ impl Trail {
         if !workdir_path.is_dir() {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
-        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(branch)?;
-        let cached_manifest = match self.lane_cached_workdir_manifest_status(
+        Ok(Some(self.lane_workdir_record_changed_paths(
+            branch,
+            head,
             &workdir_path,
-            overlay_manifest_path.as_deref(),
-            &head.root_id,
-        )? {
-            CachedWorkdirManifestStatus::Clean => return Ok(Some(Vec::new())),
-            CachedWorkdirManifestStatus::Dirty {
-                disk_manifest,
-                candidate_paths,
-            } => Some((disk_manifest, candidate_paths)),
-            CachedWorkdirManifestStatus::Missing => None,
-        };
-        let disk_files;
-        let (disk_manifest, candidate_paths) = if let Some(cached_manifest) = cached_manifest {
-            cached_manifest
-        } else {
-            disk_files = self.scan_files_under(&workdir_path)?;
-            (self.disk_manifest(&disk_files), None)
-        };
-        let changed_paths = if let Some(sparse_paths) =
-            self.lane_sparse_workdir_paths(branch, &workdir_path)?
-        {
-            let mut selected_paths = sparse_paths;
-            selected_paths.extend(disk_manifest.keys().cloned());
-            selected_paths.sort();
-            selected_paths.dedup();
-            let head_files = self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-            self.diff_file_maps_to_manifest_for_paths(&head_files, &disk_manifest, &selected_paths)
-        } else if let Some(candidate_paths) = candidate_paths {
-            let head_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
-            self.diff_file_maps_to_manifest_for_paths(&head_files, &disk_manifest, &candidate_paths)
-        } else {
-            self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?
-        };
-        Ok(Some(changed_paths))
+        )?))
     }
 
     fn ensure_direct_lane_merge_allowed(
@@ -363,4 +463,49 @@ fn lane_refresh_preview_next_steps(
     vec![format!(
         "Review the changed paths, then merge via `trail merge-queue add {lane} --into {target_branch}` when ready."
     )]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layered_lane_update_refuses_an_active_workspace_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else {
+            LaneWorkdirMode::OverlayCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "active-update",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        let backend = db
+            .lane_workspace_view("active-update")
+            .unwrap()
+            .unwrap()
+            .backend;
+        let mut lease = db
+            .acquire_workspace_mount_lease("active-update", &backend)
+            .unwrap();
+        lease.mark_mounted().unwrap();
+        let err = db
+            .update_layered_lane_from("active-update", "main", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("active writer in process"));
+        drop(lease);
+        db.update_layered_lane_from("active-update", "main", false)
+            .unwrap();
+    }
 }

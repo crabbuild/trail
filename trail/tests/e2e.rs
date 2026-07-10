@@ -13,8 +13,8 @@ use rusqlite::Connection;
 use trail::{
     Actor, ConflictManualFile, ConflictManualResolution, Error, InitImportMode, LaneGateOptions,
     LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails, LaneTurnEndReport,
-    LaneTurnEventReport, LaneTurnStartReport, OperationKind, PatchDocument, ShowResult,
-    TextContent, TextRepresentation, Trail, WorktreeState,
+    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, OperationKind, PatchDocument,
+    ShowResult, TextContent, TextRepresentation, Trail, WorktreeState,
 };
 
 fn git_available() -> bool {
@@ -621,7 +621,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 2
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 4
         }));
     }
 
@@ -3103,6 +3103,8 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     run_git(temp.path(), &["add", "README.md"]);
     run_git(temp.path(), &["commit", "-m", "initial"]);
+    let initial_git_head = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    let initial_git_index = fs::read(temp.path().join(".git/index")).unwrap();
     Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
     let empty_guide = run_trail_json(temp.path(), &["agent", "guide"]);
     assert_eq!(empty_guide["status"], "empty");
@@ -3146,6 +3148,18 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     assert!(std::path::Path::new(task_workdir).is_dir());
     assert_eq!(started["workdir"].as_str().unwrap(), task_workdir);
     assert!(started["recorded"]["operation"].as_str().is_some());
+    assert_eq!(
+        git_output(temp.path(), &["rev-parse", "HEAD"]),
+        initial_git_head
+    );
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        initial_git_index
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "hello\n"
+    );
 
     let task_guide = run_trail_json(temp.path(), &["agent", "guide", "latest"]);
     assert_eq!(task_guide["task"]["lane"], task_name);
@@ -3179,6 +3193,59 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .as_str()
         .unwrap()
         .contains("Use `doc edit` as one agent task"));
+
+    for (key, value) in [
+        ("lane.require_test_gate", "true"),
+        ("lane.required_test_suites", "smoke"),
+        ("lane.require_eval_gate", "true"),
+        ("lane.required_eval_suites", "quality"),
+    ] {
+        run_trail_json(temp.path(), &["config", "set", key, value]);
+    }
+
+    let unreviewed_land = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "land", "latest", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!unreviewed_land.status.success());
+    assert!(String::from_utf8_lossy(&unreviewed_land.stderr).contains("has not been reviewed"));
+    assert_eq!(
+        git_output(temp.path(), &["rev-parse", "HEAD"]),
+        initial_git_head
+    );
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        initial_git_index
+    );
+    let reviewed = run_trail_json(
+        temp.path(),
+        &[
+            "agent",
+            "mark-reviewed",
+            "latest",
+            "--note",
+            "reviewed before explicit land",
+        ],
+    );
+    assert_eq!(reviewed["task"]["lane"], task_name);
+    let ungated_land = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "land", "latest"])
+        .output()
+        .unwrap();
+    assert!(!ungated_land.status.success());
+    assert!(String::from_utf8_lossy(&ungated_land.stderr).contains("missing_latest_test"));
+    assert_eq!(
+        git_output(temp.path(), &["rev-parse", "HEAD"]),
+        initial_git_head
+    );
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        initial_git_index
+    );
 
     let agent_test = run_trail_json(
         temp.path(),
@@ -3304,6 +3371,18 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .unwrap()
         .contains("Apply agent task: doc edit"));
     assert!(dry_run["git_export"].is_null());
+    assert_eq!(
+        git_output(temp.path(), &["rev-parse", "HEAD"]),
+        initial_git_head
+    );
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        initial_git_index
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "hello\n"
+    );
 
     let ready = run_trail_json(temp.path(), &["agent", "ready", "latest"]);
     assert_eq!(ready["ready"], true);
@@ -3395,6 +3474,22 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
     assert_eq!(
         git_output(temp.path(), &["show", "HEAD:README.md"]),
         "hello\nedited by custom agent"
+    );
+    run_trail_json(
+        temp.path(),
+        &["config", "set", "lane.require_test_gate", "false"],
+    );
+    run_trail_json(
+        temp.path(),
+        &["config", "set", "lane.require_eval_gate", "false"],
+    );
+    run_trail_json(
+        temp.path(),
+        &["config", "set", "lane.required_test_suites", ""],
+    );
+    run_trail_json(
+        temp.path(),
+        &["config", "set", "lane.required_eval_suites", ""],
     );
 
     let view = run_trail_json(temp.path(), &["agent", "view", "latest"]);
@@ -3516,6 +3611,18 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
             .as_str()
             .unwrap()
             .contains("agent land")));
+
+    let followup_reviewed = run_trail_json(
+        temp.path(),
+        &[
+            "agent",
+            "mark-reviewed",
+            followup_task,
+            "--note",
+            "follow-up reviewed before land preview",
+        ],
+    );
+    assert_eq!(followup_reviewed["task"]["lane"], followup_task);
 
     let followup_dry_run =
         run_trail_json(temp.path(), &["agent", "land", followup_task, "--dry-run"]);
@@ -8501,6 +8608,300 @@ fn local_lane_http_api_manages_lane_branch_lifecycle() {
     assert_eq!(removed["removed_workdir"], workdir);
     assert!(!std::path::Path::new(&workdir).exists());
     assert_eq!(db.lane_details(&lane_id).unwrap().branch.status, "removed");
+}
+
+#[test]
+fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else {
+        LaneWorkdirMode::OverlayCow
+    };
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "surface",
+        Some("main"),
+        mode,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    let view = db.lane_workspace_view("surface").unwrap().unwrap();
+    fs::write(
+        Path::new(&view.source_upper).join("surface.txt"),
+        "surface parity\n",
+    )
+    .unwrap();
+
+    let http_workspace = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/surface/workspace",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_workspace.status, 200);
+    let http_workspace: serde_json::Value = http_workspace.body_json().unwrap();
+    assert_eq!(http_workspace["view_id"], view.view_id);
+
+    let http_space = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/lanes/surface/space", serde_json::Value::Null),
+    );
+    assert_eq!(http_space.status, 200);
+    let http_space: serde_json::Value = http_space.body_json().unwrap();
+    assert_eq!(http_space["view_id"], view.view_id);
+
+    let http_unmount = trail::server::handle_http_request(
+        &mut db,
+        &api_request("POST", "/v1/lanes/surface/unmount", serde_json::Value::Null),
+    );
+    assert_eq!(http_unmount.status, 200);
+    assert_eq!(
+        http_unmount.body_json::<serde_json::Value>().unwrap()["view_id"],
+        view.view_id
+    );
+
+    let http_dependencies = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/surface/dependencies",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_dependencies.status, 200);
+    assert!(http_dependencies
+        .body_json::<serde_json::Value>()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let http_checkpoint = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/checkpoint",
+            serde_json::json!({"message": "HTTP checkpoint"}),
+        ),
+    );
+    assert_eq!(http_checkpoint.status, 200);
+    let http_checkpoint: serde_json::Value = http_checkpoint.body_json().unwrap();
+    assert_eq!(
+        http_checkpoint["source_paths"],
+        serde_json::json!(["surface.txt"])
+    );
+
+    let http_update = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/update",
+            serde_json::json!({"from": "main"}),
+        ),
+    );
+    assert_eq!(http_update.status, 200);
+    let http_update: serde_json::Value = http_update.body_json().unwrap();
+    assert_eq!(http_update["source_ref"], "refs/branches/main");
+    assert_eq!(http_update["target_ref"], "refs/lanes/surface");
+
+    let http_exec_error = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/exec",
+            serde_json::json!({"command": []}),
+        ),
+    );
+    assert_eq!(http_exec_error.status, 400);
+    assert!(
+        http_exec_error.body_json::<serde_json::Value>().unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires a command")
+    );
+
+    let http_sync_error = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/dependencies/sync",
+            serde_json::json!({}),
+        ),
+    );
+    assert_eq!(http_sync_error.status, 400);
+
+    let http_cache = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/cache/layers", serde_json::Value::Null),
+    );
+    assert_eq!(http_cache.status, 200);
+    assert!(http_cache
+        .body_json::<serde_json::Value>()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let http_gc = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/cache/gc",
+            serde_json::json!({"dry_run": true, "retention_secs": 0}),
+        ),
+    );
+    assert_eq!(http_gc.status, 200);
+    assert_eq!(
+        http_gc.body_json::<serde_json::Value>().unwrap()["dry_run"],
+        true
+    );
+
+    let mcp_call = |db: &mut Trail, id: u64, name: &str, arguments: serde_json::Value| {
+        trail::mcp::handle_json_rpc(
+            db,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+        )
+        .unwrap()
+    };
+    let mcp_workspace = mcp_call(
+        &mut db,
+        1,
+        "trail.lane_workspace",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert_eq!(mcp_workspace["result"]["isError"], false);
+    assert_eq!(
+        mcp_workspace["result"]["structuredContent"]["view_id"],
+        view.view_id
+    );
+    let mcp_space = mcp_call(
+        &mut db,
+        2,
+        "trail.lane_space",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert_eq!(
+        mcp_space["result"]["structuredContent"]["view_id"],
+        view.view_id
+    );
+    let mcp_dependencies = mcp_call(
+        &mut db,
+        3,
+        "trail.deps_status",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert!(mcp_dependencies["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mcp_unmount = mcp_call(
+        &mut db,
+        31,
+        "trail.lane_unmount",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert_eq!(
+        mcp_unmount["result"]["structuredContent"]["view_id"],
+        view.view_id
+    );
+    let mcp_checkpoint = mcp_call(
+        &mut db,
+        4,
+        "trail.lane_checkpoint",
+        serde_json::json!({"lane": "surface", "message": "MCP checkpoint"}),
+    );
+    assert_eq!(mcp_checkpoint["result"]["isError"], false);
+    assert_eq!(
+        mcp_checkpoint["result"]["structuredContent"]["root_id"],
+        http_checkpoint["root_id"]
+    );
+    let mcp_cache = mcp_call(&mut db, 5, "trail.cache_list", serde_json::json!({}));
+    assert!(mcp_cache["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mcp_gc = mcp_call(
+        &mut db,
+        6,
+        "trail.cache_gc",
+        serde_json::json!({"dry_run": true, "retention_secs": 0}),
+    );
+    assert_eq!(mcp_gc["result"]["structuredContent"]["dry_run"], true);
+    let mcp_update = mcp_call(
+        &mut db,
+        7,
+        "trail.lane_update",
+        serde_json::json!({"lane": "surface", "source": "main"}),
+    );
+    assert_eq!(mcp_update["result"]["isError"], false);
+    assert_eq!(
+        mcp_update["result"]["structuredContent"]["source_ref"],
+        "refs/branches/main"
+    );
+
+    let tools = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/list",
+            "params": {}
+        }),
+    )
+    .unwrap();
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    for (name, read_only, destructive, open_world) in [
+        ("trail.lane_workspace", true, false, false),
+        ("trail.lane_mount", false, false, false),
+        ("trail.lane_unmount", false, false, false),
+        ("trail.lane_checkpoint", false, false, false),
+        ("trail.lane_update", false, false, false),
+        ("trail.lane_exec", false, false, true),
+        ("trail.deps_sync", false, false, true),
+        ("trail.cache_gc", false, true, false),
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], read_only);
+        assert_eq!(tool["annotations"]["destructiveHint"], destructive);
+        assert_eq!(tool["annotations"]["openWorldHint"], open_world);
+    }
+
+    let openapi = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/openapi.json", serde_json::Value::Null),
+    );
+    let openapi: serde_json::Value = openapi.body_json().unwrap();
+    for path in [
+        "/v1/lanes/{lane_or_id}/workspace",
+        "/v1/lanes/{lane_or_id}/mount",
+        "/v1/lanes/{lane_or_id}/unmount",
+        "/v1/lanes/{lane_or_id}/checkpoint",
+        "/v1/lanes/{lane_or_id}/update",
+        "/v1/lanes/{lane_or_id}/space",
+        "/v1/lanes/{lane_or_id}/exec",
+        "/v1/lanes/{lane_or_id}/dependencies",
+        "/v1/lanes/{lane_or_id}/dependencies/sync",
+        "/v1/cache/layers",
+        "/v1/cache/gc",
+    ] {
+        assert!(
+            openapi["paths"].get(path).is_some(),
+            "missing OpenAPI path {path}"
+        );
+    }
 }
 
 #[test]
@@ -16512,6 +16913,84 @@ fn lane_diff_cli_renders_scannable_overview() {
 }
 
 #[test]
+fn layered_lane_update_preserves_lane_changes_and_advances_its_pinned_base() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "baseline\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else {
+        LaneWorkdirMode::OverlayCow
+    };
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "updatable",
+        Some("main"),
+        mode,
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    let view_before = db.lane_workspace_view("updatable").unwrap().unwrap();
+    fs::write(
+        Path::new(&view_before.source_upper).join("lane-only.txt"),
+        "lane\n",
+    )
+    .unwrap();
+    db.checkpoint_lane_workspace("updatable", Some("lane change".to_string()))
+        .unwrap();
+
+    fs::write(temp.path().join("main-only.txt"), "main\n").unwrap();
+    let main_record = db
+        .record(
+            Some("main"),
+            Some("main change".to_string()),
+            Actor::human(),
+            false,
+        )
+        .unwrap();
+    let preview = db.preview_lane_refresh("updatable", "main").unwrap();
+    assert!(!preview.clean);
+    assert!(!preview.conflicted);
+    assert!(preview
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "main-only.txt"));
+
+    let update = db
+        .update_layered_lane_from("updatable", "main", false)
+        .unwrap();
+    assert!(update.conflicts.is_empty());
+    assert!(update
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "main-only.txt"));
+    let details = db.lane_details("updatable").unwrap();
+    assert_eq!(details.branch.base_change, main_record.operation.unwrap());
+    assert_eq!(details.branch.head_change, update.operation);
+    let view_after = db.lane_workspace_view("updatable").unwrap().unwrap();
+    assert_eq!(view_after.generation, view_before.generation + 1);
+    assert_eq!(view_after.base_change, update.operation);
+    assert_eq!(view_after.base_root, update.root_id);
+    assert_eq!(
+        db.read_lane_file("updatable", "lane-only.txt", false, false, false)
+            .unwrap()
+            .content,
+        "lane\n"
+    );
+    assert_eq!(
+        db.read_lane_file("updatable", "main-only.txt", false, false, false)
+            .unwrap()
+            .content,
+        "main\n"
+    );
+    assert!(db.preview_lane_refresh("updatable", "main").unwrap().clean);
+}
+
+#[test]
 fn lane_refresh_preview_reports_target_changes_and_conflicts_without_mutating() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("docs")).unwrap();
@@ -17507,6 +17986,13 @@ fn lane_management_commands_have_backing_apis() {
         assert!(!std::path::Path::new(&workdir).exists());
     }
     assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "removed");
+    drop(db);
+    let reopened = Trail::open(temp.path()).unwrap();
+    assert_eq!(
+        reopened.lane_details("doc-bot").unwrap().branch.status,
+        "removed"
+    );
+    drop(reopened);
 
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let messages: i64 = conn
@@ -18549,10 +19035,10 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         assert!(overlay_workdir.is_dir());
         assert!(fs::read_dir(&overlay_workdir).unwrap().next().is_none());
         assert!(!overlay_workdir.join("README.md").exists());
-        assert!(temp
-            .path()
-            .join(".trail/overlay-cow/overlay-bot/upper/.trail")
-            .is_dir());
+        let db = Trail::open(temp.path()).unwrap();
+        let view = db.lane_workspace_view("overlay-bot").unwrap().unwrap();
+        assert!(Path::new(&view.source_upper).is_dir());
+        assert!(Path::new(&view.meta_dir).is_dir());
     }
 
     #[cfg(target_os = "macos")]
@@ -18572,10 +19058,10 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         assert_eq!(nfs_spawn["workdir_mode"], "nfs-cow");
         assert_eq!(nfs_spawn["cow_backend"], "nfs-overlay");
         assert_eq!(nfs_spawn["overlay_available"], true);
-        assert!(temp
-            .path()
-            .join(".trail/nfs-cow/nfs-bot/upper/.trail")
-            .is_dir());
+        let db = Trail::open(temp.path()).unwrap();
+        let view = db.lane_workspace_view("nfs-bot").unwrap().unwrap();
+        assert!(Path::new(&view.source_upper).is_dir());
+        assert!(Path::new(&view.meta_dir).is_dir());
     }
 
     let mut db = Trail::open(temp.path()).unwrap();
@@ -19676,6 +20162,7 @@ fn dirty_lane_workdir_records_executable_bit_changes() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn materialized_lane_status_detects_manifest_candidate_paths() {
     let temp = tempfile::tempdir().unwrap();
@@ -22066,6 +22553,7 @@ fn status_does_not_persist_unreferenced_objects() {
     assert_eq!(before, after);
 }
 
+#[cfg(unix)]
 #[test]
 fn status_maintains_persisted_worktree_file_index() {
     let temp = tempfile::tempdir().unwrap();

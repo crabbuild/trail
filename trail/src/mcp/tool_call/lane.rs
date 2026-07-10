@@ -65,6 +65,15 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
             let lane = db.resolve_lane_handle(&args.lane)?;
             tool_result(db.preview_lane_refresh(&lane, args.target.as_deref().unwrap_or("main"))?)
         }
+        "trail.lane_update" => {
+            let args: LaneUpdateArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.update_layered_lane_from(
+                &lane,
+                args.from.as_deref().unwrap_or("main"),
+                args.checkpoint,
+            )?)
+        }
         "trail.lane_handoff" => {
             let args: LaneContributionArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;
@@ -79,6 +88,55 @@ pub(super) fn handle(db: &mut Trail, name: &str, arguments: &Value) -> Result<Op
             let args: LaneRewindArgs = parse_args(arguments)?;
             let lane = db.resolve_lane_handle(&args.lane)?;
             tool_result(db.rewind_lane(&lane, &args.to, args.record_current, args.sync_workdir)?)
+        }
+        "trail.lane_workspace" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.lane_workspace_view(&lane)?)
+        }
+        "trail.lane_space" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.lane_workspace_space(&lane)?)
+        }
+        "trail.lane_mount" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.start_lane_workspace_mount(&lane)?)
+        }
+        "trail.lane_unmount" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.request_lane_workspace_unmount(&lane)?)
+        }
+        "trail.lane_checkpoint" => {
+            let args: WorkspaceCheckpointArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.checkpoint_lane_workspace(&lane, args.message)?)
+        }
+        "trail.lane_exec" => {
+            let args: WorkspaceExecArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.exec_lane_workspace(&lane, &args.command)?)
+        }
+        "trail.deps_status" => {
+            let args: LaneHandleArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.workspace_environment_status(&lane)?)
+        }
+        "trail.deps_sync" => {
+            let args: DependencySyncArgs = parse_args(arguments)?;
+            let lane = db.resolve_lane_handle(&args.lane)?;
+            tool_result(db.sync_node_dependencies(&lane, args.path.as_deref())?)
+        }
+        "trail.cache_list" => tool_result(db.list_workspace_layers()?),
+        "trail.cache_inspect" | "trail.cache_verify" => {
+            let args: CacheLayerArgs = parse_args(arguments)?;
+            tool_result(db.verify_workspace_layer(&args.layer)?)
+        }
+        "trail.cache_gc" => {
+            let args: CacheGcArgs = parse_args(arguments)?;
+            tool_result(db.workspace_cache_gc(args.dry_run, args.retention_secs)?)
         }
         "trail.lease_acquire" => {
             let args: LeaseAcquireArgs = parse_args(arguments)?;

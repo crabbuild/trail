@@ -196,6 +196,54 @@ pub(crate) fn config_entries_from(config: &TrailConfig) -> Vec<ConfigEntry> {
             "policy",
             false,
         ),
+        config_entry(
+            "workspace_views.upper_logical_bytes",
+            config.workspace_views.upper_logical_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.upper_file_count",
+            config.workspace_views.upper_file_count,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.single_file_bytes",
+            config.workspace_views.single_file_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.journal_bytes",
+            config.workspace_views.journal_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.cache_build_bytes",
+            config.workspace_views.cache_build_bytes,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.concurrent_cache_builders",
+            config.workspace_views.concurrent_cache_builders,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.cache_retention_secs",
+            config.workspace_views.cache_retention_secs,
+            "u64",
+            false,
+        ),
+        config_entry(
+            "workspace_views.cache_max_bytes",
+            config.workspace_views.cache_max_bytes,
+            "u64",
+            false,
+        ),
     ]
 }
 

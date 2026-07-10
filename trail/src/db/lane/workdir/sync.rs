@@ -296,12 +296,10 @@ impl Trail {
             ));
         }
         let head = self.get_ref(&branch.ref_name)?;
-        let mount = self.mount_nfs_cow_workdir_for_lane(lane)?;
         let changed_paths = self
             .lane_workdir_changed_paths(&branch, &head)?
             .unwrap_or_default();
         if !changed_paths.is_empty() && !force {
-            drop(mount);
             return Err(Error::DirtyWorktreeWithMessage(format!(
                 "lane `{lane}` workdir has unrecorded changes; run `trail lane record {lane}` or pass `--force` to sync"
             )));
@@ -311,8 +309,9 @@ impl Trail {
         } else {
             None
         };
-        drop(mount);
-        self.prepare_nfs_cow_lane_workdir(lane, &workdir_path, false)?;
+        // A layered sync never recreates or erases the persisted view. Its
+        // source upper is durable lane state; remount composes it with the
+        // current pinned root, and a forced sync only produces a rescue copy.
         self.insert_lane_event(
             &branch.lane_id,
             "workdir_synced",
