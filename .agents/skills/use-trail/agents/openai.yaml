@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use Trail"
+  short_description: "Operate Trail safely and effectively"
+  default_prompt: "Use $use-trail to manage this coding task with Trail."
