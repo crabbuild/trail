@@ -1,4 +1,5 @@
 /target/
+/trail-vscode/
 **/*.rs.bk
 .DS_Store
 .venv/

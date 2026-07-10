@@ -802,7 +802,7 @@ Filesystem:
 
 ## Implementation Architecture
 
-Suggested TypeScript packages inside a future extension scaffold:
+Suggested TypeScript packages in the separate `trail-vscode` extension repository:
 
 ```text
 trail-vscode/src/

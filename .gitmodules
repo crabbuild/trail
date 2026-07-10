@@ -2,7 +2,3 @@
 	path = prolly
 	url = https://github.com/crabbuild/prolly.git
 	branch = main
-[submodule "trail-vscode"]
-	path = trail-vscode
-	url = https://github.com/crabbuild/trail-vscode.git
-	branch = main

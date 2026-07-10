@@ -18,7 +18,7 @@ The [VS Code ACP chat view design](../design/vscode-acp-chat-view.md) describes
 how a VS Code extension can render ACP chat components while treating Trail as
 the durable source of truth for tasks, turns, checkpoints, review, and recovery.
 The initial extension implementation lives in
-[`trail-vscode`](../../trail-vscode/README.md).
+[`crabbuild/trail-vscode`](https://github.com/crabbuild/trail-vscode).
 
 ## Choose a Surface
 
@@ -59,4 +59,4 @@ Use the Rust library when:
 - Library exports: `trail/src/lib.rs`
 - ACP relay proposal: `docs/design/acp-relay.md`
 - VS Code ACP chat view: `docs/design/vscode-acp-chat-view.md`
-- VS Code extension implementation: `trail-vscode`
+- VS Code extension implementation: `https://github.com/crabbuild/trail-vscode`
