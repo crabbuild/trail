@@ -72,6 +72,79 @@ The practical position is:
 - Trail answers "what happened locally, why did it happen, which lane contains it,
   is it safe to accept, and what still blocks merge?"
 
+## Branches and Lanes: Mental Model
+
+Trail has two kinds of local code refs that serve different jobs:
+
+- A **Trail branch** is a long-lived line of code state, such as `main`,
+  `release`, or `experiment`.
+- A **lane** is a short-lived, isolated work container created from a branch for
+  one task, person, automation run, or coding agent.
+
+Think of a lane as **a branch plus the context needed to safely finish one
+piece of work**.
+
+```text
+Git branch (shared, committed history)
+                |
+                | import / export / safe apply
+                v
+Trail branch (long-lived local code line, for example main)
+                |
+                | spawn a lane for each active task
+                +------------------------------+
+                |                              |
+                v                              v
+      lane: fix-login                 lane: update-docs
+      edits, tests, review            edits, tests, review
+      approvals, handoff              approvals, handoff
+                |                              |
+                +---------- merge when ready --+
+                               |
+                               v
+                    Trail branch: main
+```
+
+| Use this | When you need | Examples |
+| --- | --- | --- |
+| **Trail branch** | A durable local code line that can receive completed work | `main`, `release`, a long-running experiment |
+| **Lane** | One bounded piece of active work that needs isolation, review, validation, recovery, or coordination | A bug fix, a documentation update, one agent task, a migration attempt |
+
+A branch stores code state and its operation history. A lane has its own
+branch-backed code state **and** records the work around it: sessions, turns,
+messages, approvals, test/eval gates, workdirs, handoffs, and rewind
+checkpoints. This is why a lane can answer both “what changed?” and “what
+happened while making that change?”
+
+A lane is not a paired Git branch. Spawning `fix-login` creates the Trail ref
+`refs/lanes/fix-login`; it does not create or switch to a Git branch with that
+name. A lane can also be virtual, so it has no filesystem workdir until a tool
+needs real files. Git branches are already lightweight refs; lanes are lighter
+to start only when virtual, and intentionally carry more metadata once work
+begins.
+
+The usual workflow is:
+
+```text
+choose or create a Trail branch
+        -> spawn a lane from it
+        -> edit, test, review, or hand off work in the lane
+        -> merge the ready lane into the Trail branch
+        -> export or safely apply accepted state to Git
+```
+
+For example:
+
+```sh
+# `main` is the long-lived Trail branch.
+trail lane spawn fix-login --from main --materialize=true
+
+# Work is isolated in the lane until it is reviewed and validated.
+trail lane record fix-login -m "Fix login validation"
+trail lane readiness fix-login
+trail merge-lane fix-login --into main --dry-run
+```
+
 ## Why This Matters for AI Agents
 
 AI coding agents produce more than final diffs. They create attempts,
