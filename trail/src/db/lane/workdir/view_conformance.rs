@@ -29,6 +29,18 @@ pub(crate) fn run_mounted_view_conformance(root: &Path) -> Result<ViewConformanc
         fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o755))?;
     }
     fs::remove_file(root.join("delete.txt"))?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("renamed.txt", root.join("src/link.txt"))?;
+        if fs::read_link(root.join("src/link.txt"))? != Path::new("renamed.txt")
+            || fs::read(root.join("src/link.txt"))? != b"lower\n"
+        {
+            return Err(Error::InvalidInput(
+                "view conformance symlink behavior failed".to_string(),
+            ));
+        }
+        fs::remove_file(root.join("src/link.txt"))?;
+    }
     if fs::read(root.join("src/renamed.txt"))? != b"lower\n"
         || fs::read(root.join("script.sh"))? != b"abc"
     {

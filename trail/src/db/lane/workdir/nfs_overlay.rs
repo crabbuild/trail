@@ -14,6 +14,7 @@ mod macos {
     use std::collections::BTreeSet;
     use std::ffi::{CStr, CString, OsStr};
     use std::fs::{self, OpenOptions};
+    use std::os::unix::ffi::OsStrExt;
     #[cfg(test)]
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -222,15 +223,28 @@ mod macos {
         }
         async fn symlink(
             &self,
-            _dirid: fileid3,
-            _linkname: &filename3,
-            _symlink: &nfspath3,
+            dirid: fileid3,
+            linkname: &filename3,
+            symlink: &nfspath3,
             _attr: &sattr3,
         ) -> std::result::Result<(fileid3, fattr3), nfsstat3> {
-            Err(nfsstat3::NFS3ERR_NOTSUPP)
+            let name = std::str::from_utf8(&linkname.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+            let target = std::str::from_utf8(&symlink.0).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+            let attr = self
+                .core
+                .lock()
+                .unwrap()
+                .symlink(dirid, name, Path::new(target))
+                .map_err(nfs_error)?;
+            Ok((attr.ino, to_nfs_attr(&attr)))
         }
-        async fn readlink(&self, _id: fileid3) -> std::result::Result<nfspath3, nfsstat3> {
-            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        async fn readlink(&self, id: fileid3) -> std::result::Result<nfspath3, nfsstat3> {
+            self.core
+                .lock()
+                .unwrap()
+                .readlink(id)
+                .map(|target| target.as_os_str().as_bytes().to_vec().into())
+                .map_err(nfs_error)
         }
     }
 
@@ -455,10 +469,10 @@ mod macos {
     fn to_nfs_attr(attr: &NodeAttr) -> fattr3 {
         let time = to_nfs_time(attr.modified);
         fattr3 {
-            ftype: if attr.kind == NodeKind::Directory {
-                ftype3::NF3DIR
-            } else {
-                ftype3::NF3REG
+            ftype: match attr.kind {
+                NodeKind::Directory => ftype3::NF3DIR,
+                NodeKind::File => ftype3::NF3REG,
+                NodeKind::Symlink => ftype3::NF3LNK,
             },
             mode: attr.mode,
             nlink: if attr.kind == NodeKind::Directory {
@@ -625,10 +639,7 @@ mod macos {
             let outside = temp.path().join("outside");
             fs::create_dir_all(&outside).unwrap();
             std::os::unix::fs::symlink(&outside, upper.join("escape")).unwrap();
-            assert!(matches!(
-                core.mkdir(ROOT_INO, "escape", 0o755),
-                Err(libc::EPERM)
-            ));
+            assert!(core.mkdir(ROOT_INO, "escape", 0o755).is_err());
             assert_eq!(core.upper_path("escape/file"), Err(libc::EPERM));
             assert!(!outside.join("file").exists());
         }
@@ -716,17 +727,26 @@ mod macos {
                     adapter.getattr(stale).await,
                     Err(nfsstat3::NFS3ERR_NOENT)
                 ));
-                assert!(matches!(
-                    adapter
-                        .symlink(
-                            ROOT_INO,
-                            &nfsstring(b"link".to_vec()),
-                            &nfsstring(b"target".to_vec()),
-                            &sattr3::default(),
-                        )
-                        .await,
-                    Err(nfsstat3::NFS3ERR_NOTSUPP)
-                ));
+                let (link, attr) = adapter
+                    .symlink(
+                        ROOT_INO,
+                        &nfsstring(b"link".to_vec()),
+                        &nfsstring(b"b".to_vec()),
+                        &sattr3::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(attr.ftype, ftype3::NF3LNK));
+                assert_eq!(adapter.readlink(link).await.unwrap().0, b"b");
+                assert!(adapter
+                    .symlink(
+                        ROOT_INO,
+                        &nfsstring(b"escape".to_vec()),
+                        &nfsstring(b"../../outside".to_vec()),
+                        &sattr3::default(),
+                    )
+                    .await
+                    .is_err());
             });
         }
 

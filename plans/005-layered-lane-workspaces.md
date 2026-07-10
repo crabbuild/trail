@@ -71,10 +71,22 @@
   available with typed CLI, HTTP, MCP, and OpenAPI contracts.
 - A real `npm ci --ignore-scripts` fixture proves two views with identical
   manifest, lock, tool, and platform inputs bind the same immutable layer.
+- A native Linux FUSE fixture now combines a 50,000-file source root with a
+  real frozen lodash/Prettier install containing 1,116 layer entries. Two
+  mounted lanes started in 13 ms and shared one verified immutable layer.
+  Immutable and newly installed `.bin` symlinks both execute correctly.
+  Overwrite, `rm -rf node_modules`, and `npm ci` in lane A left lane B and the
+  layer hash unchanged; lane B allocated 0 generated-upper bytes, and
+  checkpointing lane A recorded zero source paths. The reproducible entry point is
+  `scripts/verify-linux-node-layer-docker.sh`.
 - A real Cargo/FUSE fixture proves `CARGO_HOME` and `SCCACHE_DIR` are shared,
   `sccache` runs with incremental compilation disabled, and an immutable
   target seed supplies compiler results to a second lane. Its writable target
-  remains private, and `cargo clean` cannot alter the producer lane or seed.
+  remains private, `cargo clean` cannot alter the producer lane or seed, and a
+  checkpoint after the build records zero source paths.
+- The million-path/twenty-view acceptance test also passes inside Linux: each
+  view starts with one indexed path, all 20 views are created in 91 ms, and
+  unchanged views consume 0 exclusive physical bytes.
 - Native NFS exec/gate/checkpoint/recovery verifies exact source-root,
   environment-key, layer-ID, and stale-gate readiness behavior with no hosted
   service.

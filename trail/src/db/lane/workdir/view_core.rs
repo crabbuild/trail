@@ -33,6 +33,7 @@ pub(crate) const VIEW_ROOT_INO: u64 = 1;
 pub(crate) enum ViewNodeKind {
     File,
     Directory,
+    Symlink,
 }
 
 #[derive(Clone, Debug)]
@@ -146,18 +147,33 @@ impl ViewCore {
         class: ViewPathClass,
         path: &str,
     ) -> std::result::Result<PathBuf, i32> {
+        self.upper_path_in_class_with_leaf(class, path, false)
+    }
+
+    fn upper_path_in_class_with_leaf(
+        &self,
+        class: ViewPathClass,
+        path: &str,
+        allow_leaf_symlink: bool,
+    ) -> std::result::Result<PathBuf, i32> {
         if path.is_empty() {
             return Ok(self.layout.upper_for_class(class).to_path_buf());
         }
         let normalized = normalize_relative_path(path).map_err(|_| EINVAL)?;
+        let components = Path::new(&normalized).components().collect::<Vec<_>>();
         let mut current = self.layout.upper_for_class(class).to_path_buf();
-        for component in Path::new(&normalized).components() {
+        for (index, component) in components.iter().enumerate() {
             let std::path::Component::Normal(name) = component else {
                 return Err(EINVAL);
             };
             current.push(name);
             match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => return Err(EPERM),
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        && !(allow_leaf_symlink && index + 1 == components.len()) =>
+                {
+                    return Err(EPERM)
+                }
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(io_errno(err)),
@@ -167,9 +183,13 @@ impl ViewCore {
     }
 
     fn upper_metadata(&self, path: &str) -> Option<fs::Metadata> {
-        self.upper_path(path)
+        self.upper_path_in_class_with_leaf(classify_view_path(path), path, true)
             .ok()
             .and_then(|path| fs::symlink_metadata(path).ok())
+    }
+
+    fn upper_path_with_leaf_symlink(&self, path: &str) -> std::result::Result<PathBuf, i32> {
+        self.upper_path_in_class_with_leaf(classify_view_path(path), path, true)
     }
 
     pub(crate) fn is_whiteouted(&self, path: &str) -> bool {
@@ -333,6 +353,9 @@ impl ViewCore {
             return Ok(None);
         }
         if let Some(metadata) = self.upper_metadata(path) {
+            if metadata.file_type().is_symlink() {
+                return Ok(Some(ViewNodeKind::Symlink));
+            }
             if metadata.is_file() {
                 return Ok(Some(ViewNodeKind::File));
             }
@@ -342,7 +365,23 @@ impl ViewCore {
             return Ok(None);
         }
         if let Some(layer_path) = self.layer_path(path)? {
-            let metadata = fs::metadata(layer_path).map_err(io_errno)?;
+            let metadata = fs::symlink_metadata(layer_path).map_err(io_errno)?;
+            if metadata.file_type().is_symlink() {
+                #[cfg(unix)]
+                return Ok(Some(ViewNodeKind::Symlink));
+                #[cfg(windows)]
+                {
+                    let metadata =
+                        fs::metadata(self.layer_path(path)?.ok_or(ENOENT)?).map_err(io_errno)?;
+                    return Ok(if metadata.is_dir() {
+                        Some(ViewNodeKind::Directory)
+                    } else if metadata.is_file() {
+                        Some(ViewNodeKind::File)
+                    } else {
+                        None
+                    });
+                }
+            }
             if metadata.is_file() {
                 return Ok(Some(ViewNodeKind::File));
             }
@@ -383,6 +422,15 @@ impl ViewCore {
             });
         }
         if let Some(metadata) = self.upper_metadata(path) {
+            if kind == ViewNodeKind::Symlink {
+                return Ok(ViewNodeAttr {
+                    ino,
+                    kind,
+                    mode: 0o777,
+                    size: metadata.len(),
+                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                });
+            }
             return Ok(ViewNodeAttr {
                 ino,
                 kind,
@@ -392,12 +440,17 @@ impl ViewCore {
             });
         }
         if let Some(layer_path) = self.layer_path(path)? {
-            let metadata = fs::metadata(layer_path).map_err(io_errno)?;
+            let metadata = if kind == ViewNodeKind::Symlink {
+                fs::symlink_metadata(layer_path)
+            } else {
+                fs::metadata(layer_path)
+            }
+            .map_err(io_errno)?;
             return Ok(ViewNodeAttr {
                 ino,
                 kind,
                 mode: metadata_mode(&metadata, kind == ViewNodeKind::Directory),
-                size: if kind == ViewNodeKind::File {
+                size: if kind != ViewNodeKind::Directory {
                     metadata.len()
                 } else {
                     0
@@ -539,6 +592,23 @@ impl ViewCore {
                 offset.saturating_add(read as u64) >= entry.size_bytes,
             ))
         }
+    }
+
+    pub(crate) fn readlink(&self, ino: u64) -> std::result::Result<PathBuf, i32> {
+        let path = self.path_for_ino(ino)?;
+        if self.node_kind(&path)? != Some(ViewNodeKind::Symlink) {
+            return Err(EINVAL);
+        }
+        if self.upper_metadata(&path).is_some() {
+            let target =
+                fs::read_link(self.upper_path_with_leaf_symlink(&path)?).map_err(io_errno)?;
+            validate_view_symlink_target(&path, &target)?;
+            return Ok(target);
+        }
+        let layer_path = self.layer_path(&path)?.ok_or(ENOENT)?;
+        let target = fs::read_link(layer_path).map_err(io_errno)?;
+        validate_view_symlink_target(&path, &target)?;
+        Ok(target)
     }
 
     fn ensure_upper_parent(&self, path: &str) -> std::result::Result<(), i32> {
@@ -780,6 +850,31 @@ impl ViewCore {
         self.attr(&path)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn symlink(
+        &mut self,
+        parent: u64,
+        name: &str,
+        target: &Path,
+    ) -> std::result::Result<ViewNodeAttr, i32> {
+        let _barrier = self.begin_mutation()?;
+        let path = self.child_path(parent, name)?;
+        if self.node_kind(&path)?.is_some() {
+            return Err(EEXIST);
+        }
+        validate_view_symlink_target(&path, target)?;
+        self.enforce_mutation_quota(&path, Some(target.to_string_lossy().len() as u64), true)?;
+        self.ensure_upper_parent(&path)?;
+        std::os::unix::fs::symlink(target, self.upper_path(&path)?).map_err(io_errno)?;
+        self.whiteouts.remove(&path);
+        self.save_whiteouts().map_err(|_| EIO)?;
+        self.journal
+            .append(ViewMutationKind::Create, &path, None)
+            .map_err(|_| EIO)?;
+        self.touch_parent(&path);
+        self.attr(&path)
+    }
+
     pub(crate) fn setattr(
         &mut self,
         ino: u64,
@@ -823,7 +918,7 @@ impl ViewCore {
             if metadata.is_dir() {
                 fs::remove_dir(self.upper_path(&path)?).map_err(io_errno)?;
             } else {
-                fs::remove_file(self.upper_path(&path)?).map_err(io_errno)?;
+                fs::remove_file(self.upper_path_with_leaf_symlink(&path)?).map_err(io_errno)?;
             }
         }
         if self.layer_path(&path)?.is_some()
@@ -879,16 +974,25 @@ impl ViewCore {
             if metadata.is_dir() {
                 fs::remove_dir(self.upper_path(&new)?).map_err(io_errno)?;
             } else {
-                fs::remove_file(self.upper_path(&new)?).map_err(io_errno)?;
+                fs::remove_file(self.upper_path_with_leaf_symlink(&new)?).map_err(io_errno)?;
             }
         }
         if kind == ViewNodeKind::Directory {
             self.merge_lower_subtree_into_upper(&old)?;
             self.move_upper_subtree(&old, &new)?;
         } else if self.upper_metadata(&old).is_some() {
-            fs::rename(self.upper_path(&old)?, self.upper_path(&new)?).map_err(io_errno)?;
+            fs::rename(
+                self.upper_path_with_leaf_symlink(&old)?,
+                self.upper_path(&new)?,
+            )
+            .map_err(io_errno)?;
         } else if kind == ViewNodeKind::File {
             self.copy_lower_file(&old, &new)?;
+        } else if kind == ViewNodeKind::Symlink {
+            let old_ino = self.ensure_ino(&old);
+            let target = self.readlink(old_ino)?;
+            validate_view_symlink_target(&new, &target)?;
+            create_view_symlink(&target, &self.upper_path(&new)?).map_err(io_errno)?;
         }
         self.whiteouts.insert(old.clone());
         self.whiteouts.remove(&new);
@@ -1131,7 +1235,7 @@ fn view_upper_usage(layout: &ViewUpperLayout) -> Result<ViewUpperUsage> {
         }
         for entry in walkdir::WalkDir::new(root).follow_links(false) {
             let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
-            if entry.file_type().is_file() {
+            if entry.file_type().is_file() || entry.file_type().is_symlink() {
                 let metadata = entry.metadata().map_err(|err| Error::Io(err.into()))?;
                 usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
                 usage.file_count = usage.file_count.saturating_add(1);
@@ -1146,6 +1250,48 @@ fn parent_of(path: &str) -> String {
         .parent()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+fn validate_view_symlink_target(link_path: &str, target: &Path) -> std::result::Result<(), i32> {
+    use std::path::Component;
+
+    if target.is_absolute() {
+        return Err(EPERM);
+    }
+    let mut resolved = parent_of(link_path)
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => resolved.push(name.to_str().ok_or(EINVAL)?.to_string()),
+            Component::ParentDir => {
+                if resolved.pop().is_none() {
+                    return Err(EPERM);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Err(EPERM),
+        }
+    }
+    if classify_view_path(&resolved.join("/")) == ViewPathClass::Internal {
+        return Err(EPERM);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_view_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn create_view_symlink(_target: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "writable view symlinks are not supported on Windows",
+    ))
 }
 
 #[cfg(unix)]
@@ -1397,13 +1543,29 @@ mod tests {
         view.setattr(script, Some(3), Some(0o755)).unwrap();
         assert_eq!(fs::read(upper.join("src/nested/tool.sh")).unwrap(), b"#!/");
 
+        let link = view
+            .symlink(src, "tool-link", Path::new("nested/tool.sh"))
+            .unwrap();
+        assert_eq!(link.kind, ViewNodeKind::Symlink);
+        assert_eq!(
+            view.readlink(link.ino).unwrap(),
+            Path::new("nested/tool.sh")
+        );
+        assert!(fs::symlink_metadata(upper.join("src/tool-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(matches!(
+            view.symlink(VIEW_ROOT_INO, "bad-link", Path::new("../../outside")),
+            Err(EPERM)
+        ));
+
         let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, upper.join("escape")).unwrap();
-        assert!(matches!(
-            view.mkdir(VIEW_ROOT_INO, "escape", 0o755),
-            Err(EPERM)
-        ));
+        assert!(view.mkdir(VIEW_ROOT_INO, "escape", 0o755).is_err());
+        let escape = view.lookup(VIEW_ROOT_INO, "escape").unwrap();
+        assert_eq!(view.readlink(escape), Err(EPERM));
         assert_eq!(view.upper_path("escape/file"), Err(EPERM));
         assert!(!outside.join("file").exists());
     }

@@ -7,6 +7,7 @@ on:
       - "scripts/verify-linux-overlay-cow-docker.sh"
       - "scripts/verify-layered-lane-scale.sh"
       - "scripts/verify-rust-cache-isolation-docker.sh"
+      - "scripts/verify-linux-node-layer-docker.sh"
       - ".github/workflows/layered-workspaces.yml"
   workflow_dispatch:
     inputs:
@@ -47,6 +48,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify-rust-cache-isolation-docker.sh
+
+  node-layer-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/verify-linux-node-layer-docker.sh
 
   nfs-conformance:
     runs-on: macos-latest

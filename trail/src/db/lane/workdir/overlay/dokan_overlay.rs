@@ -635,6 +635,10 @@ fn file_info_from_view(attr: &ViewNodeAttr) -> FileInfo {
     let attributes = match attr.kind {
         ViewNodeKind::Directory => winnt::FILE_ATTRIBUTE_DIRECTORY,
         ViewNodeKind::File => winnt::FILE_ATTRIBUTE_ARCHIVE,
+        // Windows package managers normally emit command shims rather than
+        // Unix symlinks. Preserve compatibility for imported layer links as a
+        // non-directory entry until Dokan reparse-point support is added.
+        ViewNodeKind::Symlink => winnt::FILE_ATTRIBUTE_ARCHIVE,
     };
     FileInfo {
         attributes,

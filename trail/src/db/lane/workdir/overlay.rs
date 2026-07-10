@@ -333,6 +333,13 @@ mod fuse_overlay {
             }
         }
 
+        fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+            match self.core.readlink(ino) {
+                Ok(target) => reply.data(target.as_os_str().as_encoded_bytes()),
+                Err(err) => reply.error(err),
+            }
+        }
+
         fn setattr(
             &mut self,
             _req: &Request<'_>,
@@ -371,6 +378,24 @@ mod fuse_overlay {
                 return;
             };
             match self.core.mkdir(parent, name, (mode & !umask) & 0o777) {
+                Ok(attr) => reply.entry(&TTL, &view_file_attr(&attr), 0),
+                Err(err) => reply.error(err),
+            }
+        }
+
+        fn symlink(
+            &mut self,
+            _req: &Request<'_>,
+            parent: u64,
+            link_name: &OsStr,
+            target: &Path,
+            reply: ReplyEntry,
+        ) {
+            let Some(link_name) = link_name.to_str() else {
+                reply.error(EINVAL);
+                return;
+            };
+            match self.core.symlink(parent, link_name, target) {
                 Ok(attr) => reply.entry(&TTL, &view_file_attr(&attr), 0),
                 Err(err) => reply.error(err),
             }
@@ -642,6 +667,7 @@ mod fuse_overlay {
                 let kind = match kind {
                     ViewNodeKind::File => FileType::RegularFile,
                     ViewNodeKind::Directory => FileType::Directory,
+                    ViewNodeKind::Symlink => FileType::Symlink,
                 };
                 if reply.add(*entry_ino, (index + 1) as i64, kind, name) {
                     break;
@@ -686,6 +712,7 @@ mod fuse_overlay {
             kind: match attr.kind {
                 ViewNodeKind::File => FileType::RegularFile,
                 ViewNodeKind::Directory => FileType::Directory,
+                ViewNodeKind::Symlink => FileType::Symlink,
             },
             perm: attr.mode as u16,
             nlink: if attr.kind == ViewNodeKind::Directory {
@@ -841,6 +868,14 @@ mod fuse_overlay {
                 )
                 .unwrap();
             assert_eq!(first.exit_code, 0);
+            let lane_a_head = db.lane_details("rust-seed-a").unwrap().branch.head_change;
+            let checkpoint = db.checkpoint_lane_workspace("rust-seed-a", None).unwrap();
+            assert!(checkpoint.source_paths.is_empty());
+            assert!(checkpoint.generated_dirty_paths > 0);
+            assert_eq!(
+                db.lane_details("rust-seed-a").unwrap().branch.head_change,
+                lane_a_head
+            );
             let view_a = db.lane_workspace_view("rust-seed-a").unwrap().unwrap();
             let target_a = PathBuf::from(&view_a.generated_upper).join("target");
             assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
@@ -911,6 +946,250 @@ mod fuse_overlay {
                 Path::new(&layer.storage_path),
                 "libshared_dep"
             ));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn fuse_large_root_shares_real_node_layer_but_isolates_install_and_clean() {
+            if std::env::var_os("TRAIL_RUN_FUSE_NODE_LAYER_TESTS").is_none() {
+                return;
+            }
+            for tool in ["node", "npm"] {
+                assert!(
+                    std::process::Command::new(tool)
+                        .arg("--version")
+                        .output()
+                        .is_ok_and(|output| output.status.success()),
+                    "{tool} is required for the real Node layer acceptance test"
+                );
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join("package.json"),
+                r#"{"name":"trail-fuse-node","version":"1.0.0","private":true,"dependencies":{"lodash":"4.17.21","prettier":"3.3.3"}}"#,
+            )
+            .unwrap();
+            fs::write(temp.path().join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+            for shard in 0..100 {
+                let directory = temp
+                    .path()
+                    .join("large-source")
+                    .join(format!("d{shard:03}"));
+                fs::create_dir_all(&directory).unwrap();
+                for file in 0..500 {
+                    fs::write(
+                        directory.join(format!("f{file:03}.txt")),
+                        format!("source-{shard:03}-{file:03}\n"),
+                    )
+                    .unwrap();
+                }
+            }
+            let lock = std::process::Command::new("npm")
+                .args([
+                    "install",
+                    "--package-lock-only",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                ])
+                .current_dir(temp.path())
+                .output()
+                .unwrap();
+            assert!(
+                lock.status.success(),
+                "npm lock generation failed: {}",
+                String::from_utf8_lossy(&lock.stderr)
+            );
+
+            let init_started = std::time::Instant::now();
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let init_ms = init_started.elapsed().as_millis();
+            let mut db = Trail::open(temp.path()).unwrap();
+            for lane in ["node-fuse-a", "node-fuse-b"] {
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    lane,
+                    Some("main"),
+                    LaneWorkdirMode::OverlayCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            }
+
+            let first = db.sync_node_dependencies("node-fuse-a", None).unwrap();
+            let second = db.sync_node_dependencies("node-fuse-b", None).unwrap();
+            assert_eq!(first.layer_id, second.layer_id);
+            assert_eq!(first.cache_key, second.cache_key);
+            assert!(
+                first.entry_count > 500,
+                "expected a non-trivial real npm tree"
+            );
+            let layer_file = Path::new(&first.storage_path).join("lodash/lodash.js");
+            let layer_bin = Path::new(&first.storage_path).join(".bin/prettier");
+            let immutable_bytes = fs::read(&layer_file).unwrap();
+            let immutable_hash = sha256_hex(&immutable_bytes);
+            assert!(fs::metadata(&layer_file).unwrap().permissions().readonly());
+            assert!(fs::symlink_metadata(&layer_bin)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let binding_count = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workspace_view_layers WHERE layer_id = ?1",
+                    params![first.layer_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(binding_count, 2);
+
+            let mount_started = std::time::Instant::now();
+            let mount_a = db
+                .mount_overlay_cow_workdir_for_lane("node-fuse-a")
+                .unwrap();
+            let mount_b = db
+                .mount_overlay_cow_workdir_for_lane("node-fuse-b")
+                .unwrap();
+            let mount_ms = mount_started.elapsed().as_millis();
+            let workdir_a = PathBuf::from(db.lane_workdir("node-fuse-a").unwrap().workdir.unwrap());
+            let workdir_b = PathBuf::from(db.lane_workdir("node-fuse-b").unwrap().workdir.unwrap());
+            assert_eq!(
+                fs::read_to_string(workdir_b.join("large-source/d099/f499.txt")).unwrap(),
+                "source-099-499\n"
+            );
+            for workdir in [&workdir_a, &workdir_b] {
+                let node = std::process::Command::new("node")
+                    .args([
+                        "-e",
+                        "const _ = require('lodash'); if (_.chunk([1,2,3], 2).length !== 2) process.exit(2)",
+                    ])
+                    .current_dir(workdir)
+                    .output()
+                    .unwrap();
+                assert!(
+                    node.status.success(),
+                    "Node could not consume mounted layer: {}",
+                    String::from_utf8_lossy(&node.stderr)
+                );
+                let prettier = std::process::Command::new("node_modules/.bin/prettier")
+                    .arg("--version")
+                    .current_dir(workdir)
+                    .output()
+                    .unwrap();
+                assert!(
+                    prettier.status.success(),
+                    "mounted npm bin did not execute: {}",
+                    String::from_utf8_lossy(&prettier.stderr)
+                );
+            }
+
+            fs::write(
+                workdir_a.join("node_modules/lodash/lodash.js"),
+                "lane-a-private\n",
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(workdir_a.join("node_modules/lodash/lodash.js")).unwrap(),
+                "lane-a-private\n"
+            );
+            assert_eq!(
+                sha256_hex(&fs::read(workdir_b.join("node_modules/lodash/lodash.js")).unwrap()),
+                immutable_hash
+            );
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+            let reinstalled_prettier = std::process::Command::new("node_modules/.bin/prettier")
+                .arg("--version")
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(
+                reinstalled_prettier.status.success(),
+                "npm-created bin symlink did not execute after reinstall: {}",
+                String::from_utf8_lossy(&reinstalled_prettier.stderr)
+            );
+            let prettier = std::process::Command::new("node_modules/.bin/prettier")
+                .arg("--version")
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(prettier.status.success());
+
+            let clean = std::process::Command::new("rm")
+                .args(["-rf", "node_modules"])
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(clean.status.success());
+            assert!(!workdir_a.join("node_modules").exists());
+            assert!(workdir_b.join("node_modules/lodash/lodash.js").is_file());
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+
+            let install = std::process::Command::new("npm")
+                .args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+                .env("npm_config_cache", temp.path().join("npm-test-cache"))
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(
+                install.status.success(),
+                "npm ci through FUSE failed: {}",
+                String::from_utf8_lossy(&install.stderr)
+            );
+            assert_eq!(
+                sha256_hex(&fs::read(workdir_a.join("node_modules/lodash/lodash.js")).unwrap()),
+                immutable_hash
+            );
+            assert_eq!(
+                sha256_hex(&fs::read(workdir_b.join("node_modules/lodash/lodash.js")).unwrap()),
+                immutable_hash
+            );
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+
+            let lane_head_before = db.lane_details("node-fuse-a").unwrap().branch.head_change;
+            let checkpoint = db.checkpoint_lane_workspace("node-fuse-a", None).unwrap();
+            assert!(checkpoint.source_paths.is_empty());
+            assert!(checkpoint.generated_dirty_paths > 500);
+            assert_eq!(
+                db.lane_details("node-fuse-a").unwrap().branch.head_change,
+                lane_head_before
+            );
+            let view_a = db.lane_workspace_view("node-fuse-a").unwrap().unwrap();
+            let view_b = db.lane_workspace_view("node-fuse-b").unwrap().unwrap();
+            let source_upper_entries = Path::new(&view_a.source_upper)
+                .read_dir()
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                source_upper_entries,
+                BTreeSet::from([std::ffi::OsString::from(".trail")])
+            );
+            assert!(Path::new(&view_a.generated_upper)
+                .join("node_modules/lodash/lodash.js")
+                .is_file());
+            assert!(!Path::new(&view_b.generated_upper)
+                .join("node_modules/lodash/lodash.js")
+                .exists());
+            db.verify_workspace_layer(&first.layer_id).unwrap();
+            eprintln!(
+                "linux-fuse-node-layer files=50000 layer_entries={} init_ms={} mount_two_ms={} shared_layer={} generated_a_bytes={} generated_b_bytes={}",
+                first.entry_count,
+                init_ms,
+                mount_ms,
+                first.layer_id,
+                db.lane_workspace_space("node-fuse-a")
+                    .unwrap()
+                    .generated_upper_bytes,
+                db.lane_workspace_space("node-fuse-b")
+                    .unwrap()
+                    .generated_upper_bytes,
+            );
+            drop(mount_b);
+            drop(mount_a);
         }
 
         fn tree_has_name_fragment(root: &Path, fragment: &str) -> bool {
