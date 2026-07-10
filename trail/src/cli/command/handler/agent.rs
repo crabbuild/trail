@@ -218,6 +218,11 @@ fn run_terminal_agent_task(
     } else {
         None
     };
+    let nfs_mount = if workdir_mode == LaneWorkdirMode::NfsCow {
+        Some(db.mount_nfs_cow_workdir_for_lane(&lane)?)
+    } else {
+        None
+    };
     let session = db
         .start_lane_session(&lane, Some(format!("Agent terminal {}", provider)), None)?
         .session;
@@ -303,13 +308,14 @@ fn run_terminal_agent_task(
         status: status.to_string(),
     };
     drop(overlay_mount);
+    drop(nfs_mount);
     Ok(report)
 }
 
 fn parse_agent_terminal_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
     LaneWorkdirMode::parse(value).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unknown terminal agent workdir mode `{value}`; expected full-cow or overlay-cow"
+            "unknown terminal agent workdir mode `{value}`; expected full-cow, overlay-cow, or nfs-cow"
         ))
     })
 }

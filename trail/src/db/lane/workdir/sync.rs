@@ -12,7 +12,7 @@ impl Trail {
             workdir: branch.workdir,
             cow_backend: workdir_mode.cow_backend().map(str::to_string),
             sparse_paths,
-            overlay_available: workdir_mode == LaneWorkdirMode::OverlayCow,
+            overlay_available: workdir_mode.is_transparent_cow(),
             workdir_mode,
         })
     }
@@ -116,6 +116,19 @@ impl Trail {
             )));
         };
         let workdir_path = PathBuf::from(&workdir);
+        let workdir_mode =
+            self.lane_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
+        if workdir_mode == LaneWorkdirMode::NfsCow {
+            return self.sync_nfs_cow_lane_workdir(
+                lane,
+                branch,
+                workdir,
+                workdir_path,
+                force,
+                &selected_paths,
+                include_neighbors,
+            );
+        }
         let workdir_path_metadata = match fs::symlink_metadata(&workdir_path) {
             Ok(metadata) => Some(metadata),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -251,6 +264,64 @@ impl Trail {
                 "workdir": workdir.clone(),
                 "forced": force,
                 "rescue_workdir": rescue_workdir.clone(),
+                "paths": selected_paths,
+                "include_neighbors": include_neighbors,
+                "changed_paths": changed_paths.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
+            }),
+        )?;
+        Ok(LaneWorkdirSyncReport {
+            lane_id: branch.lane_id,
+            workdir,
+            head_change: head.change_id,
+            root_id: head.root_id,
+            forced: force,
+            rescue_workdir,
+            changed_paths,
+        })
+    }
+
+    fn sync_nfs_cow_lane_workdir(
+        &mut self,
+        lane: &str,
+        branch: LaneBranch,
+        workdir: String,
+        workdir_path: PathBuf,
+        force: bool,
+        selected_paths: &[String],
+        include_neighbors: bool,
+    ) -> Result<LaneWorkdirSyncReport> {
+        if !selected_paths.is_empty() {
+            return Err(Error::InvalidInput(
+                "path-scoped sync-workdir is not supported for nfs-cow lanes".to_string(),
+            ));
+        }
+        let head = self.get_ref(&branch.ref_name)?;
+        let mount = self.mount_nfs_cow_workdir_for_lane(lane)?;
+        let changed_paths = self
+            .lane_workdir_changed_paths(&branch, &head)?
+            .unwrap_or_default();
+        if !changed_paths.is_empty() && !force {
+            drop(mount);
+            return Err(Error::DirtyWorktreeWithMessage(format!(
+                "lane `{lane}` workdir has unrecorded changes; run `trail lane record {lane}` or pass `--force` to sync"
+            )));
+        }
+        let rescue_workdir = if force && !changed_paths.is_empty() {
+            Some(self.rescue_dirty_lane_workdir(lane, &workdir, &workdir_path, &changed_paths)?)
+        } else {
+            None
+        };
+        drop(mount);
+        self.prepare_nfs_cow_lane_workdir(lane, &workdir_path, false)?;
+        self.insert_lane_event(
+            &branch.lane_id,
+            "workdir_synced",
+            Some(&head.change_id),
+            None,
+            &serde_json::json!({
+                "workdir": workdir,
+                "forced": force,
+                "rescue_workdir": rescue_workdir,
                 "paths": selected_paths,
                 "include_neighbors": include_neighbors,
                 "changed_paths": changed_paths.iter().map(|item| item.path.clone()).collect::<Vec<_>>()

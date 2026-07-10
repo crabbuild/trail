@@ -12,7 +12,7 @@ pub(super) fn tools() -> Value {
                 "name": { "type": "string" },
                 "from_ref": { "type": "string" },
                 "materialize": { "type": "boolean" },
-                "workdir_mode": { "type": "string", "enum": ["virtual", "sparse", "full-cow", "overlay-cow"] },
+                "workdir_mode": { "type": "string", "enum": ["virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"] },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
                 "paths": { "type": "array", "items": { "type": "string" } },

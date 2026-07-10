@@ -5,6 +5,7 @@ pub enum LaneWorkdirMode {
     Sparse,
     FullCow,
     OverlayCow,
+    NfsCow,
 }
 
 impl LaneWorkdirMode {
@@ -14,6 +15,7 @@ impl LaneWorkdirMode {
             LaneWorkdirMode::Sparse => "sparse",
             LaneWorkdirMode::FullCow => "full-cow",
             LaneWorkdirMode::OverlayCow => "overlay-cow",
+            LaneWorkdirMode::NfsCow => "nfs-cow",
         }
     }
 
@@ -23,6 +25,7 @@ impl LaneWorkdirMode {
             "sparse" => Some(LaneWorkdirMode::Sparse),
             "full-cow" | "full_cow" => Some(LaneWorkdirMode::FullCow),
             "overlay-cow" | "overlay_cow" => Some(LaneWorkdirMode::OverlayCow),
+            "nfs-cow" | "nfs_cow" => Some(LaneWorkdirMode::NfsCow),
             _ => None,
         }
     }
@@ -36,7 +39,12 @@ impl LaneWorkdirMode {
             LaneWorkdirMode::Virtual => None,
             LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => Some("filesystem-clone"),
             LaneWorkdirMode::OverlayCow => Some("overlay"),
+            LaneWorkdirMode::NfsCow => Some("nfs-overlay"),
         }
+    }
+
+    pub fn is_transparent_cow(&self) -> bool {
+        matches!(self, LaneWorkdirMode::OverlayCow | LaneWorkdirMode::NfsCow)
     }
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macfuse")))]
 mod fuse_overlay {
     use super::*;
     use fuser::{
@@ -1337,7 +1337,7 @@ mod fuse_overlay {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macfuse")))]
 pub(crate) use fuse_overlay::*;
 
 #[cfg(target_os = "windows")]
@@ -1346,13 +1346,21 @@ mod dokan_overlay;
 #[cfg(target_os = "windows")]
 pub(crate) use dokan_overlay::*;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "macfuse"),
+    target_os = "windows"
+)))]
 pub(crate) struct OverlayCowMount {
     #[allow(dead_code)]
     mountpoint: PathBuf,
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "macfuse"),
+    target_os = "windows"
+)))]
 impl OverlayCowMount {
     #[allow(dead_code)]
     pub(crate) fn mountpoint(&self) -> &Path {
@@ -1360,12 +1368,20 @@ impl OverlayCowMount {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "macfuse"),
+    target_os = "windows"
+)))]
 impl Drop for OverlayCowMount {
     fn drop(&mut self) {}
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "macfuse"),
+    target_os = "windows"
+)))]
 pub(crate) fn prepare_overlay_cow_workdir(
     _db: &Trail,
     _lane: &str,
@@ -1373,12 +1389,16 @@ pub(crate) fn prepare_overlay_cow_workdir(
     _custom_workdir: bool,
 ) -> Result<PathBuf> {
     Err(Error::InvalidInput(
-        "overlay-cow workdirs require Linux/macOS FUSE support or Windows Dokan support"
+        "overlay-cow workdirs require Linux FUSE, a macOS build with --features macfuse, or Windows Dokan"
             .to_string(),
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "macfuse"),
+    target_os = "windows"
+)))]
 pub(crate) fn mount_overlay_cow_for_lane(_db: &Trail, lane: &str) -> Result<OverlayCowMount> {
     Err(Error::InvalidInput(format!(
         "overlay-cow lane `{lane}` cannot be mounted on this platform"

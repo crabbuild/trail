@@ -151,12 +151,12 @@ trail agent acp --provider <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
 trail agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
-  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|overlay-cow] \
+  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|overlay-cow|nfs-cow] \
   [-- <COMMAND>...]
 
 trail agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
   [--provider <PROVIDER>] [--name <NAME>] \
-  [--workdir-mode full-cow|overlay-cow] [-- <COMMAND>...]
+  [--workdir-mode full-cow|overlay-cow|nfs-cow] [-- <COMMAND>...]
 ```
 
 Use `agent acp` as the stable editor entrypoint. It creates a fresh task lane
@@ -168,6 +168,8 @@ exits. The default `full-cow` mode creates a full materialized workdir using
 filesystem clone COW when possible. `overlay-cow` mounts a FUSE view for the
 duration of the run so the agent sees normal files without the initial full
 copy; it requires macFUSE on macOS or FUSE access on Linux.
+On macOS, `nfs-cow` provides the same write-time copy-up behavior through the
+built-in loopback NFS client and requires no kernel extension.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.

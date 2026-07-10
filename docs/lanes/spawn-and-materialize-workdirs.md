@@ -9,6 +9,8 @@ New commands and JSON reports expose this as `workdir_mode`:
 - `overlay-cow`: create an empty mountpoint and use a FUSE overlay view at
   runtime; reads come from Trail objects and writes land in a per-lane upper
   directory.
+- `nfs-cow`: on macOS, expose the same lower/upper model through a loopback
+  NFSv3 mount without macFUSE.
 
 For `full-cow` and `sparse`, COW means safe file clone during materialization or
 hydration. It does not intercept arbitrary writes to unhydrated paths.
@@ -18,6 +20,9 @@ is running. The mountpoint starts empty on disk, the writable upper layer lives
 under `.trail/overlay-cow/<lane>/upper`, and Trail records through the mounted
 view before unmounting. On macOS this requires macFUSE; on Linux it requires
 FUSE access such as `/dev/fuse`.
+
+NFS COW stores writes under `.trail/nfs-cow/<lane>/upper`, filters macOS
+metadata sidecars, records the upper-layer delta, and unmounts automatically.
 
 ## Spawn Without Materialization
 
@@ -48,6 +53,7 @@ Custom workdirs must be empty or absent and cannot be symlinks.
 ```sh
 trail agent start --provider codex --workdir-mode overlay-cow
 trail agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+trail agent start --provider codex --workdir-mode nfs-cow
 ```
 
 `overlay-cow` lets a terminal agent see a normal filesystem tree without first

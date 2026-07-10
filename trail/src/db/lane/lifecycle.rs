@@ -167,12 +167,15 @@ impl Trail {
         } else {
             None
         };
-        let overlay_available = workdir_mode == LaneWorkdirMode::OverlayCow;
+        let overlay_available = workdir_mode.is_transparent_cow();
         let mut sparse_policy_paths = None;
         let materialized_workdir = if let Some(dir) = &workdir_path {
             match &workdir_mode {
                 LaneWorkdirMode::OverlayCow => {
                     self.prepare_overlay_cow_lane_workdir(name, dir, workdir.is_some())?;
+                }
+                LaneWorkdirMode::NfsCow => {
+                    self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
                 }
                 LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => {
                     self.materialize_lane_workdir_at_paths_with_neighbors(
@@ -286,7 +289,7 @@ impl Trail {
             let record = self.lane_record(&branch.lane_id)?;
             let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
             let sparse_paths = self.lane_report_sparse_paths(&branch)?;
-            let overlay_available = workdir_mode == LaneWorkdirMode::OverlayCow;
+            let overlay_available = workdir_mode.is_transparent_cow();
             return Ok(LaneWorkdirReport {
                 lane_id: branch.lane_id,
                 workdir: Some(existing),
@@ -688,7 +691,7 @@ impl Trail {
 fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
     LaneWorkdirMode::parse(value).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unknown lane workdir mode `{value}`; expected virtual, sparse, full-cow, or overlay-cow"
+            "unknown lane workdir mode `{value}`; expected virtual, sparse, full-cow, overlay-cow, or nfs-cow"
         ))
     })
 }
@@ -732,6 +735,17 @@ fn validate_lane_workdir_mode_request(
                         .to_string(),
                 ));
             }
+        }
+        LaneWorkdirMode::NfsCow => {
+            if !sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(
+                    "nfs-cow lane workdir mode cannot be combined with sparse paths".to_string(),
+                ));
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(Error::InvalidInput(
+                "nfs-cow workdirs are currently supported only on macOS".to_string(),
+            ));
         }
     }
     Ok(())

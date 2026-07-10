@@ -2954,6 +2954,7 @@ impl Trail {
         )?;
 
         let _overlay_mount = self.maybe_mount_overlay_cow_workdir_for_lane(&lane)?;
+        let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
         let would_record = self.lane_workdir_dirty(&lane)?;
         if dry_run && would_record {
             let view = self.agent_task_view(&lane)?;

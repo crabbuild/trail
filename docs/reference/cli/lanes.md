@@ -100,7 +100,7 @@ The common lifecycle is:
 
 ```text
 trail lane spawn <NAME> [--from <REF>] \
-  [--workdir-mode virtual|sparse|full-cow|overlay-cow] \
+  [--workdir-mode virtual|sparse|full-cow|overlay-cow|nfs-cow] \
   [--materialize[=true|false]] [--no-materialize] \
   [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] \
   [--provider <PROVIDER>] [--model <MODEL>]
@@ -119,6 +119,7 @@ trail lane rm <NAME> [--force]
 | `sparse` | Materializes only selected paths. |
 | `full-cow` | Materializes the full root and tries filesystem clone COW. |
 | `overlay-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
+| `nfs-cow` | On macOS, creates a loopback NFSv3 mount with transparent copy-up and whiteouts, without macFUSE. |
 
 Compatibility flags:
 
@@ -130,6 +131,9 @@ Compatibility flags:
 `trail agent start --workdir-mode overlay-cow`: macFUSE on macOS, or `/dev/fuse`
 access on Linux. If the mount fails, Trail reports the setup error instead of
 copying the full workdir.
+
+`nfs-cow` is currently macOS-only. The loopback server listens on `127.0.0.1`
+and the mount is removed automatically after recording the agent checkpoint.
 
 ### Sparse path boundaries
 

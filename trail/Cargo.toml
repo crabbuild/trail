@@ -6,6 +6,10 @@ rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+macfuse = ["dep:fuser"]
+
 [dependencies]
 bzip2.workspace = true
 clap.workspace = true
@@ -38,7 +42,10 @@ zip.workspace = true
 fuser = { version = "0.15.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.15.1", features = ["macfuse-4-compat"] }
+async-trait = "0.1"
+fuser = { version = "0.15.1", features = ["macfuse-4-compat"], optional = true }
+nfsserve = "0.11"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 dokan = "0.3.1"

@@ -105,12 +105,25 @@ impl Trail {
         let head = self.get_ref(&branch.ref_name)?;
         let sparse_paths = self.lane_sparse_workdir_paths(&branch, &workdir_path)?;
         let is_sparse = sparse_paths.is_some();
+        let workdir_mode =
+            self.lane_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
         let overlay_manifest_path = self.lane_overlay_clean_manifest_path(&branch)?;
-        let cached_status = self.lane_cached_workdir_manifest_status(
-            &workdir_path,
-            overlay_manifest_path.as_deref(),
-            &head.root_id,
-        )?;
+        let cached_status = if workdir_mode == LaneWorkdirMode::NfsCow {
+            // Derive the delta from the persistent upper layer instead of an
+            // NFS READDIR result, which macOS may cache across a create.
+            let candidate_paths = self.nfs_cow_candidate_paths_for_lane(lane)?;
+            let disk_files = self.scan_files_under_for_paths(&workdir_path, &candidate_paths)?;
+            CachedWorkdirManifestStatus::Dirty {
+                disk_manifest: self.disk_manifest(&disk_files),
+                candidate_paths: Some(candidate_paths),
+            }
+        } else {
+            self.lane_cached_workdir_manifest_status(
+                &workdir_path,
+                overlay_manifest_path.as_deref(),
+                &head.root_id,
+            )?
+        };
         if matches!(cached_status, CachedWorkdirManifestStatus::Clean) {
             return Ok(LaneRecordReport {
                 lane_id: branch.lane_id,
@@ -411,12 +424,14 @@ impl Trail {
         branch: &LaneBranch,
     ) -> Result<Option<PathBuf>> {
         let record = self.lane_record(&branch.lane_id)?;
-        if self.lane_workdir_mode_for(&record, branch)? == LaneWorkdirMode::OverlayCow {
-            Ok(Some(self.overlay_clean_workdir_manifest_path_for_lane(
-                &branch.lane_id,
-            )?))
-        } else {
-            Ok(None)
+        match self.lane_workdir_mode_for(&record, branch)? {
+            LaneWorkdirMode::OverlayCow => Ok(Some(
+                self.overlay_clean_workdir_manifest_path_for_lane(&record.name)?,
+            )),
+            LaneWorkdirMode::NfsCow => Ok(Some(
+                self.nfs_clean_workdir_manifest_path_for_lane(&record.name)?,
+            )),
+            _ => Ok(None),
         }
     }
 

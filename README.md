@@ -751,6 +751,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail agent undo latest` | Undo the latest agent turn without copying checkpoint ids |
 | `trail agent undo-last latest` | Friendly alias for undoing the latest agent turn |
 | `trail lane spawn <name> --from <ref>` | Create an isolated lane branch |
+| `trail agent start --provider codex --workdir-mode nfs-cow` | Run a macOS terminal agent in a loopback NFS copy-on-write workdir |
 | `trail lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
 | `trail lane review <name>` | Produce a compact review packet for a lane branch |
 | `trail lane readiness <name>` | Report blockers before merging a lane branch |

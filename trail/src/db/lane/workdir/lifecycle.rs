@@ -45,6 +45,12 @@ impl Trail {
                 fs::remove_dir_all(&path)?;
             }
         }
+        for backend in ["overlay-cow", "nfs-cow"] {
+            let state = self.db_dir.join(backend).join(lane);
+            if state.exists() {
+                fs::remove_dir_all(state)?;
+            }
+        }
         self.conn.execute(
             "UPDATE lane_branches SET status = 'removed', updated_at = ?1 WHERE lane_id = ?2",
             params![now_ts(), branch.lane_id],

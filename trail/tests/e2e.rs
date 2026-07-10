@@ -18523,30 +18523,60 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert!(no_materialize_spawn["workdir"].is_null());
     assert_eq!(no_materialize_spawn["workdir_mode"], "virtual");
 
-    let overlay_spawn = run_trail_json(
-        temp.path(),
-        &[
-            "lane",
-            "spawn",
-            "overlay-bot",
-            "--from",
-            "main",
-            "--workdir-mode",
-            "overlay-cow",
-        ],
-    );
-    assert_eq!(overlay_spawn["workdir_mode"], "overlay-cow");
-    assert_eq!(overlay_spawn["cow_backend"], "overlay");
-    assert_eq!(overlay_spawn["overlay_available"], true);
-    assert_eq!(overlay_spawn["sparse_paths"].as_array().unwrap().len(), 0);
-    let overlay_workdir = PathBuf::from(overlay_spawn["workdir"].as_str().unwrap());
-    assert!(overlay_workdir.is_dir());
-    assert!(fs::read_dir(&overlay_workdir).unwrap().next().is_none());
-    assert!(!overlay_workdir.join("README.md").exists());
-    assert!(temp
-        .path()
-        .join(".trail/overlay-cow/overlay-bot/upper/.trail")
-        .is_dir());
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "windows",
+        all(target_os = "macos", feature = "macfuse")
+    ))]
+    {
+        let overlay_spawn = run_trail_json(
+            temp.path(),
+            &[
+                "lane",
+                "spawn",
+                "overlay-bot",
+                "--from",
+                "main",
+                "--workdir-mode",
+                "overlay-cow",
+            ],
+        );
+        assert_eq!(overlay_spawn["workdir_mode"], "overlay-cow");
+        assert_eq!(overlay_spawn["cow_backend"], "overlay");
+        assert_eq!(overlay_spawn["overlay_available"], true);
+        assert_eq!(overlay_spawn["sparse_paths"].as_array().unwrap().len(), 0);
+        let overlay_workdir = PathBuf::from(overlay_spawn["workdir"].as_str().unwrap());
+        assert!(overlay_workdir.is_dir());
+        assert!(fs::read_dir(&overlay_workdir).unwrap().next().is_none());
+        assert!(!overlay_workdir.join("README.md").exists());
+        assert!(temp
+            .path()
+            .join(".trail/overlay-cow/overlay-bot/upper/.trail")
+            .is_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let nfs_spawn = run_trail_json(
+            temp.path(),
+            &[
+                "lane",
+                "spawn",
+                "nfs-bot",
+                "--from",
+                "main",
+                "--workdir-mode",
+                "nfs-cow",
+            ],
+        );
+        assert_eq!(nfs_spawn["workdir_mode"], "nfs-cow");
+        assert_eq!(nfs_spawn["cow_backend"], "nfs-overlay");
+        assert_eq!(nfs_spawn["overlay_available"], true);
+        assert!(temp
+            .path()
+            .join(".trail/nfs-cow/nfs-bot/upper/.trail")
+            .is_dir());
+    }
 
     let mut db = Trail::open(temp.path()).unwrap();
     assert_eq!(

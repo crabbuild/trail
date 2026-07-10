@@ -159,11 +159,15 @@ For large repositories, terminal agents can use the overlay COW workdir mode:
 ```sh
 trail agent start --provider codex --workdir-mode overlay-cow
 trail agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+trail agent start --provider codex --workdir-mode nfs-cow
 ```
 
 The overlay mount is held only while the terminal process runs and while Trail
 records the checkpoint afterward. On macOS it requires macFUSE; on Linux it
 requires FUSE access such as `/dev/fuse`.
+
+On macOS, use `nfs-cow` for terminal-agent copy-up through the built-in NFS
+client when installing macFUSE is undesirable.
 
 For a full operator and automation-agent runbook, including real Claude Code
 edit verification and ACP permission responses, see
