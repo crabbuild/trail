@@ -4,6 +4,7 @@ The Trail CLI supports workspace initialization, recording, inspection, branchin
 
 Reference sections:
 
+- [Trail Agent commands](agent/cli-reference.md)
 - [Global options and environment](reference/cli/global-options-and-env.md)
 - [Workspace and config](reference/cli/workspace-and-config.md)
 - [Recording and history](reference/cli/recording-and-history.md)

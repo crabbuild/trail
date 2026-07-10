@@ -11,6 +11,14 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 - [Initialize a workspace](getting-started/initialize-a-workspace.md)
 - [First record and provenance query](getting-started/first-record-and-query.md)
 - [First lane workflow](getting-started/first-lane-workflow.md)
+- [Trail Agent quick start](getting-started/agent-workflow.md)
+
+## Trail Agent
+
+- [Overview](agent/overview.md)
+- [User guide](agent/user-guide.md)
+- [CLI reference](agent/cli-reference.md)
+- [Troubleshooting](agent/troubleshooting.md)
 
 ## Core Concepts
 
@@ -61,6 +69,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 
 ## Reference
 
+- [Trail Agent CLI reference](agent/cli-reference.md)
 - [CLI global options and environment](reference/cli/global-options-and-env.md)
 - [CLI command reference](reference/cli/workspace-and-config.md)
 - [Configuration keys](reference/config.md)
