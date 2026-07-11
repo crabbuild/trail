@@ -1,0 +1,117 @@
+name: Release Automation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release-automation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Update release pull request
+    runs-on: ubuntu-latest
+    outputs:
+      token_available: ${{ steps.token.outputs.available }}
+    steps:
+      - name: Check release automation token
+        id: token
+        env:
+          RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          if [[ -z "${RELEASE_PLEASE_TOKEN}" ]]; then
+            echo "::warning::Add RELEASE_PLEASE_TOKEN, then dispatch this workflow to enable automated releases."
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Create or update the release pull request
+        if: ${{ steps.token.outputs.available == 'true' }}
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+  tag-release:
+    name: Tag merged release pull request
+    needs: release-please
+    if: ${{ needs.release-please.outputs.token_available == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: true
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      - name: Detect a merged release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current_version="$(jq -er '.["."]' .release-please-manifest.json)"
+          cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+
+          if ! [[ "${current_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version in .release-please-manifest.json: ${current_version}" >&2
+            exit 1
+          fi
+          if [[ "${cargo_version}" != "${current_version}" ]]; then
+            echo "Cargo version ${cargo_version} does not match release manifest ${current_version}." >&2
+            exit 1
+          fi
+
+          version_changed=true
+          if git cat-file -e "${GITHUB_SHA}^:.release-please-manifest.json" 2>/dev/null; then
+            previous_version="$(git show "${GITHUB_SHA}^:.release-please-manifest.json" | jq -er '.["."]')"
+            if [[ "${previous_version}" == "${current_version}" ]]; then
+              version_changed=false
+            fi
+          else
+            echo "Release manifest was just bootstrapped; preparing the initial ${current_version} tag."
+          fi
+
+          if ! grep -Fq "## [${current_version}]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no ${current_version} release heading." >&2
+            exit 1
+          fi
+
+          tag="v${current_version}"
+          git fetch --force --tags origin
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            tagged_commit="$(git rev-list -n 1 "${tag}")"
+            if [[ "${version_changed}" == "true" && "${tagged_commit}" != "${GITHUB_SHA}" ]]; then
+              echo "${tag} already points to ${tagged_commit}, not ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+            echo "${tag} is already published at ${tagged_commit}."
+            echo "should_tag=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${version_changed}" == "false" ]]; then
+            echo "${tag} is missing; preparing a bootstrap or retry tag at ${GITHUB_SHA}."
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${current_version}" >> "${GITHUB_OUTPUT}"
+          echo "should_tag=true" >> "${GITHUB_OUTPUT}"
+      - name: Push the release tag
+        if: ${{ steps.release.outputs.should_tag == 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          git config user.name "Crab Build Release Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git tag -a "${RELEASE_TAG}" -m "Trail ${RELEASE_VERSION}"
+          git push origin "${RELEASE_TAG}"
