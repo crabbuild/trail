@@ -426,14 +426,14 @@ trail --version
 On Windows PowerShell:
 
 ```powershell
-winget install --id dokan-dev.Dokany --exact
+winget install --id dokan-dev.Dokany --version 2.0.6.1000 --exact
 irm https://github.com/crabbuild/trail/releases/latest/download/trail-installer.ps1 | iex
 trail --version
 ```
 
-The Windows binary currently links the Dokany 2 runtime. Linux FUSE, macFUSE,
-and the Dokan driver are otherwise relevant only to their corresponding
-mounted-workspace modes.
+The Windows binary currently links the Dokany 2.0.6 runtime. Linux FUSE,
+macFUSE, and the Dokan driver are otherwise relevant only to their
+corresponding mounted-workspace modes.
 
 To build from source instead, install Rust 1.81 or newer and use the Makefile:
 

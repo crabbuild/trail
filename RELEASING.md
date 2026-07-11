@@ -91,8 +91,8 @@ trail --version
 ```
 
 Also test the `trail-installer.sh` and `trail-installer.ps1` commands shown in
-the GitHub Release, installing Dokany 2 before the Windows check. The reported
-version must match the tag.
+the GitHub Release, installing Dokany 2.0.6 before the Windows check. The
+reported version must match the tag.
 
 If a release fails, fix the cause and rerun the failed workflow jobs. Do not
 move or reuse a published tag. If assets were already exposed, publish a new
