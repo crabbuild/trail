@@ -12,6 +12,7 @@ on:
       - "RELEASING.md"
       - ".release-please-manifest.json"
       - "release-please-config.json"
+      - "scripts/install-dokany.ps1"
       - ".github/workflows/release-automation.yml"
       - ".github/workflows/release.yml"
       - ".github/workflows/publish-homebrew.yml"
@@ -34,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Dokany runtime
         if: ${{ runner.os == 'Windows' }}
-        run: choco install dokany2 --version 2.0.6.1000 -y --no-progress
+        run: ./scripts/install-dokany.ps1
       - name: Verify release versions
         shell: bash
         run: |

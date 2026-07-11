@@ -8,6 +8,7 @@ on:
       - "scripts/verify-layered-lane-scale.sh"
       - "scripts/verify-rust-cache-isolation-docker.sh"
       - "scripts/verify-linux-node-layer-docker.sh"
+      - "scripts/install-dokany.ps1"
       - ".github/workflows/layered-workspaces.yml"
   workflow_dispatch:
     inputs:
@@ -99,7 +100,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: choco install dokany2 --version 2.0.6.1000 -y --no-progress
+      - run: ./scripts/install-dokany.ps1
       - shell: pwsh
         run: |
           $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
