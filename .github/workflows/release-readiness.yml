@@ -5,6 +5,7 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "version.txt"
       - "trail/Cargo.toml"
       - "trail/src/cli/command.rs"
       - "CHANGELOG.md"
@@ -38,9 +39,11 @@ jobs:
           workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           trail_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' trail/Cargo.toml)"
           manifest_version="$(sed -n 's/^[[:space:]]*"\."[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' .release-please-manifest.json)"
+          version_file="$(tr -d '[:space:]' < version.txt)"
           test -n "${workspace_version}"
           test "${workspace_version}" = "${trail_version}"
           test "${workspace_version}" = "${manifest_version}"
+          test "${workspace_version}" = "${version_file}"
       - name: Build release binary
         run: cargo build --locked -p trail --profile dist
       - name: Verify packaged CLI

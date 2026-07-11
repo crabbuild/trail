@@ -59,6 +59,7 @@ jobs:
           set -euo pipefail
 
           current_version="$(jq -er '.["."]' .release-please-manifest.json)"
+          version_file="$(tr -d '[:space:]' < version.txt)"
           cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           trail_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' trail/Cargo.toml)"
 
@@ -68,6 +69,10 @@ jobs:
           fi
           if [[ "${cargo_version}" != "${current_version}" ]]; then
             echo "Cargo version ${cargo_version} does not match release manifest ${current_version}." >&2
+            exit 1
+          fi
+          if [[ "${version_file}" != "${current_version}" ]]; then
+            echo "version.txt ${version_file} does not match release manifest ${current_version}." >&2
             exit 1
           fi
           if [[ "${trail_version}" != "${current_version}" ]]; then
