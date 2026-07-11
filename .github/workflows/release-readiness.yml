@@ -32,6 +32,9 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install Dokany runtime
+        if: ${{ runner.os == 'Windows' }}
+        run: choco install dokany2 -y --no-progress
       - name: Verify release versions
         shell: bash
         run: |

@@ -426,12 +426,14 @@ trail --version
 On Windows PowerShell:
 
 ```powershell
+winget install --id dokan-dev.Dokany --exact
 irm https://github.com/crabbuild/trail/releases/latest/download/trail-installer.ps1 | iex
 trail --version
 ```
 
-The normal CLI does not require a background service. Linux FUSE, macFUSE, and
-Windows Dokan are only relevant to their corresponding mounted-workspace modes.
+The Windows binary currently links the Dokany 2 runtime. Linux FUSE, macFUSE,
+and the Dokan driver are otherwise relevant only to their corresponding
+mounted-workspace modes.
 
 To build from source instead, install Rust 1.81 or newer and use the Makefile:
 

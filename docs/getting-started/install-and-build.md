@@ -37,9 +37,11 @@ brew install crabbuild/tap/trail
 
 ### Windows
 
-Run the release installer from PowerShell:
+Install the Dokany 2 runtime, then run the Trail release installer from
+PowerShell:
 
 ```powershell
+winget install --id dokan-dev.Dokany --exact
 irm https://github.com/crabbuild/trail/releases/latest/download/trail-installer.ps1 | iex
 trail --version
 ```
@@ -47,9 +49,10 @@ trail --version
 Archives and their SHA-256 checksum files are also attached to every
 [GitHub Release](https://github.com/crabbuild/trail/releases).
 
-The base CLI, HTTP daemon, and MCP server do not require a filesystem driver.
-Linux FUSE, optional macFUSE, and Windows Dokan are needed only when using the
-corresponding mounted-workspace implementation.
+The Windows binary currently links the Dokany 2 runtime, while the Dokan driver
+is actively used only for mounted-workspace lanes. Linux FUSE and optional
+macFUSE are needed only for their corresponding mounted-workspace
+implementations.
 
 ## Install from Source
 
