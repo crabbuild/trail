@@ -465,11 +465,12 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
 }))
 PY
     run_http_timed "$scale" daemon_agent_spawn "$DAEMON_URL" POST /v1/lanes "$WORK/daemon-spawn.json"
-    python3 - "$REPO" "$WORK/daemon-patch.json" "$scale" <<'PY'
+    python3 - "$REPO" "$WORK/daemon-patch.json" "$scale" "$WORK/out/daemon_agent_spawn.stdout" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 files = int(sys.argv[3])
+base_change = json.loads(pathlib.Path(sys.argv[4]).read_text())["base_change"]
 edits = []
 for i in range(max(1, min(25, files // 400))):
     idx = (i * 5393 + 31) % files
@@ -480,7 +481,7 @@ for i in range(max(1, min(25, files // 400))):
         "path": str(rel),
         "content": (root / rel).read_text() + f"\n// daemonbot {i}\n",
     })
-json.dump({"message": "scale daemonbot", "edits": edits}, out.open("w"))
+json.dump({"base_change": base_change, "message": "scale daemonbot", "edits": edits}, out.open("w"))
 PY
     run_http_timed "$scale" daemon_agent_patch "$DAEMON_URL" POST /v1/lanes/daemonbot/patches "$WORK/daemon-patch.json"
     python3 - "$WORK/daemon-read.json" <<'PY'
