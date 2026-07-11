@@ -582,11 +582,12 @@ PY
     run_timed "$scale" daemon_cli_agent_trace_summary "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace summary --trace-id "$DAEMON_CLI_TRACE_ID" --slowest 3
     run_timed "$scale" daemon_cli_agent_trace_show "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane trace show "$DAEMON_CLI_SPAN_ID"
     run_timed "$scale" daemon_cli_agent_turn_end "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane turn end "$DAEMON_CLI_TURN_ID" --status completed
-    python3 - "$REPO" "$WORK/daemon-cli-patch.json" "$scale" <<'PY'
+    python3 - "$REPO" "$WORK/daemon-cli-patch.json" "$scale" "$WORK/out/daemon_cli_agent_turn_patch.stdout" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 files = int(sys.argv[3])
+base_change = json.loads(pathlib.Path(sys.argv[4]).read_text())["operation"]
 edits = []
 for i in range(max(1, min(25, files // 400))):
     idx = (i * 6599 + 37) % files
@@ -597,7 +598,7 @@ for i in range(max(1, min(25, files // 400))):
         "path": str(rel),
         "content": (root / rel).read_text() + f"\n// daemonclibot {i}\n",
     })
-json.dump({"message": "scale daemonclibot", "edits": edits}, out.open("w"))
+json.dump({"base_change": base_change, "message": "scale daemonclibot", "edits": edits}, out.open("w"))
 PY
     run_timed "$scale" daemon_cli_agent_patch "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane apply-patch daemonclibot --patch "$WORK/daemon-cli-patch.json"
     run_timed "$scale" daemon_cli_agent_read "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane read daemonclibot README.md
@@ -623,11 +624,12 @@ PY
 
   run_timed "$scale" agent_spawn_headless "$BIN" --workspace "$REPO" --json lane spawn patchbot --from main --no-materialize
   run_timed "$scale" agent_read_headless "$BIN" --workspace "$REPO" --json lane read patchbot README.md
-  python3 - "$REPO" "$WORK/patchbot.json" "$scale" <<'PY'
+  python3 - "$REPO" "$WORK/patchbot.json" "$scale" "$WORK/out/agent_spawn_headless.stdout" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 files = int(sys.argv[3])
+base_change = json.loads(pathlib.Path(sys.argv[4]).read_text())["base_change"]
 edits = []
 for i in range(max(1, min(50, files // 200))):
     idx = (i * 6151 + 17) % files
@@ -638,19 +640,20 @@ for i in range(max(1, min(50, files // 200))):
         "path": str(rel),
         "content": (root / rel).read_text() + f"\n// patchbot {i}\n",
     })
-json.dump({"message": "scale patchbot", "edits": edits}, out.open("w"))
+json.dump({"base_change": base_change, "message": "scale patchbot", "edits": edits}, out.open("w"))
 PY
   run_timed "$scale" agent_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch patchbot --patch "$WORK/patchbot.json"
   run_timed "$scale" agent_readiness "$BIN" --workspace "$REPO" --json lane readiness patchbot
-  run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main --dry-run
-  run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main
+  run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main --direct --dry-run
+  run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main --direct
 
   run_timed "$scale" agent_spawn_queuebot "$BIN" --workspace "$REPO" --json lane spawn queuebot --from main --no-materialize
-  python3 - "$REPO" "$WORK/queuebot.json" "$scale" <<'PY'
+  python3 - "$REPO" "$WORK/queuebot.json" "$scale" "$WORK/out/agent_spawn_queuebot.stdout" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 out = pathlib.Path(sys.argv[2])
 files = int(sys.argv[3])
+base_change = json.loads(pathlib.Path(sys.argv[4]).read_text())["base_change"]
 edits = []
 for i in range(max(1, min(25, files // 400))):
     idx = (i * 4231 + 23) % files
@@ -661,7 +664,7 @@ for i in range(max(1, min(25, files // 400))):
         "path": str(rel),
         "content": (root / rel).read_text() + f"\n// queuebot {i}\n",
     })
-json.dump({"message": "scale queuebot", "edits": edits}, out.open("w"))
+json.dump({"base_change": base_change, "message": "scale queuebot", "edits": edits}, out.open("w"))
 PY
   run_timed "$scale" queuebot_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch queuebot --patch "$WORK/queuebot.json"
   run_timed "$scale" merge_queue_add "$BIN" --workspace "$REPO" --json merge-queue add queuebot --into main
