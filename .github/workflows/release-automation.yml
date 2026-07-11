@@ -60,6 +60,7 @@ jobs:
 
           current_version="$(jq -er '.["."]' .release-please-manifest.json)"
           cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          trail_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' trail/Cargo.toml)"
 
           if ! [[ "${current_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release version in .release-please-manifest.json: ${current_version}" >&2
@@ -67,6 +68,10 @@ jobs:
           fi
           if [[ "${cargo_version}" != "${current_version}" ]]; then
             echo "Cargo version ${cargo_version} does not match release manifest ${current_version}." >&2
+            exit 1
+          fi
+          if [[ "${trail_version}" != "${current_version}" ]]; then
+            echo "Trail package version ${trail_version} does not match release manifest ${current_version}." >&2
             exit 1
           fi
 

@@ -31,6 +31,16 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify release versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          trail_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' trail/Cargo.toml)"
+          manifest_version="$(sed -n 's/^[[:space:]]*"\."[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' .release-please-manifest.json)"
+          test -n "${workspace_version}"
+          test "${workspace_version}" = "${trail_version}"
+          test "${workspace_version}" = "${manifest_version}"
       - name: Build release binary
         run: cargo build --locked -p trail --profile dist
       - name: Verify packaged CLI
