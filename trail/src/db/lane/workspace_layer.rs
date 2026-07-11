@@ -1546,6 +1546,16 @@ mod tests {
             view.lookup(package, "index.js").unwrap()
         };
         let index_a = lookup_index(&mut views[0].1);
+        assert_ne!(
+            views[0].1.attr("node_modules/pkg/index.js").unwrap().mode & 0o200,
+            0
+        );
+        assert!(
+            fs::metadata(Path::new(&layer.storage_path).join("pkg/index.js"))
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
         views[0].1.setattr(index_a, Some(0), None).unwrap();
         views[0].1.write(index_a, 0, b"lane-a\n").unwrap();
         let index_b = lookup_index(&mut views[1].1);

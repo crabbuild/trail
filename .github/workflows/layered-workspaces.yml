@@ -73,6 +73,12 @@ jobs:
       - run: cargo test -p trail nfs_git_checkout_reset_and_clean_are_lane_local -- --nocapture
         env:
           TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail nfs_real_node_layer_is_shared_and_writable_installs_are_isolated -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
+      - run: cargo test -p trail nfs_cargo_target_seed_is_shared_and_writable_targets_are_isolated -- --nocapture
+        env:
+          TRAIL_RUN_NFS_COW_TESTS: "1"
 
   dokan-conformance:
     runs-on: windows-latest

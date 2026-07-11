@@ -1056,6 +1056,366 @@ mod macos {
         }
 
         #[test]
+        fn nfs_real_node_layer_is_shared_and_writable_installs_are_isolated() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            for tool in ["node", "npm"] {
+                assert!(
+                    Command::new(tool)
+                        .arg("--version")
+                        .output()
+                        .is_ok_and(|output| output.status.success()),
+                    "{tool} is required for the real NFS Node layer acceptance test"
+                );
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(
+                temp.path().join("package.json"),
+                r#"{"name":"trail-nfs-node","version":"1.0.0","private":true,"dependencies":{"lodash":"4.17.21","prettier":"3.3.3"}}"#,
+            )
+            .unwrap();
+            fs::write(temp.path().join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+            let lock = Command::new("npm")
+                .args([
+                    "install",
+                    "--package-lock-only",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                ])
+                .current_dir(temp.path())
+                .output()
+                .unwrap();
+            assert!(
+                lock.status.success(),
+                "npm lock generation failed: {}",
+                String::from_utf8_lossy(&lock.stderr)
+            );
+
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            for lane in ["node-nfs-a", "node-nfs-b"] {
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    lane,
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            }
+
+            let first = db.sync_node_dependencies("node-nfs-a", None).unwrap();
+            let second = db.sync_node_dependencies("node-nfs-b", None).unwrap();
+            assert_eq!(first.layer_id, second.layer_id);
+            assert_eq!(first.cache_key, second.cache_key);
+            assert!(first.entry_count > 500);
+            let layer_file = Path::new(&first.storage_path).join("lodash/lodash.js");
+            let layer_bin = Path::new(&first.storage_path).join(".bin/prettier");
+            let immutable_hash = sha256_hex(&fs::read(&layer_file).unwrap());
+            assert!(fs::metadata(&layer_file).unwrap().permissions().readonly());
+            assert!(fs::symlink_metadata(&layer_bin)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+
+            let mount_started = std::time::Instant::now();
+            let mount_a = db.mount_nfs_cow_workdir_for_lane("node-nfs-a").unwrap();
+            let mount_b = db.mount_nfs_cow_workdir_for_lane("node-nfs-b").unwrap();
+            let mount_ms = mount_started.elapsed().as_millis();
+            let workdir_a = PathBuf::from(db.lane_workdir("node-nfs-a").unwrap().workdir.unwrap());
+            let workdir_b = PathBuf::from(db.lane_workdir("node-nfs-b").unwrap().workdir.unwrap());
+
+            for workdir in [&workdir_a, &workdir_b] {
+                let node = Command::new("node")
+                    .args([
+                        "-e",
+                        "const _ = require('lodash'); if (_.chunk([1,2,3], 2).length !== 2) process.exit(2)",
+                    ])
+                    .current_dir(workdir)
+                    .output()
+                    .unwrap();
+                assert!(
+                    node.status.success(),
+                    "Node could not consume the NFS-mounted layer: {}",
+                    String::from_utf8_lossy(&node.stderr)
+                );
+                let prettier = Command::new("node_modules/.bin/prettier")
+                    .arg("--version")
+                    .current_dir(workdir)
+                    .output()
+                    .unwrap();
+                assert!(
+                    prettier.status.success(),
+                    "NFS-mounted npm bin symlink did not execute: {}",
+                    String::from_utf8_lossy(&prettier.stderr)
+                );
+            }
+
+            fs::write(
+                workdir_a.join("node_modules/lodash/lodash.js"),
+                "lane-a-private\n",
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(workdir_a.join("node_modules/lodash/lodash.js")).unwrap(),
+                "lane-a-private\n"
+            );
+            assert_eq!(
+                sha256_hex(&fs::read(workdir_b.join("node_modules/lodash/lodash.js")).unwrap()),
+                immutable_hash
+            );
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+
+            let clean = Command::new("rm")
+                .args(["-rf", "node_modules"])
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(clean.status.success());
+            assert!(!workdir_a.join("node_modules").exists());
+            assert!(workdir_b.join("node_modules/lodash/lodash.js").is_file());
+            assert_eq!(sha256_hex(&fs::read(&layer_file).unwrap()), immutable_hash);
+
+            let install = Command::new("npm")
+                .args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+                .env("npm_config_cache", temp.path().join("npm-test-cache"))
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(
+                install.status.success(),
+                "npm ci through NFS failed: {}",
+                String::from_utf8_lossy(&install.stderr)
+            );
+            let reinstalled_prettier = Command::new("node_modules/.bin/prettier")
+                .arg("--version")
+                .current_dir(&workdir_a)
+                .output()
+                .unwrap();
+            assert!(
+                reinstalled_prettier.status.success(),
+                "npm-created bin symlink did not execute through NFS: {}",
+                String::from_utf8_lossy(&reinstalled_prettier.stderr)
+            );
+            for path in [
+                workdir_a.join("node_modules/lodash/lodash.js"),
+                workdir_b.join("node_modules/lodash/lodash.js"),
+                layer_file.clone(),
+            ] {
+                assert_eq!(sha256_hex(&fs::read(path).unwrap()), immutable_hash);
+            }
+
+            let lane_head_before = db.lane_details("node-nfs-a").unwrap().branch.head_change;
+            let checkpoint = db.checkpoint_lane_workspace("node-nfs-a", None).unwrap();
+            assert!(checkpoint.source_paths.is_empty());
+            assert!(checkpoint.generated_dirty_paths > 500);
+            assert_eq!(
+                db.lane_details("node-nfs-a").unwrap().branch.head_change,
+                lane_head_before
+            );
+            let view_a = db.lane_workspace_view("node-nfs-a").unwrap().unwrap();
+            let view_b = db.lane_workspace_view("node-nfs-b").unwrap().unwrap();
+            assert!(Path::new(&view_a.generated_upper)
+                .join("node_modules/lodash/lodash.js")
+                .is_file());
+            assert!(!Path::new(&view_b.generated_upper)
+                .join("node_modules/lodash/lodash.js")
+                .exists());
+            db.verify_workspace_layer(&first.layer_id).unwrap();
+            eprintln!(
+                "macos-nfs-node-layer layer_entries={} mount_two_ms={} shared_layer={} generated_a_bytes={} generated_b_bytes={}",
+                first.entry_count,
+                mount_ms,
+                first.layer_id,
+                db.lane_workspace_space("node-nfs-a")
+                    .unwrap()
+                    .generated_upper_bytes,
+                db.lane_workspace_space("node-nfs-b")
+                    .unwrap()
+                    .generated_upper_bytes,
+            );
+            drop(mount_b);
+            drop(mount_a);
+        }
+
+        #[test]
+        fn nfs_cargo_target_seed_is_shared_and_writable_targets_are_isolated() {
+            if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
+                return;
+            }
+            assert!(
+                Command::new("cargo")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success()),
+                "cargo is required for the real NFS target-layer acceptance test"
+            );
+
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("src")).unwrap();
+            fs::create_dir_all(temp.path().join("shared-dep/src")).unwrap();
+            fs::write(
+                temp.path().join("Cargo.toml"),
+                "[package]\nname = \"nfs-cache-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nshared-dep = { path = \"shared-dep\" }\n",
+            )
+            .unwrap();
+            fs::write(
+                temp.path().join("src/lib.rs"),
+                "pub fn answer() -> u64 { shared_dep::answer() }\n",
+            )
+            .unwrap();
+            fs::write(
+                temp.path().join("shared-dep/Cargo.toml"),
+                "[package]\nname = \"shared-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            fs::write(
+                temp.path().join("shared-dep/src/lib.rs"),
+                "pub fn answer() -> u64 { 42 }\n",
+            )
+            .unwrap();
+            let lock = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(temp.path())
+                .output()
+                .unwrap();
+            assert!(
+                lock.status.success(),
+                "cargo generate-lockfile failed: {}",
+                String::from_utf8_lossy(&lock.stderr)
+            );
+
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(temp.path()).unwrap();
+            for lane in ["rust-nfs-a", "rust-nfs-b"] {
+                db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+                    lane,
+                    Some("main"),
+                    LaneWorkdirMode::NfsCow,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+            }
+
+            let first = db
+                .exec_lane_workspace(
+                    "rust-nfs-a",
+                    &[
+                        "cargo".to_string(),
+                        "build".to_string(),
+                        "--offline".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(first.exit_code, 0);
+            let lane_a_head = db.lane_details("rust-nfs-a").unwrap().branch.head_change;
+            let checkpoint = db.checkpoint_lane_workspace("rust-nfs-a", None).unwrap();
+            assert!(checkpoint.source_paths.is_empty());
+            assert!(checkpoint.generated_dirty_paths > 0);
+            assert_eq!(
+                db.lane_details("rust-nfs-a").unwrap().branch.head_change,
+                lane_a_head
+            );
+            let view_a = db.lane_workspace_view("rust-nfs-a").unwrap().unwrap();
+            let target_a = PathBuf::from(&view_a.generated_upper).join("target");
+            assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
+
+            let cargo_version = Command::new("cargo").arg("--version").output().unwrap();
+            let key = WorkspaceLayerKeyV1 {
+                kind: "compiler-results".to_string(),
+                adapter: "cargo-target-seed".to_string(),
+                adapter_version: 1,
+                inputs: BTreeMap::from([
+                    ("source_root".to_string(), first.source_root.0.clone()),
+                    ("command".to_string(), "cargo build --offline".to_string()),
+                ]),
+                tool_versions: BTreeMap::from([(
+                    "cargo".to_string(),
+                    String::from_utf8_lossy(&cargo_version.stdout)
+                        .trim()
+                        .to_string(),
+                )]),
+                platform: std::env::consts::OS.to_string(),
+                architecture: std::env::consts::ARCH.to_string(),
+                portability_scope: "source-root-toolchain-platform".to_string(),
+                strategy: "immutable-target-seed".to_string(),
+            };
+            let layer = db
+                .publish_workspace_layer_from_directory(&key, &target_a)
+                .unwrap();
+            db.attach_workspace_layer(
+                "rust-nfs-b",
+                &layer.layer_id,
+                "target",
+                "cargo-target-seed",
+                &layer.cache_key,
+            )
+            .unwrap();
+
+            let second = db
+                .exec_lane_workspace(
+                    "rust-nfs-b",
+                    &[
+                        "cargo".to_string(),
+                        "build".to_string(),
+                        "--offline".to_string(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(second.exit_code, 0);
+            let view_b = db.lane_workspace_view("rust-nfs-b").unwrap().unwrap();
+            let target_b = PathBuf::from(&view_b.generated_upper).join("target");
+            assert!(
+                !tree_has_name_fragment(&target_b, "libshared_dep"),
+                "the second NFS lane rebuilt a dependency present in its immutable target seed"
+            );
+            assert!(tree_has_name_fragment(
+                Path::new(&layer.storage_path),
+                "libshared_dep"
+            ));
+
+            let clean = db
+                .exec_lane_workspace("rust-nfs-b", &["cargo".to_string(), "clean".to_string()])
+                .unwrap();
+            assert_eq!(clean.exit_code, 0);
+            assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
+            assert!(tree_has_name_fragment(
+                Path::new(&layer.storage_path),
+                "libshared_dep"
+            ));
+            db.verify_workspace_layer(&layer.layer_id).unwrap();
+            eprintln!(
+                "macos-nfs-cargo-layer shared_layer={} producer_bytes={} consumer_bytes={} checkpoint_source_paths={}",
+                layer.layer_id,
+                db.lane_workspace_space("rust-nfs-a")
+                    .unwrap()
+                    .generated_upper_bytes,
+                db.lane_workspace_space("rust-nfs-b")
+                    .unwrap()
+                    .generated_upper_bytes,
+                checkpoint.source_paths.len(),
+            );
+        }
+
+        fn tree_has_name_fragment(root: &Path, fragment: &str) -> bool {
+            ignore::WalkBuilder::new(root)
+                .hidden(false)
+                .build()
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(fragment))
+        }
+
+        #[test]
         fn nfs_git_checkout_reset_and_clean_are_lane_local() {
             if std::env::var_os("TRAIL_RUN_NFS_COW_TESTS").is_none() {
                 return;

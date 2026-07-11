@@ -449,7 +449,16 @@ impl ViewCore {
             return Ok(ViewNodeAttr {
                 ino,
                 kind,
-                mode: metadata_mode(&metadata, kind == ViewNodeKind::Directory),
+                mode: if kind == ViewNodeKind::File {
+                    // Published layers are immutable on disk, but the composed
+                    // view is writable through copy-on-write. NFS clients apply
+                    // mode checks before issuing WRITE/CREATE requests, so
+                    // exposing the backing layer's read-only bit would prevent
+                    // the request from ever reaching the COW adapter.
+                    copy_up_mode(&metadata)
+                } else {
+                    metadata_mode(&metadata, kind == ViewNodeKind::Directory)
+                },
                 size: if kind != ViewNodeKind::Directory {
                     metadata.len()
                 } else {

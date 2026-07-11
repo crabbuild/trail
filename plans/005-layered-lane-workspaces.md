@@ -84,6 +84,16 @@
   target seed supplies compiler results to a second lane. Its writable target
   remains private, `cargo clean` cannot alter the producer lane or seed, and a
   checkpoint after the build records zero source paths.
+- Native macOS loopback NFS now runs equivalent real dependency acceptance
+  cases. Two Node lanes share one 1,116-entry lodash/Prettier layer; mounted
+  package binaries and symlinks execute, while overwrite, `rm -rf
+  node_modules`, and `npm ci` in lane A leave lane B and the immutable layer
+  unchanged. A Cargo producer target can be published as an immutable seed for
+  lane B; the consumer reuses dependency artifacts without private copies,
+  `cargo clean` cannot alter the producer or seed, and both dependency
+  checkpoints record zero source paths. These tests also verify that immutable
+  backing files remain read-only while the NFS COW view exposes writable modes
+  required by the macOS client.
 - The million-path/twenty-view acceptance test also passes inside Linux: each
   view starts with one indexed path, all 20 views are created in 91 ms, and
   unchanged views consume 0 exclusive physical bytes.
