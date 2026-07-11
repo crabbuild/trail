@@ -11,8 +11,9 @@ GitHub attestations, and the Homebrew formula.
    `crabbuild/homebrew-tap`.
 2. Add a fine-grained token named `RELEASE_PLEASE_TOKEN`. It needs contents,
    issues, and pull requests write access to `crabbuild/trail`. A dedicated
-   token is required because tags and pull requests created with the built-in
-   `GITHUB_TOKEN` do not trigger follow-on GitHub Actions workflows.
+   token is required because tags pushed with the built-in `GITHUB_TOKEN` do
+   not trigger follow-on GitHub Actions workflows; pull-request checks created
+   that way may also require manual approval.
 3. Allow GitHub Actions to create pull requests under repository Settings,
    Actions, General.
 4. Protect `main` and require the normal CI, Release plan, and Release Readiness
