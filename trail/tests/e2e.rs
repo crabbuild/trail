@@ -64,6 +64,20 @@ fn trail_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/trail"))
 }
 
+#[test]
+fn cli_reports_package_version() {
+    let output = Command::new(trail_bin()).arg("--version").output().unwrap();
+    assert!(
+        output.status.success(),
+        "trail --version failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("trail {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 #[cfg(unix)]
 struct StubAcpAgentOptions<'a> {
     session_id: &'a str,

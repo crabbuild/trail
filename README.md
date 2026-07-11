@@ -408,8 +408,32 @@ workdirs, stale refs, and conflicted merges before changes are accepted.
 
 ## Quick Start
 
-Trail is a Rust workspace. The repository declares Rust 1.81 in `Cargo.toml`.
-Build from source with the Makefile:
+Install the current stable release on macOS with Homebrew:
+
+```sh
+brew install crabbuild/tap/trail
+trail --version
+```
+
+On Linux, use the release installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/crabbuild/trail/releases/latest/download/trail-installer.sh | sh
+trail --version
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://github.com/crabbuild/trail/releases/latest/download/trail-installer.ps1 | iex
+trail --version
+```
+
+The normal CLI does not require a background service. Linux FUSE, macFUSE, and
+Windows Dokan are only relevant to their corresponding mounted-workspace modes.
+
+To build from source instead, install Rust 1.81 or newer and use the Makefile:
 
 ```sh
 # Build the debug binary at target/debug/trail.
@@ -419,7 +443,7 @@ make build
 target/debug/trail --help
 ```
 
-Install a local optimized binary with the Makefile. By default this installs to
+Install that source build locally. By default this installs to
 `$HOME/.cargo/bin/trail`:
 
 ```sh
@@ -1311,6 +1335,7 @@ Start with the docs home:
 
 - [Trail documentation](docs/README.md)
 - [Roadmap](ROADMAP.md)
+- [Changelog](CHANGELOG.md)
 - [Install and build](docs/getting-started/install-and-build.md)
 - [Initialize a workspace](docs/getting-started/initialize-a-workspace.md)
 - [First record and provenance query](docs/getting-started/first-record-and-query.md)
@@ -1332,6 +1357,9 @@ Read by topic:
 - [Code fact map](docs/_meta/code-fact-map.md)
 
 ## Development
+
+Maintainers should follow the reviewed, tag-driven process in
+[RELEASING.md](RELEASING.md) when publishing binaries and installers.
 
 Run the main test suite:
 

@@ -239,6 +239,11 @@ release-check: ## Verify release readiness
 	@$(CARGO) build --release -p $(BIN_NAME) \
 	  && printf "  $(CHECK) release build ok\n" \
 	  || { printf "  ✗ build failure\n"; exit 1; }
+	@actual="$$(target/release/$(BIN_NAME) --version)"; \
+	  expected="$(BIN_NAME) $(VERSION)"; \
+	  test "$$actual" = "$$expected" \
+	  && printf "  $(CHECK) version output matches v$(VERSION)\n" \
+	  || { printf "  ✗ expected '%s', got '%s'\n" "$$expected" "$$actual"; exit 1; }
 	@printf "\n$(BOLD)$(GREEN)Release v$(VERSION) is ready.$(RESET)\n"
 
 # ── Cross-compilation ──────────────────────────────────────────────

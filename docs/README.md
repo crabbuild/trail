@@ -7,6 +7,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 ## Start Here
 
 - [Roadmap](../ROADMAP.md)
+- [Changelog](../CHANGELOG.md)
 - [Install and build](getting-started/install-and-build.md)
 - [Initialize a workspace](getting-started/initialize-a-workspace.md)
 - [First record and provenance query](getting-started/first-record-and-query.md)

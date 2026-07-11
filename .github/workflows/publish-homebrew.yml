@@ -1,0 +1,58 @@
+name: Publish Homebrew Formula
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Stable Trail release tag to publish"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download formula from the GitHub Release
+        run: |
+          mkdir -p "${RUNNER_TEMP}/formula"
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern trail.rb \
+            --dir "${RUNNER_TEMP}/formula"
+          ruby -c "${RUNNER_TEMP}/formula/trail.rb"
+      - name: Check out the Crab Build tap
+        uses: actions/checkout@v6
+        with:
+          repository: crabbuild/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Commit and push the formula
+        run: |
+          mkdir -p homebrew-tap/Formula
+          install -m 0644 "${RUNNER_TEMP}/formula/trail.rb" homebrew-tap/Formula/trail.rb
+          cd homebrew-tap
+          unexpected="$(git status --porcelain | awk '$2 != "Formula/trail.rb"')"
+          if [[ -n "${unexpected}" ]]; then
+            echo "Refusing to publish because unrelated tap files changed:"
+            echo "${unexpected}"
+            exit 1
+          fi
+          if git diff --quiet -- Formula/trail.rb && \
+             git ls-files --error-unmatch Formula/trail.rb >/dev/null 2>&1; then
+            echo "Formula/trail.rb is already current"
+            exit 0
+          fi
+          git config user.name "Crab Build Release Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/trail.rb
+          git commit -m "trail ${RELEASE_TAG#v}"
+          git push

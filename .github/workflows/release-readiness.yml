@@ -1,0 +1,69 @@
+name: Release Readiness
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "trail/Cargo.toml"
+      - "trail/src/cli/command.rs"
+      - "CHANGELOG.md"
+      - "RELEASING.md"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/publish-homebrew.yml"
+      - ".github/workflows/release-readiness.yml"
+  workflow_dispatch:
+
+jobs:
+  package-smoke:
+    name: Package smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --locked -p trail --profile dist
+      - name: Verify packaged CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            suffix=".exe"
+          fi
+          binary="${PWD}/target/dist/trail${suffix}"
+          expected="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          actual="$("${binary}" --version)"
+          test "${actual}" = "trail ${expected}"
+          "${binary}" --help >/dev/null
+
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "${smoke_dir}"' EXIT
+          cd "${smoke_dir}"
+          printf 'release smoke test\n' > README.md
+          "${binary}" init --working-tree
+          "${binary}" status
+
+  dist-plan:
+    name: Generated release workflow is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install pinned dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+      - name: Check release configuration
+        run: |
+          dist generate --mode=ci --check
+          dist plan --tag="v$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"

@@ -31,6 +31,7 @@ pub(crate) fn run() {
 #[derive(Parser)]
 #[command(name = "trail")]
 #[command(about = "Local-first operation database for code and text worktrees")]
+#[command(version)]
 struct Cli {
     #[arg(long, global = true)]
     workspace: Option<PathBuf>,

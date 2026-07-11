@@ -7,7 +7,51 @@ Trail is a Rust workspace with two crates:
 
 The workspace declares Rust 1.81 in `Cargo.toml`.
 
-## Install the CLI
+## Install a Release
+
+### macOS
+
+Install the Intel or Apple Silicon binary with Homebrew:
+
+```sh
+brew install crabbuild/tap/trail
+trail --version
+```
+
+### Linux
+
+The installer selects the matching x86-64 or ARM64 GitHub Release archive and
+installs `trail` under Cargo's normal binary directory:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/crabbuild/trail/releases/latest/download/trail-installer.sh | sh
+trail --version
+```
+
+Homebrew users on Linux can alternatively run:
+
+```sh
+brew install crabbuild/tap/trail
+```
+
+### Windows
+
+Run the release installer from PowerShell:
+
+```powershell
+irm https://github.com/crabbuild/trail/releases/latest/download/trail-installer.ps1 | iex
+trail --version
+```
+
+Archives and their SHA-256 checksum files are also attached to every
+[GitHub Release](https://github.com/crabbuild/trail/releases).
+
+The base CLI, HTTP daemon, and MCP server do not require a filesystem driver.
+Linux FUSE, optional macFUSE, and Windows Dokan are needed only when using the
+corresponding mounted-workspace implementation.
+
+## Install from Source
 
 From the repository root:
 
@@ -21,7 +65,7 @@ By default this builds an optimized release binary and installs it to:
 $HOME/.cargo/bin/trail
 ```
 
-Verify the installed command and the lane command group:
+Verify the source-built command and the lane command group:
 
 ```sh
 trail --help
@@ -36,7 +80,7 @@ make install PREFIX="$PWD/.local"
 ./.local/bin/trail --help
 ```
 
-## Build from Source
+## Build Without Installing
 
 From the repository root:
 

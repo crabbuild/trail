@@ -19,6 +19,42 @@ edition = "2021"
 rust-version = "1.81"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
+authors = ["Crab Build"]
+repository = "https://github.com/crabbuild/trail"
+homepage = "https://github.com/crabbuild/trail"
+readme = "README.md"
+
+# The profile used for binaries published through GitHub Releases.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Whether to consider the binaries in a package for distribution (defaults true)
+dist = false
+# Whether to publish prereleases to package managers
+publish-prereleases = false
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# Checksums to generate for each App
+checksum = "sha256"
+# Whether to enable GitHub Attestations
+github-attestations = true
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Custom message to display on successful install
+install-success-msg = "Trail is installed. Run `trail --version` to verify it."
+# Whether to install an updater program
+install-updater = false
 
 [workspace.dependencies]
 bzip2 = "0.5"
