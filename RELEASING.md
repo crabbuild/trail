@@ -51,8 +51,8 @@ The merge changes `.release-please-manifest.json`, so the same workflow creates
 and pushes the matching annotated `vX.Y.Z` tag. That tag starts the generated
 `release.yml` cargo-dist workflow. Cargo-dist builds and attests all platform
 artifacts, then publishes the GitHub Release. Publishing the stable release
-starts `publish-homebrew.yml`, which updates `Formula/trail.rb` in the shared
-tap.
+completes the generated Release workflow, whose `workflow_run` event starts
+`publish-homebrew.yml` and updates `Formula/trail.rb` in the shared tap.
 
 No manual version editing or tagging is required during the normal flow.
 
@@ -74,7 +74,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
 ```
 
-Publishing a stable GitHub Release triggers `publish-homebrew.yml`, which
+A successful stable-tag Release workflow triggers `publish-homebrew.yml`, which
 updates `Formula/trail.rb` in `crabbuild/homebrew-tap`. Prerelease tags such as
 `v0.2.0-rc.1` create a GitHub prerelease but do not replace the stable Homebrew
 formula. The Homebrew workflow can be dispatched again with the stable tag if

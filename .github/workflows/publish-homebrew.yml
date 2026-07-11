@@ -3,6 +3,9 @@ name: Publish Homebrew Formula
 on:
   release:
     types: [published]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -15,13 +18,36 @@ permissions:
 
 jobs:
   publish:
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'release' && !github.event.release.prerelease) ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         startsWith(github.event.workflow_run.head_branch, 'v'))
+      }}
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+      RELEASE_TAG: >-
+        ${{
+          github.event_name == 'workflow_dispatch' && inputs.tag ||
+          github.event_name == 'workflow_run' && github.event.workflow_run.head_branch ||
+          github.event.release.tag_name
+        }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Resolve stable release
+        id: release
+        run: |
+          release="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft,isPrerelease)"
+          if [[ "$(jq -r '.isDraft or .isPrerelease' <<<"${release}")" == "true" ]]; then
+            echo "Skipping draft or prerelease ${RELEASE_TAG}"
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+          fi
       - name: Download formula from the GitHub Release
+        if: ${{ steps.release.outputs.publish == 'true' }}
         run: |
           mkdir -p "${RUNNER_TEMP}/formula"
           gh release download "${RELEASE_TAG}" \
@@ -30,12 +56,14 @@ jobs:
             --dir "${RUNNER_TEMP}/formula"
           ruby -c "${RUNNER_TEMP}/formula/trail.rb"
       - name: Check out the Crab Build tap
+        if: ${{ steps.release.outputs.publish == 'true' }}
         uses: actions/checkout@v6
         with:
           repository: crabbuild/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
       - name: Commit and push the formula
+        if: ${{ steps.release.outputs.publish == 'true' }}
         run: |
           mkdir -p homebrew-tap/Formula
           install -m 0644 "${RUNNER_TEMP}/formula/trail.rb" homebrew-tap/Formula/trail.rb
