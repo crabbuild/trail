@@ -11,7 +11,8 @@ if ($actualSha256 -ne $expectedSha256) {
     throw "Dokany installer checksum mismatch: expected $expectedSha256, got $actualSha256"
 }
 
-& msiexec.exe /i $installer /qn /norestart
-if ($LASTEXITCODE -notin @(0, 3010)) {
-    throw "Dokany installer failed with exit code $LASTEXITCODE"
+$arguments = @("/i", "`"$installer`"", "/qn", "/norestart")
+$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+if ($process.ExitCode -notin @(0, 3010)) {
+    throw "Dokany installer failed with exit code $($process.ExitCode)"
 }
