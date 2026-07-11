@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -75,6 +77,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -118,6 +122,8 @@ jobs:
             test: slatedb_store
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install RocksDB native dependencies
         if: ${{ matrix.backend == 'rocksdb' }}
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -132,6 +138,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 22
