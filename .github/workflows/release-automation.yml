@@ -33,6 +33,7 @@ jobs:
             echo "available=true" >> "${GITHUB_OUTPUT}"
           fi
       - name: Create or update the release pull request
+        id: release
         if: ${{ steps.token.outputs.available == 'true' }}
         uses: googleapis/release-please-action@v5
         with:
@@ -40,6 +41,72 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           skip-github-release: true
+      - name: Resolve release pull request branch
+        id: release-pr
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          branch="$(jq -er '.headBranchName' <<<"${RELEASE_PR}")"
+          echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+      - name: Check out release pull request
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release-pr.outputs.branch }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      - name: Synchronize Trail version in Cargo.lock
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          RELEASE_PR_BRANCH: ${{ steps.release-pr.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          release_version="$(tr -d '[:space:]' < version.txt)"
+          lock_version="$(awk '
+            $0 == "[[package]]" { in_trail = 0 }
+            $0 == "name = \"trail\"" { in_trail = 1; next }
+            in_trail && /^version = "/ {
+              value = $0
+              sub(/^version = "/, "", value)
+              sub(/".*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.lock)"
+
+          if [[ -z "${lock_version}" ]]; then
+            echo "Cargo.lock has no Trail package entry." >&2
+            exit 1
+          fi
+          if [[ "${lock_version}" == "${release_version}" ]]; then
+            echo "Cargo.lock is already current at ${release_version}."
+            exit 0
+          fi
+
+          RELEASE_VERSION="${release_version}" perl -0pi -e '
+            $count = s{(\[\[package\]\]\nname = "trail"\nversion = ")[^"]+}{$1$ENV{RELEASE_VERSION}};
+            die "expected exactly one Trail package entry\n" unless $count == 1;
+          ' Cargo.lock
+
+          updated_version="$(awk '
+            $0 == "[[package]]" { in_trail = 0 }
+            $0 == "name = \"trail\"" { in_trail = 1; next }
+            in_trail && /^version = "/ {
+              value = $0
+              sub(/^version = "/, "", value)
+              sub(/".*$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.lock)"
+          test "${updated_version}" = "${release_version}"
+
+          git config user.name "Crab Build Release Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: update Cargo.lock for ${release_version}"
+          git push origin "HEAD:${RELEASE_PR_BRANCH}"
 
   tag-release:
     name: Tag merged release pull request
