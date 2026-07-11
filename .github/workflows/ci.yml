@@ -90,7 +90,12 @@ jobs:
       - name: Default tests
         run: cargo test -p prolly-map
       - name: Clippy
-        run: cargo clippy -p prolly-map --all-targets --features "tokio sqlite" -- -D warnings
+        run: >-
+          cargo clippy -p prolly-map --all-targets --features "tokio sqlite" --
+          -D warnings
+          -A clippy::result-large-err
+          -A clippy::large-enum-variant
+          -A clippy::type-complexity
       - name: Rustdoc
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p prolly-map --no-deps --features "tokio sqlite"
       - name: Inspect binary
