@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_dokan_conformance:
+        description: "Run experimental Dokan mount conformance tests"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   core:
@@ -93,6 +98,7 @@ jobs:
           TRAIL_RUN_NFS_COW_TESTS: "1"
 
   dokan-conformance:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_dokan_conformance }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
