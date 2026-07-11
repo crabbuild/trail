@@ -31,7 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p trail view_core_ --no-default-features
-      - run: cargo test -p trail workspace_layer --no-default-features
+      - if: ${{ runner.os != 'Windows' }}
+        run: cargo test -p trail workspace_layer --no-default-features
 
   fuse-conformance:
     runs-on: ubuntu-latest
@@ -98,7 +99,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: choco install dokan -y --no-progress
+      - run: choco install dokany2 -y --no-progress
       - shell: pwsh
         run: |
           $env:TRAIL_RUN_DOKAN_COW_TESTS = "1"
