@@ -47,7 +47,7 @@ pub(super) fn push_active_leases_check(db: &Trail, checks: &mut Vec<DoctorCheck>
 }
 
 pub(super) fn push_merge_queue_check(db: &Trail, checks: &mut Vec<DoctorCheck>) {
-    match db.list_merge_queue() {
+    match db.list_lane_merge_queue() {
         Ok(entries) => {
             let queued = entries
                 .iter()

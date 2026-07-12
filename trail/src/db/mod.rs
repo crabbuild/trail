@@ -35,7 +35,7 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
-const TRAIL_SCHEMA_VERSION: i64 = 15;
+const TRAIL_SCHEMA_VERSION: i64 = 16;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";

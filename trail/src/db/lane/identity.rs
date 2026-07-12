@@ -78,8 +78,8 @@ impl Trail {
             .as_ref()
             .map(|_| worktree_state_from_changes(&workdir_changed_paths));
         let queued_merges: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM merge_queue WHERE source_ref = ?1 AND status IN ('queued', 'running')",
-            params![details.branch.ref_name],
+            "SELECT COUNT(*) FROM lane_merge_queue WHERE lane_id = ?1 AND status IN ('queued', 'running')",
+            params![details.branch.lane_id],
             |row| row.get(0),
         )?;
         Ok(LaneStatusReport {

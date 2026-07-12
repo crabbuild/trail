@@ -62,7 +62,7 @@ pub(crate) fn render_merge(
 }
 
 pub(crate) fn render_merge_queue_add(
-    report: &MergeQueueAddReport,
+    report: &LaneMergeQueueAddReport,
     json: bool,
     options: &RenderOptions,
 ) -> Result<()> {
@@ -73,7 +73,7 @@ pub(crate) fn render_merge_queue_add(
         &TerminalDocument::new(
             format!(
                 "Queued {} into {}",
-                report.entry.source_ref, report.entry.target_ref
+                report.entry.lane, report.entry.target_ref
             ),
             UiTone::Success,
         )
@@ -87,7 +87,7 @@ pub(crate) fn render_merge_queue_add(
 }
 
 pub(crate) fn render_merge_queue_list(
-    entries: &[MergeQueueEntry],
+    entries: &[LaneMergeQueueEntry],
     json: bool,
     options: &RenderOptions,
 ) -> Result<()> {
@@ -119,7 +119,7 @@ pub(crate) fn render_merge_queue_list(
                     vec![
                         entry.status.clone(),
                         entry.priority.to_string(),
-                        entry.source_ref.clone(),
+                        entry.lane.clone(),
                         entry.target_ref.clone(),
                         entry.queue_id.clone(),
                     ]
@@ -135,7 +135,7 @@ pub(crate) fn render_merge_queue_list(
 }
 
 pub(crate) fn render_merge_queue_run(
-    report: &MergeQueueRunReport,
+    report: &LaneMergeQueueRunReport,
     json: bool,
     options: &RenderOptions,
 ) -> Result<()> {
@@ -171,7 +171,7 @@ pub(crate) fn render_merge_queue_run(
                 .map(|item| {
                     vec![
                         item.status.clone(),
-                        item.source_ref.clone(),
+                        item.lane.clone(),
                         item.target_ref.clone(),
                         item.error
                             .clone()
@@ -197,7 +197,7 @@ pub(crate) fn render_merge_queue_run(
 }
 
 pub(crate) fn render_merge_queue_explain(
-    report: &MergeQueueExplainReport,
+    report: &LaneMergeQueueExplainReport,
     json: bool,
     options: &RenderOptions,
 ) -> Result<()> {
@@ -248,7 +248,7 @@ pub(crate) fn render_merge_queue_explain(
 }
 
 pub(crate) fn render_merge_queue_remove(
-    report: &MergeQueueRemoveReport,
+    report: &LaneMergeQueueRemoveReport,
     json: bool,
     options: &RenderOptions,
 ) -> Result<()> {
@@ -409,12 +409,12 @@ pub(crate) fn render_conflict_resolve(
     render_document(&document, options)
 }
 
-fn queue_entry_block(entry: &MergeQueueEntry) -> UiBlock {
+fn queue_entry_block(entry: &LaneMergeQueueEntry) -> UiBlock {
     UiBlock::Metadata(vec![
         ("ID".to_string(), entry.queue_id.clone()),
         ("Status".to_string(), entry.status.clone()),
         ("Priority".to_string(), entry.priority.to_string()),
-        ("Source".to_string(), entry.source_ref.clone()),
+        ("Lane".to_string(), entry.lane.clone()),
         ("Target".to_string(), entry.target_ref.clone()),
     ])
 }

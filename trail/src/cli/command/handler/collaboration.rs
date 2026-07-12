@@ -7,27 +7,27 @@ pub(super) fn handle_merge_queue_command(
     match queue.command {
         MergeQueueSubcommand::Add(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.enqueue_merge(&args.source, &args.into, args.priority)?;
+            let report = db.enqueue_lane_merge(&args.source, &args.into, args.priority)?;
             render_merge_queue_add(&report, ctx.json, &ctx.render)
         }
         MergeQueueSubcommand::List => {
             let db = open_db(ctx)?;
-            let entries = db.list_merge_queue()?;
+            let entries = db.list_lane_merge_queue()?;
             render_merge_queue_list(&entries, ctx.json, &ctx.render)
         }
         MergeQueueSubcommand::Explain(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.explain_merge_queue(&args.selector)?;
+            let report = db.explain_lane_merge_queue(&args.selector)?;
             render_merge_queue_explain(&report, ctx.json, &ctx.render)
         }
         MergeQueueSubcommand::Run(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.run_merge_queue(args.limit)?;
+            let report = db.run_lane_merge_queue(args.limit)?;
             render_merge_queue_run(&report, ctx.json, &ctx.render)
         }
         MergeQueueSubcommand::Remove(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.remove_merge_queue(&args.selector)?;
+            let report = db.remove_lane_merge_queue(&args.selector)?;
             render_merge_queue_remove(&report, ctx.json, &ctx.render)
         }
     }

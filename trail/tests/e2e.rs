@@ -1136,8 +1136,8 @@ fn conflicted_readme_workspace(
         false,
     )
     .unwrap();
-    db.enqueue_merge("manual-bot", "main", 0).unwrap();
-    let run = db.run_merge_queue(None).unwrap();
+    db.enqueue_lane_merge("manual-bot", "main", 0).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert!(run.stopped_on_conflict);
     let conflict_id = db.list_conflicts().unwrap()[0].conflict_set_id.clone();
     (temp, db, conflict_id)
@@ -1443,7 +1443,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 15
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 16
         }));
     }
 
@@ -1513,6 +1513,69 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         .unwrap();
     assert_eq!(pending.status, "warning");
     assert_eq!(pending.details.as_ref().unwrap()["count"], 1);
+}
+
+#[test]
+fn schema_v16_discards_generic_merge_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let db_path = temp.path().join(".trail/index/trail.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE lane_merge_queue;
+         CREATE TABLE merge_queue (
+             queue_id TEXT PRIMARY KEY,
+             source_ref TEXT NOT NULL,
+             target_ref TEXT NOT NULL,
+             status TEXT NOT NULL,
+             priority INTEGER NOT NULL DEFAULT 0,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         INSERT INTO merge_queue VALUES (
+             'mq_legacy', 'refs/branches/feature', 'refs/branches/main',
+             'queued', 0, 1, 1
+         );
+         ALTER TABLE merge_results RENAME COLUMN lane_queue_id TO queue_id;
+         PRAGMA user_version = 15;
+         UPDATE schema_meta SET value = '15' WHERE key = 'schema.version';",
+    )
+    .unwrap();
+    drop(conn);
+
+    Trail::open(temp.path()).unwrap();
+    let conn = Connection::open(db_path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 16);
+    let legacy_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'merge_queue'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_tables, 0);
+    let lane_queue_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM lane_merge_queue", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(lane_queue_rows, 0);
+    let merge_result_columns = conn
+        .prepare("PRAGMA table_info(merge_results)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(merge_result_columns
+        .iter()
+        .any(|name| name == "lane_queue_id"));
+    assert!(!merge_result_columns.iter().any(|name| name == "queue_id"));
 }
 
 #[test]
@@ -22772,8 +22835,8 @@ fn dirty_lane_workdir_must_be_recorded_before_merge() {
     assert!(matches!(err, Error::DirtyWorktreeWithMessage(_)));
     assert!(err.to_string().contains("lane record doc-bot"));
 
-    db.enqueue_merge("doc-bot", "main", 0).unwrap();
-    let run = db.run_merge_queue(None).unwrap();
+    db.enqueue_lane_merge("doc-bot", "main", 0).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "failed");
     assert!(run.stopped_on_failure);
@@ -23738,7 +23801,7 @@ fn local_http_bodyless_mutations_reject_request_bodies() {
         .create_anchor("README.md:1", "stable readme", Some("main"))
         .unwrap()
         .anchor;
-    let queued = db.enqueue_merge("doc-bot", "main", 0).unwrap().entry;
+    let queued = db.enqueue_lane_merge("doc-bot", "main", 0).unwrap().entry;
 
     let assert_rejected = |response: &trail::server::HttpResponse, endpoint: &str| {
         assert_eq!(response.status, 400);
@@ -23791,7 +23854,7 @@ fn local_http_bodyless_mutations_reject_request_bodies() {
     );
     assert_rejected(&bad_queue_remove, "DELETE /v1/merge-queue/{queue_id}");
     assert!(db
-        .list_merge_queue()
+        .list_lane_merge_queue()
         .unwrap()
         .iter()
         .any(|item| item.queue_id == queued.queue_id && item.status == "queued"));
@@ -23845,8 +23908,8 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
     assert!(direct_err.to_string().contains("not merge-ready"));
     assert!(direct_err.to_string().contains("pending_approvals"));
 
-    db.enqueue_merge("approval-bot", "main", 0).unwrap();
-    let explain = db.explain_merge_queue("approval-bot").unwrap();
+    db.enqueue_lane_merge("approval-bot", "main", 0).unwrap();
+    let explain = db.explain_lane_merge_queue("approval-bot").unwrap();
     assert!(explain
         .blockers
         .iter()
@@ -23859,7 +23922,7 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
             ))
     }));
 
-    let run = db.run_merge_queue(None).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "failed");
     assert!(run.stopped_on_failure);
@@ -23880,7 +23943,9 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
     }))
     .unwrap();
     apply_lane_patch_at_head(&mut db, "late-approval-bot", late_patch).unwrap();
-    let late_queue = db.enqueue_merge("late-approval-bot", "main", 0).unwrap();
+    let late_queue = db
+        .enqueue_lane_merge("late-approval-bot", "main", 0)
+        .unwrap();
     assert!(db.lane_readiness("late-approval-bot").unwrap().ready);
     db.request_lane_approval(
         "late-approval-bot",
@@ -23891,7 +23956,7 @@ fn merge_lane_and_queue_enforce_readiness_blockers() {
         None,
     )
     .unwrap();
-    let late_run = db.run_merge_queue(None).unwrap();
+    let late_run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(late_run.processed.len(), 1);
     assert_eq!(late_run.processed[0].queue_id, late_queue.entry.queue_id);
     assert_eq!(late_run.processed[0].status, "failed");
@@ -24095,7 +24160,7 @@ fn required_gate_config_blocks_merge_until_test_and_eval_pass() {
 }
 
 #[test]
-fn merge_queue_runs_lane_branch_into_main() {
+fn lane_merge_queue_runs_lane_branch_into_main() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -24114,11 +24179,12 @@ fn merge_queue_runs_lane_branch_into_main() {
     .unwrap();
     apply_lane_patch_at_head(&mut db, "doc-bot", patch).unwrap();
 
-    let queued = db.enqueue_merge("doc-bot", "main", 10).unwrap();
+    let queued = db.enqueue_lane_merge("doc-bot", "main", 10).unwrap();
     assert_eq!(queued.entry.status, "queued");
-    assert_eq!(db.list_merge_queue().unwrap().len(), 1);
+    assert_eq!(queued.entry.lane, "doc-bot");
+    assert_eq!(db.list_lane_merge_queue().unwrap().len(), 1);
 
-    let run = db.run_merge_queue(None).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "merged");
     assert!(!run.stopped_on_conflict);
@@ -24133,7 +24199,7 @@ fn merge_queue_runs_lane_branch_into_main() {
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let queue_status: String = conn
         .query_row(
-            "SELECT status FROM merge_queue WHERE queue_id = ?1",
+            "SELECT status FROM lane_merge_queue WHERE queue_id = ?1",
             [&queued.entry.queue_id],
             |row| row.get(0),
         )
@@ -24143,6 +24209,18 @@ fn merge_queue_runs_lane_branch_into_main() {
         .unwrap();
     assert_eq!(queue_status, "merged");
     assert_eq!(merge_results, 1);
+}
+
+#[test]
+fn lane_merge_queue_rejects_branch_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let error = db.enqueue_lane_merge("main", "main", 0).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(error.to_string().contains("lane"));
 }
 
 #[test]
@@ -24169,10 +24247,10 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         false,
     )
     .unwrap();
-    let queued = db.enqueue_merge("explain-bot", "main", 0).unwrap();
+    let queued = db.enqueue_lane_merge("explain-bot", "main", 0).unwrap();
     let queue_id = queued.entry.queue_id.clone();
 
-    let explain = db.explain_merge_queue("explain-bot").unwrap();
+    let explain = db.explain_lane_merge_queue("explain-bot").unwrap();
     assert!(explain
         .blockers
         .iter()
@@ -24304,7 +24382,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
 }
 
 #[test]
-fn merge_queue_pauses_on_conflict() {
+fn lane_merge_queue_pauses_on_conflict() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -24331,9 +24409,9 @@ fn merge_queue_pauses_on_conflict() {
         false,
     )
     .unwrap();
-    let queued = db.enqueue_merge("doc-bot", "main", 0).unwrap();
+    let queued = db.enqueue_lane_merge("doc-bot", "main", 0).unwrap();
 
-    let run = db.run_merge_queue(None).unwrap();
+    let run = db.run_lane_merge_queue(None).unwrap();
     assert_eq!(run.processed.len(), 1);
     assert_eq!(run.processed[0].status, "conflicted");
     assert!(run.stopped_on_conflict);
@@ -24342,7 +24420,7 @@ fn merge_queue_pauses_on_conflict() {
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let queue_status: String = conn
         .query_row(
-            "SELECT status FROM merge_queue WHERE queue_id = ?1",
+            "SELECT status FROM lane_merge_queue WHERE queue_id = ?1",
             [&queued.entry.queue_id],
             |row| row.get(0),
         )
@@ -24404,7 +24482,7 @@ fn merge_queue_pauses_on_conflict() {
 
     let queue_status: String = conn
         .query_row(
-            "SELECT status FROM merge_queue WHERE queue_id = ?1",
+            "SELECT status FROM lane_merge_queue WHERE queue_id = ?1",
             [&queued.entry.queue_id],
             |row| row.get(0),
         )

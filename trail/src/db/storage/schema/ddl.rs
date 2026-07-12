@@ -246,18 +246,22 @@ impl Trail {
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS merge_queue (
+            CREATE TABLE IF NOT EXISTS lane_merge_queue (
                 queue_id TEXT PRIMARY KEY,
-                source_ref TEXT NOT NULL,
+                lane_id TEXT NOT NULL,
                 target_ref TEXT NOT NULL,
                 status TEXT NOT NULL,
                 priority INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS lane_merge_queue_active_idx
+                ON lane_merge_queue(lane_id, target_ref, status);
+            CREATE INDEX IF NOT EXISTS lane_merge_queue_run_idx
+                ON lane_merge_queue(status, priority DESC, created_at ASC);
             CREATE TABLE IF NOT EXISTS merge_results (
                 merge_id TEXT PRIMARY KEY,
-                queue_id TEXT,
+                lane_queue_id TEXT,
                 source_ref TEXT NOT NULL,
                 target_ref TEXT NOT NULL,
                 base_change TEXT NOT NULL,
@@ -789,6 +793,9 @@ impl Trail {
             CREATE INDEX IF NOT EXISTS memory_revisions_source_change_idx ON memory_revisions(source_change, created_at);
             ",
         )?;
+            if user_version < 16 {
+                migrate_lane_merge_queue_v16(&self.conn)?;
+            }
             ensure_column(&self.conn, "conflict_sets", "details_json", "TEXT")?;
             ensure_column(&self.conn, "merge_results", "base_root", "TEXT")?;
             ensure_column(&self.conn, "merge_results", "left_root", "TEXT")?;
@@ -998,6 +1005,22 @@ impl Trail {
             }
         }
     }
+}
+
+fn migrate_lane_merge_queue_v16(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS merge_queue;")?;
+    let mut stmt = conn.prepare("PRAGMA table_info(merge_results)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    drop(stmt);
+    if columns.contains("queue_id") && !columns.contains("lane_queue_id") {
+        conn.execute_batch(
+            "ALTER TABLE merge_results RENAME COLUMN queue_id TO lane_queue_id;
+             UPDATE merge_results SET lane_queue_id = NULL WHERE lane_queue_id IS NOT NULL;",
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_environment_generation_outputs_v7(conn: &Connection) -> Result<()> {

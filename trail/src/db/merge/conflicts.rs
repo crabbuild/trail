@@ -167,7 +167,7 @@ impl Trail {
         )?;
         if let Some(queue_id) = pending.queue_id {
             self.conn.execute(
-                "UPDATE merge_queue SET status = 'merged', updated_at = ?1 WHERE queue_id = ?2",
+                "UPDATE lane_merge_queue SET status = 'merged', updated_at = ?1 WHERE queue_id = ?2",
                 params![now_ts(), queue_id],
             )?;
         }

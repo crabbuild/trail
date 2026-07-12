@@ -45,13 +45,13 @@ pub(super) fn handle_collaboration_routes(
     }
 
     if request.method == "GET" && path == "/v1/merge-queue" {
-        let entries = db.list_merge_queue()?;
+        let entries = db.list_lane_merge_queue()?;
         return Ok(Some(json_response(200, "OK", &entries)?));
     }
 
     if request.method == "POST" && path == "/v1/merge-queue" {
         let body: MergeQueueAddRequest = serde_json::from_slice(&request.body)?;
-        let report = db.enqueue_merge(&body.source, &body.target, body.priority)?;
+        let report = db.enqueue_lane_merge(&body.source, &body.target, body.priority)?;
         return Ok(Some(json_response(201, "Created", &report)?));
     }
 
@@ -61,12 +61,12 @@ pub(super) fn handle_collaboration_routes(
         } else {
             serde_json::from_slice(&request.body)?
         };
-        let report = db.run_merge_queue(body.limit)?;
+        let report = db.run_lane_merge_queue(body.limit)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
     if request.method == "GET" && path == "/v1/merge-queue/explain" {
-        let report = db.explain_merge_queue(required_query(query, "selector")?)?;
+        let report = db.explain_lane_merge_queue(required_query(query, "selector")?)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
@@ -99,7 +99,7 @@ pub(super) fn handle_collaboration_routes(
         && request.method == "DELETE"
     {
         reject_unexpected_body(request, "DELETE /v1/merge-queue/{queue_id}")?;
-        let report = db.remove_merge_queue(parts[2])?;
+        let report = db.remove_lane_merge_queue(parts[2])?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
@@ -109,7 +109,7 @@ pub(super) fn handle_collaboration_routes(
         && parts[3] == "explain"
         && request.method == "GET"
     {
-        let report = db.explain_merge_queue(parts[2])?;
+        let report = db.explain_lane_merge_queue(parts[2])?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

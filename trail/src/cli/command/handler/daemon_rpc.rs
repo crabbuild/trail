@@ -830,17 +830,17 @@ fn handle_merge_queue_command(
                 "target": args.into,
                 "priority": args.priority,
             });
-            let report: MergeQueueAddReport = client.post_json("/v1/merge-queue", &body)?;
+            let report: LaneMergeQueueAddReport = client.post_json("/v1/merge-queue", &body)?;
             render_merge_queue_add(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::List => {
-            let entries: Vec<MergeQueueEntry> = client.get_json("/v1/merge-queue")?;
+            let entries: Vec<LaneMergeQueueEntry> = client.get_json("/v1/merge-queue")?;
             render_merge_queue_list(&entries, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::Explain(args) => {
-            let report: MergeQueueExplainReport = client.get_json(&format!(
+            let report: LaneMergeQueueExplainReport = client.get_json(&format!(
                 "/v1/merge-queue/explain?selector={}",
                 args.selector
             ))?;
@@ -852,12 +852,12 @@ fn handle_merge_queue_command(
                 Some(limit) => serde_json::json!({ "limit": limit }),
                 None => serde_json::json!({}),
             };
-            let report: MergeQueueRunReport = client.post_json("/v1/merge-queue/run", &body)?;
+            let report: LaneMergeQueueRunReport = client.post_json("/v1/merge-queue/run", &body)?;
             render_merge_queue_run(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::Remove(args) => {
-            let report: MergeQueueRemoveReport =
+            let report: LaneMergeQueueRemoveReport =
                 client.delete_json(&format!("/v1/merge-queue/{}", args.selector))?;
             render_merge_queue_remove(&report, ctx.json, &ctx.render)?;
             Ok(true)
