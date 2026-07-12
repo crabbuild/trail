@@ -48,41 +48,41 @@ fn conflict_resolve_schema() -> Value {
 pub(super) fn tools() -> Value {
     json!([
         {
-            "name": "trail.merge_queue_add",
-            "title": "Queue Merge",
-            "description": "Queue a lane or branch ref for serialized merge into a target branch.",
+            "name": "trail.lane_merge_queue_add",
+            "title": "Queue Lane Merge",
+            "description": "Queue a lane for serialized merge into a target branch.",
             "inputSchema": object_schema(json!({
-                "source": { "type": "string" },
+                "lane": { "type": "string" },
                 "target": { "type": "string" },
                 "priority": { "type": "integer" }
-            }), vec!["source", "target"])
+            }), vec!["lane", "target"])
         },
         {
-            "name": "trail.merge_queue_list",
-            "title": "List Merge Queue",
-            "description": "List queued, running, merged, cancelled, failed, and conflicted merge queue entries.",
+            "name": "trail.lane_merge_queue_list",
+            "title": "List Lane Merge Queue",
+            "description": "List queued, running, merged, cancelled, failed, and conflicted lane merge queue entries.",
             "inputSchema": object_schema(json!({}), vec![])
         },
         {
-            "name": "trail.merge_queue_run",
-            "title": "Run Merge Queue",
-            "description": "Run queued merges serially, pausing on the first conflict or failure.",
+            "name": "trail.lane_merge_queue_run",
+            "title": "Run Lane Merge Queue",
+            "description": "Run queued lane merges serially, pausing on the first conflict or failure.",
             "inputSchema": object_schema(json!({
                 "limit": { "type": "integer", "minimum": 1 }
             }), vec![])
         },
         {
-            "name": "trail.merge_queue_explain",
-            "title": "Explain Merge Queue Entry",
+            "name": "trail.lane_merge_queue_explain",
+            "title": "Explain Lane Merge Queue Entry",
             "description": "Explain why one queued merge is ready or blocked, including readiness blockers, dry-run conflicts, preflight errors, warnings, and next-step commands.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string" }
             }), vec!["selector"])
         },
         {
-            "name": "trail.merge_queue_remove",
-            "title": "Remove Merge Queue Entry",
-            "description": "Cancel a queued or conflicted merge queue entry by queue id, lane, branch, or ref.",
+            "name": "trail.lane_merge_queue_remove",
+            "title": "Remove Lane Merge Queue Entry",
+            "description": "Cancel a queued or conflicted lane merge queue entry by queue id, lane id, or lane name.",
             "inputSchema": object_schema(json!({
                 "selector": { "type": "string" }
             }), vec!["selector"])

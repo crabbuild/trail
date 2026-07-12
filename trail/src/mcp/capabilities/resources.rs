@@ -246,10 +246,10 @@ pub(crate) fn resources() -> Value {
             "mimeType": "application/json"
         },
         {
-            "uri": RESOURCE_MERGE_QUEUE,
-            "name": "merge-queue",
-            "title": "Merge Queue",
-            "description": "Current serialized merge queue entries.",
+            "uri": RESOURCE_LANE_MERGE_QUEUE,
+            "name": "lane-merge-queue",
+            "title": "Lane Merge Queue",
+            "description": "Current serialized lane merge queue entries.",
             "mimeType": "application/json"
         },
         {

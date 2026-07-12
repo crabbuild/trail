@@ -48,7 +48,7 @@ Checklist:\n\
 6. Call `trail.diff_lane` with patches and line ids; inspect provenance with `trail.why`, `trail.history`, and `trail.code_from` when a change is unclear.\n\
 7. Confirm latest tests and evals passed or explain why warnings are acceptable.\n\
 8. Use `trail.approval_request` for any unresolved human decision and inspect linked paused runs with `trail.run_list`.\n\
-9. Prefer `trail.merge_queue_add` plus `trail.merge_queue_run` for shared target branches; use direct `trail lane merge` only for one-off merges.\n\
+9. Prefer `trail.lane_merge_queue_add` plus `trail.lane_merge_queue_run` for shared target branches; use direct `trail lane merge` only for one-off merges.\n\
 10. If the work should be abandoned, use `trail.lane_rewind` with `record_current = true` instead of silently moving refs.\n\
 11. If conflicts exist, stop review and switch to the `{PROMPT_RESOLVE_CONFLICT}` prompt."
                 ),

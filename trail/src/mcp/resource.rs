@@ -18,7 +18,7 @@ fn resource_read_response(db: &mut Trail, args: ResourceReadArgs) -> Result<Valu
         ),
         RESOURCE_DOCTOR => ("application/json", pretty_json(&db.doctor()?)?),
         RESOURCE_LANES => ("application/json", pretty_json(&db.list_lanes()?)?),
-        RESOURCE_MERGE_QUEUE => (
+        RESOURCE_LANE_MERGE_QUEUE => (
             "application/json",
             pretty_json(&db.list_lane_merge_queue()?)?,
         ),

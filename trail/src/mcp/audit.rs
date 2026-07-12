@@ -72,16 +72,15 @@ impl McpMutationAudit {
 
 fn argument_lane_for_tool(name: &str, arguments: &Value) -> Option<String> {
     match name {
-        "trail.merge_queue_add" => top_level_string_for_keys(arguments, &["source"])
-            .filter(|source| source.starts_with("refs/lanes/")),
+        "trail.lane_merge_queue_add" => top_level_string_for_keys(arguments, &["lane"]),
         _ => first_string_for_keys(arguments, &["lane", "lane_or_id"]),
     }
 }
 
 fn argument_target_ref_for_tool(name: &str, arguments: &Value) -> Option<String> {
     let keys: &[&str] = match name {
-        "trail.merge_queue_add" => {
-            return top_level_string_for_keys(arguments, &["target", "target_branch", "into"])
+        "trail.lane_merge_queue_add" => {
+            return top_level_string_for_keys(arguments, &["target"])
                 .map(|target| mcp_branch_ref(&target));
         }
         "trail.begin_turn" | "trail.lane_spawn" => &[],

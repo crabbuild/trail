@@ -7941,6 +7941,9 @@ fn local_api_and_mcp_manage_human_approval_gates() {
     ] {
         assert!(tool_list.iter().any(|tool| tool["name"] == name), "{name}");
     }
+    assert!(!tool_list
+        .iter()
+        .any(|tool| tool["name"] == "trail.merge_queue_add"));
 
     let mcp_run_show = trail::mcp::handle_json_rpc(
         &mut db,
@@ -9663,9 +9666,9 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
             "id": 7,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_add",
+                "name": "trail.lane_merge_queue_add",
                 "arguments": {
-                    "source": "refs/lanes/audit-mcp",
+                    "lane": "audit-mcp",
                     "target": "main",
                     "unexpected": true
                 }
@@ -9745,7 +9748,7 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
     assert!(audits.iter().any(|audit| {
         audit.actor == "mcp:stdio"
             && audit.surface == "mcp"
-            && audit.command == "trail.merge_queue_add"
+            && audit.command == "trail.lane_merge_queue_add"
             && audit.status == "error"
             && audit.lane_id.as_deref() == Some(mcp_lane_id.as_str())
             && audit.target_ref.as_deref() == Some("refs/heads/main")
@@ -9757,7 +9760,7 @@ fn external_http_and_mcp_mutations_emit_audit_events() {
     }));
     assert!(!audits.iter().any(|audit| {
         audit.actor == "mcp:stdio"
-            && audit.command == "trail.merge_queue_add"
+            && audit.command == "trail.lane_merge_queue_add"
             && audit.status == "error"
             && audit.target_ref.as_deref() == Some("main")
     }));
@@ -13303,6 +13306,12 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         .any(|resource| resource["uri"] == "trail://workspace/status"));
     assert!(resources_list
         .iter()
+        .any(|resource| resource["uri"] == "trail://workspace/lane-merge-queue"));
+    assert!(!resources_list
+        .iter()
+        .any(|resource| resource["uri"] == "trail://workspace/merge-queue"));
+    assert!(resources_list
+        .iter()
         .any(|resource| resource["uri"] == "trail://workspace/agent-tasks"));
     assert!(resources_list
         .iter()
@@ -13906,7 +13915,10 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
     assert!(!tool_annotation("trail.apply_patch", "readOnlyHint"));
     assert!(tool_annotation("trail.apply_patch", "destructiveHint"));
     assert!(tool_annotation("trail.lane_rewind", "destructiveHint"));
-    assert!(tool_annotation("trail.merge_queue_run", "destructiveHint"));
+    assert!(tool_annotation(
+        "trail.lane_merge_queue_run",
+        "destructiveHint"
+    ));
     assert!(tool_annotation("trail.run_test", "openWorldHint"));
     assert!(tool_annotation("trail.guardrail_check", "readOnlyHint"));
     assert!(tool_annotation("trail.lane_review", "readOnlyHint"));
@@ -24375,7 +24387,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "trail.merge_queue_explain"));
+        .any(|tool| tool["name"] == "trail.lane_merge_queue_explain"));
 
     let mcp_explain = trail::mcp::handle_json_rpc(
         &mut db,
@@ -24384,7 +24396,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_explain",
+                "name": "trail.lane_merge_queue_explain",
                 "arguments": {
                     "selector": "explain-bot"
                 }
@@ -25089,7 +25101,7 @@ fn manual_conflict_resolution_works_through_db_cli_http_and_mcp() {
 }
 
 #[test]
-fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
+fn local_api_and_mcp_drive_lane_merge_queue_and_conflicts() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -25158,11 +25170,11 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
     .unwrap();
     let tool_list = tools["result"]["tools"].as_array().unwrap();
     for name in [
-        "trail.merge_queue_add",
-        "trail.merge_queue_list",
-        "trail.merge_queue_run",
-        "trail.merge_queue_explain",
-        "trail.merge_queue_remove",
+        "trail.lane_merge_queue_add",
+        "trail.lane_merge_queue_list",
+        "trail.lane_merge_queue_run",
+        "trail.lane_merge_queue_explain",
+        "trail.lane_merge_queue_remove",
         "trail.conflict_list",
         "trail.conflict_show",
         "trail.conflict_resolve",
@@ -25305,7 +25317,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
             "id": 4,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_list",
+                "name": "trail.lane_merge_queue_list",
                 "arguments": {}
             }
         }),
@@ -25327,9 +25339,9 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
             "id": 5,
             "method": "tools/call",
             "params": {
-                "name": "trail.merge_queue_add",
+                "name": "trail.lane_merge_queue_add",
                 "arguments": {
-                    "source": "cancel-queue-bot",
+                    "lane": "cancel-queue-bot",
                     "target": "main",
                     "priority": 1
                 }

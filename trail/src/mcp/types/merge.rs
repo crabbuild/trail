@@ -4,9 +4,8 @@ use crate::model::ConflictManualResolution;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeQueueAddArgs {
-    pub(crate) source: String,
-    #[serde(alias = "into", alias = "target_branch")]
+pub(crate) struct LaneMergeQueueAddArgs {
+    pub(crate) lane: String,
     pub(crate) target: String,
     #[serde(default)]
     pub(crate) priority: i64,
@@ -14,20 +13,20 @@ pub(crate) struct MergeQueueAddArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeQueueRunArgs {
+pub(crate) struct LaneMergeQueueRunArgs {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeQueueExplainArgs {
+pub(crate) struct LaneMergeQueueExplainArgs {
     pub(crate) selector: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeQueueRemoveArgs {
+pub(crate) struct LaneMergeQueueRemoveArgs {
     pub(crate) selector: String,
 }
 
