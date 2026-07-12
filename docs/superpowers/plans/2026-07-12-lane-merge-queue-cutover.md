@@ -138,7 +138,7 @@ Resolve the lane before inserting, seed ids from `lane_id:target_ref:priority:no
 
 - [ ] **Step 5: Run storage and safety regressions**
 
-Run: `cargo test -p trail --test e2e schema_v16_discards_generic_merge_queue -- --exact && cargo test -p trail --test e2e lane_merge_queue_rejects_branch_sources -- --exact && cargo test -p trail --test e2e merge_lane_and_queue_enforce_readiness_blockers -- --exact && cargo test -p trail --test e2e merge_queue_pauses_on_conflict -- --exact`
+Run: `cargo test -p trail --test e2e schema_v16_discards_generic_merge_queue -- --exact && cargo test -p trail --test e2e lane_merge_queue_rejects_branch_sources -- --exact && cargo test -p trail --test e2e merge_lane_and_queue_enforce_readiness_blockers -- --exact && cargo test -p trail --test e2e lane_merge_queue_pauses_on_conflict -- --exact`
 
 Expected: PASS after renaming the existing queue tests to their lane-specific names and assertions.
 
@@ -257,7 +257,7 @@ let add = api_request(
     "/v1/lanes/merges/queue",
     serde_json::json!({"lane": "doc-bot", "into": "main", "priority": 10}),
 );
-assert_eq!(handle_http_request(&mut db, &add).status, 200);
+assert_eq!(handle_http_request(&mut db, &add).status, 201);
 
 let legacy = api_request(
     "POST",

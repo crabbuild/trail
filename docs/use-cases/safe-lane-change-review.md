@@ -33,8 +33,8 @@ trail approvals decide <approval-id> --decision approved
 
 ```sh
 trail lane merge doc-bot --into main --dry-run
-trail merge-queue add doc-bot --into main
-trail merge-queue run
+trail lane merge-queue add doc-bot --into main
+trail lane merge-queue run
 ```
 
 ## Code Facts Used

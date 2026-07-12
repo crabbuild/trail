@@ -122,7 +122,7 @@ pub(super) fn collaboration_schemas() -> Value {
             "required": ["merge_id", "source_ref", "target_ref", "base_change", "target_change", "source_change", "base_root", "target_root", "source_root"],
             "properties": {
                 "merge_id": { "type": "string" },
-                "queue_id": { "type": "string" },
+                "lane_queue_id": { "type": "string" },
                 "source_ref": { "type": "string" },
                 "target_ref": { "type": "string" },
                 "base_change": { "type": "string" },

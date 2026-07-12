@@ -27,7 +27,7 @@ Honor tool risk annotations:
 
 - Read-only: status, reports, diff, readiness, diagnosis, resources.
 - Workspace write: review markers and archive metadata.
-- Destructive write: apply/finish, undo/rewind, merge-queue execution.
+- Destructive write: apply/finish, undo/rewind, lane merge-queue execution.
 - Open-world write: test/eval commands.
 
 Require confirmation appropriate to the risk. For non-dry-run apply/finish, call readiness and dry-run first.

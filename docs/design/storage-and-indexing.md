@@ -64,7 +64,7 @@ The schema contains these major table groups:
 - Agent activity: `lane_sessions`, `lane_turns`, `lane_events`, `lane_trace_span_events`
 - Human gates and resumable state: `lane_approvals`, `lane_run_states`
 - Coordination: `leases`
-- Merge state: `merge_queue`, `merge_results`, `conflict_sets`,
+- Merge state: `lane_merge_queue`, `merge_results`, `conflict_sets`,
   `conflict_resolution_suggestions`
 - Git interop: `git_mappings`
 - Worktree scan cache: `worktree_file_index`

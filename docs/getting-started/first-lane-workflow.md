@@ -49,8 +49,8 @@ Preview and queue the merge:
 
 ```sh
 trail lane merge docs-lane --into main --dry-run
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 Remove the lane after the work is merged or intentionally abandoned:
@@ -141,8 +141,8 @@ trail lane merge docs-lane --into main --dry-run
 For shared branches, use the queue:
 
 ```sh
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 If conflicts are opened:
@@ -159,4 +159,4 @@ trail conflicts show <conflict-set-id>
 - Patch schema: `trail/src/model/inspect/patch.rs`
 - Readiness: `trail/src/db/lane/readiness.rs`
 - Rewind: `trail/src/db/lane/rewind.rs`
-- Tests: `lane_patch_can_merge_into_main`, `merge_lane_and_queue_enforce_readiness_blockers`, `merge_queue_pauses_on_conflict`
+- Tests: `lane_patch_can_merge_into_main`, `merge_lane_and_queue_enforce_readiness_blockers`, `lane_merge_queue_pauses_on_conflict`

@@ -78,7 +78,7 @@ Important hot-path rows:
 - `daemon_persisted_snapshot_diff_dirty`
 - `lane_apply_patch`
 - `lane_readiness`
-- `merge_queue_run`
+- `lane_merge_queue_run`
 - `daemon_cli_status`
 - `daemon_cli_session_start`
 - `daemon_cli_approval_request`
@@ -118,7 +118,7 @@ python3 scripts/check-cli-scale-thresholds.py \
   daemon_cli_approval_request=10 daemon_cli_lease_acquire=10 \
   daemon_cli_timeline=10 daemon_cli_why=10 daemon_cli_history=10 \
   daemon_cli_code_from=10 lane_apply_patch=10 lane_readiness=10 \
-  merge_lane_dry_run=10 merge_lane_apply=10 merge_queue_run=10 \
+  merge_lane_dry_run=10 merge_lane_apply=10 lane_merge_queue_run=10 \
   git_dirty_status=120 git_dirty_diff=120 git_dirty_record=120 \
   git_status_after_dirty_record=90 \
   --metrics /Volumes/Workspace/trail-cli-scale-codex-1m-git-daemon-20260625/1000000/metrics.tsv \

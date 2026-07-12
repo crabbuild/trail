@@ -72,8 +72,8 @@ records dirty materialized workdir edits before the rewind when possible.
 
 ```sh
 trail lane merge doc-bot --into main --dry-run
-trail merge-queue add doc-bot --into main
-trail merge-queue run
+trail lane merge-queue add doc-bot --into main
+trail lane merge-queue run
 ```
 
 Use the queue when multiple branches may target the same branch.
@@ -84,4 +84,4 @@ Use the queue when multiple branches may target the same branch.
 - Rewind: `trail/src/db/lane/rewind.rs`
 - Contribution: `trail/src/db/lane/identity.rs`
 - Merge queue: `trail/src/db/merge/queue.rs`
-- Tests: `merge_queue_runs_lane_branch_into_main`, `merge_lane_and_queue_enforce_readiness_blockers`
+- Tests: `lane_merge_queue_runs_lane_branch_into_main`, `merge_lane_and_queue_enforce_readiness_blockers`

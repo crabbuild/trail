@@ -37,7 +37,7 @@ Do not launch `trail agent start` recursively when already running as the provid
 4. Perform only the scoped mutation the user authorized.
 5. Re-read state and record evidence such as a lane operation, test/eval gate, review marker, handoff, or receipt.
 
-Treat non-dry-run Git apply/finish, merges into shared refs, merge-queue execution, rewind/undo, conflict resolution, restore, garbage collection, lane removal, and force/bypass flags as consequential. Require clear user intent before using them. Never substitute `--allow-stale`, `--allow-ignored`, `--force`, `--direct`, or `--no-auth` for resolving the underlying safety condition.
+Treat non-dry-run Git apply/finish, merges into shared refs, lane merge-queue execution, rewind/undo, conflict resolution, restore, garbage collection, lane removal, and force/bypass flags as consequential. Require clear user intent before using them. Never substitute `--allow-stale`, `--allow-ignored`, `--force`, `--direct`, or `--no-auth` for resolving the underlying safety condition.
 
 ## Use Stable Automation Patterns
 

@@ -32,23 +32,24 @@ trail lane merge <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [-
 ```
 
 Default target is `main`. Non-dry-run direct merges into the workspace default
-branch are rejected by default so shared targets flow through `merge-queue`.
+branch are rejected by default so shared targets flow through
+`lane merge-queue`.
 Use `--dry-run` to preview or `--direct` for an explicit one-off immediate
 merge.
 
-## `merge-queue`
+## `lane merge-queue`
 
 ```text
-trail merge-queue add <SOURCE> --into <TARGET> [--priority <N>]
-trail merge-queue list
-trail merge-queue explain <SELECTOR>
-trail merge-queue run [--limit <N>]
-trail merge-queue remove <SELECTOR>
+trail lane merge-queue add <LANE> --into <TARGET> [--priority <N>]
+trail lane merge-queue list
+trail lane merge-queue explain <SELECTOR>
+trail lane merge-queue run [--limit <N>]
+trail lane merge-queue remove <SELECTOR>
 ```
 
 Default priority is 0.
 
-`merge-queue explain` resolves a queue id, lane name/ref, or branch name/ref and
+`lane merge-queue explain` resolves a queue id, lane id, or lane name and
 reports readiness blockers, dry-run merge conflicts, preflight errors, warnings,
 and suggested next steps without mutating refs or recording conflict state.
 

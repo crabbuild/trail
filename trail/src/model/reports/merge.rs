@@ -87,7 +87,7 @@ pub struct ConflictExplanation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConflictMergeContext {
     pub merge_id: String,
-    pub queue_id: Option<String>,
+    pub lane_queue_id: Option<String>,
     pub source_ref: String,
     pub target_ref: String,
     pub base_change: ChangeId,

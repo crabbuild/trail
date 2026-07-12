@@ -209,9 +209,9 @@ trail lane merge <lane> --into main --dry-run
 For shared targets, queue rather than directly merging:
 
 ```sh
-trail merge-queue add <lane> --into main
-trail merge-queue explain <lane>
-trail merge-queue run
+trail lane merge-queue add <lane> --into main
+trail lane merge-queue explain <lane>
+trail lane merge-queue run
 ```
 
 Queue execution is consequential and re-runs readiness. Do it only when authorized. Remove a lane only after verifying it is merged or intentionally abandoned; `lane rm --force` is not routine cleanup.

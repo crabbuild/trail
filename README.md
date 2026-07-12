@@ -808,7 +808,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail lane readiness <name>` | Report blockers before merging a lane branch |
 | `trail lane handoff <name>` | Produce a review and continuation packet for a lane |
 | `trail lane merge <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
-| `trail merge-queue run` | Run queued lane merges with readiness and conflict checks |
+| `trail lane merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `trail daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `trail mcp` | Start the MCP stdio server for agent hosts |
 | `trail acp list` | List built-in aliases and current official ACP registry agents |
@@ -1280,8 +1280,8 @@ Merge only after review and readiness checks:
 
 ```sh
 trail lane merge doc-bot --into main --dry-run
-trail merge-queue add doc-bot --into main
-trail merge-queue run
+trail lane merge-queue add doc-bot --into main
+trail lane merge-queue run
 ```
 
 If a merge opens conflicts, inspect and resolve them explicitly:

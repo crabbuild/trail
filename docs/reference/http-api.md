@@ -147,7 +147,8 @@ paths, and next steps.
 
 `POST /v1/lanes/{lane_or_id}/merge` requires a JSON `into` target branch and
 allows `dry_run=true` preflight. A non-dry-run merge into the workspace default
-branch requires `direct=true`; otherwise enqueue with `POST /v1/merge-queue`
+branch requires `direct=true`; otherwise enqueue with
+`POST /v1/lanes/merges/queue`
 and run the queue. The former branch-scoped `merge-lane` endpoint was removed.
 
 ## Collaboration Routes
@@ -167,11 +168,10 @@ and run the queue. The former branch-scoped `merge-lane` endpoint was removed.
 | POST | `/v1/lanes/{lane_or_id}/claims` | Claim path. |
 | GET/POST | `/v1/anchors` | List or create anchors. |
 | GET/DELETE | `/v1/anchors/{anchor_id}` | Resolve or delete anchor. |
-| GET/POST | `/v1/merge-queue` | List or queue merge. |
-| POST | `/v1/merge-queue/run` | Run queue. |
-| GET | `/v1/merge-queue/explain?selector=<selector>` | Explain why a queue item is ready or blocked. |
-| GET | `/v1/merge-queue/{selector}/explain` | Explain a queue item by path-safe selector. |
-| DELETE | `/v1/merge-queue/{selector}` | Remove queue item. |
+| GET/POST | `/v1/lanes/merges/queue` | List or queue a lane merge. |
+| POST | `/v1/lanes/merges/queue/run` | Run queued lane merges. |
+| GET | `/v1/lanes/merges/queue/{selector}/explain` | Explain a queue item by queue id, lane id, or lane name. |
+| DELETE | `/v1/lanes/merges/queue/{selector}` | Remove a lane queue item. |
 | GET | `/v1/conflicts` | List conflicts. |
 | GET | `/v1/conflicts/{conflict_set_id}?limit=50` | Show conflict with explanation evidence. |
 | POST | `/v1/conflicts/{conflict_set_id}/resolve` | Resolve conflict. |
@@ -188,7 +188,7 @@ or `manual`. Manual file values can be plain strings or objects with only
 
 Bodyless mutation routes reject non-empty request bodies. This applies to
 path-only deletes such as lane removal, lease release, anchor deletion, and
-merge-queue removal.
+lane merge-queue removal.
 
 ## Turn and Trace Routes
 

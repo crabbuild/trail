@@ -49,8 +49,8 @@ trail lane merge doc-bot --into main --dry-run
 Non-dry-run lane merges into the default branch use the merge queue by default:
 
 ```sh
-trail merge-queue add doc-bot --into main
-trail merge-queue run
+trail lane merge-queue add doc-bot --into main
+trail lane merge-queue run
 ```
 
 Immediate default-branch merges require `trail lane merge ... --direct`.
@@ -58,10 +58,10 @@ Immediate default-branch merges require `trail lane merge ... --direct`.
 ## Merge Queue
 
 ```sh
-trail merge-queue add doc-bot --into main --priority 10
-trail merge-queue list
-trail merge-queue run --limit 1
-trail merge-queue remove <queue-id>
+trail lane merge-queue add doc-bot --into main --priority 10
+trail lane merge-queue list
+trail lane merge-queue run --limit 1
+trail lane merge-queue remove <queue-id>
 ```
 
 The queue serializes merges and stops on conflicts or failures.

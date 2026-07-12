@@ -521,7 +521,7 @@ state:
 trail lane review <lane>
 trail lane diff <lane> --patch
 trail lane merge <lane> --into main --dry-run
-trail merge-queue add <lane> --into main
+trail lane merge-queue add <lane> --into main
 ```
 
 ## Multi-Agent Coordination
@@ -734,7 +734,7 @@ Acceptance criteria:
 - A user can configure at least one editor and one upstream ACP agent using docs
   or generated config.
 - Two ACP sessions can run concurrently against two Trail lane branches.
-- Merge queue and conflict handling work with captured branches.
+- Lane merge queue and conflict handling work with captured lane branches.
 
 ## Test Plan
 

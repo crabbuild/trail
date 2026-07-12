@@ -614,8 +614,8 @@ PY
     run_timed "$scale" daemon_cli_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json timeline --lane daemonclibot --limit 20
     run_timed "$scale" daemon_cli_agent_handoff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane handoff daemonclibot
     run_timed "$scale" daemon_cli_merge_dry_run "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane merge daemonclibot --into main --dry-run
-    run_timed "$scale" daemon_cli_merge_queue_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue list
-    run_timed "$scale" daemon_cli_merge_queue_run_empty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue run
+    run_timed "$scale" daemon_cli_lane_merge_queue_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane merge-queue list
+    run_timed "$scale" daemon_cli_lane_merge_queue_run_empty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane merge-queue run
     DAEMON_RSS="$(daemon_rss_bytes "$DAEMON_PID")"
     kill "$DAEMON_PID" >/dev/null 2>&1 || true
     wait "$DAEMON_PID" 2>/dev/null || true
@@ -667,8 +667,8 @@ for i in range(max(1, min(25, files // 400))):
 json.dump({"base_change": base_change, "message": "scale queuebot", "edits": edits}, out.open("w"))
 PY
   run_timed "$scale" queuebot_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch queuebot --patch "$WORK/queuebot.json"
-  run_timed "$scale" merge_queue_add "$BIN" --workspace "$REPO" --json merge-queue add queuebot --into main
-  run_timed "$scale" merge_queue_run "$BIN" --workspace "$REPO" --json merge-queue run
+  run_timed "$scale" lane_merge_queue_add "$BIN" --workspace "$REPO" --json lane merge-queue add queuebot --into main
+  run_timed "$scale" lane_merge_queue_run "$BIN" --workspace "$REPO" --json lane merge-queue run
 
   if [ "$RUN_MATERIALIZED" = "1" ]; then
     run_timed "$scale" agent_spawn_sparse "$BIN" --workspace "$REPO" --json lane spawn sparsebot --from main --paths README.md

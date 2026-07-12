@@ -16,6 +16,11 @@ All notable changes to Trail are documented in this file. Trail follows
 - **Breaking:** `POST /v1/branches/{branch}/merge-lane` is removed. Use
   `POST /v1/lanes/{lane}/merge` with the target branch in the required `into`
   JSON field.
+- **Breaking:** the generic merge queue is now lane-only. Use
+  `trail lane merge-queue`, `/v1/lanes/merges/queue`, and
+  `trail.lane_merge_queue_*`; the previous CLI, HTTP, MCP, resource, and
+  `merge_queue` storage contracts are removed without aliases. Generic
+  branches and refs continue through `trail merge`.
 - Added `--format human|plain|json|ndjson`, `--color auto|always|never`, and
   `--pager auto|always|never`. `plain` is deterministic text; JSON and NDJSON
   are the supported contracts for automation.

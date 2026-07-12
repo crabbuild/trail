@@ -23,13 +23,13 @@ impl Trail {
         match limit {
             Some(limit) => {
                 let mut stmt = self.conn.prepare(&format!("{sql} LIMIT ?1"))?;
-                let rows = stmt.query_map(params![limit as i64], merge_queue_row)?;
+                let rows = stmt.query_map(params![limit as i64], lane_merge_queue_row)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Error::from)
             }
             None => {
                 let mut stmt = self.conn.prepare(sql)?;
-                let rows = stmt.query_map([], merge_queue_row)?;
+                let rows = stmt.query_map([], lane_merge_queue_row)?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(Error::from)
             }
@@ -78,7 +78,7 @@ impl Trail {
                    AND q.status NOT IN ('merged', 'cancelled') \
                  ORDER BY q.status = 'queued' DESC, q.priority DESC, q.created_at ASC LIMIT 1",
                 params![selector],
-                merge_queue_row,
+                lane_merge_queue_row,
             )
             .optional()?
             .ok_or_else(|| Error::InvalidInput(format!("merge queue item `{selector}` not found")))
@@ -117,7 +117,7 @@ impl Trail {
                 |row| {
                     Ok(PendingConflictMerge {
                         merge_id: row.get(0)?,
-                        queue_id: row.get(1)?,
+                        lane_queue_id: row.get(1)?,
                         source_ref: row.get(2)?,
                         target_ref: row.get(3)?,
                         base_change: ChangeId(row.get(4)?),

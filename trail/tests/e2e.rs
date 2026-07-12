@@ -1539,6 +1539,14 @@ fn schema_v16_discards_generic_merge_queue() {
              'queued', 0, 1, 1
          );
          ALTER TABLE merge_results RENAME COLUMN lane_queue_id TO queue_id;
+         INSERT INTO merge_results (
+             merge_id, queue_id, source_ref, target_ref, base_change,
+             left_change, right_change, status, created_at
+         ) VALUES (
+             'merge_legacy', 'mq_legacy', 'refs/branches/feature',
+             'refs/branches/main', 'change_base', 'change_left',
+             'change_right', 'merged', 1
+         );
          PRAGMA user_version = 15;
          UPDATE schema_meta SET value = '15' WHERE key = 'schema.version';",
     )
@@ -1576,6 +1584,14 @@ fn schema_v16_discards_generic_merge_queue() {
         .iter()
         .any(|name| name == "lane_queue_id"));
     assert!(!merge_result_columns.iter().any(|name| name == "queue_id"));
+    let legacy_link: Option<String> = conn
+        .query_row(
+            "SELECT lane_queue_id FROM merge_results WHERE merge_id = 'merge_legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(legacy_link.is_none());
 }
 
 #[test]
@@ -1607,7 +1623,7 @@ fn schema_v6_backfills_normalized_environment_component_states_legacy_projection
     let version = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 
     let node = conn
         .query_row(
@@ -1727,7 +1743,7 @@ fn schema_v9_backfills_typed_environment_edges_without_losing_upstream_keys() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     let active_edge = conn
         .query_row(
@@ -1784,7 +1800,7 @@ fn schema_v10_adds_typed_environment_cache_namespaces_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     for table in [
         "environment_cache_namespaces",
@@ -1848,7 +1864,7 @@ fn schema_v12_adds_agent_capture_tables_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     for table in [
         "agent_hook_installations",
@@ -1912,7 +1928,7 @@ fn schema_v13_adds_external_artifact_provenance_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     for table in [
         "environment_component_external_artifacts",
@@ -1973,7 +1989,7 @@ fn schema_v14_adds_runtime_resource_lifecycle_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     for table in [
         "environment_component_runtime_resources",
@@ -2039,7 +2055,7 @@ fn schema_v15_adds_opaque_runtime_secret_references_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     for table in [
         "environment_component_runtime_secrets",
@@ -2119,7 +2135,7 @@ fn schema_v6_migrates_v5_single_bindings_to_output_bindings() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     let columns = conn
         .prepare("PRAGMA table_info(workspace_view_layers)")
@@ -2255,7 +2271,7 @@ fn schema_v7_migrates_immutable_outputs_to_policy_aware_nullable_layers() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     let binding = conn
         .query_row(
@@ -2331,7 +2347,7 @@ fn schema_v8_adds_current_and_immutable_environment_dependency_edges() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     for table in [
         "environment_component_dependencies",
@@ -2405,7 +2421,7 @@ fn schema_v6_backfills_normalized_environment_component_states() {
     let version = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 
     let node = conn
         .query_row(
@@ -24307,7 +24323,7 @@ fn local_api_drives_lane_merge_queue() {
 }
 
 #[test]
-fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state() {
+fn lane_merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();

@@ -350,8 +350,8 @@ trail lane readiness docs-lane
 
 # Merge when ready.
 trail lane merge docs-lane --into main --dry-run
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 ## Readiness Model
@@ -459,8 +459,8 @@ trail lane merge docs-lane --into main --dry-run
 Use the merge queue for shared targets:
 
 ```sh
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 The merge updates Trail's target branch ref. Git history remains separate until
@@ -619,8 +619,8 @@ Merge through the queue:
 
 ```sh
 trail session end session-svelte-readme --status completed
-trail merge-queue add svelte-readme --into main
-trail merge-queue run
+trail lane merge-queue add svelte-readme --into main
+trail lane merge-queue run
 ```
 
 Observed merge result:

@@ -289,11 +289,11 @@ before non-dry-run apply.
 
 ## Merge and Conflicts
 
-- `trail.merge_queue_add`
-- `trail.merge_queue_list`
-- `trail.merge_queue_run`
-- `trail.merge_queue_explain`
-- `trail.merge_queue_remove`
+- `trail.lane_merge_queue_add`
+- `trail.lane_merge_queue_list`
+- `trail.lane_merge_queue_run`
+- `trail.lane_merge_queue_explain`
+- `trail.lane_merge_queue_remove`
 - `trail.conflict_list`
 - `trail.conflict_show` returns conflict details plus deterministic explanation evidence and conservative next steps.
 - `trail.conflict_resolve`
@@ -355,7 +355,7 @@ workdir path. That directory contains copied recoverable regular files and
 
 ## Tool Risk Annotations
 
-The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only tool calls also run under Trail's read-only guard, so they must not persist SQLite database changes or mutate Trail sidecars such as `config.toml`, `HEAD`, ref files, daemon endpoint/token/cache files, or lane workdir metadata manifests while serving the request. The `trail://workspace/status` resource uses the same non-mutating status path. Read-only examples include status, diff, timeline, why, history, agent status/inbox/board/stack/next/guide/dashboard/review-data/review-flow/ask/view/brief/validate/test-plan/report/handoff/story/tools/impact/review-map/risk/confidence/ready/workdir/changes/files/checkpoints/why/turn/compare/diff/review/focus, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, merge queue list, conflict show, event/span queries, and guardrail check. Workspace-write examples include `trail.agent_mark_reviewed`, `trail.agent_mark_file_reviewed`, `trail.agent_archive`, and `trail.agent_unarchive` because they write task metadata markers without deleting provenance. Destructive-write examples include `trail.agent_apply`, `trail.agent_finish`, `trail.agent_undo`, `trail.agent_rewind`, `trail.lane_rewind`, and `trail.merge_queue_run` because they intentionally move lane or shared branch refs and may refresh materialized workdirs.
+The MCP layer annotates tools as read-only, workspace write, destructive write, or open-world write. Read-only tool calls also run under Trail's read-only guard, so they must not persist SQLite database changes or mutate Trail sidecars such as `config.toml`, `HEAD`, ref files, daemon endpoint/token/cache files, or lane workdir metadata manifests while serving the request. The `trail://workspace/status` resource uses the same non-mutating status path. Read-only examples include status, diff, timeline, why, history, agent status/inbox/board/stack/next/guide/dashboard/review-data/review-flow/ask/view/brief/validate/test-plan/report/handoff/story/tools/impact/review-map/risk/confidence/ready/workdir/changes/files/checkpoints/why/turn/compare/diff/review/focus, lane status, review, readiness, handoff, sessions, approvals, runs, leases, anchors, lane merge queue list, conflict show, event/span queries, and guardrail check. Workspace-write examples include `trail.agent_mark_reviewed`, `trail.agent_mark_file_reviewed`, `trail.agent_archive`, and `trail.agent_unarchive` because they write task metadata markers without deleting provenance. Destructive-write examples include `trail.agent_apply`, `trail.agent_finish`, `trail.agent_undo`, `trail.agent_rewind`, `trail.lane_rewind`, and `trail.lane_merge_queue_run` because they intentionally move lane or shared branch refs and may refresh materialized workdirs.
 
 Open-world write examples are `trail.agent_test`, `trail.agent_eval`,
 `trail.run_test`, and `trail.run_eval` because they execute commands in lane

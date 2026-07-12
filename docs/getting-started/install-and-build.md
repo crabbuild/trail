@@ -147,8 +147,8 @@ Merge only after review and readiness checks:
 
 ```sh
 trail lane merge docs-lane --into main --dry-run
-trail merge-queue add docs-lane --into main
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue run
 ```
 
 ## Validate the Local Build

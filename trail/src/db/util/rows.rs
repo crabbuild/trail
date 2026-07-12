@@ -62,7 +62,9 @@ pub(crate) fn lane_details_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lane
     })
 }
 
-pub(crate) fn merge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneMergeQueueEntry> {
+pub(crate) fn lane_merge_queue_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LaneMergeQueueEntry> {
     Ok(LaneMergeQueueEntry {
         queue_id: row.get(0)?,
         lane_id: row.get(1)?,

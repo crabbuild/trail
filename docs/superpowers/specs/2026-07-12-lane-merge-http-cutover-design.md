@@ -34,10 +34,9 @@ all use the replacement route.
 ## Deliberate Non-Changes
 
 The persisted domain model remains unchanged. `OperationKind::LaneMerge`, the
-`lane_merge` change-id namespace, and the `merge_queue` table already model
-domain concepts rather than a deprecated command spelling. Renaming them would
-needlessly invalidate historical data or require a storage migration without
-changing the public contract.
+`lane_merge` change-id namespace and the then-current queue storage were outside
+that cutover. The subsequent lane merge queue hard-cutover design supersedes
+the queue-storage non-change described here.
 
 Internal Rust methods such as `merge_lane_with_options` likewise remain
 verb-object domain APIs. They are not CLI aliases and stay idiomatic Rust.

@@ -21,7 +21,7 @@ impl Trail {
                  WHERE q.lane_id = ?1 AND q.target_ref = ?2 AND q.status IN ('queued', 'running') \
                  ORDER BY q.created_at LIMIT 1",
                 params![lane.record.lane_id, target_ref],
-                merge_queue_row,
+                lane_merge_queue_row,
             )
             .optional()?
         {
@@ -59,7 +59,7 @@ impl Trail {
              FROM lane_merge_queue q JOIN lanes l ON l.lane_id = q.lane_id \
              ORDER BY q.status = 'queued' DESC, q.priority DESC, q.created_at ASC",
         )?;
-        let rows = stmt.query_map([], merge_queue_row)?;
+        let rows = stmt.query_map([], lane_merge_queue_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
     }
@@ -78,7 +78,7 @@ impl Trail {
                    AND q.status NOT IN ('merged', 'cancelled') \
                  ORDER BY q.priority DESC, q.created_at ASC LIMIT 1",
                 params![selector],
-                merge_queue_row,
+                lane_merge_queue_row,
             )
             .optional()?
             .ok_or_else(|| Error::InvalidInput(format!("merge queue item `{selector}` not found")))?;
@@ -109,7 +109,7 @@ impl Trail {
         let report = self.lane_readiness(&entry.lane_id)?;
         blockers.extend(report.blockers.clone());
         warnings.extend(report.warnings.clone());
-        next_steps.extend(merge_queue_readiness_next_steps(&entry.lane, &report));
+        next_steps.extend(lane_merge_queue_readiness_next_steps(&entry.lane, &report));
         let readiness = Some(report);
 
         let (dry_run, error) = match self.lane_merge_queue_entry_dry_run(&entry) {
@@ -125,7 +125,7 @@ impl Trail {
                             "conflicts": report.conflicts.clone()
                         })),
                     ));
-                    next_steps.push(merge_queue_dry_run_next_step(&entry));
+                    next_steps.push(lane_merge_queue_dry_run_next_step(&entry));
                 }
                 (Some(report), None)
             }
@@ -251,7 +251,7 @@ impl Trail {
     }
 }
 
-fn merge_queue_dry_run_next_step(entry: &LaneMergeQueueEntry) -> String {
+fn lane_merge_queue_dry_run_next_step(entry: &LaneMergeQueueEntry) -> String {
     let target = entry
         .target_ref
         .strip_prefix(MAIN_REF_PREFIX)
@@ -262,7 +262,10 @@ fn merge_queue_dry_run_next_step(entry: &LaneMergeQueueEntry) -> String {
     )
 }
 
-fn merge_queue_readiness_next_steps(lane: &str, readiness: &LaneReadinessReport) -> Vec<String> {
+fn lane_merge_queue_readiness_next_steps(
+    lane: &str,
+    readiness: &LaneReadinessReport,
+) -> Vec<String> {
     let mut steps = Vec::new();
     for issue in &readiness.blockers {
         match issue.code.as_str() {

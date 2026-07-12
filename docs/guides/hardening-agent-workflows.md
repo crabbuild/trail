@@ -28,9 +28,9 @@ trail config set lane.claim_enforcement reject
 Use merge queue for shared targets instead of direct merges:
 
 ```sh
-trail merge-queue add docs-lane --into main
-trail merge-queue explain docs-lane
-trail merge-queue run
+trail lane merge-queue add docs-lane --into main
+trail lane merge-queue explain docs-lane
+trail lane merge-queue run
 ```
 
 ## Lane Isolation
@@ -154,7 +154,7 @@ example `lane started 14 operations behind main`.
 Before merging, inspect the queue item:
 
 ```sh
-trail merge-queue explain docs-lane
+trail lane merge-queue explain docs-lane
 ```
 
 `merge-queue explain` includes readiness blockers, dry-run conflicts, preflight
@@ -218,7 +218,7 @@ Useful focused tests for these controls include:
 - `lane_workdir_record_preview_reports_risks_and_oversized_files`
 - `lane_workdir_sync_refuses_dirty_and_force_refreshes`
 - `merge_lane_and_queue_enforce_readiness_blockers`
-- `merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state`
+- `lane_merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state`
 - `conflict_explanations_classify_common_non_line_conflicts`
 - `local_lane_http_api_can_require_bearer_token`
 - `local_http_bodyless_mutations_reject_request_bodies`

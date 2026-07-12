@@ -784,7 +784,7 @@ pub(crate) struct MergeContext {
 #[derive(Debug, Clone)]
 pub(crate) struct PendingConflictMerge {
     merge_id: String,
-    queue_id: Option<String>,
+    lane_queue_id: Option<String>,
     source_ref: String,
     target_ref: String,
     base_change: ChangeId,
