@@ -166,7 +166,6 @@ fn run(cli: Cli) -> Result<()> {
         Command::Approvals(approvals_command) => {
             collaboration::handle_approvals_command(&ctx, approvals_command)
         }
-        Command::MergeLane(args) => collaboration::handle_merge_lane_command(&ctx, args),
         Command::MergeQueue(queue) => collaboration::handle_merge_queue_command(&ctx, queue),
         Command::Conflicts(conflicts) => collaboration::handle_conflicts_command(&ctx, conflicts),
         Command::Anchor(anchor) => collaboration::handle_anchor_command(&ctx, anchor),

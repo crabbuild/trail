@@ -52,7 +52,7 @@ trail config set lane.required_eval_suites policy-smoke
 Preview the lane merge first:
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 ```
 
 Use the queue for shared targets:

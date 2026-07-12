@@ -297,7 +297,7 @@ This report is the main transfer object for moving lane work between hosts or fr
 
 ## Merge Coordination
 
-Direct `merge-lane` checks readiness before merging. Merge queue runs serialize queued entries and record merge results. If a conflict appears, the queue item becomes conflicted and a conflict set persists for resolution.
+Direct `lane merge` checks readiness before merging. Merge queue runs serialize queued entries and record merge results. If a conflict appears, the queue item becomes conflicted and a conflict set persists for resolution.
 
 This avoids silent overwrites and gives humans and lane-running hosts an explicit conflict-resolution surface.
 

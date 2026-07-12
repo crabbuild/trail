@@ -315,7 +315,7 @@ pub(crate) fn render_lane_readiness(
     );
     if report.ready {
         document = document.next(
-            format!("trail merge-lane {}", report.lane.record.name),
+            format!("trail lane merge {}", report.lane.record.name),
             "merge this lane, or use --dry-run to preview it",
         );
     }

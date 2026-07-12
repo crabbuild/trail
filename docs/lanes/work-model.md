@@ -313,7 +313,7 @@ run test/eval gates
   v
 review readiness
   |
-  +-- ready ---------> merge-lane or merge queue
+  +-- ready ---------> lane merge or merge queue
   |
   +-- not ready -----> continue, approve, resolve conflict, or rewind
 ```
@@ -349,7 +349,7 @@ trail lane test docs-lane --suite unit -- cargo test
 trail lane readiness docs-lane
 
 # Merge when ready.
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 trail merge-queue add docs-lane --into main
 trail merge-queue run
 ```
@@ -453,7 +453,7 @@ trail lane rewind docs-lane \
 Merge uses the lane ref as source:
 
 ```sh
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 ```
 
 Use the merge queue for shared targets:

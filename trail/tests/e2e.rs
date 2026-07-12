@@ -1347,6 +1347,19 @@ fn plain_redirected_and_quiet_output_follow_terminal_policy() {
 }
 
 #[test]
+fn clap_diagnostics_keep_usage_on_separate_lines() {
+    let output = Command::new(trail_bin())
+        .args(["agent", "hooks", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("the following required arguments were not provided:\n  <PROVIDER>"));
+    assert!(stderr.contains("\nUsage: trail agent hooks status <PROVIDER>\n"));
+    assert!(!stderr.contains(r"\nUsage:"));
+}
+
+#[test]
 fn agent_help_is_curated_and_hidden_commands_still_work() {
     let help = Command::new(trail_bin())
         .args(["agent", "--help"])
@@ -10403,9 +10416,9 @@ fn local_lane_http_api_manages_lane_branch_lifecycle() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
+            &format!("/v1/lanes/{lane_id}/merge"),
             serde_json::json!({
-                "lane_id": lane_id,
+                "into": "main",
                 "strategy": "line_id_aware",
                 "direct": true
             }),
@@ -12666,7 +12679,7 @@ fn cli_daemon_url_routes_hot_lane_commands() {
     let merge = run_trail_json_daemon(
         temp.path(),
         &daemon_url,
-        &["merge-lane", "rpc-bot", "--into", "main", "--dry-run"],
+        &["lane", "merge", "rpc-bot", "--into", "main", "--dry-run"],
     );
     assert_eq!(merge["dry_run"], true);
     assert!(merge["changed_paths"]
@@ -12740,6 +12753,20 @@ fn local_api_and_cli_export_openapi_contract() {
     assert!(cli["paths"]
         .get("/v1/lanes/{lane_or_id}/read-file")
         .is_some());
+    assert_eq!(
+        cli["paths"]["/v1/lanes/{lane}/merge"]["post"]["operationId"],
+        "laneMerge"
+    );
+    assert!(cli["paths"]
+        .get("/v1/branches/{branch}/merge-lane")
+        .is_none());
+    assert_eq!(
+        cli["components"]["schemas"]["LaneMergeRequest"]["required"],
+        serde_json::json!(["into"])
+    );
+    assert!(cli["components"]["schemas"]
+        .get("MergeLaneRequest")
+        .is_none());
     assert!(cli["components"]["schemas"]["LaneReadFileRequest"].is_object());
     assert!(cli["paths"].get("/v1/lane/events").is_some());
     assert!(cli["paths"].get("/v1/lane/spans").is_some());
@@ -19410,7 +19437,8 @@ fn merge_dry_run_reports_without_mutating_refs() {
     let cli = run_trail_json(
         temp.path(),
         &[
-            "merge-lane",
+            "lane",
+            "merge",
             "doc-bot",
             "--strategy",
             "line-id-aware",
@@ -19424,9 +19452,9 @@ fn merge_dry_run_reports_without_mutating_refs() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
+            "/v1/lanes/doc-bot/merge",
             serde_json::json!({
-                "lane": "doc-bot",
+                "into": "main",
                 "dry_run": true
             }),
         ),
@@ -19434,6 +19462,19 @@ fn merge_dry_run_reports_without_mutating_refs() {
     assert_eq!(api_response.status, 200);
     let api: serde_json::Value = api_response.body_json().unwrap();
     assert_eq!(api["dry_run"], true);
+
+    let legacy_response = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/branches/main/merge-lane",
+            serde_json::json!({
+                "lane": "doc-bot",
+                "dry_run": true
+            }),
+        ),
+    );
+    assert_eq!(legacy_response.status, 400);
 
     let dry_run = db.merge_lane_with_options("doc-bot", "main", true).unwrap();
     assert!(dry_run.dry_run);
@@ -19463,7 +19504,7 @@ fn merge_dry_run_reports_without_mutating_refs() {
 }
 
 #[test]
-fn user_facing_merge_lane_prefers_queue_for_default_branch() {
+fn user_facing_lane_merge_prefers_queue_for_default_branch() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -19483,7 +19524,7 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
-        .args(["merge-lane", "cli-bot", "--into", "main"])
+        .args(["lane", "merge", "cli-bot", "--into", "main"])
         .output()
         .unwrap();
     assert!(!blocked.status.success());
@@ -19496,7 +19537,7 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
 
     let direct = run_trail_json(
         temp.path(),
-        &["merge-lane", "cli-bot", "--into", "main", "--direct"],
+        &["lane", "merge", "cli-bot", "--into", "main", "--direct"],
     );
     assert_eq!(direct["dry_run"], false);
     assert_eq!(direct["changed_paths"][0]["path"], "docs/cli.md");
@@ -19514,8 +19555,8 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
-            serde_json::json!({ "lane": "api-bot" }),
+            "/v1/lanes/api-bot/merge",
+            serde_json::json!({ "into": "main" }),
         ),
     );
     assert_eq!(blocked_api.status, 400);
@@ -19529,8 +19570,8 @@ fn user_facing_merge_lane_prefers_queue_for_default_branch() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
-            serde_json::json!({ "lane": "api-bot", "direct": true }),
+            "/v1/lanes/api-bot/merge",
+            serde_json::json!({ "into": "main", "direct": true }),
         ),
     );
     assert_eq!(direct_api.status, 200);
@@ -19899,7 +19940,7 @@ fn merge_dry_run_reports_conflicts_without_opening_conflict_state() {
     );
     assert_eq!(db.lane_details("doc-bot").unwrap().branch.status, "active");
 
-    let cli = run_trail_json(temp.path(), &["merge-lane", "doc-bot", "--dry-run"]);
+    let cli = run_trail_json(temp.path(), &["lane", "merge", "doc-bot", "--dry-run"]);
     assert_eq!(cli["dry_run"], true);
     assert_eq!(cli["conflicts"][0], "both changed `README.md` differently");
     assert!(db.list_conflicts().unwrap().is_empty());
@@ -19973,8 +20014,8 @@ fn local_api_direct_merge_lane_conflict_records_conflict_set() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/branches/main/merge-lane",
-            serde_json::json!({ "lane_id": "api-bot", "direct": true }),
+            "/v1/lanes/api-bot/merge",
+            serde_json::json!({ "into": "main", "direct": true }),
         ),
     );
     assert_eq!(response.status, 409);

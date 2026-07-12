@@ -10,6 +10,12 @@ All notable changes to Trail are documented in this file. Trail follows
 - **Breaking:** Trail CLI human output now uses the unified outcome-first
   terminal renderer. The old human layouts and `--no-color` option are removed;
   use `--color never` instead.
+- **Breaking:** `trail merge-lane` is removed. Use
+  `trail lane merge <lane> --into <branch>` for lane-specific merges; the
+  `trail merge` command remains for generic branch/ref merges.
+- **Breaking:** `POST /v1/branches/{branch}/merge-lane` is removed. Use
+  `POST /v1/lanes/{lane}/merge` with the target branch in the required `into`
+  JSON field.
 - Added `--format human|plain|json|ndjson`, `--color auto|always|never`, and
   `--pager auto|always|never`. `plain` is deterministic text; JSON and NDJSON
   are the supported contracts for automation.

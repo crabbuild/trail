@@ -72,7 +72,7 @@ This means CLI behavior usually has two paths:
 - Local execution through `Trail`.
 - Daemon-backed execution for selected hot commands, returning the same report shapes.
 
-The daemon path is intentionally partial. It handles `status`, `record`, `diff`, selected `lane` commands, `merge-lane`, and `merge-queue`. Unsupported commands fall back to local execution unless the user explicitly supplied a daemon URL and the command is not daemon-capable.
+The daemon path is intentionally partial. It handles `status`, `record`, `diff`, selected `lane` commands including `lane merge`, and `merge-queue`. Unsupported commands fall back to local execution unless the user explicitly supplied a daemon URL and the command is not daemon-capable.
 
 ```mermaid
 sequenceDiagram

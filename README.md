@@ -166,7 +166,7 @@ trail lane spawn fix-login --from main --materialize=true
 # Work is isolated in the lane until it is reviewed and validated.
 trail lane record fix-login -m "Fix login validation"
 trail lane readiness fix-login
-trail merge-lane fix-login --into main --dry-run
+trail lane merge fix-login --into main --dry-run
 ```
 
 ## Why This Matters for AI Agents
@@ -555,7 +555,7 @@ trail lane workdir docs-lane
 trail lane record docs-lane -m "record docs update"
 trail lane diff docs-lane --patch
 trail lane readiness docs-lane
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 ```
 
 Example CLI output from a tiny workspace looks like this. IDs, object hashes,
@@ -807,7 +807,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail lane review <name>` | Produce a compact review packet for a lane branch |
 | `trail lane readiness <name>` | Report blockers before merging a lane branch |
 | `trail lane handoff <name>` | Produce a review and continuation packet for a lane |
-| `trail merge-lane <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
+| `trail lane merge <name> --into <branch> --dry-run` | Preview merging a lane branch into a target branch |
 | `trail merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `trail daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `trail mcp` | Start the MCP stdio server for agent hosts |
@@ -1279,7 +1279,7 @@ trail lane sync-workdir doc-bot
 Merge only after review and readiness checks:
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 trail merge-queue add doc-bot --into main
 trail merge-queue run
 ```

@@ -246,7 +246,7 @@ fn merge_queue_dry_run_next_step(entry: &MergeQueueEntry) -> String {
         .unwrap_or(&entry.target_ref);
     if let Some(lane) = entry.source_ref.strip_prefix(LANE_REF_PREFIX) {
         return format!(
-            "Inspect conflicts with `trail merge-lane {lane} --into {target} --dry-run` or run the queue to record a conflict set."
+            "Inspect conflicts with `trail lane merge {lane} --into {target} --dry-run` or run the queue to record a conflict set."
         );
     }
     let source = entry

@@ -2,19 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-#[derive(Args)]
-pub(in crate::cli::command) struct MergeLaneArgs {
-    pub(in crate::cli::command) name: String,
-    #[arg(long, default_value = "main")]
-    pub(in crate::cli::command) into: String,
-    #[arg(long)]
-    pub(in crate::cli::command) strategy: Option<String>,
-    #[arg(long)]
-    pub(in crate::cli::command) dry_run: bool,
-    #[arg(long)]
-    pub(in crate::cli::command) direct: bool,
-}
-
 #[derive(Subcommand)]
 pub(in crate::cli::command) enum MergeQueueSubcommand {
     /// Add a source ref to the merge queue.

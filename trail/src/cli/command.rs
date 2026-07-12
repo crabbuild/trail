@@ -178,9 +178,6 @@ enum Command {
     Session(SessionCommand),
     /// Handle sensitive action approvals and reviewer decisions.
     Approvals(ApprovalsCommand),
-    /// Merge a lane branch into a standard branch with readiness checks.
-    /// Applies the same conflict rules as queue/manual merges.
-    MergeLane(MergeLaneArgs),
     /// Schedule and run controlled serialized merges using a queue.
     /// Merge items pause on first conflict and keep audit history.
     MergeQueue(MergeQueueCommand),
@@ -415,5 +412,33 @@ mod tests {
         };
         assert!(args.name_status);
         assert!(!args.name_only);
+    }
+
+    #[test]
+    fn top_level_merge_lane_is_removed_from_the_cli() {
+        assert!(Cli::try_parse_from(["trail", "merge-lane", "fix-login"]).is_err());
+    }
+
+    #[test]
+    fn parses_lane_merge_with_lane_specific_options() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "lane",
+            "merge",
+            "fix-login",
+            "--into",
+            "main",
+            "--dry-run",
+        ])
+        .expect("lane merge command should parse");
+        let Command::Lane(LaneCommand {
+            command: LaneSubcommand::Merge(args),
+        }) = cli.command
+        else {
+            panic!("expected lane merge command");
+        };
+        assert_eq!(args.name, "fix-login");
+        assert_eq!(args.into, "main");
+        assert!(args.dry_run);
     }
 }

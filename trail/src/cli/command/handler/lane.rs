@@ -64,6 +64,13 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
             let report = db.lane_readiness(&args.name)?;
             render_lane_readiness(&report, ctx.json, &ctx.render)
         }
+        LaneSubcommand::Merge(args) => {
+            let mut db = open_db(ctx)?;
+            validate_merge_strategy(args.strategy.as_deref())?;
+            let report =
+                db.merge_lane_user_with_options(&args.name, &args.into, args.dry_run, args.direct)?;
+            render_merge(&report, ctx.json, &ctx.render)
+        }
         LaneSubcommand::RefreshPreview(args) => {
             let db = open_db(ctx)?;
             let report = db.preview_lane_refresh(&args.name, &args.target)?;

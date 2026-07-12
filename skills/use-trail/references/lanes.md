@@ -203,7 +203,7 @@ Stop on readiness blockers. Preview refresh and merge:
 
 ```sh
 trail lane refresh-preview <lane> --target main
-trail merge-lane <lane> --into main --dry-run
+trail lane merge <lane> --into main --dry-run
 ```
 
 For shared targets, queue rather than directly merging:

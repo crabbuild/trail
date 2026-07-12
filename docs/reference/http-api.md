@@ -105,6 +105,7 @@ x-trail-token: <token>
 | POST | `/v1/lanes/{lane_or_id}/sync-workdir` | Sync workdir. |
 | POST | `/v1/lanes/{lane_or_id}/record` | Record lane workdir. |
 | POST | `/v1/lanes/{lane_or_id}/rewind` | Rewind lane branch. |
+| POST | `/v1/lanes/{lane}/merge` | Dry-run or explicitly direct-merge this lane into body field `into`. |
 | POST | `/v1/lanes/{lane_or_id}/tests` | Run test gate. |
 | POST | `/v1/lanes/{lane_or_id}/evals` | Run eval gate. |
 | POST | `/v1/lanes/{lane_or_id}/patches` | Apply lane patch. |
@@ -144,6 +145,11 @@ entries, oversized changed files, and policy allow/block details.
 non-committing refresh/rebase preview with operations-behind, conflicts, changed
 paths, and next steps.
 
+`POST /v1/lanes/{lane_or_id}/merge` requires a JSON `into` target branch and
+allows `dry_run=true` preflight. A non-dry-run merge into the workspace default
+branch requires `direct=true`; otherwise enqueue with `POST /v1/merge-queue`
+and run the queue. The former branch-scoped `merge-lane` endpoint was removed.
+
 ## Collaboration Routes
 
 | Method | Path | Purpose |
@@ -169,7 +175,6 @@ paths, and next steps.
 | GET | `/v1/conflicts` | List conflicts. |
 | GET | `/v1/conflicts/{conflict_set_id}?limit=50` | Show conflict with explanation evidence. |
 | POST | `/v1/conflicts/{conflict_set_id}/resolve` | Resolve conflict. |
-| POST | `/v1/branches/{branch}/merge-lane` | Dry-run or explicitly direct-merge lane branch. |
 
 Conflict explanations include the stored `base_root`, `target_root`, and
 `source_root` snapshots used to reproduce the conflict, plus per-path
@@ -180,10 +185,6 @@ signature matches a previously resolved conflict.
 `POST /v1/conflicts/{conflict_set_id}/resolve` requires exactly one of `take`
 or `manual`. Manual file values can be plain strings or objects with only
 `content`, `delete`, and `executable`; unknown keys are rejected.
-
-`POST /v1/branches/{branch}/merge-lane` allows `dry_run=true` preflight. A
-non-dry-run merge into the workspace default branch requires `direct=true`;
-otherwise enqueue with `POST /v1/merge-queue` and run the queue.
 
 Bodyless mutation routes reject non-empty request bodies. This applies to
 path-only deletes such as lane removal, lease release, anchor deletion, and

@@ -48,7 +48,7 @@ trail lane gates docs-lane --limit 20
 Preview and queue the merge:
 
 ```sh
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 trail merge-queue add docs-lane --into main
 trail merge-queue run
 ```
@@ -135,7 +135,7 @@ audit history.
 Preview first:
 
 ```sh
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 ```
 
 For shared branches, use the queue:

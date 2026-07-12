@@ -39,7 +39,7 @@ Daemon routing supports:
 - `record`
 - `diff`
 - selected `lane` commands
-- `merge-lane`
+- `lane merge`
 - `merge-queue`
 
 If auto-discovery finds a stale daemon endpoint, the CLI falls back to local execution for unavailable daemon errors.

@@ -1,13 +1,13 @@
 use crate::server::request_types::{
-    default_lease_mode, AnchorCreateRequest, ConflictResolveRequest, LeaseAcquireRequest,
-    MergeLaneRequest, MergeQueueAddRequest, MergeQueueRunRequest,
+    default_lease_mode, AnchorCreateRequest, ConflictResolveRequest, LaneMergeRequest,
+    LeaseAcquireRequest, MergeQueueAddRequest, MergeQueueRunRequest,
 };
 use crate::server::route::utils::{
     json_response, query_flag, query_usize, query_value, reject_unexpected_body, required_query,
     resolve_conflict_request, validate_merge_strategy,
 };
 use crate::server::transport::{HttpRequest, HttpResponse};
-use crate::{Error, Result, Trail};
+use crate::{Result, Trail};
 
 pub(super) fn handle_collaboration_routes(
     db: &mut Trail,
@@ -131,17 +131,15 @@ pub(super) fn handle_collaboration_routes(
 
     if parts.len() == 4
         && parts[0] == "v1"
-        && parts[1] == "branches"
-        && parts[3] == "merge-lane"
+        && parts[1] == "lanes"
+        && parts[3] == "merge"
         && request.method == "POST"
     {
-        let body: MergeLaneRequest = serde_json::from_slice(&request.body)?;
+        let body: LaneMergeRequest = serde_json::from_slice(&request.body)?;
         validate_merge_strategy(body.strategy.as_deref())?;
-        let lane = body.lane_id.ok_or_else(|| {
-            Error::InvalidInput("merge-lane request requires `lane_id`".to_string())
-        })?;
-        let lane = db.resolve_lane_handle(&lane)?;
-        let report = db.merge_lane_user_with_options(&lane, parts[2], body.dry_run, body.direct)?;
+        let lane = db.resolve_lane_handle(parts[2])?;
+        let report =
+            db.merge_lane_user_with_options(&lane, &body.into, body.dry_run, body.direct)?;
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 

@@ -520,7 +520,7 @@ state:
 ```sh
 trail lane review <lane>
 trail lane diff <lane> --patch
-trail merge-lane <lane> --into main --dry-run
+trail lane merge <lane> --into main --dry-run
 trail merge-queue add <lane> --into main
 ```
 

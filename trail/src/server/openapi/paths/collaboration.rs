@@ -115,10 +115,10 @@ pub(super) fn collaboration_paths() -> Value {
                 openapi_path_param("conflict_set_id", "string")
             ], Some("ConflictResolveRequest"), true)
         },
-        "/v1/branches/{branch}/merge-lane": {
-            "post": openapi_operation("branchMergeLane", "Merge lane", "Dry-run a lane merge or explicitly direct-merge a lane branch into a target branch.", vec![
-                openapi_path_param("branch", "string")
-            ], Some("MergeLaneRequest"), true)
+        "/v1/lanes/{lane}/merge": {
+            "post": openapi_operation("laneMerge", "Merge lane", "Dry-run a lane merge or explicitly direct-merge this lane into the request target branch.", vec![
+                openapi_path_param("lane", "string")
+            ], Some("LaneMergeRequest"), true)
         }
     })
 }

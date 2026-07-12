@@ -32,7 +32,7 @@ trail approvals decide <approval-id> --decision approved
 ## Merge Flow
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 trail merge-queue add doc-bot --into main
 trail merge-queue run
 ```

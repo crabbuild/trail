@@ -25,10 +25,10 @@ trail merge <SOURCE> --into <TARGET> [--strategy <STRATEGY>] [--dry-run]
 
 Allowed strategies are `conservative`, `line-id-aware`, and `line_id_aware`.
 
-## `merge-lane`
+## `lane merge`
 
 ```text
-trail merge-lane <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [--direct]
+trail lane merge <LANE> [--into <BRANCH>] [--strategy <STRATEGY>] [--dry-run] [--direct]
 ```
 
 Default target is `main`. Non-dry-run direct merges into the workspace default
@@ -72,6 +72,6 @@ rejected rather than ignored.
 
 ## Code Facts Used
 
-- Args: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/collaboration_args/merge.rs`
+- Args: `trail/src/cli/command/worktree_args.rs`, `trail/src/cli/command/lane_args.rs`
 - Merge logic: `trail/src/db/merge`
 - Conflict reports: `trail/src/model/reports/merge.rs`

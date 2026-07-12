@@ -10,6 +10,19 @@ pub(super) use run::*;
 pub(super) use trace::*;
 pub(super) use turn::*;
 
+#[derive(Args)]
+pub(super) struct LaneMergeArgs {
+    pub(super) name: String,
+    #[arg(long, default_value = "main")]
+    pub(super) into: String,
+    #[arg(long)]
+    pub(super) strategy: Option<String>,
+    #[arg(long)]
+    pub(super) dry_run: bool,
+    #[arg(long)]
+    pub(super) direct: bool,
+}
+
 #[derive(Subcommand)]
 pub(super) enum LaneSubcommand {
     /// Create a new lane branch and optional materialized workdir.
@@ -28,6 +41,8 @@ pub(super) enum LaneSubcommand {
     Gates(LaneGatesArgs),
     /// Compute lane merge-readiness including blockers and warnings.
     Readiness(LaneReadinessArgs),
+    /// Merge a ready lane into a target branch, or preview the merge safely.
+    Merge(LaneMergeArgs),
     /// Preview refreshing a lane onto a target branch before merge.
     RefreshPreview(LaneRefreshPreviewArgs),
     /// Merge a branch into a layered lane and advance its pinned view generation.

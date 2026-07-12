@@ -2,15 +2,13 @@ use serde_json::{json, Value};
 
 pub(super) fn collaboration_schemas() -> Value {
     json!({
-        "MergeLaneRequest": {
+        "LaneMergeRequest": {
             "type": "object",
+            "required": ["into"],
             "properties": {
-                "lane_id": { "type": "string" },
-                "lane": { "type": "string" },
-                "name": { "type": "string" },
+                "into": { "type": "string" },
                 "strategy": { "type": "string" },
                 "dry_run": { "type": "boolean" },
-                "dry-run": { "type": "boolean" },
                 "direct": { "type": "boolean" }
             }
         },

@@ -6,12 +6,11 @@ use super::default_completed_status;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeLaneRequest {
-    #[serde(default, alias = "lane", alias = "name")]
-    pub(crate) lane_id: Option<String>,
+pub(crate) struct LaneMergeRequest {
+    pub(crate) into: String,
     #[serde(default)]
     pub(crate) strategy: Option<String>,
-    #[serde(default, alias = "dry-run")]
+    #[serde(default)]
     pub(crate) dry_run: bool,
     #[serde(default)]
     pub(crate) direct: bool,

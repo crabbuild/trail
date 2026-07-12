@@ -495,11 +495,11 @@ PY
     python3 - "$WORK/daemon-merge.json" <<'PY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
-    "lane_id": "daemonbot",
+    "into": "main",
     "dry_run": True,
 }))
 PY
-    run_http_timed "$scale" daemon_merge_dry_run "$DAEMON_URL" POST /v1/branches/main/merge-lane "$WORK/daemon-merge.json"
+    run_http_timed "$scale" daemon_merge_dry_run "$DAEMON_URL" POST /v1/lanes/daemonbot/merge "$WORK/daemon-merge.json"
     run_timed "$scale" daemon_auto_cli_status "$BIN" --workspace "$REPO" --json status
     run_timed "$scale" daemon_auto_cli_agent_readiness "$BIN" --workspace "$REPO" --json lane readiness daemonbot
     run_timed "$scale" daemon_cli_status "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json status
@@ -613,7 +613,7 @@ PY
     run_timed "$scale" daemon_cli_agent_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane timeline daemonclibot --limit 20
     run_timed "$scale" daemon_cli_timeline "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json timeline --lane daemonclibot --limit 20
     run_timed "$scale" daemon_cli_agent_handoff "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane handoff daemonclibot
-    run_timed "$scale" daemon_cli_merge_dry_run "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-lane daemonclibot --into main --dry-run
+    run_timed "$scale" daemon_cli_merge_dry_run "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json lane merge daemonclibot --into main --dry-run
     run_timed "$scale" daemon_cli_merge_queue_list "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue list
     run_timed "$scale" daemon_cli_merge_queue_run_empty "$BIN" --workspace "$REPO" --daemon-url "$DAEMON_URL" --json merge-queue run
     DAEMON_RSS="$(daemon_rss_bytes "$DAEMON_PID")"
@@ -644,8 +644,8 @@ json.dump({"base_change": base_change, "message": "scale patchbot", "edits": edi
 PY
   run_timed "$scale" agent_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch patchbot --patch "$WORK/patchbot.json"
   run_timed "$scale" agent_readiness "$BIN" --workspace "$REPO" --json lane readiness patchbot
-  run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main --direct --dry-run
-  run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json merge-lane patchbot --into main --direct
+  run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json lane merge patchbot --into main --direct --dry-run
+  run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json lane merge patchbot --into main --direct
 
   run_timed "$scale" agent_spawn_queuebot "$BIN" --workspace "$REPO" --json lane spawn queuebot --from main --no-materialize
   python3 - "$REPO" "$WORK/queuebot.json" "$scale" "$WORK/out/agent_spawn_queuebot.stdout" <<'PY'

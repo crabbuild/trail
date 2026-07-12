@@ -146,7 +146,7 @@ trail lane readiness docs-lane
 Merge only after review and readiness checks:
 
 ```sh
-trail merge-lane docs-lane --into main --dry-run
+trail lane merge docs-lane --into main --dry-run
 trail merge-queue add docs-lane --into main
 trail merge-queue run
 ```

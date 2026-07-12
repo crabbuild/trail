@@ -43,7 +43,7 @@ When conflicts occur, Trail records structured conflict sets for inspection and 
 ## Lane Merges
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 ```
 
 Non-dry-run lane merges into the default branch use the merge queue by default:
@@ -53,7 +53,7 @@ trail merge-queue add doc-bot --into main
 trail merge-queue run
 ```
 
-Immediate default-branch merges require `trail merge-lane ... --direct`.
+Immediate default-branch merges require `trail lane merge ... --direct`.
 
 ## Merge Queue
 

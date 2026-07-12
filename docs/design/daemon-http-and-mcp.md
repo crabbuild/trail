@@ -264,7 +264,7 @@ Auto-discovery:
 - Try daemon command.
 - Fall back to local execution for daemon-unavailable errors when discovery was automatic.
 
-Supported daemon-routed commands include `status`, `record`, `diff`, selected `lane` commands, `merge-lane`, and `merge-queue`.
+Supported daemon-routed commands include `status`, `record`, `diff`, selected `lane` commands including `lane merge`, and `merge-queue`.
 
 ```mermaid
 sequenceDiagram

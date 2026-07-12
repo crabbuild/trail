@@ -71,7 +71,7 @@ records dirty materialized workdir edits before the rewind when possible.
 ## Merge
 
 ```sh
-trail merge-lane doc-bot --into main --dry-run
+trail lane merge doc-bot --into main --dry-run
 trail merge-queue add doc-bot --into main
 trail merge-queue run
 ```

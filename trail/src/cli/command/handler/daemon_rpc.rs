@@ -86,19 +86,6 @@ pub(super) fn try_handle_daemon_command(
         Command::Lane(lane) => handle_lane_command(ctx, &client, lane),
         Command::Session(session) => handle_session_command(ctx, &client, session),
         Command::Approvals(approvals) => handle_approvals_command(ctx, &client, approvals),
-        Command::MergeLane(args) => {
-            validate_merge_strategy(args.strategy.as_deref())?;
-            let body = serde_json::json!({
-                "lane_id": args.name,
-                "strategy": args.strategy,
-                "dry_run": args.dry_run,
-                "direct": args.direct,
-            });
-            let report: MergeReport =
-                client.post_json(&format!("/v1/branches/{}/merge-lane", args.into), &body)?;
-            render_merge(&report, ctx.json, &ctx.render)?;
-            Ok(true)
-        }
         Command::MergeQueue(queue) => handle_merge_queue_command(ctx, &client, queue),
         Command::Lease(lease) => handle_lease_command(ctx, &client, lease),
         Command::Doctor => {
@@ -121,7 +108,6 @@ fn daemon_supports_command(command: &Command) -> bool {
         | Command::CodeFrom(_)
         | Command::Session(_)
         | Command::Approvals(_)
-        | Command::MergeLane(_)
         | Command::MergeQueue(_)
         | Command::Lease(_)
         | Command::Doctor => true,
@@ -134,6 +120,7 @@ fn daemon_supports_command(command: &Command) -> bool {
             | LaneSubcommand::Contribution(_)
             | LaneSubcommand::Gates(_)
             | LaneSubcommand::Readiness(_)
+            | LaneSubcommand::Merge(_)
             | LaneSubcommand::RefreshPreview(_)
             | LaneSubcommand::Handoff(_)
             | LaneSubcommand::Claim(_)
@@ -246,6 +233,19 @@ fn handle_lane_command(
             let report: LaneReadinessReport =
                 client.get_json(&format!("/v1/lanes/{}/readiness", args.name))?;
             render_lane_readiness(&report, ctx.json, &ctx.render)?;
+            Ok(true)
+        }
+        LaneSubcommand::Merge(args) => {
+            validate_merge_strategy(args.strategy.as_deref())?;
+            let body = serde_json::json!({
+                "into": args.into,
+                "strategy": args.strategy,
+                "dry_run": args.dry_run,
+                "direct": args.direct,
+            });
+            let report: MergeReport =
+                client.post_json(&format!("/v1/lanes/{}/merge", args.name), &body)?;
+            render_merge(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::RefreshPreview(args) => {

@@ -988,15 +988,10 @@ impl<'a, W: Write> Renderer<'a, W> {
             indent,
         )?;
         if let Some(cause) = &diagnostic.cause {
-            self.line_indented(&sanitize_inline(cause), UiTone::Neutral, false, indent)?;
+            self.multiline_indented(cause, UiTone::Neutral, indent)?;
         }
         if let Some(consequence) = &diagnostic.consequence {
-            self.line_indented(
-                &sanitize_inline(consequence),
-                UiTone::Attention,
-                false,
-                indent,
-            )?;
+            self.multiline_indented(consequence, UiTone::Attention, indent)?;
         }
         if let Some(recovery) = &diagnostic.recovery {
             self.blank()?;
@@ -1052,7 +1047,7 @@ impl<'a, W: Write> Renderer<'a, W> {
         )?;
         self.line_indented(
             &sanitize_inline(&action.reason),
-            UiTone::Muted,
+            UiTone::Neutral,
             false,
             indent + 2,
         )
@@ -1077,6 +1072,13 @@ impl<'a, W: Write> Renderer<'a, W> {
         let rendered = self.style(value, tone, strong);
         self.writer.write_all(rendered.as_bytes())?;
         self.writer.write_all(b"\n")
+    }
+
+    fn multiline_indented(&mut self, value: &str, tone: UiTone, indent: usize) -> io::Result<()> {
+        for line in value.split('\n') {
+            self.line_indented(&sanitize_inline(line), tone, false, indent)?;
+        }
+        Ok(())
     }
 
     fn style(&self, value: &str, tone: UiTone, strong: bool) -> String {
@@ -1422,6 +1424,19 @@ mod tests {
             &RenderOptions::test(RenderMode::Human, 80),
         )
         .contains("old-name.rs → new-name.rs"));
+    }
+
+    #[test]
+    fn next_action_reason_uses_normal_text_color() {
+        let document = TerminalDocument::new("Invalid input", UiTone::Failure).next(
+            "trail --help",
+            "Review the command syntax and available options.",
+        );
+        let mut options = RenderOptions::test(RenderMode::Human, 80);
+        options.color = true;
+        let output = render_document_to_string(&document, &options);
+        assert!(output.contains("Review the command syntax and available options."));
+        assert!(!output.contains("\u{1b}[90mReview the command syntax and available options."));
     }
 
     /// An opt-in release benchmark for the renderer cutover. It deliberately
