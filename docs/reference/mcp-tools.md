@@ -329,16 +329,17 @@ file values can be plain strings or objects with only `content`, `delete`, and
 - `trail.sync_workdir`
 - `trail.read_file`
 
-`trail.lane_spawn` accepts `workdir_mode` values `virtual`, `sparse`,
-`native-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. `virtual` creates no workdir, `sparse` requires
-`paths`, and `native-cow` creates a full materialized workdir using filesystem
-clone COW when available. `fuse-cow` creates an empty workdir mountpoint and
+`trail.lane_spawn` accepts `workdir_mode` values `auto`, `virtual`, `sparse`,
+`native-cow`, `portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow`.
+`native-cow` is strict, `portable-copy` permits per-file byte-copy fallback,
+and `auto` tries the former before restarting as the latter. `fuse-cow` creates an empty workdir mountpoint and
 records the `fuse` backend; a runtime such as `trail agent start
 --workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the
-agent runs. Spawn results include `workdir_mode`, `cow_backend`, `sparse_paths`,
+agent runs. Spawn results include `requested_workdir_mode`, resolved
+`workdir_mode`, `workdir_backend`, optional `materialization`, `sparse_paths`,
 and `transparent_cow_available`.
-On macOS, `nfs-cow` reports `cow_backend: "nfs"` and uses the built-in
-loopback NFS client. On Windows, `dokan-cow` reports `cow_backend: "dokan"`.
+On macOS, `nfs-cow` reports `workdir_backend: "nfs"` and uses the built-in
+loopback NFS client. On Windows, `dokan-cow` reports `workdir_backend: "dokan"`.
 
 `trail.apply_patch` accepts either native `edits` or compatibility `files`;
 provide exactly one non-empty array. Native edit objects and compatibility file

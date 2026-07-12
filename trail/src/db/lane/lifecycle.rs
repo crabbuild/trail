@@ -194,13 +194,16 @@ impl Trail {
                     self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
                 }
                 LaneWorkdirMode::Sparse => {
-                    self.materialize_lane_workdir_at_paths_with_neighbors(
+                    if let Some(report) = self.materialize_lane_workdir_at_paths_with_neighbors(
                         &source.root_id,
                         dir,
                         workdir.is_some(),
                         &sparse_paths,
                         include_neighbors,
-                    )?;
+                    )? {
+                        workdir_backend = report.backend();
+                        materialization_report = Some(report);
+                    }
                     if !sparse_paths.is_empty() {
                         sparse_policy_paths = self.sparse_workdir_paths(dir)?;
                     }
@@ -433,6 +436,7 @@ impl Trail {
             sparse_paths,
             false,
         )
+        .map(|_| ())
     }
 
     pub(crate) fn materialize_lane_workdir_at_paths_with_neighbors(
@@ -442,7 +446,7 @@ impl Trail {
         custom_workdir: bool,
         sparse_paths: &[String],
         include_neighbors: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<MaterializationReport>> {
         if sparse_paths.is_empty() {
             self.materialize_lane_root_staged(
                 root_id,
@@ -450,7 +454,7 @@ impl Trail {
                 custom_workdir,
                 MaterializationPolicy::Auto,
             )?;
-            return Ok(());
+            return Ok(None);
         }
         prepare_lane_workdir(dir, custom_workdir)?;
         let files = if include_neighbors {
@@ -458,17 +462,37 @@ impl Trail {
         } else {
             self.load_root_files_for_selections(root_id, sparse_paths)?
         };
-        let materialized =
-            self.materialize_new_files_best_effort_at_with_workspace_cow_report(dir, &files)?;
+        let empty = BTreeMap::new();
+        let mut stamps = BTreeMap::new();
+        let mut report = MaterializationReport::default();
+        for (path, entry) in &files {
+            let mut cloned = false;
+            match materialize_workspace_file_cow_status_if_matching(
+                &self.workspace_root,
+                dir,
+                path,
+                entry,
+            )? {
+                WorkspaceCowMaterializeStatus::Cloned(stamp) => {
+                    stamps.insert(path.clone(), stamp);
+                    report.cloned_files += 1;
+                    report.cloned_bytes += entry.size_bytes;
+                    cloned = true;
+                }
+                WorkspaceCowMaterializeStatus::Skipped
+                | WorkspaceCowMaterializeStatus::Unavailable(_) => {}
+            }
+            if !cloned {
+                let one = BTreeMap::from([(path.clone(), entry.clone())]);
+                let materialized = self.materialize_files_at_report(dir, &empty, &one)?;
+                stamps.extend(materialized.stamps);
+                report.copied_files += 1;
+                report.copied_bytes += entry.size_bytes;
+            }
+        }
         self.write_sparse_workdir_manifest(dir, files.keys())?;
-        self.write_clean_workdir_manifest_from_stamps(
-            dir,
-            root_id,
-            &files,
-            files.keys(),
-            materialized.stamps,
-        )?;
-        Ok(())
+        self.write_clean_workdir_manifest_from_stamps(dir, root_id, &files, files.keys(), stamps)?;
+        Ok(Some(report))
     }
 
     pub(crate) fn sparse_workdir_paths(&self, dir: &Path) -> Result<Option<Vec<String>>> {
@@ -934,14 +958,6 @@ pub(crate) fn selected_file_entries(
 
 fn sparse_workdir_manifest_path(dir: &Path) -> PathBuf {
     dir.join(".trail").join("sparse-workdir.json")
-}
-
-fn remove_sparse_workdir_manifest(dir: &Path) -> Result<()> {
-    let manifest = sparse_workdir_manifest_path(dir);
-    if manifest.exists() {
-        fs::remove_file(manifest)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

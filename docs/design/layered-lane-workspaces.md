@@ -205,8 +205,9 @@ content so filesystem backends can serve ranged reads and use reflink copy-up.
 
 ## Current Foundation and Gaps
 
-`LaneWorkdirMode` currently supports `virtual`, `sparse`, `native-cow`,
-`fuse-cow`, and `nfs-cow`. Lane spawning records the mode and creates either
+`LaneWorkdirMode` currently supports `auto`, `virtual`, `sparse`, `native-cow`,
+`portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. Lane spawning records
+the requested and resolved modes and creates either
 a materialized workdir or an overlay mountpoint. `trail agent start` holds a
 mount for the child process, records the lane workdir when the child exits, and
 then unmounts it.
@@ -1017,13 +1018,14 @@ mapping policy, rename semantics, sharing modes, delete-pending state, and
 reparse-point safety. A future ProjFS backend can be evaluated without changing
 `ViewCore`.
 
-### Clone fallback
+### Native and portable materialization
 
-`native-cow` remains valuable for tools that are incompatible with mounted
-filesystems. It should gain a `require_clone` result: if the filesystem cannot
-clone safely, a large-repository policy can reject ordinary materialization.
-Reports distinguish reflinked bytes, copied bytes, and files hydrated from
-Trail objects.
+`native-cow` requires a successful filesystem clone for every file and never
+falls back to byte copying. `portable-copy` clones opportunistically and copies
+the remainder. Materialized-only `auto` stages a strict attempt first, then
+restarts portably only when clone support, filesystem placement, or a complete
+validated native source is unavailable. Reports distinguish requested mode,
+resolved mode, cloned bytes, and copied bytes.
 
 ### Conformance contract
 
@@ -1427,14 +1429,12 @@ and GC. Report logical and physical storage after each additional lane.
 Existing lanes using the current mode vocabulary remain valid:
 
 - `virtual` and `sparse` semantics do not change.
-- `native-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow` are the supported COW modes.
+- `native-cow`, `portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow` are the supported materialized or mounted COW modes.
 - Removed workdir mode names are rejected. Operators must remove and recreate
   those lanes with the platform-appropriate current mode.
 - Existing lane `metadata_json` remains readable while typed workspace-view
   tables become authoritative for new lanes.
-- The default remains `native-cow` until `auto` passes platform conformance and
-  performance gates; changing the default is a separately documented product
-  decision.
+- New materialized selections default to `auto`; mounted modes remain explicit.
 
 Backups from older schemas restore without views. New backups restore source
 uppers but rebuild caches. JSON reports add fields compatibly where possible;

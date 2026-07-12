@@ -12,16 +12,43 @@ pub(crate) fn render_lane_spawn(
     if json {
         return render_json(report);
     }
+    let mut metadata = vec![
+        ("Base".to_string(), report.base_change.0.clone()),
+        (
+            "Requested mode".to_string(),
+            report.requested_workdir_mode.as_str().to_string(),
+        ),
+        (
+            "Resolved mode".to_string(),
+            report.workdir_mode.as_str().to_string(),
+        ),
+        (
+            "Backend".to_string(),
+            report
+                .workdir_backend
+                .map(WorkdirBackend::as_str)
+                .unwrap_or("unverified")
+                .to_string(),
+        ),
+    ];
+    if let Some(materialization) = &report.materialization {
+        metadata.push((
+            "Materialized".to_string(),
+            format!(
+                "{} cloned ({} bytes), {} copied ({} bytes)",
+                materialization.cloned_files,
+                materialization.cloned_bytes,
+                materialization.copied_files,
+                materialization.copied_bytes
+            ),
+        ));
+        if let Some(reason) = materialization.fallback_reason {
+            metadata.push(("Fallback".to_string(), reason.as_str().to_string()));
+        }
+    }
     let mut document =
-        TerminalDocument::new(format!("Created lane {}", report.lane_id), UiTone::Success).block(
-            UiBlock::Metadata(vec![
-                ("Base".to_string(), report.base_change.0.clone()),
-                (
-                    "Workdir mode".to_string(),
-                    report.workdir_mode.as_str().to_string(),
-                ),
-            ]),
-        );
+        TerminalDocument::new(format!("Created lane {}", report.lane_id), UiTone::Success)
+            .block(UiBlock::Metadata(metadata));
     if let Some(workdir) = &report.workdir {
         document = document.block(UiBlock::Notice(format!("Workdir: {workdir}")));
     }

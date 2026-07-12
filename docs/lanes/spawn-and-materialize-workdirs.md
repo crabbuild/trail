@@ -1,19 +1,26 @@
 # Spawn and Materialize Workdirs
 
 Lane branches can stay virtual or be materialized into a filesystem workdir.
-New commands and JSON reports expose this as `workdir_mode`:
+Commands select `requested_workdir_mode`; JSON reports also expose the resolved
+`workdir_mode`, actual `workdir_backend`, and per-file materialization counts:
 
+- `auto`: try strict native COW in staging, then restart as `portable-copy` if
+  native cloning is unavailable.
 - `virtual`: no workdir; branch state changes through patches or API calls.
 - `sparse`: materialize selected paths and hydrate more paths explicitly.
-- `native-cow`: materialize the full root, using filesystem-native clone COW when safe.
+- `native-cow`: require every file to be an APFS clone or Linux reflink; fail
+  without copying if any file cannot be cloned.
+- `portable-copy`: try a native clone per file and copy bytes when cloning is
+  unavailable; report `clone`, `mixed`, or `copy` from the actual result.
 - `fuse-cow`: create an empty mountpoint and use a FUSE overlay view at
   runtime; reads come from Trail objects and writes land in a per-lane upper
   directory.
 - `nfs-cow`: on macOS, expose the same lower/upper model through a loopback
   NFSv3 mount without macFUSE.
 
-For `native-cow` and `sparse`, COW means safe file clone during materialization or
-hydration. It does not intercept arbitrary writes to unhydrated paths.
+For materialized modes, COW means file cloning during materialization. It does
+not intercept later writes. Mounted COW modes remain explicit and are never
+selected by `auto`.
 
 FUSE COW is different: the visible workdir is mounted while a terminal agent
 is running. The mountpoint starts empty on disk, the writable upper layer lives
@@ -37,7 +44,9 @@ The default is controlled by `lane.default_materialize`, and large roots default
 
 ```sh
 trail lane spawn doc-bot --from main --materialize=true
+trail lane spawn doc-bot --from main --workdir-mode auto
 trail lane spawn doc-bot --from main --workdir-mode native-cow
+trail lane spawn doc-bot --from main --workdir-mode portable-copy
 ```
 
 Use a custom workdir:

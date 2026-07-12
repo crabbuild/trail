@@ -47,17 +47,12 @@ impl LaneWorkdirMode {
         match self {
             LaneWorkdirMode::Auto | LaneWorkdirMode::PortableCopy => None,
             LaneWorkdirMode::Virtual => Some(WorkdirBackend::Virtual),
-            LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => {
-                Some(WorkdirBackend::Clone)
-            }
+            LaneWorkdirMode::Sparse => None,
+            LaneWorkdirMode::NativeCow => Some(WorkdirBackend::Clone),
             LaneWorkdirMode::FuseCow => Some(WorkdirBackend::Fuse),
             LaneWorkdirMode::NfsCow => Some(WorkdirBackend::Nfs),
             LaneWorkdirMode::DokanCow => Some(WorkdirBackend::Dokan),
         }
-    }
-
-    pub fn cow_backend(&self) -> Option<&'static str> {
-        self.default_backend().map(WorkdirBackend::as_str)
     }
 
     pub fn is_transparent_cow(&self) -> bool {
@@ -100,6 +95,18 @@ pub enum MaterializationFallbackReason {
     CloneUnsupported,
     CrossDevice,
     NativeSourceUnavailable,
+}
+
+impl MaterializationFallbackReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MaterializationFallbackReason::CloneUnsupported => "clone-unsupported",
+            MaterializationFallbackReason::CrossDevice => "cross-device",
+            MaterializationFallbackReason::NativeSourceUnavailable => {
+                "native-source-unavailable"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -981,12 +988,24 @@ mod workdir_mode_tests {
             LaneWorkdirMode::parse("portable_copy"),
             Some(LaneWorkdirMode::PortableCopy)
         );
-        assert_eq!(LaneWorkdirMode::NativeCow.cow_backend(), Some("clone"));
-        assert_eq!(LaneWorkdirMode::Auto.cow_backend(), None);
-        assert_eq!(LaneWorkdirMode::PortableCopy.cow_backend(), None);
-        assert_eq!(LaneWorkdirMode::FuseCow.cow_backend(), Some("fuse"));
-        assert_eq!(LaneWorkdirMode::NfsCow.cow_backend(), Some("nfs"));
-        assert_eq!(LaneWorkdirMode::DokanCow.cow_backend(), Some("dokan"));
+        assert_eq!(
+            LaneWorkdirMode::NativeCow.default_backend(),
+            Some(WorkdirBackend::Clone)
+        );
+        assert_eq!(LaneWorkdirMode::Auto.default_backend(), None);
+        assert_eq!(LaneWorkdirMode::PortableCopy.default_backend(), None);
+        assert_eq!(
+            LaneWorkdirMode::FuseCow.default_backend(),
+            Some(WorkdirBackend::Fuse)
+        );
+        assert_eq!(
+            LaneWorkdirMode::NfsCow.default_backend(),
+            Some(WorkdirBackend::Nfs)
+        );
+        assert_eq!(
+            LaneWorkdirMode::DokanCow.default_backend(),
+            Some(WorkdirBackend::Dokan)
+        );
     }
 
     #[test]

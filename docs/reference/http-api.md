@@ -118,16 +118,17 @@ resolve the workspace default branch. It reports the target branch/ref, target
 change, lane base change, `operations_behind`, and whether the lane base is
 stale.
 
-`POST /v1/lanes` accepts `workdir_mode` values `virtual`, `sparse`,
-`native-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. `virtual` creates no workdir, `sparse` requires
-`paths`, and `native-cow` creates a full materialized workdir using filesystem
-clone COW when available. `fuse-cow` creates an empty workdir mountpoint and
+`POST /v1/lanes` accepts `workdir_mode` values `auto`, `virtual`, `sparse`,
+`native-cow`, `portable-copy`, `fuse-cow`, `nfs-cow`, and `dokan-cow`.
+`native-cow` is strict, `portable-copy` permits per-file byte-copy fallback,
+and `auto` tries the former before restarting as the latter. `fuse-cow` creates an empty workdir mountpoint and
 records the `fuse` backend; a runtime such as `trail agent start
 --workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the
-agent runs. The response includes `workdir_mode`, `cow_backend`, `sparse_paths`,
+agent runs. The response includes `requested_workdir_mode`, resolved
+`workdir_mode`, `workdir_backend`, optional `materialization`, `sparse_paths`,
 and `transparent_cow_available`.
-On macOS, `nfs-cow` reports `cow_backend: "nfs"` and requires no
-macFUSE installation. On Windows, `dokan-cow` reports `cow_backend: "dokan"`.
+On macOS, `nfs-cow` reports `workdir_backend: "nfs"` and requires no
+macFUSE installation. On Windows, `dokan-cow` reports `workdir_backend: "dokan"`.
 
 `POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
 `sync-workdir`, but requires at least one `paths` entry.

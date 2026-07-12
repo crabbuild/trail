@@ -42,8 +42,8 @@ trail --json agent dashboard latest
 Built-in terminal profiles are `claude-code`, `codex`, `cursor`, `gemini`,
 `aider`, and `opencode`.
 
-Valid terminal workdir modes are `native-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`;
-the default is `native-cow`.
+Valid terminal workdir modes are `auto`, `native-cow`, `portable-copy`,
+`fuse-cow`, `nfs-cow`, and `dokan-cow`; the default is `auto`.
 
 ```sh
 trail agent setup --provider codex --editor vscode

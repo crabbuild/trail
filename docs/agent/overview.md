@@ -95,12 +95,14 @@ Terminal tasks support these workdir modes:
 
 | Mode | Behavior | Typical use |
 | --- | --- | --- |
-| `native-cow` | Materializes the full task root using native filesystem cloning when available. | Portable default. |
+| `auto` | Tries strict native COW, then restarts as portable materialization when native cloning is unavailable. | Default materialized task mode. |
+| `native-cow` | Requires every task file to use native filesystem cloning and fails otherwise. | Enforce block-sharing guarantees. |
+| `portable-copy` | Clones per file when possible and byte-copies the remainder. | Predictable materialization across filesystems. |
 | `fuse-cow` | Mounts a FUSE-backed copy-on-write view for the duration of the agent run. | Avoid copying a large tree on Linux/macOS with FUSE available. |
 | `nfs-cow` | Mounts a loopback NFSv3 copy-on-write view on macOS. | Large macOS workspaces without macFUSE. |
 | `dokan-cow` | Mounts a Dokan-backed copy-on-write view on Windows. | Large Windows workspaces with Dokan 2.x. |
 
-The default for `trail agent start` and `trail agent continue` is `native-cow`.
+The default for `trail agent start` and `trail agent continue` is `auto`.
 FUSE, NFS, and Dokan mounts exist only while the terminal agent is running. Trail
 records their writable changes before unmounting.
 

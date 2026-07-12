@@ -418,7 +418,13 @@ mod tests {
 
     #[test]
     fn workdir_mode_cli_uses_the_hard_cutover_names() {
-        for mode in ["native-cow", "fuse-cow", "dokan-cow"] {
+        for mode in [
+            "auto",
+            "native-cow",
+            "portable-copy",
+            "fuse-cow",
+            "dokan-cow",
+        ] {
             Cli::try_parse_from([
                 "trail",
                 "lane",

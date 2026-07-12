@@ -270,6 +270,7 @@ impl Trail {
             daemon_worktree_cache: None,
         };
         db.init_schema()?;
+        db.recover_materialization_stages()?;
         db.recover_workspace_views()?;
         db.recover_workspace_environment_sync_attempts()?;
         db.recover_workspace_runtime_leases()?;

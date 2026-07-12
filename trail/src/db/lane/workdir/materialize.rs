@@ -1,4 +1,5 @@
 use super::*;
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaterializationPolicy {
@@ -18,6 +19,63 @@ pub(crate) struct MaterializationOutcome {
 enum NativeAttemptError {
     Unavailable(MaterializationFallbackReason),
     Hard(Error),
+}
+
+struct NativeSource {
+    root: PathBuf,
+    stamps: BTreeMap<String, WorktreeFileStamp>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MaterializationOperationState {
+    Preparing,
+    Materializing,
+    Verified,
+    Published,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct MaterializationOperationRecord {
+    version: u16,
+    operation_id: String,
+    destination: String,
+    stage: String,
+    state: MaterializationOperationState,
+}
+
+struct RegisteredMaterializationStage {
+    record_path: PathBuf,
+    record: MaterializationOperationRecord,
+}
+
+impl RegisteredMaterializationStage {
+    fn path(&self) -> &Path {
+        Path::new(&self.record.stage)
+    }
+
+    fn set_state(&mut self, state: MaterializationOperationState) -> Result<()> {
+        self.record.state = state;
+        write_file_atomic(&self.record_path, &serde_json::to_vec(&self.record)?, true)
+    }
+
+    fn finish(self) -> Result<()> {
+        match fs::remove_file(&self.record_path) {
+            Ok(()) => {
+                if let Some(parent) = self.record_path.parent() {
+                    sync_directory(parent);
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    fn abort(self) {
+        let _ = fs::remove_dir_all(self.path());
+        let _ = fs::remove_file(&self.record_path);
+    }
 }
 
 impl From<Error> for NativeAttemptError {
@@ -66,41 +124,48 @@ impl Trail {
         destination: &Path,
     ) -> std::result::Result<MaterializationOutcome, NativeAttemptError> {
         let files = self.load_root_files(root_id)?;
-        let source_stamps =
-            match self.workspace_file_stamps_if_clean_index_matches(root_id, &files)? {
-                Some(stamps) => Some(stamps),
-                None => self.workspace_file_stamps_if_entries_match(&files)?,
-            }
+        let source = self
+            .resolve_native_materialization_source(root_id, &files)?
             .ok_or(NativeAttemptError::Unavailable(
                 MaterializationFallbackReason::NativeSourceUnavailable,
             ))?;
 
-        let stage = create_materialization_stage(destination)?;
+        let mut operation = self.create_materialization_stage(destination)?;
+        let stage = operation.path().to_path_buf();
         let result = (|| {
-            verify_same_native_filesystem(&self.workspace_root, &stage)?;
+            verify_same_native_filesystem(&source.root, &stage)?;
             probe_native_clone(&stage)?;
 
             let mut stamps = BTreeMap::new();
             let mut report = MaterializationReport::default();
-            for (path, entry) in &files {
-                let source_stamp =
-                    source_stamps
-                        .get(path)
-                        .ok_or(NativeAttemptError::Unavailable(
-                            MaterializationFallbackReason::NativeSourceUnavailable,
-                        ))?;
-                match materialize_workspace_file_cow_status_if_stamp_matches(
-                    &self.workspace_root,
-                    &stage,
-                    path,
-                    entry,
-                    *source_stamp,
-                    false,
-                )? {
+            let results = files
+                .par_iter()
+                .map(|(path, entry)| {
+                    let source_stamp =
+                        source
+                            .stamps
+                            .get(path)
+                            .ok_or(NativeAttemptError::Unavailable(
+                                MaterializationFallbackReason::NativeSourceUnavailable,
+                            ))?;
+                    let status = materialize_workspace_file_cow_status_if_stamp_matches(
+                        &source.root,
+                        &stage,
+                        path,
+                        entry,
+                        *source_stamp,
+                        false,
+                    )?;
+                    Ok((path.clone(), entry.size_bytes, status))
+                })
+                .collect::<Vec<std::result::Result<_, NativeAttemptError>>>();
+            for result in results {
+                let (path, size_bytes, status) = result?;
+                match status {
                     WorkspaceCowMaterializeStatus::Cloned(stamp) => {
-                        stamps.insert(path.clone(), stamp);
+                        stamps.insert(path, stamp);
                         report.cloned_files += 1;
-                        report.cloned_bytes += entry.size_bytes;
+                        report.cloned_bytes += size_bytes;
                     }
                     WorkspaceCowMaterializeStatus::Skipped => {
                         return Err(NativeAttemptError::Unavailable(
@@ -123,15 +188,19 @@ impl Trail {
                 stamps,
             )?;
             ensure_staged_manifest_is_clean(self, &stage, root_id)?;
+            operation.set_state(MaterializationOperationState::Verified)?;
             publish_materialization_stage(&stage, destination)?;
+            operation.set_state(MaterializationOperationState::Published)?;
             Ok(MaterializationOutcome {
                 resolved_mode: LaneWorkdirMode::NativeCow,
                 backend: WorkdirBackend::Clone,
                 report,
             })
         })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&stage);
+        if result.is_ok() {
+            operation.finish()?;
+        } else {
+            operation.abort();
         }
         result
     }
@@ -143,12 +212,9 @@ impl Trail {
         fallback_reason: Option<MaterializationFallbackReason>,
     ) -> Result<MaterializationOutcome> {
         let files = self.load_root_files(root_id)?;
-        let source_stamps =
-            match self.workspace_file_stamps_if_clean_index_matches(root_id, &files)? {
-                Some(stamps) => Some(stamps),
-                None => self.workspace_file_stamps_if_entries_match(&files)?,
-            };
-        let stage = create_materialization_stage(destination)?;
+        let source = self.resolve_native_materialization_source(root_id, &files)?;
+        let mut operation = self.create_materialization_stage(destination)?;
+        let stage = operation.path().to_path_buf();
         let result = (|| {
             let mut stamps = BTreeMap::new();
             let mut report = MaterializationReport {
@@ -158,18 +224,29 @@ impl Trail {
             let empty = BTreeMap::new();
             for (path, entry) in &files {
                 let mut cloned = false;
-                if let Some(source_stamp) = source_stamps
-                    .as_ref()
-                    .and_then(|source_stamps| source_stamps.get(path))
-                {
-                    match materialize_workspace_file_cow_status_if_stamp_matches(
+                let clone_status = if let Some(native_source) = source.as_ref() {
+                    if let Some(source_stamp) = native_source.stamps.get(path) {
+                        Some(materialize_workspace_file_cow_status_if_stamp_matches(
+                            &native_source.root,
+                            &stage,
+                            path,
+                            entry,
+                            *source_stamp,
+                            false,
+                        )?)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(materialize_workspace_file_cow_status_if_matching(
                         &self.workspace_root,
                         &stage,
                         path,
                         entry,
-                        *source_stamp,
-                        false,
-                    )? {
+                    )?)
+                };
+                if let Some(status) = clone_status {
+                    match status {
                         WorkspaceCowMaterializeStatus::Cloned(stamp) => {
                             stamps.insert(path.clone(), stamp);
                             report.cloned_files += 1;
@@ -198,17 +275,189 @@ impl Trail {
             )?;
             ensure_staged_manifest_is_clean(self, &stage, root_id)?;
             let backend = report.backend();
+            operation.set_state(MaterializationOperationState::Verified)?;
             publish_materialization_stage(&stage, destination)?;
+            operation.set_state(MaterializationOperationState::Published)?;
             Ok(MaterializationOutcome {
                 resolved_mode: LaneWorkdirMode::PortableCopy,
                 backend,
                 report,
             })
         })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&stage);
+        if result.is_ok() {
+            operation.finish()?;
+        } else {
+            operation.abort();
         }
         result
+    }
+
+    fn resolve_native_materialization_source(
+        &self,
+        root_id: &ObjectId,
+        files: &BTreeMap<String, FileEntry>,
+    ) -> Result<Option<NativeSource>> {
+        // Strict source selection must not trust a possibly stale daemon/index
+        // snapshot. Hash the current workspace entries before choosing it.
+        let workspace_stamps = self.workspace_file_stamps_if_entries_match(files)?;
+        if let Some(stamps) = workspace_stamps {
+            return Ok(Some(NativeSource {
+                root: self.workspace_root.clone(),
+                stamps,
+            }));
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT workdir FROM lane_branches \
+             WHERE head_root = ?1 AND workdir IS NOT NULL ORDER BY updated_at DESC",
+        )?;
+        let candidates = statement
+            .query_map(params![root_id.0], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for candidate in candidates {
+            let root = PathBuf::from(candidate);
+            if !root.is_dir()
+                || !matches!(
+                    self.cached_workdir_manifest_status(&root, root_id)?,
+                    CachedWorkdirManifestStatus::Clean
+                )
+            {
+                continue;
+            }
+            let mut stamps = BTreeMap::new();
+            let mut complete = true;
+            for path in files.keys() {
+                let source = safe_join(&root, path)?;
+                let metadata = match fs::symlink_metadata(&source) {
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                        metadata
+                    }
+                    Ok(_) => {
+                        complete = false;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        complete = false;
+                        break;
+                    }
+                    Err(error) => return Err(Error::Io(error)),
+                };
+                stamps.insert(path.clone(), WorktreeFileStamp::from_metadata(&metadata));
+            }
+            if complete {
+                return Ok(Some(NativeSource { root, stamps }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn create_materialization_stage(
+        &self,
+        destination: &Path,
+    ) -> Result<RegisteredMaterializationStage> {
+        let parent = destination.parent().ok_or_else(|| Error::InvalidPath {
+            path: destination.to_string_lossy().to_string(),
+            reason: "lane workdir has no parent".to_string(),
+        })?;
+        let leaf = destination
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "workdir".into());
+        let journal_dir = self.db_dir.join("materialization-operations");
+        fs::create_dir_all(&journal_dir)?;
+        for _ in 0..32 {
+            let operation_id = format!("materialize-{}", now_nanos());
+            let stage = parent.join(format!(".{leaf}.trail-{operation_id}"));
+            let record_path = journal_dir.join(format!("{operation_id}.json"));
+            let record = MaterializationOperationRecord {
+                version: 1,
+                operation_id,
+                destination: destination.to_string_lossy().to_string(),
+                stage: stage.to_string_lossy().to_string(),
+                state: MaterializationOperationState::Preparing,
+            };
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&record_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(&serde_json::to_vec(&record)?)?;
+                    file.sync_all()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(Error::Io(error)),
+            }
+            match fs::create_dir(&stage) {
+                Ok(()) => {
+                    let mut registered = RegisteredMaterializationStage {
+                        record_path,
+                        record,
+                    };
+                    registered.set_state(MaterializationOperationState::Materializing)?;
+                    return Ok(registered);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&record_path);
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&record_path);
+                    return Err(Error::Io(error));
+                }
+            }
+        }
+        Err(Error::InvalidInput(
+            "could not create a unique workdir materialization stage".to_string(),
+        ))
+    }
+
+    pub(crate) fn recover_materialization_stages(&self) -> Result<()> {
+        let journal_dir = self.db_dir.join("materialization-operations");
+        if !journal_dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&journal_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let record_path = entry.path();
+            let record: MaterializationOperationRecord =
+                serde_json::from_slice(&fs::read(&record_path)?)?;
+            if record.version != 1
+                || record_path.file_stem().and_then(|value| value.to_str())
+                    != Some(record.operation_id.as_str())
+            {
+                return Err(Error::Corrupt(format!(
+                    "invalid materialization operation record `{}`",
+                    record_path.display()
+                )));
+            }
+            let destination = PathBuf::from(&record.destination);
+            let stage = PathBuf::from(&record.stage);
+            let owned = stage.parent() == destination.parent()
+                && stage
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.contains(&record.operation_id));
+            if !owned {
+                return Err(Error::Corrupt(format!(
+                    "materialization operation `{}` does not own stage `{}`",
+                    record.operation_id,
+                    stage.display()
+                )));
+            }
+            if record.state != MaterializationOperationState::Published {
+                match fs::remove_dir_all(&stage) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Error::Io(error)),
+                }
+            }
+            fs::remove_file(&record_path)?;
+        }
+        sync_directory(&journal_dir);
+        Ok(())
     }
 }
 
@@ -261,28 +510,6 @@ fn prepare_staged_destination(destination: &Path, custom_workdir: bool) -> Resul
         Err(error) => return Err(Error::Io(error)),
     }
     Ok(())
-}
-
-fn create_materialization_stage(destination: &Path) -> Result<PathBuf> {
-    let parent = destination.parent().ok_or_else(|| Error::InvalidPath {
-        path: destination.to_string_lossy().to_string(),
-        reason: "lane workdir has no parent".to_string(),
-    })?;
-    let leaf = destination
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "workdir".into());
-    for _ in 0..32 {
-        let stage = parent.join(format!(".{leaf}.trail-materialize-{}", now_nanos()));
-        match fs::create_dir(&stage) {
-            Ok(()) => return Ok(stage),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(Error::Io(error)),
-        }
-    }
-    Err(Error::InvalidInput(
-        "could not create a unique workdir materialization stage".to_string(),
-    ))
 }
 
 #[cfg(unix)]
@@ -355,4 +582,91 @@ fn publish_materialization_stage(stage: &Path, destination: &Path) -> Result<()>
     }
     fs::rename(stage, destination)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_never_overwrites_a_concurrent_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        let destination = temp.path().join("workdir");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("new.txt"), "new").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("rival.txt"), "rival").unwrap();
+
+        assert!(publish_materialization_stage(&stage, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(destination.join("rival.txt")).unwrap(),
+            "rival"
+        );
+        assert_eq!(fs::read_to_string(stage.join("new.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn staged_destination_rejects_unowned_nonempty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("workdir");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("owned-by-user.txt"), "keep").unwrap();
+
+        assert!(prepare_staged_destination(&destination, true).is_err());
+        assert_eq!(
+            fs::read_to_string(destination.join("owned-by-user.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn startup_recovery_removes_only_registered_incomplete_stage() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("workdir");
+        let registered = db.create_materialization_stage(&destination).unwrap();
+        let stage = registered.path().to_path_buf();
+        let record = registered.record_path.clone();
+        fs::write(stage.join("partial.txt"), "partial").unwrap();
+        let unregistered = parent.path().join(".workdir.trail-unregistered");
+        fs::create_dir(&unregistered).unwrap();
+        drop(registered);
+        drop(db);
+
+        Trail::open(workspace.path()).unwrap();
+
+        assert!(!stage.exists());
+        assert!(!record.exists());
+        assert!(unregistered.is_dir());
+    }
+
+    #[test]
+    fn startup_recovery_keeps_a_published_destination() {
+        let workspace = tempfile::tempdir().unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("workdir");
+        let mut registered = db.create_materialization_stage(&destination).unwrap();
+        let stage = registered.path().to_path_buf();
+        let record = registered.record_path.clone();
+        fs::write(stage.join("complete.txt"), "complete").unwrap();
+        fs::rename(&stage, &destination).unwrap();
+        registered
+            .set_state(MaterializationOperationState::Published)
+            .unwrap();
+        drop(registered);
+        drop(db);
+
+        Trail::open(workspace.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("complete.txt")).unwrap(),
+            "complete"
+        );
+        assert!(!record.exists());
+    }
 }

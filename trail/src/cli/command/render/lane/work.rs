@@ -447,19 +447,47 @@ pub(crate) fn render_lane_workdir(
             options,
         );
     };
+    let mut metadata = vec![
+        ("Path".to_string(), workdir.clone()),
+        (
+            "Requested mode".to_string(),
+            report.requested_workdir_mode.as_str().to_string(),
+        ),
+        (
+            "Resolved mode".to_string(),
+            report.workdir_mode.as_str().to_string(),
+        ),
+        (
+            "Backend".to_string(),
+            report
+                .workdir_backend
+                .map(WorkdirBackend::as_str)
+                .unwrap_or("unverified")
+                .to_string(),
+        ),
+        (
+            "Transparent COW available".to_string(),
+            report.transparent_cow_available.to_string(),
+        ),
+    ];
+    if let Some(materialization) = &report.materialization {
+        metadata.push((
+            "Materialized".to_string(),
+            format!(
+                "{} cloned ({} bytes), {} copied ({} bytes)",
+                materialization.cloned_files,
+                materialization.cloned_bytes,
+                materialization.copied_files,
+                materialization.copied_bytes
+            ),
+        ));
+    }
     render_document(
         &TerminalDocument::new(
             format!("Workdir for lane {}", report.lane_id),
             UiTone::Success,
         )
-        .block(UiBlock::Metadata(vec![
-            ("Path".to_string(), workdir.clone()),
-            ("Mode".to_string(), report.workdir_mode.as_str().to_string()),
-            (
-                "Transparent COW available".to_string(),
-                report.transparent_cow_available.to_string(),
-            ),
-        ])),
+        .block(UiBlock::Metadata(metadata)),
         options,
     )
 }

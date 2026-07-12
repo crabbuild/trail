@@ -151,12 +151,12 @@ trail agent acp --provider <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
 trail agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
-  [--name <NAME>] [--from <REF>] [--workdir-mode native-cow|fuse-cow|nfs-cow|dokan-cow] \
+  [--name <NAME>] [--from <REF>] [--workdir-mode auto|native-cow|portable-copy|fuse-cow|nfs-cow|dokan-cow] \
   [-- <COMMAND>...]
 
 trail agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
   [--provider <PROVIDER>] [--name <NAME>] \
-  [--workdir-mode native-cow|fuse-cow|nfs-cow|dokan-cow] [-- <COMMAND>...]
+  [--workdir-mode auto|native-cow|portable-copy|fuse-cow|nfs-cow|dokan-cow] [-- <COMMAND>...]
 ```
 
 Use `agent acp` as the stable editor entrypoint. It creates a fresh task lane
@@ -164,8 +164,10 @@ for each ACP session.
 
 Use `agent start` when launching an agent directly from the terminal. It creates
 a task workdir, runs the agent there, and records a checkpoint when the command
-exits. The default `native-cow` mode creates a full materialized workdir using
-filesystem clone COW when possible. `fuse-cow` mounts a FUSE view for the
+exits. The default `auto` mode first requires native cloning for every file and
+restarts portably if native COW is unavailable. Explicit `native-cow` never
+copies bytes, while `portable-copy` reports the actual clone/copy mix.
+`fuse-cow` mounts a FUSE view for the
 duration of the run so the agent sees normal files without the initial full
 copy; it requires macFUSE on macOS or FUSE access on Linux.
 On macOS, `nfs-cow` provides the same write-time copy-up behavior through the

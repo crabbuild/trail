@@ -300,30 +300,6 @@ impl Trail {
         self.write_clean_workdir_manifest_entries_to_path(manifest_path, root_id, entries)
     }
 
-    pub(crate) fn write_clean_workdir_manifest_from_disk_manifest_and_stamps<'a, I>(
-        &self,
-        dir: &Path,
-        root_id: &ObjectId,
-        disk_manifest: &BTreeMap<String, DiskManifest>,
-        expected_paths: I,
-        stamps: BTreeMap<String, WorkdirFileStamp>,
-    ) -> Result<()>
-    where
-        I: IntoIterator<Item = &'a String>,
-    {
-        let expected = expected_paths
-            .into_iter()
-            .map(|path| normalize_relative_path(path))
-            .collect::<Result<BTreeSet<_>>>()?;
-        self.write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
-            dir,
-            root_id,
-            disk_manifest,
-            expected,
-            stamps,
-        )
-    }
-
     fn write_clean_workdir_manifest_from_disk_manifest_stamps_for_paths(
         &self,
         dir: &Path,

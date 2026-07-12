@@ -380,6 +380,7 @@ mod tests {
             .unwrap();
 
         assert!(modes.iter().any(|mode| mode == "native-cow"));
+        assert!(modes.iter().any(|mode| mode == "portable-copy"));
         assert!(modes.iter().any(|mode| mode == "fuse-cow"));
         assert!(modes.iter().any(|mode| mode == "dokan-cow"));
         assert!(!modes.iter().any(|mode| mode == "full-cow"));

@@ -12891,6 +12891,7 @@ fn local_api_and_cli_export_openapi_contract() {
         .as_array()
         .unwrap();
     assert!(workdir_modes.iter().any(|mode| mode == "native-cow"));
+    assert!(workdir_modes.iter().any(|mode| mode == "portable-copy"));
     assert!(workdir_modes.iter().any(|mode| mode == "fuse-cow"));
     assert!(workdir_modes.iter().any(|mode| mode == "dokan-cow"));
     assert!(!workdir_modes.iter().any(|mode| mode == "full-cow"));
@@ -21971,6 +21972,17 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         db.lane_status("cli-bot").unwrap().workdir_state,
         Some(WorktreeState::Clean)
     );
+    let persisted_workdir = db.lane_workdir("cli-bot").unwrap();
+    assert_eq!(
+        persisted_workdir.requested_workdir_mode,
+        LaneWorkdirMode::Auto
+    );
+    assert_eq!(persisted_workdir.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(
+        persisted_workdir.workdir_backend,
+        Some(WorkdirBackend::Clone)
+    );
+    assert!(persisted_workdir.materialization.is_some());
 
     let sparse_spawn = run_trail_json(
         temp.path(),
@@ -21986,6 +21998,8 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     );
     assert_eq!(sparse_spawn["workdir_mode"], "sparse");
     assert_eq!(sparse_spawn["workdir_backend"], "clone");
+    assert_eq!(sparse_spawn["materialization"]["cloned_files"], 1);
+    assert_eq!(sparse_spawn["materialization"]["copied_files"], 0);
     assert_eq!(
         sparse_spawn["sparse_paths"]
             .as_array()
@@ -22723,6 +22737,38 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
 }
 
 #[test]
+fn auto_reports_mixed_when_portable_restart_can_clone_only_clean_files() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+    fs::write(temp.path().join("dirty.txt"), "recorded\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    fs::write(temp.path().join("dirty.txt"), "changed\n").unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane("mixed-bot", Some("main"), true, None, None)
+        .unwrap();
+    let report = spawned.materialization.unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::PortableCopy);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Mixed));
+    assert_eq!(report.cloned_files, 1);
+    assert_eq!(report.copied_files, 1);
+    assert_eq!(
+        report.fallback_reason,
+        Some(MaterializationFallbackReason::NativeSourceUnavailable)
+    );
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    assert_eq!(
+        fs::read_to_string(workdir.join("clean.txt")).unwrap(),
+        "clean\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("dirty.txt")).unwrap(),
+        "recorded\n"
+    );
+}
+
+#[test]
 fn strict_native_cow_refuses_an_unvalidated_source_without_copying() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -22748,6 +22794,123 @@ fn strict_native_cow_refuses_an_unvalidated_source_without_copying() {
     assert!(matches!(error, Error::NativeCowSourceUnavailable));
     assert!(!destination.exists());
     assert!(db.lane_details("strict-bot").is_err());
+}
+
+#[test]
+fn strict_native_cow_reuses_a_complete_clean_lane_source() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("source-bot", Some("main"), true, None, None)
+        .unwrap();
+    fs::write(temp.path().join("README.md"), "hello\ndirty\n").unwrap();
+    assert_eq!(
+        db.lane_status("source-bot").unwrap().workdir_state,
+        Some(WorktreeState::Clean)
+    );
+
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "strict-from-lane",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Clone));
+    assert_eq!(
+        fs::read_to_string(PathBuf::from(spawned.workdir.unwrap()).join("README.md")).unwrap(),
+        "hello\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_native_cow_does_not_preserve_source_hardlink_aliasing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("a.txt"), "shared\n").unwrap();
+    fs::hard_link(temp.path().join("a.txt"), temp.path().join("b.txt")).unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "hardlink-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    let a = fs::metadata(workdir.join("a.txt")).unwrap();
+    let b = fs::metadata(workdir.join("b.txt")).unwrap();
+    assert_ne!(a.ino(), b.ino());
+    fs::write(workdir.join("a.txt"), "changed\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(workdir.join("b.txt")).unwrap(),
+        "shared\n"
+    );
+}
+
+#[test]
+fn strict_native_cow_probes_an_empty_root() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "empty-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Clone));
+    assert_eq!(spawned.materialization.unwrap().cloned_files, 0);
+}
+
+#[test]
+fn legacy_cow_backend_is_not_treated_as_strict_clone_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("legacy-bot", Some("main"), true, None, None)
+        .unwrap();
+    drop(db);
+
+    let connection = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE lanes SET metadata_json = ?1 WHERE name = 'legacy-bot'",
+            [r#"{"workdir_mode":"native-cow","cow_backend":"clone"}"#],
+        )
+        .unwrap();
+    drop(connection);
+
+    let db = Trail::open(temp.path()).unwrap();
+    let report = db.lane_workdir("legacy-bot").unwrap();
+    assert_eq!(report.workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(report.requested_workdir_mode, LaneWorkdirMode::NativeCow);
+    assert_eq!(report.workdir_backend, None);
+    assert_eq!(report.materialization, None);
 }
 
 #[test]
