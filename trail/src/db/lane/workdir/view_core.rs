@@ -999,8 +999,11 @@ impl ViewCore {
         size: Option<u64>,
         mode: Option<u32>,
     ) -> std::result::Result<ViewNodeAttr, i32> {
-        let _barrier = self.begin_mutation()?;
         let path = self.path_for_ino(ino)?;
+        if size.is_none() && mode.is_none() {
+            return self.attr(&path);
+        }
+        let _barrier = self.begin_mutation()?;
         if let Some(size) = size {
             self.enforce_mutation_quota(&path, Some(size), false)?;
             let file = self.ensure_upper_file_under_barrier(&path, false)?;
@@ -2163,6 +2166,20 @@ mod tests {
         );
         assert!(view.lookup(VIEW_ROOT_INO, "src").is_err());
         assert!(view.lookup(VIEW_ROOT_INO, "moved").is_ok());
+    }
+
+    #[test]
+    fn view_core_noop_setattr_does_not_create_checkpoint_candidate() {
+        let (_temp, db, root, upper) = fixture();
+        let mut view = lazy_core(&db, &root, upper.clone());
+        let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
+
+        let attr = view.setattr(readme, None, None).unwrap();
+
+        assert_eq!(attr.ino, readme);
+        assert!(!upper.join("README.md").exists());
+        let candidates = view.checkpoint_candidates().unwrap();
+        assert!(!candidates.paths.contains("README.md"));
     }
 
     #[test]
