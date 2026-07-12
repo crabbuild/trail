@@ -42,6 +42,8 @@ struct MaterializationOperationRecord {
     destination: String,
     stage: String,
     state: MaterializationOperationState,
+    owner_pid: u32,
+    owner_start_token: String,
 }
 
 struct RegisteredMaterializationStage {
@@ -375,6 +377,8 @@ impl Trail {
                 destination: destination.to_string_lossy().to_string(),
                 stage: stage.to_string_lossy().to_string(),
                 state: MaterializationOperationState::Preparing,
+                owner_pid: std::process::id(),
+                owner_start_token: current_process_start_token(),
             };
             match OpenOptions::new()
                 .write(true)
@@ -432,6 +436,9 @@ impl Trail {
                     "invalid materialization operation record `{}`",
                     record_path.display()
                 )));
+            }
+            if process_matches_start_token(record.owner_pid, &record.owner_start_token) {
+                continue;
             }
             let destination = PathBuf::from(&record.destination);
             let stage = PathBuf::from(&record.stage);
@@ -628,11 +635,17 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let destination = parent.path().join("workdir");
         let registered = db.create_materialization_stage(&destination).unwrap();
+        let mut registered = registered;
         let stage = registered.path().to_path_buf();
         let record = registered.record_path.clone();
         fs::write(stage.join("partial.txt"), "partial").unwrap();
         let unregistered = parent.path().join(".workdir.trail-unregistered");
         fs::create_dir(&unregistered).unwrap();
+        registered.record.owner_pid = u32::MAX;
+        registered.record.owner_start_token = "dead:test-owner".to_string();
+        registered
+            .set_state(MaterializationOperationState::Materializing)
+            .unwrap();
         drop(registered);
         drop(db);
 
@@ -655,6 +668,8 @@ mod tests {
         let record = registered.record_path.clone();
         fs::write(stage.join("complete.txt"), "complete").unwrap();
         fs::rename(&stage, &destination).unwrap();
+        registered.record.owner_pid = u32::MAX;
+        registered.record.owner_start_token = "dead:test-owner".to_string();
         registered
             .set_state(MaterializationOperationState::Published)
             .unwrap();

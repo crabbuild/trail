@@ -271,6 +271,18 @@ impl Trail {
                 outcome,
             )?;
         }
+        let resolved_workdir_mode = materialization_outcome
+            .as_ref()
+            .map(|outcome| outcome.resolved_mode.clone())
+            .unwrap_or_else(|| workdir_mode.clone());
+        let workdir_backend = match materialization_outcome.as_ref() {
+            Some(outcome) => Some(outcome.backend),
+            None => self.lane_workdir_backend_for(&self.lane_record(&branch.lane_id)?)?,
+        };
+        let materialization = match materialization_outcome.as_ref() {
+            Some(outcome) => Some(outcome.report.clone()),
+            None => self.lane_materialization_report_for(&self.lane_record(&branch.lane_id)?)?,
+        };
         self.insert_lane_event(
             &branch.lane_id,
             "workdir_synced",
@@ -294,6 +306,10 @@ impl Trail {
             workdir,
             head_change: head.change_id,
             root_id: head.root_id,
+            requested_workdir_mode,
+            workdir_mode: resolved_workdir_mode,
+            workdir_backend,
+            materialization,
             forced: force,
             rescue_workdir,
             changed_paths,
@@ -351,6 +367,10 @@ impl Trail {
             workdir,
             head_change: head.change_id,
             root_id: head.root_id,
+            requested_workdir_mode: LaneWorkdirMode::NfsCow,
+            workdir_mode: LaneWorkdirMode::NfsCow,
+            workdir_backend: Some(WorkdirBackend::Nfs),
+            materialization: None,
             forced: force,
             rescue_workdir,
             changed_paths,

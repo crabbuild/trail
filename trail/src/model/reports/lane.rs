@@ -843,6 +843,11 @@ pub struct LaneWorkdirSyncReport {
     pub workdir: String,
     pub head_change: ChangeId,
     pub root_id: ObjectId,
+    pub requested_workdir_mode: LaneWorkdirMode,
+    pub workdir_mode: LaneWorkdirMode,
+    pub workdir_backend: Option<WorkdirBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<MaterializationReport>,
     pub forced: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescue_workdir: Option<String>,

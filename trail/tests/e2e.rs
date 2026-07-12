@@ -176,7 +176,7 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
             "--name",
             "hook-settings",
             "--workdir-mode",
-            "native-cow",
+            "auto",
         ])
         .output()
         .unwrap();
@@ -17666,7 +17666,7 @@ fn mcp_stdio_tools_drive_lane_turn_workflow() {
         }),
     )
     .unwrap();
-    assert_eq!(sync["result"]["isError"], false);
+    assert_eq!(sync["result"]["isError"], false, "{sync:#}");
     assert_eq!(sync["result"]["structuredContent"]["forced"], true);
 
     let test = trail::mcp::handle_json_rpc(

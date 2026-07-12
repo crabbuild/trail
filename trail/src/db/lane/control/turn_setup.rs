@@ -1,3 +1,4 @@
+use super::super::workdir::MaterializationPolicy;
 use super::*;
 
 impl Trail {
@@ -30,12 +31,34 @@ impl Trail {
         if self.try_get_ref(&ref_name)?.is_some() {
             return Err(Error::InvalidInput(format!("lane `{lane}` already exists")));
         }
+        let mut materialization = None;
         let workdir = if self.default_lane_materialize_for_ref(Some(&source_selector))? {
-            let dir = self.materialize_lane_workdir(lane, &source.root_id, None)?;
+            let dir = self.resolve_lane_workdir_path(lane, None)?;
+            let outcome = self.materialize_lane_root_staged(
+                &source.root_id,
+                &dir,
+                false,
+                MaterializationPolicy::Auto,
+            )?;
+            materialization = Some(outcome);
             Some(dir.to_string_lossy().to_string())
         } else {
             None
         };
+        let metadata_json = materialization
+            .as_ref()
+            .map(|outcome| {
+                serde_json::to_string(&serde_json::json!({
+                    "requested_workdir_mode": "auto",
+                    "workdir_mode": outcome.resolved_mode.as_str(),
+                    "workdir_backend": outcome.backend.as_str(),
+                    "materialization": outcome.report,
+                    "sparse_paths": [],
+                    "include_neighbors": false,
+                    "transparent_cow_available": false
+                }))
+            })
+            .transpose()?;
         self.set_ref(
             &ref_name,
             &source.change_id,
@@ -53,7 +76,7 @@ impl Trail {
                 Option::<String>::None,
                 Option::<String>::None,
                 now,
-                Option::<String>::None
+                metadata_json
             ],
         )?;
         self.conn.execute(
@@ -80,6 +103,10 @@ impl Trail {
                 "ref_name": lane_ref(lane),
                 "base_root": source.root_id.0.clone(),
                 "workdir": workdir.clone(),
+                "requested_workdir_mode": materialization.as_ref().map(|_| "auto"),
+                "workdir_mode": materialization.as_ref().map(|outcome| outcome.resolved_mode.as_str()),
+                "workdir_backend": materialization.as_ref().map(|outcome| outcome.backend.as_str()),
+                "materialization": materialization.as_ref().map(|outcome| &outcome.report),
                 "source": "api"
             }),
         )?;

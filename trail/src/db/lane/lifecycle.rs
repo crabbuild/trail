@@ -402,43 +402,6 @@ impl Trail {
         })
     }
 
-    pub(crate) fn materialize_lane_workdir(
-        &self,
-        name: &str,
-        root_id: &ObjectId,
-        custom_workdir: Option<&Path>,
-    ) -> Result<PathBuf> {
-        let dir = self.resolve_lane_workdir_path(name, custom_workdir)?;
-        self.materialize_lane_workdir_at(root_id, &dir, custom_workdir.is_some())?;
-        Ok(dir)
-    }
-
-    pub(crate) fn materialize_lane_workdir_at(
-        &self,
-        root_id: &ObjectId,
-        dir: &Path,
-        custom_workdir: bool,
-    ) -> Result<()> {
-        self.materialize_lane_workdir_at_paths(root_id, dir, custom_workdir, &[])
-    }
-
-    pub(crate) fn materialize_lane_workdir_at_paths(
-        &self,
-        root_id: &ObjectId,
-        dir: &Path,
-        custom_workdir: bool,
-        sparse_paths: &[String],
-    ) -> Result<()> {
-        self.materialize_lane_workdir_at_paths_with_neighbors(
-            root_id,
-            dir,
-            custom_workdir,
-            sparse_paths,
-            false,
-        )
-        .map(|_| ())
-    }
-
     pub(crate) fn materialize_lane_workdir_at_paths_with_neighbors(
         &self,
         root_id: &ObjectId,
