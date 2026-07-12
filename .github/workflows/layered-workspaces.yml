@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - "trail/**"
-      - "scripts/verify-linux-overlay-cow-docker.sh"
+      - "scripts/verify-linux-fuse-cow-docker.sh"
       - "scripts/verify-layered-lane-scale.sh"
       - "scripts/verify-rust-cache-isolation-docker.sh"
       - "scripts/verify-linux-node-layer-docker.sh"

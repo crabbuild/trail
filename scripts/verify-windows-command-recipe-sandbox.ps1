@@ -57,7 +57,7 @@ portability = "host"
     function New-RecipeLane([string] $Root, [string] $Name = "recipe-a") {
         & $trail --workspace $Root init --working-tree | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "trail init failed for $Root" }
-        & $trail --workspace $Root lane spawn $Name --from main --workdir-mode overlay-cow | Out-Null
+        & $trail --workspace $Root lane spawn $Name --from main --workdir-mode dokan-cow | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "lane spawn failed for $Root" }
     }
 
@@ -69,7 +69,7 @@ portability = "host"
     $successRoot = Join-Path $env:RUNNER_TEMP ("trail-recipe-success-" + [guid]::NewGuid())
     Write-Recipe $successRoot @("tar.exe", "-cf", "generated/out.tar", "input.txt")
     New-RecipeLane $successRoot
-    & $trail --workspace $successRoot lane spawn recipe-b --from main --workdir-mode overlay-cow | Out-Null
+    & $trail --workspace $successRoot lane spawn recipe-b --from main --workdir-mode dokan-cow | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "second lane spawn failed" }
     $plan = (& $trail --workspace $successRoot --json env plan recipe-a --adapter command) | ConvertFrom-Json
     if ($plan.capabilities.sandbox -ne "windows-appcontainer-job") {
@@ -112,7 +112,7 @@ policy = "immutable_seed_private"
 portability = "host"
 "@
     New-RecipeLane $multiRoot
-    & $trail --workspace $multiRoot lane spawn recipe-b --from main --workdir-mode overlay-cow | Out-Null
+    & $trail --workspace $multiRoot lane spawn recipe-b --from main --workdir-mode dokan-cow | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "multi-output second lane spawn failed" }
     $multiFirst = (& $trail --workspace $multiRoot --json env sync recipe-a --adapter command) | ConvertFrom-Json
     $multiSecond = (& $trail --workspace $multiRoot --json env sync recipe-b --adapter command) | ConvertFrom-Json

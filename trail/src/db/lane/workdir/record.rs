@@ -123,18 +123,12 @@ impl Trail {
             None
         };
         let record_scan_root = source_upper.as_deref().unwrap_or(&workdir_path);
-        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(&branch)?;
-        let cached_status = if matches!(
-            &workdir_mode,
-            LaneWorkdirMode::OverlayCow | LaneWorkdirMode::NfsCow
-        ) {
+        let layered_manifest_path = self.lane_layered_clean_manifest_path(&branch)?;
+        let cached_status = if workdir_mode.is_transparent_cow() {
             // Derive the delta from the persistent upper layer instead of an
             // FUSE/NFS READDIR result or a scan of the composed repository.
-            let candidate_paths = if workdir_mode == LaneWorkdirMode::NfsCow {
-                self.nfs_cow_candidate_paths_for_lane(lane)?
-            } else {
-                self.overlay_cow_candidate_paths_for_lane(lane)?
-            };
+            let candidate_paths =
+                self.transparent_cow_candidate_paths_for_lane(lane, &workdir_mode)?;
             let disk_files = self.scan_files_under_for_paths(record_scan_root, &candidate_paths)?;
             CachedWorkdirManifestStatus::Dirty {
                 disk_manifest: self.disk_manifest(&disk_files),
@@ -143,7 +137,7 @@ impl Trail {
         } else {
             self.lane_cached_workdir_manifest_status(
                 &workdir_path,
-                overlay_manifest_path.as_deref(),
+                layered_manifest_path.as_deref(),
                 &head.root_id,
             )?
         };
@@ -214,7 +208,7 @@ impl Trail {
                     if use_disk_manifest_for_clean {
                         self.write_lane_clean_workdir_manifest_from_disk_manifest(
                             &workdir_path,
-                            overlay_manifest_path.as_deref(),
+                            layered_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
                             materialized_paths.iter(),
@@ -222,7 +216,7 @@ impl Trail {
                     } else {
                         self.write_lane_clean_workdir_manifest(
                             &workdir_path,
-                            overlay_manifest_path.as_deref(),
+                            layered_manifest_path.as_deref(),
                             &head.root_id,
                             &previous_files,
                             materialized_paths.iter(),
@@ -287,7 +281,7 @@ impl Trail {
                     if summaries.is_empty() {
                         self.write_lane_clean_workdir_manifest_from_disk_manifest(
                             &workdir_path,
-                            overlay_manifest_path.as_deref(),
+                            layered_manifest_path.as_deref(),
                             &head.root_id,
                             &disk_manifest,
                             materialized_paths.iter(),
@@ -329,7 +323,7 @@ impl Trail {
             if let Some(disk_manifest) = &clean_disk_manifest {
                 self.write_lane_clean_workdir_manifest_from_disk_manifest(
                     &workdir_path,
-                    overlay_manifest_path.as_deref(),
+                    layered_manifest_path.as_deref(),
                     &head.root_id,
                     disk_manifest,
                     materialized_paths.iter(),
@@ -337,7 +331,7 @@ impl Trail {
             } else {
                 self.write_lane_clean_workdir_manifest(
                     &workdir_path,
-                    overlay_manifest_path.as_deref(),
+                    layered_manifest_path.as_deref(),
                     &head.root_id,
                     &built.files,
                     materialized_paths.iter(),
@@ -413,7 +407,7 @@ impl Trail {
         if let Some(disk_manifest) = &clean_disk_manifest {
             self.write_lane_clean_workdir_manifest_from_disk_manifest(
                 &workdir_path,
-                overlay_manifest_path.as_deref(),
+                layered_manifest_path.as_deref(),
                 &built.root_id,
                 disk_manifest,
                 materialized_paths.iter(),
@@ -421,7 +415,7 @@ impl Trail {
         } else {
             self.write_lane_clean_workdir_manifest(
                 &workdir_path,
-                overlay_manifest_path.as_deref(),
+                layered_manifest_path.as_deref(),
                 &built.root_id,
                 &built.files,
                 materialized_paths.iter(),
@@ -457,29 +451,58 @@ impl Trail {
         })
     }
 
-    pub(crate) fn lane_overlay_clean_manifest_path(
+    pub(crate) fn lane_layered_clean_manifest_path(
         &self,
         branch: &LaneBranch,
     ) -> Result<Option<PathBuf>> {
         let record = self.lane_record(&branch.lane_id)?;
-        match self.lane_workdir_mode_for(&record, branch)? {
-            LaneWorkdirMode::OverlayCow => Ok(Some(
-                self.overlay_clean_workdir_manifest_path_for_lane(&record.name)?,
-            )),
-            LaneWorkdirMode::NfsCow => Ok(Some(
-                self.nfs_clean_workdir_manifest_path_for_lane(&record.name)?,
-            )),
-            _ => Ok(None),
+        if self
+            .lane_workdir_mode_for(&record, branch)?
+            .is_transparent_cow()
+        {
+            return Ok(Some(
+                self.workspace_view_paths_for_lane_name(&record.name)
+                    .meta_dir
+                    .join("workdir-manifest.json"),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn transparent_cow_candidate_paths_for_lane(
+        &self,
+        lane: &str,
+        mode: &LaneWorkdirMode,
+    ) -> Result<Vec<String>> {
+        match mode {
+            LaneWorkdirMode::FuseCow => self.fuse_cow_candidate_paths_for_lane(lane),
+            LaneWorkdirMode::NfsCow => self.nfs_cow_candidate_paths_for_lane(lane),
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.dokan_cow_candidate_paths_for_lane(lane)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Err(Error::InvalidInput(
+                        "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                    ))
+                }
+            }
+            _ => Err(Error::InvalidInput(format!(
+                "lane `{lane}` uses non-layered workdir mode `{}`",
+                mode.as_str()
+            ))),
         }
     }
 
     pub(crate) fn lane_cached_workdir_manifest_status(
         &self,
         workdir_path: &Path,
-        overlay_manifest_path: Option<&Path>,
+        layered_manifest_path: Option<&Path>,
         root_id: &ObjectId,
     ) -> Result<CachedWorkdirManifestStatus> {
-        if let Some(manifest_path) = overlay_manifest_path {
+        if let Some(manifest_path) = layered_manifest_path {
             self.cached_workdir_manifest_status_from_path(workdir_path, manifest_path, root_id)
         } else {
             self.cached_workdir_manifest_status(workdir_path, root_id)
@@ -489,7 +512,7 @@ impl Trail {
     fn write_lane_clean_workdir_manifest<'a, I>(
         &self,
         workdir_path: &Path,
-        overlay_manifest_path: Option<&Path>,
+        layered_manifest_path: Option<&Path>,
         root_id: &ObjectId,
         files: &BTreeMap<String, FileEntry>,
         expected_paths: I,
@@ -497,7 +520,7 @@ impl Trail {
     where
         I: IntoIterator<Item = &'a String>,
     {
-        if let Some(manifest_path) = overlay_manifest_path {
+        if let Some(manifest_path) = layered_manifest_path {
             self.write_clean_workdir_manifest_to_path(
                 workdir_path,
                 manifest_path,
@@ -513,7 +536,7 @@ impl Trail {
     fn write_lane_clean_workdir_manifest_from_disk_manifest<'a, I>(
         &self,
         workdir_path: &Path,
-        overlay_manifest_path: Option<&Path>,
+        layered_manifest_path: Option<&Path>,
         root_id: &ObjectId,
         disk_manifest: &BTreeMap<String, DiskManifest>,
         expected_paths: I,
@@ -521,7 +544,7 @@ impl Trail {
     where
         I: IntoIterator<Item = &'a String>,
     {
-        if let Some(manifest_path) = overlay_manifest_path {
+        if let Some(manifest_path) = layered_manifest_path {
             self.write_clean_workdir_manifest_from_disk_manifest_to_path(
                 workdir_path,
                 manifest_path,
@@ -548,11 +571,8 @@ impl Trail {
         let lane_record = self.lane_record(&branch.lane_id)?;
         let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
         if workdir_mode.is_transparent_cow() {
-            let candidate_paths = if workdir_mode == LaneWorkdirMode::NfsCow {
-                self.nfs_cow_candidate_paths_for_lane(&lane_record.name)?
-            } else {
-                self.overlay_cow_candidate_paths_for_lane(&lane_record.name)?
-            };
+            let candidate_paths =
+                self.transparent_cow_candidate_paths_for_lane(&lane_record.name, &workdir_mode)?;
             let source_upper = self
                 .workspace_view_paths_for_lane(&lane_record.name)?
                 .source_upper;
@@ -566,10 +586,10 @@ impl Trail {
             ));
         }
         let sparse_paths = self.lane_sparse_workdir_paths(branch, workdir_path)?;
-        let overlay_manifest_path = self.lane_overlay_clean_manifest_path(branch)?;
+        let layered_manifest_path = self.lane_layered_clean_manifest_path(branch)?;
         match self.lane_cached_workdir_manifest_status(
             workdir_path,
-            overlay_manifest_path.as_deref(),
+            layered_manifest_path.as_deref(),
             &head.root_id,
         )? {
             CachedWorkdirManifestStatus::Clean => Ok(Vec::new()),

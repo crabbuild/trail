@@ -78,7 +78,7 @@ impl Trail {
             .is_transparent_cow()
         {
             return Err(Error::InvalidInput(format!(
-                "lane update requires a layered workspace view; lane {lane} is not overlay-cow or nfs-cow"
+                "lane update requires a layered workspace view; lane {lane} is not fuse-cow, nfs-cow, or dokan-cow"
             )));
         }
         let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
@@ -477,8 +477,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "active-update",

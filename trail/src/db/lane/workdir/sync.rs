@@ -12,7 +12,7 @@ impl Trail {
             workdir: branch.workdir,
             cow_backend: workdir_mode.cow_backend().map(str::to_string),
             sparse_paths,
-            overlay_available: workdir_mode.is_transparent_cow(),
+            transparent_cow_available: workdir_mode.is_transparent_cow(),
             workdir_mode,
         })
     }

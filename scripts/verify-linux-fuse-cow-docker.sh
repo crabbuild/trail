@@ -5,8 +5,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 IMAGE=${RUST_IMAGE:-rust:bookworm}
 TARGET_DIR=${TRAIL_DOCKER_TARGET_DIR:-/target}
 CARGO_HOME_DIR=${TRAIL_DOCKER_CARGO_HOME:-/cargo-home}
-CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-overlay-cow-cargo}
-TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-overlay-cow-target}
+CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-fuse-cow-cargo}
+TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-fuse-cow-target}
 
 docker run --rm --privileged \
   -v "$ROOT":/work \
@@ -27,15 +27,15 @@ TRAIL_RUN_FUSE_COW_TESTS=1 cargo test -p trail \
   fuse_adapter_runs_shared_mounted_view_suite -- --nocapture
 cargo build -p trail
 
-tmp=$(mktemp -d /tmp/trail-linux-overlay.XXXXXX)
+tmp=$(mktemp -d /tmp/trail-linux-fuse-cow.XXXXXX)
 printf "hello\n" > "$tmp/README.md"
 mkdir -p "$tmp/src"
 printf "pub fn answer() -> u8 { 42 }\n" > "$tmp/src/lib.rs"
 
-"$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" init --working-tree >/tmp/trail-overlay-init.out
+"$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" init --working-tree >/tmp/trail-fuse-init.out
 "$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" agent start \
   --provider custom \
-  --workdir-mode overlay-cow \
+  --workdir-mode fuse-cow \
   -- bash -lc '"'"'
 set -euo pipefail
 test -f README.md
@@ -47,22 +47,22 @@ printf "changed\n" >> README.md
 mkdir notes
 printf "new\n" > notes/todo.txt
 rm src/lib.rs
-'"'"' >/tmp/trail-overlay-agent.out
+'"'"' >/tmp/trail-fuse-agent.out
 
-"$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" agent changes latest --json >/tmp/trail-overlay-changes.json
-cat /tmp/trail-overlay-agent.out
+"$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" agent changes latest --json >/tmp/trail-fuse-changes.json
+cat /tmp/trail-fuse-agent.out
 python3 - <<'"'"'PY'"'"'
 import json
 from pathlib import Path
 
-data = json.loads(Path("/tmp/trail-overlay-changes.json").read_text())
+data = json.loads(Path("/tmp/trail-fuse-changes.json").read_text())
 paths = sorted(item["path"] for item in data["total_changed_paths"])
 print("changed-paths=" + ",".join(paths))
 assert paths == ["README.md", "notes/todo.txt", "src/lib.rs"], paths
 
 workdir = Path(data["task"]["workdir"])
 assert workdir.is_dir(), workdir
-assert not any(workdir.iterdir()), "overlay mountpoint should be empty after unmount"
+assert not any(workdir.iterdir()), "FUSE COW mountpoint should be empty after unmount"
 
 db_dir = workdir.parents[1]
 views = sorted((db_dir / "views").iterdir())
@@ -75,11 +75,11 @@ assert (view / "meta" / "source-whiteouts.json").is_file(), view
 PY
 
 "$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" lane spawn persistent \
-  --from main --workdir-mode overlay-cow >/tmp/trail-overlay-spawn.out
+  --from main --workdir-mode fuse-cow >/tmp/trail-fuse-spawn.out
 workdir=$("$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" lane workdir persistent --json | \
   python3 -c '"'"'import json,sys; print(json.load(sys.stdin)["workdir"])'"'"')
 "$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" lane mount persistent \
-  >/tmp/trail-overlay-mount.out 2>&1 &
+  >/tmp/trail-fuse-mount.out 2>&1 &
 mount_pid=$!
 for _ in $(seq 1 100); do
   test -f "$workdir/README.md" && break
@@ -88,16 +88,16 @@ done
 test -f "$workdir/README.md"
 printf "persistent\n" > "$workdir/persistent.txt"
 "$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" lane unmount persistent \
-  >/tmp/trail-overlay-unmount.out
+  >/tmp/trail-fuse-unmount.out
 wait "$mount_pid"
 test ! -e "$workdir/README.md"
 "$CARGO_TARGET_DIR/debug/trail" --workspace "$tmp" lane checkpoint persistent \
-  -m "persistent lifecycle" --json >/tmp/trail-overlay-checkpoint.json
+  -m "persistent lifecycle" --json >/tmp/trail-fuse-checkpoint.json
 python3 - <<'"'"'PY'"'"'
 import json
 from pathlib import Path
 
-checkpoint = json.loads(Path("/tmp/trail-overlay-checkpoint.json").read_text())
+checkpoint = json.loads(Path("/tmp/trail-fuse-checkpoint.json").read_text())
 assert checkpoint["source_paths"] == ["persistent.txt"], checkpoint
 print("persistent-mount-checkpoint=" + checkpoint["root_id"])
 PY

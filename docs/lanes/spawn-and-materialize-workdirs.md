@@ -6,7 +6,7 @@ New commands and JSON reports expose this as `workdir_mode`:
 - `virtual`: no workdir; branch state changes through patches or API calls.
 - `sparse`: materialize selected paths and hydrate more paths explicitly.
 - `full-cow`: materialize the full root, using filesystem clone COW when safe.
-- `overlay-cow`: create an empty mountpoint and use a FUSE overlay view at
+- `fuse-cow`: create an empty mountpoint and use a FUSE overlay view at
   runtime; reads come from Trail objects and writes land in a per-lane upper
   directory.
 - `nfs-cow`: on macOS, expose the same lower/upper model through a loopback
@@ -15,13 +15,13 @@ New commands and JSON reports expose this as `workdir_mode`:
 For `full-cow` and `sparse`, COW means safe file clone during materialization or
 hydration. It does not intercept arbitrary writes to unhydrated paths.
 
-Overlay COW is different: the visible workdir is mounted while a terminal agent
+FUSE COW is different: the visible workdir is mounted while a terminal agent
 is running. The mountpoint starts empty on disk, the writable upper layer lives
-under `.trail/overlay-cow/<lane>/upper`, and Trail records through the mounted
+under `.trail/views/<view-id>/source-upper`, and Trail records through the mounted
 view before unmounting. On macOS this requires macFUSE; on Linux it requires
 FUSE access such as `/dev/fuse`.
 
-NFS COW stores writes under `.trail/nfs-cow/<lane>/upper`, filters macOS
+NFS COW stores writes under `.trail/views/<view-id>/source-upper`, filters macOS
 metadata sidecars, records the upper-layer delta, and unmounts automatically.
 
 ## Spawn Without Materialization
@@ -48,15 +48,15 @@ trail lane spawn doc-bot --from main --materialize=true --workdir /tmp/doc-bot
 
 Custom workdirs must be empty or absent and cannot be symlinks.
 
-## Overlay COW For Terminal Agents
+## FUSE COW For Terminal Agents
 
 ```sh
-trail agent start --provider codex --workdir-mode overlay-cow
-trail agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+trail agent start --provider codex --workdir-mode fuse-cow
+trail agent start --provider custom --workdir-mode fuse-cow -- my-agent --flag
 trail agent start --provider codex --workdir-mode nfs-cow
 ```
 
-`overlay-cow` lets a terminal agent see a normal filesystem tree without first
+`fuse-cow` lets a terminal agent see a normal filesystem tree without first
 copying every file into the lane workdir. Lower files are served from Trail
 objects. The first write, create, rename, or delete for a path is captured in
 the lane upper layer and then recorded as the agent checkpoint.
@@ -68,11 +68,11 @@ full copy.
 On macOS with Docker Desktop, verify the Linux path with:
 
 ```sh
-scripts/verify-linux-overlay-cow-docker.sh
+scripts/verify-linux-fuse-cow-docker.sh
 ```
 
 The script runs a privileged Linux container with `/dev/fuse`, builds Trail,
-starts a terminal task with `--workdir-mode overlay-cow`, and asserts that the
+starts a terminal task with `--workdir-mode fuse-cow`, and asserts that the
 agent saw a FUSE filesystem and recorded modified, added, and deleted paths.
 
 ## Sparse Materialization

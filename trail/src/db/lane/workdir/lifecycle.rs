@@ -59,7 +59,7 @@ impl Trail {
                 fs::remove_dir_all(&path)?;
             }
         }
-        for backend in ["overlay-cow", "nfs-cow"] {
+        for backend in ["fuse-cow", "nfs-cow", "dokan-cow"] {
             let state = self.db_dir.join(backend).join(lane);
             if state.exists() {
                 fs::remove_dir_all(state)?;

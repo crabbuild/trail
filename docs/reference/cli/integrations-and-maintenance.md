@@ -45,11 +45,11 @@ trail agent start --provider aider
 trail agent start --provider opencode
 ```
 
-Use `--workdir-mode overlay-cow` when a large repository should be exposed as a
+Use `--workdir-mode fuse-cow` when a large repository should be exposed as a
 mounted COW filesystem view instead of a full copied workdir:
 
 ```sh
-trail agent start --provider codex --workdir-mode overlay-cow
+trail agent start --provider codex --workdir-mode fuse-cow
 ```
 
 For an unsupported terminal agent, pass the exact command after `--`:
@@ -97,7 +97,7 @@ validation, apply, or recovery step.
 | --- | --- |
 | Task | One unit of agent work tracked by Trail |
 | Lane | Isolated Trail branch-like workspace for the task |
-| Workdir | Filesystem directory where a terminal agent edits; usually full-cow, optionally overlay-cow |
+| Workdir | Filesystem directory where a terminal agent edits; usually full-cow, optionally fuse-cow |
 | Turn | One prompt or response cycle captured from ACP |
 | Checkpoint | Recorded code state that can be reviewed, applied, or rewound |
 | `latest` | The most recent non-archived agent task |
@@ -151,12 +151,12 @@ trail agent acp --provider <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
 trail agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
-  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|overlay-cow|nfs-cow] \
+  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|fuse-cow|nfs-cow|dokan-cow] \
   [-- <COMMAND>...]
 
 trail agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
   [--provider <PROVIDER>] [--name <NAME>] \
-  [--workdir-mode full-cow|overlay-cow|nfs-cow] [-- <COMMAND>...]
+  [--workdir-mode full-cow|fuse-cow|nfs-cow|dokan-cow] [-- <COMMAND>...]
 ```
 
 Use `agent acp` as the stable editor entrypoint. It creates a fresh task lane
@@ -165,11 +165,12 @@ for each ACP session.
 Use `agent start` when launching an agent directly from the terminal. It creates
 a task workdir, runs the agent there, and records a checkpoint when the command
 exits. The default `full-cow` mode creates a full materialized workdir using
-filesystem clone COW when possible. `overlay-cow` mounts a FUSE view for the
+filesystem clone COW when possible. `fuse-cow` mounts a FUSE view for the
 duration of the run so the agent sees normal files without the initial full
 copy; it requires macFUSE on macOS or FUSE access on Linux.
 On macOS, `nfs-cow` provides the same write-time copy-up behavior through the
 built-in loopback NFS client and requires no kernel extension.
+On Windows, `dokan-cow` exposes the same layered semantics through Dokan 2.x.
 
 Use `agent continue` after a task has landed or when you want another round of
 edits from a known checkpoint. `agent follow-up` is an alias.

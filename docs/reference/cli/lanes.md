@@ -100,7 +100,7 @@ The common lifecycle is:
 
 ```text
 trail lane spawn <NAME> [--from <REF>] \
-  [--workdir-mode virtual|sparse|full-cow|overlay-cow|nfs-cow] \
+  [--workdir-mode virtual|sparse|full-cow|fuse-cow|nfs-cow|dokan-cow] \
   [--materialize[=true|false]] [--no-materialize] \
   [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] \
   [--provider <PROVIDER>] [--model <MODEL>]
@@ -118,8 +118,9 @@ trail lane rm <NAME> [--force]
 | `virtual` | Creates no filesystem workdir. This is the high-scale default. |
 | `sparse` | Materializes only selected paths. |
 | `full-cow` | Materializes the full root and tries filesystem clone COW. |
-| `overlay-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
+| `fuse-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
 | `nfs-cow` | On macOS, creates a loopback NFSv3 mount with transparent copy-up and whiteouts, without macFUSE. |
+| `dokan-cow` | On Windows, creates a Dokan-backed transparent COW view. |
 
 Compatibility flags:
 
@@ -127,13 +128,15 @@ Compatibility flags:
 - `--no-materialize` keeps the lane virtual.
 - `--paths <PATH>...` implies a sparse materialized workdir.
 
-`overlay-cow` requires FUSE support when mounted by a runtime such as
-`trail agent start --workdir-mode overlay-cow`: macFUSE on macOS, or `/dev/fuse`
+`fuse-cow` requires FUSE support when mounted by a runtime such as
+`trail agent start --workdir-mode fuse-cow`: macFUSE on macOS, or `/dev/fuse`
 access on Linux. If the mount fails, Trail reports the setup error instead of
 copying the full workdir.
 
 `nfs-cow` is currently macOS-only. The loopback server listens on `127.0.0.1`
 and the mount is removed automatically after recording the agent checkpoint.
+
+`dokan-cow` is Windows-only and requires Dokan 2.x with its driver service running.
 
 ### Sparse path boundaries
 

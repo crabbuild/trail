@@ -119,15 +119,15 @@ change, lane base change, `operations_behind`, and whether the lane base is
 stale.
 
 `POST /v1/lanes` accepts `workdir_mode` values `virtual`, `sparse`,
-`full-cow`, `overlay-cow`, and `nfs-cow`. `virtual` creates no workdir, `sparse` requires
+`full-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. `virtual` creates no workdir, `sparse` requires
 `paths`, and `full-cow` creates a full materialized workdir using filesystem
-clone COW when available. `overlay-cow` creates an empty workdir mountpoint and
-records an overlay backend; a runtime such as `trail agent start
---workdir-mode overlay-cow` mounts the FUSE view and keeps it alive while the
+clone COW when available. `fuse-cow` creates an empty workdir mountpoint and
+records the `fuse` backend; a runtime such as `trail agent start
+--workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the
 agent runs. The response includes `workdir_mode`, `cow_backend`, `sparse_paths`,
-and `overlay_available`.
-On macOS, `nfs-cow` reports `cow_backend: "nfs-overlay"` and requires no
-macFUSE installation.
+and `transparent_cow_available`.
+On macOS, `nfs-cow` reports `cow_backend: "nfs"` and requires no
+macFUSE installation. On Windows, `dokan-cow` reports `cow_backend: "dokan"`.
 
 `POST /v1/lanes/{lane_or_id}/hydrate` accepts the same body as path-scoped
 `sync-workdir`, but requires at least one `paths` entry.

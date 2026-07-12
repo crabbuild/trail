@@ -7,7 +7,7 @@ use std::sync::{mpsc, Mutex, MutexGuard, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dokan::{
+use ::dokan::{
     init, unmount, CreateFileInfo, DiskSpaceInfo, FileInfo, FileSystemHandler, FileSystemMounter,
     FillDataError, FillDataResult, FindData, MountFlags, MountOptions, OperationInfo,
     OperationResult, VolumeInfo, IO_SECURITY_CONTEXT,
@@ -25,21 +25,22 @@ static DOKAN_INIT: Once = Once::new();
 
 const OVERLAY_META_DIR: &str = ".trail";
 
-pub(crate) struct OverlayCowMount {
+pub(crate) struct DokanCowMount {
     mountpoint: PathBuf,
     mount_name: U16CString,
     worker: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
     lease: WorkspaceMountLease,
 }
 
-impl OverlayCowMount {
+impl DokanCowMount {
     #[allow(dead_code)]
     pub(crate) fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
 }
 
-impl Drop for OverlayCowMount {
+impl Drop for DokanCowMount {
     fn drop(&mut self) {
         let _ = unmount(&self.mount_name);
         if let Some(worker) = self.worker.take() {
@@ -48,7 +49,7 @@ impl Drop for OverlayCowMount {
     }
 }
 
-pub(crate) fn prepare_overlay_cow_workdir(
+pub(crate) fn prepare_dokan_cow_workdir(
     db: &Trail,
     lane: &str,
     dir: &Path,
@@ -62,38 +63,38 @@ pub(crate) fn prepare_overlay_cow_workdir(
     Ok(upperdir)
 }
 
-pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<OverlayCowMount> {
-    mount_overlay_cow_for_lane_with_view(db, lane, None)
+pub(crate) fn mount_dokan_cow_for_lane(db: &Trail, lane: &str) -> Result<DokanCowMount> {
+    mount_dokan_cow_for_lane_with_view(db, lane, None)
 }
 
-pub(crate) fn mount_overlay_cow_for_lane_with_ephemeral_bindings(
+pub(crate) fn mount_dokan_cow_for_lane_with_ephemeral_bindings(
     db: &Trail,
     lane: &str,
     source_upper: PathBuf,
     source_root: ObjectId,
     bindings: Vec<WorkspaceLayerBinding>,
-) -> Result<OverlayCowMount> {
-    mount_overlay_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
+) -> Result<DokanCowMount> {
+    mount_dokan_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
 }
 
-fn mount_overlay_cow_for_lane_with_view(
+fn mount_dokan_cow_for_lane_with_view(
     db: &Trail,
     lane: &str,
     ephemeral: Option<(PathBuf, ObjectId, Vec<WorkspaceLayerBinding>)>,
-) -> Result<OverlayCowMount> {
+) -> Result<DokanCowMount> {
     validate_ref_segment(lane)?;
     let branch = db.lane_branch(lane)?;
     let record = db.lane_record(&branch.lane_id)?;
     let mode = db.lane_workdir_mode_for(&record, &branch)?;
-    if mode != LaneWorkdirMode::OverlayCow {
+    if mode != LaneWorkdirMode::DokanCow {
         return Err(Error::InvalidInput(format!(
-            "lane `{lane}` uses workdir mode `{}`; expected overlay-cow",
+            "lane `{lane}` uses workdir mode `{}`; expected dokan-cow",
             mode.as_str()
         )));
     }
     let Some(workdir) = branch.workdir.clone() else {
         return Err(Error::InvalidInput(format!(
-            "overlay-cow lane `{lane}` has no mountpoint"
+            "dokan-cow lane `{lane}` has no mountpoint"
         )));
     };
     let mountpoint = PathBuf::from(workdir);
@@ -107,7 +108,7 @@ fn mount_overlay_cow_for_lane_with_view(
 
     let mount_name = U16CString::from_str(mountpoint.to_string_lossy().as_ref()).map_err(|_| {
         Error::InvalidInput(format!(
-            "overlay-cow mountpoint `{}` is not a valid Windows mount string",
+            "dokan-cow mountpoint `{}` is not a valid Windows mount string",
             mountpoint.display()
         ))
     })?;
@@ -155,7 +156,7 @@ fn mount_overlay_cow_for_lane_with_view(
     }
     lease.mark_mounted()?;
 
-    Ok(OverlayCowMount {
+    Ok(DokanCowMount {
         mountpoint,
         mount_name,
         worker: Some(worker),
@@ -163,7 +164,7 @@ fn mount_overlay_cow_for_lane_with_view(
     })
 }
 
-pub(crate) fn overlay_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+pub(crate) fn dokan_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
     let upper = overlay_upperdir(db, lane)?;
     let branch = db.lane_branch(lane)?;
     let head = db.get_ref(&branch.ref_name)?;
@@ -175,9 +176,58 @@ pub(crate) fn overlay_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<Stri
     )
 }
 
+impl Trail {
+    pub(crate) fn prepare_dokan_cow_lane_workdir(
+        &self,
+        lane: &str,
+        dir: &Path,
+        custom_workdir: bool,
+    ) -> Result<PathBuf> {
+        prepare_dokan_cow_workdir(self, lane, dir, custom_workdir)
+    }
+
+    pub fn mount_dokan_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
+        mount_dokan_cow_for_lane(self, lane)
+    }
+
+    pub(crate) fn mount_dokan_cow_workdir_for_lane_with_ephemeral_bindings(
+        &self,
+        lane: &str,
+        source_upper: PathBuf,
+        source_root: ObjectId,
+        bindings: Vec<WorkspaceLayerBinding>,
+    ) -> Result<DokanCowMount> {
+        mount_dokan_cow_for_lane_with_ephemeral_bindings(
+            self,
+            lane,
+            source_upper,
+            source_root,
+            bindings,
+        )
+    }
+
+    pub(crate) fn dokan_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
+        dokan_candidate_paths(self, lane)
+    }
+
+    pub(crate) fn maybe_mount_dokan_cow_workdir_for_lane(
+        &self,
+        lane: &str,
+    ) -> Result<Option<DokanCowMount>> {
+        validate_ref_segment(lane)?;
+        let branch = self.lane_branch(lane)?;
+        let record = self.lane_record(&branch.lane_id)?;
+        if self.lane_workdir_mode_for(&record, &branch)? == LaneWorkdirMode::DokanCow {
+            Ok(Some(mount_dokan_cow_for_lane(self, lane)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 fn overlay_mount_error(mountpoint: &Path, err: &str) -> Error {
     Error::InvalidInput(format!(
-        "failed to mount overlay-cow workdir at `{}` with Dokan: {err}. Install Dokan 2.x and ensure the Dokan driver service is running.",
+        "failed to mount dokan-cow workdir at `{}` with Dokan: {err}. Install Dokan 2.x and ensure the Dokan driver service is running.",
         mountpoint.display()
     ))
 }
@@ -192,18 +242,18 @@ fn prepare_overlay_mountpoint(path: &Path, custom_workdir: bool) -> Result<()> {
         if metadata.file_type().is_symlink() {
             return Err(Error::InvalidPath {
                 path: path.to_string_lossy().to_string(),
-                reason: "overlay-cow mountpoint cannot be a symlink".to_string(),
+                reason: "dokan-cow mountpoint cannot be a symlink".to_string(),
             });
         }
         if !metadata.is_dir() {
             return Err(Error::InvalidPath {
                 path: path.to_string_lossy().to_string(),
-                reason: "overlay-cow mountpoint must be a directory".to_string(),
+                reason: "dokan-cow mountpoint must be a directory".to_string(),
             });
         }
         if fs::read_dir(path)?.next().transpose()?.is_some() && custom_workdir {
             return Err(Error::InvalidInput(format!(
-                "custom overlay-cow workdir `{}` must be empty",
+                "custom dokan-cow workdir `{}` must be empty",
                 path.display()
             )));
         }
@@ -753,7 +803,7 @@ mod mounted_conformance {
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "dokan-conformance",
             Some("main"),
-            LaneWorkdirMode::OverlayCow,
+            LaneWorkdirMode::DokanCow,
             None,
             None,
             None,
@@ -762,7 +812,7 @@ mod mounted_conformance {
         )
         .unwrap();
         let mount = db
-            .mount_overlay_cow_workdir_for_lane("dokan-conformance")
+            .mount_dokan_cow_workdir_for_lane("dokan-conformance")
             .unwrap();
         let workdir = PathBuf::from(
             db.lane_workdir("dokan-conformance")
@@ -800,7 +850,7 @@ mod mounted_conformance {
             .spawn_lane_with_workdir_mode_paths_and_neighbors(
                 "foreground-dokan",
                 Some("main"),
-                LaneWorkdirMode::OverlayCow,
+                LaneWorkdirMode::DokanCow,
                 None,
                 None,
                 None,
@@ -854,7 +904,7 @@ mod mounted_conformance {
             .spawn_lane_with_workdir_mode_paths_and_neighbors(
                 "daemon-dokan",
                 Some("main"),
-                LaneWorkdirMode::OverlayCow,
+                LaneWorkdirMode::DokanCow,
                 None,
                 None,
                 None,

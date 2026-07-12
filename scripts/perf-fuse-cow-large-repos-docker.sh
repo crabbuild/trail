@@ -6,8 +6,8 @@ OPENCLAW_PATH=${OPENCLAW_PATH:-/Users/haipingfu/Github/openclaw}
 IMAGE=${RUST_IMAGE:-rust:bookworm}
 TARGET_DIR=${TRAIL_DOCKER_TARGET_DIR:-/target}
 CARGO_HOME_DIR=${TRAIL_DOCKER_CARGO_HOME:-/cargo-home}
-CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-overlay-cow-cargo}
-TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-overlay-cow-target}
+CARGO_CACHE_VOLUME=${TRAIL_DOCKER_CARGO_CACHE_VOLUME:-trail-fuse-cow-cargo}
+TARGET_CACHE_VOLUME=${TRAIL_DOCKER_TARGET_CACHE_VOLUME:-trail-fuse-cow-target}
 LINUX_CACHE_VOLUME=${TRAIL_LINUX_CACHE_VOLUME:-trail-linux-source-cache}
 LINUX_REPO_URL=${LINUX_REPO_URL:-https://github.com/torvalds/linux.git}
 LINUX_REF=${LINUX_REF:-}
@@ -157,7 +157,7 @@ headers = [
     "land_ms",
     "db_mb",
     "worktrees_kb",
-    "overlay_kb",
+    "fuse_view_kb",
     "commit",
 ]
 print("\t".join(headers))
@@ -174,7 +174,7 @@ for row in rows:
             row["land_ms"],
             round(row["trail_bytes"] / 1024 / 1024, 1),
             round(row["worktrees_bytes"] / 1024, 1),
-            round(row["overlay_bytes"] / 1024, 1),
+            round(row["fuse_bytes"] / 1024, 1),
             row["head_after"][:12],
         ]
     ))
@@ -231,7 +231,7 @@ benchmark_repo() {
   local clone_ms init_ms agent_ms changes_ms land_dry_run_ms land_ms
   local tracked_files head_before head_after edit_file new_file marker
   local agent_out agent_err changes_json land_json status_tracked
-  local trail_bytes worktrees_bytes overlay_bytes
+  local trail_bytes worktrees_bytes fuse_bytes
 
   echo "== $name: clone =="
   if [[ "$clone_kind" == "openclaw" ]]; then
@@ -250,8 +250,8 @@ benchmark_repo() {
   tracked_files=$(git -C "$repo" ls-files | wc -l | awk '{print $1}')
   head_before=$(git -C "$repo" rev-parse HEAD)
   edit_file=$(choose_edit_file "$repo")
-  new_file="trail-perf/${name}-overlay.txt"
-  marker="trail-overlay-perf-${name}-$(date +%s)-$$"
+  new_file="trail-perf/${name}-fuse.txt"
+  marker="trail-fuse-perf-${name}-$(date +%s)-$$"
   agent_out="$BENCH_ROOT/${name}.agent.out"
   agent_err="$BENCH_ROOT/${name}.agent.err"
   changes_json="$BENCH_ROOT/${name}.changes.json"
@@ -267,13 +267,13 @@ benchmark_repo() {
     exit 1
   fi
 
-  echo "== $name: overlay agent edit =="
+  echo "== $name: FUSE COW agent edit =="
   export PERF_EDIT_FILE="$edit_file"
   export PERF_NEW_FILE="$new_file"
   export PERF_MARKER="$marker"
   run_timed agent_ms "$TRAIL" --workspace "$repo" agent start \
     --provider custom \
-    --workdir-mode overlay-cow \
+    --workdir-mode fuse-cow \
     -- bash -lc '
 set -euo pipefail
 test -f "$PERF_EDIT_FILE"
@@ -301,7 +301,7 @@ workdir = Path(data["task"]["workdir"])
 if not workdir.is_dir():
     raise SystemExit(f"missing lane workdir mountpoint: {workdir}")
 if any(workdir.iterdir()):
-    raise SystemExit(f"overlay mountpoint should be empty after unmount: {workdir}")
+    raise SystemExit(f"FUSE COW mountpoint should be empty after unmount: {workdir}")
 PY
 
   echo "== $name: agent land dry-run =="
@@ -322,7 +322,7 @@ PY
 
   echo "== $name: agent land =="
   run_timed land_ms "$TRAIL" --workspace "$repo" agent land latest \
-    -m "Trail overlay perf test for $name" \
+    -m "Trail FUSE COW perf test for $name" \
     --json >"$land_json"
   head_after=$(git -C "$repo" rev-parse HEAD)
   if [[ "$head_before" == "$head_after" ]]; then
@@ -341,7 +341,7 @@ PY
 
   trail_bytes=$(du_bytes "$repo/.trail")
   worktrees_bytes=$(du_bytes "$repo/.trail/worktrees")
-  overlay_bytes=$(du_bytes "$repo/.trail/overlay-cow")
+  fuse_bytes=$(du_bytes "$repo/.trail/views")
   append_result_json \
     "repo=$name" \
     "tracked_files=$tracked_files" \
@@ -353,7 +353,7 @@ PY
     "land_ms=$land_ms" \
     "trail_bytes=$trail_bytes" \
     "worktrees_bytes=$worktrees_bytes" \
-    "overlay_bytes=$overlay_bytes" \
+    "fuse_bytes=$fuse_bytes" \
     "head_before=$head_before" \
     "head_after=$head_after" \
     "edit_file=$edit_file" \
@@ -365,7 +365,7 @@ configure_git
 cargo build -p trail
 TRAIL="$CARGO_TARGET_DIR/debug/trail"
 
-BENCH_ROOT=${BENCH_ROOT:-$(mktemp -d /tmp/trail-overlay-perf.XXXXXX)}
+BENCH_ROOT=${BENCH_ROOT:-$(mktemp -d /tmp/trail-fuse-perf.XXXXXX)}
 mkdir -p "$BENCH_ROOT"
 RESULTS="$BENCH_ROOT/results.jsonl"
 echo "bench-root=$BENCH_ROOT"

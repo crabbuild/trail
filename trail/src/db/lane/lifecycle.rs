@@ -67,7 +67,7 @@ impl Trail {
         #[cfg(target_os = "windows")]
         {
             let _ = from;
-            Ok(LaneWorkdirMode::OverlayCow)
+            Ok(LaneWorkdirMode::DokanCow)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -80,7 +80,7 @@ impl Trail {
             #[cfg(target_os = "linux")]
             {
                 if Path::new("/dev/fuse").exists() {
-                    return Ok(LaneWorkdirMode::OverlayCow);
+                    return Ok(LaneWorkdirMode::FuseCow);
                 }
             }
             let source = match from {
@@ -204,12 +204,20 @@ impl Trail {
         } else {
             None
         };
-        let overlay_available = workdir_mode.is_transparent_cow();
+        let transparent_cow_available = workdir_mode.is_transparent_cow();
         let mut sparse_policy_paths = None;
         let materialized_workdir = if let Some(dir) = &workdir_path {
             match &workdir_mode {
-                LaneWorkdirMode::OverlayCow => {
-                    self.prepare_overlay_cow_lane_workdir(name, dir, workdir.is_some())?;
+                LaneWorkdirMode::FuseCow => {
+                    self.prepare_fuse_cow_lane_workdir(name, dir, workdir.is_some())?;
+                }
+                LaneWorkdirMode::DokanCow => {
+                    #[cfg(target_os = "windows")]
+                    self.prepare_dokan_cow_lane_workdir(name, dir, workdir.is_some())?;
+                    #[cfg(not(target_os = "windows"))]
+                    return Err(Error::InvalidInput(
+                        "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                    ));
                 }
                 LaneWorkdirMode::NfsCow => {
                     self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
@@ -238,7 +246,7 @@ impl Trail {
             "cow_backend": workdir_mode.cow_backend(),
             "sparse_paths": sparse_paths_for_report,
             "include_neighbors": include_neighbors,
-            "overlay_available": overlay_available
+            "transparent_cow_available": transparent_cow_available
         }))?;
         self.set_ref(
             &ref_name,
@@ -301,7 +309,7 @@ impl Trail {
                 "cow_backend": workdir_mode.cow_backend(),
                 "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
                 "include_neighbors": include_neighbors,
-                "overlay_available": overlay_available
+                "transparent_cow_available": transparent_cow_available
             }),
         )?;
         Ok(LaneSpawnReport {
@@ -311,7 +319,7 @@ impl Trail {
             workdir: materialized_workdir,
             cow_backend: workdir_mode.cow_backend().map(str::to_string),
             sparse_paths: sparse_policy_paths.unwrap_or_default(),
-            overlay_available,
+            transparent_cow_available,
             workdir_mode,
         })
     }
@@ -338,13 +346,13 @@ impl Trail {
             let record = self.lane_record(&branch.lane_id)?;
             let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
             let sparse_paths = self.lane_report_sparse_paths(&branch)?;
-            let overlay_available = workdir_mode.is_transparent_cow();
+            let transparent_cow_available = workdir_mode.is_transparent_cow();
             return Ok(LaneWorkdirReport {
                 lane_id: branch.lane_id,
                 workdir: Some(existing),
                 cow_backend: workdir_mode.cow_backend().map(str::to_string),
                 sparse_paths,
-                overlay_available,
+                transparent_cow_available,
                 workdir_mode,
             });
         }
@@ -372,7 +380,7 @@ impl Trail {
             workdir_mode: LaneWorkdirMode::FullCow,
             cow_backend: (LaneWorkdirMode::FullCow).cow_backend().map(str::to_string),
             sparse_paths: Vec::new(),
-            overlay_available: false,
+            transparent_cow_available: false,
         })
     }
 
@@ -738,9 +746,18 @@ impl Trail {
 }
 
 fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
+    match value {
+        "overlay-cow" | "overlay_cow" => {
+            return Err(Error::InvalidInput(
+                "unsupported lane workdir mode `overlay-cow`; this build uses the hard-cutover modes `fuse-cow` and `dokan-cow`; remove and recreate the lane with the platform-appropriate mode"
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
     LaneWorkdirMode::parse(value).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, full-cow, overlay-cow, or nfs-cow"
+            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, full-cow, fuse-cow, nfs-cow, or dokan-cow"
         ))
     })
 }
@@ -748,8 +765,8 @@ fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
 fn platform_workspace_backend(mode: &LaneWorkdirMode) -> &'static str {
     match mode {
         LaneWorkdirMode::NfsCow => "nfs",
-        LaneWorkdirMode::OverlayCow if cfg!(target_os = "windows") => "dokan",
-        LaneWorkdirMode::OverlayCow => "fuse",
+        LaneWorkdirMode::FuseCow => "fuse",
+        LaneWorkdirMode::DokanCow => "dokan",
         LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => "clone",
         LaneWorkdirMode::Virtual => "virtual",
     }
@@ -787,13 +804,28 @@ fn validate_lane_workdir_mode_request(
                 ));
             }
         }
-        LaneWorkdirMode::OverlayCow => {
+        LaneWorkdirMode::FuseCow => {
             if !sparse_paths.is_empty() {
                 return Err(Error::InvalidInput(
-                    "overlay-cow lane workdir mode cannot be combined with sparse paths"
-                        .to_string(),
+                    "fuse-cow lane workdir mode cannot be combined with sparse paths".to_string(),
                 ));
             }
+            #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+            return Err(Error::InvalidInput(
+                "fuse-cow workdirs require Linux FUSE or a macOS build with --features macfuse"
+                    .to_string(),
+            ));
+        }
+        LaneWorkdirMode::DokanCow => {
+            if !sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(
+                    "dokan-cow lane workdir mode cannot be combined with sparse paths".to_string(),
+                ));
+            }
+            #[cfg(not(target_os = "windows"))]
+            return Err(Error::InvalidInput(
+                "dokan-cow workdirs are currently supported only on Windows".to_string(),
+            ));
         }
         LaneWorkdirMode::NfsCow => {
             if !sparse_paths.is_empty() {
@@ -835,4 +867,17 @@ fn remove_sparse_workdir_manifest(dir: &Path) -> Result<()> {
         fs::remove_file(manifest)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hard_cutover_tests {
+    use super::*;
+
+    #[test]
+    fn removed_cow_mode_reports_the_recreate_lifecycle() {
+        let overlay_error = parse_lane_workdir_mode("overlay-cow").unwrap_err();
+        let overlay_message = overlay_error.to_string();
+        assert!(overlay_message.contains("hard-cutover modes `fuse-cow` and `dokan-cow`"));
+        assert!(overlay_message.contains("remove and recreate the lane"));
+    }
 }

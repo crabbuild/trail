@@ -4,8 +4,9 @@ pub enum LaneWorkdirMode {
     Virtual,
     Sparse,
     FullCow,
-    OverlayCow,
+    FuseCow,
     NfsCow,
+    DokanCow,
 }
 
 impl LaneWorkdirMode {
@@ -14,8 +15,9 @@ impl LaneWorkdirMode {
             LaneWorkdirMode::Virtual => "virtual",
             LaneWorkdirMode::Sparse => "sparse",
             LaneWorkdirMode::FullCow => "full-cow",
-            LaneWorkdirMode::OverlayCow => "overlay-cow",
+            LaneWorkdirMode::FuseCow => "fuse-cow",
             LaneWorkdirMode::NfsCow => "nfs-cow",
+            LaneWorkdirMode::DokanCow => "dokan-cow",
         }
     }
 
@@ -24,8 +26,9 @@ impl LaneWorkdirMode {
             "virtual" => Some(LaneWorkdirMode::Virtual),
             "sparse" => Some(LaneWorkdirMode::Sparse),
             "full-cow" | "full_cow" => Some(LaneWorkdirMode::FullCow),
-            "overlay-cow" | "overlay_cow" => Some(LaneWorkdirMode::OverlayCow),
+            "fuse-cow" | "fuse_cow" => Some(LaneWorkdirMode::FuseCow),
             "nfs-cow" | "nfs_cow" => Some(LaneWorkdirMode::NfsCow),
+            "dokan-cow" | "dokan_cow" => Some(LaneWorkdirMode::DokanCow),
             _ => None,
         }
     }
@@ -37,14 +40,18 @@ impl LaneWorkdirMode {
     pub fn cow_backend(&self) -> Option<&'static str> {
         match self {
             LaneWorkdirMode::Virtual => None,
-            LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => Some("filesystem-clone"),
-            LaneWorkdirMode::OverlayCow => Some("overlay"),
-            LaneWorkdirMode::NfsCow => Some("nfs-overlay"),
+            LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => Some("clone"),
+            LaneWorkdirMode::FuseCow => Some("fuse"),
+            LaneWorkdirMode::NfsCow => Some("nfs"),
+            LaneWorkdirMode::DokanCow => Some("dokan"),
         }
     }
 
     pub fn is_transparent_cow(&self) -> bool {
-        matches!(self, LaneWorkdirMode::OverlayCow | LaneWorkdirMode::NfsCow)
+        matches!(
+            self,
+            LaneWorkdirMode::FuseCow | LaneWorkdirMode::NfsCow | LaneWorkdirMode::DokanCow
+        )
     }
 }
 
@@ -57,7 +64,7 @@ pub struct LaneSpawnReport {
     pub workdir_mode: LaneWorkdirMode,
     pub cow_backend: Option<String>,
     pub sparse_paths: Vec<String>,
-    pub overlay_available: bool,
+    pub transparent_cow_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -746,7 +753,7 @@ pub struct LaneWorkdirReport {
     pub workdir_mode: LaneWorkdirMode,
     pub cow_backend: Option<String>,
     pub sparse_paths: Vec<String>,
-    pub overlay_available: bool,
+    pub transparent_cow_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -861,4 +868,37 @@ pub struct LaneGateOptions {
     pub score: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f64>,
+}
+
+#[cfg(test)]
+mod workdir_mode_tests {
+    use super::*;
+
+    #[test]
+    fn cow_modes_use_backend_specific_names_and_reject_removed_aliases() {
+        assert_eq!(
+            LaneWorkdirMode::parse("full-cow"),
+            Some(LaneWorkdirMode::FullCow)
+        );
+        assert_eq!(
+            LaneWorkdirMode::parse("full_cow"),
+            Some(LaneWorkdirMode::FullCow)
+        );
+        assert_eq!(LaneWorkdirMode::parse("fuse-cow"), Some(LaneWorkdirMode::FuseCow));
+        assert_eq!(LaneWorkdirMode::parse("fuse_cow"), Some(LaneWorkdirMode::FuseCow));
+        assert_eq!(
+            LaneWorkdirMode::parse("dokan-cow"),
+            Some(LaneWorkdirMode::DokanCow)
+        );
+        assert_eq!(
+            LaneWorkdirMode::parse("dokan_cow"),
+            Some(LaneWorkdirMode::DokanCow)
+        );
+        assert_eq!(LaneWorkdirMode::parse("overlay-cow"), None);
+        assert_eq!(LaneWorkdirMode::parse("overlay_cow"), None);
+        assert_eq!(LaneWorkdirMode::FullCow.cow_backend(), Some("clone"));
+        assert_eq!(LaneWorkdirMode::FuseCow.cow_backend(), Some("fuse"));
+        assert_eq!(LaneWorkdirMode::NfsCow.cow_backend(), Some("nfs"));
+        assert_eq!(LaneWorkdirMode::DokanCow.cow_backend(), Some("dokan"));
+    }
 }

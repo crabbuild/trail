@@ -15,7 +15,7 @@ Trail now treats code-agent integration as three complementary paths:
   when the agent supports MCP so it can inspect Trail state directly.
 - **Terminal task**: universal CLI path. `trail agent start --provider <NAME>`
   creates a task lane workdir, runs the provider command there, and records the
-  final checkpoint when the process exits. Use `--workdir-mode overlay-cow` to
+  final checkpoint when the process exits. Use `--workdir-mode fuse-cow` to
   mount a transparent COW view for large repositories instead of creating a full
   copied workdir.
 
@@ -154,15 +154,15 @@ trail agent start --provider opencode
 trail agent start --provider custom -- my-agent --flag
 ```
 
-For large repositories, terminal agents can use the overlay COW workdir mode:
+For large repositories, terminal agents can use the FUSE COW workdir mode:
 
 ```sh
-trail agent start --provider codex --workdir-mode overlay-cow
-trail agent start --provider custom --workdir-mode overlay-cow -- my-agent --flag
+trail agent start --provider codex --workdir-mode fuse-cow
+trail agent start --provider custom --workdir-mode fuse-cow -- my-agent --flag
 trail agent start --provider codex --workdir-mode nfs-cow
 ```
 
-The overlay mount is held only while the terminal process runs and while Trail
+The FUSE COW mount is held only while the terminal process runs and while Trail
 records the checkpoint afterward. On macOS it requires macFUSE; on Linux it
 requires FUSE access such as `/dev/fuse`.
 

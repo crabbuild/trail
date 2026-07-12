@@ -42,7 +42,7 @@ trail --json agent dashboard latest
 Built-in terminal profiles are `claude-code`, `codex`, `cursor`, `gemini`,
 `aider`, and `opencode`.
 
-Valid terminal workdir modes are `full-cow`, `overlay-cow`, and `nfs-cow`; the
+Valid terminal workdir modes are `full-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`; the
 default is `full-cow`.
 
 ```sh

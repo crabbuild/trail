@@ -2607,7 +2607,7 @@ impl Trail {
         let branch = self.lane_branch(lane)?;
         let record = self.lane_record(&branch.lane_id)?;
         let mode = self.lane_workdir_mode_for(&record, &branch)?;
-        if !matches!(mode, LaneWorkdirMode::OverlayCow | LaneWorkdirMode::NfsCow) {
+        if !mode.is_transparent_cow() {
             return Err(Error::InvalidInput(format!(
                 "lane `{lane}` uses `{}` and cannot run mounted environment initialization",
                 mode.as_str()
@@ -2783,8 +2783,8 @@ impl Trail {
         };
 
         let run_result = match mode {
-            LaneWorkdirMode::OverlayCow => {
-                let mount = self.mount_overlay_cow_workdir_for_lane_with_ephemeral_bindings(
+            LaneWorkdirMode::FuseCow => {
+                let mount = self.mount_fuse_cow_workdir_for_lane_with_ephemeral_bindings(
                     lane,
                     candidate_source_upper.clone(),
                     source_root.clone(),
@@ -2804,6 +2804,24 @@ impl Trail {
                 let result = run();
                 drop(mount);
                 result
+            }
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mount = self.mount_dokan_cow_workdir_for_lane_with_ephemeral_bindings(
+                        lane,
+                        candidate_source_upper,
+                        source_root.clone(),
+                        bindings,
+                    )?;
+                    let result = run();
+                    drop(mount);
+                    result
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(Error::InvalidInput(
+                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                ));
             }
             _ => unreachable!(),
         };
@@ -5909,8 +5927,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -6103,8 +6123,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "recover-env",
@@ -6571,8 +6593,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "polyglot",

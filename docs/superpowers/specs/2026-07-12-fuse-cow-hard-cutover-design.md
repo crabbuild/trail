@@ -65,9 +65,10 @@ existing full-COW/large-root policy.
 5. Lane metadata written before the cutover is not migrated. Opening or operating on a
    lane whose metadata contains `overlay-cow` returns an unsupported workdir-mode error
    instructing the operator to remove and recreate the lane.
-6. Runtime state directories and identifiers use `.trail/fuse-cow`,
-   `.trail/dokan-cow`, `trail-fuse-cow-*`, and `trail-dokan-cow-*`. Old
-   `.trail/overlay-cow` state is ignored and never adopted.
+6. Persistent transparent-COW state remains backend-neutral under
+   `.trail/views/<view-id>`, while mount identifiers use `trail-fuse-cow-*` and Dokan
+   ownership reports `dokan`. Old `.trail/overlay-cow` state is ignored and never
+   adopted.
 7. Rust symbols use `FuseCow`/`fuse_cow` for FUSE and `DokanCow`/`dokan_cow` for Dokan.
    Generic overlay terminology may remain only where it describes the filesystem
    algorithm rather than the removed product mode.

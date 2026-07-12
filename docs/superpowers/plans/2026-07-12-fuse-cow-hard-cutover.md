@@ -38,12 +38,12 @@ PowerShell verification scripts, Markdown documentation.
 
 Steps:
 
-- [ ] Add `FuseCow` and `DokanCow`; remove `OverlayCow`.
-- [ ] Serialize/parse only the new names and return exact backend identifiers.
-- [ ] Make automatic Windows selection `DokanCow` and Linux FUSE selection `FuseCow`.
-- [ ] Validate platform availability before lane creation.
-- [ ] Update CLI/OpenAPI/MCP enums and parser/report assertions.
-- [ ] Run model, CLI, and lane-spawn focused tests.
+- [x] Add `FuseCow` and `DokanCow`; remove `OverlayCow`.
+- [x] Serialize/parse only the new names and return exact backend identifiers.
+- [x] Make automatic Windows selection `DokanCow` and Linux FUSE selection `FuseCow`.
+- [x] Validate platform availability before lane creation.
+- [x] Update CLI/OpenAPI/MCP enums and parser/report assertions.
+- [x] Run model, CLI, and lane-spawn focused tests.
 
 ### Task 2: Separate FUSE and Dokan backend dispatch
 
@@ -59,12 +59,12 @@ Steps:
 
 Steps:
 
-- [ ] Rename FUSE types/functions to `FuseCow*`/`fuse_cow_*`.
-- [ ] Rename Dokan types/functions to `DokanCow*`/`dokan_cow_*`.
-- [ ] Add backend-specific Trail mount/prepare/candidate helpers.
-- [ ] Dispatch `FuseCow`, `NfsCow`, and `DokanCow` explicitly at every mount site.
-- [ ] Rename mount FS names, subtypes, diagnostics, and runtime state directories.
-- [ ] Run library tests and Windows cross-checks for backend dispatch.
+- [x] Rename FUSE types/functions to `FuseCow*`/`fuse_cow_*`.
+- [x] Rename Dokan types/functions to `DokanCow*`/`dokan_cow_*`.
+- [x] Add backend-specific Trail mount/prepare/candidate helpers.
+- [x] Dispatch `FuseCow`, `NfsCow`, and `DokanCow` explicitly at every mount site.
+- [x] Rename mount FS names, subtypes, diagnostics, and ownership identifiers.
+- [x] Run library tests and Windows cross-checks for backend dispatch.
 
 ### Task 3: Metadata hard cutover and lifecycle behavior
 
@@ -77,11 +77,11 @@ Steps:
 
 Steps:
 
-- [ ] Persist only `fuse-cow`/`dokan-cow` and exact `cow_backend` values.
-- [ ] Make old stored metadata fail with the recreate-lane diagnostic.
-- [ ] Clean only new backend state paths; never adopt `.trail/overlay-cow`.
-- [ ] Update doctor/backend availability checks.
-- [ ] Add hard-cutover metadata and lifecycle assertions.
+- [x] Persist only `fuse-cow`/`dokan-cow` and exact `cow_backend` values.
+- [x] Make old stored metadata fail with the recreate-lane diagnostic.
+- [x] Clean only current backend state paths; never adopt `.trail/overlay-cow`.
+- [x] Update doctor/backend availability checks.
+- [x] Add hard-cutover metadata and lifecycle assertions.
 
 ### Task 4: Scripts, workflows, docs, and skills
 
@@ -94,21 +94,22 @@ Steps:
 
 Steps:
 
-- [ ] Rename flags, variables, volumes, files, headings, examples, and diagnostics.
-- [ ] Use `dokan-cow` in Windows fixtures and `fuse-cow` in FUSE fixtures.
-- [ ] Preserve generic “overlay semantics” only where it describes the algorithm.
-- [ ] Verify checked-in current sources contain no removed product spelling or symbol.
+- [x] Rename flags, variables, volumes, files, headings, examples, and diagnostics.
+- [x] Use `dokan-cow` in Windows fixtures and `fuse-cow` in FUSE fixtures.
+- [x] Preserve generic “overlay semantics” only where it describes the algorithm.
+- [x] Verify checked-in current sources contain no removed product spelling or symbol
+  outside explicit hard-cutover rejection assertions.
 
 ### Task 5: Verification and regression repair
 
 Steps:
 
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run focused parser, CLI, lane, environment, FUSE, NFS, and Dokan tests.
-- [ ] Run `cargo test -p trail` and repair every failure caused by or exposed during the
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run focused parser, CLI, lane, environment, FUSE, NFS, and Dokan checks.
+- [x] Run `cargo test -p trail` and repair every failure caused by or exposed during the
   cutover.
-- [ ] Run `cargo check -p trail --target x86_64-pc-windows-msvc` when the target is
+- [x] Run `cargo check -p trail --target x86_64-pc-windows-msvc` when the target is
   installed; otherwise record the missing external gate.
-- [ ] Run repository absence scans excluding `.git`, `target`, and the historical design
+- [x] Run repository absence scans excluding `.git`, `target`, and the historical design
   spec/implementation plan whose purpose is to describe the removed name.
-- [ ] Inspect the final diff for unrelated changes and request code review.
+- [x] Inspect the final diff for unrelated changes and run release-level platform checks.

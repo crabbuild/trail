@@ -2956,8 +2956,10 @@ impl Trail {
             &crab_branch,
         )?;
 
-        let _overlay_mount = self.maybe_mount_overlay_cow_workdir_for_lane(&lane)?;
+        let _fuse_mount = self.maybe_mount_fuse_cow_workdir_for_lane(&lane)?;
         let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
+        #[cfg(target_os = "windows")]
+        let _dokan_mount = self.maybe_mount_dokan_cow_workdir_for_lane(&lane)?;
         let would_record = self.lane_workdir_dirty(&lane)?;
         if dry_run && would_record {
             let view = self.agent_task_view(&lane)?;

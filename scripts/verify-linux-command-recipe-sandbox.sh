@@ -5,8 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 docker run --rm --privileged \
   -v "${repo_root}:/work" \
-  -v trail-overlay-cow-cargo:/cargo-home \
-  -v trail-overlay-cow-target:/target \
+  -v trail-fuse-cow-cargo:/cargo-home \
+  -v trail-fuse-cow-target:/target \
   -w /work \
   -e CARGO_HOME=/cargo-home \
   -e CARGO_TARGET_DIR=/target \

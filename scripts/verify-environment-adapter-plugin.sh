@@ -173,7 +173,7 @@ assert_fails "signed adapter unexpectedly installed before publisher trust" \
   "${trail}" --workspace "${root}" env plugin install "${packages}/copy"
 trust_json="$("${trail}" --workspace "${root}" --json env plugin trust add "${packages}/copy/publisher-key.toml")"
 publisher_key_id="$(json_field key_id <<<"${trust_json}")"
-mode="overlay-cow"
+mode="fuse-cow"
 if [[ "$(uname -s)" == "Darwin" ]]; then
   mode="nfs-cow"
 fi

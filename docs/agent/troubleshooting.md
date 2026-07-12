@@ -52,9 +52,9 @@ you need a custom executable or flags, override the profile after `--`:
 trail agent start --provider codex -- /absolute/path/to/codex --flag
 ```
 
-## Overlay COW Mount Fails
+## FUSE COW Mount Fails
 
-`overlay-cow` requires macFUSE on macOS or FUSE access such as `/dev/fuse` on
+`fuse-cow` requires macFUSE on macOS or FUSE access such as `/dev/fuse` on
 Linux. Trail reports the mount error and does not silently fall back to a full
 copy.
 

@@ -1,9 +1,11 @@
 use super::*;
 
+#[cfg(target_os = "windows")]
+mod dokan;
+mod fuse;
 mod lifecycle;
 mod manifest;
 mod nfs_overlay;
-mod overlay;
 mod record;
 mod sync;
 mod view_barrier;

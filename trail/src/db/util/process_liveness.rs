@@ -185,10 +185,12 @@ fn windows_watch_parent_and_terminate_child(
     child_pid: u32,
     child_start_token: &str,
 ) -> std::result::Result<(), String> {
-    use winapi::shared::minwindef::{FALSE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use winapi::shared::minwindef::FALSE;
+    use winapi::shared::winerror::WAIT_TIMEOUT;
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
     use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winbase::WAIT_OBJECT_0;
     use winapi::um::winnt::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, SYNCHRONIZE};
 
     // SAFETY: handles are checked before use and closed on every return path.

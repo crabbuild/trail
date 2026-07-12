@@ -12,7 +12,7 @@ pub(super) fn tools() -> Value {
                 "name": { "type": "string" },
                 "from_ref": { "type": "string" },
                 "materialize": { "type": "boolean" },
-                "workdir_mode": { "type": "string", "enum": ["auto", "virtual", "sparse", "full-cow", "overlay-cow", "nfs-cow"] },
+                "workdir_mode": { "type": "string", "enum": ["auto", "virtual", "sparse", "full-cow", "fuse-cow", "nfs-cow", "dokan-cow"] },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
                 "paths": { "type": "array", "items": { "type": "string" } },
@@ -360,4 +360,28 @@ pub(super) fn tools() -> Value {
             }), vec![])
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_spawn_schema_uses_the_hard_cutover_modes() {
+        let declarations = tools();
+        let lane_spawn = declarations
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "trail.lane_spawn")
+            .unwrap();
+        let modes = lane_spawn["inputSchema"]["properties"]["workdir_mode"]["enum"]
+            .as_array()
+            .unwrap();
+
+        assert!(modes.iter().any(|mode| mode == "full-cow"));
+        assert!(modes.iter().any(|mode| mode == "fuse-cow"));
+        assert!(modes.iter().any(|mode| mode == "dokan-cow"));
+        assert!(!modes.iter().any(|mode| mode == "overlay-cow"));
+    }
 }

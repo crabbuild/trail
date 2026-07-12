@@ -285,13 +285,6 @@ mod macos {
         Ok(upper)
     }
 
-    pub(crate) fn nfs_clean_manifest_path(db: &Trail, lane: &str) -> Result<PathBuf> {
-        Ok(db
-            .workspace_view_paths_for_lane_name(lane)
-            .meta_dir
-            .join("workdir-manifest.json"))
-    }
-
     pub(crate) fn nfs_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
         let upper = nfs_upperdir(db, lane)?;
         let branch = db.lane_branch(lane)?;
@@ -1979,13 +1972,6 @@ pub(crate) fn mount_nfs_cow_for_lane_with_ephemeral_bindings(
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn nfs_clean_manifest_path(_db: &Trail, _lane: &str) -> Result<PathBuf> {
-    Err(Error::InvalidInput(
-        "nfs-cow workdirs are currently supported only on macOS".to_string(),
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn nfs_candidate_paths(_db: &Trail, _lane: &str) -> Result<Vec<String>> {
     Err(Error::InvalidInput(
         "nfs-cow workdirs are currently supported only on macOS".to_string(),
@@ -2020,10 +2006,6 @@ impl Trail {
             source_root,
             bindings,
         )
-    }
-
-    pub(crate) fn nfs_clean_workdir_manifest_path_for_lane(&self, lane: &str) -> Result<PathBuf> {
-        nfs_clean_manifest_path(self, lane)
     }
 
     pub(crate) fn nfs_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {

@@ -429,8 +429,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         for lane in ["node-one", "node-two"] {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(

@@ -417,6 +417,36 @@ mod tests {
     }
 
     #[test]
+    fn workdir_mode_cli_uses_the_hard_cutover_names() {
+        for mode in ["full-cow", "fuse-cow", "dokan-cow"] {
+            Cli::try_parse_from([
+                "trail",
+                "lane",
+                "spawn",
+                "mode-check",
+                "--workdir-mode",
+                mode,
+            ])
+            .unwrap_or_else(|error| panic!("current workdir mode `{mode}` should parse: {error}"));
+        }
+
+        for removed in ["overlay-cow", "overlay_cow"] {
+            assert!(
+                Cli::try_parse_from([
+                    "trail",
+                    "lane",
+                    "spawn",
+                    "mode-check",
+                    "--workdir-mode",
+                    removed,
+                ])
+                .is_err(),
+                "removed workdir mode `{removed}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn parses_lane_merge_with_lane_specific_options() {
         let cli = Cli::try_parse_from([
             "trail",

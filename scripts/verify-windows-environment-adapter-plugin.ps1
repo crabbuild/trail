@@ -158,7 +158,7 @@ max_response_bytes = 1048576
     Assert-TrailFails { & $trail --workspace $workspace env plugin install $copyPackage } "signed Windows adapter installed before publisher trust"
     $trusted = (& $trail --workspace $workspace --json env plugin trust add $keyPath) | ConvertFrom-Json
     foreach ($lane in @("plugin-a", "plugin-b", "plugin-mounted-a", "plugin-mounted-b", "plugin-mounted-kill")) {
-        & $trail --workspace $workspace lane spawn $lane --from main --workdir-mode overlay-cow | Out-Null
+        & $trail --workspace $workspace lane spawn $lane --from main --workdir-mode dokan-cow | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "lane spawn failed for $lane" }
     }
 

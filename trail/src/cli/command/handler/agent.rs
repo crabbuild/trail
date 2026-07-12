@@ -1421,13 +1421,19 @@ fn run_terminal_agent_task(
     let workdir = spawn.workdir.clone().ok_or_else(|| {
         Error::InvalidInput("agent start requires a filesystem lane workdir".to_string())
     })?;
-    let overlay_mount = if workdir_mode == LaneWorkdirMode::OverlayCow {
-        Some(db.mount_overlay_cow_workdir_for_lane(&lane)?)
+    let fuse_mount = if workdir_mode == LaneWorkdirMode::FuseCow {
+        Some(db.mount_fuse_cow_workdir_for_lane(&lane)?)
     } else {
         None
     };
     let nfs_mount = if workdir_mode == LaneWorkdirMode::NfsCow {
         Some(db.mount_nfs_cow_workdir_for_lane(&lane)?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "windows")]
+    let dokan_mount = if workdir_mode == LaneWorkdirMode::DokanCow {
+        Some(db.mount_dokan_cow_workdir_for_lane(&lane)?)
     } else {
         None
     };
@@ -1589,8 +1595,10 @@ fn run_terminal_agent_task(
         recorded: Some(recorded),
         status: status.to_string(),
     };
-    drop(overlay_mount);
+    drop(fuse_mount);
     drop(nfs_mount);
+    #[cfg(target_os = "windows")]
+    drop(dokan_mount);
     Ok(report)
 }
 

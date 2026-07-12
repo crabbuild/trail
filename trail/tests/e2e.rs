@@ -10565,8 +10565,10 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
     let mut db = Trail::open(temp.path()).unwrap();
     let mode = if cfg!(target_os = "macos") {
         LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
     } else {
-        LaneWorkdirMode::OverlayCow
+        LaneWorkdirMode::FuseCow
     };
     db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         "surface",
@@ -10999,8 +11001,10 @@ command = ["git", "--version"]
         Some("main"),
         if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         },
         None,
         None,
@@ -11077,8 +11081,10 @@ fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
         Some("main"),
         if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         },
         None,
         None,
@@ -11210,8 +11216,10 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
     let mut db = Trail::open(temp.path()).unwrap();
     let mode = if cfg!(target_os = "macos") {
         LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
     } else {
-        LaneWorkdirMode::OverlayCow
+        LaneWorkdirMode::FuseCow
     };
     for lane in ["env-http", "env-mcp", "env-all-http", "env-all-mcp"] {
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
@@ -11612,8 +11620,10 @@ fn environment_sync_reuses_one_node_layer_across_http_and_mcp() {
     let mut db = Trail::open(temp.path()).unwrap();
     let mode = if cfg!(target_os = "macos") {
         LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
     } else {
-        LaneWorkdirMode::OverlayCow
+        LaneWorkdirMode::FuseCow
     };
     for lane in ["env-http", "env-mcp"] {
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
@@ -12875,6 +12885,14 @@ fn local_api_and_cli_export_openapi_contract() {
         .get("MergeLaneRequest")
         .is_none());
     assert!(cli["components"]["schemas"]["LaneReadFileRequest"].is_object());
+    let workdir_modes = cli["components"]["schemas"]["SpawnLaneRequest"]["properties"]
+        ["workdir_mode"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(workdir_modes.iter().any(|mode| mode == "full-cow"));
+    assert!(workdir_modes.iter().any(|mode| mode == "fuse-cow"));
+    assert!(workdir_modes.iter().any(|mode| mode == "dokan-cow"));
+    assert!(!workdir_modes.iter().any(|mode| mode == "overlay-cow"));
     assert!(cli["paths"].get("/v1/lane/events").is_some());
     assert!(cli["paths"].get("/v1/lane/spans").is_some());
     assert!(cli["paths"].get("/v1/lane/turns/{turn_id}/spans").is_some());
@@ -19742,8 +19760,10 @@ fn layered_lane_update_preserves_lane_changes_and_advances_its_pinned_base() {
     let mut db = Trail::open(temp.path()).unwrap();
     let mode = if cfg!(target_os = "macos") {
         LaneWorkdirMode::NfsCow
+    } else if cfg!(target_os = "windows") {
+        LaneWorkdirMode::DokanCow
     } else {
-        LaneWorkdirMode::OverlayCow
+        LaneWorkdirMode::FuseCow
     };
     db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         "updatable",
@@ -21769,7 +21789,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(default_spawn["workdir_mode"], "virtual");
     assert!(default_spawn["cow_backend"].is_null());
     assert_eq!(default_spawn["sparse_paths"].as_array().unwrap().len(), 0);
-    assert_eq!(default_spawn["overlay_available"], false);
+    assert_eq!(default_spawn["transparent_cow_available"], false);
 
     let cli_workdir = workdir_parent.path().join("cli-bot");
     let cli_spawn = run_trail_json(
@@ -21785,7 +21805,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         ],
     );
     assert_eq!(cli_spawn["workdir_mode"], "full-cow");
-    assert_eq!(cli_spawn["cow_backend"], "filesystem-clone");
+    assert_eq!(cli_spawn["cow_backend"], "clone");
     assert_eq!(
         PathBuf::from(cli_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -21825,36 +21845,51 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert!(no_materialize_spawn["workdir"].is_null());
     assert_eq!(no_materialize_spawn["workdir_mode"], "virtual");
 
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "windows",
-        all(target_os = "macos", feature = "macfuse")
-    ))]
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macfuse")))]
     {
-        let overlay_spawn = run_trail_json(
+        let fuse_spawn = run_trail_json(
             temp.path(),
             &[
                 "lane",
                 "spawn",
-                "overlay-bot",
+                "fuse-bot",
                 "--from",
                 "main",
                 "--workdir-mode",
-                "overlay-cow",
+                "fuse-cow",
             ],
         );
-        assert_eq!(overlay_spawn["workdir_mode"], "overlay-cow");
-        assert_eq!(overlay_spawn["cow_backend"], "overlay");
-        assert_eq!(overlay_spawn["overlay_available"], true);
-        assert_eq!(overlay_spawn["sparse_paths"].as_array().unwrap().len(), 0);
-        let overlay_workdir = PathBuf::from(overlay_spawn["workdir"].as_str().unwrap());
-        assert!(overlay_workdir.is_dir());
-        assert!(fs::read_dir(&overlay_workdir).unwrap().next().is_none());
-        assert!(!overlay_workdir.join("README.md").exists());
+        assert_eq!(fuse_spawn["workdir_mode"], "fuse-cow");
+        assert_eq!(fuse_spawn["cow_backend"], "fuse");
+        assert_eq!(fuse_spawn["transparent_cow_available"], true);
+        assert_eq!(fuse_spawn["sparse_paths"].as_array().unwrap().len(), 0);
+        let fuse_workdir = PathBuf::from(fuse_spawn["workdir"].as_str().unwrap());
+        assert!(fuse_workdir.is_dir());
+        assert!(fs::read_dir(&fuse_workdir).unwrap().next().is_none());
+        assert!(!fuse_workdir.join("README.md").exists());
         let db = Trail::open(temp.path()).unwrap();
-        let view = db.lane_workspace_view("overlay-bot").unwrap().unwrap();
+        let view = db.lane_workspace_view("fuse-bot").unwrap().unwrap();
         assert!(Path::new(&view.source_upper).is_dir());
         assert!(Path::new(&view.meta_dir).is_dir());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let dokan_spawn = run_trail_json(
+            temp.path(),
+            &[
+                "lane",
+                "spawn",
+                "dokan-bot",
+                "--from",
+                "main",
+                "--workdir-mode",
+                "dokan-cow",
+            ],
+        );
+        assert_eq!(dokan_spawn["workdir_mode"], "dokan-cow");
+        assert_eq!(dokan_spawn["cow_backend"], "dokan");
+        assert_eq!(dokan_spawn["transparent_cow_available"], true);
     }
 
     #[cfg(target_os = "macos")]
@@ -21872,8 +21907,8 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             ],
         );
         assert_eq!(nfs_spawn["workdir_mode"], "nfs-cow");
-        assert_eq!(nfs_spawn["cow_backend"], "nfs-overlay");
-        assert_eq!(nfs_spawn["overlay_available"], true);
+        assert_eq!(nfs_spawn["cow_backend"], "nfs");
+        assert_eq!(nfs_spawn["transparent_cow_available"], true);
         let db = Trail::open(temp.path()).unwrap();
         let view = db.lane_workspace_view("nfs-bot").unwrap().unwrap();
         assert!(Path::new(&view.source_upper).is_dir());
@@ -21899,7 +21934,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         ],
     );
     assert_eq!(sparse_spawn["workdir_mode"], "sparse");
-    assert_eq!(sparse_spawn["cow_backend"], "filesystem-clone");
+    assert_eq!(sparse_spawn["cow_backend"], "clone");
     assert_eq!(
         sparse_spawn["sparse_paths"]
             .as_array()

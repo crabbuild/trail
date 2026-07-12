@@ -276,8 +276,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -398,8 +400,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -492,8 +496,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -511,7 +517,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let mounted = db.mount_nfs_cow_workdir_for_lane("python-all").unwrap();
         #[cfg(any(target_os = "linux", windows))]
-        let mounted = db.mount_overlay_cow_workdir_for_lane("python-all").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("python-all").unwrap();
         let workdir = PathBuf::from(db.lane_workdir("python-all").unwrap().workdir.unwrap());
         for component in ["services/api", "services/worker"] {
             let venv = workdir.join(component).join(".venv");
@@ -567,8 +573,10 @@ mod tests {
                 Some("main"),
                 if cfg!(target_os = "macos") {
                     LaneWorkdirMode::NfsCow
+                } else if cfg!(target_os = "windows") {
+                    LaneWorkdirMode::DokanCow
                 } else {
-                    LaneWorkdirMode::OverlayCow
+                    LaneWorkdirMode::FuseCow
                 },
                 None,
                 None,
@@ -585,7 +593,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             let mounted = db.mount_nfs_cow_workdir_for_lane(lane).unwrap();
             #[cfg(target_os = "linux")]
-            let mounted = db.mount_overlay_cow_workdir_for_lane(lane).unwrap();
+            let mounted = db.mount_fuse_cow_workdir_for_lane(lane).unwrap();
             let workdir = PathBuf::from(db.lane_workdir(lane).unwrap().workdir.unwrap());
             assert!(workdir.join(".venv/pyvenv.cfg").is_file());
             let venv_python = workdir.join(".venv/bin/python");
@@ -614,7 +622,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let mounted = db.mount_nfs_cow_workdir_for_lane("python-a").unwrap();
         #[cfg(target_os = "linux")]
-        let mounted = db.mount_overlay_cow_workdir_for_lane("python-a").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("python-a").unwrap();
         let workdir = PathBuf::from(db.lane_workdir("python-a").unwrap().workdir.unwrap());
         assert!(workdir.join(".venv/lane-a.txt").is_file());
         drop(mounted);
@@ -642,7 +650,7 @@ mod tests {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 lane,
                 Some("main"),
-                LaneWorkdirMode::OverlayCow,
+                LaneWorkdirMode::FuseCow,
                 None,
                 None,
                 None,
@@ -655,7 +663,7 @@ mod tests {
                 .unwrap();
             assert!(report.layers.is_empty());
 
-            let mounted = db.mount_overlay_cow_workdir_for_lane(lane).unwrap();
+            let mounted = db.mount_fuse_cow_workdir_for_lane(lane).unwrap();
             let workdir = PathBuf::from(db.lane_workdir(lane).unwrap().workdir.unwrap());
             assert!(workdir.join(".venv/pyvenv.cfg").is_file());
             let venv_python = workdir.join(".venv/Scripts/python.exe");
@@ -681,7 +689,7 @@ mod tests {
             .sync_workspace_environment_component("python-a", "trail/python-venv@1", None, None)
             .unwrap();
         assert!(unchanged.layers.is_empty());
-        let mounted = db.mount_overlay_cow_workdir_for_lane("python-a").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("python-a").unwrap();
         let workdir = PathBuf::from(db.lane_workdir("python-a").unwrap().workdir.unwrap());
         assert!(workdir.join(".venv/lane-a.txt").is_file());
         drop(mounted);

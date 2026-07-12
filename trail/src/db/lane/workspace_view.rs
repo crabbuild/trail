@@ -178,8 +178,8 @@ impl Trail {
         }
 
         match mode {
-            LaneWorkdirMode::OverlayCow => {
-                let mount = self.mount_overlay_cow_workdir_for_lane(lane)?;
+            LaneWorkdirMode::FuseCow => {
+                let mount = self.mount_fuse_cow_workdir_for_lane(lane)?;
                 self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
                 drop(mount);
             }
@@ -187,6 +187,18 @@ impl Trail {
                 let mount = self.mount_nfs_cow_workdir_for_lane(lane)?;
                 self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
                 drop(mount);
+            }
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mount = self.mount_dokan_cow_workdir_for_lane(lane)?;
+                    self.wait_for_workspace_unmount_request(lane, &view, &stop_path)?;
+                    drop(mount);
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(Error::InvalidInput(
+                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                ));
             }
             _ => {
                 return Err(Error::InvalidInput(format!(
@@ -614,8 +626,8 @@ impl Trail {
         let head = self.get_ref(&branch.ref_name)?;
         let run = || self.run_workspace_command(&view, &head.root_id, command);
         let exit_code = match mode {
-            LaneWorkdirMode::OverlayCow => {
-                let mount = self.mount_overlay_cow_workdir_for_lane(lane)?;
+            LaneWorkdirMode::FuseCow => {
+                let mount = self.mount_fuse_cow_workdir_for_lane(lane)?;
                 let result = run();
                 drop(mount);
                 result?
@@ -625,6 +637,19 @@ impl Trail {
                 let result = run();
                 drop(mount);
                 result?
+            }
+            LaneWorkdirMode::DokanCow => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mount = self.mount_dokan_cow_workdir_for_lane(lane)?;
+                    let result = run();
+                    drop(mount);
+                    result?
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(Error::InvalidInput(
+                    "dokan-cow workdirs are currently supported only on Windows".to_string(),
+                ));
             }
             _ => {
                 return Err(Error::InvalidInput(format!(
@@ -1224,8 +1249,10 @@ mod tests {
             let mut db = Trail::open(workspace.path()).unwrap();
             let mode = if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             };
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 "checkpoint-crash",
@@ -1304,8 +1331,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "barrier",
@@ -1427,8 +1456,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "layered",
@@ -1470,8 +1501,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "checkpoint",
@@ -1614,8 +1647,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "crash",
@@ -1689,8 +1724,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "retry",
@@ -1751,8 +1788,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "lease",
@@ -1807,8 +1846,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "unmount-control",
@@ -1867,8 +1908,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         for lane in ["cargo-a", "cargo-b"] {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
@@ -1935,8 +1978,10 @@ mod tests {
         let mut db = Trail::open(temp.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "quota",
@@ -2027,8 +2072,10 @@ mod tests {
         let view_started = Instant::now();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         let mut cores = Vec::new();
         let mut exclusive_bytes = 0_u64;

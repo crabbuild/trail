@@ -202,8 +202,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -267,8 +269,10 @@ mod tests {
                 Some("main"),
                 if cfg!(target_os = "macos") {
                     LaneWorkdirMode::NfsCow
+                } else if cfg!(target_os = "windows") {
+                    LaneWorkdirMode::DokanCow
                 } else {
-                    LaneWorkdirMode::OverlayCow
+                    LaneWorkdirMode::FuseCow
                 },
                 None,
                 None,
@@ -287,7 +291,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             let mounted = db.mount_nfs_cow_workdir_for_lane(lane).unwrap();
             #[cfg(target_os = "linux")]
-            let mounted = db.mount_overlay_cow_workdir_for_lane(lane).unwrap();
+            let mounted = db.mount_fuse_cow_workdir_for_lane(lane).unwrap();
             let workdir = PathBuf::from(db.lane_workdir(lane).unwrap().workdir.unwrap());
             let configured = Command::new("cmake")
                 .args(["-S", ".", "-B", "build", "-G", "Unix Makefiles"])
@@ -310,7 +314,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let mounted = db.mount_nfs_cow_workdir_for_lane("cmake-a").unwrap();
         #[cfg(target_os = "linux")]
-        let mounted = db.mount_overlay_cow_workdir_for_lane("cmake-a").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("cmake-a").unwrap();
         let workdir_a = PathBuf::from(db.lane_workdir("cmake-a").unwrap().workdir.unwrap());
         let cleaned = Command::new("cmake")
             .args(["--build", "build", "--target", "clean"])
@@ -324,7 +328,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         let mounted = db.mount_nfs_cow_workdir_for_lane("cmake-b").unwrap();
         #[cfg(target_os = "linux")]
-        let mounted = db.mount_overlay_cow_workdir_for_lane("cmake-b").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("cmake-b").unwrap();
         let workdir_b = PathBuf::from(db.lane_workdir("cmake-b").unwrap().workdir.unwrap());
         assert!(workdir_b.join("build/hello").is_file());
         drop(mounted);
@@ -357,7 +361,7 @@ mod tests {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 lane,
                 Some("main"),
-                LaneWorkdirMode::OverlayCow,
+                LaneWorkdirMode::FuseCow,
                 None,
                 None,
                 None,
@@ -380,7 +384,7 @@ mod tests {
             .expect("CMake did not produce hello.exe")
         };
         for lane in ["cmake-a", "cmake-b"] {
-            let mounted = db.mount_overlay_cow_workdir_for_lane(lane).unwrap();
+            let mounted = db.mount_fuse_cow_workdir_for_lane(lane).unwrap();
             let workdir = PathBuf::from(db.lane_workdir(lane).unwrap().workdir.unwrap());
             assert!(Command::new("cmake")
                 .args(["-S", ".", "-B", "build"])
@@ -401,7 +405,7 @@ mod tests {
             assert!(cache.contains(&workdir.to_string_lossy().replace('\\', "/")));
             drop(mounted);
         }
-        let mounted = db.mount_overlay_cow_workdir_for_lane("cmake-a").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("cmake-a").unwrap();
         let workdir_a = PathBuf::from(db.lane_workdir("cmake-a").unwrap().workdir.unwrap());
         assert!(Command::new("cmake")
             .args(["--build", "build", "--target", "clean", "--config", "Debug"])
@@ -416,7 +420,7 @@ mod tests {
         .iter()
         .any(|path| path.exists()));
         drop(mounted);
-        let mounted = db.mount_overlay_cow_workdir_for_lane("cmake-b").unwrap();
+        let mounted = db.mount_fuse_cow_workdir_for_lane("cmake-b").unwrap();
         let workdir_b = PathBuf::from(db.lane_workdir("cmake-b").unwrap().workdir.unwrap());
         assert!(executable(&workdir_b).is_file());
         drop(mounted);

@@ -39,9 +39,9 @@ Trail already has the right starting points:
 
 - Virtual and sparse lanes.
 - Full materialization with filesystem clone COW where available.
-- FUSE overlay COW on Linux and supported macOS builds.
+- FUSE COW on Linux and supported macOS builds.
 - Loopback NFS COW on macOS.
-- Dokan-backed overlay support on Windows.
+- Dokan COW support on Windows.
 - Persistent lane uppers, whiteouts, workdir manifests, sessions, turns,
   checkpoints, gates, readiness, merge queues, and safe Git apply.
 
@@ -206,7 +206,7 @@ content so filesystem backends can serve ranged reads and use reflink copy-up.
 ## Current Foundation and Gaps
 
 `LaneWorkdirMode` currently supports `virtual`, `sparse`, `full-cow`,
-`overlay-cow`, and `nfs-cow`. Lane spawning records the mode and creates either
+`fuse-cow`, and `nfs-cow`. Lane spawning records the mode and creates either
 a materialized workdir or an overlay mountpoint. `trail agent start` holds a
 mount for the child process, records the lane workdir when the child exits, and
 then unmounts it.
@@ -1424,12 +1424,12 @@ and GC. Report logical and physical storage after each additional lane.
 
 ## Migration and Compatibility
 
-Existing lanes remain valid:
+Existing lanes using the current mode vocabulary remain valid:
 
 - `virtual` and `sparse` semantics do not change.
-- `full-cow`, `overlay-cow`, and `nfs-cow` continue to parse.
-- Legacy overlay upper directories can be mounted through a compatibility
-  adapter, checkpointed, and migrated to split uppers.
+- `full-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow` are the supported COW modes.
+- Removed workdir mode names are rejected. Operators must remove and recreate
+  those lanes with the platform-appropriate current mode.
 - Existing lane `metadata_json` remains readable while typed workspace-view
   tables become authoritative for new lanes.
 - The default remains `full-cow` until `auto` passes platform conformance and
@@ -1552,8 +1552,9 @@ Current implementation areas that this design extends:
 - Lane spawn and materialization: `trail/src/db/lane/lifecycle.rs`
 - Workdir lifecycle and manifests: `trail/src/db/lane/workdir.rs` and
   `trail/src/db/lane/workdir/`
-- FUSE and Dokan overlay: `trail/src/db/lane/workdir/overlay.rs`
-- macOS loopback NFS overlay: `trail/src/db/lane/workdir/nfs_overlay.rs`
+- FUSE COW: `trail/src/db/lane/workdir/fuse.rs`
+- Dokan COW: `trail/src/db/lane/workdir/dokan.rs`
+- macOS loopback NFS COW: `trail/src/db/lane/workdir/nfs_overlay.rs`
 - Filesystem clone COW: `trail/src/db/util/fs_cow.rs`
 - Workdir recording: `trail/src/db/lane/workdir/record.rs`
 - Agent terminal lifecycle: `trail/src/cli/command/handler/agent.rs`

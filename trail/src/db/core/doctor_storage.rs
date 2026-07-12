@@ -233,10 +233,13 @@ pub(super) fn push_workspace_views_check(db: &Trail, checks: &mut Vec<DoctorChec
                 }
             }
             let backend_available = match backend.as_str() {
-                "overlay-cow" if cfg!(target_os = "linux") => Path::new("/dev/fuse").exists(),
-                "nfs-cow" if cfg!(target_os = "macos") => Path::new("/sbin/mount_nfs").is_file(),
-                "overlay-cow" if cfg!(target_os = "windows") => true,
-                _ => true,
+                "fuse" if cfg!(target_os = "linux") => Path::new("/dev/fuse").exists(),
+                "fuse" if cfg!(target_os = "macos") => cfg!(feature = "macfuse"),
+                "nfs" if cfg!(target_os = "macos") => Path::new("/sbin/mount_nfs").is_file(),
+                "dokan" if cfg!(target_os = "windows") => true,
+                "clone" | "virtual" => true,
+                "fuse" | "nfs" | "dokan" => false,
+                _ => false,
             };
             if !backend_available {
                 errors.push(format!(

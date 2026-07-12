@@ -3679,8 +3679,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -3859,8 +3861,10 @@ mod tests {
             Some("main"),
             if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             },
             None,
             None,
@@ -4015,8 +4019,10 @@ mod tests {
             let mut db = Trail::open(workspace.path()).unwrap();
             let mode = if cfg!(target_os = "macos") {
                 LaneWorkdirMode::NfsCow
+            } else if cfg!(target_os = "windows") {
+                LaneWorkdirMode::DokanCow
             } else {
-                LaneWorkdirMode::OverlayCow
+                LaneWorkdirMode::FuseCow
             };
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 "crash-source",
@@ -4233,8 +4239,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         for lane in ["node-a", "node-b"] {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
@@ -4375,8 +4383,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "python-a",
@@ -4485,8 +4495,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "reset-commit",
@@ -4591,8 +4603,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "recover",
@@ -4646,8 +4660,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "pinned",
@@ -4749,8 +4765,10 @@ mod tests {
         let mut db = Trail::open(workspace.path()).unwrap();
         let mode = if cfg!(target_os = "macos") {
             LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
         } else {
-            LaneWorkdirMode::OverlayCow
+            LaneWorkdirMode::FuseCow
         };
         db.spawn_lane_with_workdir_mode_paths_and_neighbors(
             "corrupt",

@@ -330,15 +330,15 @@ file values can be plain strings or objects with only `content`, `delete`, and
 - `trail.read_file`
 
 `trail.lane_spawn` accepts `workdir_mode` values `virtual`, `sparse`,
-`full-cow`, `overlay-cow`, and `nfs-cow`. `virtual` creates no workdir, `sparse` requires
+`full-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. `virtual` creates no workdir, `sparse` requires
 `paths`, and `full-cow` creates a full materialized workdir using filesystem
-clone COW when available. `overlay-cow` creates an empty workdir mountpoint and
-records an overlay backend; a runtime such as `trail agent start
---workdir-mode overlay-cow` mounts the FUSE view and keeps it alive while the
+clone COW when available. `fuse-cow` creates an empty workdir mountpoint and
+records the `fuse` backend; a runtime such as `trail agent start
+--workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the
 agent runs. Spawn results include `workdir_mode`, `cow_backend`, `sparse_paths`,
-and `overlay_available`.
-On macOS, `nfs-cow` reports `cow_backend: "nfs-overlay"` and uses the built-in
-loopback NFS client.
+and `transparent_cow_available`.
+On macOS, `nfs-cow` reports `cow_backend: "nfs"` and uses the built-in
+loopback NFS client. On Windows, `dokan-cow` reports `cow_backend: "dokan"`.
 
 `trail.apply_patch` accepts either native `edits` or compatibility `files`;
 provide exactly one non-empty array. Native edit objects and compatibility file

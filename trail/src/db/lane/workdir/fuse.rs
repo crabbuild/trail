@@ -22,7 +22,7 @@ mod fuse_overlay {
     const TTL: Duration = Duration::from_secs(1);
     const OVERLAY_META_DIR: &str = ".trail";
 
-    pub(crate) struct OverlayCowMount {
+    pub(crate) struct FuseCowMount {
         #[allow(dead_code)]
         session: fuser::BackgroundSession,
         #[allow(dead_code)]
@@ -31,18 +31,18 @@ mod fuse_overlay {
         lease: WorkspaceMountLease,
     }
 
-    impl OverlayCowMount {
+    impl FuseCowMount {
         #[allow(dead_code)]
         pub(crate) fn mountpoint(&self) -> &Path {
             &self.mountpoint
         }
     }
 
-    impl Drop for OverlayCowMount {
+    impl Drop for FuseCowMount {
         fn drop(&mut self) {}
     }
 
-    pub(crate) fn prepare_overlay_cow_workdir(
+    pub(crate) fn prepare_fuse_cow_workdir(
         db: &Trail,
         lane: &str,
         dir: &Path,
@@ -56,38 +56,38 @@ mod fuse_overlay {
         Ok(upperdir)
     }
 
-    pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<OverlayCowMount> {
-        mount_overlay_cow_for_lane_with_view(db, lane, None)
+    pub(crate) fn mount_fuse_cow_for_lane(db: &Trail, lane: &str) -> Result<FuseCowMount> {
+        mount_fuse_cow_for_lane_with_view(db, lane, None)
     }
 
-    pub(crate) fn mount_overlay_cow_for_lane_with_ephemeral_bindings(
+    pub(crate) fn mount_fuse_cow_for_lane_with_ephemeral_bindings(
         db: &Trail,
         lane: &str,
         source_upper: PathBuf,
         source_root: ObjectId,
         bindings: Vec<WorkspaceLayerBinding>,
-    ) -> Result<OverlayCowMount> {
-        mount_overlay_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
+    ) -> Result<FuseCowMount> {
+        mount_fuse_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
     }
 
-    fn mount_overlay_cow_for_lane_with_view(
+    fn mount_fuse_cow_for_lane_with_view(
         db: &Trail,
         lane: &str,
         ephemeral: Option<(PathBuf, ObjectId, Vec<WorkspaceLayerBinding>)>,
-    ) -> Result<OverlayCowMount> {
+    ) -> Result<FuseCowMount> {
         validate_ref_segment(lane)?;
         let branch = db.lane_branch(lane)?;
         let record = db.lane_record(&branch.lane_id)?;
         let mode = db.lane_workdir_mode_for(&record, &branch)?;
-        if mode != LaneWorkdirMode::OverlayCow {
+        if mode != LaneWorkdirMode::FuseCow {
             return Err(Error::InvalidInput(format!(
-                "lane `{lane}` uses workdir mode `{}`; expected overlay-cow",
+                "lane `{lane}` uses workdir mode `{}`; expected fuse-cow",
                 mode.as_str()
             )));
         }
         let Some(workdir) = branch.workdir.clone() else {
             return Err(Error::InvalidInput(format!(
-                "overlay-cow lane `{lane}` has no mountpoint"
+                "fuse-cow lane `{lane}` has no mountpoint"
             )));
         };
         let mountpoint = PathBuf::from(workdir);
@@ -107,12 +107,12 @@ mod fuse_overlay {
             bindings,
         )?;
         #[cfg(target_os = "linux")]
-        let mut options = vec![MountOption::FSName(format!("trail-overlay-cow-{lane}"))];
+        let mut options = vec![MountOption::FSName(format!("trail-fuse-cow-{lane}"))];
         #[cfg(target_os = "macos")]
-        let options = vec![MountOption::FSName(format!("trail-overlay-cow-{lane}"))];
+        let options = vec![MountOption::FSName(format!("trail-fuse-cow-{lane}"))];
         #[cfg(target_os = "linux")]
         {
-            options.push(MountOption::Subtype("trail-overlay-cow".to_string()));
+            options.push(MountOption::Subtype("trail-fuse-cow".to_string()));
             options.push(MountOption::RW);
             options.push(MountOption::NoAtime);
         }
@@ -122,14 +122,14 @@ mod fuse_overlay {
             .map_err(|err| overlay_mount_error(&mountpoint, err))?;
         lease.mark_mounted()?;
 
-        Ok(OverlayCowMount {
+        Ok(FuseCowMount {
             session,
             mountpoint,
             lease,
         })
     }
 
-    pub(crate) fn overlay_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
+    pub(crate) fn fuse_candidate_paths(db: &Trail, lane: &str) -> Result<Vec<String>> {
         let upper = overlay_upperdir(db, lane)?;
         let branch = db.lane_branch(lane)?;
         let head = db.get_ref(&branch.ref_name)?;
@@ -143,7 +143,7 @@ mod fuse_overlay {
 
     fn overlay_mount_error(mountpoint: &Path, err: std::io::Error) -> Error {
         Error::InvalidInput(format!(
-            "failed to mount overlay-cow workdir at `{}`: {err}. On macOS install macFUSE; on Linux ensure /dev/fuse is available and your user can mount FUSE filesystems.",
+            "failed to mount fuse-cow workdir at `{}`: {err}. On macOS install macFUSE; on Linux ensure /dev/fuse is available and your user can mount FUSE filesystems.",
             mountpoint.display()
         ))
     }
@@ -154,7 +154,7 @@ mod fuse_overlay {
             return Ok(());
         }
         Err(Error::InvalidInput(
-            "overlay-cow workdirs require `/dev/fuse`; enable FUSE for this Linux environment"
+            "fuse-cow workdirs require `/dev/fuse`; enable FUSE for this Linux environment"
                 .to_string(),
         ))
     }
@@ -167,7 +167,7 @@ mod fuse_overlay {
         let loader = Path::new("/Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse");
         if !loader.exists() {
             return Err(Error::InvalidInput(
-                "overlay-cow workdirs require macFUSE; install macFUSE and approve its system extension".to_string(),
+                "fuse-cow workdirs require macFUSE; install macFUSE and approve its system extension".to_string(),
             ));
         }
         run_macos_fuse_loader(loader, Duration::from_secs(5))?;
@@ -244,18 +244,18 @@ mod fuse_overlay {
             if metadata.file_type().is_symlink() {
                 return Err(Error::InvalidPath {
                     path: path.to_string_lossy().to_string(),
-                    reason: "overlay-cow mountpoint cannot be a symlink".to_string(),
+                    reason: "fuse-cow mountpoint cannot be a symlink".to_string(),
                 });
             }
             if !metadata.is_dir() {
                 return Err(Error::InvalidPath {
                     path: path.to_string_lossy().to_string(),
-                    reason: "overlay-cow mountpoint must be a directory".to_string(),
+                    reason: "fuse-cow mountpoint must be a directory".to_string(),
                 });
             }
             if fs::read_dir(path)?.next().transpose()?.is_some() && custom_workdir {
                 return Err(Error::InvalidInput(format!(
-                    "custom overlay-cow workdir `{}` must be empty",
+                    "custom fuse-cow workdir `{}` must be empty",
                     path.display()
                 )));
             }
@@ -786,7 +786,7 @@ mod fuse_overlay {
             db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                 "fuse-conformance",
                 Some("main"),
-                LaneWorkdirMode::OverlayCow,
+                LaneWorkdirMode::FuseCow,
                 None,
                 None,
                 None,
@@ -795,7 +795,7 @@ mod fuse_overlay {
             )
             .unwrap();
             let mount = db
-                .mount_overlay_cow_workdir_for_lane("fuse-conformance")
+                .mount_fuse_cow_workdir_for_lane("fuse-conformance")
                 .unwrap();
             let workdir = PathBuf::from(
                 db.lane_workdir("fuse-conformance")
@@ -873,7 +873,7 @@ mod fuse_overlay {
                 db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                     lane,
                     Some("main"),
-                    LaneWorkdirMode::OverlayCow,
+                    LaneWorkdirMode::FuseCow,
                     None,
                     None,
                     None,
@@ -1006,7 +1006,7 @@ mod fuse_overlay {
                 db.spawn_lane_with_workdir_mode_paths_and_neighbors(
                     lane,
                     Some("main"),
-                    LaneWorkdirMode::OverlayCow,
+                    LaneWorkdirMode::FuseCow,
                     None,
                     None,
                     None,
@@ -1044,12 +1044,8 @@ mod fuse_overlay {
             assert_eq!(binding_count, 2);
 
             let mount_started = std::time::Instant::now();
-            let mount_a = db
-                .mount_overlay_cow_workdir_for_lane("node-fuse-a")
-                .unwrap();
-            let mount_b = db
-                .mount_overlay_cow_workdir_for_lane("node-fuse-b")
-                .unwrap();
+            let mount_a = db.mount_fuse_cow_workdir_for_lane("node-fuse-a").unwrap();
+            let mount_b = db.mount_fuse_cow_workdir_for_lane("node-fuse-b").unwrap();
             let mount_ms = mount_started.elapsed().as_millis();
             let workdir_a = PathBuf::from(db.lane_workdir("node-fuse-a").unwrap().workdir.unwrap());
             let workdir_b = PathBuf::from(db.lane_workdir("node-fuse-b").unwrap().workdir.unwrap());
@@ -1201,132 +1197,86 @@ mod fuse_overlay {
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macfuse")))]
 pub(crate) use fuse_overlay::*;
 
-#[cfg(target_os = "windows")]
-mod dokan_overlay;
-
-#[cfg(target_os = "windows")]
-pub(crate) use dokan_overlay::*;
-
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-pub(crate) struct OverlayCowMount {
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+pub(crate) struct FuseCowMount {
     #[allow(dead_code)]
     mountpoint: PathBuf,
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-impl OverlayCowMount {
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+impl FuseCowMount {
     #[allow(dead_code)]
     pub(crate) fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-impl Drop for OverlayCowMount {
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+impl Drop for FuseCowMount {
     fn drop(&mut self) {}
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-pub(crate) fn prepare_overlay_cow_workdir(
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+pub(crate) fn prepare_fuse_cow_workdir(
     _db: &Trail,
     _lane: &str,
     _dir: &Path,
     _custom_workdir: bool,
 ) -> Result<PathBuf> {
     Err(Error::InvalidInput(
-        "overlay-cow workdirs require Linux FUSE, a macOS build with --features macfuse, or Windows Dokan"
-            .to_string(),
+        "fuse-cow workdirs require Linux FUSE or a macOS build with --features macfuse".to_string(),
     ))
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-pub(crate) fn mount_overlay_cow_for_lane(_db: &Trail, lane: &str) -> Result<OverlayCowMount> {
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+pub(crate) fn mount_fuse_cow_for_lane(_db: &Trail, lane: &str) -> Result<FuseCowMount> {
     Err(Error::InvalidInput(format!(
-        "overlay-cow lane `{lane}` cannot be mounted on this platform"
+        "fuse-cow lane `{lane}` cannot be mounted on this platform"
     )))
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-pub(crate) fn mount_overlay_cow_for_lane_with_ephemeral_bindings(
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+pub(crate) fn mount_fuse_cow_for_lane_with_ephemeral_bindings(
     _db: &Trail,
     lane: &str,
     _source_upper: PathBuf,
     _source_root: ObjectId,
     _bindings: Vec<WorkspaceLayerBinding>,
-) -> Result<OverlayCowMount> {
+) -> Result<FuseCowMount> {
     Err(Error::InvalidInput(format!(
-        "overlay-cow lane `{lane}` cannot be mounted on this platform"
+        "fuse-cow lane `{lane}` cannot be mounted on this platform"
     )))
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    all(target_os = "macos", feature = "macfuse"),
-    target_os = "windows"
-)))]
-pub(crate) fn overlay_candidate_paths(_db: &Trail, lane: &str) -> Result<Vec<String>> {
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "macfuse"))))]
+pub(crate) fn fuse_candidate_paths(_db: &Trail, lane: &str) -> Result<Vec<String>> {
     Err(Error::InvalidInput(format!(
-        "overlay-cow lane `{lane}` cannot be inspected on this platform"
+        "fuse-cow lane `{lane}` cannot be inspected on this platform"
     )))
 }
 
 impl Trail {
-    pub(crate) fn overlay_clean_workdir_manifest_path_for_lane(
-        &self,
-        lane: &str,
-    ) -> Result<PathBuf> {
-        validate_ref_segment(lane)?;
-        Ok(self
-            .workspace_view_paths_for_lane_name(lane)
-            .meta_dir
-            .join("workdir-manifest.json"))
-    }
-
-    pub(crate) fn prepare_overlay_cow_lane_workdir(
+    pub(crate) fn prepare_fuse_cow_lane_workdir(
         &self,
         lane: &str,
         dir: &Path,
         custom_workdir: bool,
     ) -> Result<PathBuf> {
-        prepare_overlay_cow_workdir(self, lane, dir, custom_workdir)
+        prepare_fuse_cow_workdir(self, lane, dir, custom_workdir)
     }
 
-    pub fn mount_overlay_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
-        mount_overlay_cow_for_lane(self, lane)
+    pub fn mount_fuse_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
+        mount_fuse_cow_for_lane(self, lane)
     }
 
-    pub(crate) fn mount_overlay_cow_workdir_for_lane_with_ephemeral_bindings(
+    pub(crate) fn mount_fuse_cow_workdir_for_lane_with_ephemeral_bindings(
         &self,
         lane: &str,
         source_upper: PathBuf,
         source_root: ObjectId,
         bindings: Vec<WorkspaceLayerBinding>,
     ) -> Result<impl Drop> {
-        mount_overlay_cow_for_lane_with_ephemeral_bindings(
+        mount_fuse_cow_for_lane_with_ephemeral_bindings(
             self,
             lane,
             source_upper,
@@ -1335,19 +1285,19 @@ impl Trail {
         )
     }
 
-    pub(crate) fn overlay_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
-        overlay_candidate_paths(self, lane)
+    pub(crate) fn fuse_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {
+        fuse_candidate_paths(self, lane)
     }
 
-    pub(crate) fn maybe_mount_overlay_cow_workdir_for_lane(
+    pub(crate) fn maybe_mount_fuse_cow_workdir_for_lane(
         &self,
         lane: &str,
-    ) -> Result<Option<OverlayCowMount>> {
+    ) -> Result<Option<FuseCowMount>> {
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
         let record = self.lane_record(&branch.lane_id)?;
-        if self.lane_workdir_mode_for(&record, &branch)? == LaneWorkdirMode::OverlayCow {
-            Ok(Some(mount_overlay_cow_for_lane(self, lane)?))
+        if self.lane_workdir_mode_for(&record, &branch)? == LaneWorkdirMode::FuseCow {
+            Ok(Some(mount_fuse_cow_for_lane(self, lane)?))
         } else {
             Ok(None)
         }

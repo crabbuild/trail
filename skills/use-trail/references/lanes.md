@@ -17,8 +17,9 @@ Choose intentionally:
 - `virtual`: no filesystem workdir; use structured patches.
 - `sparse`: selected paths only; supply `--paths`.
 - `full-cow`: portable full materialization.
-- `overlay-cow`: runtime-mounted FUSE COW where supported.
+- `fuse-cow`: runtime-mounted FUSE COW where supported.
 - `nfs-cow`: macOS loopback NFS COW.
+- `dokan-cow`: Windows Dokan COW.
 
 For a narrow large-repository task:
 

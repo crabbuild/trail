@@ -67,7 +67,7 @@ workdir checkpoint when the provider exits.
 Choose a workdir mode when the default full materialization is unsuitable:
 
 ```sh
-trail agent start --provider codex --workdir-mode overlay-cow
+trail agent start --provider codex --workdir-mode fuse-cow
 trail agent start --provider codex --workdir-mode nfs-cow
 ```
 

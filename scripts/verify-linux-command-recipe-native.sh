@@ -50,13 +50,13 @@ write_spec() {
 new_lane_workspace() {
   local root="$1"
   "${trail}" --workspace "${root}" init --working-tree >/dev/null
-  "${trail}" --workspace "${root}" lane spawn recipe-a --from main --workdir-mode overlay-cow >/dev/null
+  "${trail}" --workspace "${root}" lane spawn recipe-a --from main --workdir-mode fuse-cow >/dev/null
 }
 
 success_root="$(mktemp -d)"
 write_spec "${success_root}" cp input.txt generated/copied.txt
 new_lane_workspace "${success_root}"
-"${trail}" --workspace "${success_root}" lane spawn recipe-b --from main --workdir-mode overlay-cow >/dev/null
+"${trail}" --workspace "${success_root}" lane spawn recipe-b --from main --workdir-mode fuse-cow >/dev/null
 plan="$("${trail}" --workspace "${success_root}" --json env plan recipe-a --adapter command)"
 grep -q "linux-landlock-seccomp" <<<"${plan}"
 first="$("${trail}" --workspace "${success_root}" --json env sync recipe-a --adapter command)"
@@ -97,7 +97,7 @@ write_spec "${multi_root}" touch generated/a.txt generated-b/b.txt
   printf "%s\n" "portability = \"host\""
 } >>"${multi_root}/trail.environment.toml"
 new_lane_workspace "${multi_root}"
-"${trail}" --workspace "${multi_root}" lane spawn recipe-b --from main --workdir-mode overlay-cow >/dev/null
+"${trail}" --workspace "${multi_root}" lane spawn recipe-b --from main --workdir-mode fuse-cow >/dev/null
 multi_plan="$("${trail}" --workspace "${multi_root}" --json env plan recipe-a --adapter command)"
 test "$(grep -c '"output_path"' <<<"${multi_plan}")" -ge 3
 multi_first="$("${trail}" --workspace "${multi_root}" --json env sync-all recipe-a)"

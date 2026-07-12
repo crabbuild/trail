@@ -456,8 +456,8 @@ pub(crate) fn render_lane_workdir(
             ("Path".to_string(), workdir.clone()),
             ("Mode".to_string(), report.workdir_mode.as_str().to_string()),
             (
-                "Overlay available".to_string(),
-                report.overlay_available.to_string(),
+                "Transparent COW available".to_string(),
+                report.transparent_cow_available.to_string(),
             ),
         ])),
         options,
