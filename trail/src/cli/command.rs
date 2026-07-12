@@ -47,8 +47,10 @@ struct Cli {
     verbose: bool,
     #[arg(long, global = true)]
     trace: bool,
-    #[arg(long, global = true)]
-    no_color: bool,
+    #[arg(long, global = true, value_enum, default_value_t = ColorArg::Auto)]
+    color: ColorArg,
+    #[arg(long, global = true, value_enum, default_value_t = PagerArg::Auto)]
+    pager: PagerArg,
     #[arg(long, global = true)]
     format: Option<OutputFormat>,
     #[arg(long, global = true, value_name = "URL")]
@@ -59,11 +61,46 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Clone, Debug, clap::ValueEnum)]
-enum OutputFormat {
+#[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
     Human,
+    Plain,
     Json,
     Ndjson,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum ColorArg {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorArg {
+    fn as_policy(&self) -> render::ColorPolicy {
+        match self {
+            Self::Auto => render::ColorPolicy::Auto,
+            Self::Always => render::ColorPolicy::Always,
+            Self::Never => render::ColorPolicy::Never,
+        }
+    }
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum PagerArg {
+    Auto,
+    Always,
+    Never,
+}
+
+impl PagerArg {
+    fn as_policy(&self) -> render::PagerPolicy {
+        match self {
+            Self::Auto => render::PagerPolicy::Auto,
+            Self::Always => render::PagerPolicy::Always,
+            Self::Never => render::PagerPolicy::Never,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -353,5 +390,30 @@ mod tests {
             assert_eq!(actual, expected);
             assert_eq!(lane, "lane-a");
         }
+    }
+
+    #[test]
+    fn parses_terminal_rendering_options_and_diff_projections() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "--format",
+            "plain",
+            "--color",
+            "never",
+            "--pager",
+            "always",
+            "diff",
+            "--dirty",
+            "--name-status",
+        ])
+        .expect("terminal rendering options should parse");
+        assert!(matches!(cli.format, Some(OutputFormat::Plain)));
+        assert!(matches!(cli.color, ColorArg::Never));
+        assert!(matches!(cli.pager, PagerArg::Always));
+        let Command::Diff(args) = cli.command else {
+            panic!("expected diff command");
+        };
+        assert!(args.name_status);
+        assert!(!args.name_only);
     }
 }

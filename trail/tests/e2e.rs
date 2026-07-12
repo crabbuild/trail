@@ -1291,7 +1291,59 @@ fn cli_env_defaults_select_workspace_db_branch_and_format() {
         .unwrap();
     assert!(!invalid_format.status.success());
     assert!(String::from_utf8_lossy(&invalid_format.stderr)
-        .contains("TRAIL_FORMAT must be human, json, or ndjson"));
+        .contains("TRAIL_FORMAT must be human, plain, json, or ndjson"));
+}
+
+#[test]
+fn ndjson_rejects_single_report_commands_with_a_structured_diagnostic() {
+    let output = Command::new(trail_bin())
+        .args(["--format", "ndjson", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "INVALID_INPUT");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("streaming watch commands"));
+}
+
+#[test]
+fn plain_redirected_and_quiet_output_follow_terminal_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let plain = Command::new(trail_bin())
+        .args([
+            "--workspace",
+            temp.path().to_str().unwrap(),
+            "--format",
+            "plain",
+            "--color",
+            "always",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+    let plain_stdout = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain_stdout.contains("Worktree clean"));
+    assert!(!plain_stdout.contains("\u{1b}["));
+
+    let quiet = Command::new(trail_bin())
+        .args([
+            "--workspace",
+            temp.path().to_str().unwrap(),
+            "--quiet",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(quiet.status.success());
+    assert!(quiet.stdout.is_empty());
+    assert!(quiet.stderr.is_empty());
 }
 
 #[test]

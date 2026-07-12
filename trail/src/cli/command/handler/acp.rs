@@ -16,7 +16,7 @@ pub(super) fn handle_acp_command(ctx: &RuntimeContext, acp: AcpCommand) -> Resul
 pub(super) fn handle_transcript_command(ctx: &RuntimeContext, args: TranscriptArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.transcript(&args.selector)?;
-    render_transcript(&report, ctx.json, ctx.quiet)
+    render_transcript(&report, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_top_turn_command(ctx: &RuntimeContext, turn: TopTurnCommand) -> Result<()> {
@@ -24,7 +24,7 @@ pub(super) fn handle_top_turn_command(ctx: &RuntimeContext, turn: TopTurnCommand
         TopTurnSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let details = db.show_lane_turn(&args.turn_id)?;
-            render_lane_turn_details(&details, ctx.json, ctx.quiet)
+            render_lane_turn_details(&details, ctx.json, &ctx.render)
         }
     }
 }
@@ -37,20 +37,20 @@ fn handle_acp_install(ctx: &RuntimeContext, args: AcpInstallArgs) -> Result<()> 
         args.dry_run,
         db.as_ref().map(|db| db.db_dir()),
     )?;
-    render_acp_install(&report, ctx.json, ctx.quiet, args.print_only)
+    render_acp_install(&report, ctx.json, &ctx.render, args.print_only)
 }
 
 fn handle_acp_list(ctx: &RuntimeContext) -> Result<()> {
     let db = open_db(ctx).ok();
     let profiles =
         trail::acp::acp_provider_profiles_with_registry(db.as_ref().map(|db| db.db_dir()))?;
-    render_acp_profiles(&profiles, ctx.json, ctx.quiet)
+    render_acp_profiles(&profiles, ctx.json, &ctx.render)
 }
 
 fn handle_acp_sessions(ctx: &RuntimeContext, args: AcpSessionsArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.list_lane_acp_sessions(args.lane.as_deref())?;
-    render_acp_sessions(&report, ctx.json, ctx.quiet)
+    render_acp_sessions(&report, ctx.json, &ctx.render)
 }
 
 fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
@@ -170,7 +170,7 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
         checks,
         warnings,
     };
-    render_acp_doctor(&report, ctx.json, ctx.quiet)
+    render_acp_doctor(&report, ctx.json, &ctx.render)
 }
 
 fn handle_acp_relay(ctx: &RuntimeContext, args: AcpRelayArgs) -> Result<()> {

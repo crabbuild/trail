@@ -73,6 +73,7 @@ These docs are written from the current Rust code, CLI definitions, exported mod
 
 - [Trail Agent CLI reference](agent/cli-reference.md)
 - [CLI global options and environment](reference/cli/global-options-and-env.md)
+- [Terminal output contract](CLI_TERMINAL_OUTPUT.md)
 - [CLI command reference](reference/cli/workspace-and-config.md)
 - [Configuration keys](reference/config.md)
 - [Patch format](reference/patch-format.md)

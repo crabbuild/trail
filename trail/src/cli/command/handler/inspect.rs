@@ -9,13 +9,13 @@ pub(super) fn handle_timeline_command(ctx: &RuntimeContext, args: TimelineArgs) 
         args.lane.as_deref(),
         args.limit,
     )?;
-    render_timeline(&entries, ctx.json, ctx.quiet)
+    render_timeline(&entries, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_show_command(ctx: &RuntimeContext, args: ShowArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let result = db.show(&args.selector)?;
-    render_show(&result, ctx.json, ctx.quiet)
+    render_show(&result, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_object_command(ctx: &RuntimeContext, object: ObjectCommand) -> Result<()> {
@@ -23,7 +23,7 @@ pub(super) fn handle_object_command(ctx: &RuntimeContext, object: ObjectCommand)
         ObjectSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let report = db.inspect_object(&args.object_id)?;
-            render_object_inspect(&report, ctx.json, ctx.quiet)
+            render_object_inspect(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -33,7 +33,7 @@ pub(super) fn handle_root_command(ctx: &RuntimeContext, root: RootCommand) -> Re
         RootSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let report = db.inspect_root(&args.root_id)?;
-            render_root_inspect(&report, ctx.json, ctx.quiet)
+            render_root_inspect(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -43,7 +43,7 @@ pub(super) fn handle_text_command(ctx: &RuntimeContext, text: TextCommand) -> Re
         TextSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let report = db.inspect_text(&args.text_id, args.limit)?;
-            render_text_inspect(&report, ctx.json, ctx.quiet)
+            render_text_inspect(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -59,7 +59,7 @@ pub(super) fn handle_map_command(ctx: &RuntimeContext, map: MapCommand) -> Resul
                 args.end.as_deref(),
                 args.limit,
             )?;
-            render_map_range(&report, ctx.json, ctx.quiet)
+            render_map_range(&report, ctx.json, &ctx.render)
         }
         MapSubcommand::Diff(args) => {
             let db = open_db(ctx)?;
@@ -71,7 +71,7 @@ pub(super) fn handle_map_command(ctx: &RuntimeContext, map: MapCommand) -> Resul
                 args.end.as_deref(),
                 args.limit,
             )?;
-            render_map_diff(&report, ctx.json, ctx.quiet)
+            render_map_diff(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -93,7 +93,7 @@ pub(super) fn handle_why_command(ctx: &RuntimeContext, args: WhyArgs) -> Result<
             ));
         }
     };
-    render_why(&result, ctx.json, ctx.quiet)
+    render_why(&result, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_history_command(ctx: &RuntimeContext, args: HistoryArgs) -> Result<()> {
@@ -117,11 +117,11 @@ pub(super) fn handle_history_command(ctx: &RuntimeContext, args: HistoryArgs) ->
             ));
         }
     };
-    render_history(&result, ctx.json, ctx.quiet)
+    render_history(&result, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_code_from_command(ctx: &RuntimeContext, args: CodeFromArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let result = db.code_from(&args.selector)?;
-    render_code_from(&result, ctx.json, ctx.quiet)
+    render_code_from(&result, ctx.json, &ctx.render)
 }

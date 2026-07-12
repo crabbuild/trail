@@ -5,17 +5,17 @@ pub(super) fn handle_config_command(ctx: &RuntimeContext, config: ConfigCommand)
         ConfigSubcommand::List => {
             let db = open_db(ctx)?;
             let entries = db.config_entries();
-            render_config_list(&entries, ctx.json, ctx.quiet)
+            render_config_list(&entries, ctx.json, &ctx.render)
         }
         ConfigSubcommand::Get(args) => {
             let db = open_db(ctx)?;
             let entry = db.config_get(&args.key)?;
-            render_config_entry(&entry, ctx.json, ctx.quiet)
+            render_config_entry(&entry, ctx.json, &ctx.render)
         }
         ConfigSubcommand::Set(args) => {
             let mut db = open_db(ctx)?;
             let report = db.config_set(&args.key, &args.value)?;
-            render_config_set(&report, ctx.json, ctx.quiet)
+            render_config_set(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -25,22 +25,22 @@ pub(super) fn handle_ignore_command(ctx: &RuntimeContext, ignore: IgnoreCommand)
         IgnoreSubcommand::List => {
             let db = open_db(ctx)?;
             let report = db.ignore_list()?;
-            render_ignore_list(&report, ctx.json, ctx.quiet)
+            render_ignore_list(&report, ctx.json, &ctx.render)
         }
         IgnoreSubcommand::Add(args) => {
             let mut db = open_db(ctx)?;
             let report = db.ignore_add(&args.pattern)?;
-            render_ignore_add(&report, ctx.json, ctx.quiet)
+            render_ignore_add(&report, ctx.json, &ctx.render)
         }
         IgnoreSubcommand::Remove(args) => {
             let mut db = open_db(ctx)?;
             let report = db.ignore_remove(&args.pattern)?;
-            render_ignore_remove(&report, ctx.json, ctx.quiet)
+            render_ignore_remove(&report, ctx.json, &ctx.render)
         }
         IgnoreSubcommand::Check(args) => {
             let db = open_db(ctx)?;
             let report = db.ignore_check(&args.path)?;
-            render_ignore_check(&report, ctx.json, ctx.quiet)
+            render_ignore_check(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -60,7 +60,7 @@ pub(super) fn handle_guardrails_command(
                 payload,
                 &args.paths,
             )?;
-            render_guardrail_check(&report, ctx.json, ctx.quiet)
+            render_guardrail_check(&report, ctx.json, &ctx.render)
         }
     }
 }

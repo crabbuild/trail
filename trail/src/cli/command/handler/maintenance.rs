@@ -20,30 +20,31 @@ pub(super) fn handle_git_command(ctx: &RuntimeContext, git: GitCommand) -> Resul
                 }
                 let mut db = open_db(ctx)?;
                 let report = db.git_export_commit(&args.range, &message)?;
-                render_git_export(&report, ctx.json, ctx.quiet)
+                render_git_export(&report, ctx.json, &ctx.render)
             } else if let Some(output) = args.output {
                 let db = open_db(ctx)?;
                 db.write_patch_to(&args.range, &output)?;
-                if !ctx.quiet {
-                    println!("Wrote patch: {}", output.display());
-                }
-                Ok(())
+                render_document(
+                    &TerminalDocument::new("Patch written", UiTone::Success).block(
+                        UiBlock::Metadata(vec![("Path".to_string(), output.display().to_string())]),
+                    ),
+                    &ctx.render,
+                )
             } else {
                 let db = open_db(ctx)?;
                 let patch = db.export_patch(&args.range)?;
-                print!("{patch}");
-                Ok(())
+                render_raw_content(&patch, &ctx.render)
             }
         }
         GitSubcommand::ImportUpdate(args) => {
             let mut db = open_db(ctx)?;
             let report = db.git_import_update(ctx.branch.as_deref(), args.message)?;
-            render_git_import_update(&report, ctx.json, ctx.quiet)
+            render_git_import_update(&report, ctx.json, &ctx.render)
         }
         GitSubcommand::Mappings(args) => {
             let db = open_db(ctx)?;
             let mappings = db.git_mappings(args.limit)?;
-            render_git_mappings(&mappings, ctx.json, ctx.quiet)
+            render_git_mappings(&mappings, ctx.json, &ctx.render)
         }
     }
 }
@@ -56,7 +57,21 @@ pub(super) fn handle_api_command(_ctx: &RuntimeContext, api: ApiCommand) -> Resu
             if let Some(output) = args.output {
                 fs::write(output, json)?;
             } else {
-                println!("{json}");
+                render_raw_content(
+                    &format!("{json}\n"),
+                    &RenderOptions {
+                        mode: RenderMode::Plain,
+                        color: false,
+                        glyphs: GlyphSet::Ascii,
+                        width: 80,
+                        height: 24,
+                        stdout_is_terminal: false,
+                        stderr_is_terminal: false,
+                        verbose: false,
+                        quiet: false,
+                        pager: PagerPolicy::Never,
+                    },
+                )?;
             }
             Ok(())
         }
@@ -85,34 +100,70 @@ pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> R
     )?;
     let endpoint_writer = endpoint_registration.writer();
     let quiet = ctx.quiet;
+    let error_options = ctx.render.clone();
     thread::spawn(move || {
         if let Err(err) = cache_warmup
             .run()
             .and_then(|_| endpoint_writer.write_if_alive())
         {
             if !quiet {
-                eprintln!("Trail daemon cache warmup failed: {err}");
+                let diagnostic = UiDiagnostic {
+                    code: err.code().to_string(),
+                    summary: "Trail daemon cache warmup failed".to_string(),
+                    cause: Some(err.to_string()),
+                    consequence: Some(
+                        "Requests may rebuild workspace cache entries before responding."
+                            .to_string(),
+                    ),
+                    recovery: None,
+                    alternatives: Vec::new(),
+                };
+                let _ = render_error_document(
+                    &TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic)),
+                    &error_options,
+                );
             }
         }
     });
-    if !ctx.quiet {
-        println!("Trail API listening on {daemon_url}");
-    }
     if args.no_auth {
-        eprintln!(
-            "WARNING: Trail daemon auth is disabled; any local process can mutate this workspace through {daemon_url}. Keep the listener on loopback and use this only for trusted local automation."
-        );
-    } else if !ctx.quiet {
+        let diagnostic = UiDiagnostic {
+            code: "DAEMON_AUTH_DISABLED".to_string(),
+            summary: "Daemon authentication is disabled".to_string(),
+            cause: Some(
+                "Any local process can mutate this workspace through the daemon.".to_string(),
+            ),
+            consequence: Some(
+                "Keep the listener on loopback and use this only for trusted local automation."
+                    .to_string(),
+            ),
+            recovery: None,
+            alternatives: Vec::new(),
+        };
+        render_error_document(
+            &TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic)),
+            &ctx.render,
+        )?;
+    }
+    let mut metadata = vec![("Endpoint".to_string(), daemon_url.clone())];
+    if !args.no_auth {
         if let Some(path) = token_file {
-            println!("Daemon token file: {}", path.display());
-            println!(
-                "Send requests with: Authorization: Bearer $(cat {})",
-                path.display()
-            );
+            metadata.push(("Token file".to_string(), path.display().to_string()));
+            metadata.push((
+                "Authorization".to_string(),
+                format!("Bearer token from {}", path.display()),
+            ));
         } else {
-            println!("Daemon token configured from flag or TRAIL_DAEMON_TOKEN");
+            metadata.push((
+                "Authorization".to_string(),
+                "token from --auth-token or TRAIL_DAEMON_TOKEN".to_string(),
+            ));
         }
     }
+    render_document(
+        &TerminalDocument::new("Trail API daemon listening", UiTone::Success)
+            .block(UiBlock::Metadata(metadata)),
+        &ctx.render,
+    )?;
     let max_requests = if args.once {
         Some(1)
     } else {
@@ -233,7 +284,7 @@ pub(super) fn handle_mcp_command(ctx: &RuntimeContext) -> Result<()> {
 pub(super) fn handle_doctor_command(ctx: &RuntimeContext) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.doctor()?;
-    render_doctor(&report, ctx.json, ctx.quiet)
+    render_doctor(&report, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_backup_command(ctx: &RuntimeContext, backup: BackupCommand) -> Result<()> {
@@ -241,11 +292,11 @@ pub(super) fn handle_backup_command(ctx: &RuntimeContext, backup: BackupCommand)
         BackupSubcommand::Create(args) => {
             let db = open_db(ctx)?;
             let report = db.create_backup(args.output, args.overwrite)?;
-            render_backup_create(&report, ctx.json, ctx.quiet)
+            render_backup_create(&report, ctx.json, &ctx.render)
         }
         BackupSubcommand::Verify(args) => {
             let report = Trail::verify_backup(args.path)?;
-            render_backup_verify(&report, ctx.json, ctx.quiet)
+            render_backup_verify(&report, ctx.json, &ctx.render)
         }
         BackupSubcommand::Restore(args) => {
             let workspace = ctx
@@ -253,7 +304,7 @@ pub(super) fn handle_backup_command(ctx: &RuntimeContext, backup: BackupCommand)
                 .clone()
                 .unwrap_or(std::env::current_dir().map_err(Error::from)?);
             let report = Trail::restore_backup(workspace, args.path, args.force)?;
-            render_backup_restore(&report, ctx.json, ctx.quiet)
+            render_backup_restore(&report, ctx.json, &ctx.render)
         }
     }
 }
@@ -261,7 +312,7 @@ pub(super) fn handle_backup_command(ctx: &RuntimeContext, backup: BackupCommand)
 pub(super) fn handle_fsck_command(ctx: &RuntimeContext) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.fsck()?;
-    render_fsck(&report, ctx.json, ctx.quiet)
+    render_fsck(&report, ctx.json, &ctx.render)
 }
 
 pub(super) fn handle_index_command(ctx: &RuntimeContext, index: IndexCommand) -> Result<()> {
@@ -273,7 +324,7 @@ pub(super) fn handle_index_command(ctx: &RuntimeContext, index: IndexCommand) ->
             } else {
                 db.rebuild_indexes()?
             };
-            render_index_rebuild(&report, ctx.json, ctx.quiet)
+            render_index_rebuild(&report, ctx.json, &ctx.render)
         }
         IndexSubcommand::Watch(args) => {
             if args.interval_ms == 0 {
@@ -288,9 +339,9 @@ pub(super) fn handle_index_command(ctx: &RuntimeContext, index: IndexCommand) ->
                 let report = db.refresh_worktree_index()?;
                 iterations += 1;
                 if matches!(ctx.format, OutputFormat::Ndjson) {
-                    println!("{}", serde_json::to_string(&report)?);
+                    render_ndjson(&report)?;
                 } else {
-                    render_worktree_index(&report, ctx.json, ctx.quiet)?;
+                    render_worktree_index(&report, ctx.json, &ctx.render)?;
                 }
                 if args.once || args.iterations.is_some_and(|max| iterations >= max) {
                     break;
@@ -305,7 +356,7 @@ pub(super) fn handle_index_command(ctx: &RuntimeContext, index: IndexCommand) ->
 pub(super) fn handle_gc_command(ctx: &RuntimeContext, args: GcArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.gc(args.dry_run)?;
-    render_gc(&report, ctx.json, ctx.quiet)
+    render_gc(&report, ctx.json, &ctx.render)
 }
 
 fn daemon_auth(

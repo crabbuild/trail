@@ -27,67 +27,67 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 &args.paths,
                 args.include_neighbors,
             )?;
-            render_lane_spawn(&report, ctx.json, ctx.quiet)
+            render_lane_spawn(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::List => {
             let db = open_db(ctx)?;
             let lanes = db.list_lanes()?;
-            render_lane_list(&lanes, ctx.json, ctx.quiet)
+            render_lane_list(&lanes, ctx.json, &ctx.render)
         }
         LaneSubcommand::Show(args) => {
             let db = open_db(ctx)?;
             let details = db.lane_details(&args.name)?;
-            render_lane_details(&details, ctx.json, ctx.quiet)
+            render_lane_details(&details, ctx.json, &ctx.render)
         }
         LaneSubcommand::Status(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_status(&args.name)?;
-            render_lane_status(&report, ctx.json, ctx.quiet)
+            render_lane_status(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Review(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_review_packet(&args.name, args.limit)?;
-            render_lane_review_packet(&report, ctx.json, ctx.quiet)
+            render_lane_review_packet(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Contribution(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_contribution(&args.name, args.limit)?;
-            render_lane_contribution(&report, ctx.json, ctx.quiet)
+            render_lane_contribution(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Gates(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_gate_history(&args.name, args.kind.as_deref(), args.limit)?;
-            render_lane_gate_history(&report, ctx.json, ctx.quiet)
+            render_lane_gate_history(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Readiness(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_readiness(&args.name)?;
-            render_lane_readiness(&report, ctx.json, ctx.quiet)
+            render_lane_readiness(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::RefreshPreview(args) => {
             let db = open_db(ctx)?;
             let report = db.preview_lane_refresh(&args.name, &args.target)?;
-            render_lane_refresh_preview(&report, ctx.json, ctx.quiet)
+            render_lane_refresh_preview(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Update(args) => {
             let mut db = open_db(ctx)?;
             let report = db.update_layered_lane_from(&args.name, &args.source, args.checkpoint)?;
-            render_merge(&report, ctx.json, ctx.quiet)
+            render_merge(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Handoff(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_handoff(&args.name, args.limit)?;
-            render_lane_handoff(&report, ctx.json, ctx.quiet)
+            render_lane_handoff(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Claim(args) => {
             let mut db = open_db(ctx)?;
             let report = db.claim_lane_path(&args.name, &args.path, args.ttl_secs)?;
-            render_lane_claim(&report, ctx.json, ctx.quiet)
+            render_lane_claim(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Message(args) => {
             let mut db = open_db(ctx)?;
             let report = db.add_lane_message(&args.name, &args.role, &args.text, args.session)?;
-            render_lane_message(&report, ctx.json, ctx.quiet)
+            render_lane_message(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Turn(turn) => turns::handle_turn_command(ctx, turn),
         LaneSubcommand::Run(run) => runs::handle_run_command(ctx, run),
@@ -100,56 +100,44 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.event_type.as_deref(),
                 args.limit,
             )?;
-            render_lane_events(&events, ctx.json, ctx.quiet)
+            render_lane_events(&events, ctx.json, &ctx.render)
         }
         LaneSubcommand::Trace(trace) => traces::handle_trace_command(ctx, trace),
         LaneSubcommand::Record(args) => {
             let mut db = open_db(ctx)?;
             if args.preview {
                 let report = db.preview_lane_workdir_record(&args.name)?;
-                render_lane_record_preview(&report, ctx.json, ctx.quiet)
+                render_lane_record_preview(&report, ctx.json, &ctx.render)
             } else {
                 let report = db.record_lane_workdir(&args.name, args.message)?;
-                render_lane_record(&report, ctx.json, ctx.quiet)
+                render_lane_record(&report, ctx.json, &ctx.render)
             }
         }
         LaneSubcommand::Checkpoint(args) => {
             let mut db = open_db(ctx)?;
             let report = db.checkpoint_lane_workspace(&args.name, args.message)?;
-            render_workspace_checkpoint(&report, ctx.json, ctx.quiet)
+            render_workspace_checkpoint(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Space(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_workspace_space(&args.name)?;
-            render_workspace_space(&report, ctx.json, ctx.quiet)
+            render_workspace_space(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Exec(args) => {
             let db = open_db(ctx)?;
             let report = db.exec_lane_workspace(&args.name, &args.command)?;
-            render_workspace_exec(&report, ctx.json, ctx.quiet)
+            render_workspace_exec(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Mount(args) => {
             let db = open_db(ctx)?;
             let _foreground = args.foreground;
-            if !ctx.json && !ctx.quiet {
-                let view = db.lane_workspace_view(&args.name)?.ok_or_else(|| {
-                    Error::InvalidInput(format!(
-                        "lane `{}` does not have a layered workspace view",
-                        args.name
-                    ))
-                })?;
-                println!(
-                    "Mounting workspace view {} at {}; run `trail lane unmount {}` to stop it",
-                    view.view_id, view.mountpoint, args.name
-                );
-            }
             let report = db.mount_lane_workspace_until_requested(&args.name)?;
-            render_workspace_mount(&report, "unmounted", ctx.json, ctx.quiet)
+            render_workspace_mount(&report, "mounted", ctx.json, &ctx.render)
         }
         LaneSubcommand::Unmount(args) => {
             let db = open_db(ctx)?;
             let report = db.request_lane_workspace_unmount(&args.name)?;
-            render_workspace_mount(&report, "unmounted", ctx.json, ctx.quiet)
+            render_workspace_mount(&report, "unmounted", ctx.json, &ctx.render)
         }
         LaneSubcommand::Rewind(args) => {
             let mut db = open_db(ctx)?;
@@ -159,7 +147,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.record_current,
                 args.sync_workdir,
             )?;
-            render_lane_rewind(&report, ctx.json, ctx.quiet)
+            render_lane_rewind(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Watch(args) => work::handle_watch_command(ctx, args),
         LaneSubcommand::Test(args) => {
@@ -184,7 +172,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.force,
                 args.include_neighbors,
             )?;
-            render_lane_file_read(&report, ctx.json, ctx.quiet)
+            render_lane_file_read(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Hydrate(args) => {
             let mut db = open_db(ctx)?;
@@ -194,12 +182,12 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 &args.paths,
                 args.include_neighbors,
             )?;
-            render_lane_workdir_sync(&report, ctx.json, ctx.quiet)
+            render_lane_workdir_sync(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Workdir(args) => {
             let db = open_db(ctx)?;
             let report = db.lane_workdir(&args.name)?;
-            render_lane_workdir(&report, ctx.json, ctx.quiet)
+            render_lane_workdir(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::SyncWorkdir(args) => {
             let mut db = open_db(ctx)?;
@@ -209,7 +197,7 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 &args.paths,
                 args.include_neighbors,
             )?;
-            render_lane_workdir_sync(&report, ctx.json, ctx.quiet)
+            render_lane_workdir_sync(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::ApplyPatch(args) => {
             let mut db = open_db(ctx)?;
@@ -222,25 +210,34 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 patch.allow_stale = true;
             }
             let report = db.apply_lane_patch(&args.name, patch)?;
-            render_lane_patch(&report, ctx.json, ctx.quiet)
+            render_lane_patch(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Diff(args) => {
             let db = open_db(ctx)?;
+            validate_diff_view(
+                args.patch,
+                args.stat,
+                args.show_line_ids,
+                args.name_only,
+                args.name_status,
+            )?;
             let summary = db.diff_lane_with_options(&args.name, args.patch, args.show_line_ids)?;
             let title = format!("Lane diff: {}", args.name);
             render_diff_with_title(
                 &summary,
                 ctx.json,
-                ctx.quiet,
+                &ctx.render,
+                args.patch,
                 args.stat,
-                ctx.color,
+                args.name_only,
+                args.name_status,
                 Some(&title),
             )
         }
         LaneSubcommand::Timeline(args) => {
             let db = open_db(ctx)?;
             let entries = db.lane_timeline(&args.name, args.limit)?;
-            render_timeline(&entries, ctx.json, ctx.quiet)
+            render_timeline(&entries, ctx.json, &ctx.render)
         }
         LaneSubcommand::Checkout(args) => {
             let mut db = open_db(ctx)?;
@@ -250,12 +247,12 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 args.dry_run,
                 args.workdir.as_deref(),
             )?;
-            render_checkout(&report, ctx.json, ctx.quiet)
+            render_checkout(&report, ctx.json, &ctx.render)
         }
         LaneSubcommand::Rm(args) => {
             let mut db = open_db(ctx)?;
             let report = db.remove_lane(&args.name, args.force)?;
-            render_lane_remove(&report, ctx.json, ctx.quiet)
+            render_lane_remove(&report, ctx.json, &ctx.render)
         }
     }
 }

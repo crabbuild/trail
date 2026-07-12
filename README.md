@@ -54,6 +54,30 @@ provenance, and lane-coordination layer.
 Use Git for durable shared source-control history. Use Trail for the messy,
 high-frequency, local work that happens before a commit is ready.
 
+## Terminal output and automation
+
+Trail's default terminal output is designed for people: it leads with the
+outcome, shows changed paths/checks in responsive layouts, and ends with the
+safest next action when one exists. It deliberately is not a parsing API.
+
+```sh
+# Adaptive interactive output (the default).
+trail status
+trail diff --dirty --patch
+
+# Deterministic log-friendly text.
+trail --format plain lane readiness fix-login
+
+# Stable automation contracts.
+trail --format json status
+trail --format ndjson index watch --once
+```
+
+Use `--color auto|always|never` and `--pager auto|always|never` to control
+terminal behavior. The former `--no-color` option is intentionally removed;
+use `--color never`. See [the terminal output contract](docs/CLI_TERMINAL_OUTPUT.md)
+for the complete behavior matrix and the explicitly raw content modes.
+
 | Need | Git | Trail |
 | --- | --- | --- |
 | Shared project history | Excellent: commits, branches, remotes, tags, PR workflows | Complements Git and can import/export mappings |

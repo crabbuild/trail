@@ -1,4 +1,4 @@
-use super::render_json;
+use super::*;
 
 use trail::model::*;
 use trail::Result;
@@ -6,141 +6,240 @@ use trail::Result;
 pub(crate) fn render_acp_profiles(
     profiles: &[AcpProviderProfile],
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(profiles);
     }
-    if !quiet {
-        for profile in profiles {
-            let status = if profile.available {
-                "available"
-            } else {
-                "missing"
-            };
-            println!("{} ({status})", profile.agent);
-            println!(
-                "  capabilities: acp={} mcp={} terminal={}",
-                profile.supports_acp, profile.supports_mcp, profile.supports_terminal
-            );
-            println!("  {}", shell_join(&profile.relay_command));
-            for note in &profile.notes {
-                println!("  note: {note}");
-            }
-        }
+    if profiles.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No ACP providers", UiTone::Neutral),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("{} ACP provider(s)", profiles.len()),
+            UiTone::Neutral,
+        )
+        .block(UiBlock::Table(UiTable::new(
+            vec![
+                UiColumn::left("PROVIDER", 0, 10),
+                UiColumn::left("STATUS", 0, 9),
+                UiColumn::left("ACP", 1, 4),
+                UiColumn::left("MCP", 1, 4),
+                UiColumn::left("TERMINAL", 1, 8),
+                UiColumn::left("RELAY", 0, 18),
+            ],
+            profiles
+                .iter()
+                .map(|profile| {
+                    vec![
+                        profile.agent.clone(),
+                        if profile.available {
+                            "available"
+                        } else {
+                            "missing"
+                        }
+                        .to_string(),
+                        profile.supports_acp.to_string(),
+                        profile.supports_mcp.to_string(),
+                        profile.supports_terminal.to_string(),
+                        shell_join(&profile.relay_command),
+                    ]
+                })
+                .collect(),
+        ))),
+        options,
+    )
 }
 
 pub(crate) fn render_acp_install(
     report: &AcpInstallReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
     print_only: bool,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        if print_only {
-            println!("{}", report.snippet);
-            return Ok(());
-        }
-        let detected = if report.detected { "yes" } else { "no" };
-        println!("ACP install plan: {}", report.agent);
-        println!("Editor: {}", report.editor);
-        println!("Detected: {detected}");
-        println!("Relay command:");
-        println!("  {}", shell_join(&report.relay_command));
-        if !report.warnings.is_empty() {
-            println!("Warnings:");
-            for warning in &report.warnings {
-                println!("  {warning}");
-            }
-        }
-        println!("Snippet:");
-        println!("{}", report.snippet);
+    if print_only {
+        return render_document(
+            &TerminalDocument::empty().block(UiBlock::Patch {
+                title: "ACP snippet".to_string(),
+                text: report.snippet.clone(),
+            }),
+            options,
+        );
     }
-    Ok(())
+    let mut document = TerminalDocument::new(
+        format!("ACP install plan for {}", report.agent),
+        if report.dry_run {
+            UiTone::Attention
+        } else {
+            UiTone::Success
+        },
+    )
+    .block(UiBlock::Metadata(vec![
+        ("Editor".to_string(), report.editor.clone()),
+        ("Detected".to_string(), report.detected.to_string()),
+        ("Relay".to_string(), shell_join(&report.relay_command)),
+    ]))
+    .block(UiBlock::Patch {
+        title: "Configuration snippet".to_string(),
+        text: report.snippet.clone(),
+    });
+    if !report.warnings.is_empty() {
+        document = document.block(UiBlock::Checklist(
+            report
+                .warnings
+                .iter()
+                .map(|warning| UiCheck::new(UiCheckState::Warn, "Install warning", warning))
+                .collect(),
+        ));
+    }
+    render_document(&document.pager_eligible(), options)
 }
 
-pub(crate) fn render_acp_doctor(report: &AcpDoctorReport, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_acp_doctor(
+    report: &AcpDoctorReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!("ACP doctor: {}", report.status);
-        for check in &report.checks {
-            println!("[{}] {}: {}", check.status, check.name, check.message);
-        }
-        for warning in &report.warnings {
-            println!("warning: {warning}");
-        }
-    }
-    Ok(())
+    let mut checks: Vec<_> = report
+        .checks
+        .iter()
+        .map(|check| UiCheck::new(acp_check_state(&check.status), &check.name, &check.message))
+        .collect();
+    checks.extend(
+        report
+            .warnings
+            .iter()
+            .map(|warning| UiCheck::new(UiCheckState::Warn, "Warning", warning)),
+    );
+    render_document(
+        &TerminalDocument::new(
+            format!("ACP diagnostics: {}", report.status),
+            if report.status == "ok" {
+                UiTone::Success
+            } else {
+                UiTone::Attention
+            },
+        )
+        .block(UiBlock::Checklist(checks)),
+        options,
+    )
 }
 
 pub(crate) fn render_acp_sessions(
     report: &AcpSessionListReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        if report.sessions.is_empty() {
-            println!("No ACP sessions");
-        }
-        for session in &report.sessions {
-            let provider = session.provider.as_deref().unwrap_or("-");
-            println!(
-                "{} {} {} {}",
-                session.acp_session_id, session.status, provider, session.trail_session_id
-            );
-        }
+    if report.sessions.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No ACP sessions", UiTone::Neutral),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("{} ACP session(s)", report.sessions.len()),
+            UiTone::Neutral,
+        )
+        .block(UiBlock::Table(UiTable::new(
+            vec![
+                UiColumn::left("STATUS", 0, 8),
+                UiColumn::left("PROVIDER", 1, 10),
+                UiColumn::left("TRAIL SESSION", 1, 12),
+                UiColumn::left("ACP SESSION", 0, 14),
+            ],
+            report
+                .sessions
+                .iter()
+                .map(|session| {
+                    vec![
+                        session.status.clone(),
+                        session.provider.clone().unwrap_or_else(|| "—".to_string()),
+                        session.trail_session_id.clone(),
+                        session.acp_session_id.clone(),
+                    ]
+                })
+                .collect(),
+        ))),
+        options,
+    )
 }
 
-pub(crate) fn render_transcript(report: &TranscriptReport, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_transcript(
+    report: &TranscriptReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!("Transcript: {}", report.selector);
-        println!("Lane: {}", report.lane_name);
-        println!(
-            "Session: {} ({})",
-            report.session.session_id, report.session.status
+    let mut document =
+        TerminalDocument::new(format!("Transcript: {}", report.lane_name), UiTone::Neutral).block(
+            UiBlock::Metadata(vec![
+                ("Session".to_string(), report.session.session_id.clone()),
+                ("Status".to_string(), report.session.status.clone()),
+                ("Turns".to_string(), report.turns.len().to_string()),
+            ]),
         );
-        if let Some(acp) = &report.acp_session {
-            println!("ACP session: {} ({})", acp.acp_session_id, acp.status);
+    for turn in &report.turns {
+        let mut blocks = vec![UiBlock::Metadata(vec![
+            ("Status".to_string(), turn.turn.status.clone()),
+            (
+                "Checkpoint".to_string(),
+                turn.checkpoint
+                    .as_ref()
+                    .map(|value| value.0.clone())
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+        ])];
+        if !turn.messages.is_empty() {
+            blocks.push(UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("ROLE", 0, 8),
+                    UiColumn::left("MESSAGE", 0, 28),
+                ],
+                turn.messages
+                    .iter()
+                    .map(|message| vec![message.role.clone(), preview(&message.body, 160)])
+                    .collect(),
+            )));
         }
-        for turn in &report.turns {
-            let checkpoint = turn
-                .checkpoint
-                .as_ref()
-                .map(|change| change.0.as_str())
-                .unwrap_or("-");
-            println!();
-            println!(
-                "Turn: {} {} checkpoint {}",
-                turn.turn.turn_id, turn.turn.status, checkpoint
-            );
-            for message in &turn.messages {
-                println!(
-                    "{}: {}",
-                    message.role,
-                    single_line_preview(&message.body, 160)
-                );
-            }
-            for tool in &turn.tool_summaries {
-                println!("tool: {tool}");
-            }
+        if !turn.tool_summaries.is_empty() {
+            blocks.push(UiBlock::Lines(
+                turn.tool_summaries
+                    .iter()
+                    .cloned()
+                    .map(|tool| (tool, UiTone::Muted))
+                    .collect(),
+            ));
         }
+        document = document.block(UiBlock::section(
+            format!("Turn {}", turn.turn.turn_id),
+            blocks,
+        ));
     }
-    Ok(())
+    render_document(&document.pager_eligible(), options)
+}
+
+fn acp_check_state(status: &str) -> UiCheckState {
+    match status.to_ascii_lowercase().as_str() {
+        "ok" | "pass" | "healthy" => UiCheckState::Pass,
+        "warn" | "warning" => UiCheckState::Warn,
+        "pending" => UiCheckState::Pending,
+        _ => UiCheckState::Fail,
+    }
 }
 
 fn shell_join(parts: &[String]) -> String {
@@ -158,12 +257,17 @@ fn shell_join(parts: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-
-fn single_line_preview(value: &str, limit: usize) -> String {
-    let mut preview = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if preview.len() > limit {
-        preview.truncate(limit.saturating_sub(3));
-        preview.push_str("...");
+fn preview(value: &str, limit: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= limit {
+        compact
+    } else {
+        format!(
+            "{}…",
+            compact
+                .chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
+        )
     }
-    preview
 }

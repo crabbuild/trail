@@ -1,79 +1,120 @@
 use super::render_json;
+use crate::cli::command::render::*;
 
 use trail::model::*;
 use trail::Result;
 
-pub(crate) fn render_lane_spawn(report: &LaneSpawnReport, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_lane_spawn(
+    report: &LaneSpawnReport,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!("Spawned {} at {}", report.lane_id, report.base_change.0);
-        println!("Workdir mode: {}", report.workdir_mode.as_str());
-        if let Some(cow_backend) = &report.cow_backend {
-            println!("COW backend: {cow_backend}");
-        }
-        if !report.sparse_paths.is_empty() {
-            println!("Sparse paths: {}", report.sparse_paths.join(", "));
-        }
-        if let Some(workdir) = &report.workdir {
-            println!("Workdir: {workdir}");
-        }
+    let mut document =
+        TerminalDocument::new(format!("Created lane {}", report.lane_id), UiTone::Success).block(
+            UiBlock::Metadata(vec![
+                ("Base".to_string(), report.base_change.0.clone()),
+                (
+                    "Workdir mode".to_string(),
+                    report.workdir_mode.as_str().to_string(),
+                ),
+            ]),
+        );
+    if let Some(workdir) = &report.workdir {
+        document = document.block(UiBlock::Notice(format!("Workdir: {workdir}")));
     }
-    Ok(())
+    if !report.sparse_paths.is_empty() {
+        document = document.block(UiBlock::Metadata(vec![(
+            "Sparse paths".to_string(),
+            report.sparse_paths.join(", "),
+        )]));
+    }
+    document = document.next(
+        format!("trail lane status {}", report.lane_id),
+        "inspect the lane before beginning work",
+    );
+    render_document(&document, options)
 }
 
-pub(crate) fn render_lane_list(entries: &[LaneDetails], json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_lane_list(
+    entries: &[LaneDetails],
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(&entries);
     }
-    if !quiet {
-        for entry in entries {
-            println!(
-                "{} {} {} {}",
-                entry.record.name,
-                entry.branch.status,
-                entry.branch.head_change.0,
-                entry.branch.ref_name
-            );
-        }
+    if entries.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No lanes", UiTone::Neutral).next(
+                "trail lane spawn <name>",
+                "create an isolated lane for new work",
+            ),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(format!("{} lane(s)", entries.len()), UiTone::Neutral).block(
+            UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("NAME", 0, 10),
+                    UiColumn::left("STATUS", 0, 8),
+                    UiColumn::left("REF", 1, 12),
+                    UiColumn::left("HEAD", 2, 10),
+                ],
+                entries
+                    .iter()
+                    .map(|entry| {
+                        vec![
+                            entry.record.name.clone(),
+                            entry.branch.status.clone(),
+                            entry.branch.ref_name.clone(),
+                            entry.branch.head_change.0.clone(),
+                        ]
+                    })
+                    .collect(),
+            )),
+        ),
+        options,
+    )
 }
 
-pub(crate) fn render_lane_details(details: &LaneDetails, json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_lane_details(
+    details: &LaneDetails,
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(details);
     }
-    if !quiet {
-        println!("Lane: {}", details.record.name);
-        println!("ID: {}", details.record.lane_id);
-        println!("Ref: {}", details.branch.ref_name);
-        println!("Status: {}", details.branch.status);
-        println!("Base: {}", details.branch.base_change.0);
-        println!("Head: {}", details.branch.head_change.0);
-        if let Some(provider) = &details.record.provider {
-            println!("Provider: {provider}");
-        }
-        if let Some(model) = &details.record.model {
-            println!("Model: {model}");
-        }
-        if let Some(session_id) = &details.branch.session_id {
-            println!("Session: {session_id}");
-        }
-        if let Some(workdir) = &details.branch.workdir {
-            println!("Workdir: {workdir}");
-        }
-        if let Some(metadata_json) = &details.record.metadata_json {
-            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_json) {
-                if let Some(mode) = metadata
-                    .get("workdir_mode")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    println!("Workdir mode: {mode}");
-                }
-            }
-        }
+    let mut metadata = vec![
+        ("ID".to_string(), details.record.lane_id.clone()),
+        ("Ref".to_string(), details.branch.ref_name.clone()),
+        ("Status".to_string(), details.branch.status.clone()),
+        ("Base".to_string(), details.branch.base_change.0.clone()),
+        ("Head".to_string(), details.branch.head_change.0.clone()),
+    ];
+    if let Some(provider) = &details.record.provider {
+        metadata.push(("Provider".to_string(), provider.clone()));
     }
-    Ok(())
+    if let Some(model) = &details.record.model {
+        metadata.push(("Model".to_string(), model.clone()));
+    }
+    if let Some(session_id) = &details.branch.session_id {
+        metadata.push(("Session".to_string(), session_id.clone()));
+    }
+    if let Some(workdir) = &details.branch.workdir {
+        metadata.push(("Workdir".to_string(), workdir.clone()));
+    }
+    render_document(
+        &TerminalDocument::new(format!("Lane {}", details.record.name), UiTone::Neutral)
+            .block(UiBlock::Metadata(metadata))
+            .next(
+                format!("trail lane status {}", details.record.name),
+                "inspect lane state and merge readiness",
+            ),
+        options,
+    )
 }

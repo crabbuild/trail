@@ -269,9 +269,12 @@ fn handle_agent_trace_export(ctx: &RuntimeContext, args: AgentTraceExportArgs) -
         let mut file = options.open(&output)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        if !ctx.quiet {
-            eprintln!("wrote portable agent trace to {}", output.display());
-        }
+        render_document(
+            &TerminalDocument::new("Exported portable agent trace", UiTone::Success).block(
+                UiBlock::Metadata(vec![("Path".to_string(), output.display().to_string())]),
+            ),
+            &ctx.render,
+        )?;
     } else {
         std::io::stdout().write_all(&bytes)?;
     }
@@ -463,17 +466,37 @@ fn handle_agent_hooks_list(ctx: &RuntimeContext, args: AgentHooksListArgs) -> Re
         })
         .collect::<Vec<_>>();
     if ctx.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        render_json(&rows)?;
     } else if !ctx.quiet {
-        for row in &rows {
-            let count = row["installations"].as_array().map(Vec::len).unwrap_or(0);
-            println!(
-                "{:<14} {:<12} {} installation(s)",
-                row["provider"].as_str().unwrap_or_default(),
-                row["support"].as_str().unwrap_or("known"),
-                count
-            );
-        }
+        let table = UiTable::new(
+            vec![
+                UiColumn::left("PROVIDER", 0, 12),
+                UiColumn::left("SUPPORT", 1, 10),
+                UiColumn::right("INSTALLED", 0, 9),
+            ],
+            rows.iter()
+                .map(|row| {
+                    vec![
+                        row["display_name"]
+                            .as_str()
+                            .or_else(|| row["provider"].as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        state_label(row["support"].as_str().unwrap_or("known")),
+                        row["installations"]
+                            .as_array()
+                            .map(Vec::len)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ]
+                })
+                .collect(),
+        );
+        render_document(
+            &TerminalDocument::new("Agent hook providers", UiTone::Neutral)
+                .block(UiBlock::Table(table)),
+            &ctx.render,
+        )?;
     }
     Ok(())
 }
@@ -826,9 +849,12 @@ fn render_agent_hooks_value(
     human: String,
 ) -> Result<()> {
     if ctx.json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if !ctx.quiet {
-        println!("{human}");
+        render_json(&value)?;
+    } else {
+        render_document(
+            &TerminalDocument::new("Agent hook", UiTone::Neutral).block(UiBlock::paragraph(human)),
+            &ctx.render,
+        )?;
     }
     Ok(())
 }
@@ -850,13 +876,21 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
         .take(MAX_STDIN_BYTES)
         .read_to_end(&mut bytes)
     {
-        eprintln!("trail: native agent receipt could not be read: {error}");
+        render_native_receipt_diagnostic(
+            ctx,
+            "Native agent receipt could not be read",
+            error.to_string(),
+        );
         return acknowledge_agent_hook(&provider, &args.native_event);
     }
     if bytes.len() > trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES {
-        eprintln!(
-            "trail: native agent receipt exceeds {} bytes and was not recorded",
-            trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+        render_native_receipt_diagnostic(
+            ctx,
+            "Native agent receipt was not recorded",
+            format!(
+                "The receipt exceeds {} bytes.",
+                trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+            ),
         );
         return acknowledge_agent_hook(&provider, &args.native_event);
     }
@@ -868,7 +902,11 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
         } {
             Ok(payload) => payload,
             Err(error) => {
-                eprintln!("trail: native agent receipt was not valid JSON: {error}");
+                render_native_receipt_diagnostic(
+                    ctx,
+                    "Native agent receipt was not recorded",
+                    format!("The receipt is not valid JSON: {error}"),
+                );
                 return acknowledge_agent_hook(&provider, &args.native_event);
             }
         };
@@ -878,9 +916,13 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
         .unwrap_or(usize::MAX)
         > trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
     {
-        eprintln!(
-            "trail: native agent receipt exceeds {} bytes after provider enrichment and was not recorded",
-            trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+        render_native_receipt_diagnostic(
+            ctx,
+            "Native agent receipt was not recorded",
+            format!(
+                "The enriched receipt exceeds {} bytes.",
+                trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+            ),
         );
         return acknowledge_agent_hook(&provider, &args.native_event);
     }
@@ -890,7 +932,11 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
         .and_then(|registry| registry.resolve(&provider).ok())
         .is_none()
     {
-        eprintln!("trail: native agent provider `{provider}` is not registered");
+        render_native_receipt_diagnostic(
+            ctx,
+            "Native agent provider is not registered",
+            format!("Provider `{provider}` is not registered."),
+        );
         return acknowledge_agent_hook(&provider, &args.native_event);
     }
     let native_session_id = hook_payload_string(
@@ -931,8 +977,10 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
         let ingested = db.persist_agent_hook_receipt(input.clone())?;
         if ingested.receipt.status != "processed" {
             if let Err(error) = db.replay_agent_hook_receipt(&ingested.receipt.receipt_id) {
-                eprintln!(
-                    "trail: native receipt was journaled but semantic replay is deferred: {error}"
+                render_native_receipt_diagnostic(
+                    ctx,
+                    "Native receipt replay is deferred",
+                    error.to_string(),
                 );
             }
         }
@@ -947,11 +995,17 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
             },
         };
         if let Err(spool_error) = spool_agent_hook_receipt(ctx, &envelope) {
-            eprintln!(
-                "trail: native receipt was not recorded ({error}); fallback spool also failed: {spool_error}"
+            render_native_receipt_diagnostic(
+                ctx,
+                "Native receipt was not recorded",
+                format!("{error}; fallback spool also failed: {spool_error}"),
             );
         } else {
-            eprintln!("trail: native receipt was spooled for later replay: {error}");
+            render_native_receipt_diagnostic(
+                ctx,
+                "Native receipt was spooled for later replay",
+                error.to_string(),
+            );
         }
     }
     acknowledge_agent_hook(&provider, &args.native_event)
@@ -994,11 +1048,32 @@ struct AgentHookSpoolEnvelope {
 
 fn acknowledge_agent_hook(provider: &str, native_event: &str) -> Result<()> {
     if provider == "codex" && matches!(native_event, "Stop" | "SubagentStop") {
-        println!("{{\"continue\":true}}");
+        render_protocol_content("{\"continue\":true}\n")?;
     } else if provider == "gemini" {
-        println!("{{}}");
+        render_protocol_content("{}\n")?;
     }
     Ok(())
+}
+
+fn render_native_receipt_diagnostic(ctx: &RuntimeContext, summary: &str, cause: String) {
+    let diagnostic = UiDiagnostic {
+        code: "AGENT_HOOK_RECEIPT".to_string(),
+        summary: summary.to_string(),
+        cause: Some(cause),
+        consequence: Some(
+            "Trail acknowledged the native hook but did not apply this receipt.".to_string(),
+        ),
+        recovery: Some(UiNextAction {
+            command: "trail agent hooks replay --pending".to_string(),
+            reason: "Retry recorded native hook receipts after fixing the provider issue."
+                .to_string(),
+        }),
+        alternatives: Vec::new(),
+    };
+    let _ = render_error_document(
+        &TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic)),
+        &ctx.render,
+    );
 }
 
 fn spool_agent_hook_receipt(ctx: &RuntimeContext, envelope: &AgentHookSpoolEnvelope) -> Result<()> {
@@ -1194,17 +1269,17 @@ fn handle_agent_home(ctx: &RuntimeContext) -> Result<()> {
     let tasks = db.list_agent_tasks()?.tasks;
     if tasks.len() == 1 {
         let report = db.agent_dashboard(&tasks[0].lane)?;
-        render_agent_dashboard(&report, ctx.json, ctx.quiet)
+        render_agent_dashboard(&report, ctx.json, &ctx.render)
     } else {
         let report = db.agent_inbox()?;
-        render_agent_inbox(&report, ctx.json, ctx.quiet)
+        render_agent_inbox(&report, ctx.json, &ctx.render)
     }
 }
 
 fn handle_agent_setup(ctx: &RuntimeContext, args: AgentSetupArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_setup_report(&args.provider, &args.editor)?;
-    render_agent_setup(&report, ctx.json, ctx.quiet)
+    render_agent_setup(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
@@ -1262,7 +1337,7 @@ fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> 
         workdir_mode,
         args.command,
     )?;
-    render_agent_run(&report, ctx.json, ctx.quiet)
+    render_agent_run(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Result<()> {
@@ -1319,7 +1394,7 @@ fn handle_agent_continue(ctx: &RuntimeContext, args: AgentContinueArgs) -> Resul
         run,
         suggestions,
     };
-    render_agent_continue(&report, ctx.json, ctx.quiet)
+    render_agent_continue(&report, ctx.json, &ctx.render)
 }
 
 fn run_terminal_agent_task(
@@ -1424,10 +1499,16 @@ fn run_terminal_agent_task(
             command.push(settings.to_string_lossy().into_owned());
         }
     }
-    if !ctx.quiet && !ctx.json {
-        println!("Agent task: {lane}");
-        println!("Workdir: {workdir}");
-        println!("Command: {}", command.join(" "));
+    if !ctx.json {
+        render_document(
+            &TerminalDocument::new(format!("Launching agent task {lane}"), UiTone::Success).block(
+                UiBlock::Metadata(vec![
+                    ("Workdir".to_string(), workdir.clone()),
+                    ("Command".to_string(), command.join(" ")),
+                ]),
+            ),
+            &ctx.render,
+        )?;
     }
     let (launch_program, launch_args) =
         confined_terminal_agent_command(&command, &workspace_root, Path::new(&workdir))?;
@@ -1532,7 +1613,7 @@ fn push_agent_cli_suggestion(
 fn handle_agent_guide(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_guide(&args.selector)?;
-    render_agent_guide(&report, ctx.json, ctx.quiet)
+    render_agent_guide(&report, ctx.json, &ctx.render)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2505,19 +2586,19 @@ fn agent_ask_clean_path(token: &str) -> Option<String> {
 fn handle_agent_status(ctx: &RuntimeContext) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_status()?;
-    render_agent_status(&report, ctx.json, ctx.quiet)
+    render_agent_status(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_dashboard(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_dashboard(&args.selector)?;
-    render_agent_dashboard(&report, ctx.json, ctx.quiet)
+    render_agent_dashboard(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_review_data(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_review_data(&args.selector)?;
-    render_agent_review_data(&report, ctx.json, ctx.quiet)
+    render_agent_review_data(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()> {
@@ -2529,12 +2610,12 @@ fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()
             if let Some(action_id) = action_id {
                 return handle_agent_empty_action(ctx, &action_id, &args);
             }
-            return render_agent_empty_action_palette(ctx.json, ctx.quiet);
+            return render_agent_empty_action_palette(ctx.json, &ctx.render);
         }
         Err(err) => return Err(err),
     };
     let Some(action_id) = action_id else {
-        return render_agent_action_palette(&review_data, ctx.json, ctx.quiet);
+        return render_agent_action_palette(&review_data, ctx.json, &ctx.render);
     };
     let action = review_data
         .actions
@@ -2560,9 +2641,7 @@ fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()
                 "action": action
             }));
         }
-        if !ctx.quiet {
-            println!("{}", action.command);
-        }
+        render_raw_content(&format!("{}\n", action.command), &ctx.render)?;
         return Ok(());
     }
     if !action.enabled {
@@ -2587,11 +2666,11 @@ fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()
         "open_focus_file" => run_agent_shell_action(ctx, &action.command),
         "inspect_focus_file" => {
             let report = db.agent_focus(&lane, action.path.as_deref(), false)?;
-            render_agent_focus(&report, ctx.json, ctx.quiet)
+            render_agent_focus(&report, ctx.json, &ctx.render)
         }
         "show_focus_patch" => {
             let report = db.agent_focus(&lane, action.path.as_deref(), true)?;
-            render_agent_focus(&report, ctx.json, ctx.quiet)
+            render_agent_focus(&report, ctx.json, &ctx.render)
         }
         "mark_focus_file_reviewed" => {
             let path = action.path.as_deref().ok_or_else(|| {
@@ -2600,15 +2679,15 @@ fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()
                 )
             })?;
             let report = db.agent_mark_file_reviewed(&lane, path, args.note)?;
-            render_agent_mark_file_reviewed(&report, ctx.json, ctx.quiet)
+            render_agent_mark_file_reviewed(&report, ctx.json, &ctx.render)
         }
         "show_review_map" => {
             let report = db.agent_review_map(&lane)?;
-            render_agent_review_map(&report, ctx.json, ctx.quiet)
+            render_agent_review_map(&report, ctx.json, &ctx.render)
         }
         "show_test_plan" => {
             let report = db.agent_test_plan(&lane)?;
-            render_agent_test_plan(&report, ctx.json, ctx.quiet)
+            render_agent_test_plan(&report, ctx.json, &ctx.render)
         }
         "validation_next" => {
             if ctx.json {
@@ -2620,15 +2699,15 @@ fn handle_agent_action(ctx: &RuntimeContext, args: AgentActionArgs) -> Result<()
         }
         "apply_dry_run" => {
             let report = db.agent_apply(&lane, true, args.message)?;
-            render_agent_apply(&report, ctx.json, ctx.quiet)
+            render_agent_apply(&report, ctx.json, &ctx.render)
         }
         "apply_task" => {
             let report = db.agent_finish(&lane, false, args.message, args.note)?;
-            render_agent_finish(&report, ctx.json, ctx.quiet)
+            render_agent_finish(&report, ctx.json, &ctx.render)
         }
         "mark_task_reviewed" => {
             let report = db.agent_mark_reviewed(&lane, args.note)?;
-            render_agent_mark_reviewed(&report, ctx.json, ctx.quiet)
+            render_agent_mark_reviewed(&report, ctx.json, &ctx.render)
         }
         _ => Err(Error::InvalidInput(format!(
             "agent action `{}` is not executable by this Trail version; run `{}` directly",
@@ -2659,9 +2738,7 @@ fn handle_agent_empty_action(
                 "action": action
             }));
         }
-        if !ctx.quiet {
-            println!("{}", action.command);
-        }
+        render_raw_content(&format!("{}\n", action.command), &ctx.render)?;
         return Ok(());
     }
     if action.requires_confirmation && !args.confirm {
@@ -2819,88 +2896,91 @@ fn run_agent_shell_action(ctx: &RuntimeContext, command: &str) -> Result<()> {
                 .unwrap_or_else(|| "terminated by signal".to_string())
         )));
     }
-    if !ctx.quiet {
-        println!("Agent action command completed: {command}");
-    }
+    render_document(
+        &TerminalDocument::new("Agent action completed", UiTone::Success).block(UiBlock::Metadata(
+            vec![("Command".to_string(), command.to_string())],
+        )),
+        &ctx.render,
+    )?;
     Ok(())
 }
 
 fn handle_agent_review_flow(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_review_flow(&args.selector)?;
-    render_agent_review_flow(&report, ctx.json, ctx.quiet)
+    render_agent_review_flow(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_inbox(ctx: &RuntimeContext, args: AgentInboxArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_inbox_with_options(args.all)?;
-    render_agent_inbox(&report, ctx.json, ctx.quiet)
+    render_agent_inbox(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_board(ctx: &RuntimeContext, args: AgentInboxArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_board_with_options(args.all)?;
-    render_agent_board(&report, ctx.json, ctx.quiet)
+    render_agent_board(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_stack(ctx: &RuntimeContext, args: AgentInboxArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_stack_with_options(args.all)?;
-    render_agent_stack(&report, ctx.json, ctx.quiet)
+    render_agent_stack(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_next(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_next(&args.selector)?;
-    render_agent_next(&report, ctx.json, ctx.quiet)
+    render_agent_next(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_list(ctx: &RuntimeContext, args: AgentListArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.list_agent_tasks_with_options(args.all)?;
-    render_agent_list(&report, ctx.json, ctx.quiet)
+    render_agent_list(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_brief(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_brief(&args.selector)?;
-    render_agent_brief(&report, ctx.json, ctx.quiet)
+    render_agent_brief(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_summary(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_summary(&args.selector)?;
-    render_agent_summary(&report, ctx.json, ctx.quiet)
+    render_agent_summary(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_validate(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_validate(&args.selector)?;
-    render_agent_validate(&report, ctx.json, ctx.quiet)
+    render_agent_validate(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_test_plan(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_test_plan(&args.selector)?;
-    render_agent_test_plan(&report, ctx.json, ctx.quiet)
+    render_agent_test_plan(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_report(ctx: &RuntimeContext, args: AgentReportArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_report(&args.selector)?;
-    render_agent_report(&report, ctx.json, ctx.quiet, args.markdown)
+    render_agent_report(&report, ctx.json, &ctx.render, args.markdown)
 }
 
 fn handle_agent_handoff(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_handoff(&args.selector)?;
-    render_agent_handoff(&report, ctx.json, ctx.quiet)
+    render_agent_handoff(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_receipt(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_receipt(&args.selector)?;
-    render_agent_receipt(&report, ctx.json, ctx.quiet)
+    render_agent_receipt(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_pr(ctx: &RuntimeContext, args: AgentPrArgs) -> Result<()> {
@@ -2909,7 +2989,7 @@ fn handle_agent_pr(ctx: &RuntimeContext, args: AgentPrArgs) -> Result<()> {
     render_agent_pr(
         &report,
         ctx.json,
-        ctx.quiet,
+        &ctx.render,
         args.title_only,
         args.body_only,
     )
@@ -2918,55 +2998,55 @@ fn handle_agent_pr(ctx: &RuntimeContext, args: AgentPrArgs) -> Result<()> {
 fn handle_agent_story(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_story(&args.selector)?;
-    render_agent_story(&report, ctx.json, ctx.quiet)
+    render_agent_story(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_tools(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_tools(&args.selector)?;
-    render_agent_tools(&report, ctx.json, ctx.quiet)
+    render_agent_tools(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_impact(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_impact(&args.selector)?;
-    render_agent_impact(&report, ctx.json, ctx.quiet)
+    render_agent_impact(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_review_map(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_review_map(&args.selector)?;
-    render_agent_review_map(&report, ctx.json, ctx.quiet)
+    render_agent_review_map(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_risk(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_risk(&args.selector)?;
-    render_agent_risk(&report, ctx.json, ctx.quiet)
+    render_agent_risk(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_confidence(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_confidence(&args.selector)?;
-    render_agent_confidence(&report, ctx.json, ctx.quiet)
+    render_agent_confidence(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_ready(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_ready(&args.selector)?;
-    render_agent_ready(&report, ctx.json, ctx.quiet)
+    render_agent_ready(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_diagnose(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_diagnose(&args.selector)?;
-    render_agent_diagnose(&report, ctx.json, ctx.quiet)
+    render_agent_diagnose(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_compare(ctx: &RuntimeContext, args: AgentCompareArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_compare(&args.left, &args.right)?;
-    render_agent_compare(&report, ctx.json, ctx.quiet)
+    render_agent_compare(&report, ctx.json, &ctx.render)
 }
 
 enum AgentGateKind {
@@ -2997,7 +3077,7 @@ fn handle_agent_gate(ctx: &RuntimeContext, args: AgentGateArgs, kind: AgentGateK
             options,
         )?,
     };
-    let render_result = render_lane_test(&report, ctx.json, ctx.quiet);
+    let render_result = render_lane_test(&report, ctx.json, &ctx.render);
     if render_result.is_ok() && !report.success {
         std::process::exit(command_failure_exit_code(report.exit_code));
     }
@@ -3007,15 +3087,15 @@ fn handle_agent_gate(ctx: &RuntimeContext, args: AgentGateArgs, kind: AgentGateK
 fn handle_agent_workdir(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_workdir(&args.selector)?;
-    render_agent_workdir(&report, ctx.json, ctx.quiet)
+    render_agent_workdir(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_view(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     match db.agent_task_view(&args.selector) {
-        Ok(report) => render_agent_view(&report, ctx.json, ctx.quiet),
+        Ok(report) => render_agent_view(&report, ctx.json, &ctx.render),
         Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
-            render_agent_empty_task_hint("view", ctx.json, ctx.quiet)
+            render_agent_empty_task_hint("view", ctx.json, &ctx.render)
         }
         Err(err) => Err(err),
     }
@@ -3025,9 +3105,9 @@ fn handle_agent_changes(ctx: &RuntimeContext, args: AgentChangesArgs) -> Result<
     let db = open_db(ctx)?;
     let _ = args.by_turn;
     match db.agent_changes_with_options(&args.selector, args.by_operation, args.by_file) {
-        Ok(report) => render_agent_changes(&report, ctx.json, ctx.quiet),
+        Ok(report) => render_agent_changes(&report, ctx.json, &ctx.render),
         Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
-            render_agent_empty_task_hint("changes", ctx.json, ctx.quiet)
+            render_agent_empty_task_hint("changes", ctx.json, &ctx.render)
         }
         Err(err) => Err(err),
     }
@@ -3042,19 +3122,19 @@ fn handle_agent_delta(ctx: &RuntimeContext, args: AgentDeltaArgs) -> Result<()> 
         args.file.as_deref(),
         args.patch,
     )?;
-    render_agent_delta(&report, ctx.json, ctx.quiet)
+    render_agent_delta(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_new(ctx: &RuntimeContext, args: AgentNewArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_new(&args.selector, args.file.as_deref(), args.patch)?;
-    render_agent_new(&report, ctx.json, ctx.quiet)
+    render_agent_new(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_mark_reviewed(ctx: &RuntimeContext, args: AgentMarkReviewedArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_mark_reviewed(&args.selector, args.note)?;
-    render_agent_mark_reviewed(&report, ctx.json, ctx.quiet)
+    render_agent_mark_reviewed(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_mark_file_reviewed(
@@ -3064,7 +3144,7 @@ fn handle_agent_mark_file_reviewed(
     let mut db = open_db(ctx)?;
     let (selector, path) = agent_mark_file_reviewed_selector_args(&args);
     let report = db.agent_mark_file_reviewed(&selector, &path, args.note)?;
-    render_agent_mark_file_reviewed(&report, ctx.json, ctx.quiet)
+    render_agent_mark_file_reviewed(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_archive(
@@ -3074,40 +3154,40 @@ fn handle_agent_archive(
 ) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_archive(&args.selector, archived, args.note)?;
-    render_agent_archive(&report, ctx.json, ctx.quiet)
+    render_agent_archive(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_change(ctx: &RuntimeContext, args: AgentChangeArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let (selector, change_selector) = agent_change_selector_args(&args);
     let report = db.agent_change_set(&selector, &change_selector, args.patch)?;
-    render_agent_change_set(&report, ctx.json, ctx.quiet)
+    render_agent_change_set(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_timeline(ctx: &RuntimeContext, args: AgentTimelineArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let _ = args.by_turn;
     let report = db.agent_timeline(&args.selector, args.by_operation)?;
-    render_agent_timeline(&report, ctx.json, ctx.quiet)
+    render_agent_timeline(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_files(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_files(&args.selector)?;
-    render_agent_files(&report, ctx.json, ctx.quiet)
+    render_agent_files(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_file(ctx: &RuntimeContext, args: AgentFileArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let (selector, path) = agent_file_selector_args(&args);
     let report = db.agent_file(&selector, &path, args.patch)?;
-    render_agent_file(&report, ctx.json, ctx.quiet)
+    render_agent_file(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_checkpoints(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_checkpoints(&args.selector)?;
-    render_agent_checkpoints(&report, ctx.json, ctx.quiet)
+    render_agent_checkpoints(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_why(ctx: &RuntimeContext, args: AgentWhyArgs) -> Result<()> {
@@ -3117,7 +3197,7 @@ fn handle_agent_why(ctx: &RuntimeContext, args: AgentWhyArgs) -> Result<()> {
         None => ("latest".to_string(), args.selector_or_path),
     };
     let report = db.agent_why(&selector, &path)?;
-    render_agent_why(&report, ctx.json, ctx.quiet)
+    render_agent_why(&report, ctx.json, &ctx.render)
 }
 
 fn agent_change_selector_args(args: &AgentChangeArgs) -> (String, String) {
@@ -3147,7 +3227,7 @@ fn handle_agent_turn(ctx: &RuntimeContext, args: AgentTurnArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let (selector, turn) = resolve_agent_turn_cli_args(&db, &args);
     let report = db.agent_turn(&selector, &turn, args.file.as_deref(), args.patch)?;
-    render_agent_turn(&report, ctx.json, ctx.quiet)
+    render_agent_turn(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_turn_diff(ctx: &RuntimeContext, args: AgentTurnDiffArgs) -> Result<()> {
@@ -3161,7 +3241,7 @@ fn handle_agent_turn_diff(ctx: &RuntimeContext, args: AgentTurnDiffArgs) -> Resu
         args.file.as_deref(),
         args.patch,
     )?;
-    render_agent_diff(&report, ctx.json, ctx.quiet, args.stat)
+    render_agent_diff(&report, ctx.json, &ctx.render, args.stat)
 }
 
 fn resolve_agent_turn_cli_args(db: &trail::Trail, args: &AgentTurnArgs) -> (String, String) {
@@ -3190,19 +3270,19 @@ fn handle_agent_diff(ctx: &RuntimeContext, args: AgentDiffArgs) -> Result<()> {
         args.file.as_deref(),
         args.patch,
     )?;
-    render_agent_diff(&report, ctx.json, ctx.quiet, args.stat)
+    render_agent_diff(&report, ctx.json, &ctx.render, args.stat)
 }
 
 fn handle_agent_review(ctx: &RuntimeContext, args: AgentSelectorArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_review(&args.selector)?;
-    render_agent_review(&report, ctx.json, ctx.quiet)
+    render_agent_review(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_focus(ctx: &RuntimeContext, args: AgentFocusArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.agent_focus(&args.selector, args.file.as_deref(), args.patch)?;
-    render_agent_focus(&report, ctx.json, ctx.quiet)
+    render_agent_focus(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_open(ctx: &RuntimeContext, args: AgentOpenArgs) -> Result<()> {
@@ -3221,12 +3301,10 @@ fn handle_agent_open(ctx: &RuntimeContext, args: AgentOpenArgs) -> Result<()> {
         ))
     })?;
     if ctx.json {
-        return render_agent_focus(&report, true, ctx.quiet);
+        return render_agent_focus(&report, true, &ctx.render);
     }
     if args.print {
-        if !ctx.quiet {
-            println!("{open_command}");
-        }
+        render_raw_content(&format!("{open_command}\n"), &ctx.render)?;
         return Ok(());
     }
     let shell = std::env::var_os("SHELL")
@@ -3249,9 +3327,11 @@ fn handle_agent_open(ctx: &RuntimeContext, args: AgentOpenArgs) -> Result<()> {
                 .unwrap_or_else(|| "terminated by signal".to_string())
         )));
     }
-    if !ctx.quiet {
-        println!("Opened: {open_path}");
-    }
+    render_document(
+        &TerminalDocument::new("Opened agent focus", UiTone::Success)
+            .block(UiBlock::Metadata(vec![("Path".to_string(), open_path)])),
+        &ctx.render,
+    )?;
     Ok(())
 }
 
@@ -3259,9 +3339,9 @@ fn handle_agent_apply(ctx: &RuntimeContext, args: AgentApplyArgs) -> Result<()> 
     let _ = args.into_current_git_branch;
     let mut db = open_db(ctx)?;
     match db.agent_apply(&args.selector, args.dry_run, args.message) {
-        Ok(report) => render_agent_apply(&report, ctx.json, ctx.quiet),
+        Ok(report) => render_agent_apply(&report, ctx.json, &ctx.render),
         Err(Error::InvalidInput(message)) if message.contains("no agent tasks") => {
-            render_agent_empty_task_hint("apply", ctx.json, ctx.quiet)
+            render_agent_empty_task_hint("apply", ctx.json, &ctx.render)
         }
         Err(err) => Err(err),
     }
@@ -3271,13 +3351,13 @@ fn handle_agent_finish(ctx: &RuntimeContext, args: AgentFinishArgs) -> Result<()
     let _ = args.into_current_git_branch;
     let mut db = open_db(ctx)?;
     let report = db.agent_finish(&args.selector, args.dry_run, args.message, args.note)?;
-    render_agent_finish(&report, ctx.json, ctx.quiet)
+    render_agent_finish(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_rewind(ctx: &RuntimeContext, args: AgentRewindArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
     let report = db.agent_rewind(&args.selector, &args.target)?;
-    render_lane_rewind(&report, ctx.json, ctx.quiet)
+    render_lane_rewind(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_undo(ctx: &RuntimeContext, args: AgentUndoArgs) -> Result<()> {
@@ -3289,7 +3369,7 @@ fn handle_agent_undo(ctx: &RuntimeContext, args: AgentUndoArgs) -> Result<()> {
         args.prompt.as_deref(),
         args.last_operation,
     )?;
-    render_lane_rewind(&report, ctx.json, ctx.quiet)
+    render_lane_rewind(&report, ctx.json, &ctx.render)
 }
 
 fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()> {
@@ -3434,18 +3514,33 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
     if ctx.json {
         return render_json(&report);
     }
-    if !ctx.quiet {
-        println!("Agent doctor: {status}");
-        for check in checks {
-            println!(
-                "[{}] {}: {}",
-                check["status"].as_str().unwrap_or("-"),
-                check["name"].as_str().unwrap_or("-"),
-                check["message"].as_str().unwrap_or("")
-            );
-        }
-    }
-    Ok(())
+    let check_rows = checks
+        .iter()
+        .map(|check| {
+            UiCheck::new(
+                match check["status"].as_str().unwrap_or_default() {
+                    "ok" | "pass" => UiCheckState::Pass,
+                    "warn" | "warning" => UiCheckState::Warn,
+                    "pending" => UiCheckState::Pending,
+                    _ => UiCheckState::Fail,
+                },
+                check["name"].as_str().unwrap_or("check"),
+                check["message"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    render_document(
+        &TerminalDocument::new(
+            format!("Agent diagnostics: {status}"),
+            if status == "ok" {
+                UiTone::Success
+            } else {
+                UiTone::Attention
+            },
+        )
+        .block(UiBlock::Checklist(check_rows)),
+        &ctx.render,
+    )
 }
 
 fn default_terminal_agent_command(provider: &str) -> Result<Vec<String>> {

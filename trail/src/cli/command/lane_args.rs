@@ -347,6 +347,10 @@ pub(super) struct LaneDiffArgs {
     pub(super) patch: bool,
     #[arg(long)]
     pub(super) stat: bool,
+    #[arg(long = "name-only")]
+    pub(super) name_only: bool,
+    #[arg(long = "name-status")]
+    pub(super) name_status: bool,
     #[arg(long = "show-line-ids")]
     pub(super) show_line_ids: bool,
 }

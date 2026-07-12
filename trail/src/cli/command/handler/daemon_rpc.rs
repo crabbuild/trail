@@ -49,13 +49,21 @@ pub(super) fn try_handle_daemon_command(
                 return Ok(false);
             }
             let report: StatusReport = client.get_json("/v1/status")?;
-            render_status(&report, ctx.json, ctx.quiet)?;
+            render_status(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         Command::Diff(args) => {
             let path = diff_path(args)?;
             let summary: DiffSummary = client.get_json(&path)?;
-            render_diff(&summary, ctx.json, ctx.quiet, args.stat, ctx.color)?;
+            render_diff(
+                &summary,
+                ctx.json,
+                &ctx.render,
+                args.patch,
+                args.stat,
+                args.name_only,
+                args.name_status,
+            )?;
             Ok(true)
         }
         Command::Record(args) => {
@@ -68,7 +76,7 @@ pub(super) fn try_handle_daemon_command(
                 "allow_ignored": args.allow_ignored,
             });
             let report: RecordReport = client.post_json("/v1/record", &body)?;
-            render_record(&report, ctx.json, ctx.quiet)?;
+            render_record(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         Command::Timeline(args) => handle_timeline_command(ctx, &client, args),
@@ -88,14 +96,14 @@ pub(super) fn try_handle_daemon_command(
             });
             let report: MergeReport =
                 client.post_json(&format!("/v1/branches/{}/merge-lane", args.into), &body)?;
-            render_merge(&report, ctx.json, ctx.quiet)?;
+            render_merge(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         Command::MergeQueue(queue) => handle_merge_queue_command(ctx, &client, queue),
         Command::Lease(lease) => handle_lease_command(ctx, &client, lease),
         Command::Doctor => {
             let report: DoctorReport = client.get_json("/v1/doctor")?;
-            render_doctor(&report, ctx.json, ctx.quiet)?;
+            render_doctor(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -189,23 +197,23 @@ fn handle_lane_command(
                 body.insert("model".to_string(), Value::String(model.clone()));
             }
             let report: LaneSpawnReport = client.post_json("/v1/lanes", &Value::Object(body))?;
-            render_lane_spawn(&report, ctx.json, ctx.quiet)?;
+            render_lane_spawn(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::List => {
             let lanes: Vec<LaneDetails> = client.get_json("/v1/lanes")?;
-            render_lane_list(&lanes, ctx.json, ctx.quiet)?;
+            render_lane_list(&lanes, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Show(args) => {
             let details: LaneDetails = client.get_json(&format!("/v1/lanes/{}", args.name))?;
-            render_lane_details(&details, ctx.json, ctx.quiet)?;
+            render_lane_details(&details, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Status(args) => {
             let report: LaneStatusReport =
                 client.get_json(&format!("/v1/lanes/{}/status", args.name))?;
-            render_lane_status(&report, ctx.json, ctx.quiet)?;
+            render_lane_status(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Review(args) => {
@@ -213,7 +221,7 @@ fn handle_lane_command(
                 "/v1/lanes/{}/review?limit={}",
                 args.name, args.limit
             ))?;
-            render_lane_review_packet(&report, ctx.json, ctx.quiet)?;
+            render_lane_review_packet(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Contribution(args) => {
@@ -221,7 +229,7 @@ fn handle_lane_command(
                 "/v1/lanes/{}/contribution?limit={}",
                 args.name, args.limit
             ))?;
-            render_lane_contribution(&report, ctx.json, ctx.quiet)?;
+            render_lane_contribution(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Gates(args) => {
@@ -231,13 +239,13 @@ fn handle_lane_command(
             }
             let path = append_query(&format!("/v1/lanes/{}/gates", args.name), params);
             let report: LaneGateHistoryReport = client.get_json(&path)?;
-            render_lane_gate_history(&report, ctx.json, ctx.quiet)?;
+            render_lane_gate_history(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Readiness(args) => {
             let report: LaneReadinessReport =
                 client.get_json(&format!("/v1/lanes/{}/readiness", args.name))?;
-            render_lane_readiness(&report, ctx.json, ctx.quiet)?;
+            render_lane_readiness(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::RefreshPreview(args) => {
@@ -246,7 +254,7 @@ fn handle_lane_command(
                 vec![format!("target={}", args.target)],
             );
             let report: LaneRefreshPreviewReport = client.get_json(&path)?;
-            render_lane_refresh_preview(&report, ctx.json, ctx.quiet)?;
+            render_lane_refresh_preview(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Handoff(args) => {
@@ -254,7 +262,7 @@ fn handle_lane_command(
                 "/v1/lanes/{}/handoff?limit={}",
                 args.name, args.limit
             ))?;
-            render_lane_handoff(&report, ctx.json, ctx.quiet)?;
+            render_lane_handoff(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Claim(args) => {
@@ -264,7 +272,7 @@ fn handle_lane_command(
             });
             let report: LaneClaimReport =
                 client.post_json(&format!("/v1/lanes/{}/claims", args.name), &body)?;
-            render_lane_claim(&report, ctx.json, ctx.quiet)?;
+            render_lane_claim(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Record(args) => {
@@ -275,11 +283,11 @@ fn handle_lane_command(
             if args.preview {
                 let report: LaneRecordPreviewReport =
                     client.post_json(&format!("/v1/lanes/{}/record", args.name), &body)?;
-                render_lane_record_preview(&report, ctx.json, ctx.quiet)?;
+                render_lane_record_preview(&report, ctx.json, &ctx.render)?;
             } else {
                 let report: LaneRecordReport =
                     client.post_json(&format!("/v1/lanes/{}/record", args.name), &body)?;
-                render_lane_record(&report, ctx.json, ctx.quiet)?;
+                render_lane_record(&report, ctx.json, &ctx.render)?;
             }
             Ok(true)
         }
@@ -291,7 +299,7 @@ fn handle_lane_command(
             });
             let report: LaneRewindReport =
                 client.post_json(&format!("/v1/lanes/{}/rewind", args.name), &body)?;
-            render_lane_rewind(&report, ctx.json, ctx.quiet)?;
+            render_lane_rewind(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Events(args) => {
@@ -310,7 +318,7 @@ fn handle_lane_command(
             }
             let path = append_query("/v1/lane/events", params);
             let events: Vec<LaneEventRecord> = client.get_json(&path)?;
-            render_lane_events(&events, ctx.json, ctx.quiet)?;
+            render_lane_events(&events, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::SyncWorkdir(args) => {
@@ -321,7 +329,7 @@ fn handle_lane_command(
             });
             let report: LaneWorkdirSyncReport =
                 client.post_json(&format!("/v1/lanes/{}/sync-workdir", args.name), &body)?;
-            render_lane_workdir_sync(&report, ctx.json, ctx.quiet)?;
+            render_lane_workdir_sync(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Read(args) => {
@@ -341,13 +349,13 @@ fn handle_lane_command(
                 &format!("/v1/lanes/{}/read-file", args.name),
                 &Value::Object(body),
             )?;
-            render_lane_file_read(&report, ctx.json, ctx.quiet)?;
+            render_lane_file_read(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Workdir(args) => {
             let report: LaneWorkdirReport =
                 client.get_json(&format!("/v1/lanes/{}/workdir", args.name))?;
-            render_lane_workdir(&report, ctx.json, ctx.quiet)?;
+            render_lane_workdir(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::ApplyPatch(args) => {
@@ -362,10 +370,17 @@ fn handle_lane_command(
             let body = serde_json::to_value(&patch)?;
             let report: LanePatchReport =
                 client.post_json(&format!("/v1/lanes/{}/patches", args.name), &body)?;
-            render_lane_patch(&report, ctx.json, ctx.quiet)?;
+            render_lane_patch(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Diff(args) => {
+            validate_diff_view(
+                args.patch,
+                args.stat,
+                args.show_line_ids,
+                args.name_only,
+                args.name_status,
+            )?;
             let mut params = Vec::new();
             if args.patch {
                 params.push("patch=1".to_string());
@@ -379,9 +394,11 @@ fn handle_lane_command(
             render_diff_with_title(
                 &summary,
                 ctx.json,
-                ctx.quiet,
+                &ctx.render,
+                args.patch,
                 args.stat,
-                ctx.color,
+                args.name_only,
+                args.name_status,
                 Some(&title),
             )?;
             Ok(true)
@@ -395,7 +412,7 @@ fn handle_lane_command(
                 ],
             );
             let entries: Vec<TimelineEntry> = client.get_json(&path)?;
-            render_timeline(&entries, ctx.json, ctx.quiet)?;
+            render_timeline(&entries, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneSubcommand::Turn(turn) => handle_lane_turn_command(ctx, client, turn),
@@ -420,7 +437,7 @@ fn handle_timeline_command(
         params.push(format!("lane={lane}"));
     }
     let entries: Vec<TimelineEntry> = client.get_json(&append_query("/v1/timeline", params))?;
-    render_timeline(&entries, ctx.json, ctx.quiet)?;
+    render_timeline(&entries, ctx.json, &ctx.render)?;
     Ok(true)
 }
 
@@ -444,7 +461,7 @@ fn handle_why_command(ctx: &RuntimeContext, client: &DaemonClient, args: &WhyArg
         params.push(format!("at={at}"));
     }
     let result: WhyResult = client.get_json(&append_query("/v1/why", params))?;
-    render_why(&result, ctx.json, ctx.quiet)?;
+    render_why(&result, ctx.json, &ctx.render)?;
     Ok(true)
 }
 
@@ -473,7 +490,7 @@ fn handle_history_command(
         }
     };
     let result: HistoryResult = client.get_json(&append_query("/v1/history", params))?;
-    render_history(&result, ctx.json, ctx.quiet)?;
+    render_history(&result, ctx.json, &ctx.render)?;
     Ok(true)
 }
 
@@ -486,7 +503,7 @@ fn handle_code_from_command(
         "/v1/code-from",
         vec![format!("selector={}", args.selector)],
     ))?;
-    render_code_from(&result, ctx.json, ctx.quiet)?;
+    render_code_from(&result, ctx.json, &ctx.render)?;
     Ok(true)
 }
 
@@ -503,7 +520,7 @@ fn handle_session_command(
                 "id": args.id,
             });
             let report: LaneSessionStartReport = client.post_json("/v1/sessions", &body)?;
-            render_session_start(&report, ctx.json, ctx.quiet)?;
+            render_session_start(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         SessionSubcommand::Current(args) => {
@@ -512,7 +529,7 @@ fn handle_session_command(
                 None => "/v1/sessions/current".to_string(),
             };
             let reports: Vec<LaneSessionCurrentReport> = client.get_json(&path)?;
-            render_session_current(&reports, ctx.json, ctx.quiet)?;
+            render_session_current(&reports, ctx.json, &ctx.render)?;
             Ok(true)
         }
         SessionSubcommand::List(args) => {
@@ -521,13 +538,13 @@ fn handle_session_command(
                 None => "/v1/sessions".to_string(),
             };
             let sessions: Vec<LaneSession> = client.get_json(&path)?;
-            render_session_list(&sessions, ctx.json, ctx.quiet)?;
+            render_session_list(&sessions, ctx.json, &ctx.render)?;
             Ok(true)
         }
         SessionSubcommand::Show(args) => {
             let details: LaneSessionDetails =
                 client.get_json(&format!("/v1/sessions/{}", args.session_id))?;
-            render_session_details(&details, ctx.json, ctx.quiet)?;
+            render_session_details(&details, ctx.json, &ctx.render)?;
             Ok(true)
         }
         SessionSubcommand::Context(args) => {
@@ -536,7 +553,7 @@ fn handle_session_command(
                 vec![format!("limit={}", args.limit)],
             );
             let report: LaneSessionContextReport = client.get_json(&path)?;
-            render_session_context(&report, ctx.json, ctx.quiet)?;
+            render_session_context(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         SessionSubcommand::End(args) => {
@@ -545,7 +562,7 @@ fn handle_session_command(
             });
             let report: LaneSessionEndReport =
                 client.post_json(&format!("/v1/sessions/{}/end", args.session_id), &body)?;
-            render_session_end(&report, ctx.json, ctx.quiet)?;
+            render_session_end(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }
@@ -573,7 +590,7 @@ fn handle_approvals_command(
             }
             let report: LaneApprovalRequestReport =
                 client.post_json("/v1/approvals", &Value::Object(body))?;
-            render_approval_request(&report, ctx.json, ctx.quiet)?;
+            render_approval_request(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         ApprovalsSubcommand::List(args) => {
@@ -586,13 +603,13 @@ fn handle_approvals_command(
             }
             let approvals: Vec<LaneApproval> =
                 client.get_json(&append_query("/v1/approvals", params))?;
-            render_approval_list(&approvals, ctx.json, ctx.quiet)?;
+            render_approval_list(&approvals, ctx.json, &ctx.render)?;
             Ok(true)
         }
         ApprovalsSubcommand::Show(args) => {
             let approval: LaneApproval =
                 client.get_json(&format!("/v1/approvals/{}", args.approval_id))?;
-            render_approval(&approval, ctx.json, ctx.quiet)?;
+            render_approval(&approval, ctx.json, &ctx.render)?;
             Ok(true)
         }
         ApprovalsSubcommand::Decide(args) => {
@@ -605,7 +622,7 @@ fn handle_approvals_command(
                 &format!("/v1/approvals/{}/decision", args.approval_id),
                 &body,
             )?;
-            render_approval_decision(&report, ctx.json, ctx.quiet)?;
+            render_approval_decision(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }
@@ -634,13 +651,13 @@ fn handle_lane_turn_command(
             }
             let report: LaneTurnStartReport =
                 client.post_json("/v1/lane/turns", &Value::Object(body))?;
-            render_lane_turn_start(&report, ctx.json, ctx.quiet)?;
+            render_lane_turn_start(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTurnSubcommand::Show(args) => {
             let details: LaneTurnDetails =
                 client.get_json(&format!("/v1/lane/turns/{}", args.turn_id))?;
-            render_lane_turn_details(&details, ctx.json, ctx.quiet)?;
+            render_lane_turn_details(&details, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTurnSubcommand::Message(args) => {
@@ -650,7 +667,7 @@ fn handle_lane_turn_command(
             });
             let report: LaneMessageReport =
                 client.post_json(&format!("/v1/lane/turns/{}/messages", args.turn_id), &body)?;
-            render_lane_message(&report, ctx.json, ctx.quiet)?;
+            render_lane_message(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTurnSubcommand::Event(args) => {
@@ -672,7 +689,7 @@ fn handle_lane_turn_command(
                 &format!("/v1/lane/turns/{}/events", args.turn_id),
                 &Value::Object(body),
             )?;
-            render_lane_turn_event(&report, ctx.json, ctx.quiet)?;
+            render_lane_turn_event(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTurnSubcommand::ApplyPatch(args) => {
@@ -687,7 +704,7 @@ fn handle_lane_turn_command(
             let body = serde_json::to_value(&patch)?;
             let report: LanePatchReport =
                 client.post_json(&format!("/v1/lane/turns/{}/patches", args.turn_id), &body)?;
-            render_lane_patch(&report, ctx.json, ctx.quiet)?;
+            render_lane_patch(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTurnSubcommand::End(args) => {
@@ -696,7 +713,7 @@ fn handle_lane_turn_command(
             });
             let report: LaneTurnEndReport =
                 client.post_json(&format!("/v1/lane/turns/{}/end", args.turn_id), &body)?;
-            render_lane_turn_end(&report, ctx.json, ctx.quiet)?;
+            render_lane_turn_end(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }
@@ -728,7 +745,7 @@ fn handle_lane_trace_command(
                 &format!("/v1/lane/turns/{}/spans", args.turn_id),
                 &Value::Object(body),
             )?;
-            render_lane_trace_span_start(&report, ctx.json, ctx.quiet)?;
+            render_lane_trace_span_start(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTraceSubcommand::End(args) => {
@@ -741,7 +758,7 @@ fn handle_lane_trace_command(
                 &format!("/v1/lane/spans/{}/end", args.span_id),
                 &Value::Object(body),
             )?;
-            render_lane_trace_span_end(&report, ctx.json, ctx.quiet)?;
+            render_lane_trace_span_end(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTraceSubcommand::List(args) => {
@@ -754,7 +771,7 @@ fn handle_lane_trace_command(
             params.push(format!("limit={}", args.limit));
             let path = append_query("/v1/lane/spans", params);
             let spans: Vec<LaneTraceSpan> = client.get_json(&path)?;
-            render_lane_trace_spans(&spans, ctx.json, ctx.quiet)?;
+            render_lane_trace_spans(&spans, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTraceSubcommand::Summary(args) => {
@@ -767,13 +784,13 @@ fn handle_lane_trace_command(
             params.push(format!("slowest={}", args.slowest_limit));
             let path = append_query("/v1/lane/spans/summary", params);
             let report: LaneTraceSummaryReport = client.get_json(&path)?;
-            render_lane_trace_summary(&report, ctx.json, ctx.quiet)?;
+            render_lane_trace_summary(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneTraceSubcommand::Show(args) => {
             let span: LaneTraceSpan =
                 client.get_json(&format!("/v1/lane/spans/{}", args.span_id))?;
-            render_lane_trace_span(&span, ctx.json, ctx.quiet)?;
+            render_lane_trace_span(&span, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }
@@ -814,12 +831,12 @@ fn handle_merge_queue_command(
                 "priority": args.priority,
             });
             let report: MergeQueueAddReport = client.post_json("/v1/merge-queue", &body)?;
-            render_merge_queue_add(&report, ctx.json, ctx.quiet)?;
+            render_merge_queue_add(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::List => {
             let entries: Vec<MergeQueueEntry> = client.get_json("/v1/merge-queue")?;
-            render_merge_queue_list(&entries, ctx.json, ctx.quiet)?;
+            render_merge_queue_list(&entries, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::Explain(args) => {
@@ -827,7 +844,7 @@ fn handle_merge_queue_command(
                 "/v1/merge-queue/explain?selector={}",
                 args.selector
             ))?;
-            render_merge_queue_explain(&report, ctx.json, ctx.quiet)?;
+            render_merge_queue_explain(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::Run(args) => {
@@ -836,13 +853,13 @@ fn handle_merge_queue_command(
                 None => serde_json::json!({}),
             };
             let report: MergeQueueRunReport = client.post_json("/v1/merge-queue/run", &body)?;
-            render_merge_queue_run(&report, ctx.json, ctx.quiet)?;
+            render_merge_queue_run(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         MergeQueueSubcommand::Remove(args) => {
             let report: MergeQueueRemoveReport =
                 client.delete_json(&format!("/v1/merge-queue/{}", args.selector))?;
-            render_merge_queue_remove(&report, ctx.json, ctx.quiet)?;
+            render_merge_queue_remove(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }
@@ -862,7 +879,7 @@ fn handle_lease_command(
                 "ttl_secs": args.ttl_secs,
             });
             let report: LeaseAcquireReport = client.post_json("/v1/leases", &body)?;
-            render_lease_acquire(&report, ctx.json, ctx.quiet)?;
+            render_lease_acquire(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LeaseSubcommand::List(args) => {
@@ -872,13 +889,13 @@ fn handle_lease_command(
                 "/v1/leases".to_string()
             };
             let leases: Vec<LeaseRecord> = client.get_json(&path)?;
-            render_lease_list(&leases, ctx.json, ctx.quiet)?;
+            render_lease_list(&leases, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LeaseSubcommand::Release(args) => {
             let report: LeaseReleaseReport =
                 client.delete_json(&format!("/v1/leases/{}", args.lease_id))?;
-            render_lease_release(&report, ctx.json, ctx.quiet)?;
+            render_lease_release(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }

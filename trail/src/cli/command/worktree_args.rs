@@ -93,6 +93,10 @@ pub(super) struct DiffArgs {
     pub(super) patch: bool,
     #[arg(long)]
     pub(super) stat: bool,
+    #[arg(long = "name-only")]
+    pub(super) name_only: bool,
+    #[arg(long = "name-status")]
+    pub(super) name_status: bool,
     #[arg(long)]
     pub(super) dirty: bool,
     #[arg(long)]

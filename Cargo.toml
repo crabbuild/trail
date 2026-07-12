@@ -95,6 +95,10 @@ thiserror = "1.0"
 tokio = { version = "1.45", features = ["rt-multi-thread", "time"] }
 toml = "0.8"
 unicode-normalization = "0.1"
+unicode-width = "0.2.2"
+terminal_size = "0.4.4"
+anstyle = "1.0.14"
+time = { version = "=0.3.36", features = ["formatting"] }
 walkdir = "2.5"
 zip = { version = "0.6.6", default-features = false, features = ["bzip2", "deflate"] }
 uniffi = "=0.31.0"

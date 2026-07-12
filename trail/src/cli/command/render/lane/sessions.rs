@@ -1,4 +1,4 @@
-use super::render_json;
+use crate::cli::command::render::*;
 
 use trail::model::*;
 use trail::Result;
@@ -6,175 +6,256 @@ use trail::Result;
 pub(crate) fn render_session_start(
     report: &LaneSessionStartReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!(
-            "Started session {} for {}",
-            report.session.session_id, report.session.lane_id
-        );
-        if let Some(title) = &report.session.title {
-            println!("Title: {title}");
-        }
-    }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("Started session {}", report.session.session_id),
+            UiTone::Success,
+        )
+        .block(session_metadata(&report.session))
+        .next(
+            format!("trail session context {}", report.session.session_id),
+            "inspect the growing session context",
+        ),
+        options,
+    )
 }
 
 pub(crate) fn render_session_current(
     reports: &[LaneSessionCurrentReport],
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(&reports);
     }
-    if !quiet {
-        if reports.is_empty() {
-            println!("No active sessions");
-        }
-        for report in reports {
-            match &report.session {
-                Some(session) => {
-                    let title = session.title.as_deref().unwrap_or("");
-                    println!(
-                        "{} {} {} {}",
-                        report.lane_name, session.session_id, session.status, title
-                    );
-                }
-                None => println!("{} has no active session", report.lane_name),
-            }
-        }
+    let active: Vec<_> = reports
+        .iter()
+        .filter_map(|report| report.session.as_ref().map(|session| (report, session)))
+        .collect();
+    if active.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No active sessions", UiTone::Neutral),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("{} active session(s)", active.len()),
+            UiTone::Success,
+        )
+        .block(UiBlock::Table(UiTable::new(
+            vec![
+                UiColumn::left("LANE", 0, 10),
+                UiColumn::left("STATUS", 0, 8),
+                UiColumn::left("TITLE", 0, 14),
+                UiColumn::left("SESSION", 2, 12),
+            ],
+            active
+                .iter()
+                .map(|(report, session)| {
+                    vec![
+                        report.lane_name.clone(),
+                        session.status.clone(),
+                        session.title.clone().unwrap_or_else(|| "—".to_string()),
+                        session.session_id.clone(),
+                    ]
+                })
+                .collect(),
+        ))),
+        options,
+    )
 }
 
-pub(crate) fn render_session_list(sessions: &[LaneSession], json: bool, quiet: bool) -> Result<()> {
+pub(crate) fn render_session_list(
+    sessions: &[LaneSession],
+    json: bool,
+    options: &RenderOptions,
+) -> Result<()> {
     if json {
         return render_json(&sessions);
     }
-    if !quiet {
-        if sessions.is_empty() {
-            println!("No sessions");
-        }
-        for session in sessions {
-            let title = session.title.as_deref().unwrap_or("");
-            println!(
-                "{} {} {} {}",
-                session.session_id, session.status, session.lane_id, title
-            );
-        }
+    if sessions.is_empty() {
+        return render_document(
+            &TerminalDocument::new("No sessions", UiTone::Neutral),
+            options,
+        );
     }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(format!("{} session(s)", sessions.len()), UiTone::Neutral).block(
+            UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("STATUS", 0, 8),
+                    UiColumn::left("LANE", 0, 10),
+                    UiColumn::left("TITLE", 0, 14),
+                    UiColumn::left("STARTED", 1, 10),
+                    UiColumn::left("SESSION", 2, 12),
+                ],
+                sessions
+                    .iter()
+                    .map(|session| {
+                        vec![
+                            session.status.clone(),
+                            session.lane_id.clone(),
+                            session.title.clone().unwrap_or_else(|| "—".to_string()),
+                            format_timestamp(session.started_at, options),
+                            session.session_id.clone(),
+                        ]
+                    })
+                    .collect(),
+            )),
+        ),
+        options,
+    )
 }
 
 pub(crate) fn render_session_details(
     details: &LaneSessionDetails,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(details);
     }
-    if !quiet {
-        println!("Session: {}", details.session.session_id);
-        println!("Lane: {}", details.session.lane_id);
-        println!("Status: {}", details.session.status);
-        if let Some(title) = &details.session.title {
-            println!("Title: {title}");
-        }
-        println!("Turns: {}", details.turns.len());
-        println!("Messages: {}", details.messages.len());
-        println!("Operations: {}", details.operations.len());
-        for turn in &details.turns {
-            let after = turn
-                .after_change
-                .as_ref()
-                .map(|change| change.0.as_str())
-                .unwrap_or("-");
-            println!("  {} {} {}", turn.turn_id, turn.status, after);
-        }
-        for operation in &details.operations {
-            let message = operation.message.as_deref().unwrap_or("");
-            println!(
-                "  op {} {:?} {}",
-                operation.change_id.0, operation.kind, message
-            );
-        }
+    let mut document = TerminalDocument::new(
+        format!("Session {}", details.session.session_id),
+        UiTone::Neutral,
+    )
+    .block(session_metadata(&details.session))
+    .block(UiBlock::Metadata(vec![
+        ("Turns".to_string(), details.turns.len().to_string()),
+        ("Messages".to_string(), details.messages.len().to_string()),
+        ("Events".to_string(), details.events.len().to_string()),
+        (
+            "Operations".to_string(),
+            details.operations.len().to_string(),
+        ),
+    ]));
+    if !details.turns.is_empty() {
+        document = document.block(UiBlock::section(
+            "Turns:",
+            vec![UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("STATUS", 0, 8),
+                    UiColumn::left("CHECKPOINT", 1, 12),
+                    UiColumn::left("TURN", 0, 12),
+                ],
+                details
+                    .turns
+                    .iter()
+                    .map(|turn| {
+                        vec![
+                            turn.status.clone(),
+                            turn.after_change
+                                .as_ref()
+                                .map(|change| change.0.clone())
+                                .unwrap_or_else(|| "—".to_string()),
+                            turn.turn_id.clone(),
+                        ]
+                    })
+                    .collect(),
+            ))],
+        ));
     }
-    Ok(())
+    document = document.next(
+        format!("trail session context {}", details.session.session_id),
+        "review recent messages, turns, and operations",
+    );
+    render_document(&document.pager_eligible(), options)
 }
 
 pub(crate) fn render_session_context(
     report: &LaneSessionContextReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!("Session context: {}", report.session.session_id);
-        println!("Lane: {}", report.session.lane_id);
-        println!("Status: {}", report.session.status);
-        if let Some(title) = &report.session.title {
-            println!("Title: {title}");
-        }
-        println!(
-            "Totals: {} messages, {} events, {} turns, {} operations",
-            report.message_count, report.event_count, report.turn_count, report.operation_count
-        );
-        if !report.recent_messages.is_empty() {
-            println!("Recent messages:");
-            for message in &report.recent_messages {
-                let preview = single_line_preview(&message.body, 80);
-                println!("  {} {} {}", message.id.0, message.role, preview);
-            }
-        }
-        if !report.recent_turns.is_empty() {
-            println!("Recent turns:");
-            for turn in &report.recent_turns {
-                println!("  {} {}", turn.turn_id, turn.status);
-            }
-        }
-        if !report.recent_operations.is_empty() {
-            println!("Recent operations:");
-            for operation in &report.recent_operations {
-                let message = operation.message.as_deref().unwrap_or("");
-                println!(
-                    "  {} {:?} {}",
-                    operation.change_id.0, operation.kind, message
-                );
-            }
-        }
+    let mut document = TerminalDocument::new(
+        format!("Session context: {}", report.session.session_id),
+        UiTone::Neutral,
+    )
+    .block(session_metadata(&report.session))
+    .block(UiBlock::Metadata(vec![
+        ("Messages".to_string(), report.message_count.to_string()),
+        ("Events".to_string(), report.event_count.to_string()),
+        ("Turns".to_string(), report.turn_count.to_string()),
+        ("Operations".to_string(), report.operation_count.to_string()),
+    ]));
+    if !report.recent_messages.is_empty() {
+        document = document.block(UiBlock::section(
+            "Recent messages:",
+            vec![UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("ROLE", 0, 8),
+                    UiColumn::left("MESSAGE", 0, 28),
+                ],
+                report
+                    .recent_messages
+                    .iter()
+                    .map(|message| vec![message.role.clone(), preview(&message.body, 100)])
+                    .collect(),
+            ))],
+        ));
     }
-    Ok(())
+    if !report.recent_turns.is_empty() {
+        document = document.block(UiBlock::section(
+            "Recent turns:",
+            vec![UiBlock::Table(UiTable::new(
+                vec![
+                    UiColumn::left("STATUS", 0, 8),
+                    UiColumn::left("TURN", 0, 12),
+                ],
+                report
+                    .recent_turns
+                    .iter()
+                    .map(|turn| vec![turn.status.clone(), turn.turn_id.clone()])
+                    .collect(),
+            ))],
+        ));
+    }
+    render_document(&document.pager_eligible(), options)
 }
 
 pub(crate) fn render_session_end(
     report: &LaneSessionEndReport,
     json: bool,
-    quiet: bool,
+    options: &RenderOptions,
 ) -> Result<()> {
     if json {
         return render_json(report);
     }
-    if !quiet {
-        println!(
-            "Ended session {} as {}",
-            report.session.session_id, report.session.status
-        );
-    }
-    Ok(())
+    render_document(
+        &TerminalDocument::new(
+            format!("Ended session {}", report.session.session_id),
+            UiTone::Success,
+        )
+        .block(session_metadata(&report.session)),
+        options,
+    )
 }
 
-fn single_line_preview(value: &str, limit: usize) -> String {
+fn session_metadata(session: &LaneSession) -> UiBlock {
+    let mut metadata = vec![
+        ("Lane".to_string(), session.lane_id.clone()),
+        ("Status".to_string(), session.status.clone()),
+    ];
+    if let Some(title) = &session.title {
+        metadata.push(("Title".to_string(), title.clone()));
+    }
+    UiBlock::Metadata(metadata)
+}
+
+fn preview(value: &str, limit: usize) -> String {
     let mut preview = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if preview.len() > limit {
-        preview.truncate(limit.saturating_sub(3));
-        preview.push_str("...");
+    if preview.chars().count() > limit {
+        preview = preview.chars().take(limit.saturating_sub(1)).collect();
+        preview.push('…');
     }
     preview
 }
