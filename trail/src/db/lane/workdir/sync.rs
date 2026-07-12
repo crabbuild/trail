@@ -6,11 +6,16 @@ impl Trail {
         let branch = self.lane_branch(lane)?;
         let record = self.lane_record(&branch.lane_id)?;
         let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
+        let requested_workdir_mode = self.lane_requested_workdir_mode_for(&record, &branch)?;
+        let workdir_backend = self.lane_workdir_backend_for(&record)?;
+        let materialization = self.lane_materialization_report_for(&record)?;
         let sparse_paths = self.lane_report_sparse_paths(&branch)?;
         Ok(LaneWorkdirReport {
             lane_id: branch.lane_id,
             workdir: branch.workdir,
-            cow_backend: workdir_mode.cow_backend().map(str::to_string),
+            requested_workdir_mode,
+            workdir_backend,
+            materialization,
             sparse_paths,
             transparent_cow_available: workdir_mode.is_transparent_cow(),
             workdir_mode,
@@ -118,6 +123,8 @@ impl Trail {
         let workdir_path = PathBuf::from(&workdir);
         let workdir_mode =
             self.lane_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
+        let requested_workdir_mode =
+            self.lane_requested_workdir_mode_for(&self.lane_record(&branch.lane_id)?, &branch)?;
         if workdir_mode == LaneWorkdirMode::NfsCow {
             return self.sync_nfs_cow_lane_workdir(
                 lane,
@@ -210,6 +217,7 @@ impl Trail {
         } else {
             None
         };
+        let mut materialization_outcome = None;
         if path_scoped {
             if workdir_path_is_non_dir {
                 remove_existing_lane_workdir_path(&workdir_path)?;
@@ -229,11 +237,12 @@ impl Trail {
                 target_files
             };
             if force || !workdir_exists {
-                self.materialize_full_lane_workdir_staged(
+                materialization_outcome = self.materialize_full_lane_workdir_staged(
                     &workdir_path,
                     &head.root_id,
                     &target_files,
                     sparse_paths.is_some(),
+                    &requested_workdir_mode,
                 )?;
             } else {
                 fs::create_dir_all(&workdir_path)?;
@@ -255,6 +264,13 @@ impl Trail {
                 )?;
             }
         }
+        if let Some(outcome) = &materialization_outcome {
+            self.update_lane_materialization_metadata(
+                &branch.lane_id,
+                &requested_workdir_mode,
+                outcome,
+            )?;
+        }
         self.insert_lane_event(
             &branch.lane_id,
             "workdir_synced",
@@ -266,6 +282,10 @@ impl Trail {
                 "rescue_workdir": rescue_workdir.clone(),
                 "paths": selected_paths,
                 "include_neighbors": include_neighbors,
+                "requested_workdir_mode": requested_workdir_mode.as_str(),
+                "workdir_mode": materialization_outcome.as_ref().map(|outcome| outcome.resolved_mode.as_str()),
+                "workdir_backend": materialization_outcome.as_ref().map(|outcome| outcome.backend.as_str()),
+                "materialization": materialization_outcome.as_ref().map(|outcome| &outcome.report),
                 "changed_paths": changed_paths.iter().map(|item| item.path.clone()).collect::<Vec<_>>()
             }),
         )?;
@@ -343,12 +363,29 @@ impl Trail {
         root_id: &ObjectId,
         target_files: &BTreeMap<String, FileEntry>,
         sparse: bool,
-    ) -> Result<()> {
+        requested_mode: &LaneWorkdirMode,
+    ) -> Result<Option<MaterializationOutcome>> {
         let parent = workdir_path.parent().ok_or_else(|| Error::InvalidPath {
             path: workdir_path.to_string_lossy().to_string(),
             reason: "workdir path has no parent".to_string(),
         })?;
         fs::create_dir_all(parent)?;
+        if !sparse
+            && matches!(
+                requested_mode,
+                LaneWorkdirMode::Auto | LaneWorkdirMode::NativeCow | LaneWorkdirMode::PortableCopy
+            )
+        {
+            let replacement = create_unique_lane_workdir_replacement_target(parent, workdir_path)?;
+            let policy = materialization_policy_for_mode(requested_mode);
+            let outcome =
+                self.materialize_lane_root_staged(root_id, &replacement, false, policy)?;
+            if let Err(error) = replace_lane_workdir_with_stage(workdir_path, &replacement) {
+                let _ = fs::remove_dir_all(&replacement);
+                return Err(error);
+            }
+            return Ok(Some(outcome));
+        }
         let stage_dir = create_unique_lane_workdir_sync_stage_dir(parent, workdir_path)?;
         let result = (|| -> Result<()> {
             let empty = BTreeMap::new();
@@ -376,7 +413,7 @@ impl Trail {
         if result.is_err() {
             let _ = fs::remove_dir_all(&stage_dir);
         }
-        result
+        result.map(|()| None)
     }
 
     fn rescue_dirty_lane_workdir(
@@ -801,6 +838,36 @@ fn create_unique_lane_workdir_sync_stage_dir(
     Err(Error::InvalidInput(
         "could not create unique lane workdir sync staging directory".to_string(),
     ))
+}
+
+fn create_unique_lane_workdir_replacement_target(
+    parent: &Path,
+    workdir_path: &Path,
+) -> Result<PathBuf> {
+    let leaf = workdir_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "workdir".into());
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".{leaf}.trail-next-{}", now_nanos()));
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Err(Error::InvalidInput(
+        "could not reserve a unique lane workdir replacement target".to_string(),
+    ))
+}
+
+fn materialization_policy_for_mode(mode: &LaneWorkdirMode) -> MaterializationPolicy {
+    match mode {
+        LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
+        LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
+        LaneWorkdirMode::Auto => MaterializationPolicy::Auto,
+        _ => MaterializationPolicy::Portable,
+    }
 }
 
 fn replace_lane_workdir_with_stage(workdir_path: &Path, stage_dir: &Path) -> Result<()> {

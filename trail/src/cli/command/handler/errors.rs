@@ -176,6 +176,19 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
+        Error::CloneUnsupported | Error::CloneCrossDevice | Error::NativeCowSourceUnavailable => {
+            let mut diagnostic = UiDiagnostic::new(err.code(), "Strict native COW is unavailable");
+            diagnostic.consequence = Some(
+                "Trail did not publish a partially cloned workdir or copy bytes for the strict request."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: "trail lane spawn --workdir-mode portable-copy".to_string(),
+                reason: "Use portable materialization with truthful clone/copy reporting."
+                    .to_string(),
+            });
+            diagnostic
+        }
         Error::RefNotFound(_)
         | Error::OperationNotFound(_)
         | Error::RootNotFound(_)

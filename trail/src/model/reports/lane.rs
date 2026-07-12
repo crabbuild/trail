@@ -1,9 +1,11 @@
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum LaneWorkdirMode {
+    Auto,
     Virtual,
     Sparse,
     NativeCow,
+    PortableCopy,
     FuseCow,
     NfsCow,
     DokanCow,
@@ -12,9 +14,11 @@ pub enum LaneWorkdirMode {
 impl LaneWorkdirMode {
     pub fn as_str(&self) -> &'static str {
         match self {
+            LaneWorkdirMode::Auto => "auto",
             LaneWorkdirMode::Virtual => "virtual",
             LaneWorkdirMode::Sparse => "sparse",
             LaneWorkdirMode::NativeCow => "native-cow",
+            LaneWorkdirMode::PortableCopy => "portable-copy",
             LaneWorkdirMode::FuseCow => "fuse-cow",
             LaneWorkdirMode::NfsCow => "nfs-cow",
             LaneWorkdirMode::DokanCow => "dokan-cow",
@@ -23,9 +27,11 @@ impl LaneWorkdirMode {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "auto" => Some(LaneWorkdirMode::Auto),
             "virtual" => Some(LaneWorkdirMode::Virtual),
             "sparse" => Some(LaneWorkdirMode::Sparse),
             "native-cow" | "native_cow" => Some(LaneWorkdirMode::NativeCow),
+            "portable-copy" | "portable_copy" => Some(LaneWorkdirMode::PortableCopy),
             "fuse-cow" | "fuse_cow" => Some(LaneWorkdirMode::FuseCow),
             "nfs-cow" | "nfs_cow" => Some(LaneWorkdirMode::NfsCow),
             "dokan-cow" | "dokan_cow" => Some(LaneWorkdirMode::DokanCow),
@@ -37,14 +43,21 @@ impl LaneWorkdirMode {
         !matches!(self, LaneWorkdirMode::Virtual)
     }
 
-    pub fn cow_backend(&self) -> Option<&'static str> {
+    pub fn default_backend(&self) -> Option<WorkdirBackend> {
         match self {
-            LaneWorkdirMode::Virtual => None,
-            LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => Some("clone"),
-            LaneWorkdirMode::FuseCow => Some("fuse"),
-            LaneWorkdirMode::NfsCow => Some("nfs"),
-            LaneWorkdirMode::DokanCow => Some("dokan"),
+            LaneWorkdirMode::Auto | LaneWorkdirMode::PortableCopy => None,
+            LaneWorkdirMode::Virtual => Some(WorkdirBackend::Virtual),
+            LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => {
+                Some(WorkdirBackend::Clone)
+            }
+            LaneWorkdirMode::FuseCow => Some(WorkdirBackend::Fuse),
+            LaneWorkdirMode::NfsCow => Some(WorkdirBackend::Nfs),
+            LaneWorkdirMode::DokanCow => Some(WorkdirBackend::Dokan),
         }
+    }
+
+    pub fn cow_backend(&self) -> Option<&'static str> {
+        self.default_backend().map(WorkdirBackend::as_str)
     }
 
     pub fn is_transparent_cow(&self) -> bool {
@@ -55,14 +68,72 @@ impl LaneWorkdirMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkdirBackend {
+    Clone,
+    Mixed,
+    Copy,
+    Fuse,
+    Nfs,
+    Dokan,
+    Virtual,
+}
+
+impl WorkdirBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkdirBackend::Clone => "clone",
+            WorkdirBackend::Mixed => "mixed",
+            WorkdirBackend::Copy => "copy",
+            WorkdirBackend::Fuse => "fuse",
+            WorkdirBackend::Nfs => "nfs",
+            WorkdirBackend::Dokan => "dokan",
+            WorkdirBackend::Virtual => "virtual",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaterializationFallbackReason {
+    CloneUnsupported,
+    CrossDevice,
+    NativeSourceUnavailable,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializationReport {
+    pub cloned_files: u64,
+    pub cloned_bytes: u64,
+    pub copied_files: u64,
+    pub copied_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<MaterializationFallbackReason>,
+}
+
+impl MaterializationReport {
+    pub fn backend(&self) -> WorkdirBackend {
+        match (self.cloned_files > 0, self.copied_files > 0) {
+            (true, true) => WorkdirBackend::Mixed,
+            (true, false) => WorkdirBackend::Clone,
+            (false, true) => WorkdirBackend::Copy,
+            (false, false) => WorkdirBackend::Clone,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneSpawnReport {
     pub lane_id: String,
     pub ref_name: String,
     pub base_change: ChangeId,
     pub workdir: Option<String>,
+    pub requested_workdir_mode: LaneWorkdirMode,
     pub workdir_mode: LaneWorkdirMode,
-    pub cow_backend: Option<String>,
+    pub workdir_backend: Option<WorkdirBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<MaterializationReport>,
     pub sparse_paths: Vec<String>,
     pub transparent_cow_available: bool,
 }
@@ -750,8 +821,11 @@ pub struct LaneRewindReport {
 pub struct LaneWorkdirReport {
     pub lane_id: String,
     pub workdir: Option<String>,
+    pub requested_workdir_mode: LaneWorkdirMode,
     pub workdir_mode: LaneWorkdirMode,
-    pub cow_backend: Option<String>,
+    pub workdir_backend: Option<WorkdirBackend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<MaterializationReport>,
     pub sparse_paths: Vec<String>,
     pub transparent_cow_available: bool,
 }
@@ -898,9 +972,32 @@ mod workdir_mode_tests {
         assert_eq!(LaneWorkdirMode::parse("overlay_cow"), None);
         assert_eq!(LaneWorkdirMode::parse("full-cow"), None);
         assert_eq!(LaneWorkdirMode::parse("full_cow"), None);
+        assert_eq!(LaneWorkdirMode::parse("auto"), Some(LaneWorkdirMode::Auto));
+        assert_eq!(
+            LaneWorkdirMode::parse("portable-copy"),
+            Some(LaneWorkdirMode::PortableCopy)
+        );
+        assert_eq!(
+            LaneWorkdirMode::parse("portable_copy"),
+            Some(LaneWorkdirMode::PortableCopy)
+        );
         assert_eq!(LaneWorkdirMode::NativeCow.cow_backend(), Some("clone"));
+        assert_eq!(LaneWorkdirMode::Auto.cow_backend(), None);
+        assert_eq!(LaneWorkdirMode::PortableCopy.cow_backend(), None);
         assert_eq!(LaneWorkdirMode::FuseCow.cow_backend(), Some("fuse"));
         assert_eq!(LaneWorkdirMode::NfsCow.cow_backend(), Some("nfs"));
         assert_eq!(LaneWorkdirMode::DokanCow.cow_backend(), Some("dokan"));
+    }
+
+    #[test]
+    fn materialization_report_derives_actual_backend() {
+        let mut report = MaterializationReport::default();
+        assert_eq!(report.backend(), WorkdirBackend::Clone);
+        report.copied_files = 1;
+        assert_eq!(report.backend(), WorkdirBackend::Copy);
+        report.cloned_files = 1;
+        assert_eq!(report.backend(), WorkdirBackend::Mixed);
+        report.copied_files = 0;
+        assert_eq!(report.backend(), WorkdirBackend::Clone);
     }
 }

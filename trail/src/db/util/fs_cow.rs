@@ -5,7 +5,19 @@ use sha2::{Digest, Sha256};
 pub(crate) enum WorkspaceCowMaterializeStatus {
     Cloned(WorkdirFileStamp),
     Skipped,
-    Unavailable,
+    Unavailable(NativeCloneUnavailable),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeCloneUnavailable {
+    Unsupported,
+    CrossDevice,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeCloneOutcome {
+    Cloned,
+    Unavailable(NativeCloneUnavailable),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,16 +35,11 @@ pub(crate) fn clone_or_copy_projected_file(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    match cow_clone_file(source, destination) {
-        Ok(true) => Ok(FileProjectionCopy::Cloned),
-        Ok(false) => {
-            let _ = fs::remove_file(destination);
+    match clone_file_native(source, destination)? {
+        NativeCloneOutcome::Cloned => Ok(FileProjectionCopy::Cloned),
+        NativeCloneOutcome::Unavailable(_) => {
             fs::copy(source, destination)?;
             Ok(FileProjectionCopy::Copied)
-        }
-        Err(err) => {
-            let _ = fs::remove_file(destination);
-            Err(Error::Io(err))
         }
     }
 }
@@ -82,7 +89,7 @@ pub(crate) fn materialize_from_workspace_cow_report(
         WorkspaceCowMaterializeStatus::Cloned(stamp) => {
             report.insert_stamp(first_path.clone(), stamp);
         }
-        WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable => {
+        WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable(_) => {
             return Ok(None);
         }
     }
@@ -118,7 +125,8 @@ pub(crate) fn materialize_from_workspace_cow_report(
             }
             Ok((
                 _,
-                WorkspaceCowMaterializeStatus::Skipped | WorkspaceCowMaterializeStatus::Unavailable,
+                WorkspaceCowMaterializeStatus::Skipped
+                | WorkspaceCowMaterializeStatus::Unavailable(_),
             )) => {
                 rejected = true;
             }
@@ -158,10 +166,16 @@ pub(crate) fn materialize_workspace_file_cow_status_if_matching(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    clone_file_cow_clean(&source, &destination, entry.executable, false)
+    clone_file_cow_clean(
+        &source,
+        &destination,
+        entry.executable,
+        &entry.content_hash,
+        false,
+    )
 }
 
-fn materialize_workspace_file_cow_status_if_stamp_matches(
+pub(crate) fn materialize_workspace_file_cow_status_if_stamp_matches(
     workspace_root: &Path,
     output_root: &Path,
     path: &str,
@@ -182,7 +196,13 @@ fn materialize_workspace_file_cow_status_if_stamp_matches(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    clone_file_cow_clean(&source, &destination, entry.executable, durable)
+    clone_file_cow_clean(
+        &source,
+        &destination,
+        entry.executable,
+        &entry.content_hash,
+        durable,
+    )
 }
 
 fn workspace_file_matches_entry(source: &Path, entry: &FileEntry) -> Result<bool> {
@@ -228,13 +248,20 @@ fn clone_file_cow_clean(
     source: &Path,
     destination: &Path,
     executable: bool,
+    expected_content_hash: &str,
     durable: bool,
 ) -> Result<WorkspaceCowMaterializeStatus> {
-    match cow_clone_file(source, destination) {
-        Ok(true) => {
+    match clone_file_native(source, destination)? {
+        NativeCloneOutcome::Cloned => {
             let result = (|| -> Result<bool> {
                 set_executable(destination, executable)?;
                 let clean = clear_cloned_xattrs(destination)?;
+                if clean && sha256_file_hex(destination)? != expected_content_hash {
+                    return Err(Error::Corrupt(format!(
+                        "native clone `{}` does not match the immutable root",
+                        destination.display()
+                    )));
+                }
                 if clean && durable {
                     sync_cloned_file(destination)?;
                     if let Some(parent) = destination.parent() {
@@ -252,16 +279,13 @@ fn clone_file_cow_clean(
                     WorkdirFileStamp::from_metadata(&metadata),
                 ))
             } else {
-                Ok(WorkspaceCowMaterializeStatus::Unavailable)
+                Ok(WorkspaceCowMaterializeStatus::Unavailable(
+                    NativeCloneUnavailable::Unsupported,
+                ))
             }
         }
-        Ok(false) => {
-            let _ = fs::remove_file(destination);
-            Ok(WorkspaceCowMaterializeStatus::Unavailable)
-        }
-        Err(err) => {
-            let _ = fs::remove_file(destination);
-            Err(Error::Io(err))
+        NativeCloneOutcome::Unavailable(reason) => {
+            Ok(WorkspaceCowMaterializeStatus::Unavailable(reason))
         }
     }
 }
@@ -274,7 +298,7 @@ fn remove_cow_attempt_files(output_root: &Path, paths: &[String]) {
     }
 }
 
-fn sha256_file_hex(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -289,7 +313,7 @@ fn sha256_file_hex(path: &Path) -> Result<String> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn cow_clone_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
+pub(crate) fn clone_file_native(source: &Path, destination: &Path) -> Result<NativeCloneOutcome> {
     use rustix::fs::{fclonefileat, CloneFlags};
 
     let source_file = fs::File::open(source)?;
@@ -306,23 +330,29 @@ fn cow_clone_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
         )
     })?;
     let parent_dir = fs::File::open(parent)?;
-    match fclonefileat(
+    let result = match fclonefileat(
         &source_file,
         &parent_dir,
         file_name,
         CloneFlags::NOFOLLOW | CloneFlags::NOOWNERCOPY,
     ) {
-        Ok(()) => Ok(true),
-        Err(err) if cow_clone_unavailable(err) => Ok(false),
-        Err(err) => Err(err.into()),
+        Ok(()) => Ok(NativeCloneOutcome::Cloned),
+        Err(err) => match native_clone_unavailable(err) {
+            Some(reason) => Ok(NativeCloneOutcome::Unavailable(reason)),
+            None => Err(Error::Io(err.into())),
+        },
+    };
+    if !matches!(result, Ok(NativeCloneOutcome::Cloned)) {
+        let _ = fs::remove_file(destination);
     }
+    result
 }
 
 #[cfg(all(
     target_os = "linux",
     not(any(target_arch = "sparc", target_arch = "sparc64"))
 ))]
-fn cow_clone_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
+pub(crate) fn clone_file_native(source: &Path, destination: &Path) -> Result<NativeCloneOutcome> {
     use rustix::fs::ioctl_ficlone;
 
     let source_file = fs::File::open(source)?;
@@ -330,11 +360,18 @@ fn cow_clone_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
         .write(true)
         .create_new(true)
         .open(destination)?;
-    match ioctl_ficlone(&destination_file, &source_file) {
-        Ok(()) => Ok(true),
-        Err(err) if cow_clone_unavailable(err) => Ok(false),
-        Err(err) => Err(err.into()),
+    let result = match ioctl_ficlone(&destination_file, &source_file) {
+        Ok(()) => Ok(NativeCloneOutcome::Cloned),
+        Err(err) => match native_clone_unavailable(err) {
+            Some(reason) => Ok(NativeCloneOutcome::Unavailable(reason)),
+            None => Err(Error::Io(err.into())),
+        },
+    };
+    if !matches!(result, Ok(NativeCloneOutcome::Cloned)) {
+        drop(destination_file);
+        let _ = fs::remove_file(destination);
     }
+    result
 }
 
 #[cfg(not(any(
@@ -345,8 +382,10 @@ fn cow_clone_file(source: &Path, destination: &Path) -> std::io::Result<bool> {
         not(any(target_arch = "sparc", target_arch = "sparc64"))
     )
 )))]
-fn cow_clone_file(_source: &Path, _destination: &Path) -> std::io::Result<bool> {
-    Ok(false)
+pub(crate) fn clone_file_native(_source: &Path, _destination: &Path) -> Result<NativeCloneOutcome> {
+    Ok(NativeCloneOutcome::Unavailable(
+        NativeCloneUnavailable::Unsupported,
+    ))
 }
 
 #[cfg(any(
@@ -365,7 +404,7 @@ fn clear_cloned_xattrs(path: &Path) -> std::io::Result<bool> {
     let mut empty: [u8; 0] = [];
     let size = match listxattr(path, &mut empty) {
         Ok(size) => size,
-        Err(err) if cow_clone_unavailable(err) => return Ok(false),
+        Err(err) if native_clone_unavailable(err).is_some() => return Ok(false),
         Err(err) => return Err(err.into()),
     };
     if size == 0 {
@@ -375,7 +414,7 @@ fn clear_cloned_xattrs(path: &Path) -> std::io::Result<bool> {
     let mut names = vec![0; size];
     let size = match listxattr(path, &mut names) {
         Ok(size) => size,
-        Err(err) if cow_clone_unavailable(err) => return Ok(false),
+        Err(err) if native_clone_unavailable(err).is_some() => return Ok(false),
         Err(err) => return Err(err.into()),
     };
     names.truncate(size);
@@ -391,7 +430,7 @@ fn clear_cloned_xattrs(path: &Path) -> std::io::Result<bool> {
         })?;
         match removexattr(path, name.as_c_str()) {
             Ok(()) => {}
-            Err(err) if cow_clone_unavailable(err) => return Ok(false),
+            Err(err) if native_clone_unavailable(err).is_some() => return Ok(false),
             Err(err) => return Err(err.into()),
         }
     }
@@ -418,22 +457,47 @@ fn clear_cloned_xattrs(_path: &Path) -> std::io::Result<bool> {
         not(any(target_arch = "sparc", target_arch = "sparc64"))
     )
 ))]
-fn cow_clone_unavailable(err: rustix::io::Errno) -> bool {
-    err == rustix::io::Errno::NOTSUP
+fn native_clone_unavailable(err: rustix::io::Errno) -> Option<NativeCloneUnavailable> {
+    if err == rustix::io::Errno::XDEV {
+        return Some(NativeCloneUnavailable::CrossDevice);
+    }
+    if err == rustix::io::Errno::NOTSUP
         || err == rustix::io::Errno::OPNOTSUPP
         || matches!(
             err,
-            rustix::io::Errno::NOSYS
-                | rustix::io::Errno::XDEV
-                | rustix::io::Errno::INVAL
-                | rustix::io::Errno::PERM
-                | rustix::io::Errno::ACCESS
+            rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::NOTTY
         )
+    {
+        return Some(NativeCloneUnavailable::Unsupported);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        all(
+            target_os = "linux",
+            not(any(target_arch = "sparc", target_arch = "sparc64"))
+        )
+    ))]
+    #[test]
+    fn clone_classifier_keeps_permissions_as_hard_errors() {
+        assert_eq!(native_clone_unavailable(rustix::io::Errno::PERM), None);
+        assert_eq!(native_clone_unavailable(rustix::io::Errno::ACCESS), None);
+        assert_eq!(
+            native_clone_unavailable(rustix::io::Errno::XDEV),
+            Some(NativeCloneUnavailable::CrossDevice)
+        );
+        assert_eq!(
+            native_clone_unavailable(rustix::io::Errno::NOTTY),
+            Some(NativeCloneUnavailable::Unsupported)
+        );
+    }
 
     fn parallel_cow_clone_test_entry(bytes: &[u8]) -> FileEntry {
         let change = ChangeId("change_test".to_string());

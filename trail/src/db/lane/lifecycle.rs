@@ -1,3 +1,4 @@
+use super::workdir::{MaterializationOutcome, MaterializationPolicy};
 use super::*;
 
 const LARGE_LANE_MATERIALIZE_FILE_THRESHOLD: u64 = 10_000;
@@ -29,7 +30,7 @@ impl Trail {
         sparse_paths: &[String],
     ) -> Result<LaneWorkdirMode> {
         let mode = if let Some("auto") = requested_mode {
-            self.resolve_automatic_lane_workdir_mode(from)?
+            LaneWorkdirMode::Auto
         } else if let Some(requested_mode) = requested_mode {
             parse_lane_workdir_mode(requested_mode)?
         } else if no_materialize || materialize == Some(false) {
@@ -37,9 +38,9 @@ impl Trail {
         } else if !sparse_paths.is_empty() {
             LaneWorkdirMode::Sparse
         } else if custom_workdir || materialize == Some(true) {
-            LaneWorkdirMode::NativeCow
+            LaneWorkdirMode::Auto
         } else if self.default_lane_materialize_for_ref(from)? {
-            LaneWorkdirMode::NativeCow
+            LaneWorkdirMode::Auto
         } else {
             LaneWorkdirMode::Virtual
         };
@@ -61,41 +62,6 @@ impl Trail {
         }
         validate_lane_workdir_mode_request(&mode, custom_workdir, sparse_paths)?;
         Ok(mode)
-    }
-
-    fn resolve_automatic_lane_workdir_mode(&self, from: Option<&str>) -> Result<LaneWorkdirMode> {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = from;
-            Ok(LaneWorkdirMode::DokanCow)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            #[cfg(target_os = "macos")]
-            {
-                if Path::new("/sbin/mount_nfs").is_file() {
-                    return Ok(LaneWorkdirMode::NfsCow);
-                }
-            }
-            #[cfg(target_os = "linux")]
-            {
-                if Path::new("/dev/fuse").exists() {
-                    return Ok(LaneWorkdirMode::FuseCow);
-                }
-            }
-            let source = match from {
-                Some(refish) => self.resolve_refish(refish)?,
-                None => self.resolve_branch_ref(&self.current_branch()?)?,
-            };
-            let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &source.root_id)?;
-            if root.file_count > LARGE_LANE_MATERIALIZE_FILE_THRESHOLD {
-                return Err(Error::InvalidInput(format!(
-                    "automatic layered workdir selection found no available mount backend for a {}-path root; install/enable FUSE, use nfs-cow on macOS, Dokan on Windows, or explicitly accept native-cow",
-                    root.file_count
-                )));
-            }
-            Ok(LaneWorkdirMode::NativeCow)
-        }
     }
 
     pub fn spawn_lane(
@@ -156,7 +122,7 @@ impl Trail {
     ) -> Result<LaneSpawnReport> {
         let workdir_mode = if materialize {
             if sparse_paths.is_empty() {
-                LaneWorkdirMode::NativeCow
+                LaneWorkdirMode::Auto
             } else {
                 LaneWorkdirMode::Sparse
             }
@@ -206,6 +172,11 @@ impl Trail {
         };
         let transparent_cow_available = workdir_mode.is_transparent_cow();
         let mut sparse_policy_paths = None;
+        let mut resolved_workdir_mode = workdir_mode.clone();
+        let mut workdir_backend = workdir_mode
+            .default_backend()
+            .unwrap_or(WorkdirBackend::Clone);
+        let mut materialization_report = None;
         let materialized_workdir = if let Some(dir) = &workdir_path {
             match &workdir_mode {
                 LaneWorkdirMode::FuseCow => {
@@ -222,7 +193,7 @@ impl Trail {
                 LaneWorkdirMode::NfsCow => {
                     self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
                 }
-                LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => {
+                LaneWorkdirMode::Sparse => {
                     self.materialize_lane_workdir_at_paths_with_neighbors(
                         &source.root_id,
                         dir,
@@ -234,6 +205,25 @@ impl Trail {
                         sparse_policy_paths = self.sparse_workdir_paths(dir)?;
                     }
                 }
+                LaneWorkdirMode::NativeCow
+                | LaneWorkdirMode::PortableCopy
+                | LaneWorkdirMode::Auto => {
+                    let policy = match workdir_mode {
+                        LaneWorkdirMode::NativeCow => MaterializationPolicy::StrictNative,
+                        LaneWorkdirMode::PortableCopy => MaterializationPolicy::Portable,
+                        LaneWorkdirMode::Auto => MaterializationPolicy::Auto,
+                        _ => unreachable!(),
+                    };
+                    let outcome = self.materialize_lane_root_staged(
+                        &source.root_id,
+                        dir,
+                        workdir.is_some(),
+                        policy,
+                    )?;
+                    resolved_workdir_mode = outcome.resolved_mode;
+                    workdir_backend = outcome.backend;
+                    materialization_report = Some(outcome.report);
+                }
                 LaneWorkdirMode::Virtual => {}
             }
             Some(dir.to_string_lossy().to_string())
@@ -241,9 +231,12 @@ impl Trail {
             None
         };
         let sparse_paths_for_report = sparse_policy_paths.clone().unwrap_or_default();
+        let requested_workdir_mode = workdir_mode.clone();
         let metadata_json = serde_json::to_string(&serde_json::json!({
-            "workdir_mode": workdir_mode.as_str(),
-            "cow_backend": workdir_mode.cow_backend(),
+            "requested_workdir_mode": requested_workdir_mode.as_str(),
+            "workdir_mode": resolved_workdir_mode.as_str(),
+            "workdir_backend": workdir_backend.as_str(),
+            "materialization": materialization_report,
             "sparse_paths": sparse_paths_for_report,
             "include_neighbors": include_neighbors,
             "transparent_cow_available": transparent_cow_available
@@ -305,8 +298,10 @@ impl Trail {
                 "ref_name": ref_name.clone(),
                 "base_root": source.root_id.0.clone(),
                 "workdir": materialized_workdir.clone(),
-                "workdir_mode": workdir_mode.as_str(),
-                "cow_backend": workdir_mode.cow_backend(),
+                "requested_workdir_mode": requested_workdir_mode.as_str(),
+                "workdir_mode": resolved_workdir_mode.as_str(),
+                "workdir_backend": workdir_backend.as_str(),
+                "materialization": materialization_report,
                 "sparse_paths": sparse_policy_paths.clone().unwrap_or_default(),
                 "include_neighbors": include_neighbors,
                 "transparent_cow_available": transparent_cow_available
@@ -317,10 +312,12 @@ impl Trail {
             ref_name,
             base_change: source.change_id,
             workdir: materialized_workdir,
-            cow_backend: workdir_mode.cow_backend().map(str::to_string),
+            requested_workdir_mode,
+            workdir_mode: resolved_workdir_mode,
+            workdir_backend: Some(workdir_backend),
+            materialization: materialization_report,
             sparse_paths: sparse_policy_paths.unwrap_or_default(),
             transparent_cow_available,
-            workdir_mode,
         })
     }
 
@@ -345,12 +342,17 @@ impl Trail {
             }
             let record = self.lane_record(&branch.lane_id)?;
             let workdir_mode = self.lane_workdir_mode_for(&record, &branch)?;
+            let requested_workdir_mode = self.lane_requested_workdir_mode_for(&record, &branch)?;
+            let workdir_backend = self.lane_workdir_backend_for(&record)?;
+            let materialization = self.lane_materialization_report_for(&record)?;
             let sparse_paths = self.lane_report_sparse_paths(&branch)?;
             let transparent_cow_available = workdir_mode.is_transparent_cow();
             return Ok(LaneWorkdirReport {
                 lane_id: branch.lane_id,
                 workdir: Some(existing),
-                cow_backend: workdir_mode.cow_backend().map(str::to_string),
+                requested_workdir_mode,
+                workdir_backend,
+                materialization,
                 sparse_paths,
                 transparent_cow_available,
                 workdir_mode,
@@ -358,7 +360,18 @@ impl Trail {
         }
 
         let head = self.get_ref(&branch.ref_name)?;
-        let dir = self.materialize_lane_workdir(lane, &head.root_id, workdir.as_deref())?;
+        let dir = self.resolve_lane_workdir_path(lane, workdir.as_deref())?;
+        let outcome = self.materialize_lane_root_staged(
+            &head.root_id,
+            &dir,
+            workdir.is_some(),
+            MaterializationPolicy::Auto,
+        )?;
+        self.update_lane_materialization_metadata(
+            &branch.lane_id,
+            &LaneWorkdirMode::Auto,
+            &outcome,
+        )?;
         let workdir = dir.to_string_lossy().to_string();
         self.conn.execute(
             "UPDATE lane_branches SET workdir = ?1, updated_at = ?2 WHERE lane_id = ?3",
@@ -377,10 +390,10 @@ impl Trail {
         Ok(LaneWorkdirReport {
             lane_id: branch.lane_id,
             workdir: Some(dir.to_string_lossy().to_string()),
-            workdir_mode: LaneWorkdirMode::NativeCow,
-            cow_backend: (LaneWorkdirMode::NativeCow)
-                .cow_backend()
-                .map(str::to_string),
+            requested_workdir_mode: LaneWorkdirMode::Auto,
+            workdir_mode: outcome.resolved_mode,
+            workdir_backend: Some(outcome.backend),
+            materialization: Some(outcome.report),
             sparse_paths: Vec::new(),
             transparent_cow_available: false,
         })
@@ -430,83 +443,32 @@ impl Trail {
         sparse_paths: &[String],
         include_neighbors: bool,
     ) -> Result<()> {
-        prepare_lane_workdir(dir, custom_workdir)?;
         if sparse_paths.is_empty() {
-            let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-            if root.file_count > LARGE_LANE_MATERIALIZE_FILE_THRESHOLD {
-                return self.materialize_lane_workdir_at_streaming(root_id, dir);
-            }
+            self.materialize_lane_root_staged(
+                root_id,
+                dir,
+                custom_workdir,
+                MaterializationPolicy::Auto,
+            )?;
+            return Ok(());
         }
-        let empty = BTreeMap::new();
-        let files = if sparse_paths.is_empty() {
-            self.load_root_files(root_id)?
-        } else if include_neighbors {
+        prepare_lane_workdir(dir, custom_workdir)?;
+        let files = if include_neighbors {
             self.load_root_files_for_selections_with_neighbors(root_id, sparse_paths)?
         } else {
             self.load_root_files_for_selections(root_id, sparse_paths)?
         };
-        let mut materialized = None;
-        let cloned_from_workspace = if sparse_paths.is_empty() {
-            let source_stamps =
-                match self.workspace_file_stamps_if_clean_index_matches(root_id, &files)? {
-                    Some(stamps) => Some(stamps),
-                    None => self.workspace_file_stamps_if_entries_match(&files)?,
-                };
-            if let Some(source_stamps) = source_stamps {
-                if let Some(report) = materialize_from_workspace_cow_report(
-                    &self.workspace_root,
-                    dir,
-                    &files,
-                    &source_stamps,
-                    false,
-                )? {
-                    materialized = Some(report);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !cloned_from_workspace {
-            materialized = Some(if sparse_paths.is_empty() {
-                self.materialize_files_best_effort_at_report(dir, &empty, &files)?
-            } else {
-                self.materialize_new_files_best_effort_at_with_workspace_cow_report(dir, &files)?
-            });
-        }
-        if sparse_paths.is_empty() {
-            remove_sparse_workdir_manifest(dir)?;
-        } else {
-            self.write_sparse_workdir_manifest(dir, files.keys())?;
-        }
-        if let Some(report) = materialized {
-            self.write_clean_workdir_manifest_from_stamps(
-                dir,
-                root_id,
-                &files,
-                files.keys(),
-                report.stamps,
-            )?;
-        } else {
-            self.write_clean_workdir_manifest(dir, root_id, &files, files.keys())?;
-        }
-        Ok(())
-    }
-
-    fn materialize_lane_workdir_at_streaming(&self, root_id: &ObjectId, dir: &Path) -> Result<()> {
-        let report = self.materialize_root_files_at_streaming(root_id, dir, false)?;
-        remove_sparse_workdir_manifest(dir)?;
-        self.write_clean_workdir_manifest_from_disk_manifest_and_stamps(
+        let materialized =
+            self.materialize_new_files_best_effort_at_with_workspace_cow_report(dir, &files)?;
+        self.write_sparse_workdir_manifest(dir, files.keys())?;
+        self.write_clean_workdir_manifest_from_stamps(
             dir,
             root_id,
-            &report.disk_manifest,
-            report.disk_manifest.keys(),
-            report.materialized.stamps,
-        )
+            &files,
+            files.keys(),
+            materialized.stamps,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn sparse_workdir_paths(&self, dir: &Path) -> Result<Option<Vec<String>>> {
@@ -574,6 +536,100 @@ impl Trail {
         } else {
             Ok(LaneWorkdirMode::Virtual)
         }
+    }
+
+    pub(crate) fn lane_requested_workdir_mode_for(
+        &self,
+        record: &LaneRecord,
+        branch: &LaneBranch,
+    ) -> Result<LaneWorkdirMode> {
+        if let Some(metadata_json) = &record.metadata_json {
+            let value: serde_json::Value = serde_json::from_str(metadata_json)?;
+            if let Some(mode) = value
+                .get("requested_workdir_mode")
+                .and_then(serde_json::Value::as_str)
+            {
+                return parse_lane_workdir_mode(mode);
+            }
+        }
+        self.lane_workdir_mode_for(record, branch)
+    }
+
+    pub(crate) fn lane_workdir_backend_for(
+        &self,
+        record: &LaneRecord,
+    ) -> Result<Option<WorkdirBackend>> {
+        let Some(metadata_json) = &record.metadata_json else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(metadata_json)?;
+        let Some(backend) = value.get("workdir_backend") else {
+            return Ok(None);
+        };
+        serde_json::from_value(backend.clone())
+            .map(Some)
+            .map_err(Error::Json)
+    }
+
+    pub(crate) fn lane_materialization_report_for(
+        &self,
+        record: &LaneRecord,
+    ) -> Result<Option<MaterializationReport>> {
+        let Some(metadata_json) = &record.metadata_json else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(metadata_json)?;
+        let Some(report) = value.get("materialization") else {
+            return Ok(None);
+        };
+        if report.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(report.clone())
+            .map(Some)
+            .map_err(Error::Json)
+    }
+
+    pub(crate) fn update_lane_materialization_metadata(
+        &self,
+        lane_id: &str,
+        requested_mode: &LaneWorkdirMode,
+        outcome: &MaterializationOutcome,
+    ) -> Result<()> {
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT metadata_json FROM lanes WHERE lane_id = ?1",
+                params![lane_id],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .unwrap_or_else(|| "{}".to_string());
+        let mut value: serde_json::Value = serde_json::from_str(&existing)?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            Error::Corrupt(format!("lane `{lane_id}` metadata is not a JSON object"))
+        })?;
+        object.insert(
+            "requested_workdir_mode".to_string(),
+            serde_json::json!(requested_mode.as_str()),
+        );
+        object.insert(
+            "workdir_mode".to_string(),
+            serde_json::json!(outcome.resolved_mode.as_str()),
+        );
+        object.insert(
+            "workdir_backend".to_string(),
+            serde_json::json!(outcome.backend.as_str()),
+        );
+        object.remove("cow_backend");
+        object.insert(
+            "materialization".to_string(),
+            serde_json::to_value(&outcome.report)?,
+        );
+        self.conn.execute(
+            "UPDATE lanes SET metadata_json = ?1 WHERE lane_id = ?2",
+            params![serde_json::to_string(&value)?, lane_id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn lane_report_sparse_paths(&self, branch: &LaneBranch) -> Result<Vec<String>> {
@@ -765,7 +821,7 @@ fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
     }
     LaneWorkdirMode::parse(value).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, native-cow, fuse-cow, nfs-cow, or dokan-cow"
+            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, native-cow, portable-copy, fuse-cow, nfs-cow, or dokan-cow"
         ))
     })
 }
@@ -775,7 +831,10 @@ fn platform_workspace_backend(mode: &LaneWorkdirMode) -> &'static str {
         LaneWorkdirMode::NfsCow => "nfs",
         LaneWorkdirMode::FuseCow => "fuse",
         LaneWorkdirMode::DokanCow => "dokan",
-        LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => "clone",
+        LaneWorkdirMode::Auto
+        | LaneWorkdirMode::Sparse
+        | LaneWorkdirMode::NativeCow
+        | LaneWorkdirMode::PortableCopy => "clone",
         LaneWorkdirMode::Virtual => "virtual",
     }
 }
@@ -786,6 +845,14 @@ fn validate_lane_workdir_mode_request(
     sparse_paths: &[String],
 ) -> Result<()> {
     match mode {
+        LaneWorkdirMode::Auto | LaneWorkdirMode::PortableCopy => {
+            if !sparse_paths.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "{} lane workdir mode cannot be combined with sparse paths",
+                    mode.as_str()
+                )));
+            }
+        }
         LaneWorkdirMode::Virtual => {
             if custom_workdir {
                 return Err(Error::InvalidInput(

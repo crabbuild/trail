@@ -40,6 +40,12 @@ pub enum Error {
     Git(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("native COW is unsupported for this source and destination")]
+    CloneUnsupported,
+    #[error("native COW source and destination are on different filesystems")]
+    CloneCrossDevice,
+    #[error("no complete validated filesystem source is available for native COW")]
+    NativeCowSourceUnavailable,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("SQLite error: {0}")]
@@ -84,6 +90,9 @@ impl Error {
             Error::Corrupt(_) => "DATABASE_CORRUPT",
             Error::Git(_) => "GIT_ERROR",
             Error::InvalidInput(_) => "INVALID_INPUT",
+            Error::CloneUnsupported => "CLONE_UNSUPPORTED",
+            Error::CloneCrossDevice => "CLONE_CROSS_DEVICE",
+            Error::NativeCowSourceUnavailable => "NATIVE_COW_SOURCE_UNAVAILABLE",
             Error::Io(_) => "IO_ERROR",
             Error::Sqlite(_) => "SQLITE_ERROR",
             Error::Serialization(_) => "SERIALIZATION_ERROR",
@@ -111,7 +120,11 @@ impl Error {
             Error::OperationNotFound(_) => 12,
             Error::RefNotFound(_) => 13,
             Error::IgnoredPath(_) => 14,
-            Error::InvalidInput(_) | Error::WorkspaceExists(_) => 2,
+            Error::InvalidInput(_)
+            | Error::WorkspaceExists(_)
+            | Error::CloneUnsupported
+            | Error::CloneCrossDevice
+            | Error::NativeCowSourceUnavailable => 2,
             Error::DaemonUnavailable(_) => 11,
             Error::DaemonError { exit_code, .. } => *exit_code,
             _ => 1,

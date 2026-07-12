@@ -13,8 +13,9 @@ use rusqlite::Connection;
 use trail::{
     Actor, ConflictManualFile, ConflictManualResolution, Error, InitImportMode, LaneGateOptions,
     LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails, LaneTurnEndReport,
-    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, OperationKind, PatchDocument,
-    ShowResult, TextContent, TextRepresentation, Trail, WorktreeState,
+    LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, MaterializationFallbackReason,
+    OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
+    WorkdirBackend, WorktreeState,
 };
 
 fn git_available() -> bool {
@@ -21787,8 +21788,9 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         &["lane", "spawn", "default-bot", "--from", "main"],
     );
     assert!(default_spawn["workdir"].is_null());
+    assert_eq!(default_spawn["requested_workdir_mode"], "virtual");
     assert_eq!(default_spawn["workdir_mode"], "virtual");
-    assert!(default_spawn["cow_backend"].is_null());
+    assert_eq!(default_spawn["workdir_backend"], "virtual");
     assert_eq!(default_spawn["sparse_paths"].as_array().unwrap().len(), 0);
     assert_eq!(default_spawn["transparent_cow_available"], false);
 
@@ -21805,8 +21807,16 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             cli_workdir.to_str().unwrap(),
         ],
     );
+    assert_eq!(cli_spawn["requested_workdir_mode"], "auto");
     assert_eq!(cli_spawn["workdir_mode"], "native-cow");
-    assert_eq!(cli_spawn["cow_backend"], "clone");
+    assert_eq!(cli_spawn["workdir_backend"], "clone");
+    assert_eq!(cli_spawn["materialization"]["copied_files"], 0);
+    assert!(
+        cli_spawn["materialization"]["cloned_files"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert_eq!(
         PathBuf::from(cli_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -21817,6 +21827,46 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         fs::read_to_string(cli_workdir.join("README.md")).unwrap(),
         "hello\n"
     );
+
+    let native_workdir = workdir_parent.path().join("native-bot");
+    let native_spawn = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "native-bot",
+            "--from",
+            "main",
+            "--workdir-mode",
+            "native-cow",
+            "--workdir",
+            native_workdir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(native_spawn["requested_workdir_mode"], "native-cow");
+    assert_eq!(native_spawn["workdir_mode"], "native-cow");
+    assert_eq!(native_spawn["workdir_backend"], "clone");
+    assert_eq!(native_spawn["materialization"]["copied_files"], 0);
+
+    let portable_workdir = workdir_parent.path().join("portable-bot");
+    let portable_spawn = run_trail_json(
+        temp.path(),
+        &[
+            "lane",
+            "spawn",
+            "portable-bot",
+            "--from",
+            "main",
+            "--workdir-mode",
+            "portable-copy",
+            "--workdir",
+            portable_workdir.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(portable_spawn["requested_workdir_mode"], "portable-copy");
+    assert_eq!(portable_spawn["workdir_mode"], "portable-copy");
+    assert_eq!(portable_spawn["workdir_backend"], "clone");
+    assert_eq!(portable_spawn["materialization"]["copied_files"], 0);
 
     let headless_spawn = run_trail_json(
         temp.path(),
@@ -21861,7 +21911,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             ],
         );
         assert_eq!(fuse_spawn["workdir_mode"], "fuse-cow");
-        assert_eq!(fuse_spawn["cow_backend"], "fuse");
+        assert_eq!(fuse_spawn["workdir_backend"], "fuse");
         assert_eq!(fuse_spawn["transparent_cow_available"], true);
         assert_eq!(fuse_spawn["sparse_paths"].as_array().unwrap().len(), 0);
         let fuse_workdir = PathBuf::from(fuse_spawn["workdir"].as_str().unwrap());
@@ -21889,7 +21939,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             ],
         );
         assert_eq!(dokan_spawn["workdir_mode"], "dokan-cow");
-        assert_eq!(dokan_spawn["cow_backend"], "dokan");
+        assert_eq!(dokan_spawn["workdir_backend"], "dokan");
         assert_eq!(dokan_spawn["transparent_cow_available"], true);
     }
 
@@ -21908,7 +21958,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             ],
         );
         assert_eq!(nfs_spawn["workdir_mode"], "nfs-cow");
-        assert_eq!(nfs_spawn["cow_backend"], "nfs");
+        assert_eq!(nfs_spawn["workdir_backend"], "nfs");
         assert_eq!(nfs_spawn["transparent_cow_available"], true);
         let db = Trail::open(temp.path()).unwrap();
         let view = db.lane_workspace_view("nfs-bot").unwrap().unwrap();
@@ -21935,7 +21985,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
         ],
     );
     assert_eq!(sparse_spawn["workdir_mode"], "sparse");
-    assert_eq!(sparse_spawn["cow_backend"], "clone");
+    assert_eq!(sparse_spawn["workdir_backend"], "clone");
     assert_eq!(
         sparse_spawn["sparse_paths"]
             .as_array()
@@ -22650,6 +22700,16 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
     let spawned = db
         .spawn_lane("doc-bot", Some("main"), true, None, None)
         .unwrap();
+    assert_eq!(spawned.requested_workdir_mode, LaneWorkdirMode::Auto);
+    assert_eq!(spawned.workdir_mode, LaneWorkdirMode::PortableCopy);
+    assert_eq!(spawned.workdir_backend, Some(WorkdirBackend::Copy));
+    assert_eq!(
+        spawned
+            .materialization
+            .as_ref()
+            .and_then(|report| report.fallback_reason),
+        Some(MaterializationFallbackReason::NativeSourceUnavailable)
+    );
     let workdir = PathBuf::from(spawned.workdir.unwrap());
 
     assert_eq!(
@@ -22660,6 +22720,34 @@ fn lane_spawn_materialization_ignores_dirty_workspace_for_recorded_root() {
         fs::read_to_string(temp.path().join("README.md")).unwrap(),
         "hello\ndirty\n"
     );
+}
+
+#[test]
+fn strict_native_cow_refuses_an_unvalidated_source_without_copying() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    fs::write(temp.path().join("README.md"), "hello\ndirty\n").unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let workdir_parent = tempfile::tempdir().unwrap();
+    let destination = workdir_parent.path().join("strict-workdir");
+    let error = db
+        .spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "strict-bot",
+            Some("main"),
+            LaneWorkdirMode::NativeCow,
+            None,
+            None,
+            Some(destination.clone()),
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, Error::NativeCowSourceUnavailable));
+    assert!(!destination.exists());
+    assert!(db.lane_details("strict-bot").is_err());
 }
 
 #[test]

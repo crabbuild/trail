@@ -5,6 +5,7 @@ mod dokan;
 mod fuse;
 mod lifecycle;
 mod manifest;
+mod materialize;
 mod nfs_overlay;
 mod record;
 mod sync;
@@ -15,6 +16,7 @@ mod view_core;
 mod view_journal;
 mod view_layout;
 
+pub(crate) use materialize::*;
 pub(crate) use view_barrier::*;
 #[cfg(test)]
 pub(crate) use view_conformance::*;

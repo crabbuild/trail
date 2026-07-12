@@ -603,7 +603,7 @@ impl Trail {
                         continue;
                     }
                     WorkspaceCowMaterializeStatus::Skipped => {}
-                    WorkspaceCowMaterializeStatus::Unavailable => {
+                    WorkspaceCowMaterializeStatus::Unavailable(_) => {
                         cow_available = false;
                     }
                 }
