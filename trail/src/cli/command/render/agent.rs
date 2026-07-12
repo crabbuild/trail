@@ -125,7 +125,16 @@ agent_renderer!(
 pub(crate) fn render_agent_empty_action_palette(json: bool, options: &RenderOptions) -> Result<()> {
     let actions = agent_empty_action_palette_actions();
     if json {
-        return render_json(&actions);
+        return render_json(&serde_json::json!({
+            "status": "empty",
+            "task": null,
+            "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
+            "next": {
+                "command": "trail agent setup",
+                "reason": "print a stable editor config that creates fresh Trail tasks automatically"
+            },
+            "actions": actions
+        }));
     }
     render_document(
         &TerminalDocument::new("No agent task yet", UiTone::Neutral)
@@ -145,7 +154,17 @@ pub(crate) fn render_agent_empty_task_hint(
     options: &RenderOptions,
 ) -> Result<()> {
     if json {
-        return render_json(&serde_json::json!({"requested": requested, "status": "empty"}));
+        return render_json(&serde_json::json!({
+            "requested": requested,
+            "status": "empty",
+            "task": null,
+            "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
+            "next": {
+                "command": "trail agent setup",
+                "reason": "print a stable editor config that creates fresh Trail tasks automatically"
+            },
+            "actions": agent_empty_action_palette_actions()
+        }));
     }
     render_document(
         &TerminalDocument::new(

@@ -126,21 +126,17 @@ pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> R
         }
     });
     if args.no_auth {
-        let diagnostic = UiDiagnostic {
-            code: "DAEMON_AUTH_DISABLED".to_string(),
-            summary: "Daemon authentication is disabled".to_string(),
-            cause: Some(
-                "Any local process can mutate this workspace through the daemon.".to_string(),
-            ),
-            consequence: Some(
-                "Keep the listener on loopback and use this only for trusted local automation."
-                    .to_string(),
-            ),
-            recovery: None,
-            alternatives: Vec::new(),
-        };
         render_error_document(
-            &TerminalDocument::empty().block(UiBlock::Diagnostic(diagnostic)),
+            &TerminalDocument::new("WARNING: daemon auth is disabled", UiTone::Attention)
+                .context("Any local process can mutate this workspace through the daemon.")
+                .block(UiBlock::Metadata(vec![(
+                    "Endpoint".to_string(),
+                    daemon_url.clone(),
+                )]))
+                .block(UiBlock::Notice(
+                    "Keep the listener on loopback and use this only for trusted local automation."
+                        .to_string(),
+                )),
             &ctx.render,
         )?;
     }

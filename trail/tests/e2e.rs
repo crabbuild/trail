@@ -3009,7 +3009,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(empty_next["focus"], "setup");
     assert_eq!(empty_next["primary"]["command"], "trail agent setup");
     let empty_actions = run_trail_json(temp.path(), &["agent", "action"]);
-    assert_eq!(empty_actions["status"], "empty");
+    assert_eq!(empty_actions["status"], "empty", "{empty_actions}");
     assert!(empty_actions["task"].is_null());
     assert_eq!(empty_actions["next"]["command"], "trail agent setup");
     assert!(empty_actions["actions"]
@@ -3826,9 +3826,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&diagnose_text.stderr)
     );
     let diagnose_stdout = String::from_utf8_lossy(&diagnose_text.stdout);
-    assert!(diagnose_stdout.contains("Agent diagnose:"));
-    assert!(diagnose_stdout.contains("Likely issue:"));
-    assert!(diagnose_stdout.contains("Recovery options:"));
+    assert!(
+        diagnose_stdout.contains("Agent diagnosis: git blocked"),
+        "{diagnose_stdout}"
+    );
+    assert!(diagnose_stdout.contains("Likely Issue"));
+    assert!(diagnose_stdout.contains("Recovery Options"));
     assert!(diagnose_stdout.contains("requires a Git working tree"));
     let report = run_trail_json(temp.path(), &["agent", "report", "latest"]);
     assert_eq!(report["task"]["lane"], lane);
@@ -4049,7 +4052,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&open_launch.stdout),
         String::from_utf8_lossy(&open_launch.stderr)
     );
-    assert!(String::from_utf8_lossy(&open_launch.stdout).contains("Opened:"));
+    assert!(
+        String::from_utf8_lossy(&open_launch.stdout).contains("Opened agent focus"),
+        "{}",
+        String::from_utf8_lossy(&open_launch.stdout)
+    );
     let ask_dashboard = run_trail_json(
         temp.path(),
         &["agent", "ask", "show", "me", "the", "dashboard"],
@@ -4206,7 +4213,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     );
     let summary_stdout = String::from_utf8_lossy(&summary_text.stdout);
     assert!(summary_stdout.contains("Agent summary:"));
-    assert!(summary_stdout.contains("PR title:"));
+    assert!(summary_stdout.contains("Pr Title"), "{summary_stdout}");
     let compare = run_trail_json(temp.path(), &["agent", "compare", first, second]);
     assert_eq!(compare["left"]["lane"], first);
     assert_eq!(compare["right"]["lane"], second);
@@ -4322,9 +4329,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&change_text.stderr)
     );
     let change_stdout = String::from_utf8_lossy(&change_text.stdout);
-    assert!(change_stdout.contains("Agent change set:"));
+    assert!(
+        change_stdout.contains("Agent change set"),
+        "{change_stdout}"
+    );
     assert!(change_stdout.contains("Docs and getting-started"));
-    assert!(change_stdout.contains("Files:"));
+    assert!(change_stdout.contains("Files"));
 
     let timeline = run_trail_json(temp.path(), &["agent", "timeline", "latest"]);
     assert_eq!(timeline["task"]["lane"], lane);
@@ -4378,9 +4388,9 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&timeline_text.stderr)
     );
     let timeline_stdout = String::from_utf8_lossy(&timeline_text.stdout);
-    assert!(timeline_stdout.contains("Agent timeline:"));
-    assert!(timeline_stdout.contains("Timeline:"));
-    assert!(timeline_stdout.contains("Rewind before:"));
+    assert!(timeline_stdout.contains("Agent timeline"));
+    assert!(timeline_stdout.contains("Items"), "{timeline_stdout}");
+    assert!(timeline_stdout.contains("Before Change"));
 
     let delta = run_trail_json(temp.path(), &["agent", "delta", "latest"]);
     assert_eq!(delta["task"]["lane"], lane);
@@ -4443,8 +4453,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&delta_text.stderr)
     );
     let delta_stdout = String::from_utf8_lossy(&delta_text.stdout);
-    assert!(delta_stdout.contains("Agent delta:"));
-    assert!(delta_stdout.contains("Newest delta:"));
+    assert!(delta_stdout.contains("Agent delta"));
+    assert!(
+        delta_stdout.contains("Latest turn 1 changed 1 file(s)"),
+        "{delta_stdout}"
+    );
     let last_alias = run_trail_json(temp.path(), &["agent", "last", "latest"]);
     assert_eq!(last_alias["task"]["lane"], lane);
     assert_eq!(last_alias["mode"], delta["mode"]);
@@ -4562,8 +4575,12 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&new_text.stderr)
     );
     let new_stdout = String::from_utf8_lossy(&new_text.stdout);
-    assert!(new_stdout.contains("Agent new:"));
-    assert!(new_stdout.contains("Status: up_to_date"));
+    assert!(
+        new_stdout.contains("Created agent task: up to date"),
+        "{new_stdout}"
+    );
+    assert!(new_stdout.contains("Status"));
+    assert!(new_stdout.contains("up to date"));
     let next_after_reviewed = run_trail_json(temp.path(), &["agent", "next", "latest"]);
     assert_eq!(next_after_reviewed["focus"], "preview_apply");
     assert_eq!(
@@ -4685,9 +4702,10 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         String::from_utf8_lossy(&file_text.stderr)
     );
     let file_stdout = String::from_utf8_lossy(&file_text.stdout);
-    assert!(file_stdout.contains("Agent file: README.md"));
-    assert!(file_stdout.contains("Change sets:"));
-    assert!(file_stdout.contains("Changed in:"));
+    assert!(file_stdout.contains("Agent file"), "{file_stdout}");
+    assert!(file_stdout.contains("Path   : README.md"));
+    assert!(file_stdout.contains("Change Cards"));
+    assert!(file_stdout.contains("Touched By"));
 
     let checkpoints = run_trail_json(temp.path(), &["agent", "checkpoints", "latest"]);
     assert_eq!(checkpoints["task"]["lane"], lane);
@@ -10420,9 +10438,12 @@ fn local_lane_http_api_manages_lane_branch_lifecycle() {
         .unwrap();
     assert!(cli_review_text.status.success());
     let cli_review_stdout = String::from_utf8_lossy(&cli_review_text.stdout);
-    assert!(cli_review_stdout.contains("Lane review: api-branch-lane"));
-    assert!(cli_review_stdout.contains("Evidence:"));
-    assert!(cli_review_stdout.contains("Next steps:"));
+    assert!(
+        cli_review_stdout.contains("Lane api-branch-lane is ready for review"),
+        "{cli_review_stdout}"
+    );
+    assert!(cli_review_stdout.contains("Operations: 1"));
+    assert!(cli_review_stdout.contains("Next:"));
 
     let readiness_response = trail::server::handle_http_request(
         &mut db,
@@ -12158,11 +12179,15 @@ fn daemon_no_auth_prints_loud_stderr_warning() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let daemon_url = format!("http://127.0.0.1:{port}");
-    assert!(stdout.contains(&format!("Trail API listening on {daemon_url}")));
+    assert!(stdout.contains("Trail API daemon listening"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Endpoint: {daemon_url}")),
+        "{stdout}"
+    );
     assert!(stderr.contains("WARNING"), "{stderr}");
     assert!(stderr.contains("daemon auth is disabled"), "{stderr}");
     assert!(
-        stderr.contains("any local process can mutate this workspace"),
+        stderr.contains("Any local process can mutate this workspace"),
         "{stderr}"
     );
     assert!(stderr.contains(&daemon_url), "{stderr}");
@@ -19704,12 +19729,9 @@ fn lane_diff_cli_renders_scannable_overview() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Lane diff: doc-bot"));
-    assert!(stdout.contains("from:"));
-    assert!(stdout.contains("to:"));
-    assert!(stdout.contains("2 file(s) changed, +2 -0"));
-    assert!(stdout.contains("M modified    README.md (+1 -0) +"));
-    assert!(stdout.contains("A added       docs/guide.md (+1 -0) +"));
-    assert!(stdout.contains("2 files changed, 2 additions, 0 deletions"));
+    assert!(stdout.contains("M  README.md  +1 -0"), "{stdout}");
+    assert!(stdout.contains("A  docs/guide.md  +1 -0"), "{stdout}");
+    assert!(stdout.contains("2 files changed, 2 insertions, 0 deletions"));
 }
 
 #[test]
@@ -19991,7 +20013,7 @@ fn lane_status_surfaces_stale_base_lag() {
     assert!(cli_text.status.success());
     let stdout = String::from_utf8_lossy(&cli_text.stdout);
     assert!(
-        stdout.contains("Lane started 2 operations behind main"),
+        stdout.contains("Base: 2 operation(s) behind main"),
         "{stdout}"
     );
 }
