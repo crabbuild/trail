@@ -47,7 +47,7 @@ impl Trail {
               provider_version_range, detected_provider_version, capability_status,
               status, installed_at, verified_at, last_receipt_at, metadata_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11,
-                     NULL, NULL, 'configured', 'installed', ?12, ?12, NULL, NULL)
+                     ?12, NULL, 'configured', 'installed', ?13, ?13, NULL, NULL)
              ON CONFLICT(installation_id) DO UPDATE SET
                provider = excluded.provider,
                scope = excluded.scope,
@@ -58,6 +58,7 @@ impl Trail {
                config_before_digest = excluded.config_before_digest,
                config_after_digest = excluded.config_after_digest,
                adapter_version = excluded.adapter_version,
+               provider_version_range = excluded.provider_version_range,
                capability_status = excluded.capability_status,
                status = 'installed',
                installed_at = excluded.installed_at,
@@ -74,6 +75,7 @@ impl Trail {
                 plan.before_digest,
                 plan.after_digest,
                 plan.adapter_version,
+                plan.provider_version_range,
                 now,
             ],
         )?;

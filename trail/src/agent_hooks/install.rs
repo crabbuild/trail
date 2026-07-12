@@ -53,6 +53,7 @@ pub struct AgentHookInstallPlan {
     pub provider: String,
     pub scope: AgentHookInstallScope,
     pub adapter_version: String,
+    pub provider_version_range: Option<String>,
     pub config_path: PathBuf,
     pub action: AgentHookInstallAction,
     pub before_digest: Option<String>,
@@ -156,6 +157,7 @@ pub fn build_agent_hook_install_plan(
         provider: manifest.provider.clone(),
         scope: request.scope,
         adapter_version: manifest.adapter_version.clone(),
+        provider_version_range: manifest.provider_version_range.clone(),
         config_path: target,
         action,
         before_digest,
@@ -1320,6 +1322,7 @@ mod tests {
         let plan = build_agent_hook_install_plan(request(&registry, "kiro", temp.path())).unwrap();
         let value: Value = serde_json::from_slice(&plan.desired_bytes).unwrap();
         assert_eq!(value["version"], "v1");
+        assert_eq!(plan.provider_version_range.as_deref(), Some(">=2.8.0"));
         assert!(value.get("trailOwnership").is_none());
         let hooks = value["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), registry.resolve("kiro").unwrap().events.len());
