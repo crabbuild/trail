@@ -1639,7 +1639,7 @@ impl Trail {
                 .map(str::to_string),
                 lane,
                 trail_session_id,
-                capture_run_id: capture_run.map(|run| run.capture_run_id),
+                capture_run_id: capture_run.as_ref().map(|run| run.capture_run_id.clone()),
                 primary_transport: AgentCaptureTransport::Hybrid,
                 transcript_identity: payload_string_value(
                     payload,
@@ -1674,6 +1674,32 @@ impl Trail {
             }
             lane
         };
+        if let Some(capture_run) = capture_run.as_ref() {
+            let managed_branch = self.lane_branch(&lane)?;
+            if capture_run.lane_id.as_deref() == Some(managed_branch.lane_id.as_str()) {
+                let managed_session = self.lane_session(&capture_run.owner_session_id)?;
+                if managed_session.lane_id == managed_branch.lane_id {
+                    return self.ensure_lane_agent_session(LaneAgentSessionInput {
+                        provider: receipt.provider.clone(),
+                        native_session_id: native_session_id.to_string(),
+                        parent_native_session_id: payload_string_value(
+                            payload,
+                            &["parent_session_id", "parentSessionId"],
+                        )
+                        .map(str::to_string),
+                        lane,
+                        trail_session_id: managed_session.session_id,
+                        capture_run_id: Some(capture_run.capture_run_id.clone()),
+                        primary_transport: AgentCaptureTransport::Hybrid,
+                        transcript_identity: payload_string_value(
+                            payload,
+                            &["transcript_path", "transcriptPath"],
+                        )
+                        .map(str::to_string),
+                    });
+                }
+            }
+        }
         let trail_session_id = format!(
             "session_hook_{}",
             crate::ids::short_hash(
@@ -1848,12 +1874,19 @@ impl Trail {
                 | AgentCaptureAction::RecoverInterruptedTurn
                 | AgentCaptureAction::DeferUntilFinalized => {}
                 AgentCaptureAction::CaptureBaseline => {
-                    self.record_native_agent_workspace_checkpoint(
-                        lane,
-                        &mapping.trail_session_id,
-                        None,
-                        Some(format!("agent {} turn baseline", event.provider)),
-                    )?;
+                    if self.lane_details(lane)?.branch.workdir.is_some() {
+                        self.record_lane_workdir(
+                            lane,
+                            Some(format!("agent {} turn baseline", event.provider)),
+                        )?;
+                    } else {
+                        self.record_native_agent_workspace_checkpoint(
+                            lane,
+                            &mapping.trail_session_id,
+                            None,
+                            Some(format!("agent {} turn baseline", event.provider)),
+                        )?;
+                    }
                 }
                 AgentCaptureAction::BeginTurn { synthetic } => {
                     if self

@@ -78,6 +78,304 @@ fn cli_reports_package_version() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "context",
+            "--workdir-mode",
+            "full-cow",
+            "--",
+            "/usr/bin/env",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = report["workdir"].as_str().unwrap();
+    let workspace = temp.path().canonicalize().unwrap();
+    let environment = String::from_utf8_lossy(&output.stderr);
+    assert!(environment
+        .lines()
+        .any(|line| line == format!("PWD={workdir}")));
+    assert!(environment
+        .lines()
+        .any(|line| line == format!("TRAIL_WORKSPACE={}", workspace.display())));
+    assert!(environment
+        .lines()
+        .any(|line| line.starts_with("TRAIL_LANE=lane_")));
+    assert!(environment
+        .lines()
+        .any(|line| line.starts_with("TRAIL_SOURCE_ROOT=object_")));
+    assert!(environment.lines().any(|line| {
+        line.strip_prefix("GIT_CEILING_DIRECTORIES=")
+            .is_some_and(|value| {
+                value
+                    .split(':')
+                    .any(|path| path == workspace.to_string_lossy())
+            })
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let install = run_trail_json(
+        temp.path(),
+        &["agent", "hooks", "add", "claude-code", "--scope", "project"],
+    );
+    let settings = install["config_path"].as_str().unwrap().to_string();
+
+    let bin = tempfile::tempdir().unwrap();
+    let fake_claude = bin.path().join("claude");
+    fs::write(
+        &fake_claude,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > CLAUDE_ARGS.txt\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_claude, permissions).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .env("PATH", path)
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "hook-settings",
+            "--workdir-mode",
+            "full-cow",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(workdir.join("CLAUDE_ARGS.txt")).unwrap(),
+        format!("--settings\n{settings}\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_full_cow_does_not_discover_or_write_the_parent_git_checkout() {
+    if !git_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "root baseline\n").unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-qm", "baseline"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+
+    let provider = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        provider.path(),
+        "#!/bin/sh\nset -eu\nprintf 'lane change\\n' > LANE_ONLY.md\nif root=$(git rev-parse --show-toplevel 2>/dev/null); then\n  printf 'escaped\\n' > \"$root/ESCAPED.md\"\nfi\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(provider.path(), permissions).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "containment",
+            "--workdir-mode",
+            "full-cow",
+            "--",
+        ])
+        .arg(provider.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "root baseline\n"
+    );
+    assert!(!temp.path().join("ESCAPED.md").exists());
+    assert_eq!(
+        fs::read_to_string(workdir.join("LANE_ONLY.md")).unwrap(),
+        "lane change\n"
+    );
+    assert!(report["recorded"]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "LANE_ONLY.md"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_agent_full_cow_denies_explicit_writes_to_the_original_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "root baseline\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let provider = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        provider.path(),
+        "#!/bin/sh\nprintf 'lane change\\n' > LANE_ONLY.md\nif printf 'escaped\\n' > \"$1/ESCAPED.md\"; then\n  printf 'workspace write was allowed\\n' > CONTAINMENT.txt\nelse\n  printf 'workspace write was blocked\\n' > CONTAINMENT.txt\nfi\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(provider.path(), permissions).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "explicit-containment",
+            "--workdir-mode",
+            "full-cow",
+            "--",
+        ])
+        .arg(provider.path())
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let workdir = PathBuf::from(report["workdir"].as_str().unwrap());
+    assert!(!temp.path().join("ESCAPED.md").exists());
+    assert_eq!(
+        fs::read_to_string(workdir.join("LANE_ONLY.md")).unwrap(),
+        "lane change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("CONTAINMENT.txt")).unwrap(),
+        "workspace write was blocked\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_native_hooks_enrich_the_existing_task_without_duplication() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let provider = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        provider.path(),
+        "#!/bin/sh\nset -eu\nsend() {\n  event=$1\n  payload=$2\n  printf '%s' \"$payload\" | \"$TRAIL_TEST_BIN\" --workspace \"$TRAIL_WORKSPACE\" agent hook receive claude-code \"$event\" >/dev/null\n}\ncwd=$(pwd)\nsend SessionStart \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\"}\"\nsend UserPromptSubmit \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\",\\\"prompt\\\":\\\"edit lane\\\"}\"\nprintf 'hooked change\\n' > HOOKED.md\nsend Stop \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\",\\\"last_assistant_message\\\":\\\"done\\\"}\"\nsend SessionEnd \"{\\\"session_id\\\":\\\"native-terminal-1\\\",\\\"cwd\\\":\\\"$cwd\\\"}\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(provider.path()).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(provider.path(), permissions).unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .env("TRAIL_TEST_BIN", trail_bin())
+        .args([
+            "agent",
+            "start",
+            "--provider",
+            "claude-code",
+            "--name",
+            "hooked-terminal",
+            "--workdir-mode",
+            "full-cow",
+            "--",
+        ])
+        .arg(provider.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "agent start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let task_id = report["task"]["task_id"].as_str().unwrap();
+    let list = run_trail_json(temp.path(), &["agent", "list", "--all"]);
+    assert_eq!(list["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(list["tasks"][0]["task_id"], task_id);
+    assert_eq!(list["tasks"][0]["turns"], 1);
+    assert!(list["tasks"][0]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["path"] == "HOOKED.md"));
+    let view = run_trail_json(temp.path(), &["agent", "view", task_id]);
+    assert_eq!(
+        view["review"]["recent_sessions"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(view["transcript"]["turns"].as_array().unwrap().len(), 1);
+}
+
 #[test]
 fn native_hook_cli_journals_codex_stop_and_returns_required_success_json() {
     let temp = tempfile::tempdir().unwrap();

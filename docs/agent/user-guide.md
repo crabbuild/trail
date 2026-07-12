@@ -51,6 +51,19 @@ Trail ref, task, lane, or checkpoint, use `--from`:
 trail agent start --provider codex --from main --name update-agent-docs
 ```
 
+Terminal tasks align the child process `PWD`, `OLDPWD`, and Git discovery
+ceiling with the materialized lane workdir. This prevents tools from treating
+the original parent Git checkout as their project root. On macOS Trail also
+launches the provider with workspace write confinement: project files in the
+original checkout are read-only to the provider, while the lane workdir and
+Trail's internal `.trail` state remain writable.
+
+When native provider hooks are installed, `agent start` registers a managed
+capture run for the new lane before launching the provider. Hook receipts then
+enrich the existing terminal task and session rather than creating a second
+native-hook task. The terminal wrapper still records the authoritative final
+workdir checkpoint when the provider exits.
+
 Choose a workdir mode when the default full materialization is unsuitable:
 
 ```sh

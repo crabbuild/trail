@@ -103,6 +103,12 @@ Existing direct sessions are never retroactively stamped. If a lease expires,
 turn/session as `interrupted`, preserving recoverable evidence without claiming
 clean completion.
 
+`trail agent start` creates and closes this managed capture lease automatically.
+The terminal task's pre-created lane session remains the lifecycle owner; native
+hooks attach prompt, tool, approval, transcript, and per-turn checkpoint evidence
+to that same session. Provider exit performs one final workdir reconciliation,
+which is a no-op when the latest hook checkpoint already captured every change.
+
 ## Inspect evidence
 
 ```sh

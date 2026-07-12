@@ -1,5 +1,6 @@
 use super::*;
 use crate::cli::command::render::render_agent_timeline;
+use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use trail::agent_hooks::{
     apply_agent_hook_install_plan, build_agent_hook_install_plan, inspect_agent_hook_installation,
@@ -1330,6 +1331,8 @@ fn run_terminal_agent_task(
     workdir_mode: LaneWorkdirMode,
     command: Vec<String>,
 ) -> Result<AgentRunReport> {
+    const TERMINAL_CAPTURE_LEASE_MS: u64 = 86_400_000;
+
     let spawn = db.spawn_lane_with_workdir_mode_paths_and_neighbors(
         &lane,
         from.as_deref(),
@@ -1356,6 +1359,16 @@ fn run_terminal_agent_task(
     let session = db
         .start_lane_session(&lane, Some(format!("Agent terminal {}", provider)), None)?
         .session;
+    let capture_run = db.begin_agent_capture_run(trail::AgentCaptureRunInput {
+        lane: Some(lane.clone()),
+        workdir: workdir.clone(),
+        owner_agent: provider.clone(),
+        owner_session_id: session.session_id.clone(),
+        executor_agent: Some(provider.clone()),
+        work_item_id: Some(lane.clone()),
+        lease_ms: TERMINAL_CAPTURE_LEASE_MS,
+        metadata_json: Some("{\"source\":\"agent-start\",\"mode\":\"terminal\"}".to_string()),
+    })?;
     db.add_lane_session_event(
         &lane,
         &session.session_id,
@@ -1368,24 +1381,77 @@ fn run_terminal_agent_task(
             "from": from
         })),
     )?;
-    let workspace_environment = db.lane_workspace_environment(&lane)?;
+    let mut workspace_environment = db.lane_workspace_environment(&lane)?;
+    workspace_environment.extend([
+        ("TRAIL_CAPTURE_MODE".to_string(), "terminal".to_string()),
+        (
+            "TRAIL_CAPTURE_RUN_ID".to_string(),
+            capture_run.capture_run_id.clone(),
+        ),
+        (
+            "TRAIL_CAPTURE_WORKSPACE".to_string(),
+            db.workspace_root().to_string_lossy().into_owned(),
+        ),
+        (
+            "TRAIL_CAPTURE_LANE".to_string(),
+            capture_run.lane_id.clone().unwrap_or_else(|| lane.clone()),
+        ),
+    ]);
+    let project_hook_settings = if provider == "claude-code" {
+        db.list_agent_hook_installations(Some(&provider))?
+            .into_iter()
+            .find(|installation| {
+                installation.status == "installed"
+                    && installation.scope == AgentHookInstallScope::Project
+                    && installation.config_path.is_file()
+            })
+            .map(|installation| installation.config_path)
+    } else {
+        None
+    };
+    let workspace_root = db.workspace_root().to_path_buf();
     drop(db);
 
-    let command = if command.is_empty() {
+    let command_is_default = command.is_empty();
+    let mut command = if command_is_default {
         default_terminal_agent_command(&provider)?
     } else {
         command
     };
+    if command_is_default {
+        if let Some(settings) = project_hook_settings {
+            command.push("--settings".to_string());
+            command.push(settings.to_string_lossy().into_owned());
+        }
+    }
     if !ctx.quiet && !ctx.json {
         println!("Agent task: {lane}");
         println!("Workdir: {workdir}");
         println!("Command: {}", command.join(" "));
     }
-    let mut process = ProcessCommand::new(&command[0]);
+    let (launch_program, launch_args) =
+        confined_terminal_agent_command(&command, &workspace_root, Path::new(&workdir))?;
+    let mut process = ProcessCommand::new(launch_program);
+    let mut git_ceiling_directories = std::env::var_os("GIT_CEILING_DIRECTORIES")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !git_ceiling_directories
+        .iter()
+        .any(|path| path == &workspace_root)
+    {
+        git_ceiling_directories.push(workspace_root.clone());
+    }
+    let git_ceiling_directories =
+        std::env::join_paths(git_ceiling_directories).map_err(|error| {
+            Error::InvalidInput(format!("cannot construct Git discovery ceiling: {error}"))
+        })?;
     process
-        .args(&command[1..])
+        .args(launch_args)
         .current_dir(&workdir)
         .envs(workspace_environment)
+        .env("PWD", &workdir)
+        .env("OLDPWD", &workdir)
+        .env("GIT_CEILING_DIRECTORIES", git_ceiling_directories)
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit());
     if ctx.json {
@@ -1428,7 +1494,10 @@ fn run_terminal_agent_task(
             "status": status
         })),
     )?;
-    db.end_lane_session(&session.session_id, status)?;
+    if db.show_lane_session(&session.session_id)?.session.status == "active" {
+        db.end_lane_session(&session.session_id, status)?;
+    }
+    db.end_agent_capture_run(&capture_run.capture_run_id, &provider, &session.session_id)?;
     let view = db.agent_task_view(&lane)?;
     let report = AgentRunReport {
         task: view.task,
@@ -3381,6 +3450,54 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
 
 fn default_terminal_agent_command(provider: &str) -> Result<Vec<String>> {
     trail::acp::terminal_agent_command(provider)
+}
+
+fn confined_terminal_agent_command(
+    command: &[String],
+    workspace_root: &Path,
+    workdir: &Path,
+) -> Result<(std::ffi::OsString, Vec<std::ffi::OsString>)> {
+    #[cfg(target_os = "macos")]
+    {
+        let sandbox = PathBuf::from("/usr/bin/sandbox-exec");
+        if !sandbox.is_file() {
+            return Err(Error::InvalidInput(
+                "isolated terminal agents require `/usr/bin/sandbox-exec` on macOS".to_string(),
+            ));
+        }
+        let workspace_root = workspace_root.canonicalize()?;
+        let workdir = workdir.canonicalize()?;
+        let trail_internal = workspace_root.join(".trail").canonicalize()?;
+        let escape = |path: &Path| {
+            path.to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        };
+        let profile = format!(
+            "(version 1)\n\
+             (allow default)\n\
+             (deny file-write* (subpath \"{}\"))\n\
+             (allow file-write* (subpath \"{}\") (subpath \"{}\"))",
+            escape(&workspace_root),
+            escape(&trail_internal),
+            escape(&workdir),
+        );
+        let mut args = vec![
+            std::ffi::OsString::from("-p"),
+            std::ffi::OsString::from(profile),
+            std::ffi::OsString::from(&command[0]),
+        ];
+        args.extend(command[1..].iter().map(std::ffi::OsString::from));
+        Ok((sandbox.into_os_string(), args))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (workspace_root, workdir);
+        Ok((
+            std::ffi::OsString::from(&command[0]),
+            command[1..].iter().map(std::ffi::OsString::from).collect(),
+        ))
+    }
 }
 
 fn command_available(command: &str) -> bool {
