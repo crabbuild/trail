@@ -1,34 +1,34 @@
 use super::*;
 
-pub(super) fn handle_merge_queue_command(
+pub(super) fn handle_lane_merge_queue_command(
     ctx: &RuntimeContext,
-    queue: MergeQueueCommand,
+    queue: LaneMergeQueueCommand,
 ) -> Result<()> {
     match queue.command {
-        MergeQueueSubcommand::Add(args) => {
+        LaneMergeQueueSubcommand::Add(args) => {
             let mut db = open_db(ctx)?;
-            let report = db.enqueue_lane_merge(&args.source, &args.into, args.priority)?;
-            render_merge_queue_add(&report, ctx.json, &ctx.render)
+            let report = db.enqueue_lane_merge(&args.lane, &args.into, args.priority)?;
+            render_lane_merge_queue_add(&report, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::List => {
+        LaneMergeQueueSubcommand::List => {
             let db = open_db(ctx)?;
             let entries = db.list_lane_merge_queue()?;
-            render_merge_queue_list(&entries, ctx.json, &ctx.render)
+            render_lane_merge_queue_list(&entries, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::Explain(args) => {
+        LaneMergeQueueSubcommand::Explain(args) => {
             let mut db = open_db(ctx)?;
             let report = db.explain_lane_merge_queue(&args.selector)?;
-            render_merge_queue_explain(&report, ctx.json, &ctx.render)
+            render_lane_merge_queue_explain(&report, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::Run(args) => {
+        LaneMergeQueueSubcommand::Run(args) => {
             let mut db = open_db(ctx)?;
             let report = db.run_lane_merge_queue(args.limit)?;
-            render_merge_queue_run(&report, ctx.json, &ctx.render)
+            render_lane_merge_queue_run(&report, ctx.json, &ctx.render)
         }
-        MergeQueueSubcommand::Remove(args) => {
+        LaneMergeQueueSubcommand::Remove(args) => {
             let mut db = open_db(ctx)?;
             let report = db.remove_lane_merge_queue(&args.selector)?;
-            render_merge_queue_remove(&report, ctx.json, &ctx.render)
+            render_lane_merge_queue_remove(&report, ctx.json, &ctx.render)
         }
     }
 }

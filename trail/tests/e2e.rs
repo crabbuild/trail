@@ -19595,7 +19595,7 @@ fn user_facing_lane_merge_prefers_queue_for_default_branch() {
     assert!(blocked_stderr["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("merge-queue add cli-bot --into main"));
+        .contains("lane merge-queue add cli-bot --into main"));
     assert_eq!(db.status(Some("main")).unwrap().changed_paths.len(), 0);
 
     let direct = run_trail_json(
@@ -19627,7 +19627,7 @@ fn user_facing_lane_merge_prefers_queue_for_default_branch() {
     assert!(blocked_api_body["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("merge-queue add api-bot --into main"));
+        .contains("lane merge-queue add api-bot --into main"));
 
     let direct_api = trail::server::handle_http_request(
         &mut db,
@@ -24332,7 +24332,10 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
     assert!(db.list_conflicts().unwrap().is_empty());
     drop(db);
 
-    let cli = run_trail_json(temp.path(), &["merge-queue", "explain", "explain-bot"]);
+    let cli = run_trail_json(
+        temp.path(),
+        &["lane", "merge-queue", "explain", "explain-bot"],
+    );
     assert_eq!(cli["entry"]["source_ref"], "refs/lanes/explain-bot");
     assert!(cli["blockers"]
         .as_array()
@@ -24367,7 +24370,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
     let daemon_cli = run_trail_json_daemon(
         temp.path(),
         &daemon_url,
-        &["merge-queue", "explain", "refs/lanes/explain-bot"],
+        &["lane", "merge-queue", "explain", "refs/lanes/explain-bot"],
     );
     assert_eq!(daemon_cli["entry"]["queue_id"], queue_id);
     assert!(daemon_cli["blockers"]

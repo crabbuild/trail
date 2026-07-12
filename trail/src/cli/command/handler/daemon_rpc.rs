@@ -86,7 +86,6 @@ pub(super) fn try_handle_daemon_command(
         Command::Lane(lane) => handle_lane_command(ctx, &client, lane),
         Command::Session(session) => handle_session_command(ctx, &client, session),
         Command::Approvals(approvals) => handle_approvals_command(ctx, &client, approvals),
-        Command::MergeQueue(queue) => handle_merge_queue_command(ctx, &client, queue),
         Command::Lease(lease) => handle_lease_command(ctx, &client, lease),
         Command::Doctor => {
             let report: DoctorReport = client.get_json("/v1/doctor")?;
@@ -108,7 +107,6 @@ fn daemon_supports_command(command: &Command) -> bool {
         | Command::CodeFrom(_)
         | Command::Session(_)
         | Command::Approvals(_)
-        | Command::MergeQueue(_)
         | Command::Lease(_)
         | Command::Doctor => true,
         Command::Lane(lane) => match &lane.command {
@@ -121,6 +119,7 @@ fn daemon_supports_command(command: &Command) -> bool {
             | LaneSubcommand::Gates(_)
             | LaneSubcommand::Readiness(_)
             | LaneSubcommand::Merge(_)
+            | LaneSubcommand::MergeQueue(_)
             | LaneSubcommand::RefreshPreview(_)
             | LaneSubcommand::Handoff(_)
             | LaneSubcommand::Claim(_)
@@ -248,6 +247,7 @@ fn handle_lane_command(
             render_merge(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
+        LaneSubcommand::MergeQueue(queue) => handle_lane_merge_queue_command(ctx, client, queue),
         LaneSubcommand::RefreshPreview(args) => {
             let path = append_query(
                 &format!("/v1/lanes/{}/refresh-preview", args.name),
@@ -818,48 +818,48 @@ fn trace_filter_params(
     params
 }
 
-fn handle_merge_queue_command(
+fn handle_lane_merge_queue_command(
     ctx: &RuntimeContext,
     client: &DaemonClient,
-    queue: &MergeQueueCommand,
+    queue: &LaneMergeQueueCommand,
 ) -> Result<bool> {
     match &queue.command {
-        MergeQueueSubcommand::Add(args) => {
+        LaneMergeQueueSubcommand::Add(args) => {
             let body = serde_json::json!({
-                "source": args.source,
+                "lane": args.lane,
                 "target": args.into,
                 "priority": args.priority,
             });
             let report: LaneMergeQueueAddReport = client.post_json("/v1/merge-queue", &body)?;
-            render_merge_queue_add(&report, ctx.json, &ctx.render)?;
+            render_lane_merge_queue_add(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
-        MergeQueueSubcommand::List => {
+        LaneMergeQueueSubcommand::List => {
             let entries: Vec<LaneMergeQueueEntry> = client.get_json("/v1/merge-queue")?;
-            render_merge_queue_list(&entries, ctx.json, &ctx.render)?;
+            render_lane_merge_queue_list(&entries, ctx.json, &ctx.render)?;
             Ok(true)
         }
-        MergeQueueSubcommand::Explain(args) => {
+        LaneMergeQueueSubcommand::Explain(args) => {
             let report: LaneMergeQueueExplainReport = client.get_json(&format!(
                 "/v1/merge-queue/explain?selector={}",
                 args.selector
             ))?;
-            render_merge_queue_explain(&report, ctx.json, &ctx.render)?;
+            render_lane_merge_queue_explain(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
-        MergeQueueSubcommand::Run(args) => {
+        LaneMergeQueueSubcommand::Run(args) => {
             let body = match args.limit {
                 Some(limit) => serde_json::json!({ "limit": limit }),
                 None => serde_json::json!({}),
             };
             let report: LaneMergeQueueRunReport = client.post_json("/v1/merge-queue/run", &body)?;
-            render_merge_queue_run(&report, ctx.json, &ctx.render)?;
+            render_lane_merge_queue_run(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
-        MergeQueueSubcommand::Remove(args) => {
+        LaneMergeQueueSubcommand::Remove(args) => {
             let report: LaneMergeQueueRemoveReport =
                 client.delete_json(&format!("/v1/merge-queue/{}", args.selector))?;
-            render_merge_queue_remove(&report, ctx.json, &ctx.render)?;
+            render_lane_merge_queue_remove(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
     }

@@ -3,28 +3,28 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
-pub(in crate::cli::command) enum MergeQueueSubcommand {
-    /// Add a source ref to the merge queue.
-    Add(MergeQueueAddArgs),
+pub(in crate::cli::command) enum LaneMergeQueueSubcommand {
+    /// Add a lane to the serialized merge queue.
+    Add(LaneMergeQueueAddArgs),
     /// List queued merge candidates and states.
     List,
     /// Explain why a queued merge is ready or blocked.
-    Explain(MergeQueueExplainArgs),
+    Explain(LaneMergeQueueExplainArgs),
     /// Run queued merges up to optional item limit.
-    Run(MergeQueueRunArgs),
+    Run(LaneMergeQueueRunArgs),
     /// Remove a queued item before execution.
-    Remove(MergeQueueRemoveArgs),
+    Remove(LaneMergeQueueRemoveArgs),
 }
 
 #[derive(Args)]
-pub(in crate::cli::command) struct MergeQueueCommand {
+pub(in crate::cli::command) struct LaneMergeQueueCommand {
     #[command(subcommand)]
-    pub(in crate::cli::command) command: MergeQueueSubcommand,
+    pub(in crate::cli::command) command: LaneMergeQueueSubcommand,
 }
 
 #[derive(Args)]
-pub(in crate::cli::command) struct MergeQueueAddArgs {
-    pub(in crate::cli::command) source: String,
+pub(in crate::cli::command) struct LaneMergeQueueAddArgs {
+    pub(in crate::cli::command) lane: String,
     #[arg(long)]
     pub(in crate::cli::command) into: String,
     #[arg(long, default_value_t = 0)]
@@ -32,18 +32,18 @@ pub(in crate::cli::command) struct MergeQueueAddArgs {
 }
 
 #[derive(Args)]
-pub(in crate::cli::command) struct MergeQueueRunArgs {
+pub(in crate::cli::command) struct LaneMergeQueueRunArgs {
     #[arg(long)]
     pub(in crate::cli::command) limit: Option<usize>,
 }
 
 #[derive(Args)]
-pub(in crate::cli::command) struct MergeQueueExplainArgs {
+pub(in crate::cli::command) struct LaneMergeQueueExplainArgs {
     pub(in crate::cli::command) selector: String,
 }
 
 #[derive(Args)]
-pub(in crate::cli::command) struct MergeQueueRemoveArgs {
+pub(in crate::cli::command) struct LaneMergeQueueRemoveArgs {
     pub(in crate::cli::command) selector: String,
 }
 

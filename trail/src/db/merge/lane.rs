@@ -439,7 +439,7 @@ impl Trail {
             return Ok(());
         }
         Err(Error::InvalidInput(format!(
-            "direct merge into shared target `{into}` is disabled by default; run `trail merge-queue add {lane} --into {into}` and `trail merge-queue run`, or pass `--direct` to merge immediately"
+            "direct merge into shared target `{into}` is disabled by default; run `trail lane merge-queue add {lane} --into {into}` and `trail lane merge-queue run`, or pass `--direct` to merge immediately"
         )))
     }
 }
@@ -461,7 +461,7 @@ fn lane_refresh_preview_next_steps(
         )];
     }
     vec![format!(
-        "Review the changed paths, then merge via `trail merge-queue add {lane} --into {target_branch}` when ready."
+        "Review the changed paths, then merge via `trail lane merge-queue add {lane} --into {target_branch}` when ready."
     )]
 }
 

@@ -71,6 +71,9 @@ pub(super) fn handle_lane_command(ctx: &RuntimeContext, lane: LaneCommand) -> Re
                 db.merge_lane_user_with_options(&args.name, &args.into, args.dry_run, args.direct)?;
             render_merge(&report, ctx.json, &ctx.render)
         }
+        LaneSubcommand::MergeQueue(queue) => {
+            collaboration::handle_lane_merge_queue_command(ctx, queue)
+        }
         LaneSubcommand::RefreshPreview(args) => {
             let db = open_db(ctx)?;
             let report = db.preview_lane_refresh(&args.name, &args.target)?;

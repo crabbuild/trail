@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+use super::LaneMergeQueueCommand;
+
 mod run;
 mod trace;
 mod turn;
@@ -43,6 +45,8 @@ pub(super) enum LaneSubcommand {
     Readiness(LaneReadinessArgs),
     /// Merge a ready lane into a target branch, or preview the merge safely.
     Merge(LaneMergeArgs),
+    /// Schedule and run serialized lane merges.
+    MergeQueue(LaneMergeQueueCommand),
     /// Preview refreshing a lane onto a target branch before merge.
     RefreshPreview(LaneRefreshPreviewArgs),
     /// Merge a branch into a layered lane and advance its pinned view generation.

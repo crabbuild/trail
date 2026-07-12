@@ -61,7 +61,7 @@ pub(crate) fn render_merge(
     render_document(&document, options)
 }
 
-pub(crate) fn render_merge_queue_add(
+pub(crate) fn render_lane_merge_queue_add(
     report: &LaneMergeQueueAddReport,
     json: bool,
     options: &RenderOptions,
@@ -79,14 +79,14 @@ pub(crate) fn render_merge_queue_add(
         )
         .block(queue_entry_block(&report.entry))
         .next(
-            "trail merge-queue explain <queue-id>",
+            "trail lane merge-queue explain <queue-id>",
             "check readiness before processing this merge",
         ),
         options,
     )
 }
 
-pub(crate) fn render_merge_queue_list(
+pub(crate) fn render_lane_merge_queue_list(
     entries: &[LaneMergeQueueEntry],
     json: bool,
     options: &RenderOptions,
@@ -127,14 +127,14 @@ pub(crate) fn render_merge_queue_list(
                 .collect(),
         )))
         .next(
-            "trail merge-queue explain <queue-id>",
+            "trail lane merge-queue explain <queue-id>",
             "inspect blockers and the dry-run before running the queue",
         ),
         options,
     )
 }
 
-pub(crate) fn render_merge_queue_run(
+pub(crate) fn render_lane_merge_queue_run(
     report: &LaneMergeQueueRunReport,
     json: bool,
     options: &RenderOptions,
@@ -189,14 +189,14 @@ pub(crate) fn render_merge_queue_run(
         );
     } else if report.stopped_on_failure {
         document = document.next(
-            "trail merge-queue list",
+            "trail lane merge-queue list",
             "inspect the failed queue item before retrying",
         );
     }
     render_document(&document, options)
 }
 
-pub(crate) fn render_merge_queue_explain(
+pub(crate) fn render_lane_merge_queue_explain(
     report: &LaneMergeQueueExplainReport,
     json: bool,
     options: &RenderOptions,
@@ -247,7 +247,7 @@ pub(crate) fn render_merge_queue_explain(
     render_document(&document, options)
 }
 
-pub(crate) fn render_merge_queue_remove(
+pub(crate) fn render_lane_merge_queue_remove(
     report: &LaneMergeQueueRemoveReport,
     json: bool,
     options: &RenderOptions,

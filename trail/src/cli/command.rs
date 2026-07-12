@@ -178,9 +178,6 @@ enum Command {
     Session(SessionCommand),
     /// Handle sensitive action approvals and reviewer decisions.
     Approvals(ApprovalsCommand),
-    /// Schedule and run controlled serialized merges using a queue.
-    /// Merge items pause on first conflict and keep audit history.
-    MergeQueue(MergeQueueCommand),
     /// Inspect and resolve conflict sets opened by merge operations.
     Conflicts(ConflictsCommand),
     /// Create and resolve stable anchors that survive nearby line churn.
@@ -440,5 +437,34 @@ mod tests {
         assert_eq!(args.name, "fix-login");
         assert_eq!(args.into, "main");
         assert!(args.dry_run);
+    }
+
+    #[test]
+    fn parses_lane_merge_queue_and_rejects_top_level_form() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "lane",
+            "merge-queue",
+            "add",
+            "doc-bot",
+            "--into",
+            "main",
+        ])
+        .expect("lane merge queue should parse");
+        let Command::Lane(LaneCommand {
+            command: LaneSubcommand::MergeQueue(queue),
+        }) = cli.command
+        else {
+            panic!("expected lane merge queue command");
+        };
+        let LaneMergeQueueSubcommand::Add(args) = queue.command else {
+            panic!("expected lane merge queue add command");
+        };
+        assert_eq!(args.lane, "doc-bot");
+        assert_eq!(args.into, "main");
+        assert!(
+            Cli::try_parse_from(["trail", "merge-queue", "add", "doc-bot", "--into", "main",])
+                .is_err()
+        );
     }
 }
