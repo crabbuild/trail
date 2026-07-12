@@ -1,13 +1,28 @@
 use super::*;
 use crate::cli::command::render::render_agent_timeline;
 use std::process::{Command as ProcessCommand, Stdio};
+use trail::agent_hooks::{
+    apply_agent_hook_install_plan, build_agent_hook_install_plan, inspect_agent_hook_installation,
+    redact_agent_hook_payload, remove_agent_hook_installation, rollback_agent_hook_install_plan,
+    AgentHookInstallRequest, AgentHookInstallScope, AgentProviderRegistry,
+};
 use trail::{
-    AgentContinueReport, AgentReviewAction, AgentRunReport, LaneWorkdirMode, StatusSuggestion,
+    AgentCaptureTransport, AgentContinueReport, AgentHookReceiptInput, AgentReviewAction,
+    AgentRunReport, LaneWorkdirMode, StatusSuggestion,
 };
 
 pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) -> Result<()> {
     match agent.command {
         None => handle_agent_home(ctx),
+        Some(AgentSubcommand::Hook(args)) => handle_agent_hook(ctx, args),
+        Some(AgentSubcommand::Hooks(args)) => handle_agent_hooks(ctx, args),
+        Some(AgentSubcommand::Capture(args)) => handle_agent_capture(ctx, args),
+        Some(AgentSubcommand::Artifacts(args)) => handle_agent_artifacts(ctx, args),
+        Some(AgentSubcommand::Provenance(args)) => handle_agent_provenance(ctx, args),
+        Some(AgentSubcommand::Attest(args)) => handle_agent_attest(ctx, args),
+        Some(AgentSubcommand::Learnings(args)) => handle_agent_learnings(ctx, args),
+        Some(AgentSubcommand::Export(args)) => handle_agent_trace_export(ctx, args),
+        Some(AgentSubcommand::GitLink(args)) => handle_agent_git_link(ctx, args),
         Some(AgentSubcommand::Setup(args)) => handle_agent_setup(ctx, args),
         Some(AgentSubcommand::Acp(args)) => handle_agent_acp(ctx, args),
         Some(AgentSubcommand::Start(args)) => handle_agent_start(ctx, args),
@@ -70,6 +85,1107 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
         Some(AgentSubcommand::Rewind(args)) => handle_agent_rewind(ctx, args),
         Some(AgentSubcommand::Doctor(args)) => handle_agent_doctor(ctx, args),
     }
+}
+
+fn handle_agent_hook(ctx: &RuntimeContext, args: AgentHookCommand) -> Result<()> {
+    match args.command {
+        AgentHookSubcommand::Receive(args) => handle_agent_hook_receive(ctx, args),
+    }
+}
+
+fn handle_agent_capture(ctx: &RuntimeContext, args: AgentCaptureCommand) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    match args.command {
+        AgentCaptureSubcommand::Begin(args) => {
+            let workdir = args
+                .workdir
+                .unwrap_or(std::env::current_dir()?)
+                .canonicalize()?;
+            let report = db.begin_agent_capture_run(trail::AgentCaptureRunInput {
+                lane: args.lane,
+                workdir: workdir.to_string_lossy().into_owned(),
+                owner_agent: args.owner,
+                owner_session_id: args.session,
+                executor_agent: args.executor,
+                work_item_id: args.work_item,
+                lease_ms: args.ttl_ms,
+                metadata_json: Some("{\"source\":\"cli\"}".to_string()),
+            })?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("capture run {} started", report.capture_run_id),
+            )
+        }
+        AgentCaptureSubcommand::Renew(args) => {
+            let report =
+                db.renew_agent_capture_run(&args.run_id, &args.owner, &args.session, args.ttl_ms)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("capture run {} renewed", report.capture_run_id),
+            )
+        }
+        AgentCaptureSubcommand::End(args) => {
+            let report = db.end_agent_capture_run(&args.run_id, &args.owner, &args.session)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("capture run {} ended", report.capture_run_id),
+            )
+        }
+        AgentCaptureSubcommand::Status(args) => {
+            let reports = db.list_agent_capture_runs_page(!args.all, args.offset, args.limit)?;
+            let summary = format!("{} capture run(s)", reports.len());
+            render_agent_hooks_value(ctx, serde_json::to_value(reports)?, summary)
+        }
+        AgentCaptureSubcommand::Reconcile => {
+            let report = db.reconcile_expired_agent_capture_runs()?;
+            let summary = format!(
+                "expired {} run(s); interrupted {} session mapping(s)",
+                report.expired_run_ids.len(),
+                report.interrupted_mapping_ids.len()
+            );
+            render_agent_hooks_value(ctx, serde_json::to_value(report)?, summary)
+        }
+    }
+}
+
+fn handle_agent_artifacts(ctx: &RuntimeContext, args: AgentArtifactsArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let artifacts =
+        db.list_lane_artifacts_page(&args.session, args.turn.as_deref(), args.offset, args.limit)?;
+    let summary = format!("{} artifact(s) for {}", artifacts.len(), args.session);
+    render_agent_hooks_value(ctx, serde_json::to_value(artifacts)?, summary)
+}
+
+fn handle_agent_provenance(ctx: &RuntimeContext, args: AgentProvenanceArgs) -> Result<()> {
+    let db = open_db(ctx)?;
+    let (nodes, edges) = db.list_session_provenance_page(&args.session, args.offset, args.limit)?;
+    let summary = format!(
+        "{} provenance node(s), {} edge(s) for {}",
+        nodes.len(),
+        edges.len(),
+        args.session
+    );
+    render_agent_hooks_value(
+        ctx,
+        serde_json::json!({"session_id":args.session,"nodes":nodes,"edges":edges}),
+        summary,
+    )
+}
+
+fn handle_agent_attest(ctx: &RuntimeContext, args: AgentAttestCommand) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    match args.command {
+        AgentAttestSubcommand::Create(args) => {
+            let report = db.create_session_attestation(
+                &args.session,
+                &args.policy,
+                Some(serde_json::json!({"source":"cli"})),
+            )?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("attestation {} created", report.attestation_id),
+            )
+        }
+        AgentAttestSubcommand::List(args) => {
+            let reports =
+                db.list_session_attestations_page(&args.session, args.offset, args.limit)?;
+            let summary = format!("{} attestation(s) for {}", reports.len(), args.session);
+            render_agent_hooks_value(ctx, serde_json::to_value(reports)?, summary)
+        }
+        AgentAttestSubcommand::Show(args) => {
+            let report = db.session_attestation(&args.attestation_id)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("attestation {} ({})", report.attestation_id, report.status),
+            )
+        }
+        AgentAttestSubcommand::Verify(args) => {
+            let report = db.verify_session_attestation(&args.attestation_id)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!(
+                    "attestation {}: {}",
+                    report.attestation_id,
+                    if report.valid { "valid" } else { "invalid" }
+                ),
+            )
+        }
+    }
+}
+
+fn handle_agent_learnings(ctx: &RuntimeContext, args: AgentLearningsCommand) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    match args.command {
+        AgentLearningsSubcommand::List(args) => {
+            let reports = db.list_learnings_page(
+                args.session.as_deref(),
+                args.status.as_deref(),
+                args.offset,
+                args.limit,
+            )?;
+            let summary = format!("{} learning(s)", reports.len());
+            render_agent_hooks_value(ctx, serde_json::to_value(reports)?, summary)
+        }
+        AgentLearningsSubcommand::Accept(args) => {
+            let report = db.review_learning(&args.learning_id, true, &args.reviewer)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("learning {} accepted", report.learning_id),
+            )
+        }
+        AgentLearningsSubcommand::Reject(args) => {
+            let report = db.review_learning(&args.learning_id, false, &args.reviewer)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("learning {} rejected", report.learning_id),
+            )
+        }
+    }
+}
+
+fn handle_agent_trace_export(ctx: &RuntimeContext, args: AgentTraceExportArgs) -> Result<()> {
+    use std::io::Write;
+
+    let db = open_db(ctx)?;
+    let trace = db.export_agent_trace(&args.session, args.attachments)?;
+    let bytes = trace.to_canonical_json()?;
+    if let Some(output) = args.output {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&output)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if !ctx.quiet {
+            eprintln!("wrote portable agent trace to {}", output.display());
+        }
+    } else {
+        std::io::stdout().write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+fn handle_agent_git_link(ctx: &RuntimeContext, args: AgentGitLinkCommand) -> Result<()> {
+    let mut db = open_db(ctx)?;
+    match args.command {
+        AgentGitLinkSubcommand::Link(args) => {
+            let report = db.link_git_commit_to_agent(trail::GitAgentLinkInput {
+                session_id: args.session,
+                turn_id: args.turn,
+                git_commit: args.git_commit,
+                from_change: args.from_change,
+                through_change: args.through_change,
+                confidence: args.confidence,
+                source: args.source,
+                metadata: Some(serde_json::json!({"source":"cli"})),
+            })?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!(
+                    "linked Git commit {} to session {}",
+                    report.git_commit, report.session_id
+                ),
+            )
+        }
+        AgentGitLinkSubcommand::List(args) => {
+            let reports = db.list_git_agent_links_page(&args.session, args.offset, args.limit)?;
+            let summary = format!("{} Git link(s) for {}", reports.len(), args.session);
+            render_agent_hooks_value(ctx, serde_json::to_value(reports)?, summary)
+        }
+    }
+}
+
+fn handle_agent_hooks(ctx: &RuntimeContext, args: AgentHooksCommand) -> Result<()> {
+    match args.command {
+        AgentHooksSubcommand::Add(args) => handle_agent_hooks_add(ctx, args),
+        AgentHooksSubcommand::Remove(args) => handle_agent_hooks_remove(ctx, args),
+        AgentHooksSubcommand::List(args) => handle_agent_hooks_list(ctx, args),
+        AgentHooksSubcommand::Status(args) => handle_agent_hooks_status(ctx, args),
+        AgentHooksSubcommand::Doctor(args) => handle_agent_hooks_doctor(ctx, args),
+        AgentHooksSubcommand::Events(args) => handle_agent_hooks_events(ctx, args),
+        AgentHooksSubcommand::Replay(args) => handle_agent_hooks_replay(ctx, args),
+        AgentHooksSubcommand::Retry(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.retry_agent_hook_receipt(&args.receipt)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("receipt {} queued for retry", report.receipt_id),
+            )
+        }
+        AgentHooksSubcommand::Discard(args) => {
+            let mut db = open_db(ctx)?;
+            let report = db.discard_agent_hook_receipt(&args.receipt)?;
+            render_agent_hooks_value(
+                ctx,
+                serde_json::to_value(&report)?,
+                format!("receipt {} discarded", report.receipt_id),
+            )
+        }
+    }
+}
+
+fn handle_agent_hooks_add(ctx: &RuntimeContext, args: AgentHooksAddArgs) -> Result<()> {
+    let registry = AgentProviderRegistry::built_in()?;
+    registry.resolve(&args.provider)?;
+    let mut db = open_db(ctx)?;
+    let scope = agent_hook_scope(args.scope);
+    let home = agent_hooks_home_dir();
+    let plan = build_agent_hook_install_plan(AgentHookInstallRequest {
+        registry: &registry,
+        provider: &args.provider,
+        workspace_id: &db.config().workspace.id.0,
+        workspace_root: db.workspace_root(),
+        home_dir: home.as_deref(),
+        scope,
+        force: args.force,
+    })?;
+    let report = apply_agent_hook_install_plan(&plan, args.dry_run)?;
+    if !args.dry_run {
+        if let Err(error) = db.record_agent_hook_installation(&plan, args.lane.as_deref()) {
+            rollback_agent_hook_install_plan(&plan).map_err(|rollback| {
+                Error::Conflict(format!(
+                    "failed to record hook installation ({error}); rollback also failed: {rollback}"
+                ))
+            })?;
+            return Err(error);
+        }
+    }
+    render_agent_hooks_value(
+        ctx,
+        serde_json::to_value(&report)?,
+        format!(
+            "{} {} hooks at {} ({:?}){}",
+            if args.dry_run {
+                "Would configure"
+            } else {
+                "Configured"
+            },
+            report.provider,
+            report.config_path.display(),
+            report.action,
+            if args.dry_run { " [dry run]" } else { "" }
+        ),
+    )
+}
+
+fn handle_agent_hooks_remove(ctx: &RuntimeContext, args: AgentHooksRemoveArgs) -> Result<()> {
+    let registry = AgentProviderRegistry::built_in()?;
+    let provider = registry.resolve(&args.provider)?.provider.clone();
+    let mut db = open_db(ctx)?;
+    let scope = agent_hook_scope(args.scope);
+    let record = db
+        .list_agent_hook_installations(Some(&provider))?
+        .into_iter()
+        .find(|record| record.scope == scope && record.status == "installed")
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "no installed {provider} hooks were recorded for {} scope",
+                scope.as_str()
+            ))
+        })?;
+    let home = agent_hooks_home_dir();
+    let plan = build_agent_hook_install_plan(AgentHookInstallRequest {
+        registry: &registry,
+        provider: &provider,
+        workspace_id: &db.config().workspace.id.0,
+        workspace_root: db.workspace_root(),
+        home_dir: home.as_deref(),
+        scope,
+        force: true,
+    })?;
+    if plan.installation_id != record.installation_id || plan.config_path != record.config_path {
+        return Err(Error::Conflict(
+            "recorded hook ownership does not match the current provider install target"
+                .to_string(),
+        ));
+    }
+    let report = remove_agent_hook_installation(&plan, &record.config_after_digest, args.dry_run)?;
+    if !args.dry_run {
+        db.mark_agent_hook_installation_removed(&record.installation_id)?;
+    }
+    render_agent_hooks_value(
+        ctx,
+        serde_json::to_value(&report)?,
+        format!(
+            "{} {} hooks from {}{}",
+            if args.dry_run {
+                "Would remove"
+            } else {
+                "Removed"
+            },
+            provider,
+            report.config_path.display(),
+            if args.dry_run { " [dry run]" } else { "" }
+        ),
+    )
+}
+
+fn handle_agent_hooks_list(ctx: &RuntimeContext, args: AgentHooksListArgs) -> Result<()> {
+    let registry = AgentProviderRegistry::built_in()?;
+    let db = open_db(ctx)?;
+    let installations = db.list_agent_hook_installations(None)?;
+    let rows = registry
+        .list()
+        .into_iter()
+        .filter_map(|manifest| {
+            let matching = installations
+                .iter()
+                .filter(|record| {
+                    record.provider == manifest.provider && record.status == "installed"
+                })
+                .collect::<Vec<_>>();
+            if args.installed && matching.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "provider": manifest.provider,
+                "display_name": manifest.display_name,
+                "support": manifest.support,
+                "deployment": manifest.deployment,
+                "project_config_path": manifest.project_config_path,
+                "installations": matching,
+            }))
+        })
+        .collect::<Vec<_>>();
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if !ctx.quiet {
+        for row in &rows {
+            let count = row["installations"].as_array().map(Vec::len).unwrap_or(0);
+            println!(
+                "{:<14} {:<12} {} installation(s)",
+                row["provider"].as_str().unwrap_or_default(),
+                row["support"].as_str().unwrap_or("known"),
+                count
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_agent_hooks_status(ctx: &RuntimeContext, args: AgentHooksProviderArgs) -> Result<()> {
+    let registry = AgentProviderRegistry::built_in()?;
+    let provider = registry.resolve(&args.provider)?.provider.clone();
+    let db = open_db(ctx)?;
+    let records = db.list_agent_hook_installations(Some(&provider))?;
+    let home = agent_hooks_home_dir();
+    let mut statuses = Vec::new();
+    for record in records {
+        let plan = build_agent_hook_install_plan(AgentHookInstallRequest {
+            registry: &registry,
+            provider: &provider,
+            workspace_id: &db.config().workspace.id.0,
+            workspace_root: db.workspace_root(),
+            home_dir: home.as_deref(),
+            scope: record.scope,
+            force: true,
+        })?;
+        statuses.push(serde_json::json!({
+            "record": record,
+            "filesystem_status": inspect_agent_hook_installation(&plan)?,
+        }));
+    }
+    let summary = if statuses.is_empty() {
+        format!("{provider}: not installed")
+    } else {
+        format!("{provider}: {} recorded installation(s)", statuses.len())
+    };
+    render_agent_hooks_value(
+        ctx,
+        serde_json::json!({"provider": provider, "installations": statuses}),
+        summary,
+    )
+}
+
+fn handle_agent_hooks_doctor(ctx: &RuntimeContext, args: AgentHooksDoctorArgs) -> Result<()> {
+    let _all = args.all;
+    let registry = AgentProviderRegistry::built_in()?;
+    let providers = if let Some(provider) = args.provider.as_deref() {
+        vec![registry.resolve(provider)?]
+    } else {
+        registry.list()
+    };
+    let db = open_db(ctx)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let spool = agent_hook_spool_pressure(db.db_dir());
+    let mut reports = Vec::new();
+    for manifest in providers {
+        let installations = db.list_agent_hook_installations(Some(&manifest.provider))?;
+        let receipts = db.list_agent_hook_receipts(Some(&manifest.provider), None, 1_000)?;
+        let mappings = db.list_lane_agent_sessions(Some(&manifest.provider), None, 1_000)?;
+        let runs = db
+            .list_agent_capture_runs(false, 1_000)?
+            .into_iter()
+            .filter(|run| {
+                run.owner_agent == manifest.provider
+                    || run.executor_agent.as_deref() == Some(manifest.provider.as_str())
+            })
+            .collect::<Vec<_>>();
+        let probe = registry.probe(&manifest.provider, args.probe)?;
+        let failed_receipts = receipts
+            .iter()
+            .filter(|receipt| matches!(receipt.status.as_str(), "retry" | "quarantined"))
+            .count();
+        let stale_finalizers = mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.status == trail::AgentCapturePhase::Finalizing
+                    && mapping
+                        .finalization_lease_expires_at
+                        .is_none_or(|expires_at| expires_at <= now)
+            })
+            .count();
+        let home = agent_hooks_home_dir();
+        let installation_checks = installations
+            .iter()
+            .map(|record| {
+                build_agent_hook_install_plan(AgentHookInstallRequest {
+                    registry: &registry,
+                    provider: &manifest.provider,
+                    workspace_id: &db.config().workspace.id.0,
+                    workspace_root: db.workspace_root(),
+                    home_dir: home.as_deref(),
+                    scope: record.scope,
+                    force: true,
+                })
+                .and_then(|plan| inspect_agent_hook_installation(&plan))
+                .map(|status| {
+                    serde_json::json!({
+                        "installation_id": record.installation_id,
+                        "status": status,
+                    })
+                })
+                .unwrap_or_else(|error| {
+                    serde_json::json!({
+                        "installation_id": record.installation_id,
+                        "status": "malformed",
+                        "diagnostic": error.to_string(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let checks = vec![
+            serde_json::json!({
+                "code": "HOOK_INSTALLATION_STATUS",
+                "status": if installations.is_empty() { "warning" } else { "ok" },
+                "message": if installations.is_empty() { "no recorded native hook installation" } else { "native hook ownership records found" },
+                "remediation": format!("trail agent hooks add {}", manifest.provider),
+                "details": installation_checks,
+            }),
+            serde_json::json!({
+                "code": "RECEIPT_REPLAY_FAILURES",
+                "status": if failed_receipts == 0 { "ok" } else { "warning" },
+                "message": format!("{failed_receipts} receipt(s) require retry or operator review"),
+                "remediation": "trail agent hooks replay --pending",
+            }),
+            serde_json::json!({
+                "code": "TURN_FINALIZATION_LEASE_STALE",
+                "status": if stale_finalizers == 0 { "ok" } else { "warning" },
+                "message": format!("{stale_finalizers} stale finalization lease(s)"),
+                "remediation": "trail agent hooks replay --pending",
+            }),
+            serde_json::json!({
+                "code": "CAPTURE_RECEIPT_SPOOLING",
+                "status": if spool.files == 0 { "ok" } else { "warning" },
+                "message": format!("{} spooled receipt file(s), {} bytes", spool.files, spool.bytes),
+                "remediation": "trail agent hooks replay --pending",
+            }),
+            serde_json::json!({
+                "code": "TRANSCRIPT_CAPABILITY",
+                "status": if manifest.transcript_location_hints.is_empty() && manifest.canonical_export_command.is_none() { "warning" } else { "ok" },
+                "message": if manifest.transcript_location_hints.is_empty() && manifest.canonical_export_command.is_none() { "provider has no stable native transcript or canonical export contract" } else { "provider transcript/export collection is capability-gated" },
+                "remediation": "inspect provider capability and fidelity diagnostics before relying on transcript evidence",
+            }),
+        ];
+        reports.push(serde_json::json!({
+            "provider": manifest.provider,
+            "support": manifest.support,
+            "adapter_version": manifest.adapter_version,
+            "provider_version_range": manifest.provider_version_range,
+            "contract_source": manifest.contract_source,
+            "installations": installations,
+            "last_receipt": receipts.first(),
+            "receipt_status_counts": receipt_status_counts(&receipts),
+            "capture_mappings": mappings,
+            "managed_runs": runs,
+            "spool": spool,
+            "checks": checks,
+            "probe": probe,
+            "probe_requested": args.probe,
+            "probe_status": if args.probe { "version-command" } else { "static-discovery" },
+        }));
+    }
+    let summary = format!("checked {} agent hook provider(s)", reports.len());
+    render_agent_hooks_value(ctx, serde_json::Value::Array(reports), summary)
+}
+
+fn handle_agent_hooks_events(ctx: &RuntimeContext, args: AgentHooksEventsArgs) -> Result<()> {
+    let registry = AgentProviderRegistry::built_in()?;
+    let provider = registry.resolve(&args.provider)?.provider.clone();
+    let db = open_db(ctx)?;
+    let mut receipts =
+        db.list_agent_hook_receipts_page(Some(&provider), None, args.offset, args.last)?;
+    if args.failed {
+        receipts.retain(|receipt| {
+            matches!(
+                receipt.status.as_str(),
+                "retry" | "quarantined" | "discarded"
+            )
+        });
+    }
+    let summary = format!("{}: {} durable receipt(s)", provider, receipts.len());
+    render_agent_hooks_value(ctx, serde_json::to_value(receipts)?, summary)
+}
+
+fn handle_agent_hooks_replay(ctx: &RuntimeContext, args: AgentHooksReplayArgs) -> Result<()> {
+    if args.receipt.is_none() && !args.pending {
+        return Err(Error::InvalidInput(
+            "agent hooks replay requires --receipt <id> or --pending".to_string(),
+        ));
+    }
+    let mut db = open_db(ctx)?;
+    let spool = if args.pending {
+        drain_agent_hook_spool(&mut db)?
+    } else {
+        AgentHookSpoolDrain::default()
+    };
+    let batch = if let Some(receipt_id) = args.receipt {
+        match db.replay_agent_hook_receipt(&receipt_id) {
+            Ok(report) => trail::AgentHookReplayBatchReport {
+                recovered_stale_receipts: 0,
+                replayed: vec![report],
+                failures: Vec::new(),
+            },
+            Err(error) => trail::AgentHookReplayBatchReport {
+                recovered_stale_receipts: 0,
+                replayed: Vec::new(),
+                failures: vec![trail::AgentHookReplayFailure {
+                    receipt_id,
+                    code: error.code().to_string(),
+                    message: error.to_string(),
+                }],
+            },
+        }
+    } else {
+        db.replay_pending_agent_hook_receipts(args.limit)?
+    };
+    let value = serde_json::json!({
+        "spool": spool,
+        "recovered_stale_receipts": batch.recovered_stale_receipts,
+        "replayed": batch.replayed,
+        "failures": batch.failures
+    });
+    let summary = format!(
+        "replayed {} receipt(s); {} failed",
+        value["replayed"].as_array().map(Vec::len).unwrap_or(0),
+        value["failures"].as_array().map(Vec::len).unwrap_or(0)
+    );
+    render_agent_hooks_value(ctx, value, summary)
+}
+
+#[derive(Default, serde::Serialize)]
+struct AgentHookSpoolDrain {
+    imported: usize,
+    duplicates: usize,
+    failed: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct AgentHookSpoolPressure {
+    files: usize,
+    bytes: u64,
+}
+
+fn agent_hook_spool_pressure(db_dir: &std::path::Path) -> AgentHookSpoolPressure {
+    let directory = db_dir.join("runtime/agent-hooks-spool");
+    if directory
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+        .unwrap_or(true)
+    {
+        return AgentHookSpoolPressure::default();
+    }
+    let mut pressure = AgentHookSpoolPressure::default();
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten().take(10_000) {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    pressure.files += 1;
+                    pressure.bytes = pressure.bytes.saturating_add(metadata.len());
+                }
+            }
+        }
+    }
+    pressure
+}
+
+fn receipt_status_counts(
+    receipts: &[trail::AgentHookReceipt],
+) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for receipt in receipts {
+        *counts.entry(receipt.status.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn drain_agent_hook_spool(db: &mut trail::Trail) -> Result<AgentHookSpoolDrain> {
+    let directory = db.db_dir().join("runtime/agent-hooks-spool");
+    if !directory.exists() {
+        return Ok(AgentHookSpoolDrain::default());
+    }
+    if directory
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(Error::InvalidPath {
+            path: directory.display().to_string(),
+            reason: "agent hook spool directory is a symlink".to_string(),
+        });
+    }
+    let mut paths = std::fs::read_dir(&directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("receipt-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut report = AgentHookSpoolDrain::default();
+    for path in paths.into_iter().take(1_000) {
+        let result = (|| -> Result<bool> {
+            let metadata = path.symlink_metadata()?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > (trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES + 16_384) as u64
+            {
+                return Err(Error::InvalidPath {
+                    path: path.display().to_string(),
+                    reason: "invalid agent hook spool entry".to_string(),
+                });
+            }
+            let envelope: AgentHookSpoolEnvelope = serde_json::from_slice(&std::fs::read(&path)?)?;
+            if envelope.version != 1 {
+                return Err(Error::InvalidInput(format!(
+                    "unsupported agent hook spool version {}",
+                    envelope.version
+                )));
+            }
+            let ingested = db.persist_agent_hook_receipt(envelope.input)?;
+            std::fs::remove_file(&path)?;
+            Ok(ingested.duplicate)
+        })();
+        match result {
+            Ok(true) => report.duplicates += 1,
+            Ok(false) => report.imported += 1,
+            Err(error) => report.failed.push(serde_json::json!({
+                "path": path,
+                "code": error.code(),
+                "error": error.to_string(),
+            })),
+        }
+    }
+    Ok(report)
+}
+
+fn agent_hook_scope(scope: AgentHooksScopeArg) -> AgentHookInstallScope {
+    match scope {
+        AgentHooksScopeArg::Project => AgentHookInstallScope::Project,
+        AgentHooksScopeArg::User => AgentHookInstallScope::User,
+    }
+}
+
+fn agent_hooks_home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+fn render_agent_hooks_value(
+    ctx: &RuntimeContext,
+    value: serde_json::Value,
+    human: String,
+) -> Result<()> {
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if !ctx.quiet {
+        println!("{human}");
+    }
+    Ok(())
+}
+
+fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -> Result<()> {
+    use std::io::Read;
+
+    const MAX_STDIN_BYTES: u64 = (trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES + 1) as u64;
+    let registry = AgentProviderRegistry::built_in();
+    let provider = registry
+        .as_ref()
+        .ok()
+        .and_then(|registry| registry.resolve(&args.provider).ok())
+        .map(|manifest| manifest.provider.clone())
+        .unwrap_or_else(|| args.provider.trim().to_ascii_lowercase());
+    let mut bytes = Vec::new();
+    if let Err(error) = std::io::stdin()
+        .lock()
+        .take(MAX_STDIN_BYTES)
+        .read_to_end(&mut bytes)
+    {
+        eprintln!("trail: native agent receipt could not be read: {error}");
+        return acknowledge_agent_hook(&provider, &args.native_event);
+    }
+    if bytes.len() > trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES {
+        eprintln!(
+            "trail: native agent receipt exceeds {} bytes and was not recorded",
+            trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+        );
+        return acknowledge_agent_hook(&provider, &args.native_event);
+    }
+    let payload: serde_json::Value =
+        match if bytes.iter().all(u8::is_ascii_whitespace) && provider == "kiro" {
+            Ok(serde_json::json!({}))
+        } else {
+            serde_json::from_slice(&bytes)
+        } {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("trail: native agent receipt was not valid JSON: {error}");
+                return acknowledge_agent_hook(&provider, &args.native_event);
+            }
+        };
+    let payload = enrich_kiro_hook_payload(payload, &provider, &args.native_event);
+    if serde_json::to_vec(&payload)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+        > trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+    {
+        eprintln!(
+            "trail: native agent receipt exceeds {} bytes after provider enrichment and was not recorded",
+            trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES
+        );
+        return acknowledge_agent_hook(&provider, &args.native_event);
+    }
+    if registry
+        .as_ref()
+        .ok()
+        .and_then(|registry| registry.resolve(&provider).ok())
+        .is_none()
+    {
+        eprintln!("trail: native agent provider `{provider}` is not registered");
+        return acknowledge_agent_hook(&provider, &args.native_event);
+    }
+    let native_session_id = hook_payload_string(
+        &payload,
+        &[
+            "session_id",
+            "sessionId",
+            "sessionID",
+            "conversation_id",
+            "conversationId",
+            "thread_id",
+            "threadId",
+        ],
+    );
+    let native_turn_id = hook_payload_string(&payload, &["turn_id", "turnId"]);
+    let occurred_at = hook_payload_i64(&payload, &["timestamp", "occurred_at", "occurredAt"]);
+    let dedupe_key = args.dedupe_key.unwrap_or_else(|| {
+        derive_hook_dedupe_key(
+            &provider,
+            &args.native_event,
+            native_session_id.as_deref(),
+            native_turn_id.as_deref(),
+            &payload,
+        )
+    });
+    let input = AgentHookReceiptInput {
+        installation_id: args.installation,
+        provider: provider.clone(),
+        native_event: args.native_event.clone(),
+        native_session_id,
+        native_turn_id,
+        transport: AgentCaptureTransport::NativeHooks,
+        dedupe_key,
+        payload: payload.clone(),
+        occurred_at,
+    };
+    let capture_result = open_db(ctx).and_then(|mut db| {
+        let ingested = db.persist_agent_hook_receipt(input.clone())?;
+        if ingested.receipt.status != "processed" {
+            if let Err(error) = db.replay_agent_hook_receipt(&ingested.receipt.receipt_id) {
+                eprintln!(
+                    "trail: native receipt was journaled but semantic replay is deferred: {error}"
+                );
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = capture_result {
+        let envelope = AgentHookSpoolEnvelope {
+            version: 1,
+            input: AgentHookReceiptInput {
+                payload: redact_agent_hook_payload(payload),
+                ..input
+            },
+        };
+        if let Err(spool_error) = spool_agent_hook_receipt(ctx, &envelope) {
+            eprintln!(
+                "trail: native receipt was not recorded ({error}); fallback spool also failed: {spool_error}"
+            );
+        } else {
+            eprintln!("trail: native receipt was spooled for later replay: {error}");
+        }
+    }
+    acknowledge_agent_hook(&provider, &args.native_event)
+}
+
+fn enrich_kiro_hook_payload(
+    mut payload: serde_json::Value,
+    provider: &str,
+    native_event: &str,
+) -> serde_json::Value {
+    if provider != "kiro" {
+        return payload;
+    }
+    let Some(root) = payload.as_object_mut() else {
+        return payload;
+    };
+    if native_event.eq_ignore_ascii_case("UserPromptSubmit") && !root.contains_key("prompt") {
+        if let Ok(prompt) = std::env::var("USER_PROMPT") {
+            if !prompt.is_empty() && prompt.len() <= trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES {
+                root.insert("prompt".to_string(), serde_json::Value::String(prompt));
+            }
+        }
+    }
+    if !root.contains_key("cwd") {
+        if let Ok(cwd) = std::env::current_dir() {
+            root.insert(
+                "cwd".to_string(),
+                serde_json::Value::String(cwd.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    payload
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct AgentHookSpoolEnvelope {
+    version: u16,
+    input: AgentHookReceiptInput,
+}
+
+fn acknowledge_agent_hook(provider: &str, native_event: &str) -> Result<()> {
+    if provider == "codex" && matches!(native_event, "Stop" | "SubagentStop") {
+        println!("{{\"continue\":true}}");
+    } else if provider == "gemini" {
+        println!("{{}}");
+    }
+    Ok(())
+}
+
+fn spool_agent_hook_receipt(ctx: &RuntimeContext, envelope: &AgentHookSpoolEnvelope) -> Result<()> {
+    use std::io::Write;
+
+    let db_dir = agent_hook_spool_db_dir(ctx)
+        .ok_or_else(|| Error::WorkspaceNotFound(std::env::current_dir().unwrap_or_default()))?;
+    if db_dir
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(Error::InvalidPath {
+            path: db_dir.display().to_string(),
+            reason: "agent hook spool database directory is a symlink".to_string(),
+        });
+    }
+    let spool_dir = db_dir.join("runtime/agent-hooks-spool");
+    std::fs::create_dir_all(&spool_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut spool_files = 0usize;
+    let mut spool_bytes = 0u64;
+    for entry in std::fs::read_dir(&spool_dir)? {
+        let entry = entry?;
+        let metadata = entry.path().symlink_metadata()?;
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            spool_files = spool_files.saturating_add(1);
+            spool_bytes = spool_bytes.saturating_add(metadata.len());
+        }
+    }
+    if spool_files >= 10_000 || spool_bytes >= 64 * 1024 * 1024 {
+        return Err(Error::InvalidInput(format!(
+            "agent hook spool quota exceeded ({spool_files} files, {spool_bytes} bytes)"
+        )));
+    }
+    let bytes = serde_json::to_vec(envelope)?;
+    if bytes.len() > trail::AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES + 16_384 {
+        return Err(Error::InvalidInput(
+            "redacted agent hook spool envelope is too large".to_string(),
+        ));
+    }
+    let digest = hook_short_hash(&bytes, 24);
+    let target = spool_dir.join(format!("receipt-{digest}.json"));
+    if target.exists() {
+        return Ok(());
+    }
+    let temp = spool_dir.join(format!(".receipt-{digest}-{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    if let Err(error) = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &target)?;
+        #[cfg(unix)]
+        std::fs::File::open(&spool_dir)?.sync_all()?;
+        Ok(())
+    })() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn agent_hook_spool_db_dir(ctx: &RuntimeContext) -> Option<std::path::PathBuf> {
+    if let Some(db_dir) = ctx.db_dir.as_ref() {
+        return Some(db_dir.clone());
+    }
+    if let Some(workspace) = ctx.workspace.as_ref() {
+        return Some(workspace.join(".trail"));
+    }
+    let mut cursor = std::env::current_dir().ok()?;
+    loop {
+        let candidate = cursor.join(".trail");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+fn hook_payload_string(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        hook_payload_value(payload, key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn hook_payload_i64(payload: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        hook_payload_value(payload, key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        })
+    })
+}
+
+fn hook_payload_value<'a>(
+    payload: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    payload.get(key).or_else(|| {
+        ["properties", "input", "event", "data", "session"]
+            .iter()
+            .find_map(|container| payload.get(*container).and_then(|value| value.get(key)))
+    })
+}
+
+fn derive_hook_dedupe_key(
+    provider: &str,
+    native_event: &str,
+    native_session_id: Option<&str>,
+    native_turn_id: Option<&str>,
+    payload: &serde_json::Value,
+) -> String {
+    let explicit_event_id = hook_payload_string(
+        payload,
+        &[
+            "event_id",
+            "eventId",
+            "tool_use_id",
+            "toolUseId",
+            "toolCallId",
+            "agent_id",
+            "agentId",
+        ],
+    );
+    let timestamp = hook_payload_i64(payload, &["timestamp", "occurred_at", "occurredAt"]);
+    let payload_digest = hook_short_hash(
+        serde_json::to_vec(payload).unwrap_or_default().as_slice(),
+        24,
+    );
+    let entropy = if explicit_event_id.is_none() && native_turn_id.is_none() && timestamp.is_none()
+    {
+        hook_short_hash(
+            format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_nanos())
+                    .unwrap_or_default()
+            )
+            .as_bytes(),
+            16,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        provider,
+        native_event,
+        native_session_id.unwrap_or("none"),
+        native_turn_id.unwrap_or("none"),
+        explicit_event_id.as_deref().unwrap_or("none"),
+        timestamp
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        if entropy.is_empty() {
+            payload_digest
+        } else {
+            format!("{payload_digest}:{entropy}")
+        }
+    )
+}
+
+fn hook_short_hash(bytes: &[u8], digest_bytes: usize) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .take(digest_bytes.min(digest.len()))
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn handle_agent_home(ctx: &RuntimeContext) -> Result<()> {

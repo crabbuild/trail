@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+mod agent_hooks;
 mod annotations;
 mod collaboration;
 mod core;
@@ -11,6 +12,7 @@ pub(crate) use annotations::tool_is_read_only;
 
 pub(crate) fn tools() -> Value {
     let mut tools = core::tools();
+    append_tools(&mut tools, agent_hooks::tools());
     append_tools(&mut tools, lane::tools());
     append_tools(&mut tools, collaboration::tools());
     append_tools(&mut tools, merge::tools());

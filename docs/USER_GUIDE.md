@@ -10,6 +10,7 @@ Start here:
 - [First lane workflow](getting-started/first-lane-workflow.md)
 - [Trail Agent quick start](getting-started/agent-workflow.md)
 - [Trail Agent user guide](agent/user-guide.md)
+- [Native agent hooks, evidence, and recovery](agent/native-hooks.md)
 - [Lane work model](lanes/work-model.md)
 - [Record worktree changes](guides/record-worktree-changes.md)
 - [Inspect history and provenance](guides/inspect-history-and-provenance.md)

@@ -5,6 +5,7 @@ use crate::{Error, Result, Trail};
 
 use super::{tools::tool_is_read_only, types::*, utils::from_arguments};
 
+mod agent_hooks;
 mod collaboration;
 mod core;
 mod lane;
@@ -21,6 +22,9 @@ pub(crate) fn handle_tool_call(db: &mut Trail, params: Value) -> Result<Value> {
 
 fn dispatch_tool_call(db: &mut Trail, call: &ToolCall) -> Result<Value> {
     if let Some(value) = core::handle(db, &call.name, &call.arguments)? {
+        return Ok(value);
+    }
+    if let Some(value) = agent_hooks::handle(db, &call.name, &call.arguments)? {
         return Ok(value);
     }
     if let Some(value) = lane::handle(db, &call.name, &call.arguments)? {

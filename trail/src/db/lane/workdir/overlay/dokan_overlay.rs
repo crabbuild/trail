@@ -63,6 +63,24 @@ pub(crate) fn prepare_overlay_cow_workdir(
 }
 
 pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<OverlayCowMount> {
+    mount_overlay_cow_for_lane_with_view(db, lane, None)
+}
+
+pub(crate) fn mount_overlay_cow_for_lane_with_ephemeral_bindings(
+    db: &Trail,
+    lane: &str,
+    source_upper: PathBuf,
+    source_root: ObjectId,
+    bindings: Vec<WorkspaceLayerBinding>,
+) -> Result<OverlayCowMount> {
+    mount_overlay_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
+}
+
+fn mount_overlay_cow_for_lane_with_view(
+    db: &Trail,
+    lane: &str,
+    ephemeral: Option<(PathBuf, ObjectId, Vec<WorkspaceLayerBinding>)>,
+) -> Result<OverlayCowMount> {
     validate_ref_segment(lane)?;
     let branch = db.lane_branch(lane)?;
     let record = db.lane_record(&branch.lane_id)?;
@@ -80,10 +98,13 @@ pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<Overl
     };
     let mountpoint = PathBuf::from(workdir);
     prepare_overlay_mountpoint(&mountpoint, false)?;
-    let upperdir = overlay_upperdir(db, lane)?;
+    let head = db.get_ref(&branch.ref_name)?;
+    let (upperdir, source_root, bindings) = match ephemeral {
+        Some((upperdir, source_root, bindings)) => (upperdir, source_root, Some(bindings)),
+        None => (overlay_upperdir(db, lane)?, head.root_id, None),
+    };
     fs::create_dir_all(upperdir.join(OVERLAY_META_DIR))?;
 
-    let head = db.get_ref(&branch.ref_name)?;
     let mount_name = U16CString::from_str(mountpoint.to_string_lossy().as_ref()).map_err(|_| {
         Error::InvalidInput(format!(
             "overlay-cow mountpoint `{}` is not a valid Windows mount string",
@@ -95,7 +116,8 @@ pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<Overl
         db.workspace_root.clone(),
         db.db_dir.clone(),
         upperdir,
-        head.root_id,
+        source_root,
+        bindings,
     )?;
     let mut lease = db.acquire_workspace_mount_lease(lane, "dokan")?;
     let thread_mount_name = mount_name.clone();
@@ -230,13 +252,17 @@ impl DokanOverlayFs {
         db_dir: PathBuf,
         upperdir: PathBuf,
         root_id: ObjectId,
+        ephemeral_bindings: Option<Vec<WorkspaceLayerBinding>>,
     ) -> Result<Self> {
+        let db = Trail::open_with_db_dir(workspace_root, db_dir)?;
+        let core = match ephemeral_bindings {
+            Some(bindings) => {
+                ViewCore::new_lazy_with_ephemeral_bindings(db, upperdir, root_id, bindings)?
+            }
+            None => ViewCore::new_lazy(db, upperdir, root_id)?,
+        };
         Ok(Self {
-            core: Mutex::new(ViewCore::new_lazy(
-                Trail::open_with_db_dir(workspace_root, db_dir)?,
-                upperdir,
-                root_id,
-            )?),
+            core: Mutex::new(core),
         })
     }
 

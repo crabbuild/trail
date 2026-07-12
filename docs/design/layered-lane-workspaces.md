@@ -3,6 +3,13 @@
 Status: implemented behind platform acceptance gates; native Windows Dokan CI
 evidence remains required before declaring the rollout complete.
 
+Environment-layer follow-on: the shared adapter host, normalized component state,
+Node/Cargo/Go adapters, metadata-driven discovery, atomic environment generations, and
+CLI/HTTP/MCP environment surfaces are implemented. Restricted repository command
+recipes, local reusable profiles, multi-output atomic publication, and experimental
+content-addressed isolated subprocess adapters are implemented; signed catalogs/WASI
+packaging and the full universal-environment graph remain tracked by Plan 006.
+
 This document defines the execution and filesystem architecture needed for
 Trail to become the default local coordination substrate for many coding agents
 working concurrently in a large repository. It extends Trail's existing lane,
@@ -631,6 +638,19 @@ sync` or fail with a concrete stale-environment blocker. A successful sync
 builds or reuses the new layer and swaps bindings at a quiescent view-generation
 boundary.
 
+Dependency replacement is a Trail administrative operation, not a recursive
+filesystem emulation. `trail deps sync` requires an unmounted lane, builds or
+reuses the immutable layer first, removes the matching dependency subtree from
+the private generated upper, clears whiteouts at or below that mount path, and
+then advances the layer binding and view generation. If the process stops
+before the binding update, the previous immutable layer remains a valid
+fallback. Source-class paths are never accepted by this bulk reset primitive.
+
+This path matters most for loopback NFS: NFSv3 has no recursive-delete request,
+so ordinary `rm -rf node_modules` must still issue one operation per entry.
+Agents should use `trail deps sync` for dependency replacement; direct POSIX
+deletion remains correct but is intentionally not the optimized control path.
+
 Trail must not infer that a lockfile update is valid merely because an agent
 mutated `node_modules`. The lockfile and adapter build remain authoritative.
 
@@ -969,9 +989,26 @@ Preferred order:
 
 The NFS server must bind only to loopback, validate mount ownership, reject
 unsupported node kinds, and preserve immediate mutation visibility required by
-checkpointing. Metadata-heavy dependency workloads need dedicated benchmarks
-because disabling NFS attribute caches improves correctness but can reduce
-throughput.
+checkpointing. macOS mounts use synchronous write requests because its default
+`nosync` mode may return after queueing a truncate/write sequence; immediate teardown
+could otherwise remount the private upper after the truncate but before the data WRITE.
+The userspace server fsyncs each WRITE before reporting NFS `FILE_SYNC`.
+Metadata-heavy dependency workloads need dedicated benchmarks because disabling NFS
+attribute caches improves correctness but can reduce throughput.
+
+The real Next.js/Vite benchmark confirms that a global `noac,actimeo=0` policy
+does not scale to large Node resolution graphs. Keep strict coherency for
+writable uppers and directory mutation boundaries, but allow long-lived
+attribute/content caching for immutable source and dependency lowers. Layer
+binding generation changes must invalidate those cached lower identities.
+Immutable publication now writes a bounded durable verification seal containing the
+content-addressed manifest identity, layer summary, and platform filesystem identity of
+the published directory. Routine cache-hit reuse and attachment validate that seal
+without reopening the artifact tree. Missing, oversized, malformed, or stale seals
+fall back to one full scan and are rewritten only after every entry matches. Explicit
+`cache verify`, doctor, and readiness remain full-content operations. This removes
+hundreds-of-megabytes of rehashing from warm attachment without claiming that bounded
+attachment evidence is a full audit.
 
 ### Windows
 

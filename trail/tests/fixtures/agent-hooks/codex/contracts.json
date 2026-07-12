@@ -1,0 +1,5 @@
+[
+  {"event":"UserPromptSubmit","payload":{"session_id":"codex-s1","turn_id":"codex-t1","prompt":"fix it"},"expected":["turn.started","message.user"]},
+  {"event":"PostToolUse","payload":{"session_id":"codex-s1","turn_id":"codex-t1","tool_use_id":"tool-1","error":"exit 1"},"expected":["tool.failed"]},
+  {"event":"Stop","payload":{"session_id":"codex-s1","turn_id":"codex-t1","status":"cancelled"},"expected":["turn.cancelled"]}
+]

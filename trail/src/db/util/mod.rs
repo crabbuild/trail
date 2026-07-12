@@ -8,6 +8,8 @@ mod config_parse;
 mod conflicts;
 mod diff_summary;
 mod executable;
+#[cfg(windows)]
+mod file_identity;
 mod file_kind;
 mod fs_cow;
 mod gates;
@@ -25,7 +27,8 @@ mod parsing;
 mod patch;
 mod path;
 mod previews;
-mod process_liveness;
+#[doc(hidden)]
+pub mod process_liveness;
 mod prolly;
 mod readiness_reports;
 mod redaction;
@@ -44,6 +47,8 @@ pub(crate) use self::config_parse::*;
 pub(crate) use self::conflicts::*;
 pub(crate) use self::diff_summary::*;
 pub(crate) use self::executable::*;
+#[cfg(windows)]
+pub(crate) use self::file_identity::*;
 pub(crate) use self::file_kind::*;
 pub(crate) use self::fs_cow::*;
 pub(crate) use self::gates::*;

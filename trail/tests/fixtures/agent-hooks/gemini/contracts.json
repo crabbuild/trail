@@ -1,0 +1,5 @@
+[
+  {"event":"BeforeAgent","payload":{"sessionId":"gemini-s1","turnId":"gemini-t1","prompt":"fix it"},"expected":["turn.started","message.user"]},
+  {"event":"AfterTool","payload":{"sessionId":"gemini-s1","toolCallId":"tool-1","error":"failed"},"expected":["tool.failed"]},
+  {"event":"AfterAgent","payload":{"sessionId":"gemini-s1","turnId":"gemini-t1","status":"cancelled"},"expected":["turn.cancelled"]}
+]

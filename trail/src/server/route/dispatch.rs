@@ -2,7 +2,7 @@ use crate::server::transport::{HttpRequest, HttpResponse, ServerAuth};
 use crate::{Error, Result};
 
 use super::utils;
-use super::{lane, system};
+use super::{agent_hooks, lane, system};
 
 pub(crate) fn route_request_result(
     db: &mut crate::Trail,
@@ -37,6 +37,20 @@ pub(crate) fn route_request_result(
     }
 
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+
+    if request.method == "POST"
+        && parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "agent-hooks"
+        && !auth.is_required()
+    {
+        return Ok(utils::unauthorized_response());
+    }
+
+    if let Some(response) = agent_hooks::handle_agent_hook_route(db, &request, path, query, &parts)?
+    {
+        return Ok(response);
+    }
 
     if let Some(response) = system::handle_system_route(db, &request, path, query, &parts)? {
         return Ok(response);

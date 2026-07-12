@@ -274,6 +274,20 @@ pub(crate) fn resources() -> Value {
             "mimeType": "application/json"
         },
         {
+            "uri": RESOURCE_AGENT_INTEGRATIONS,
+            "name": "agent-integrations",
+            "title": "Agent Integration Capabilities",
+            "description": "Built-in provider hook, transcript/export, and ACP capability contracts.",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": RESOURCE_AGENT_HOOK_RECEIPTS,
+            "name": "agent-hook-receipts",
+            "title": "Agent Hook Receipt Diagnostics",
+            "description": "The latest durable redacted native hook receipt journal rows.",
+            "mimeType": "application/json"
+        },
+        {
             "uri": RESOURCE_AGENT_LATEST_SUMMARY,
             "name": "latest-agent-summary",
             "title": "Latest Agent Summary",

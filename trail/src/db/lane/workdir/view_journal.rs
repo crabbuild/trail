@@ -149,16 +149,37 @@ impl ViewMutationJournal {
         Ok(journal)
     }
 
+    #[cfg(test)]
     pub(crate) fn append(
         &mut self,
         kind: ViewMutationKind,
         path: &str,
         destination: Option<&str>,
     ) -> Result<u64> {
-        let path = normalize_relative_path(path)?;
-        let destination = destination.map(normalize_relative_path).transpose()?;
-        let class = classify_view_path(&path);
-        let destination_class = destination.as_deref().map(classify_view_path);
+        let class = classify_view_path(path);
+        let destination_class = destination.map(classify_view_path);
+        self.append_classified(
+            kind,
+            path.to_string(),
+            class,
+            destination.map(str::to_string),
+            destination_class,
+        )
+    }
+
+    pub(crate) fn append_classified(
+        &mut self,
+        kind: ViewMutationKind,
+        path: String,
+        class: ViewPathClass,
+        destination: Option<String>,
+        destination_class: Option<ViewPathClass>,
+    ) -> Result<u64> {
+        let path = normalize_relative_path(&path)?;
+        let destination = destination
+            .as_deref()
+            .map(normalize_relative_path)
+            .transpose()?;
         if matches!(kind, ViewMutationKind::Write | ViewMutationKind::Metadata)
             && self.dirty_paths.contains(&path)
             && destination.is_none()

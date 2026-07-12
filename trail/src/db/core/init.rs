@@ -271,6 +271,8 @@ impl Trail {
         };
         db.init_schema()?;
         db.recover_workspace_views()?;
+        db.recover_workspace_environment_sync_attempts()?;
+        db.recover_workspace_runtime_leases()?;
         Ok(db)
     }
 

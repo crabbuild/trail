@@ -63,6 +63,42 @@ pub(crate) struct ViewCore {
     journal: ViewMutationJournal,
 }
 
+const LAYER_MOUNT_RESET_INTENT_VERSION: u16 = 2;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct LayerMountResetIntent {
+    version: u16,
+    mount_path: String,
+    upper_class: ViewPathClass,
+    replacement_layer_id: String,
+    #[serde(default)]
+    binding_removed: bool,
+    removed_whiteouts: Vec<String>,
+}
+
+/// A durable, filesystem-side half of workspace-layer activation.
+///
+/// The reset intent is written before the private upper is moved aside. If the
+/// process dies, `ViewCore::new_with_lower` compares the intended replacement
+/// with SQLite: a committed binding discards the backup, while an uncommitted
+/// binding restores it. Dropping this value intentionally leaves the durable
+/// intent for crash recovery.
+#[must_use = "a prepared layer reset must be committed or rolled back"]
+pub(crate) struct PreparedLayerMountReset {
+    layout: ViewUpperLayout,
+    mount_path: String,
+    upper_class: ViewPathClass,
+    intent_path: PathBuf,
+    backup_path: PathBuf,
+    removed_whiteouts: Vec<String>,
+}
+
+struct RecoveredLayerMountReset {
+    intent_path: PathBuf,
+    backup_path: PathBuf,
+    removed_whiteouts: Vec<String>,
+}
+
 enum ViewLower {
     #[cfg(test)]
     Eager(BTreeMap<String, FileEntry>),
@@ -83,12 +119,47 @@ impl ViewCore {
         Self::new_with_lower(db, upperdir, ViewLower::Root(root_id))
     }
 
+    /// Construct a temporary mounted view with an explicit desired binding
+    /// set. This is used while initializing path-sensitive private outputs at
+    /// the lane's stable mountpoint before their generation is activated.
+    ///
+    /// Reset recovery is deliberately skipped: the supplied upper layout is
+    /// ephemeral and cannot contain a durable activation intent. The real
+    /// lane layout continues to use `new_lazy`, which always performs normal
+    /// SQLite-correlated recovery.
+    pub(crate) fn new_lazy_with_ephemeral_bindings(
+        db: Trail,
+        upperdir: PathBuf,
+        root_id: ObjectId,
+        layers: Vec<WorkspaceLayerBinding>,
+    ) -> Result<Self> {
+        Self::new_with_lower_and_bindings(db, upperdir, ViewLower::Root(root_id), Some(layers))
+    }
+
     fn new_with_lower(db: Trail, upperdir: PathBuf, lower: ViewLower) -> Result<Self> {
+        Self::new_with_lower_and_bindings(db, upperdir, lower, None)
+    }
+
+    fn new_with_lower_and_bindings(
+        db: Trail,
+        upperdir: PathBuf,
+        lower: ViewLower,
+        ephemeral_layers: Option<Vec<WorkspaceLayerBinding>>,
+    ) -> Result<Self> {
         let dir_epoch = SystemTime::now();
         let layout = ViewUpperLayout::from_source_upper(upperdir);
         layout.ensure()?;
         let journal = ViewMutationJournal::open(&layout.source_upper)?;
-        let layers = db.workspace_layer_bindings_for_source_upper(&layout.source_upper)?;
+        let ephemeral = ephemeral_layers.is_some();
+        let layers = match ephemeral_layers {
+            Some(layers) => layers,
+            None => db.workspace_layer_bindings_for_source_upper(&layout.source_upper)?,
+        };
+        let recovered_resets = if ephemeral {
+            Vec::new()
+        } else {
+            recover_layer_mount_resets(&layout, &layers)?
+        };
         let mut core = Self {
             db,
             layout,
@@ -103,6 +174,16 @@ impl ViewCore {
             journal,
         };
         core.whiteouts = core.load_whiteouts()?;
+        if !recovered_resets.is_empty() {
+            for recovered in &recovered_resets {
+                core.whiteouts
+                    .extend(recovered.removed_whiteouts.iter().cloned());
+            }
+            core.save_whiteouts()?;
+            for recovered in recovered_resets {
+                finish_layer_mount_reset_recovery(&recovered)?;
+            }
+        }
         Ok(core)
     }
 
@@ -139,7 +220,28 @@ impl ViewCore {
     }
 
     pub(crate) fn upper_path(&self, path: &str) -> std::result::Result<PathBuf, i32> {
-        self.upper_path_in_class(classify_view_path(path), path)
+        self.upper_path_in_class(self.path_class(path), path)
+    }
+
+    fn path_class(&self, path: &str) -> ViewPathClass {
+        let conventional = classify_view_path(path);
+        if matches!(
+            conventional,
+            ViewPathClass::Internal | ViewPathClass::Secret
+        ) {
+            return conventional;
+        }
+        let binding = self.layers.iter().find(|binding| {
+            path == binding.mount_path
+                || path
+                    .strip_prefix(&binding.mount_path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        match binding.map(|binding| binding.kind.as_str()) {
+            Some("dependency") => ViewPathClass::Dependency,
+            Some("compiler-results" | "generated" | "build") => ViewPathClass::Generated,
+            _ => conventional,
+        }
     }
 
     fn upper_path_in_class(
@@ -183,13 +285,13 @@ impl ViewCore {
     }
 
     fn upper_metadata(&self, path: &str) -> Option<fs::Metadata> {
-        self.upper_path_in_class_with_leaf(classify_view_path(path), path, true)
+        self.upper_path_in_class_with_leaf(self.path_class(path), path, true)
             .ok()
             .and_then(|path| fs::symlink_metadata(path).ok())
     }
 
     fn upper_path_with_leaf_symlink(&self, path: &str) -> std::result::Result<PathBuf, i32> {
-        self.upper_path_in_class_with_leaf(classify_view_path(path), path, true)
+        self.upper_path_in_class_with_leaf(self.path_class(path), path, true)
     }
 
     pub(crate) fn is_whiteouted(&self, path: &str) -> bool {
@@ -211,6 +313,9 @@ impl ViewCore {
 
     fn layer_path(&self, path: &str) -> std::result::Result<Option<PathBuf>, i32> {
         for binding in &self.layers {
+            let Some(storage_path) = &binding.storage_path else {
+                continue;
+            };
             let suffix = if path == binding.mount_path {
                 Some("")
             } else {
@@ -221,9 +326,9 @@ impl ViewCore {
                 continue;
             };
             let candidate = if suffix.is_empty() {
-                binding.storage_path.clone()
+                storage_path.clone()
             } else {
-                safe_join(&binding.storage_path, suffix).map_err(|_| EINVAL)?
+                safe_join(storage_path, suffix).map_err(|_| EINVAL)?
             };
             let metadata = match fs::symlink_metadata(&candidate) {
                 Ok(metadata) => metadata,
@@ -232,7 +337,7 @@ impl ViewCore {
             };
             if metadata.file_type().is_symlink() {
                 let canonical = candidate.canonicalize().map_err(io_errno)?;
-                let root = binding.storage_path.canonicalize().map_err(io_errno)?;
+                let root = storage_path.canonicalize().map_err(io_errno)?;
                 if !canonical.starts_with(root) {
                     return Err(EPERM);
                 }
@@ -349,7 +454,7 @@ impl ViewCore {
         if path.is_empty() {
             return Ok(Some(ViewNodeKind::Directory));
         }
-        if classify_view_path(path) == ViewPathClass::Internal || self.is_whiteouted(path) {
+        if self.path_class(path) == ViewPathClass::Internal || self.is_whiteouted(path) {
             return Ok(None);
         }
         if let Some(metadata) = self.upper_metadata(path) {
@@ -769,8 +874,9 @@ impl ViewCore {
         }
         self.whiteouts.remove(path);
         self.save_whiteouts().map_err(|_| EIO)?;
+        let class = self.path_class(path);
         self.journal
-            .append(ViewMutationKind::Write, path, None)
+            .append_classified(ViewMutationKind::Write, path.to_string(), class, None, None)
             .map_err(|_| EIO)?;
         let file = OpenOptions::new()
             .read(true)
@@ -828,8 +934,9 @@ impl ViewCore {
         file.sync_data().map_err(io_errno)?;
         self.whiteouts.remove(&path);
         self.save_whiteouts().map_err(|_| EIO)?;
+        let class = self.path_class(&path);
         self.journal
-            .append(ViewMutationKind::Create, &path, None)
+            .append_classified(ViewMutationKind::Create, path.clone(), class, None, None)
             .map_err(|_| EIO)?;
         self.touch_parent(&path);
         self.attr(&path)
@@ -851,8 +958,9 @@ impl ViewCore {
         set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
         self.whiteouts.remove(&path);
         self.save_whiteouts().map_err(|_| EIO)?;
+        let class = self.path_class(&path);
         self.journal
-            .append(ViewMutationKind::Mkdir, &path, None)
+            .append_classified(ViewMutationKind::Mkdir, path.clone(), class, None, None)
             .map_err(|_| EIO)?;
         self.touch_parent(&path);
         self.touch_dir(path.clone());
@@ -877,8 +985,9 @@ impl ViewCore {
         std::os::unix::fs::symlink(target, self.upper_path(&path)?).map_err(io_errno)?;
         self.whiteouts.remove(&path);
         self.save_whiteouts().map_err(|_| EIO)?;
+        let class = self.path_class(&path);
         self.journal
-            .append(ViewMutationKind::Create, &path, None)
+            .append_classified(ViewMutationKind::Create, path.clone(), class, None, None)
             .map_err(|_| EIO)?;
         self.touch_parent(&path);
         self.attr(&path)
@@ -908,8 +1017,9 @@ impl ViewCore {
                 set_file_mode(&self.upper_path(&path)?, mode & 0o777).map_err(io_errno)?;
             }
         }
+        let class = self.path_class(&path);
         self.journal
-            .append(ViewMutationKind::Metadata, &path, None)
+            .append_classified(ViewMutationKind::Metadata, path.clone(), class, None, None)
             .map_err(|_| EIO)?;
         self.attr(&path)
     }
@@ -938,11 +1048,228 @@ impl ViewCore {
             self.whiteouts.insert(path.clone());
         }
         self.save_whiteouts().map_err(|_| EIO)?;
+        let class = self.path_class(&path);
         self.journal
-            .append(ViewMutationKind::Delete, &path, None)
+            .append_classified(ViewMutationKind::Delete, path.clone(), class, None, None)
             .map_err(|_| EIO)?;
         self.touch_parent(&path);
         Ok(())
+    }
+
+    /// Prepare an adapter-owned mount replacement without irreversibly
+    /// deleting private generated state. The returned transaction is paired
+    /// with the SQLite layer-binding savepoint by the caller.
+    pub(crate) fn prepare_declared_layer_mount_path(
+        &mut self,
+        path: &str,
+        layer_kind: &str,
+        replacement_layer_id: &str,
+    ) -> Result<PreparedLayerMountReset> {
+        let path = normalize_relative_path(path)?;
+        if matches!(
+            classify_view_path(&path),
+            ViewPathClass::Internal | ViewPathClass::Secret
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "workspace layer replacement path `{path}` is protected internal or secret state"
+            )));
+        }
+        let class = match layer_kind {
+            "dependency" => ViewPathClass::Dependency,
+            "compiler-results" | "generated" | "build" => ViewPathClass::Generated,
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "workspace layer kind `{other}` cannot own a writable mount path"
+                )))
+            }
+        };
+        self.prepare_validated_layer_mount_path(&path, class, replacement_layer_id, false)
+    }
+
+    /// Prepare a writable-private output replacement. Its durable binding
+    /// identity is component/output/key-derived rather than a workspace layer
+    /// ID, but crash recovery is otherwise identical to layer replacement.
+    pub(crate) fn prepare_declared_private_mount_path(
+        &mut self,
+        path: &str,
+        layer_kind: &str,
+        binding_identity: &str,
+    ) -> Result<PreparedLayerMountReset> {
+        self.prepare_declared_layer_mount_path(path, layer_kind, binding_identity)
+    }
+
+    /// Preserve a compatible writable-private output and make an empty first
+    /// binding visible without manufacturing an immutable lower layer.
+    pub(crate) fn ensure_declared_private_mount_path(
+        &mut self,
+        path: &str,
+        layer_kind: &str,
+    ) -> Result<()> {
+        let path = normalize_relative_path(path)?;
+        if matches!(
+            classify_view_path(&path),
+            ViewPathClass::Internal | ViewPathClass::Secret
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "writable-private path `{path}` is protected internal or secret state"
+            )));
+        }
+        let class = match layer_kind {
+            "dependency" => ViewPathClass::Dependency,
+            "compiler-results" | "generated" | "build" => ViewPathClass::Generated,
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "environment kind `{other}` cannot own a writable-private path"
+                )))
+            }
+        };
+        let upper = self
+            .upper_path_in_class_with_leaf(class, &path, true)
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        let _barrier = self
+            .begin_mutation()
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        match fs::symlink_metadata(&upper) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(Error::InvalidInput(format!(
+                "writable-private mount `{path}` is not a directory"
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&upper)?;
+                Ok(())
+            }
+            Err(err) => Err(Error::Io(err)),
+        }?;
+        let prefix = format!("{path}/");
+        self.whiteouts
+            .retain(|whiteout| whiteout != &path && !whiteout.starts_with(&prefix));
+        self.save_whiteouts()?;
+        self.touch_parent(&path);
+        Ok(())
+    }
+
+    /// Prepare removal of an adapter-owned mount with the same durable
+    /// rollback semantics as replacement. Recovery commits the reset only when
+    /// SQLite no longer contains a binding at this path.
+    pub(crate) fn prepare_declared_layer_unmount_path(
+        &mut self,
+        path: &str,
+        layer_kind: &str,
+    ) -> Result<PreparedLayerMountReset> {
+        let path = normalize_relative_path(path)?;
+        if matches!(
+            classify_view_path(&path),
+            ViewPathClass::Internal | ViewPathClass::Secret
+        ) {
+            return Err(Error::InvalidInput(format!(
+                "workspace layer removal path `{path}` is protected internal or secret state"
+            )));
+        }
+        let class = match layer_kind {
+            "dependency" => ViewPathClass::Dependency,
+            "compiler-results" | "generated" | "build" => ViewPathClass::Generated,
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "workspace layer kind `{other}` cannot own a writable mount path"
+                )))
+            }
+        };
+        self.prepare_validated_layer_mount_path(&path, class, "binding-removed", true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_layer_mount_path(
+        &mut self,
+        path: &str,
+        replacement_layer_id: &str,
+    ) -> Result<PreparedLayerMountReset> {
+        let path = normalize_relative_path(path)?;
+        let class = classify_view_path(&path);
+        if !matches!(class, ViewPathClass::Dependency | ViewPathClass::Generated) {
+            return Err(Error::InvalidInput(format!(
+                "workspace layer replacement path `{path}` is not dependency or generated state"
+            )));
+        }
+        self.prepare_validated_layer_mount_path(&path, class, replacement_layer_id, false)
+    }
+
+    fn prepare_validated_layer_mount_path(
+        &mut self,
+        path: &str,
+        class: ViewPathClass,
+        replacement_layer_id: &str,
+        binding_removed: bool,
+    ) -> Result<PreparedLayerMountReset> {
+        if replacement_layer_id.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "replacement workspace layer id cannot be empty".to_string(),
+            ));
+        }
+        let source_path = self
+            .upper_path_in_class_with_leaf(ViewPathClass::Source, path, true)
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        if fs::symlink_metadata(&source_path).is_ok() {
+            return Err(Error::InvalidInput(format!(
+                "adapter mount `{path}` overlaps pre-existing source-upper state; preserve or remove that source state before synchronizing the environment"
+            )));
+        }
+        let _barrier = self
+            .begin_mutation()
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        let upper = self
+            .upper_path_in_class_with_leaf(class, path, true)
+            .map_err(|errno| Error::Io(std::io::Error::from_raw_os_error(errno)))?;
+        let prefix = format!("{path}/");
+        let removed_whiteouts = self
+            .whiteouts
+            .iter()
+            .filter(|whiteout| *whiteout == path || whiteout.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let (intent_path, backup_path) = create_layer_mount_reset_paths(&self.layout, path)?;
+        let intent = LayerMountResetIntent {
+            version: LAYER_MOUNT_RESET_INTENT_VERSION,
+            mount_path: path.to_string(),
+            upper_class: class,
+            replacement_layer_id: replacement_layer_id.to_string(),
+            binding_removed,
+            removed_whiteouts: removed_whiteouts.clone(),
+        };
+        write_file_atomic(&intent_path, &serde_json::to_vec_pretty(&intent)?, true)?;
+
+        let reset = (|| -> Result<()> {
+            match fs::symlink_metadata(&upper) {
+                Ok(_) => {
+                    fs::rename(&upper, &backup_path)?;
+                    if let Some(parent) = upper.parent() {
+                        sync_directory(parent);
+                    }
+                    if let Some(parent) = backup_path.parent() {
+                        sync_directory(parent);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(Error::Io(err)),
+            }
+            self.whiteouts
+                .retain(|whiteout| whiteout != path && !whiteout.starts_with(&prefix));
+            self.save_whiteouts()?;
+            Ok(())
+        })();
+        let prepared = PreparedLayerMountReset {
+            layout: self.layout.clone(),
+            mount_path: path.to_string(),
+            upper_class: class,
+            intent_path,
+            backup_path,
+            removed_whiteouts,
+        };
+        if let Err(err) = reset {
+            let _ = prepared.rollback(self);
+            return Err(err);
+        }
+        self.touch_parent(path);
+        Ok(prepared)
     }
 
     pub(crate) fn rename(
@@ -1006,8 +1333,16 @@ impl ViewCore {
         self.whiteouts.insert(old.clone());
         self.whiteouts.remove(&new);
         self.save_whiteouts().map_err(|_| EIO)?;
+        let old_class = self.path_class(&old);
+        let new_class = self.path_class(&new);
         self.journal
-            .append(ViewMutationKind::Rename, &old, Some(&new))
+            .append_classified(
+                ViewMutationKind::Rename,
+                old.clone(),
+                old_class,
+                Some(new.clone()),
+                Some(new_class),
+            )
             .map_err(|_| EIO)?;
         self.touch_parent(&old);
         self.touch_parent(&new);
@@ -1214,7 +1549,7 @@ impl ViewCore {
             let paths = self
                 .whiteouts
                 .iter()
-                .filter(|path| classify_view_path(path) == class)
+                .filter(|path| self.path_class(path) == class)
                 .collect::<Vec<_>>();
             write_file_atomic(
                 &self.layout.whiteouts_path(class),
@@ -1224,6 +1559,213 @@ impl ViewCore {
         }
         Ok(())
     }
+}
+
+impl PreparedLayerMountReset {
+    pub(crate) fn install_private_directory(&self, source: &Path) -> Result<()> {
+        if !source.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "writable-private seed `{}` is not a directory",
+                source.display()
+            )));
+        }
+        let upper = safe_join(
+            self.layout.upper_for_class(self.upper_class),
+            &self.mount_path,
+        )?;
+        if fs::symlink_metadata(&upper).is_ok() {
+            return Err(Error::Corrupt(format!(
+                "writable-private destination `{}` was recreated during activation",
+                upper.display()
+            )));
+        }
+        copy_dir_recursive(source, &upper)?;
+        if let Some(parent) = upper.parent() {
+            sync_directory(parent);
+        }
+        Ok(())
+    }
+
+    /// SQLite already committed the replacement. Cleanup is best-effort; a
+    /// retained intent is safe because the next view open observes the new
+    /// binding and completes cleanup idempotently.
+    pub(crate) fn commit(self) {
+        let _ = remove_layer_mount_reset_path(&self.backup_path);
+        if !self.backup_path.exists() {
+            let _ = fs::remove_file(&self.intent_path);
+            if let Some(parent) = self.intent_path.parent() {
+                sync_directory(parent);
+            }
+        }
+    }
+
+    pub(crate) fn rollback(self, core: &mut ViewCore) -> Result<()> {
+        let upper = safe_join(
+            self.layout.upper_for_class(self.upper_class),
+            &self.mount_path,
+        )?;
+        remove_layer_mount_reset_path(&upper)?;
+        if self.backup_path.exists() {
+            if let Some(parent) = upper.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&self.backup_path, &upper)?;
+            if let Some(parent) = upper.parent() {
+                sync_directory(parent);
+            }
+        }
+        core.whiteouts.extend(self.removed_whiteouts);
+        core.save_whiteouts()?;
+        remove_layer_mount_reset_path(&self.intent_path)?;
+        if let Some(parent) = self.intent_path.parent() {
+            sync_directory(parent);
+        }
+        Ok(())
+    }
+}
+
+fn layer_mount_reset_intents_dir(layout: &ViewUpperLayout) -> PathBuf {
+    layout.meta_dir.join("layer-reset-intents")
+}
+
+fn layer_mount_reset_backups_dir(layout: &ViewUpperLayout) -> PathBuf {
+    layout.meta_dir.join("layer-reset-backups")
+}
+
+fn create_layer_mount_reset_paths(
+    layout: &ViewUpperLayout,
+    mount_path: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let intents = layer_mount_reset_intents_dir(layout);
+    let backups = layer_mount_reset_backups_dir(layout);
+    fs::create_dir_all(&intents)?;
+    fs::create_dir_all(&backups)?;
+    for attempt in 0..32_u8 {
+        let id = sha256_hex(
+            format!(
+                "{}:{}:{}:{}",
+                std::process::id(),
+                now_nanos(),
+                mount_path,
+                attempt
+            )
+            .as_bytes(),
+        );
+        let intent = intents.join(format!("{id}.json"));
+        let backup = backups.join(&id);
+        if !intent.exists() && !backup.exists() {
+            return Ok((intent, backup));
+        }
+    }
+    Err(Error::InvalidInput(
+        "could not allocate a unique workspace-layer reset intent".to_string(),
+    ))
+}
+
+fn recover_layer_mount_resets(
+    layout: &ViewUpperLayout,
+    layers: &[WorkspaceLayerBinding],
+) -> Result<Vec<RecoveredLayerMountReset>> {
+    let intents_dir = layer_mount_reset_intents_dir(layout);
+    let entries = match fs::read_dir(&intents_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let mut intent_paths = entries
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    intent_paths.sort();
+
+    let mut recovered = Vec::new();
+    for intent_path in intent_paths {
+        let id = intent_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "invalid workspace-layer reset intent name `{}`",
+                    intent_path.display()
+                ))
+            })?;
+        let intent: LayerMountResetIntent = serde_json::from_slice(&fs::read(&intent_path)?)?;
+        if intent.version != 1 && intent.version != LAYER_MOUNT_RESET_INTENT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "unsupported workspace-layer reset intent version {}",
+                intent.version
+            )));
+        }
+        let mount_path = normalize_relative_path(&intent.mount_path)?;
+        if !matches!(
+            intent.upper_class,
+            ViewPathClass::Dependency | ViewPathClass::Generated
+        ) {
+            return Err(Error::Corrupt(format!(
+                "workspace-layer reset for `{mount_path}` targets protected upper class `{}`",
+                intent.upper_class.as_str()
+            )));
+        }
+        let backup_path = layer_mount_reset_backups_dir(layout).join(id);
+        let binding_committed = if intent.binding_removed {
+            layers
+                .iter()
+                .all(|binding| binding.mount_path != mount_path)
+        } else {
+            layers.iter().any(|binding| {
+                binding.mount_path == mount_path
+                    && binding.binding_identity == intent.replacement_layer_id
+            })
+        };
+        if binding_committed {
+            remove_layer_mount_reset_path(&backup_path)?;
+            remove_layer_mount_reset_path(&intent_path)?;
+            sync_directory(&intents_dir);
+            continue;
+        }
+
+        let upper = safe_join(layout.upper_for_class(intent.upper_class), &mount_path)?;
+        remove_layer_mount_reset_path(&upper)?;
+        if backup_path.exists() {
+            if let Some(parent) = upper.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&backup_path, &upper)?;
+            if let Some(parent) = upper.parent() {
+                sync_directory(parent);
+            }
+        }
+        recovered.push(RecoveredLayerMountReset {
+            intent_path,
+            backup_path,
+            removed_whiteouts: intent.removed_whiteouts,
+        });
+    }
+    Ok(recovered)
+}
+
+fn finish_layer_mount_reset_recovery(recovered: &RecoveredLayerMountReset) -> Result<()> {
+    remove_layer_mount_reset_path(&recovered.backup_path)?;
+    remove_layer_mount_reset_path(&recovered.intent_path)?;
+    if let Some(parent) = recovered.intent_path.parent() {
+        sync_directory(parent);
+    }
+    Ok(())
+}
+
+fn remove_layer_mount_reset_path(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)?;
+        }
+        Ok(_) => fs::remove_file(path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Io(err)),
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1462,9 +2004,125 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_layer_reset_restores_private_upper_and_whiteouts_when_binding_did_not_commit() {
+        let (_temp, db, root, upper) = fixture();
+        let layout = ViewUpperLayout::from_source_upper(upper.clone());
+        fs::create_dir_all(layout.generated_upper.join("node_modules/pkg")).unwrap();
+        fs::write(
+            layout.generated_upper.join("node_modules/pkg/private.js"),
+            "private\n",
+        )
+        .unwrap();
+        let mut view = lazy_core(&db, &root, upper.clone());
+        view.whiteouts
+            .insert("node_modules/pkg/removed.js".to_string());
+        view.save_whiteouts().unwrap();
+
+        let reset = view
+            .prepare_declared_layer_mount_path("node_modules", "dependency", "layer-not-committed")
+            .unwrap();
+        assert!(!layout.generated_upper.join("node_modules").exists());
+        let seed = _temp.path().join("replacement-seed");
+        fs::create_dir_all(seed.join("pkg")).unwrap();
+        fs::write(seed.join("pkg/replacement.js"), "replacement\n").unwrap();
+        reset.install_private_directory(&seed).unwrap();
+        assert!(layout
+            .generated_upper
+            .join("node_modules/pkg/replacement.js")
+            .is_file());
+        drop(reset); // simulate process loss: recovery owns the durable intent
+        drop(view);
+
+        let reopened = lazy_core(&db, &root, upper);
+        assert_eq!(
+            fs::read(layout.generated_upper.join("node_modules/pkg/private.js")).unwrap(),
+            b"private\n"
+        );
+        assert!(reopened.is_whiteouted("node_modules/pkg/removed.js"));
+        assert!(fs::read_dir(layer_mount_reset_intents_dir(&layout))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn interrupted_private_seed_is_kept_only_after_matching_binding_commit() {
+        let (temp, db, root, upper) = fixture();
+        let layout = ViewUpperLayout::from_source_upper(upper.clone());
+        fs::create_dir_all(layout.generated_upper.join("build")).unwrap();
+        fs::write(layout.generated_upper.join("build/old.txt"), "old\n").unwrap();
+        let seed = temp.path().join("private-seed");
+        fs::create_dir_all(&seed).unwrap();
+        fs::write(seed.join("new.txt"), "new\n").unwrap();
+
+        let mut view = lazy_core(&db, &root, upper);
+        let reset = view
+            .prepare_declared_private_mount_path("build", "generated", "private_committed_identity")
+            .unwrap();
+        reset.install_private_directory(&seed).unwrap();
+        drop(reset);
+        drop(view);
+
+        let bindings = vec![WorkspaceLayerBinding {
+            binding_identity: "private_committed_identity".to_string(),
+            layer_id: None,
+            mount_path: "build".to_string(),
+            storage_path: None,
+            kind: "generated".to_string(),
+            priority: 100,
+        }];
+        assert!(recover_layer_mount_resets(&layout, &bindings)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs::read(layout.generated_upper.join("build/new.txt")).unwrap(),
+            b"new\n"
+        );
+        assert!(!layout.generated_upper.join("build/old.txt").exists());
+        assert!(fs::read_dir(layer_mount_reset_intents_dir(&layout))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn interrupted_layer_unmount_discards_private_upper_when_binding_removal_committed() {
+        let (_temp, db, root, upper) = fixture();
+        let layout = ViewUpperLayout::from_source_upper(upper.clone());
+        fs::create_dir_all(layout.generated_upper.join("generated/old")).unwrap();
+        fs::write(
+            layout.generated_upper.join("generated/old/private.txt"),
+            "private\n",
+        )
+        .unwrap();
+        let mut view = lazy_core(&db, &root, upper.clone());
+        view.whiteouts
+            .insert("generated/old/removed.txt".to_string());
+        view.save_whiteouts().unwrap();
+
+        let reset = view
+            .prepare_declared_layer_unmount_path("generated/old", "generated")
+            .unwrap();
+        assert!(!layout.generated_upper.join("generated/old").exists());
+        drop(reset); // SQLite contains no binding, so recovery commits removal.
+        drop(view);
+
+        let reopened = lazy_core(&db, &root, upper);
+        assert!(!layout.generated_upper.join("generated/old").exists());
+        assert!(!reopened.is_whiteouted("generated/old/removed.txt"));
+        assert!(fs::read_dir(layer_mount_reset_intents_dir(&layout))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
     fn view_core_conformance_copy_up_write_delete_and_reopen() {
         let (temp, db, root, upper) = fixture();
         let mut view = core(&db, &root, upper.clone());
+        assert!(view
+            .prepare_layer_mount_path("README.md", "layer-test")
+            .is_err());
         let readme = view.lookup(VIEW_ROOT_INO, "README.md").unwrap();
         assert!(!upper.join("README.md").exists());
         view.write(readme, 0, b"changed\n").unwrap();

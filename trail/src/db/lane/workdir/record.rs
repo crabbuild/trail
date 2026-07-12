@@ -677,7 +677,7 @@ impl Trail {
         Ok(oversized.into_values().collect())
     }
 
-    fn ensure_lane_record_file_size_policy(
+    pub(crate) fn ensure_lane_record_file_size_policy(
         &self,
         files: &BTreeMap<String, FileEntry>,
         summaries: &[FileDiffSummary],

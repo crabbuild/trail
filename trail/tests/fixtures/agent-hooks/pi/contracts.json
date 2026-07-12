@@ -1,0 +1,5 @@
+[
+  {"event":"before_agent_start","payload":{"session":{"sessionId":"pi-s1"},"input":{"turnId":"pi-t1","message":"fix it"}},"expected":["turn.started","message.user"]},
+  {"event":"tool_execution_end","payload":{"sessionId":"pi-s1","toolCallId":"tool-1","isError":true},"expected":["tool.failed"]},
+  {"event":"agent_end","payload":{"sessionId":"pi-s1","turnId":"pi-t1","status":"cancelled"},"expected":["turn.cancelled"]}
+]

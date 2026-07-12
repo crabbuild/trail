@@ -100,7 +100,7 @@ impl Trail {
             let layer_ids = if let Some(view) = &view {
                 self.workspace_layer_bindings_for_source_upper(Path::new(&view.source_upper))?
                     .into_iter()
-                    .map(|binding| binding.layer_id)
+                    .filter_map(|binding| binding.layer_id)
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()

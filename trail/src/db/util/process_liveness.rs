@@ -120,6 +120,125 @@ pub(crate) fn process_matches_start_token(pid: u32, token: &str) -> bool {
     process_start_token(pid).map_or(true, |actual| actual == token)
 }
 
+/// Internal helper entry point used by the CLI's hidden process-watchdog mode.
+/// The watchdog is a direct child of the Trail process and owns no workspace
+/// state. It terminates one authenticated sandbox-helper process if its parent
+/// disappears, preventing an adapter action from surviving host death.
+#[doc(hidden)]
+pub fn run_internal_process_watchdog(
+    parent_pid: u32,
+    child_pid: u32,
+    child_start_token: &str,
+) -> std::result::Result<(), String> {
+    if child_pid == 0 || child_start_token.is_empty() {
+        return Err("process watchdog received an invalid child identity".to_string());
+    }
+    if !process_matches_start_token(child_pid, child_start_token) {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        let parent_pid = i32::try_from(parent_pid)
+            .map_err(|_| "process watchdog parent PID is out of range".to_string())?;
+        let child_pid = i32::try_from(child_pid)
+            .map_err(|_| "process watchdog child PID is out of range".to_string())?;
+        loop {
+            if !process_matches_start_token(child_pid as u32, child_start_token) {
+                return Ok(());
+            }
+            // The watchdog is spawned directly by the owning Trail process.
+            // Unix reparents it immediately if that process exits, avoiding
+            // repeated process-table probes and PID-reuse ambiguity.
+            if unsafe { libc::getppid() } != parent_pid {
+                // SAFETY: the PID was range-checked and still matches the
+                // captured start token immediately before this signal.
+                if unsafe { libc::kill(child_pid, libc::SIGKILL) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(format!(
+                            "process watchdog could not terminate child {child_pid}: {error}"
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return windows_watch_parent_and_terminate_child(parent_pid, child_pid, child_start_token);
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = parent_pid;
+        Err("process watchdog is unavailable on this platform".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_watch_parent_and_terminate_child(
+    parent_pid: u32,
+    child_pid: u32,
+    child_start_token: &str,
+) -> std::result::Result<(), String> {
+    use winapi::shared::minwindef::{FALSE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
+    use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winnt::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, SYNCHRONIZE};
+
+    // SAFETY: handles are checked before use and closed on every return path.
+    unsafe {
+        let parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
+        if parent.is_null() {
+            return Err(format!(
+                "process watchdog cannot open parent {parent_pid}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let child = OpenProcess(
+            SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            child_pid,
+        );
+        if child.is_null() {
+            CloseHandle(parent);
+            return Ok(());
+        }
+        if windows_process_start_token(child_pid).as_deref() != Some(child_start_token) {
+            CloseHandle(child);
+            CloseHandle(parent);
+            return Ok(());
+        }
+        loop {
+            if WaitForSingleObject(child, 0) == WAIT_OBJECT_0 {
+                CloseHandle(child);
+                CloseHandle(parent);
+                return Ok(());
+            }
+            match WaitForSingleObject(parent, 50) {
+                WAIT_OBJECT_0 => {
+                    let _ = TerminateProcess(child, 137);
+                    CloseHandle(child);
+                    CloseHandle(parent);
+                    return Ok(());
+                }
+                WAIT_TIMEOUT => {}
+                _ => {
+                    let error = std::io::Error::last_os_error();
+                    CloseHandle(child);
+                    CloseHandle(parent);
+                    return Err(format!("process watchdog wait failed: {error}"));
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn test_crash_point(name: &str) {
     #[cfg(test)]
     {

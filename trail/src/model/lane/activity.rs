@@ -1255,7 +1255,7 @@ pub struct LaneTurn {
 }
 
 pub const TURN_ENVELOPE_SCHEMA: &str = "trail.turn_envelope";
-pub const TURN_ENVELOPE_VERSION: u16 = 1;
+pub const TURN_ENVELOPE_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TurnEnvelope {
@@ -1263,6 +1263,12 @@ pub struct TurnEnvelope {
     pub version: u16,
     pub kind: String,
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub session: TurnEnvelopeSession,
@@ -1331,13 +1337,38 @@ pub struct TurnEnvelopeReview {
 }
 
 impl TurnEnvelope {
-    pub fn new_acp_prompt(input: TurnEnvelopeAcpPromptInput) -> Self {
+    pub fn new_agent_turn(input: TurnEnvelopeInput) -> Self {
         Self {
             schema: TURN_ENVELOPE_SCHEMA.to_string(),
             version: TURN_ENVELOPE_VERSION,
+            kind: input.kind,
+            protocol: input.protocol,
+            host: input.host,
+            agent: input.agent,
+            adapter: input.adapter,
+            provider: input.provider,
+            model: input.model,
+            session: input.session,
+            prompt: input.prompt,
+            workspace: input.workspace,
+            usage: TurnEnvelopeUsage::default(),
+            capture: TurnEnvelopeCapture::default(),
+            outcome: TurnEnvelopeOutcome::default(),
+            review: TurnEnvelopeReview::default(),
+        }
+    }
+
+    pub fn new_acp_prompt(input: TurnEnvelopeAcpPromptInput) -> Self {
+        let provider = input.provider.clone();
+        Self::new_agent_turn(TurnEnvelopeInput {
             kind: "acp_prompt".to_string(),
             protocol: "acp".to_string(),
-            provider: input.provider,
+            host: Some("acp-relay".to_string()),
+            agent: provider.clone(),
+            adapter: provider
+                .as_ref()
+                .map(|provider| format!("trail/{provider}@acp")),
+            provider,
             model: input.model,
             session: TurnEnvelopeSession {
                 trail_session_id: Some(input.trail_session_id),
@@ -1358,11 +1389,7 @@ impl TurnEnvelope {
                 base_change: Some(input.base_change),
                 before_change: Some(input.before_change),
             },
-            usage: TurnEnvelopeUsage::default(),
-            capture: TurnEnvelopeCapture::default(),
-            outcome: TurnEnvelopeOutcome::default(),
-            review: TurnEnvelopeReview::default(),
-        }
+        })
     }
 
     pub fn from_metadata_json(metadata: Option<&str>) -> Option<Self> {
@@ -1374,7 +1401,7 @@ impl TurnEnvelope {
             && value
                 .get("version")
                 .and_then(serde_json::Value::as_u64)
-                .is_some_and(|version| version == u64::from(TURN_ENVELOPE_VERSION))
+                .is_some_and(|version| matches!(version, 1 | 2))
         {
             serde_json::from_value(value).ok()
         } else {
@@ -1408,6 +1435,20 @@ impl TurnEnvelope {
             }
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnEnvelopeInput {
+    pub kind: String,
+    pub protocol: String,
+    pub host: Option<String>,
+    pub agent: Option<String>,
+    pub adapter: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session: TurnEnvelopeSession,
+    pub prompt: TurnEnvelopePrompt,
+    pub workspace: TurnEnvelopeWorkspace,
 }
 
 #[derive(Clone, Debug)]

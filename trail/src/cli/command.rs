@@ -125,6 +125,8 @@ enum Command {
     Lane(LaneCommand),
     /// Build, attach, and inspect reproducible dependency environments.
     Deps(DepsCommand),
+    /// Inspect and synchronize adapter-owned workspace environments.
+    Env(EnvironmentCommand),
     /// Inspect and verify immutable local workspace cache layers.
     Cache(CacheCommand),
     /// Run Agent Client Protocol relay integrations for coding agents.
@@ -170,4 +172,186 @@ enum Command {
     Index(IndexCommand),
     /// Prune unused objects and stale index references.
     Gc(GcArgs),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_environment_adapter_catalog() {
+        let cli = Cli::try_parse_from(["trail", "env", "adapters"])
+            .expect("environment adapter catalog command should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Adapters,
+        }) = cli.command
+        else {
+            panic!("expected environment adapters command");
+        };
+    }
+
+    #[test]
+    fn parses_environment_status() {
+        let cli = Cli::try_parse_from(["trail", "env", "status", "lane-a"])
+            .expect("environment status command should parse");
+
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Status(args),
+        }) = cli.command
+        else {
+            panic!("expected environment status command");
+        };
+        assert_eq!(args.lane, "lane-a");
+    }
+
+    #[test]
+    fn parses_environment_discovery_with_component_root() {
+        let cli = Cli::try_parse_from(["trail", "env", "discover", "lane-a", "--path", "apps/web"])
+            .expect("environment discovery command should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Discover(args),
+        }) = cli.command
+        else {
+            panic!("expected environment discovery command");
+        };
+        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.path.as_deref(), Some("apps/web"));
+    }
+
+    #[test]
+    fn parses_environment_graph_with_component_root() {
+        let cli = Cli::try_parse_from([
+            "trail", "env", "graph", "lane-a", "--path", "apps", "--offset", "10", "--limit", "20",
+        ])
+        .expect("environment graph command should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Graph(args),
+        }) = cli.command
+        else {
+            panic!("expected environment graph command");
+        };
+        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.path.as_deref(), Some("apps"));
+        assert_eq!(args.offset, 10);
+        assert_eq!(args.limit, 20);
+    }
+
+    #[test]
+    fn parses_environment_generation() {
+        let cli = Cli::try_parse_from(["trail", "env", "generation", "lane-a"])
+            .expect("environment generation command should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Generation(args),
+        }) = cli.command
+        else {
+            panic!("expected environment generation command");
+        };
+        assert_eq!(args.lane, "lane-a");
+    }
+
+    #[test]
+    fn parses_environment_plan_with_adapter_and_root() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "env",
+            "plan",
+            "lane-a",
+            "--adapter",
+            "command",
+            "--path",
+            "tools/schema",
+            "--component",
+            "protobuf.generated",
+        ])
+        .expect("environment plan command should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Plan(args),
+        }) = cli.command
+        else {
+            panic!("expected environment plan command");
+        };
+        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.adapter, "command");
+        assert_eq!(args.path.as_deref(), Some("tools/schema"));
+        assert_eq!(args.component.as_deref(), Some("protobuf.generated"));
+    }
+
+    #[test]
+    fn environment_sync_defaults_to_auto_detection_and_accepts_a_component_root() {
+        let cli = Cli::try_parse_from(["trail", "env", "sync", "lane-a", "--path", "apps/web"])
+            .expect("environment sync command should parse");
+
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Sync(args),
+        }) = cli.command
+        else {
+            panic!("expected environment sync command");
+        };
+        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.adapter, "auto");
+        assert_eq!(args.path.as_deref(), Some("apps/web"));
+        assert_eq!(args.component, None);
+    }
+
+    #[test]
+    fn environment_sync_accepts_an_explicit_adapter() {
+        let cli = Cli::try_parse_from([
+            "trail",
+            "env",
+            "sync",
+            "lane-a",
+            "--adapter",
+            "example/python@1",
+        ])
+        .expect("environment sync command should parse");
+
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::Sync(args),
+        }) = cli.command
+        else {
+            panic!("expected environment sync command");
+        };
+        assert_eq!(args.adapter, "example/python@1");
+        assert_eq!(args.path, None);
+        assert_eq!(args.component, None);
+    }
+
+    #[test]
+    fn environment_sync_all_accepts_a_discovery_root() {
+        let cli = Cli::try_parse_from(["trail", "env", "sync-all", "lane-a", "--path", "apps"])
+            .expect("environment sync-all command should parse");
+        let Command::Env(EnvironmentCommand {
+            command: EnvironmentSubcommand::SyncAll(args),
+        }) = cli.command
+        else {
+            panic!("expected environment sync-all command");
+        };
+        assert_eq!(args.lane, "lane-a");
+        assert_eq!(args.path.as_deref(), Some("apps"));
+    }
+
+    #[test]
+    fn parses_environment_runtime_lifecycle_commands() {
+        for (action, expected) in [
+            ("status", "status"),
+            ("reconcile", "reconcile"),
+            ("stop", "stop"),
+        ] {
+            let cli = Cli::try_parse_from(["trail", "env", "runtime", action, "lane-a"])
+                .expect("environment runtime command should parse");
+            let Command::Env(EnvironmentCommand {
+                command: EnvironmentSubcommand::Runtime(runtime),
+            }) = cli.command
+            else {
+                panic!("expected environment runtime command");
+            };
+            let (actual, lane) = match runtime.command {
+                EnvironmentRuntimeSubcommand::Status(args) => ("status", args.lane),
+                EnvironmentRuntimeSubcommand::Reconcile(args) => ("reconcile", args.lane),
+                EnvironmentRuntimeSubcommand::Stop(args) => ("stop", args.lane),
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(lane, "lane-a");
+        }
+    }
 }

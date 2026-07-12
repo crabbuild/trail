@@ -182,10 +182,21 @@ pub(crate) struct WorkspaceExecRequest {
     pub(crate) command: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DependencySyncRequest {
     #[serde(default)]
+    pub(crate) path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentSyncRequest {
+    #[serde(default)]
+    pub(crate) adapter: Option<String>,
+    #[serde(default, alias = "component_id")]
+    pub(crate) component: Option<String>,
+    #[serde(default, alias = "component_root")]
     pub(crate) path: Option<String>,
 }
 

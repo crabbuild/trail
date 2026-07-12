@@ -1,202 +1,94 @@
+use super::workspace_environment::{
+    resolve_workspace_tool_executable, WorkspaceEnvironmentAdapter,
+    WorkspaceEnvironmentAdapterMetadata, WorkspaceEnvironmentCacheAccess,
+    WorkspaceEnvironmentCacheProtocol, WorkspaceEnvironmentCommand, WorkspaceEnvironmentInput,
+    WorkspaceEnvironmentOutput, WorkspaceEnvironmentOutputPolicy, WorkspaceEnvironmentPlan,
+    WorkspaceEnvironmentSandboxPolicy,
+};
 use super::*;
 
-#[derive(Clone, Debug)]
-struct NodeEnvironmentInputs {
-    package_root: String,
-    manager: String,
-    files: BTreeMap<String, FileEntry>,
-    key: WorkspaceLayerKeyV1,
+pub(crate) struct NodeWorkspaceAdapter;
+
+pub(crate) static NODE_WORKSPACE_ADAPTER: NodeWorkspaceAdapter = NodeWorkspaceAdapter;
+
+static NODE_WORKSPACE_ADAPTER_METADATA: WorkspaceEnvironmentAdapterMetadata =
+    WorkspaceEnvironmentAdapterMetadata {
+        canonical_identity: "trail/node@1",
+        namespace: "trail",
+        name: "node",
+        contract_major: 1,
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        distribution_digest: "builtin:node-plan-v1",
+        selectors: &["trail/node@1", "node"],
+        kind: "dependency",
+        layer_adapter_name: "node",
+        discovery_markers: &["package.json"],
+        supported_operating_systems: &["linux", "macos", "windows"],
+        supported_architectures: &["aarch64", "x86_64"],
+        stability: "stable",
+        description:
+            "Frozen npm, pnpm, Yarn, or Bun dependency tree with a private writable lane upper",
+    };
+
+impl WorkspaceEnvironmentAdapter for NodeWorkspaceAdapter {
+    fn metadata(&self) -> &'static WorkspaceEnvironmentAdapterMetadata {
+        &NODE_WORKSPACE_ADAPTER_METADATA
+    }
+
+    fn component_id(&self, component_root: &str) -> Result<String> {
+        let root = normalize_package_root(component_root)?;
+        Ok(if root.is_empty() {
+            "node".to_string()
+        } else {
+            format!("node:{root}")
+        })
+    }
+
+    fn detect(&self, db: &Trail, source_root: &ObjectId, component_root: &str) -> Result<bool> {
+        let root = normalize_package_root(component_root)?;
+        if db
+            .root_file_entry(source_root, &join_repo_path(&root, "package.json"))?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        for (name, _) in supported_lockfiles() {
+            if db
+                .root_file_entry(source_root, &join_repo_path(&root, name))?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn plan(
+        &self,
+        db: &Trail,
+        source_root: &ObjectId,
+        component_root: &str,
+    ) -> Result<WorkspaceEnvironmentPlan> {
+        db.node_environment_plan(source_root, component_root)
+    }
 }
 
 impl Trail {
+    /// Compatibility entry point retained for existing `trail deps sync`
+    /// callers. All execution and persistence is owned by the generic host.
     pub fn sync_node_dependencies(
         &self,
         lane: &str,
         package_root: Option<&str>,
     ) -> Result<WorkspaceLayerReport> {
-        let branch = self.lane_branch(lane)?;
-        let head = self.get_ref(&branch.ref_name)?;
-        let inputs = self.node_environment_inputs(&head.root_id, package_root.unwrap_or(""))?;
-        let cache_key = self.workspace_layer_cache_key(&inputs.key)?;
-        let adapter_id = if inputs.package_root.is_empty() {
-            "node".to_string()
-        } else {
-            format!("node:{}", inputs.package_root)
-        };
-        self.set_workspace_environment_state(
-            lane,
-            &adapter_id,
-            &cache_key,
-            None,
-            "building",
-            None,
-        )?;
-        let build = self.build_workspace_layer_singleflight(&inputs.key, |build_dir| {
-            let project = build_dir.join("project");
-            fs::create_dir_all(&project)?;
-            for (path, entry) in &inputs.files {
-                let relative = strip_package_root(path, &inputs.package_root)?;
-                let destination = safe_join(&project, &relative)?;
-                if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let projection = self.project_entry_file(entry)?;
-                fs::copy(projection, &destination)?;
-                let mut permissions = fs::metadata(&destination)?.permissions();
-                permissions.set_readonly(false);
-                fs::set_permissions(&destination, permissions)?;
-            }
-            let cache = self.db_dir.join("cache/tool-home/node");
-            fs::create_dir_all(&cache)?;
-            let mut command = Command::new(&inputs.manager);
-            command
-                .current_dir(&project)
-                .env("npm_config_cache", cache.join("npm"))
-                .env("PNPM_HOME", cache.join("pnpm-home"))
-                .env("PNPM_STORE_DIR", cache.join("pnpm-store"));
-            match inputs.manager.as_str() {
-                "npm" => {
-                    command.args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"]);
-                }
-                "pnpm" => {
-                    command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
-                }
-                "yarn" => {
-                    let version = inputs
-                        .key
-                        .tool_versions
-                        .get("yarn")
-                        .map(String::as_str)
-                        .unwrap_or_default();
-                    if version.starts_with('1') {
-                        command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
-                    } else {
-                        command.args(["install", "--immutable", "--mode=skip-build"]);
-                    }
-                }
-                "bun" => {
-                    command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
-                }
-                other => {
-                    return Err(Error::InvalidInput(format!(
-                        "unsupported Node package manager `{other}`"
-                    )))
-                }
-            }
-            let status = command.status().map_err(|err| {
-                Error::InvalidInput(format!(
-                    "failed to launch `{}` for Node dependency layer: {err}",
-                    inputs.manager
-                ))
-            })?;
-            if !status.success() {
-                return Err(Error::InvalidInput(format!(
-                    "{} frozen install failed with {status}",
-                    inputs.manager
-                )));
-            }
-            let output = project.join("node_modules");
-            fs::create_dir_all(&output)?;
-            Ok(output)
-        });
-        let layer = match build {
-            Ok(layer) => layer,
-            Err(err) => {
-                self.set_workspace_environment_state(
-                    lane,
-                    &adapter_id,
-                    &cache_key,
-                    None,
-                    "failed",
-                    Some(&err.to_string()),
-                )?;
-                return Err(err);
-            }
-        };
-        let mount_path = if inputs.package_root.is_empty() {
-            "node_modules".to_string()
-        } else {
-            format!("{}/node_modules", inputs.package_root)
-        };
-        self.attach_workspace_layer(lane, &layer.layer_id, &mount_path, &adapter_id, &cache_key)?;
-        Ok(layer)
+        self.sync_workspace_environment(lane, "trail/node@1", package_root)
     }
 
-    pub fn workspace_environment_status(
-        &self,
-        lane: &str,
-    ) -> Result<Vec<WorkspaceEnvironmentReport>> {
-        let branch = self.lane_branch(lane)?;
-        let head = self.get_ref(&branch.ref_name)?;
-        let mut reports = self.workspace_environment_rows(lane)?;
-        for report in &mut reports {
-            let package_root = if report.adapter == "node" {
-                ""
-            } else if let Some(root) = report.adapter.strip_prefix("node:") {
-                root
-            } else {
-                continue;
-            };
-            let inputs = self.node_environment_inputs(&head.root_id, package_root)?;
-            let expected = self.workspace_layer_cache_key(&inputs.key)?;
-            if report.attached_key.as_deref() == Some(expected.as_str()) {
-                report.expected_key = expected;
-                report.status = "ready".to_string();
-                report.reason = None;
-            } else if report.expected_key != expected {
-                report.expected_key = expected;
-                report.status = "stale".to_string();
-                report.reason = Some("package or lock inputs changed".to_string());
-            }
-        }
-        Ok(reports)
-    }
-
-    fn workspace_environment_rows(&self, lane: &str) -> Result<Vec<WorkspaceEnvironmentReport>> {
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "lane `{lane}` does not have a layered workspace view"
-            ))
-        })?;
-        let mut stmt = self.conn.prepare(
-            "SELECT view_id, adapter, expected_key, attached_key, status, reason, updated_at FROM workspace_environment_states WHERE view_id = ?1 ORDER BY adapter",
-        )?;
-        let reports = stmt
-            .query_map(params![view.view_id], |row| {
-                Ok(WorkspaceEnvironmentReport {
-                    view_id: row.get(0)?,
-                    adapter: row.get(1)?,
-                    expected_key: row.get(2)?,
-                    attached_key: row.get(3)?,
-                    status: row.get(4)?,
-                    reason: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(reports)
-    }
-
-    pub fn refresh_workspace_environment_staleness(&self, lane: &str) -> Result<()> {
-        let states = self.workspace_environment_status(lane)?;
-        for state in states {
-            self.set_workspace_environment_state(
-                lane,
-                &state.adapter,
-                &state.expected_key,
-                state.attached_key.as_deref(),
-                &state.status,
-                state.reason.as_deref(),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn node_environment_inputs(
+    fn node_environment_plan(
         &self,
         root_id: &ObjectId,
         package_root: &str,
-    ) -> Result<NodeEnvironmentInputs> {
+    ) -> Result<WorkspaceEnvironmentPlan> {
         let package_root = if package_root.trim_matches('/').is_empty() {
             String::new()
         } else {
@@ -215,16 +107,8 @@ impl Trail {
                     }
                 ))
             })?;
-        let lock_names = [
-            ("pnpm-lock.yaml", "pnpm"),
-            ("yarn.lock", "yarn"),
-            ("bun.lock", "bun"),
-            ("bun.lockb", "bun"),
-            ("npm-shrinkwrap.json", "npm"),
-            ("package-lock.json", "npm"),
-        ];
         let mut selected = None;
-        for (name, manager) in lock_names {
+        for (name, manager) in supported_lockfiles() {
             let path = join_repo_path(&package_root, name);
             if let Some(entry) = self.root_file_entry(root_id, &path)? {
                 selected = Some((path, manager.to_string(), entry));
@@ -243,74 +127,244 @@ impl Trail {
         })?;
         let manager_version = tool_version(&manager)?;
         let node_version = tool_version("node")?;
+        let node_tool = resolve_workspace_tool_executable("node")?;
+        let manager_tool = resolve_workspace_tool_executable(&manager)?;
+        let package_projection = self.project_entry_file(&package_entry)?;
+        let package_text = fs::read_to_string(package_projection)?;
+        let package_value: serde_json::Value = serde_json::from_str(&package_text)?;
+        if package_value.get("workspaces").is_some() {
+            return Err(Error::InvalidInput(format!(
+                "Node component `{}` declares workspaces; synchronize a supported leaf package explicitly until the monorepo adapter is enabled",
+                display_package_root(&package_root)
+            )));
+        }
+        if contains_local_node_dependency(&package_value) {
+            return Err(Error::InvalidInput(format!(
+                "Node component `{}` contains file:, link:, or workspace: dependencies that cannot be represented by an isolated node_modules layer",
+                display_package_root(&package_root)
+            )));
+        }
+        if manager == "pnpm"
+            && self
+                .root_file_entry(
+                    root_id,
+                    &join_repo_path(&package_root, "pnpm-workspace.yaml"),
+                )?
+                .is_some()
+        {
+            return Err(Error::InvalidInput(
+                "pnpm workspace roots require the future monorepo environment adapter".to_string(),
+            ));
+        }
+        if manager == "yarn"
+            && (!manager_version.starts_with('1')
+                || self
+                    .root_file_entry(root_id, &join_repo_path(&package_root, ".yarnrc.yml"))?
+                    .is_some())
+        {
+            return Err(Error::InvalidInput(
+                "Yarn Berry/PnP layouts are not node_modules layers; use Yarn Classic or wait for the PnP adapter"
+                    .to_string(),
+            ));
+        }
         let mut files = BTreeMap::from([
             (package_json.clone(), package_entry.clone()),
             (lock_path.clone(), lock_entry.clone()),
         ]);
-        // Workspace package manifests affect installation. Discover them in a
-        // streaming pass; this runs only during explicit dependency sync, not
-        // during view creation or lookup.
-        self.for_each_root_file_chunk(root_id, 1024, |chunk| {
-            for (path, entry) in chunk {
-                if Path::new(&path).file_name().and_then(|name| name.to_str())
-                    != Some("package.json")
-                {
-                    continue;
-                }
-                if package_root.is_empty()
-                    || path.starts_with(&format!("{package_root}/"))
-                    || path == package_json
-                {
-                    files.insert(path, entry);
-                }
+        for name in [
+            ".npmrc",
+            ".yarnrc",
+            "pnpmfile.cjs",
+            ".node-version",
+            ".nvmrc",
+        ] {
+            let path = join_repo_path(&package_root, name);
+            if let Some(entry) = self.root_file_entry(root_id, &path)? {
+                files.insert(path, entry);
             }
-            Ok(())
-        })?;
+        }
+        let implementation_version = env!("CARGO_PKG_VERSION").to_string();
+        let distribution_digest = "builtin:node-plan-v1".to_string();
+        let mut key_inputs = files
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.content_hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+        key_inputs.insert(
+            "adapter_implementation".to_string(),
+            implementation_version.clone(),
+        );
+        key_inputs.insert(
+            "adapter_distribution_digest".to_string(),
+            distribution_digest.clone(),
+        );
         let key = WorkspaceLayerKeyV1 {
             kind: "dependency".to_string(),
             adapter: "node".to_string(),
             adapter_version: 1,
-            inputs: files
-                .iter()
-                .map(|(path, entry)| (path.clone(), entry.content_hash.clone()))
-                .collect(),
+            inputs: key_inputs,
             tool_versions: BTreeMap::from([
                 ("node".to_string(), node_version),
                 (manager.clone(), manager_version),
+                ("node-executable".to_string(), node_tool.identity),
+                (
+                    format!("{manager}-executable"),
+                    manager_tool.identity.clone(),
+                ),
             ]),
             platform: std::env::consts::OS.to_string(),
             architecture: std::env::consts::ARCH.to_string(),
             portability_scope: "platform-architecture-node-abi".to_string(),
             strategy: format!("{manager}-frozen-ignore-scripts-v1"),
         };
-        Ok(NodeEnvironmentInputs {
-            package_root,
-            manager,
-            files,
-            key,
+        let project = "project".to_string();
+        let cache = self.declare_workspace_environment_cache(
+            NODE_WORKSPACE_ADAPTER.identity(),
+            "package-manager",
+            WorkspaceEnvironmentCacheProtocol::ContentStore,
+            WorkspaceEnvironmentCacheAccess::ToolConcurrent,
+            BTreeMap::from([
+                ("manager".to_string(), manager.clone()),
+                (
+                    "manager_executable".to_string(),
+                    manager_tool.identity.clone(),
+                ),
+                ("platform".to_string(), std::env::consts::OS.to_string()),
+                (
+                    "architecture".to_string(),
+                    std::env::consts::ARCH.to_string(),
+                ),
+            ]),
+        )?;
+        let cache_root = &cache.storage_path;
+        let environment = BTreeMap::from([
+            (
+                "npm_config_cache".to_string(),
+                cache_root.join("npm").to_string_lossy().into_owned(),
+            ),
+            (
+                "PNPM_HOME".to_string(),
+                cache_root.join("pnpm-home").to_string_lossy().into_owned(),
+            ),
+            (
+                "PNPM_STORE_DIR".to_string(),
+                cache_root.join("pnpm-store").to_string_lossy().into_owned(),
+            ),
+        ]);
+        let args = match manager.as_str() {
+            "npm" => vec!["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+            "pnpm" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
+            "yarn" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
+            "bun" => vec!["install", "--frozen-lockfile", "--ignore-scripts"],
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "unsupported Node package manager `{other}`"
+                )))
+            }
+        }
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let inputs = files
+            .into_iter()
+            .map(|(source_path, entry)| {
+                let relative = strip_package_root(&source_path, &package_root)?;
+                Ok(WorkspaceEnvironmentInput {
+                    source_path,
+                    staging_path: format!("project/{relative}"),
+                    entry,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mount_path = if package_root.is_empty() {
+            "node_modules".to_string()
+        } else {
+            format!("{package_root}/node_modules")
+        };
+        Ok(WorkspaceEnvironmentPlan {
+            component_id: NODE_WORKSPACE_ADAPTER.component_id(&package_root)?,
+            adapter_identity: NODE_WORKSPACE_ADAPTER.identity().to_string(),
+            adapter_version: 1,
+            implementation_version,
+            distribution_digest,
+            kind: "dependency".to_string(),
+            dependencies: Vec::new(),
+            resolved_dependencies: Vec::new(),
+            layer_key: key,
+            inputs,
+            source_projection: None,
+            pre_commands: Vec::new(),
+            command: Some(WorkspaceEnvironmentCommand {
+                program: manager,
+                resolved_program: manager_tool.path,
+                executable_identity: manager_tool.identity,
+                args,
+                working_directory: project.clone(),
+                environment,
+                remove_environment: Vec::new(),
+                cache_names: vec![cache.name.clone()],
+            }),
+            mounted_commands: Vec::new(),
+            caches: vec![cache],
+            external_artifacts: Vec::new(),
+            runtime_resources: Vec::new(),
+            sandbox_policy: WorkspaceEnvironmentSandboxPolicy::TrustedBuiltin,
+            outputs: vec![WorkspaceEnvironmentOutput {
+                name: "modules".to_string(),
+                output_path: format!("{project}/node_modules"),
+                mount_path,
+                policy: WorkspaceEnvironmentOutputPolicy::ImmutableSeedPrivate,
+                create_if_missing: true,
+            }],
+            stale_reason:
+                "package, lockfile, Node runtime, package manager, or adapter policy changed"
+                    .to_string(),
         })
     }
+}
 
-    fn set_workspace_environment_state(
-        &self,
-        lane: &str,
-        adapter: &str,
-        expected_key: &str,
-        attached_key: Option<&str>,
-        status: &str,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        let view = self.lane_workspace_view(lane)?.ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "lane `{lane}` does not have a layered workspace view"
-            ))
-        })?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO workspace_environment_states (view_id, adapter, expected_key, attached_key, status, reason, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![view.view_id, adapter, expected_key, attached_key, status, reason, now_ts()],
-        )?;
-        Ok(())
+fn supported_lockfiles() -> [(&'static str, &'static str); 6] {
+    [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lock", "bun"),
+        ("bun.lockb", "bun"),
+        ("npm-shrinkwrap.json", "npm"),
+        ("package-lock.json", "npm"),
+    ]
+}
+
+fn normalize_package_root(package_root: &str) -> Result<String> {
+    if package_root.trim_matches('/').is_empty() {
+        Ok(String::new())
+    } else {
+        normalize_relative_path(package_root)
     }
+}
+
+fn display_package_root(package_root: &str) -> &str {
+    if package_root.is_empty() {
+        "."
+    } else {
+        package_root
+    }
+}
+
+fn contains_local_node_dependency(package: &serde_json::Value) -> bool {
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .into_iter()
+    .filter_map(|name| package.get(name).and_then(serde_json::Value::as_object))
+    .flat_map(|dependencies| dependencies.values())
+    .filter_map(serde_json::Value::as_str)
+    .any(|value| {
+        ["file:", "link:", "workspace:"]
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+    })
 }
 
 fn tool_version(tool: &str) -> Result<String> {
@@ -392,7 +446,9 @@ mod tests {
             .unwrap();
         }
         let first = db.sync_node_dependencies("node-one", None).unwrap();
-        let second = db.sync_node_dependencies("node-two", None).unwrap();
+        let second = db
+            .sync_workspace_environment("node-two", "auto", None)
+            .unwrap();
         assert_eq!(first.layer_id, second.layer_id);
         assert_eq!(first.cache_key, second.cache_key);
         assert_eq!(db.list_workspace_layers().unwrap().len(), 1);
@@ -407,6 +463,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bound, 2);
+        let generation_one = db
+            .active_environment_generation("node-one")
+            .unwrap()
+            .unwrap();
+        let generation_two = db
+            .active_environment_generation("node-two")
+            .unwrap()
+            .unwrap();
+        let cache_one = &generation_one.components[0].caches[0];
+        let cache_two = &generation_two.components[0].caches[0];
+        assert_eq!(cache_one.namespace_id, cache_two.namespace_id);
+        assert_eq!(cache_one.protocol, "content_store");
+        assert_eq!(cache_one.access, "tool_concurrent");
+        assert_eq!(cache_one.authority, "performance_only");
+        assert!(db
+            .db_dir
+            .join("cache/namespaces")
+            .join(&cache_one.namespace_id)
+            .is_dir());
+        assert!(!db.db_dir.join("cache/tool-home/node").exists());
+
+        db.conn
+            .execute(
+                "UPDATE workspace_views SET owner_pid = ?1, owner_start_token = ?2, status = 'mounted' WHERE view_id = ?3",
+                params![
+                    std::process::id(),
+                    current_process_start_token(),
+                    view_one.view_id
+                ],
+            )
+            .unwrap();
+        let mounted = db.sync_node_dependencies("node-one", None).unwrap_err();
+        assert!(mounted.to_string().contains("trail lane unmount node-one"));
+        assert_eq!(
+            db.workspace_environment_rows("node-one").unwrap()[0].status,
+            "ready"
+        );
+        db.conn
+            .execute(
+                "UPDATE workspace_views SET owner_pid = NULL, owner_start_token = NULL, status = 'unmounted' WHERE view_id = ?1",
+                params![view_one.view_id],
+            )
+            .unwrap();
 
         db.conn
             .execute(
@@ -415,10 +514,26 @@ mod tests {
             )
             .unwrap();
         let dynamic = db.workspace_environment_status("node-one").unwrap();
-        assert_eq!(dynamic[0].status, "ready");
+        assert_eq!(dynamic[0].status, "building");
         let persisted = db.workspace_environment_rows("node-one").unwrap().remove(0);
         assert_eq!(persisted.status, "building");
         assert_eq!(persisted.reason.as_deref(), Some("sentinel"));
+
+        let normalized = db
+            .enforce_read_only_mcp_call("trail.env_status", |db| {
+                db.environment_component_status("node-one")
+            })
+            .unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].component.component_id, "node");
+
+        let normalized = db
+            .enforce_read_only_mcp_call("trail.env_status", |db| {
+                db.environment_component_status("node-one")
+            })
+            .unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].component.component_id, "node");
         assert_eq!(persisted.updated_at, -1);
 
         let paths = db.workspace_view_paths_for_lane("node-one").unwrap();
@@ -434,5 +549,20 @@ mod tests {
             .blockers
             .iter()
             .any(|issue| issue.code == "dependency_environment_stale"));
+        let explanation = db
+            .explain_workspace_environment_staleness("node-one", "node")
+            .unwrap();
+        assert!(explanation.complete);
+        assert_eq!(explanation.status, "stale");
+        assert!(explanation.changes.iter().any(|change| {
+            change.dimension == "input"
+                && change.name == "package-lock.json"
+                && change.change == "modified"
+        }));
+        let state = db.environment_component_status("node-one").unwrap();
+        assert!(state[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("input:package-lock.json modified")));
     }
 }

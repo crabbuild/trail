@@ -209,6 +209,35 @@ Git branch.
 
 ## Recovery
 
+### Native hooks, evidence, and managed capture
+
+| Command | Purpose and important options |
+| --- | --- |
+| `hooks add PROVIDER` | Safely install Trail-owned project or user hooks. Use `--scope project|user`, `--lane`, `--dry-run`, and `--force` only after reviewing foreign config. |
+| `hooks remove PROVIDER` | Remove only exact Trail-owned entries or files. Supports scope, dry-run, and force. |
+| `hooks list` | List all eight adapters and recorded installations; `--installed` filters the catalog. |
+| `hooks status PROVIDER` | Compare persisted ownership digests with current provider configuration. |
+| `hooks doctor [PROVIDER]` | Report compatibility, drift, receipt failures, spool pressure, capture ownership, transcript fidelity, and stale finalizers. Use `--all` or `--probe`. |
+| `hooks events PROVIDER` | List durable redacted receipt rows; `--failed` selects retry, quarantine, and discarded states. |
+| `hooks replay --pending` | Drain the secure fallback spool, recover stale processing leases, and replay due receipts with bounded exponential backoff. |
+| `hooks retry RECEIPT` | Move a retrying or quarantined receipt back to the replay queue. |
+| `hooks discard RECEIPT` | Retain the receipt audit row while explicitly preventing later replay. |
+| `capture begin` | Declare a leased managed run with `--owner`, `--session`, optional `--executor`, `--lane`, `--workdir`, `--work-item`, and `--ttl-ms`. |
+| `capture renew RUN` | Renew the exact owner/session lease. |
+| `capture end RUN` | Idempotently end the exact owner/session run. |
+| `capture status` | List active runs; `--all` includes ended and expired runs. |
+| `capture reconcile` | Expire abandoned runs and close their open mappings, turns, and sessions as interrupted. |
+| `artifacts SESSION` | List immutable native transcript, canonical export, or reconstructed evidence artifacts. |
+| `provenance SESSION` | Read factual and explicitly derived causal nodes and edges. |
+| `attest create|list|show|verify` | Create and verify content-addressed, chained session attestations. |
+| `learnings list|accept|reject` | Review reusable findings; Trail never edits provider context files automatically. |
+| `export SESSION` | Write or print the verified portable agent-trace representation; `--attachments` includes bounded attachment bytes. |
+| `git-link link|list` | Record or query exact Git commit, Trail change, turn, and session associations. |
+
+The singular `trail agent hook receive PROVIDER EVENT` command is an internal,
+fail-open provider callback. Integration authors may call it, but users should
+manage installations through `trail agent hooks`.
+
 | Command | Purpose and important options |
 | --- | --- |
 | `undo [TASK]` | Undo the latest completed turn by default. Select with `--last-turn`, `--turn <N_OR_ID>`, `--prompt <TEXT>`, or `--last-operation`. Alias: `undo-last`. |

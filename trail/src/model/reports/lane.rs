@@ -109,6 +109,430 @@ pub struct WorkspaceEnvironmentReport {
     pub updated_at: i64,
 }
 
+/// The stable, repository-local identity of an environment graph component.
+///
+/// Component identity is deliberately independent from the adapter that currently
+/// implements it. This lets Trail upgrade or replace an adapter without changing
+/// references to the logical component in status, policy, and dependency edges.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentComponentIdentityReport {
+    pub component_id: String,
+    pub kind: String,
+}
+
+/// The versioned identity of the adapter implementation responsible for a component.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentAdapterIdentityReport {
+    pub namespace: String,
+    pub name: String,
+    pub contract_major: u32,
+    pub implementation_version: String,
+    pub distribution_digest: Option<String>,
+}
+
+/// One adapter available to the environment host.
+///
+/// Catalog entries describe discovery and compatibility only. They never grant
+/// an adapter permission to execute commands or mutate a lane.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentAdapterCatalogEntryReport {
+    pub identity: EnvironmentAdapterIdentityReport,
+    pub canonical_identity: String,
+    pub selectors: Vec<String>,
+    pub kind: String,
+    pub layer_adapter_name: String,
+    pub discovery_markers: Vec<String>,
+    /// External planner protocols supported by the packaged executable.
+    /// Built-ins and repository recipes use the in-process host contract and
+    /// therefore report an empty list.
+    pub protocols: Vec<String>,
+    pub supported_operating_systems: Vec<String>,
+    pub supported_architectures: Vec<String>,
+    pub source: String,
+    pub publisher: Option<String>,
+    pub publisher_key_id: Option<String>,
+    pub trust: String,
+    pub certification_tier: String,
+    pub stability: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentAdapterCatalogReport {
+    pub contract_major: u32,
+    pub adapters: Vec<EnvironmentAdapterCatalogEntryReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPluginInstallReport {
+    pub canonical_identity: String,
+    pub distribution_digest: String,
+    pub executable_digest: String,
+    pub package_path: String,
+    pub replaced_distribution_digest: Option<String>,
+    pub publisher: Option<String>,
+    pub publisher_key_id: Option<String>,
+    pub trust: String,
+    pub certification_tier: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPluginPackageInspectionReport {
+    pub canonical_identity: String,
+    pub payload_digest: String,
+    pub executable_digest: String,
+    pub distribution_digest: String,
+    pub signature_present: bool,
+    pub publisher: Option<String>,
+    pub publisher_key_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPluginRemoveReport {
+    pub canonical_identity: String,
+    pub removed_distribution_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentStaleChangeReport {
+    pub dimension: String,
+    pub name: String,
+    pub change: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentStaleExplanationReport {
+    pub component_id: String,
+    pub status: String,
+    pub expected_key: String,
+    pub attached_key: Option<String>,
+    pub complete: bool,
+    pub provenance_complete: bool,
+    pub total_changes: u64,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+    pub changes: Vec<EnvironmentStaleChangeReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPublisherTrustEntryReport {
+    pub publisher: String,
+    pub key_id: String,
+    pub public_key: String,
+    pub trusted_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPublisherTrustReport {
+    pub keys: Vec<EnvironmentPublisherTrustEntryReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPublisherTrustMutationReport {
+    pub publisher: Option<String>,
+    pub key_id: String,
+    pub action: String,
+}
+
+/// Normalized environment state for one logical component in a workspace view.
+///
+/// `expected_key`, `attached_key`, and the status fields intentionally mirror
+/// [`WorkspaceEnvironmentReport`] so legacy dependency state has a lossless report
+/// projection while clients move to component-oriented APIs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentComponentStateReport {
+    pub view_id: String,
+    pub component: EnvironmentComponentIdentityReport,
+    pub adapter: EnvironmentAdapterIdentityReport,
+    pub expected_key: String,
+    pub attached_key: Option<String>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGenerationOutputReport {
+    pub name: String,
+    pub policy: String,
+    pub storage_identity: String,
+    pub layer_id: Option<String>,
+    pub mount_path: String,
+    pub layer_subpath: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentCacheReport {
+    pub name: String,
+    pub namespace_id: String,
+    pub protocol: String,
+    pub access: String,
+    pub authority: String,
+    pub scope: String,
+    pub compatibility: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentExternalArtifactReport {
+    pub name: String,
+    pub artifact_type: String,
+    pub provider: String,
+    pub reference: String,
+    pub digest: String,
+    pub platform: String,
+    pub cleanup_owner: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentRuntimeDeclarationReport {
+    pub name: String,
+    pub runtime_type: String,
+    pub provider: String,
+    pub artifact_name: String,
+    pub container_port: u16,
+    pub protocol: String,
+    pub health_type: String,
+    pub health_timeout_ms: u64,
+    pub restart_policy: String,
+    pub cleanup_owner: String,
+    pub volume_target: Option<String>,
+    #[serde(default)]
+    pub secrets: Vec<EnvironmentSecretReferenceReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentSecretReferenceReport {
+    pub name: String,
+    pub provider: String,
+    pub reference: String,
+    pub version: Option<String>,
+    pub purpose: String,
+    pub injection: String,
+    pub target: String,
+    pub environment: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentSecretStatusReport {
+    #[serde(flatten)]
+    pub reference: EnvironmentSecretReferenceReport,
+    pub status: String,
+    pub reason: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentRuntimeResourceReport {
+    #[serde(flatten)]
+    pub declaration: EnvironmentRuntimeDeclarationReport,
+    pub image_reference: String,
+    pub image_digest: String,
+    pub image_platform: String,
+    pub allocation_id: String,
+    pub provider_resource_id: Option<String>,
+    pub container_name: String,
+    pub network_name: String,
+    pub volume_name: Option<String>,
+    pub host_port: Option<u16>,
+    pub status: String,
+    pub health_status: String,
+    pub reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub stopped_at: Option<i64>,
+    #[serde(default)]
+    pub secret_statuses: Vec<EnvironmentSecretStatusReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGenerationDependencyReport {
+    pub component_id: String,
+    pub component_key: String,
+    #[serde(default = "default_environment_edge_type")]
+    pub edge_type: String,
+}
+
+fn default_environment_edge_type() -> String {
+    "build_requires".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGenerationComponentReport {
+    pub component_id: String,
+    pub adapter_identity: String,
+    pub kind: String,
+    pub component_key: String,
+    pub layer_id: Option<String>,
+    pub mount_path: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<EnvironmentGenerationDependencyReport>,
+    #[serde(default)]
+    pub outputs: Vec<EnvironmentGenerationOutputReport>,
+    #[serde(default)]
+    pub caches: Vec<EnvironmentCacheReport>,
+    #[serde(default)]
+    pub external_artifacts: Vec<EnvironmentExternalArtifactReport>,
+    #[serde(default)]
+    pub runtime_resources: Vec<EnvironmentRuntimeResourceReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGenerationReport {
+    pub generation_id: String,
+    pub view_id: String,
+    pub generation_sequence: u64,
+    pub source_root: ObjectId,
+    pub specification_digest: String,
+    pub predecessor_generation_id: Option<String>,
+    pub state: String,
+    pub components: Vec<EnvironmentGenerationComponentReport>,
+    pub created_at: i64,
+    pub activated_at: Option<i64>,
+    pub retired_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentDiscoveredComponentReport {
+    pub component_id: String,
+    pub component_root: String,
+    pub kind: String,
+    pub adapter_identity: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentDiscoveryConflictReport {
+    pub component_root: String,
+    pub adapter_identities: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentDiscoveryReport {
+    pub source_root: ObjectId,
+    pub components: Vec<EnvironmentDiscoveredComponentReport>,
+    pub conflicts: Vec<EnvironmentDiscoveryConflictReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGraphNodeReport {
+    pub topological_index: u64,
+    pub component_id: String,
+    pub component_root: String,
+    pub kind: String,
+    pub adapter_identity: String,
+    pub component_key: String,
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub caches: Vec<EnvironmentCacheReport>,
+    #[serde(default)]
+    pub external_artifacts: Vec<EnvironmentExternalArtifactReport>,
+    #[serde(default)]
+    pub runtime_resources: Vec<EnvironmentRuntimeDeclarationReport>,
+    pub outputs: Vec<EnvironmentPlanOutputReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGraphEdgeReport {
+    pub source_component_id: String,
+    pub source_component_key: String,
+    pub target_component_id: String,
+    pub edge_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentGraphReport {
+    pub source_root: ObjectId,
+    pub total_nodes: u64,
+    pub total_edges: u64,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+    pub nodes: Vec<EnvironmentGraphNodeReport>,
+    pub edges: Vec<EnvironmentGraphEdgeReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPlanInputReport {
+    pub source_path: String,
+    pub staging_path: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPlanCommandReport {
+    /// `staging` or `mounted_initialization`.
+    #[serde(default = "default_environment_command_phase")]
+    pub phase: String,
+    pub program: String,
+    pub resolved_program: String,
+    pub executable_identity: String,
+    pub args: Vec<String>,
+    pub working_directory: String,
+    pub environment_names: Vec<String>,
+}
+
+fn default_environment_command_phase() -> String {
+    "staging".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentCapabilityReport {
+    pub filesystem_read: Vec<String>,
+    pub filesystem_write: Vec<String>,
+    pub process: Vec<String>,
+    pub network: String,
+    pub shell: String,
+    pub scripts: String,
+    pub secrets: String,
+    pub sandbox: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPlanOutputReport {
+    pub name: String,
+    pub output_path: String,
+    pub mount_path: String,
+    pub policy: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentPlanReport {
+    pub source_root: ObjectId,
+    pub component_id: String,
+    pub adapter_identity: String,
+    pub kind: String,
+    pub component_key: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub dependency_edges: Vec<EnvironmentGenerationDependencyReport>,
+    #[serde(default)]
+    pub caches: Vec<EnvironmentCacheReport>,
+    #[serde(default)]
+    pub external_artifacts: Vec<EnvironmentExternalArtifactReport>,
+    #[serde(default)]
+    pub runtime_resources: Vec<EnvironmentRuntimeDeclarationReport>,
+    pub inputs: Vec<EnvironmentPlanInputReport>,
+    pub tools: std::collections::BTreeMap<String, String>,
+    pub commands: Vec<EnvironmentPlanCommandReport>,
+    pub outputs: Vec<EnvironmentPlanOutputReport>,
+    /// Compatibility projection of the first output.
+    pub output_path: String,
+    /// Compatibility projection of the first output.
+    pub mount_path: String,
+    pub portability_scope: String,
+    pub capabilities: EnvironmentCapabilityReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentSyncReport {
+    pub generation: EnvironmentGenerationReport,
+    pub layers: Vec<WorkspaceLayerReport>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceCheckpointReport {
     pub view_id: String,
@@ -150,6 +574,7 @@ pub struct WorkspaceExecReport {
     pub lane_id: String,
     pub source_root: ObjectId,
     pub generation: u64,
+    pub environment_generation: Option<String>,
     pub backend: String,
     pub command: Vec<String>,
     pub exit_code: i32,

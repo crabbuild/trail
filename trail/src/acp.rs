@@ -6,8 +6,10 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
@@ -76,6 +78,25 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
                 default_terminal_command: Some(vec!["agent".to_string()]),
             })
         }
+        Some("grok") => {
+            let available = command_in_path("grok");
+            Ok(AcpProviderProfile {
+                agent: "grok".to_string(),
+                display_name: "Grok Build".to_string(),
+                available,
+                relay_command: built_in_acp_relay_command("grok"),
+                notes: if available {
+                    vec!["uses Grok Build's native ACP server through `grok agent stdio`"
+                        .to_string()]
+                } else {
+                    vec!["`grok` was not found on PATH".to_string()]
+                },
+                supports_acp: true,
+                supports_mcp: true,
+                supports_terminal: true,
+                default_terminal_command: Some(vec!["grok".to_string()]),
+            })
+        }
         _ => Err(Error::InvalidInput(format!(
             "unsupported ACP agent `{agent}`; supported agents: {}; use `trail acp relay -- <COMMAND>...` for another ACP-compatible agent",
             supported_acp_agents().join(", ")
@@ -101,6 +122,11 @@ pub fn acp_provider_upstream_command(agent: &str) -> Result<Vec<String>> {
             CODEX_ACP_ADAPTER.to_string(),
         ]),
         "cursor" => Ok(vec!["agent".to_string(), "acp".to_string()]),
+        "grok" => Ok(vec![
+            "grok".to_string(),
+            "agent".to_string(),
+            "stdio".to_string(),
+        ]),
         _ => Err(Error::InvalidInput(format!(
             "provider `{}` does not define an ACP upstream command",
             profile.agent
@@ -237,7 +263,7 @@ pub fn acp_install_report_with_registry(
 }
 
 fn supported_acp_agents() -> Vec<&'static str> {
-    vec!["claude-code", "codex", "cursor"]
+    vec!["claude-code", "codex", "cursor", "grok"]
 }
 
 fn supported_agent_providers() -> Vec<&'static str> {
@@ -256,6 +282,7 @@ fn canonical_acp_agent(agent: &str) -> Option<&'static str> {
         "claude-code" | "claude" => Some("claude-code"),
         "codex" | "codex-cli" | "openai-codex" => Some("codex"),
         "cursor" | "cursor-agent" => Some("cursor"),
+        "grok" | "grok-build" | "xai-grok" => Some("grok"),
         _ => None,
     }
 }
@@ -462,6 +489,91 @@ fn shell_join(parts: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn record_acp_lifecycle_event(
+    db: &mut Trail,
+    lane: &str,
+    session_id: &str,
+    turn_id: Option<&str>,
+    provider: Option<&str>,
+    acp_session_id: &str,
+    kind: AgentLifecycleEventKind,
+    payload: Value,
+) -> Result<()> {
+    let provider = provider.unwrap_or("acp-agent").to_ascii_lowercase();
+    let payload = redact_json(payload);
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let event_id = format!(
+        "acp_event_{}",
+        crate::ids::short_hash(
+            format!(
+                "{}:{}:{}:{}:{}",
+                db.config().workspace.id.0,
+                session_id,
+                turn_id.unwrap_or("session"),
+                kind.wire_name(),
+                hex::encode(Sha256::digest(&payload_bytes))
+            )
+            .as_bytes(),
+            24,
+        )
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let event = AgentLifecycleEvent {
+        schema: AGENT_LIFECYCLE_EVENT_SCHEMA.to_string(),
+        version: AGENT_LIFECYCLE_EVENT_VERSION,
+        event_id: event_id.clone(),
+        event_type: AgentLifecycleEventType::from(kind),
+        occurred_at: Some(now),
+        received_at: now,
+        provider,
+        provider_version: None,
+        transport: AgentCaptureTransport::Acp,
+        workspace_id: db.config().workspace.id.0.clone(),
+        lane_id: Some(db.lane_branch(lane)?.lane_id),
+        capture_run_id: None,
+        native: AgentNativeEventIdentity {
+            session_id: Some(acp_session_id.to_string()),
+            turn_id: None,
+            message_id: payload
+                .get("message_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tool_id: payload
+                .get("tool_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            subagent_id: None,
+            event_name: format!("acp/{}", kind.wire_name()),
+            sequence: None,
+        },
+        correlation: AgentEventCorrelation {
+            trace_id: turn_id.map(acp_trace_id_for_turn),
+            ..AgentEventCorrelation::default()
+        },
+        payload,
+        evidence: AgentEventEvidence {
+            receipt_id: format!("acp:{event_id}"),
+            raw_digest: Some(format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(payload_bytes))
+            )),
+            transcript_offset: None,
+            confidence: AgentEvidenceConfidence::ProtocolStructured,
+        },
+    };
+    event.validate()?;
+    let serialized = serde_json::to_value(&event)?;
+    if let Some(turn_id) = turn_id {
+        db.add_lane_turn_event(turn_id, kind.wire_name(), Some(serialized), None, None)?;
+    } else {
+        db.add_lane_session_event(lane, session_id, kind.wire_name(), Some(serialized))?;
+    }
+    Ok(())
 }
 
 enum PumpDone {
@@ -1002,7 +1114,6 @@ impl CaptureCoordinator {
                 "materialized": self.options.materialize
             }))),
         )?;
-
         Ok(SessionState {
             acp_session_id: acp_session_id.map(str::to_string).unwrap_or_else(|| {
                 format!(
@@ -1080,6 +1191,22 @@ impl CaptureCoordinator {
                 "status": status
             }))),
         )?;
+        record_acp_lifecycle_event(
+            &mut db,
+            &session.lane_name,
+            &session.trail_session_id,
+            None,
+            self.options.provider.as_deref(),
+            &acp_session_id,
+            if status == "resumed" || status == "loaded" {
+                AgentLifecycleEventKind::SessionResumed
+            } else if status == "failed" {
+                AgentLifecycleEventKind::Diagnostic
+            } else {
+                AgentLifecycleEventKind::SessionStarted
+            },
+            serde_json::json!({"method": pending.method, "status": status}),
+        )?;
         if status == "failed" {
             let _ = db.end_lane_session(&session.trail_session_id, "failed");
         }
@@ -1143,6 +1270,29 @@ impl CaptureCoordinator {
             }))),
             None,
             None,
+        )?;
+        record_acp_lifecycle_event(
+            &mut db,
+            &session.lane_name,
+            &session.trail_session_id,
+            Some(&turn.turn.turn_id),
+            self.options.provider.as_deref(),
+            acp_session_id,
+            AgentLifecycleEventKind::TurnStarted,
+            serde_json::json!({"prompt_summary": summarize_text(&prompt_text)}),
+        )?;
+        record_acp_lifecycle_event(
+            &mut db,
+            &session.lane_name,
+            &session.trail_session_id,
+            Some(&turn.turn.turn_id),
+            self.options.provider.as_deref(),
+            acp_session_id,
+            AgentLifecycleEventKind::MessageUser,
+            serde_json::json!({
+                "message_id": user_message.message_id,
+                "prompt_hash": prompt_hash(&prompt_text),
+            }),
         )?;
         let root_span = db
             .start_lane_trace_span(
@@ -1228,6 +1378,25 @@ impl CaptureCoordinator {
             None,
             None,
         )?;
+        let terminal_kind = match status {
+            "failed" => AgentLifecycleEventKind::TurnFailed,
+            "cancelled" | "interrupted" => AgentLifecycleEventKind::TurnCancelled,
+            _ => AgentLifecycleEventKind::TurnCompleted,
+        };
+        let session_id = db
+            .lane_turn(&pending.turn_id)?
+            .session_id
+            .ok_or_else(|| Error::Corrupt("ACP turn lost its session identity".to_string()))?;
+        record_acp_lifecycle_event(
+            &mut db,
+            &pending.lane_name,
+            &session_id,
+            Some(&pending.turn_id),
+            self.options.provider.as_deref(),
+            &pending.acp_session_id,
+            terminal_kind,
+            serde_json::json!({"status": status, "stop_reason": stop_reason(message)}),
+        )?;
         if let Some(span_id) = pending.root_span_id {
             let _ = db.end_lane_trace_span(
                 &span_id,
@@ -1238,6 +1407,8 @@ impl CaptureCoordinator {
             );
         }
         db.end_lane_turn(&pending.turn_id, status)?;
+        db.create_turn_evidence_manifest(&pending.turn_id)?;
+        db.classify_session_activity(&session_id, 10_000)?;
         self.finalize_turn_envelope(
             &mut db,
             &pending.turn_id,
@@ -1617,7 +1788,28 @@ impl CaptureCoordinator {
             }))),
         )?;
         if status == "closed" {
+            record_acp_lifecycle_event(
+                &mut db,
+                &session.lane_name,
+                &session.trail_session_id,
+                None,
+                self.options.provider.as_deref(),
+                acp_session_id,
+                AgentLifecycleEventKind::SessionEnded,
+                serde_json::json!({"status": status}),
+            )?;
             let _ = db.end_lane_session(&session.trail_session_id, "completed");
+            if db
+                .lane_session_turns(&session.trail_session_id)?
+                .iter()
+                .any(|turn| turn.ended_at.is_some())
+            {
+                let _ = db.create_session_attestation(
+                    &session.trail_session_id,
+                    "acp-on-session-close",
+                    Some(serde_json::json!({"acp_session_id": acp_session_id})),
+                );
+            }
             self.sessions_by_acp.remove(acp_session_id);
         }
         Ok(())
@@ -1673,6 +1865,7 @@ impl CaptureCoordinator {
                 );
             }
             let _ = db.end_lane_turn(&active.turn_id, status);
+            let _ = db.create_turn_evidence_manifest(&active.turn_id);
             let _ = self.finalize_turn_envelope(
                 &mut db,
                 &active.turn_id,

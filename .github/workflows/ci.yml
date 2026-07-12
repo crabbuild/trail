@@ -91,25 +91,25 @@ jobs:
         run: cargo test -p prolly-map
       - name: Clippy
         run: >-
-          cargo clippy -p prolly-map --all-targets --features "tokio sqlite" --
+          cargo clippy -p prolly-map --all-targets --features tokio --
           -D warnings
           -A clippy::result-large-err
           -A clippy::large-enum-variant
           -A clippy::type-complexity
       - name: Rustdoc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc -p prolly-map --no-deps --features "tokio sqlite"
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p prolly-map --no-deps --features tokio
       - name: Inspect binary
         run: cargo check -p prolly-map --bin prolly-inspect
       - name: Examples
         run: cargo check -p prolly-map --examples
       - name: Bench compile
-        run: cargo check -p prolly-map --benches --features "tokio sqlite"
+        run: cargo check -p prolly-map --benches --features tokio
       - name: Package
         run: cargo package -p prolly-map --no-verify
       - name: Tokio feature tests
         run: cargo test -p prolly-map --features tokio
       - name: SQLite store contract
-        run: cargo test -p prolly-map --features sqlite --test sqlite_store
+        run: cargo test -p prolly-store-sqlite
 
   prolly-optional-backends:
     name: Prolly optional backend (${{ matrix.backend }})
@@ -120,11 +120,9 @@ jobs:
       matrix:
         include:
           - backend: rocksdb
-            features: rocksdb
-            test: rocksdb_store
+            package: prolly-store-rocksdb
           - backend: slatedb
-            features: slatedb
-            test: slatedb_store
+            package: prolly-store-slatedb
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,7 +133,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Store contract
-        run: cargo test -p prolly-map --features "${{ matrix.features }}" --test "${{ matrix.test }}"
+        run: cargo test -p "${{ matrix.package }}"
 
   prolly-pglite-sidecar:
     name: Prolly PGlite sidecar
@@ -155,7 +153,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/prolly-pglite-node"
           npm install --prefix "${{ runner.temp }}/prolly-pglite-node" @electric-sql/pglite@0.5.3
       - name: PGlite store contract
-        run: cargo test -p prolly-map --features pglite --test pglite_store
+        run: cargo test -p prolly-store-pglite
         env:
           PROLLY_PGLITE_TEST: "1"
           PROLLY_PGLITE_NODE_CWD: ${{ runner.temp }}/prolly-pglite-node

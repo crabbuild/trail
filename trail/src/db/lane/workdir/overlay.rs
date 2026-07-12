@@ -57,6 +57,24 @@ mod fuse_overlay {
     }
 
     pub(crate) fn mount_overlay_cow_for_lane(db: &Trail, lane: &str) -> Result<OverlayCowMount> {
+        mount_overlay_cow_for_lane_with_view(db, lane, None)
+    }
+
+    pub(crate) fn mount_overlay_cow_for_lane_with_ephemeral_bindings(
+        db: &Trail,
+        lane: &str,
+        source_upper: PathBuf,
+        source_root: ObjectId,
+        bindings: Vec<WorkspaceLayerBinding>,
+    ) -> Result<OverlayCowMount> {
+        mount_overlay_cow_for_lane_with_view(db, lane, Some((source_upper, source_root, bindings)))
+    }
+
+    fn mount_overlay_cow_for_lane_with_view(
+        db: &Trail,
+        lane: &str,
+        ephemeral: Option<(PathBuf, ObjectId, Vec<WorkspaceLayerBinding>)>,
+    ) -> Result<OverlayCowMount> {
         validate_ref_segment(lane)?;
         let branch = db.lane_branch(lane)?;
         let record = db.lane_record(&branch.lane_id)?;
@@ -74,15 +92,19 @@ mod fuse_overlay {
         };
         let mountpoint = PathBuf::from(workdir);
         prepare_overlay_mountpoint(&mountpoint, false)?;
-        let upperdir = overlay_upperdir(db, lane)?;
+        let head = db.get_ref(&branch.ref_name)?;
+        let (upperdir, source_root, bindings) = match ephemeral {
+            Some((upperdir, source_root, bindings)) => (upperdir, source_root, Some(bindings)),
+            None => (overlay_upperdir(db, lane)?, head.root_id, None),
+        };
         fs::create_dir_all(&upperdir)?;
         fs::create_dir_all(upperdir.join(OVERLAY_META_DIR))?;
-        let head = db.get_ref(&branch.ref_name)?;
         let fs = SharedOverlayFs::new(
             db.workspace_root.clone(),
             db.db_dir.clone(),
             upperdir,
-            head.root_id,
+            source_root,
+            bindings,
         )?;
         #[cfg(target_os = "linux")]
         let mut options = vec![MountOption::FSName(format!("trail-overlay-cow-{lane}"))];
@@ -256,13 +278,17 @@ mod fuse_overlay {
             db_dir: PathBuf,
             upperdir: PathBuf,
             root_id: ObjectId,
+            ephemeral_bindings: Option<Vec<WorkspaceLayerBinding>>,
         ) -> Result<Self> {
+            let db = Trail::open_with_db_dir(workspace_root, db_dir)?;
+            let core = match ephemeral_bindings {
+                Some(bindings) => {
+                    ViewCore::new_lazy_with_ephemeral_bindings(db, upperdir, root_id, bindings)?
+                }
+                None => ViewCore::new_lazy(db, upperdir, root_id)?,
+            };
             Ok(Self {
-                core: ViewCore::new_lazy(
-                    Trail::open_with_db_dir(workspace_root, db_dir)?,
-                    upperdir,
-                    root_id,
-                )?,
+                core,
                 handles: HashMap::new(),
                 directory_handles: HashMap::new(),
                 next_fh: 1,
@@ -880,40 +906,10 @@ mod fuse_overlay {
             let target_a = PathBuf::from(&view_a.generated_upper).join("target");
             assert!(tree_has_name_fragment(&target_a, "libshared_dep"));
 
-            let cargo_version = std::process::Command::new("cargo")
-                .arg("--version")
-                .output()
-                .unwrap();
-            let key = WorkspaceLayerKeyV1 {
-                kind: "compiler-results".to_string(),
-                adapter: "cargo-target-seed".to_string(),
-                adapter_version: 1,
-                inputs: BTreeMap::from([
-                    ("source_root".to_string(), first.source_root.0.clone()),
-                    ("command".to_string(), "cargo build --offline".to_string()),
-                ]),
-                tool_versions: BTreeMap::from([(
-                    "cargo".to_string(),
-                    String::from_utf8_lossy(&cargo_version.stdout)
-                        .trim()
-                        .to_string(),
-                )]),
-                platform: std::env::consts::OS.to_string(),
-                architecture: std::env::consts::ARCH.to_string(),
-                portability_scope: "source-root-toolchain-platform".to_string(),
-                strategy: "immutable-target-seed".to_string(),
-            };
             let layer = db
-                .publish_workspace_layer_from_directory(&key, &target_a)
+                .sync_workspace_environment("rust-seed-b", "cargo", None)
                 .unwrap();
-            db.attach_workspace_layer(
-                "rust-seed-b",
-                &layer.layer_id,
-                "target",
-                "cargo-target-seed",
-                &layer.cache_key,
-            )
-            .unwrap();
+            assert_eq!(layer.adapter, "cargo-target-seed");
 
             let second = db
                 .exec_lane_workspace(
@@ -1275,6 +1271,23 @@ pub(crate) fn mount_overlay_cow_for_lane(_db: &Trail, lane: &str) -> Result<Over
     all(target_os = "macos", feature = "macfuse"),
     target_os = "windows"
 )))]
+pub(crate) fn mount_overlay_cow_for_lane_with_ephemeral_bindings(
+    _db: &Trail,
+    lane: &str,
+    _source_upper: PathBuf,
+    _source_root: ObjectId,
+    _bindings: Vec<WorkspaceLayerBinding>,
+) -> Result<OverlayCowMount> {
+    Err(Error::InvalidInput(format!(
+        "overlay-cow lane `{lane}` cannot be mounted on this platform"
+    )))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "macfuse"),
+    target_os = "windows"
+)))]
 pub(crate) fn overlay_candidate_paths(_db: &Trail, lane: &str) -> Result<Vec<String>> {
     Err(Error::InvalidInput(format!(
         "overlay-cow lane `{lane}` cannot be inspected on this platform"
@@ -1304,6 +1317,22 @@ impl Trail {
 
     pub fn mount_overlay_cow_workdir_for_lane(&self, lane: &str) -> Result<impl Drop> {
         mount_overlay_cow_for_lane(self, lane)
+    }
+
+    pub(crate) fn mount_overlay_cow_workdir_for_lane_with_ephemeral_bindings(
+        &self,
+        lane: &str,
+        source_upper: PathBuf,
+        source_root: ObjectId,
+        bindings: Vec<WorkspaceLayerBinding>,
+    ) -> Result<impl Drop> {
+        mount_overlay_cow_for_lane_with_ephemeral_bindings(
+            self,
+            lane,
+            source_upper,
+            source_root,
+            bindings,
+        )
     }
 
     pub(crate) fn overlay_cow_candidate_paths_for_lane(&self, lane: &str) -> Result<Vec<String>> {

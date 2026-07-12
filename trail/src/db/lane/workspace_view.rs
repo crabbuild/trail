@@ -633,6 +633,14 @@ impl Trail {
                 )))
             }
         };
+        let environment_generation = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM environment_view_generations WHERE view_id = ?1",
+                params![&view.view_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         self.insert_lane_event(
             &branch.lane_id,
             "workspace_view_exec_completed",
@@ -642,6 +650,7 @@ impl Trail {
                 "view_id": view.view_id,
                 "source_root": head.root_id.0,
                 "generation": view.generation,
+                "environment_generation": environment_generation,
                 "command_fingerprint": sha256_hex(&serde_json::to_vec(command)?),
                 "exit_code": exit_code,
             }),
@@ -651,6 +660,7 @@ impl Trail {
             lane_id: branch.lane_id,
             source_root: head.root_id,
             generation: view.generation,
+            environment_generation,
             backend: view.backend,
             command: command.to_vec(),
             exit_code,
@@ -730,6 +740,78 @@ impl Trail {
                 node_cache.to_string_lossy().into_owned(),
             ),
         ];
+        if let Some(generation_id) = self
+            .conn
+            .query_row(
+                "SELECT generation_id FROM environment_view_generations WHERE view_id = ?1",
+                params![&view.view_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            environment.push(("TRAIL_ENVIRONMENT_GENERATION".to_string(), generation_id));
+        }
+        let mut runtime_stmt = self.conn.prepare(
+            "SELECT r.component_id, r.resource_name, r.host_port, r.status, r.health_status
+             FROM environment_view_generations active
+             JOIN environment_generation_runtime_resources r
+               ON r.generation_id = active.generation_id
+             WHERE active.view_id = ?1
+             ORDER BY r.component_id, r.resource_name",
+        )?;
+        let runtime_resources = runtime_stmt
+            .query_map(params![&view.view_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<u16>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !runtime_resources.is_empty() {
+            let mut alias_counts = BTreeMap::<String, usize>::new();
+            for (_, resource_name, _, _, _) in &runtime_resources {
+                *alias_counts
+                    .entry(runtime_service_environment_segment(resource_name))
+                    .or_default() += 1;
+            }
+            let mut services = serde_json::Map::new();
+            for (component_id, resource_name, host_port, status, health_status) in runtime_resources
+            {
+                let host_port = host_port.filter(|_| {
+                    status == "running" && health_status == "healthy"
+                }).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "runtime service `{component_id}/{resource_name}` is {status}/{health_status}; run `trail env runtime reconcile {}` before executing lane commands",
+                        view.lane_id
+                    ))
+                })?;
+                let address = format!("127.0.0.1:{host_port}");
+                services.insert(
+                    format!("{component_id}/{resource_name}"),
+                    serde_json::json!({
+                        "host": "127.0.0.1",
+                        "port": host_port,
+                        "address": address,
+                    }),
+                );
+                let alias = runtime_service_environment_segment(&resource_name);
+                if alias_counts.get(&alias) == Some(&1) {
+                    let prefix = format!("TRAIL_SERVICE_{alias}");
+                    environment.extend([
+                        (format!("{prefix}_HOST"), "127.0.0.1".to_string()),
+                        (format!("{prefix}_PORT"), host_port.to_string()),
+                        (format!("{prefix}_ADDRESS"), address),
+                    ]);
+                }
+            }
+            environment.push((
+                "TRAIL_SERVICES_JSON".to_string(),
+                serde_json::to_string(&services)?,
+            ));
+        }
         if command_available("sccache") {
             environment.extend([
                 ("RUSTC_WRAPPER".to_string(), "sccache".to_string()),
@@ -960,6 +1042,23 @@ impl Trail {
             generated_dirty_paths: generated.file_count,
         })
     }
+}
+
+fn runtime_service_environment_segment(name: &str) -> String {
+    let mut segment = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if segment.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        segment.insert(0, '_');
+    }
+    segment
 }
 
 fn workspace_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneWorkspaceViewReport> {

@@ -1047,7 +1047,10 @@ impl Trail {
             .resolve_agent_selector(selector)?
             .ok_or_else(|| Error::InvalidInput("no agent tasks have been recorded".to_string()))?;
         let review = self.lane_review_packet(&lane, 50)?;
-        let transcript = self.transcript(&lane).ok();
+        let transcript = self
+            .preferred_agent_session_id(&review)?
+            .and_then(|session_id| self.transcript(&session_id).ok())
+            .or_else(|| self.transcript(&lane).ok());
         let task = self.agent_task_from_review(&review, transcript.as_ref())?;
         Ok(AgentTaskViewReport {
             task,
@@ -3187,7 +3190,10 @@ impl Trail {
         limit: usize,
     ) -> Result<AgentTaskReport> {
         let review = self.lane_review_packet(&lane.record.name, limit)?;
-        let transcript = self.transcript(&lane.record.name).ok();
+        let transcript = self
+            .preferred_agent_session_id(&review)?
+            .and_then(|session_id| self.transcript(&session_id).ok())
+            .or_else(|| self.transcript(&lane.record.name).ok());
         self.agent_task_from_review(&review, transcript.as_ref())
     }
 
@@ -3205,35 +3211,28 @@ impl Trail {
         let session_id = acp_session
             .as_ref()
             .map(|session| session.trail_session_id.clone())
-            .or_else(|| {
-                review
-                    .recent_sessions
-                    .first()
-                    .map(|session| session.session_id.clone())
-            });
-        let latest_checkpoint = transcript
-            .and_then(|report| {
-                report
-                    .turns
-                    .iter()
-                    .rev()
-                    .find_map(|turn| turn.checkpoint.clone())
-            })
-            .or_else(|| {
-                review
-                    .recent_operations
-                    .iter()
-                    .find(|operation| {
-                        matches!(
-                            operation.kind,
-                            OperationKind::LaneRecord
-                                | OperationKind::LanePatch
-                                | OperationKind::LaneMerge
-                                | OperationKind::LaneRewind
-                        )
+            .or(self.preferred_agent_session_id(review)?);
+        let latest_checkpoint =
+            review
+                .recent_operations
+                .iter()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        OperationKind::LaneRecord
+                            | OperationKind::LanePatch
+                            | OperationKind::LaneMerge
+                            | OperationKind::LaneRewind
+                    )
+                })
+                .map(|operation| operation.change_id.clone())
+                .or_else(|| {
+                    transcript.and_then(|report| {
+                        report.turns.iter().rev().find_map(|turn| {
+                            turn.turn.after_change.clone().or(turn.checkpoint.clone())
+                        })
                     })
-                    .map(|operation| operation.change_id.clone())
-            });
+                });
         let turns = transcript
             .map(|report| report.turns.len())
             .unwrap_or(review.recent_sessions.len());
@@ -3285,6 +3284,39 @@ impl Trail {
         })
     }
 
+    fn preferred_agent_session_id(
+        &self,
+        review: &LaneReviewPacketReport,
+    ) -> Result<Option<String>> {
+        let mut native_sessions = self
+            .list_lane_agent_sessions(None, None, 10_000)?
+            .into_iter()
+            .filter(|session| session.lane_id == review.lane.record.lane_id)
+            .collect::<Vec<_>>();
+        native_sessions.sort_by(|left, right| {
+            right
+                .status
+                .eq(&AgentCapturePhase::Active)
+                .cmp(&left.status.eq(&AgentCapturePhase::Active))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.created_at.cmp(&left.created_at))
+        });
+        if let Some(session) = native_sessions.first() {
+            return Ok(Some(session.trail_session_id.clone()));
+        }
+
+        let mut sessions = review.recent_sessions.clone();
+        sessions.sort_by(|left, right| {
+            right
+                .status
+                .eq("active")
+                .cmp(&left.status.eq("active"))
+                .then_with(|| right.started_at.cmp(&left.started_at))
+                .then_with(|| right.session_id.cmp(&left.session_id))
+        });
+        Ok(sessions.first().map(|session| session.session_id.clone()))
+    }
+
     fn resolve_agent_selector(&self, selector: &str) -> Result<Option<String>> {
         if selector == "latest" {
             return self.latest_agent_lane();
@@ -3294,6 +3326,9 @@ impl Trail {
         }
         if let Some(acp) = self.try_lane_acp_session(selector)? {
             return self.resolve_lane_handle(&acp.lane_id).map(Some);
+        }
+        if let Some(native) = self.try_lane_agent_session_by_native_id(selector)? {
+            return self.resolve_lane_handle(&native.lane_id).map(Some);
         }
         if let Some(session) = self.try_lane_session(selector)? {
             return self.resolve_lane_handle(&session.lane_id).map(Some);

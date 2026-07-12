@@ -190,7 +190,7 @@ where
     Ok(())
 }
 
-fn case_insensitive_path_key(path: &str) -> String {
+pub(crate) fn case_insensitive_path_key(path: &str) -> String {
     let folded: String = path.nfkc().flat_map(char::to_lowercase).collect();
     folded.nfc().collect()
 }

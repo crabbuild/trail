@@ -1,3 +1,4 @@
+mod agent_hooks;
 mod collaboration;
 mod constants;
 mod core;
@@ -6,6 +7,7 @@ mod merge;
 mod protocol;
 mod turns;
 
+pub(crate) use self::agent_hooks::*;
 pub(crate) use self::collaboration::*;
 pub(crate) use self::constants::*;
 pub(crate) use self::core::*;

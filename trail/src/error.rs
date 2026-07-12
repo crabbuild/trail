@@ -49,9 +49,9 @@ pub enum Error {
     #[error("prolly error: {0}")]
     Prolly(#[from] prolly::Error),
     #[error("prolly SQLite error: {0}")]
-    ProllySqlite(#[from] prolly::SqliteStoreError),
+    ProllySqlite(#[from] prolly_store_sqlite::SqliteStoreError),
     #[error("prolly SlateDB error: {0}")]
-    ProllySlateDb(#[from] prolly::SlateDbStoreError),
+    ProllySlateDb(#[from] prolly_store_slatedb::SlateDbStoreError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("TOML error: {0}")]

@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 //! Trail core library.
 //!
@@ -7,6 +7,7 @@
 //! gives humans and coding lanes a safe branch/provenance layer above Git.
 
 pub mod acp;
+pub mod agent_hooks;
 pub mod db;
 pub mod error;
 pub mod ids;

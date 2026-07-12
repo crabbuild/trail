@@ -244,7 +244,7 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.end_turn",
             "title": "End Lane Turn",
-            "description": "Close a durable lane turn with completed, failed, cancelled, or archived status.",
+            "description": "Close a durable lane turn with completed, failed, cancelled, interrupted, or archived status.",
             "inputSchema": object_schema(json!({
                 "turn_id": { "type": "string" },
                 "status": { "type": "string", "enum": ["completed", "failed", "cancelled", "archived"] }

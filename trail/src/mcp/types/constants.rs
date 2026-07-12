@@ -8,6 +8,8 @@ pub(crate) const RESOURCE_MERGE_QUEUE: &str = "trail://workspace/merge-queue";
 pub(crate) const RESOURCE_CONFLICTS: &str = "trail://workspace/conflicts";
 pub(crate) const RESOURCE_OPENAPI: &str = "trail://workspace/openapi";
 pub(crate) const RESOURCE_AGENT_INBOX: &str = "trail://workspace/agent-tasks";
+pub(crate) const RESOURCE_AGENT_INTEGRATIONS: &str = "trail://workspace/agent-integrations";
+pub(crate) const RESOURCE_AGENT_HOOK_RECEIPTS: &str = "trail://workspace/agent-hooks/receipts";
 pub(crate) const RESOURCE_AGENT_LATEST_SUMMARY: &str =
     "trail://workspace/agent-tasks/latest/summary";
 pub(crate) const RESOURCE_AGENT_LATEST_DIAGNOSE: &str =

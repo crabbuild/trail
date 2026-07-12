@@ -1,0 +1,5 @@
+[
+  {"event":"UserPromptSubmit","payload":{"session_id":"claude-s1","turn_id":"claude-t1","prompt":"fix it"},"expected":["turn.started","message.user"]},
+  {"event":"PostToolUseFailure","payload":{"session_id":"claude-s1","tool_use_id":"tool-1","error":"failed"},"expected":["tool.failed"]},
+  {"event":"StopFailure","payload":{"session_id":"claude-s1","turn_id":"claude-t1","error":"model failed"},"expected":["turn.failed"]}
+]

@@ -387,7 +387,7 @@ fn install_registry_binary(
     }
     match fs::rename(&staging, &install_dir) {
         Ok(()) => Ok(command_path),
-        Err(error) if command_path.is_file() => {
+        Err(_error) if command_path.is_file() => {
             let _ = fs::remove_dir_all(&staging);
             Ok(command_path)
         }

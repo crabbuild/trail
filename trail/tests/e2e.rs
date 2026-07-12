@@ -78,6 +78,446 @@ fn cli_reports_package_version() {
     );
 }
 
+#[test]
+fn native_hook_cli_journals_codex_stop_and_returns_required_success_json() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "codex-session-1",
+        "turn_id": "codex-turn-1",
+        "hook_event_name": "Stop",
+        "last_assistant_message": "done"
+    })
+    .to_string();
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "hook", "receive", "codex", "Stop"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook ingress failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "{\"continue\":true}"
+    );
+    let db = Trail::open(temp.path()).unwrap();
+    let receipts = db
+        .list_agent_hook_receipts(Some("codex"), Some("processed"), 10)
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].native_session_id.as_deref(),
+        Some("codex-session-1")
+    );
+    assert_eq!(receipts[0].native_turn_id.as_deref(), Some("codex-turn-1"));
+}
+
+#[test]
+fn agent_hook_http_openapi_and_mcp_surfaces_share_durable_receipts() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "codex-http-session",
+        "turn_id": "codex-http-turn",
+        "hook_event_name": "Stop"
+    });
+
+    let unauthenticated = trail::server::handle_http_request(
+        &mut db,
+        &api_request("POST", "/v1/agent-hooks/codex/Stop", payload.clone()),
+    );
+    assert_eq!(unauthenticated.status, 401);
+
+    let auth = trail::server::ServerAuth::bearer("agent-hook-test-token").unwrap();
+    let ingested = trail::server::handle_http_request_with_auth(
+        &mut db,
+        &api_request_with_headers(
+            "POST",
+            "/v1/agent-hooks/codex/Stop",
+            &[("Authorization", "Bearer agent-hook-test-token")],
+            payload,
+        ),
+        &auth,
+    );
+    assert_eq!(ingested.status, 200);
+    let ingested: serde_json::Value = ingested.body_json().unwrap();
+    assert_eq!(ingested["continue"], true);
+
+    let receipts = trail::server::handle_http_request_with_auth(
+        &mut db,
+        &api_request_with_headers(
+            "GET",
+            "/v1/agent-hooks/receipts?provider=codex",
+            &[("Authorization", "Bearer agent-hook-test-token")],
+            serde_json::Value::Null,
+        ),
+        &auth,
+    );
+    assert_eq!(receipts.status, 200);
+    let receipts: serde_json::Value = receipts.body_json().unwrap();
+    assert_eq!(receipts.as_array().unwrap().len(), 1);
+    let receipt_id = receipts[0]["receipt_id"].as_str().unwrap().to_string();
+    let cli_receipts = run_trail_json(
+        temp.path(),
+        &["agent", "hooks", "events", "codex", "--last", "10"],
+    );
+    assert_eq!(cli_receipts[0]["receipt_id"], receipt_id);
+    let cli_receipts_after_first = run_trail_json(
+        temp.path(),
+        &[
+            "agent", "hooks", "events", "codex", "--offset", "1", "--last", "1",
+        ],
+    );
+    assert_eq!(cli_receipts_after_first, serde_json::json!([]));
+
+    let receipts_after_first = trail::server::handle_http_request_with_auth(
+        &mut db,
+        &api_request_with_headers(
+            "GET",
+            "/v1/agent-hooks/receipts?provider=codex&offset=1&limit=1",
+            &[("Authorization", "Bearer agent-hook-test-token")],
+            serde_json::Value::Null,
+        ),
+        &auth,
+    );
+    assert_eq!(receipts_after_first.status, 200);
+    let receipts_after_first: serde_json::Value = receipts_after_first.body_json().unwrap();
+    assert_eq!(receipts_after_first, serde_json::json!([]));
+
+    let capabilities = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.agent_integrations",
+                "arguments": {"provider": "codex"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(capabilities["result"]["isError"], false);
+    assert_eq!(
+        capabilities["result"]["structuredContent"]["provider"],
+        "codex"
+    );
+
+    let mcp_receipts = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.agent_hook_receipts",
+                "arguments": {"provider": "codex"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_receipts["result"]["isError"], false);
+    assert_eq!(
+        mcp_receipts["result"]["structuredContent"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        mcp_receipts["result"]["structuredContent"][0]["receipt_id"],
+        receipt_id
+    );
+    let mcp_receipts_after_first = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.agent_hook_receipts",
+                "arguments": {"provider": "codex", "offset": 1, "limit": 1}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_receipts_after_first["result"]["isError"], false);
+    assert_eq!(
+        mcp_receipts_after_first["result"]["structuredContent"],
+        serde_json::json!([])
+    );
+
+    let resource = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "resources/read",
+            "params": {"uri": "trail://workspace/agent-hooks/receipts"}
+        }),
+    )
+    .unwrap();
+    assert!(resource["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("codex-http-session"));
+
+    let spec = trail::server::openapi_spec();
+    assert!(spec["paths"]["/v1/agent-hooks/{provider}/{event}"]["post"].is_object());
+    assert!(spec["paths"]["/v1/agent-sessions/{id}/provenance"]["get"].is_object());
+    assert_eq!(
+        spec["components"]["schemas"]["AgentCaptureRunRequest"]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
+fn native_hook_management_cli_installs_reports_and_removes_owned_config() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let add = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "hooks", "add", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "hook install failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let add: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    assert_eq!(add["provider"], "codex");
+    let hooks_path = temp.path().join(".codex/hooks.json");
+    let hooks = fs::read_to_string(&hooks_path).unwrap();
+    assert!(hooks.contains(" agent hook receive codex Stop --installation hook_"));
+
+    let db = Trail::open(temp.path()).unwrap();
+    let records = db.list_agent_hook_installations(Some("codex")).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, "installed");
+    drop(db);
+
+    let status = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "hooks", "status", "codex"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["installations"][0]["filesystem_status"], "installed");
+
+    let remove = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "hooks", "remove", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "hook removal failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let remaining: serde_json::Value =
+        serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+    assert!(remaining.get("hooks").is_none());
+    let db = Trail::open(temp.path()).unwrap();
+    assert_eq!(
+        db.list_agent_hook_installations(Some("codex")).unwrap()[0].status,
+        "removed"
+    );
+}
+
+#[test]
+fn native_hook_cli_spools_during_database_failure_and_replays_after_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let index = temp.path().join(".trail/index/trail.sqlite");
+    let backup = temp.path().join(".trail/index/trail.sqlite.saved");
+    fs::rename(&index, &backup).unwrap();
+    fs::create_dir(&index).unwrap();
+
+    let payload = serde_json::json!({
+        "session_id": "spooled-session-1",
+        "turn_id": "spooled-turn-1",
+        "hook_event_name": "Stop"
+    })
+    .to_string();
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "hook", "receive", "codex", "Stop"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "{\"continue\":true}"
+    );
+    let spool = temp.path().join(".trail/runtime/agent-hooks-spool");
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 1);
+
+    fs::remove_dir(&index).unwrap();
+    fs::rename(&backup, &index).unwrap();
+    let replay = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "hooks", "replay", "--pending"])
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "spool replay failed: {}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["spool"]["imported"], 1);
+    assert_eq!(replay["replayed"].as_array().unwrap().len(), 1);
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+}
+
+#[test]
+fn agent_capture_and_portable_evidence_cli_surface_round_trips() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let begin = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "capture",
+            "begin",
+            "--owner",
+            "codex",
+            "--session",
+            "owner-1",
+            "--workdir",
+        ])
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        begin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+    let begin: serde_json::Value = serde_json::from_slice(&begin.stdout).unwrap();
+    let run_id = begin["capture_run_id"].as_str().unwrap();
+    let status = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "capture", "status"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status[0]["capture_run_id"], run_id);
+    let end = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args([
+            "agent",
+            "capture",
+            "end",
+            run_id,
+            "--owner",
+            "codex",
+            "--session",
+            "owner-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        end.status.success(),
+        "{}",
+        String::from_utf8_lossy(&end.stderr)
+    );
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("portable", None, false, Some("codex".to_string()), None)
+        .unwrap();
+    let session = db
+        .start_lane_session("portable", Some("portable".to_string()), None)
+        .unwrap()
+        .session;
+    let turn = db
+        .begin_lane_session_turn("portable", &session.session_id, None)
+        .unwrap()
+        .turn;
+    db.add_lane_turn_message(&turn.turn_id, "user", "portable trace")
+        .unwrap();
+    db.end_lane_turn(&turn.turn_id, "completed").unwrap();
+    db.create_turn_evidence_manifest(&turn.turn_id).unwrap();
+    let attestation = db
+        .create_session_attestation(&session.session_id, "test", None)
+        .unwrap();
+    drop(db);
+
+    let verify = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["agent", "attest", "verify", &attestation.attestation_id])
+        .output()
+        .unwrap();
+    assert!(verify.status.success());
+    let verify: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify["valid"], true);
+
+    let export = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["agent", "export", &session.session_id])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let trace = trail::PortableAgentTrace::from_json(&export.stdout).unwrap();
+    assert_eq!(trace.session_id, session.session_id);
+    assert!(trace.verify().valid);
+}
+
 #[cfg(unix)]
 struct StubAcpAgentOptions<'a> {
     session_id: &'a str,
@@ -635,7 +1075,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 4
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 15
         }));
     }
 
@@ -705,6 +1145,1027 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         .unwrap();
     assert_eq!(pending.status, "warning");
     assert_eq!(pending.details.as_ref().unwrap()["count"], 1);
+}
+
+#[test]
+fn schema_v6_backfills_normalized_environment_component_states_legacy_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_component_states;
+             INSERT INTO workspace_environment_states
+                 (view_id, adapter, expected_key, attached_key, status, reason, updated_at)
+             VALUES
+                 ('view-1', 'node:apps/web', 'expected-node', 'attached-node', 'stale', 'lock changed', 41),
+                 ('view-1', 'acme:custom', 'expected-custom', NULL, 'building', NULL, 42);
+             PRAGMA user_version = 4;
+             UPDATE schema_meta SET value = '4' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    // Opening a v4 workspace applies the additive schema and legacy projection.
+    drop(Trail::open(temp.path()).unwrap());
+
+    let conn = Connection::open(sqlite_path).unwrap();
+    let version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(version, 15);
+
+    let node = conn
+        .query_row(
+            "SELECT component_id, adapter_identity, adapter_version, kind, expected_key,
+                    attached_key, status, reason, updated_at
+             FROM environment_component_states
+             WHERE view_id = 'view-1' AND component_id = 'node:apps/web'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        node,
+        (
+            "node:apps/web".to_string(),
+            "trail/node@1".to_string(),
+            1,
+            "dependency".to_string(),
+            "expected-node".to_string(),
+            Some("attached-node".to_string()),
+            "stale".to_string(),
+            Some("lock changed".to_string()),
+            41,
+        )
+    );
+
+    let custom = conn
+        .query_row(
+            "SELECT adapter_identity, adapter_version, kind, attached_key, reason
+             FROM environment_component_states
+             WHERE view_id = 'view-1' AND component_id = 'acme:custom'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        custom,
+        (
+            "legacy/acme:custom".to_string(),
+            0,
+            "legacy".to_string(),
+            None,
+            None,
+        )
+    );
+}
+
+#[test]
+fn schema_v9_backfills_typed_environment_edges_without_losing_upstream_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO environment_component_states
+                 (view_id, component_id, adapter_identity, adapter_version,
+                  implementation_version, distribution_digest, kind, expected_key,
+                  attached_key, status, reason, updated_at)
+             VALUES
+                 ('view-v8', 'upstream', 'trail/test@1', 1, 'test', 'builtin:test',
+                  'generated', 'upstream-key', 'upstream-key', 'ready', NULL, 1),
+                 ('view-v8', 'downstream', 'trail/test@1', 1, 'test', 'builtin:test',
+                  'generated', 'downstream-key', 'downstream-key', 'ready', NULL, 1);
+             DROP TABLE environment_component_dependencies;
+             CREATE TABLE environment_component_dependencies (
+                 view_id TEXT NOT NULL,
+                 component_id TEXT NOT NULL,
+                 dependency_component_id TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (view_id, component_id, dependency_component_id)
+             );
+             INSERT INTO environment_component_dependencies
+                 (view_id, component_id, dependency_component_id, updated_at)
+             VALUES ('view-v8', 'downstream', 'upstream', 1);
+             DROP TABLE environment_generation_edges;
+             CREATE TABLE environment_generation_edges (
+                 generation_id TEXT NOT NULL,
+                 component_id TEXT NOT NULL,
+                 dependency_component_id TEXT NOT NULL,
+                 dependency_component_key TEXT NOT NULL,
+                 PRIMARY KEY (generation_id, component_id, dependency_component_id)
+             );
+             INSERT INTO environment_generation_edges
+                 (generation_id, component_id, dependency_component_id, dependency_component_key)
+             VALUES ('generation-v8', 'downstream', 'upstream', 'historic-upstream-key');
+             PRAGMA user_version = 8;
+             UPDATE schema_meta SET value = '8' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    let active_edge = conn
+        .query_row(
+            "SELECT dependency_component_key, edge_type
+             FROM environment_component_dependencies
+             WHERE view_id = 'view-v8' AND component_id = 'downstream'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        active_edge,
+        ("upstream-key".to_string(), "build_requires".to_string())
+    );
+    let historic_edge = conn
+        .query_row(
+            "SELECT dependency_component_key, edge_type
+             FROM environment_generation_edges
+             WHERE generation_id = 'generation-v8' AND component_id = 'downstream'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        historic_edge,
+        (
+            "historic-upstream-key".to_string(),
+            "build_requires".to_string()
+        )
+    );
+}
+
+#[test]
+fn schema_v10_adds_typed_environment_cache_namespaces_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_generation_caches;
+             DROP TABLE environment_component_caches;
+             DROP TABLE environment_cache_namespaces;
+             PRAGMA user_version = 9;
+             UPDATE schema_meta SET value = '9' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    for table in [
+        "environment_cache_namespaces",
+        "environment_component_caches",
+        "environment_generation_caches",
+    ] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "missing migrated table {table}"
+        );
+    }
+    let namespace_columns = conn
+        .prepare("PRAGMA table_info(environment_cache_namespaces)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .unwrap();
+    assert!(namespace_columns.contains("compatibility_json"));
+    assert!(namespace_columns.contains("last_used_at"));
+}
+
+#[test]
+fn schema_v12_adds_agent_capture_tables_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE agent_attestation_key_revocations;
+             DROP TABLE git_agent_links;
+             DROP TABLE lane_learnings;
+             DROP TABLE lane_session_attestation_turns;
+             DROP TABLE lane_session_attestations;
+             DROP TABLE lane_provenance_edges;
+             DROP TABLE lane_provenance_nodes;
+             DROP TABLE lane_turn_evidence_manifests;
+             DROP TABLE agent_hook_receipts;
+             DROP TABLE lane_artifacts;
+             DROP TABLE lane_agent_session_aliases;
+             DROP TABLE lane_agent_sessions;
+             DROP TABLE agent_capture_runs;
+             DROP TABLE agent_hook_installations;
+             PRAGMA user_version = 10;
+             UPDATE schema_meta SET value = '10' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    for table in [
+        "agent_hook_installations",
+        "agent_capture_runs",
+        "lane_agent_sessions",
+        "lane_agent_session_aliases",
+        "lane_artifacts",
+        "agent_hook_receipts",
+        "lane_turn_evidence_manifests",
+        "lane_provenance_nodes",
+        "lane_provenance_edges",
+        "lane_session_attestations",
+        "agent_attestation_key_revocations",
+        "lane_session_attestation_turns",
+        "lane_learnings",
+        "git_agent_links",
+    ] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "missing migrated table {table}"
+        );
+    }
+    let receipt_columns = conn
+        .prepare("PRAGMA table_info(agent_hook_receipts)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .unwrap();
+    assert!(receipt_columns.contains("raw_object_id"));
+    assert!(receipt_columns.contains("receive_sequence"));
+    assert!(receipt_columns.contains("next_attempt_at"));
+}
+
+#[test]
+fn schema_v13_adds_external_artifact_provenance_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_generation_external_artifacts;
+             DROP TABLE environment_component_external_artifacts;
+             PRAGMA user_version = 12;
+             UPDATE schema_meta SET value = '12' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    for table in [
+        "environment_component_external_artifacts",
+        "environment_generation_external_artifacts",
+    ] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "missing migrated table {table}"
+        );
+        let columns = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .unwrap();
+        for column in [
+            "component_id",
+            "artifact_name",
+            "artifact_type",
+            "provider",
+            "reference",
+            "digest",
+            "platform",
+            "cleanup_owner",
+        ] {
+            assert!(columns.contains(column), "{table} is missing {column}");
+        }
+    }
+}
+
+#[test]
+fn schema_v14_adds_runtime_resource_lifecycle_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_generation_runtime_resources;
+             DROP TABLE environment_component_runtime_resources;
+             PRAGMA user_version = 13;
+             UPDATE schema_meta SET value = '13' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    for table in [
+        "environment_component_runtime_resources",
+        "environment_generation_runtime_resources",
+    ] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "missing migrated table {table}"
+        );
+    }
+    let columns = conn
+        .prepare("PRAGMA table_info(environment_generation_runtime_resources)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .unwrap();
+    for column in [
+        "image_digest",
+        "allocation_id",
+        "container_name",
+        "network_name",
+        "volume_name",
+        "host_port",
+        "health_status",
+        "cleanup_token",
+        "owner_start_token",
+    ] {
+        assert!(
+            columns.contains(column),
+            "runtime schema is missing {column}"
+        );
+    }
+}
+
+#[test]
+fn schema_v15_adds_opaque_runtime_secret_references_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_secret_access_audit;
+             DROP TABLE environment_generation_runtime_secrets;
+             DROP TABLE environment_component_runtime_secrets;
+             PRAGMA user_version = 14;
+             UPDATE schema_meta SET value = '14' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    for table in [
+        "environment_component_runtime_secrets",
+        "environment_generation_runtime_secrets",
+        "environment_secret_access_audit",
+    ] {
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "missing migrated table {table}"
+        );
+    }
+    let columns = conn
+        .prepare("PRAGMA table_info(environment_generation_runtime_secrets)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .unwrap();
+    for column in [
+        "provider",
+        "reference",
+        "version",
+        "injection",
+        "target",
+        "environment",
+        "required",
+        "status",
+        "resolved_at",
+    ] {
+        assert!(columns.contains(column), "missing secret column {column}");
+    }
+    assert!(!columns.contains("value"));
+    assert!(!columns.contains("bytes"));
+}
+
+#[test]
+fn schema_v6_migrates_v5_single_bindings_to_output_bindings() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_component_output_bindings;
+             DROP TABLE environment_generation_outputs;
+             ALTER TABLE workspace_view_layers RENAME TO workspace_view_layers_v6;
+             CREATE TABLE workspace_view_layers (
+                 view_id TEXT NOT NULL,
+                 layer_id TEXT NOT NULL,
+                 mount_path TEXT NOT NULL,
+                 priority INTEGER NOT NULL,
+                 read_only INTEGER NOT NULL,
+                 PRIMARY KEY (view_id, mount_path, priority)
+             );
+             INSERT INTO environment_component_bindings
+                 (view_id, component_id, mount_path, kind, updated_at)
+             VALUES ('view-v5', 'node', 'node_modules', 'dependency', 10);
+             INSERT INTO environment_generation_components
+                 (generation_id, component_id, adapter_identity, kind, component_key, layer_id, mount_path)
+             VALUES ('generation-v5', 'node', 'trail/node@1', 'dependency', 'key', 'layer-v5', 'node_modules');
+             DROP TABLE workspace_view_layers_v6;
+             PRAGMA user_version = 5;
+             UPDATE schema_meta SET value = '5' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    let columns = conn
+        .prepare("PRAGMA table_info(workspace_view_layers)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.iter().any(|column| column == "source_path"));
+    let binding = conn
+        .query_row(
+            "SELECT output_name, mount_path, layer_subpath, policy, binding_identity
+             FROM environment_component_output_bindings
+             WHERE view_id = 'view-v5' AND component_id = 'node'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        binding,
+        (
+            "primary".to_string(),
+            "node_modules".to_string(),
+            String::new(),
+            "immutable_seed_private".to_string(),
+            "legacy-unbound:node".to_string(),
+        )
+    );
+    let generation_output = conn
+        .query_row(
+            "SELECT output_name, policy, storage_identity, layer_id, mount_path, layer_subpath
+             FROM environment_generation_outputs
+             WHERE generation_id = 'generation-v5' AND component_id = 'node'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        generation_output,
+        (
+            "primary".to_string(),
+            "immutable_seed_private".to_string(),
+            "layer-v5".to_string(),
+            "layer-v5".to_string(),
+            "node_modules".to_string(),
+            String::new(),
+        )
+    );
+    let layer_id_not_null = conn
+        .prepare("PRAGMA table_info(environment_generation_outputs)")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(3)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == "layer_id")
+        .unwrap()
+        .1;
+    assert!(!layer_id_not_null);
+}
+
+#[test]
+fn schema_v7_migrates_immutable_outputs_to_policy_aware_nullable_layers() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_component_output_bindings;
+             CREATE TABLE environment_component_output_bindings (
+                 view_id TEXT NOT NULL,
+                 component_id TEXT NOT NULL,
+                 output_name TEXT NOT NULL,
+                 mount_path TEXT NOT NULL,
+                 layer_subpath TEXT NOT NULL DEFAULT '',
+                 kind TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (view_id, component_id, output_name),
+                 UNIQUE (view_id, mount_path)
+             );
+             INSERT INTO environment_component_output_bindings
+                 (view_id, component_id, output_name, mount_path, layer_subpath, kind, updated_at)
+             VALUES ('view-v6', 'component-v6', 'primary', 'generated', '', 'generated', 1);
+             INSERT INTO workspace_view_layers
+                 (view_id, layer_id, mount_path, priority, read_only, source_path)
+             VALUES ('view-v6', 'layer-v6', 'generated', 100, 1, '');
+             DROP TABLE environment_generation_outputs;
+             CREATE TABLE environment_generation_outputs (
+                 generation_id TEXT NOT NULL,
+                 component_id TEXT NOT NULL,
+                 output_name TEXT NOT NULL,
+                 layer_id TEXT NOT NULL,
+                 mount_path TEXT NOT NULL,
+                 layer_subpath TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (generation_id, component_id, output_name),
+                 UNIQUE (generation_id, mount_path)
+             );
+             CREATE INDEX environment_generation_outputs_layer_idx
+                 ON environment_generation_outputs(layer_id);
+             INSERT INTO environment_generation_outputs
+                 (generation_id, component_id, output_name, layer_id, mount_path, layer_subpath)
+             VALUES ('generation-v6', 'component-v6', 'primary', 'layer-v6', 'generated', '');
+             PRAGMA user_version = 6;
+             UPDATE schema_meta SET value = '6' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    let binding = conn
+        .query_row(
+            "SELECT policy, binding_identity
+             FROM environment_component_output_bindings
+             WHERE view_id = 'view-v6' AND component_id = 'component-v6'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        binding,
+        ("immutable_seed_private".to_string(), "layer-v6".to_string())
+    );
+    let output = conn
+        .query_row(
+            "SELECT policy, storage_identity, layer_id
+             FROM environment_generation_outputs
+             WHERE generation_id = 'generation-v6'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        output,
+        (
+            "immutable_seed_private".to_string(),
+            "layer-v6".to_string(),
+            Some("layer-v6".to_string())
+        )
+    );
+    let layer_id_not_null = conn
+        .prepare("PRAGMA table_info(environment_generation_outputs)")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(3)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == "layer_id")
+        .unwrap()
+        .1;
+    assert!(!layer_id_not_null);
+}
+
+#[test]
+fn schema_v8_adds_current_and_immutable_environment_dependency_edges() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_component_dependencies;
+             DROP TABLE environment_generation_edges;
+             PRAGMA user_version = 7;
+             UPDATE schema_meta SET value = '7' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    drop(Trail::open(temp.path()).unwrap());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        15
+    );
+    for table in [
+        "environment_component_dependencies",
+        "environment_generation_edges",
+    ] {
+        assert!(conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+}
+
+#[test]
+fn environment_component_report_keeps_component_and_adapter_identities_separate_json() {
+    let report = trail::EnvironmentComponentStateReport {
+        view_id: "view-1".to_string(),
+        component: trail::EnvironmentComponentIdentityReport {
+            component_id: "web.dependencies".to_string(),
+            kind: "dependency".to_string(),
+        },
+        adapter: trail::EnvironmentAdapterIdentityReport {
+            namespace: "trail".to_string(),
+            name: "node".to_string(),
+            contract_major: 1,
+            implementation_version: "0.5.0".to_string(),
+            distribution_digest: Some("builtin".to_string()),
+        },
+        expected_key: "expected".to_string(),
+        attached_key: Some("attached".to_string()),
+        status: "stale".to_string(),
+        reason: Some("lock changed".to_string()),
+        updated_at: 7,
+    };
+
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["component"]["component_id"], "web.dependencies");
+    assert_eq!(json["adapter"]["namespace"], "trail");
+    assert_eq!(json["adapter"]["contract_major"], 1);
+    assert!(json["component"].get("adapter").is_none());
+}
+
+#[test]
+fn schema_v6_backfills_normalized_environment_component_states() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE environment_component_states;
+             INSERT INTO workspace_environment_states
+                 (view_id, adapter, expected_key, attached_key, status, reason, updated_at)
+             VALUES
+                 ('view-1', 'node:apps/web', 'expected-node', 'attached-node', 'stale', 'lock changed', 41),
+                 ('view-1', 'acme:custom', 'expected-custom', NULL, 'building', NULL, 42);
+             PRAGMA user_version = 4;
+             UPDATE schema_meta SET value = '4' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    // Opening a v4 workspace applies the additive schema and legacy projection.
+    drop(Trail::open(temp.path()).unwrap());
+
+    let conn = Connection::open(sqlite_path).unwrap();
+    let version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(version, 15);
+
+    let node = conn
+        .query_row(
+            "SELECT component_id, adapter_identity, adapter_version, kind, expected_key,
+                    attached_key, status, reason, updated_at
+             FROM environment_component_states
+             WHERE view_id = 'view-1' AND component_id = 'node:apps/web'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        node,
+        (
+            "node:apps/web".to_string(),
+            "trail/node@1".to_string(),
+            1,
+            "dependency".to_string(),
+            "expected-node".to_string(),
+            Some("attached-node".to_string()),
+            "stale".to_string(),
+            Some("lock changed".to_string()),
+            41,
+        )
+    );
+
+    let custom = conn
+        .query_row(
+            "SELECT adapter_identity, adapter_version, kind, attached_key, reason
+             FROM environment_component_states
+             WHERE view_id = 'view-1' AND component_id = 'acme:custom'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        custom,
+        (
+            "legacy/acme:custom".to_string(),
+            0,
+            "legacy".to_string(),
+            None,
+            None,
+        )
+    );
+}
+
+#[test]
+fn schema_v6_migration_rolls_back_version_and_backfill_on_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let sqlite_path = temp.path().join(".trail/index/trail.sqlite");
+    {
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute_batch(
+            "DELETE FROM environment_component_states;
+             INSERT INTO workspace_environment_states
+                 (view_id, adapter, expected_key, attached_key, status, reason, updated_at)
+             VALUES ('rollback-view', 'node', 'expected', NULL, 'building', NULL, 1);
+             CREATE TRIGGER fail_environment_backfill
+             BEFORE INSERT ON environment_component_states
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected migration failure');
+             END;
+             PRAGMA user_version = 4;
+             UPDATE schema_meta SET value = '4' WHERE key = 'schema.version';",
+        )
+        .unwrap();
+    }
+
+    assert!(Trail::open(temp.path()).is_err());
+    let conn = Connection::open(sqlite_path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema.version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "4"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM environment_component_states WHERE view_id = 'rollback-view'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn environment_component_report_keeps_component_and_adapter_identities_separate() {
+    let report = trail::EnvironmentComponentStateReport {
+        view_id: "view-1".to_string(),
+        component: trail::EnvironmentComponentIdentityReport {
+            component_id: "web.dependencies".to_string(),
+            kind: "dependency".to_string(),
+        },
+        adapter: trail::EnvironmentAdapterIdentityReport {
+            namespace: "trail".to_string(),
+            name: "node".to_string(),
+            contract_major: 1,
+            implementation_version: "0.5.0".to_string(),
+            distribution_digest: Some("builtin".to_string()),
+        },
+        expected_key: "expected".to_string(),
+        attached_key: Some("attached".to_string()),
+        status: "stale".to_string(),
+        reason: Some("lock changed".to_string()),
+        updated_at: 7,
+    };
+
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["component"]["component_id"], "web.dependencies");
+    assert_eq!(json["adapter"]["namespace"], "trail");
+    assert_eq!(json["adapter"]["contract_major"], 1);
+    assert!(json["component"].get("adapter").is_none());
+}
+
+#[test]
+fn environment_plugin_publisher_trust_cli_is_append_only_and_catalogued() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+    Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let key = workspace.path().join("publisher-key.toml");
+    fs::write(
+        &key,
+        r#"schema = "trail.environment-adapter-publisher-key/v1"
+publisher = "rfc8032-test"
+public_key = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+"#,
+    )
+    .unwrap();
+    let key_path = key.to_string_lossy().into_owned();
+
+    let added = run_trail_json(
+        workspace.path(),
+        &["env", "plugin", "trust", "add", &key_path],
+    );
+    assert_eq!(added["action"], "trust");
+    assert_eq!(added["publisher"], "rfc8032-test");
+    let key_id = added["key_id"].as_str().unwrap().to_string();
+    assert!(key_id.starts_with("sha256:"));
+
+    let listed = run_trail_json(workspace.path(), &["env", "plugin", "trust", "list"]);
+    assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["keys"][0]["key_id"], key_id);
+
+    let catalog = run_trail_json(workspace.path(), &["env", "adapters"]);
+    assert!(catalog["adapters"].as_array().unwrap().iter().all(|entry| {
+        entry["trust"] == "builtin"
+            && entry["publisher"] == "trail"
+            && entry["certification_tier"].as_str().is_some()
+    }));
+
+    let removed = run_trail_json(
+        workspace.path(),
+        &["env", "plugin", "trust", "remove", &key_id],
+    );
+    assert_eq!(removed["action"], "remove");
+    assert_eq!(removed["key_id"], key_id);
+    let listed = run_trail_json(workspace.path(), &["env", "plugin", "trust", "list"]);
+    assert!(listed["keys"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -2865,7 +4326,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         turn_latest["turn_envelope"]["schema"],
         "trail.turn_envelope"
     );
-    assert_eq!(turn_latest["turn_envelope"]["version"], 1);
+    assert_eq!(turn_latest["turn_envelope"]["version"], 2);
     assert_eq!(turn_latest["turn_envelope"]["provider"], "claude-code");
     assert_eq!(turn_latest["turn_envelope"]["kind"], "acp_prompt");
     assert_eq!(turn_latest["turn_envelope"]["protocol"], "acp");
@@ -8699,6 +10160,22 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         .unwrap()
         .is_empty());
 
+    let http_environment = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/surface/environment",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_environment.status, 200);
+    assert!(http_environment
+        .body_json::<serde_json::Value>()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+
     let http_checkpoint = trail::server::handle_http_request(
         &mut db,
         &api_request(
@@ -8752,6 +10229,16 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         ),
     );
     assert_eq!(http_sync_error.status, 400);
+
+    let http_environment_sync_error = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/surface/environment/sync",
+            serde_json::json!({"adapter": "trail/node@1"}),
+        ),
+    );
+    assert_eq!(http_environment_sync_error.status, 400);
 
     let http_cache = trail::server::handle_http_request(
         &mut db,
@@ -8821,6 +10308,26 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         .as_array()
         .unwrap()
         .is_empty());
+    let mcp_environment = mcp_call(
+        &mut db,
+        32,
+        "trail.env_status",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert!(mcp_environment["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mcp_environment = mcp_call(
+        &mut db,
+        32,
+        "trail.env_status",
+        serde_json::json!({"lane": "surface"}),
+    );
+    assert!(mcp_environment["result"]["structuredContent"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let mcp_unmount = mcp_call(
         &mut db,
         31,
@@ -8866,11 +10373,57 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         "refs/branches/main"
     );
 
+    let http_adapters = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/environment/adapters", serde_json::Value::Null),
+    );
+    assert_eq!(http_adapters.status, 200);
+    let http_adapters: serde_json::Value = http_adapters.body_json().unwrap();
+    assert_eq!(http_adapters["contract_major"], 1);
+    let adapter_identities = http_adapters["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|adapter| adapter["canonical_identity"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        adapter_identities,
+        BTreeSet::from([
+            "trail/cargo-target-seed@1",
+            "trail/cmake-build@1",
+            "trail/command@1",
+            "trail/go-vendor@1",
+            "trail/node@1",
+            "trail/oci-image@1",
+            "trail/python-venv@1",
+        ])
+    );
+    assert!(http_adapters["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|adapter| {
+            adapter["canonical_identity"] == "trail/node@1"
+                && adapter["discovery_markers"][0] == "package.json"
+        }));
+    assert!(http_adapters["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|adapter| {
+            adapter["canonical_identity"] == "trail/cmake-build@1"
+                && adapter["kind"] == "build"
+                && adapter["discovery_markers"][0] == "CMakeLists.txt"
+        }));
+    let mcp_adapters = mcp_call(&mut db, 8, "trail.env_adapters", serde_json::json!({}));
+    assert_eq!(mcp_adapters["result"]["isError"], false);
+    assert_eq!(mcp_adapters["result"]["structuredContent"], http_adapters);
+
     let tools = trail::mcp::handle_json_rpc(
         &mut db,
         serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 8,
+            "id": 9,
             "method": "tools/list",
             "params": {}
         }),
@@ -8885,6 +10438,17 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         ("trail.lane_update", false, false, false),
         ("trail.lane_exec", false, false, true),
         ("trail.deps_sync", false, false, true),
+        ("trail.env_adapters", true, false, false),
+        ("trail.env_status", true, false, false),
+        ("trail.env_discover", true, false, false),
+        ("trail.env_graph", true, false, false),
+        ("trail.env_generation", true, false, false),
+        ("trail.env_explain", true, false, false),
+        ("trail.env_plan", true, false, false),
+        ("trail.env_sync", false, false, true),
+        ("trail.env_sync_all", false, false, true),
+        ("trail.env_status", true, false, false),
+        ("trail.env_sync", false, false, true),
         ("trail.cache_gc", false, true, false),
     ] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
@@ -8899,6 +10463,7 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
     );
     let openapi: serde_json::Value = openapi.body_json().unwrap();
     for path in [
+        "/v1/environment/adapters",
         "/v1/lanes/{lane_or_id}/workspace",
         "/v1/lanes/{lane_or_id}/mount",
         "/v1/lanes/{lane_or_id}/unmount",
@@ -8908,6 +10473,14 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
         "/v1/lanes/{lane_or_id}/exec",
         "/v1/lanes/{lane_or_id}/dependencies",
         "/v1/lanes/{lane_or_id}/dependencies/sync",
+        "/v1/lanes/{lane_or_id}/environment",
+        "/v1/lanes/{lane_or_id}/environment/discover",
+        "/v1/lanes/{lane_or_id}/environment/graph",
+        "/v1/lanes/{lane_or_id}/environment/generation",
+        "/v1/lanes/{lane_or_id}/environment/explain",
+        "/v1/lanes/{lane_or_id}/environment/plan",
+        "/v1/lanes/{lane_or_id}/environment/sync",
+        "/v1/lanes/{lane_or_id}/environment/sync-all",
         "/v1/cache/layers",
         "/v1/cache/gc",
     ] {
@@ -8916,6 +10489,721 @@ fn layered_workspace_reports_have_http_mcp_and_openapi_parity() {
             "missing OpenAPI path {path}"
         );
     }
+}
+
+#[test]
+fn environment_graph_has_cli_http_mcp_and_openapi_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("input.txt"), "graph\n").unwrap();
+    fs::write(
+        temp.path().join("trail.environment.toml"),
+        r#"schema = "trail.environment/v1"
+
+[[component]]
+id = "graph.a"
+adapter = "trail/command@1"
+kind = "generated"
+inputs = [{ path = "input.txt" }]
+outputs = [{ source = "generated-a", target = ".trail-generated/a" }]
+[component.build]
+command = ["git", "--version"]
+
+[[component]]
+id = "graph.b"
+adapter = "trail/command@1"
+kind = "generated"
+depends_on = ["graph.a"]
+inputs = [{ path = "input.txt" }]
+outputs = [{ source = "generated-b", target = ".trail-generated/b" }]
+[component.build]
+command = ["git", "--version"]
+"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "graph",
+        Some("main"),
+        if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else {
+            LaneWorkdirMode::OverlayCow
+        },
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let rust = db.workspace_environment_graph("graph", None).unwrap();
+    let expected = serde_json::to_value(&rust).unwrap();
+    assert_eq!(rust.nodes.len(), 2);
+    assert_eq!(rust.edges.len(), 1);
+    assert_eq!(rust.nodes[0].component_id, "graph.a");
+    assert_eq!(rust.nodes[1].component_id, "graph.b");
+    assert_eq!(
+        rust.edges[0].source_component_key,
+        rust.nodes[0].component_key
+    );
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/graph/environment/graph",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http.status, 200);
+    assert_eq!(http.body_json::<serde_json::Value>().unwrap(), expected);
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_graph",
+                "arguments": {"lane": "graph"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"], expected);
+
+    let cli = run_trail_json(temp.path(), &["env", "graph", "graph"]);
+    assert_eq!(cli, expected);
+    let openapi = trail::server::openapi_spec();
+    assert_eq!(
+        openapi["paths"]["/v1/lanes/{lane_or_id}/environment/graph"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EnvironmentGraphReport"
+    );
+    assert!(db.list_workspace_layers().unwrap().is_empty());
+}
+
+#[test]
+fn pinned_oci_metadata_has_cli_http_mcp_openapi_and_gc_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fs::write(
+        temp.path().join("trail.oci.toml"),
+        format!(
+            "schema = \"trail.oci-images/v1\"\n\n[[image]]\nname = \"web\"\nreference = \"ghcr.io/example/web@{digest}\"\nplatform = \"linux/amd64\"\n"
+        ),
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+        "oci-surfaces",
+        Some("main"),
+        if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else {
+            LaneWorkdirMode::OverlayCow
+        },
+        None,
+        None,
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+
+    let http_plan = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/oci-surfaces/environment/plan?adapter=oci-image",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_plan.status, 200);
+    let plan: serde_json::Value = http_plan.body_json().unwrap();
+    assert_eq!(plan["component_id"], "oci-images");
+    assert_eq!(plan["kind"], "external");
+    assert!(plan["outputs"].as_array().unwrap().is_empty());
+    assert!(plan["commands"].as_array().unwrap().is_empty());
+    assert_eq!(plan["external_artifacts"][0]["digest"], digest);
+    assert_eq!(
+        plan["capabilities"]["sandbox"],
+        "not-applicable-metadata-only"
+    );
+    assert_eq!(
+        run_trail_json(
+            temp.path(),
+            &[
+                "env",
+                "plan",
+                "oci-surfaces",
+                "--adapter",
+                "trail/oci-image@1",
+            ],
+        ),
+        plan
+    );
+
+    let sync = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/oci-surfaces/environment/sync",
+            serde_json::json!({"adapter": "trail/oci-image@1"}),
+        ),
+    );
+    assert_eq!(sync.status, 200);
+    let sync: serde_json::Value = sync.body_json().unwrap();
+    assert!(sync["layers"].as_array().unwrap().is_empty());
+    assert!(sync["generation"]["components"][0]["outputs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(sync["generation"]["components"][0]["layer_id"].is_null());
+    assert!(sync["generation"]["components"][0]["mount_path"].is_null());
+    assert_eq!(
+        sync["generation"]["components"][0]["external_artifacts"][0]["reference"],
+        format!("ghcr.io/example/web@{digest}")
+    );
+    assert_eq!(
+        sync["generation"]["components"][0]["external_artifacts"][0]["cleanup_owner"],
+        "external"
+    );
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_generation",
+                "arguments": {"lane": "oci-surfaces"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(mcp["result"]["structuredContent"], sync["generation"]);
+
+    let gc = db.workspace_cache_gc(false, Some(0)).unwrap();
+    assert!(gc
+        .deleted
+        .iter()
+        .all(|entry| entry.kind != "external_artifact"));
+    let active = db
+        .active_environment_generation("oci-surfaces")
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.components[0].external_artifacts[0].digest, digest);
+    assert!(db.list_workspace_layers().unwrap().is_empty());
+
+    let openapi = trail::server::openapi_spec();
+    assert!(openapi["components"]["schemas"]
+        .get("EnvironmentExternalArtifactReport")
+        .is_some());
+    assert!(
+        openapi["components"]["schemas"]["EnvironmentPlanReport"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "external_artifacts")
+    );
+}
+
+#[test]
+fn environment_sync_reuses_one_node_layer_across_http_and_mcp_parity() {
+    if Command::new("npm").arg("--version").output().is_err()
+        || Command::new("node").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{"name":"env-surface","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("package-lock.json"),
+        r#"{"name":"env-surface","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else {
+        LaneWorkdirMode::OverlayCow
+    };
+    for lane in ["env-http", "env-mcp", "env-all-http", "env-all-mcp"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            mode.clone(),
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let http_plan = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/plan",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(http_plan.status, 200);
+    let http_plan: serde_json::Value = http_plan.body_json().unwrap();
+    assert_eq!(http_plan["component_id"], "node");
+    assert_eq!(http_plan["capabilities"]["sandbox"], "trusted-builtin");
+    assert!(http_plan["dependencies"].as_array().unwrap().is_empty());
+    let mcp_plan = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_plan",
+                "arguments": {"lane": "env-mcp"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_plan["result"]["isError"], false);
+    assert_eq!(
+        mcp_plan["result"]["structuredContent"]["component_key"],
+        http_plan["component_key"]
+    );
+
+    let discovery = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/discover",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(discovery.status, 200);
+    let discovery: serde_json::Value = discovery.body_json().unwrap();
+    assert_eq!(discovery["components"][0]["component_id"], "node");
+    assert!(discovery["conflicts"].as_array().unwrap().is_empty());
+    let mcp_discovery = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_discover",
+                "arguments": {"lane": "env-mcp"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_discovery["result"]["isError"], false);
+    assert_eq!(
+        mcp_discovery["result"]["structuredContent"]["source_root"],
+        discovery["source_root"]
+    );
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/env-http/environment/sync",
+            serde_json::json!({"adapter": "trail/node@1"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http_report: serde_json::Value = http.body_json().unwrap();
+    let http_layer = &http_report["layers"][0];
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync",
+                "arguments": {"lane": "env-mcp", "adapter": "auto"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["layers"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+
+    let status = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment",
+            serde_json::Value::Null,
+        ),
+    );
+    let status: serde_json::Value = status.body_json().unwrap();
+    assert_eq!(status[0]["component"]["component_id"], "node");
+    assert_eq!(status[0]["adapter"]["name"], "node");
+    assert_eq!(status[0]["status"], "ready");
+    assert_eq!(
+        status[0]["adapter"]["distribution_digest"],
+        "builtin:node-plan-v1"
+    );
+
+    let generation = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/generation",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(generation.status, 200);
+    let generation: serde_json::Value = generation.body_json().unwrap();
+    assert_eq!(generation["generation_sequence"], 1);
+    assert_eq!(generation["components"][0]["component_id"], "node");
+    assert!(generation["components"][0]["dependencies"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        generation["components"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+    let mcp_generation = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_generation",
+                "arguments": {"lane": "env-http"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_generation["result"]["isError"], false);
+    assert_eq!(
+        mcp_generation["result"]["structuredContent"]["generation_id"],
+        generation["generation_id"]
+    );
+
+    let view = db.lane_workspace_view("env-http").unwrap().unwrap();
+    fs::write(
+        Path::new(&view.source_upper).join("package-lock.json"),
+        r#"{"name":"env-surface","version":"1.0.1","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.1"}}}"#,
+    )
+    .unwrap();
+    db.checkpoint_lane_workspace("env-http", Some("change lock".to_string()))
+        .unwrap();
+    db.lane_readiness("env-http").unwrap();
+    let explained = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment/explain?component=node",
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(explained.status, 200);
+    let explained: serde_json::Value = explained.body_json().unwrap();
+    assert_eq!(explained["status"], "stale");
+    assert_eq!(explained["complete"], true);
+    assert!(explained["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| {
+            change["dimension"] == "input"
+                && change["name"] == "package-lock.json"
+                && change["change"] == "modified"
+        }));
+    let mcp_explained = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_explain",
+                "arguments": {"lane": "env-http", "component": "node"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp_explained["result"]["isError"], false);
+    assert_eq!(mcp_explained["result"]["structuredContent"], explained);
+    let cli_explained = run_trail_json(
+        temp.path(),
+        &["env", "explain", "env-http", "--component", "node"],
+    );
+    assert_eq!(cli_explained, explained);
+
+    let all_http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/env-all-http/environment/sync-all",
+            serde_json::json!({}),
+        ),
+    );
+    assert_eq!(all_http.status, 200);
+    let all_http: serde_json::Value = all_http.body_json().unwrap();
+    assert_eq!(all_http["generation"]["generation_sequence"], 1);
+    assert_eq!(all_http["layers"][0]["layer_id"], http_layer["layer_id"]);
+    let all_mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync_all",
+                "arguments": {"lane": "env-all-mcp"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(all_mcp["result"]["isError"], false);
+    assert_eq!(
+        all_mcp["result"]["structuredContent"]["layers"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn writable_private_environment_sync_has_cli_http_mcp_and_openapi_parity() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("input.txt"), "private input\n").unwrap();
+    fs::write(
+        temp.path().join("trail.environment.toml"),
+        r#"schema = "trail.environment/v1"
+
+[environment]
+default_network = "deny"
+default_scripts = "deny"
+
+[[component]]
+id = "generated.private"
+adapter = "trail/command@1"
+root = "."
+kind = "generated"
+
+[[component.input]]
+path = "input.txt"
+role = "identity"
+format = "bytes"
+
+[component.build]
+command = ["cp", "input.txt", "generated/copied.txt"]
+cwd = "."
+network = "deny"
+scripts = "deny"
+
+[[component.output]]
+name = "private"
+source = "generated"
+target = ".trail-generated/private"
+policy = "writable_private"
+portability = "host"
+"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    for lane in ["private-http", "private-mcp", "private-cli"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            LaneWorkdirMode::NfsCow,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/private-http/environment/sync",
+            serde_json::json!({"adapter": "trail/command@1"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http: serde_json::Value = http.body_json().unwrap();
+    assert!(http["layers"].as_array().unwrap().is_empty());
+    let http_output = &http["generation"]["components"][0]["outputs"][0];
+    assert_eq!(http_output["policy"], "writable_private");
+    assert!(http_output["layer_id"].is_null());
+    assert!(http_output["storage_identity"]
+        .as_str()
+        .unwrap()
+        .starts_with("private_"));
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync",
+                "arguments": {"lane": "private-mcp", "adapter": "trail/command@1"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    let mcp = &mcp["result"]["structuredContent"];
+    assert!(mcp["layers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        mcp["generation"]["components"][0]["outputs"][0]["policy"],
+        http_output["policy"]
+    );
+    assert!(mcp["generation"]["components"][0]["outputs"][0]["layer_id"].is_null());
+
+    let cli = run_trail_json(
+        temp.path(),
+        &["env", "sync", "private-cli", "--adapter", "trail/command@1"],
+    );
+    assert!(cli["layers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        cli["generation"]["components"][0]["outputs"][0]["policy"],
+        "writable_private"
+    );
+    assert!(cli["generation"]["components"][0]["outputs"][0]["layer_id"].is_null());
+
+    let openapi = trail::server::openapi_spec();
+    assert_eq!(
+        openapi["paths"]["/v1/lanes/{lane_or_id}/environment/sync"]["post"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EnvironmentSyncReport"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["EnvironmentGenerationOutputReport"]["properties"]
+            ["policy"]["enum"][1],
+        "writable_private"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["EnvironmentPlanReport"]["properties"]["dependencies"]
+            ["items"]["type"],
+        "string"
+    );
+    assert_eq!(
+        openapi["components"]["schemas"]["EnvironmentGenerationComponentReport"]["properties"]
+            ["dependencies"]["items"]["$ref"],
+        "#/components/schemas/EnvironmentGenerationDependencyReport"
+    );
+}
+
+#[test]
+fn environment_sync_reuses_one_node_layer_across_http_and_mcp() {
+    if Command::new("npm").arg("--version").output().is_err()
+        || Command::new("node").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{"name":"env-surface","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("package-lock.json"),
+        r#"{"name":"env-surface","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"env-surface","version":"1.0.0"}}}"#,
+    )
+    .unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let mode = if cfg!(target_os = "macos") {
+        LaneWorkdirMode::NfsCow
+    } else {
+        LaneWorkdirMode::OverlayCow
+    };
+    for lane in ["env-http", "env-mcp"] {
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            lane,
+            Some("main"),
+            mode.clone(),
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+    }
+
+    let http = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/env-http/environment/sync",
+            serde_json::json!({"adapter": "trail/node@1"}),
+        ),
+    );
+    assert_eq!(http.status, 200);
+    let http_report: serde_json::Value = http.body_json().unwrap();
+    let http_layer = &http_report["layers"][0];
+
+    let mcp = trail::mcp::handle_json_rpc(
+        &mut db,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "trail.env_sync",
+                "arguments": {"lane": "env-mcp", "adapter": "auto"}
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(mcp["result"]["isError"], false);
+    assert_eq!(
+        mcp["result"]["structuredContent"]["layers"][0]["layer_id"],
+        http_layer["layer_id"]
+    );
+
+    let status = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "GET",
+            "/v1/lanes/env-http/environment",
+            serde_json::Value::Null,
+        ),
+    );
+    let status: serde_json::Value = status.body_json().unwrap();
+    assert_eq!(status[0]["component"]["component_id"], "node");
+    assert_eq!(status[0]["adapter"]["name"], "node");
+    assert_eq!(status[0]["status"], "ready");
+    assert_eq!(
+        status[0]["adapter"]["distribution_digest"],
+        "builtin:node-plan-v1"
+    );
 }
 
 #[test]

@@ -1,7 +1,26 @@
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 
 #[derive(Subcommand)]
 pub(super) enum AgentSubcommand {
+    /// Internal native-agent hook ingress. Use `agent hooks` to manage integrations.
+    #[command(hide = true)]
+    Hook(AgentHookCommand),
+    /// Install, inspect, diagnose, and remove native agent lifecycle hooks.
+    Hooks(AgentHooksCommand),
+    /// Declare and manage an explicit ACP/native/terminal capture ownership run.
+    Capture(AgentCaptureCommand),
+    /// List immutable native transcripts, exports, and other captured artifacts.
+    Artifacts(AgentArtifactsArgs),
+    /// Inspect the deterministic causal provenance graph for a session.
+    Provenance(AgentProvenanceArgs),
+    /// Create and verify exact session evidence attestations.
+    Attest(AgentAttestCommand),
+    /// Review captured, evidence-anchored learnings.
+    Learnings(AgentLearningsCommand),
+    /// Export a portable, canonical agent trace.
+    Export(AgentTraceExportArgs),
+    /// Link an exact Git commit to enumerated Trail session/change evidence.
+    GitLink(AgentGitLinkCommand),
     /// Print editor setup for the high-level agent task workflow.
     Setup(AgentSetupArgs),
     /// Run a stable ACP entrypoint that creates a fresh Trail lane per task.
@@ -192,6 +211,317 @@ pub(super) enum AgentSubcommand {
     Rewind(AgentRewindArgs),
     /// Check provider and workspace readiness for agent tasks.
     Doctor(AgentDoctorArgs),
+}
+
+#[derive(Args)]
+pub(super) struct AgentHookCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentHookSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentHookSubcommand {
+    /// Durably journal one provider hook payload from stdin.
+    Receive(AgentHookReceiveArgs),
+}
+
+#[derive(Args)]
+pub(super) struct AgentHookReceiveArgs {
+    pub(super) provider: String,
+    pub(super) native_event: String,
+    #[arg(long)]
+    pub(super) installation: Option<String>,
+    #[arg(long, hide = true)]
+    pub(super) dedupe_key: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentHooksSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentHooksSubcommand {
+    /// Install or update Trail-owned hooks for a provider.
+    Add(AgentHooksAddArgs),
+    /// Remove only the entries or file owned by a Trail installation.
+    Remove(AgentHooksRemoveArgs),
+    /// List supported providers and their recorded installations.
+    List(AgentHooksListArgs),
+    /// Inspect one provider's configured installation and drift state.
+    Status(AgentHooksProviderArgs),
+    /// Diagnose provider support, configuration, and recent delivery.
+    Doctor(AgentHooksDoctorArgs),
+    /// List durable native receipts for a provider.
+    Events(AgentHooksEventsArgs),
+    /// Replay one receipt or the pending durable receipt queue.
+    Replay(AgentHooksReplayArgs),
+    /// Move a retry or quarantined receipt back to the replay queue.
+    Retry(AgentHookReceiptArgs),
+    /// Explicitly discard a received, retrying, or quarantined receipt.
+    Discard(AgentHookReceiptArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(super) enum AgentHooksScopeArg {
+    Project,
+    User,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksAddArgs {
+    pub(super) provider: String,
+    #[arg(long, value_enum, default_value = "project")]
+    pub(super) scope: AgentHooksScopeArg,
+    #[arg(long)]
+    pub(super) lane: Option<String>,
+    #[arg(long)]
+    pub(super) dry_run: bool,
+    #[arg(long)]
+    pub(super) force: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksRemoveArgs {
+    pub(super) provider: String,
+    #[arg(long, value_enum, default_value = "project")]
+    pub(super) scope: AgentHooksScopeArg,
+    #[arg(long)]
+    pub(super) dry_run: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksListArgs {
+    #[arg(long)]
+    pub(super) installed: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksProviderArgs {
+    pub(super) provider: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksDoctorArgs {
+    pub(super) provider: Option<String>,
+    #[arg(long, conflicts_with = "provider")]
+    pub(super) all: bool,
+    #[arg(long)]
+    pub(super) probe: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksEventsArgs {
+    pub(super) provider: String,
+    #[arg(long, default_value_t = 20)]
+    pub(super) last: usize,
+    #[arg(long, default_value_t = 0)]
+    pub(super) offset: usize,
+    #[arg(long)]
+    pub(super) failed: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHooksReplayArgs {
+    #[arg(long, conflicts_with = "pending")]
+    pub(super) receipt: Option<String>,
+    #[arg(long)]
+    pub(super) pending: bool,
+    #[arg(long, default_value_t = 100)]
+    pub(super) limit: usize,
+}
+
+#[derive(Args)]
+pub(super) struct AgentHookReceiptArgs {
+    pub(super) receipt: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentCaptureCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentCaptureSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentCaptureSubcommand {
+    Begin(AgentCaptureBeginArgs),
+    Renew(AgentCaptureRenewArgs),
+    End(AgentCaptureEndArgs),
+    Status(AgentCaptureStatusArgs),
+    Reconcile,
+}
+
+#[derive(Args)]
+pub(super) struct AgentCaptureBeginArgs {
+    #[arg(long)]
+    pub(super) owner: String,
+    #[arg(long)]
+    pub(super) session: String,
+    #[arg(long)]
+    pub(super) executor: Option<String>,
+    #[arg(long)]
+    pub(super) lane: Option<String>,
+    #[arg(long)]
+    pub(super) workdir: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pub(super) work_item: Option<String>,
+    #[arg(long, default_value_t = 300_000)]
+    pub(super) ttl_ms: u64,
+}
+
+#[derive(Args)]
+pub(super) struct AgentCaptureRenewArgs {
+    pub(super) run_id: String,
+    #[arg(long)]
+    pub(super) owner: String,
+    #[arg(long)]
+    pub(super) session: String,
+    #[arg(long, default_value_t = 300_000)]
+    pub(super) ttl_ms: u64,
+}
+
+#[derive(Args)]
+pub(super) struct AgentCaptureEndArgs {
+    pub(super) run_id: String,
+    #[arg(long)]
+    pub(super) owner: String,
+    #[arg(long)]
+    pub(super) session: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentCaptureStatusArgs {
+    #[arg(long)]
+    pub(super) all: bool,
+    #[arg(long, default_value_t = 100)]
+    pub(super) limit: usize,
+    #[arg(long, default_value_t = 0)]
+    pub(super) offset: usize,
+}
+
+#[derive(Args)]
+pub(super) struct AgentArtifactsArgs {
+    pub(super) session: String,
+    #[arg(long)]
+    pub(super) turn: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    pub(super) limit: usize,
+    #[arg(long, default_value_t = 0)]
+    pub(super) offset: usize,
+}
+
+#[derive(Args)]
+pub(super) struct AgentProvenanceArgs {
+    pub(super) session: String,
+    #[arg(long, default_value_t = 1_000)]
+    pub(super) limit: usize,
+    #[arg(long, default_value_t = 0)]
+    pub(super) offset: usize,
+}
+
+#[derive(Args)]
+pub(super) struct AgentAttestCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentAttestSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentAttestSubcommand {
+    Create(AgentAttestCreateArgs),
+    List(AgentSessionIdArgs),
+    Show(AgentAttestationIdArgs),
+    Verify(AgentAttestationIdArgs),
+}
+
+#[derive(Args)]
+pub(super) struct AgentAttestCreateArgs {
+    pub(super) session: String,
+    #[arg(long, default_value = "manual")]
+    pub(super) policy: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentSessionIdArgs {
+    pub(super) session: String,
+    #[arg(long, default_value_t = 100)]
+    pub(super) limit: usize,
+    #[arg(long, default_value_t = 0)]
+    pub(super) offset: usize,
+}
+
+#[derive(Args)]
+pub(super) struct AgentAttestationIdArgs {
+    pub(super) attestation_id: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentLearningsCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentLearningsSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentLearningsSubcommand {
+    List(AgentLearningsListArgs),
+    Accept(AgentLearningReviewArgs),
+    Reject(AgentLearningReviewArgs),
+}
+
+#[derive(Args)]
+pub(super) struct AgentLearningsListArgs {
+    #[arg(long)]
+    pub(super) session: Option<String>,
+    #[arg(long)]
+    pub(super) status: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    pub(super) limit: usize,
+    #[arg(long, default_value_t = 0)]
+    pub(super) offset: usize,
+}
+
+#[derive(Args)]
+pub(super) struct AgentLearningReviewArgs {
+    pub(super) learning_id: String,
+    #[arg(long)]
+    pub(super) reviewer: String,
+}
+
+#[derive(Args)]
+pub(super) struct AgentTraceExportArgs {
+    pub(super) session: String,
+    #[arg(long)]
+    pub(super) output: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pub(super) attachments: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentGitLinkCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentGitLinkSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentGitLinkSubcommand {
+    Link(AgentGitLinkArgs),
+    List(AgentSessionIdArgs),
+}
+
+#[derive(Args)]
+pub(super) struct AgentGitLinkArgs {
+    pub(super) session: String,
+    pub(super) git_commit: String,
+    #[arg(long)]
+    pub(super) turn: Option<String>,
+    #[arg(long)]
+    pub(super) from_change: Option<String>,
+    #[arg(long)]
+    pub(super) through_change: Option<String>,
+    #[arg(long, default_value = "exact-change")]
+    pub(super) confidence: String,
+    #[arg(long, default_value = "explicit-cli")]
+    pub(super) source: String,
 }
 
 #[derive(Args)]

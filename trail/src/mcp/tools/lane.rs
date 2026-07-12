@@ -214,10 +214,118 @@ pub(super) fn tools() -> Value {
         {
             "name": "trail.deps_sync",
             "title": "Synchronize Dependencies",
-            "description": "Build or reuse a frozen dependency layer and attach it to the lane.",
+            "description": "Build or reuse a frozen dependency layer, then bulk-replace private dependency state in an unmounted lane.",
             "inputSchema": object_schema(json!({
                 "lane": { "type": "string" },
                 "path": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_adapters",
+            "title": "Workspace Environment Adapters",
+            "description": "List registered adapters, selectors, component kinds, discovery markers, provenance, and stability without probing tools or repository code.",
+            "inputSchema": object_schema(json!({}), vec![])
+        },
+        {
+            "name": "trail.env_status",
+            "title": "Workspace Environment Status",
+            "description": "Show normalized component and versioned adapter state for one layered lane.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_discover",
+            "title": "Discover Workspace Environments",
+            "description": "Detect built-in environment components without running package managers, compilers, network providers, or repository code.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "path": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_graph",
+            "title": "Workspace Environment Graph",
+            "description": "Return the validated desired component DAG, deterministic topological order, output ownership, component keys, and ordering/invalidation edges without executing tools or mutating state.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "path": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 256 }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_generation",
+            "title": "Active Environment Generation",
+            "description": "Show the exact component keys, layers, mounts, source root, and predecessor active for one lane.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_explain",
+            "title": "Explain Workspace Environment Staleness",
+            "description": "List every canonical input, tool, platform, architecture, portability, and policy edge that differs from the attached component artifact.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "component": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 256 }
+            }), vec!["lane", "component"])
+        },
+        {
+            "name": "trail.env_plan",
+            "title": "Plan Workspace Environment",
+            "description": "Return the normalized component key, declared inputs, argv actions, output, and capability grants without executing or mutating state.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "adapter": { "type": "string", "default": "auto" },
+                "component": { "type": "string" },
+                "path": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_sync",
+            "title": "Synchronize Workspace Environment",
+            "description": "Prepare one adapter-owned environment component and atomically activate its shared and/or writable-private outputs for an unmounted lane.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "adapter": { "type": "string", "default": "auto" },
+                "component": { "type": "string" },
+                "path": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_sync_all",
+            "title": "Synchronize All Workspace Environments",
+            "description": "Build every discovered component first, then atomically activate all mounts as one environment generation.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" },
+                "path": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_runtime_status",
+            "title": "Environment Runtime Status",
+            "description": "Show persisted container, network, volume, port, lifecycle, and health state for the active lane generation without contacting a provider.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_runtime_reconcile",
+            "title": "Reconcile Environment Runtime",
+            "description": "Idempotently create or adopt declared lane-private OCI resources and wait for their health contracts.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
+            }), vec!["lane"])
+        },
+        {
+            "name": "trail.env_runtime_stop",
+            "title": "Stop Environment Runtime",
+            "description": "Stop the active generation's Trail-owned containers while retaining private networks and volumes for restart.",
+            "inputSchema": object_schema(json!({
+                "lane": { "type": "string" }
             }), vec!["lane"])
         },
         {

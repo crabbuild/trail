@@ -15,9 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::WalkBuilder;
 use prolly::{
-    BatchBuilder, BatchOp, Cid, Config, Diff, Encoding, Prolly, SlateDbStore, SortedBatchBuilder,
-    SqliteStore, Store, Tree,
+    BatchBuilder, BatchOp, Cid, Config, Diff, Encoding, Prolly, SortedBatchBuilder, Store, Tree,
 };
+use prolly_store_slatedb::SlateDbStore;
+use prolly_store_sqlite::SqliteStore;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,7 +35,7 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
-const TRAIL_SCHEMA_VERSION: i64 = 4;
+const TRAIL_SCHEMA_VERSION: i64 = 15;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";
@@ -852,6 +853,10 @@ mod merge;
 mod record;
 mod storage;
 mod util;
+
+#[doc(hidden)]
+pub use self::util::process_liveness::run_internal_process_watchdog;
+pub(crate) use self::util::redact_sensitive_json;
 
 #[cfg(test)]
 mod tests {

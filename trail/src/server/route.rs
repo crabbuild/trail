@@ -1,3 +1,4 @@
+mod agent_hooks;
 mod audit;
 mod dispatch;
 mod idempotency;
