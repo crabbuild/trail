@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn workdir_mode_cli_uses_the_hard_cutover_names() {
-        for mode in ["full-cow", "fuse-cow", "dokan-cow"] {
+        for mode in ["native-cow", "fuse-cow", "dokan-cow"] {
             Cli::try_parse_from([
                 "trail",
                 "lane",
@@ -430,7 +430,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("current workdir mode `{mode}` should parse: {error}"));
         }
 
-        for removed in ["overlay-cow", "overlay_cow"] {
+        for removed in ["full-cow", "full_cow", "overlay-cow", "overlay_cow"] {
             assert!(
                 Cli::try_parse_from([
                     "trail",

@@ -588,8 +588,8 @@ pub(super) struct AgentStartArgs {
     pub(super) from: Option<String>,
     #[arg(
         long = "workdir-mode",
-        value_parser = ["auto", "full-cow", "fuse-cow", "nfs-cow", "dokan-cow"],
-        default_value = "full-cow",
+        value_parser = ["auto", "native-cow", "fuse-cow", "nfs-cow", "dokan-cow"],
+        default_value = "native-cow",
         help = "Filesystem view for the terminal agent task"
     )]
     pub(super) workdir_mode: String,
@@ -614,8 +614,8 @@ pub(super) struct AgentContinueArgs {
     pub(super) name: Option<String>,
     #[arg(
         long = "workdir-mode",
-        value_parser = ["auto", "full-cow", "fuse-cow", "nfs-cow", "dokan-cow"],
-        default_value = "full-cow",
+        value_parser = ["auto", "native-cow", "fuse-cow", "nfs-cow", "dokan-cow"],
+        default_value = "native-cow",
         help = "Filesystem view for the terminal follow-up task"
     )]
     pub(super) workdir_mode: String,

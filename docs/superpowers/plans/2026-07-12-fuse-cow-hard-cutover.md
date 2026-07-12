@@ -1,10 +1,10 @@
-# Fuse COW Hard-Cutover Implementation Plan
+# COW Workdir Mode Hard-Cutover Implementation Plan
 
 > **For agentic workers:** Execute inline. The user explicitly waived test-first TDD;
 > update tests with each implementation slice and run them as verification gates.
 
-**Goal:** Remove `overlay-cow` completely and expose distinct `fuse-cow` and
-`dokan-cow` workdir modes across Trail.
+**Goal:** Rename filesystem materialization to `native-cow`, remove `overlay-cow`, and
+expose distinct `fuse-cow` and `dokan-cow` workdir modes across Trail.
 
 **Architecture:** `LaneWorkdirMode` names the concrete transport. FUSE, NFS, and Dokan
 share `ViewCore` semantics but have separate dispatch and user-visible identities. No
@@ -15,8 +15,8 @@ PowerShell verification scripts, Markdown documentation.
 
 ## Global constraints
 
-- Preserve `full-cow` as a first-class mode.
-- Do not accept `overlay-cow`, `overlay_cow`, or `OverlayCow` anywhere.
+- Preserve `native-cow` as the portable first-class materialized mode.
+- Do not accept removed `full-cow` or `overlay-cow` spellings and symbols anywhere.
 - Do not modify unrelated untracked projects or the parent checkout.
 - Keep platform dispatch explicit: FUSE on Linux/macOS, Dokan on Windows, NFS on macOS.
 - Run formatting, focused tests, the complete Trail suite, and cross-target checks.
@@ -38,7 +38,7 @@ PowerShell verification scripts, Markdown documentation.
 
 Steps:
 
-- [x] Add `FuseCow` and `DokanCow`; remove `OverlayCow`.
+- [x] Add `NativeCow`, `FuseCow`, and `DokanCow`; remove the old enum variants.
 - [x] Serialize/parse only the new names and return exact backend identifiers.
 - [x] Make automatic Windows selection `DokanCow` and Linux FUSE selection `FuseCow`.
 - [x] Validate platform availability before lane creation.
@@ -77,7 +77,7 @@ Steps:
 
 Steps:
 
-- [x] Persist only `fuse-cow`/`dokan-cow` and exact `cow_backend` values.
+- [x] Persist only current mode names and exact `cow_backend` values.
 - [x] Make old stored metadata fail with the recreate-lane diagnostic.
 - [x] Clean only current backend state paths; never adopt `.trail/overlay-cow`.
 - [x] Update doctor/backend availability checks.

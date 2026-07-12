@@ -61,7 +61,7 @@ copy.
 Use the portable mode while diagnosing the host setup:
 
 ```sh
-trail agent start --provider codex --workdir-mode full-cow
+trail agent start --provider codex --workdir-mode native-cow
 ```
 
 On macOS, `nfs-cow` is another large-workspace option:

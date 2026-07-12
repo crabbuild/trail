@@ -5,14 +5,14 @@ New commands and JSON reports expose this as `workdir_mode`:
 
 - `virtual`: no workdir; branch state changes through patches or API calls.
 - `sparse`: materialize selected paths and hydrate more paths explicitly.
-- `full-cow`: materialize the full root, using filesystem clone COW when safe.
+- `native-cow`: materialize the full root, using filesystem-native clone COW when safe.
 - `fuse-cow`: create an empty mountpoint and use a FUSE overlay view at
   runtime; reads come from Trail objects and writes land in a per-lane upper
   directory.
 - `nfs-cow`: on macOS, expose the same lower/upper model through a loopback
   NFSv3 mount without macFUSE.
 
-For `full-cow` and `sparse`, COW means safe file clone during materialization or
+For `native-cow` and `sparse`, COW means safe file clone during materialization or
 hydration. It does not intercept arbitrary writes to unhydrated paths.
 
 FUSE COW is different: the visible workdir is mounted while a terminal agent
@@ -37,7 +37,7 @@ The default is controlled by `lane.default_materialize`, and large roots default
 
 ```sh
 trail lane spawn doc-bot --from main --materialize=true
-trail lane spawn doc-bot --from main --workdir-mode full-cow
+trail lane spawn doc-bot --from main --workdir-mode native-cow
 ```
 
 Use a custom workdir:

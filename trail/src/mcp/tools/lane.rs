@@ -12,7 +12,7 @@ pub(super) fn tools() -> Value {
                 "name": { "type": "string" },
                 "from_ref": { "type": "string" },
                 "materialize": { "type": "boolean" },
-                "workdir_mode": { "type": "string", "enum": ["auto", "virtual", "sparse", "full-cow", "fuse-cow", "nfs-cow", "dokan-cow"] },
+                "workdir_mode": { "type": "string", "enum": ["auto", "virtual", "sparse", "native-cow", "fuse-cow", "nfs-cow", "dokan-cow"] },
                 "workdir": { "type": "string" },
                 "workdir_path": { "type": "string" },
                 "paths": { "type": "array", "items": { "type": "string" } },
@@ -379,9 +379,10 @@ mod tests {
             .as_array()
             .unwrap();
 
-        assert!(modes.iter().any(|mode| mode == "full-cow"));
+        assert!(modes.iter().any(|mode| mode == "native-cow"));
         assert!(modes.iter().any(|mode| mode == "fuse-cow"));
         assert!(modes.iter().any(|mode| mode == "dokan-cow"));
+        assert!(!modes.iter().any(|mode| mode == "full-cow"));
         assert!(!modes.iter().any(|mode| mode == "overlay-cow"));
     }
 }

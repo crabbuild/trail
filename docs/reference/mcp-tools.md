@@ -330,8 +330,8 @@ file values can be plain strings or objects with only `content`, `delete`, and
 - `trail.read_file`
 
 `trail.lane_spawn` accepts `workdir_mode` values `virtual`, `sparse`,
-`full-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. `virtual` creates no workdir, `sparse` requires
-`paths`, and `full-cow` creates a full materialized workdir using filesystem
+`native-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow`. `virtual` creates no workdir, `sparse` requires
+`paths`, and `native-cow` creates a full materialized workdir using filesystem
 clone COW when available. `fuse-cow` creates an empty workdir mountpoint and
 records the `fuse` backend; a runtime such as `trail agent start
 --workdir-mode fuse-cow` mounts the FUSE view and keeps it alive while the

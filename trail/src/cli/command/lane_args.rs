@@ -128,7 +128,7 @@ pub(super) struct LaneSpawnArgs {
     pub(super) no_materialize: bool,
     #[arg(
         long,
-        value_parser = ["auto", "virtual", "sparse", "full-cow", "fuse-cow", "nfs-cow", "dokan-cow"]
+        value_parser = ["auto", "virtual", "sparse", "native-cow", "fuse-cow", "nfs-cow", "dokan-cow"]
     )]
     pub(super) workdir_mode: Option<String>,
     #[arg(long)]

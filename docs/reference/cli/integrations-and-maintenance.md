@@ -97,7 +97,7 @@ validation, apply, or recovery step.
 | --- | --- |
 | Task | One unit of agent work tracked by Trail |
 | Lane | Isolated Trail branch-like workspace for the task |
-| Workdir | Filesystem directory where a terminal agent edits; usually full-cow, optionally fuse-cow |
+| Workdir | Filesystem directory where a terminal agent edits; usually native-cow, optionally fuse-cow |
 | Turn | One prompt or response cycle captured from ACP |
 | Checkpoint | Recorded code state that can be reviewed, applied, or rewound |
 | `latest` | The most recent non-archived agent task |
@@ -151,12 +151,12 @@ trail agent acp --provider <claude-code|codex|cursor> \
   [--name <NAME>] [--from <REF>] [--no-mcp] [-- <COMMAND>...]
 
 trail agent start --provider <claude-code|codex|cursor|gemini|aider|opencode> \
-  [--name <NAME>] [--from <REF>] [--workdir-mode full-cow|fuse-cow|nfs-cow|dokan-cow] \
+  [--name <NAME>] [--from <REF>] [--workdir-mode native-cow|fuse-cow|nfs-cow|dokan-cow] \
   [-- <COMMAND>...]
 
 trail agent continue [latest|<TASK_OR_LANE_OR_SESSION>] \
   [--provider <PROVIDER>] [--name <NAME>] \
-  [--workdir-mode full-cow|fuse-cow|nfs-cow|dokan-cow] [-- <COMMAND>...]
+  [--workdir-mode native-cow|fuse-cow|nfs-cow|dokan-cow] [-- <COMMAND>...]
 ```
 
 Use `agent acp` as the stable editor entrypoint. It creates a fresh task lane
@@ -164,7 +164,7 @@ for each ACP session.
 
 Use `agent start` when launching an agent directly from the terminal. It creates
 a task workdir, runs the agent there, and records a checkpoint when the command
-exits. The default `full-cow` mode creates a full materialized workdir using
+exits. The default `native-cow` mode creates a full materialized workdir using
 filesystem clone COW when possible. `fuse-cow` mounts a FUSE view for the
 duration of the run so the agent sees normal files without the initial full
 copy; it requires macFUSE on macOS or FUSE access on Linux.

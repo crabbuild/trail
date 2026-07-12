@@ -205,7 +205,7 @@ content so filesystem backends can serve ranged reads and use reflink copy-up.
 
 ## Current Foundation and Gaps
 
-`LaneWorkdirMode` currently supports `virtual`, `sparse`, `full-cow`,
+`LaneWorkdirMode` currently supports `virtual`, `sparse`, `native-cow`,
 `fuse-cow`, and `nfs-cow`. Lane spawning records the mode and creates either
 a materialized workdir or an overlay mountpoint. `trail agent start` holds a
 mount for the child process, records the lane workdir when the child exits, and
@@ -295,7 +295,7 @@ trail/src/db/lane/view/
     fuse.rs               Linux/macFUSE adapter
     nfs.rs                macOS loopback NFS adapter
     dokan.rs              Windows adapter
-    clone.rs              full-COW portable fallback
+    clone.rs              native-COW portable fallback
   cache/
     store.rs              immutable layer store and pinning
     builder.rs            build leases, staging, atomic publish
@@ -971,7 +971,7 @@ Preferred order:
    allow an isolated mount.
 2. Shared FUSE `ViewCore` adapter when the source root is lazy or native overlay
    is unavailable.
-3. Filesystem reflink full-COW fallback.
+3. Filesystem reflink native-COW fallback.
 4. Sparse or virtual mode when policy rejects copying.
 
 Unprivileged/container environments require explicit `/dev/fuse` or a suitable
@@ -984,7 +984,7 @@ Preferred order:
 
 1. Built-in loopback NFS COW for installation-free terminal use.
 2. macFUSE when installed and approved.
-3. APFS clonefile full-COW fallback.
+3. APFS clonefile native-COW fallback.
 4. Sparse or virtual mode.
 
 The NFS server must bind only to loopback, validate mount ownership, reject
@@ -1019,7 +1019,7 @@ reparse-point safety. A future ProjFS backend can be evaluated without changing
 
 ### Clone fallback
 
-`full-cow` remains valuable for tools that are incompatible with mounted
+`native-cow` remains valuable for tools that are incompatible with mounted
 filesystems. It should gain a `require_clone` result: if the filesystem cannot
 clone safely, a large-repository policy can reject ordinary materialization.
 Reports distinguish reflinked bytes, copied bytes, and files hydrated from
@@ -1276,7 +1276,7 @@ view does not satisfy a required current-root gate.
 ### Phase 0: Specify and benchmark current behavior
 
 - Add a backend-independent filesystem conformance model.
-- Measure current full-COW, FUSE, NFS, and Dokan behavior.
+- Measure current native-COW, FUSE, NFS, and Dokan behavior.
 - Add large-root mount/start benchmarks and physical-space fixtures.
 - Document current backend limitations.
 
@@ -1427,12 +1427,12 @@ and GC. Report logical and physical storage after each additional lane.
 Existing lanes using the current mode vocabulary remain valid:
 
 - `virtual` and `sparse` semantics do not change.
-- `full-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow` are the supported COW modes.
+- `native-cow`, `fuse-cow`, `nfs-cow`, and `dokan-cow` are the supported COW modes.
 - Removed workdir mode names are rejected. Operators must remove and recreate
   those lanes with the platform-appropriate current mode.
 - Existing lane `metadata_json` remains readable while typed workspace-view
   tables become authoritative for new lanes.
-- The default remains `full-cow` until `auto` passes platform conformance and
+- The default remains `native-cow` until `auto` passes platform conformance and
   performance gates; changing the default is a separately documented product
   decision.
 
@@ -1528,7 +1528,7 @@ The following decisions require prototypes and measurements:
 
 - Whether the persistent directory index belongs in the versioned root object
   or remains a rebuildable projection keyed by root.
-- Whether macOS NFS or APFS full-COW should be the automatic default for
+- Whether macOS NFS or APFS native-COW should be the automatic default for
   metadata-heavy Node workloads.
 - Whether a workspace-local or user-global immutable cache is the first
   supported scope. Workspace-local is simpler and safer; global saves more

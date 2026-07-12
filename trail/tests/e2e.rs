@@ -97,7 +97,7 @@ fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
             "--name",
             "context",
             "--workdir-mode",
-            "full-cow",
+            "native-cow",
             "--",
             "/usr/bin/env",
         ])
@@ -175,7 +175,7 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
             "--name",
             "hook-settings",
             "--workdir-mode",
-            "full-cow",
+            "native-cow",
         ])
         .output()
         .unwrap();
@@ -195,7 +195,7 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
 
 #[cfg(unix)]
 #[test]
-fn terminal_agent_full_cow_does_not_discover_or_write_the_parent_git_checkout() {
+fn terminal_agent_native_cow_does_not_discover_or_write_the_parent_git_checkout() {
     if !git_available() {
         return;
     }
@@ -230,7 +230,7 @@ fn terminal_agent_full_cow_does_not_discover_or_write_the_parent_git_checkout() 
             "--name",
             "containment",
             "--workdir-mode",
-            "full-cow",
+            "native-cow",
             "--",
         ])
         .arg(provider.path())
@@ -262,7 +262,7 @@ fn terminal_agent_full_cow_does_not_discover_or_write_the_parent_git_checkout() 
 
 #[cfg(target_os = "macos")]
 #[test]
-fn terminal_agent_full_cow_denies_explicit_writes_to_the_original_workspace() {
+fn terminal_agent_native_cow_denies_explicit_writes_to_the_original_workspace() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "root baseline\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -289,7 +289,7 @@ fn terminal_agent_full_cow_denies_explicit_writes_to_the_original_workspace() {
             "--name",
             "explicit-containment",
             "--workdir-mode",
-            "full-cow",
+            "native-cow",
             "--",
         ])
         .arg(provider.path())
@@ -345,7 +345,7 @@ fn terminal_agent_native_hooks_enrich_the_existing_task_without_duplication() {
             "--name",
             "hooked-terminal",
             "--workdir-mode",
-            "full-cow",
+            "native-cow",
             "--",
         ])
         .arg(provider.path())
@@ -12889,9 +12889,10 @@ fn local_api_and_cli_export_openapi_contract() {
         ["workdir_mode"]["enum"]
         .as_array()
         .unwrap();
-    assert!(workdir_modes.iter().any(|mode| mode == "full-cow"));
+    assert!(workdir_modes.iter().any(|mode| mode == "native-cow"));
     assert!(workdir_modes.iter().any(|mode| mode == "fuse-cow"));
     assert!(workdir_modes.iter().any(|mode| mode == "dokan-cow"));
+    assert!(!workdir_modes.iter().any(|mode| mode == "full-cow"));
     assert!(!workdir_modes.iter().any(|mode| mode == "overlay-cow"));
     assert!(cli["paths"].get("/v1/lane/events").is_some());
     assert!(cli["paths"].get("/v1/lane/spans").is_some());
@@ -21804,7 +21805,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             cli_workdir.to_str().unwrap(),
         ],
     );
-    assert_eq!(cli_spawn["workdir_mode"], "full-cow");
+    assert_eq!(cli_spawn["workdir_mode"], "native-cow");
     assert_eq!(cli_spawn["cow_backend"], "clone");
     assert_eq!(
         PathBuf::from(cli_spawn["workdir"].as_str().unwrap())
@@ -22231,14 +22232,14 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
             serde_json::json!({
                 "name": "api-bot",
                 "from_ref": "main",
-                "workdir_mode": "full-cow",
+                "workdir_mode": "native-cow",
                 "workdir": api_workdir
             }),
         ),
     );
     assert_eq!(api_response.status, 201);
     let api_spawn: serde_json::Value = api_response.body_json().unwrap();
-    assert_eq!(api_spawn["workdir_mode"], "full-cow");
+    assert_eq!(api_spawn["workdir_mode"], "native-cow");
     assert_eq!(
         PathBuf::from(api_spawn["workdir"].as_str().unwrap())
             .canonicalize()
@@ -22350,7 +22351,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
                 "arguments": {
                     "name": "mcp-bot",
                     "from_ref": "main",
-                    "workdir_mode": "full-cow",
+                    "workdir_mode": "native-cow",
                     "workdir": mcp_workdir
                 }
             }
@@ -22360,7 +22361,7 @@ fn lane_spawn_supports_custom_and_configured_workdirs() {
     assert_eq!(mcp_spawn["result"]["isError"], false);
     assert_eq!(
         mcp_spawn["result"]["structuredContent"]["workdir_mode"],
-        "full-cow"
+        "native-cow"
     );
     assert_eq!(
         PathBuf::from(

@@ -3,7 +3,7 @@
 pub enum LaneWorkdirMode {
     Virtual,
     Sparse,
-    FullCow,
+    NativeCow,
     FuseCow,
     NfsCow,
     DokanCow,
@@ -14,7 +14,7 @@ impl LaneWorkdirMode {
         match self {
             LaneWorkdirMode::Virtual => "virtual",
             LaneWorkdirMode::Sparse => "sparse",
-            LaneWorkdirMode::FullCow => "full-cow",
+            LaneWorkdirMode::NativeCow => "native-cow",
             LaneWorkdirMode::FuseCow => "fuse-cow",
             LaneWorkdirMode::NfsCow => "nfs-cow",
             LaneWorkdirMode::DokanCow => "dokan-cow",
@@ -25,7 +25,7 @@ impl LaneWorkdirMode {
         match value {
             "virtual" => Some(LaneWorkdirMode::Virtual),
             "sparse" => Some(LaneWorkdirMode::Sparse),
-            "full-cow" | "full_cow" => Some(LaneWorkdirMode::FullCow),
+            "native-cow" | "native_cow" => Some(LaneWorkdirMode::NativeCow),
             "fuse-cow" | "fuse_cow" => Some(LaneWorkdirMode::FuseCow),
             "nfs-cow" | "nfs_cow" => Some(LaneWorkdirMode::NfsCow),
             "dokan-cow" | "dokan_cow" => Some(LaneWorkdirMode::DokanCow),
@@ -40,7 +40,7 @@ impl LaneWorkdirMode {
     pub fn cow_backend(&self) -> Option<&'static str> {
         match self {
             LaneWorkdirMode::Virtual => None,
-            LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => Some("clone"),
+            LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => Some("clone"),
             LaneWorkdirMode::FuseCow => Some("fuse"),
             LaneWorkdirMode::NfsCow => Some("nfs"),
             LaneWorkdirMode::DokanCow => Some("dokan"),
@@ -877,12 +877,12 @@ mod workdir_mode_tests {
     #[test]
     fn cow_modes_use_backend_specific_names_and_reject_removed_aliases() {
         assert_eq!(
-            LaneWorkdirMode::parse("full-cow"),
-            Some(LaneWorkdirMode::FullCow)
+            LaneWorkdirMode::parse("native-cow"),
+            Some(LaneWorkdirMode::NativeCow)
         );
         assert_eq!(
-            LaneWorkdirMode::parse("full_cow"),
-            Some(LaneWorkdirMode::FullCow)
+            LaneWorkdirMode::parse("native_cow"),
+            Some(LaneWorkdirMode::NativeCow)
         );
         assert_eq!(LaneWorkdirMode::parse("fuse-cow"), Some(LaneWorkdirMode::FuseCow));
         assert_eq!(LaneWorkdirMode::parse("fuse_cow"), Some(LaneWorkdirMode::FuseCow));
@@ -896,7 +896,9 @@ mod workdir_mode_tests {
         );
         assert_eq!(LaneWorkdirMode::parse("overlay-cow"), None);
         assert_eq!(LaneWorkdirMode::parse("overlay_cow"), None);
-        assert_eq!(LaneWorkdirMode::FullCow.cow_backend(), Some("clone"));
+        assert_eq!(LaneWorkdirMode::parse("full-cow"), None);
+        assert_eq!(LaneWorkdirMode::parse("full_cow"), None);
+        assert_eq!(LaneWorkdirMode::NativeCow.cow_backend(), Some("clone"));
         assert_eq!(LaneWorkdirMode::FuseCow.cow_backend(), Some("fuse"));
         assert_eq!(LaneWorkdirMode::NfsCow.cow_backend(), Some("nfs"));
         assert_eq!(LaneWorkdirMode::DokanCow.cow_backend(), Some("dokan"));

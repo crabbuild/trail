@@ -270,7 +270,7 @@ You can override the provider and workdir mode:
 ```sh
 trail agent continue latest \
   --provider claude-code \
-  --workdir-mode full-cow
+  --workdir-mode native-cow
 ```
 
 ## 10. Share the Result

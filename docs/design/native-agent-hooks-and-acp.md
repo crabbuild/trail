@@ -152,7 +152,7 @@ The primary workflow is:
 
 ```console
 $ trail init
-$ trail lane spawn feature-auth --workdir-mode full-cow
+$ trail lane spawn feature-auth --workdir-mode native-cow
 $ cd "$(trail lane workdir feature-auth)"
 $ trail agent hooks add codex --lane feature-auth
 $ trail agent hooks doctor codex

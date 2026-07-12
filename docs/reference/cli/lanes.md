@@ -31,7 +31,7 @@ workdir.
 ### Create a lane with a workdir
 
 ```sh
-trail lane spawn feature-docs --workdir-mode full-cow
+trail lane spawn feature-docs --workdir-mode native-cow
 trail lane workdir feature-docs
 ```
 
@@ -100,7 +100,7 @@ The common lifecycle is:
 
 ```text
 trail lane spawn <NAME> [--from <REF>] \
-  [--workdir-mode virtual|sparse|full-cow|fuse-cow|nfs-cow|dokan-cow] \
+  [--workdir-mode virtual|sparse|native-cow|fuse-cow|nfs-cow|dokan-cow] \
   [--materialize[=true|false]] [--no-materialize] \
   [--workdir <PATH>] [--paths <PATH>...] [--include-neighbors] \
   [--provider <PROVIDER>] [--model <MODEL>]
@@ -117,7 +117,7 @@ trail lane rm <NAME> [--force]
 | --- | --- |
 | `virtual` | Creates no filesystem workdir. This is the high-scale default. |
 | `sparse` | Materializes only selected paths. |
-| `full-cow` | Materializes the full root and tries filesystem clone COW. |
+| `native-cow` | Materializes the full root and prefers filesystem-native clone/reflink COW. |
 | `fuse-cow` | Creates an empty FUSE mountpoint for a transparent write-time COW view. Reads come from Trail objects; writes land in the lane upper layer. |
 | `nfs-cow` | On macOS, creates a loopback NFSv3 mount with transparent copy-up and whiteouts, without macFUSE. |
 | `dokan-cow` | On Windows, creates a Dokan-backed transparent COW view. |

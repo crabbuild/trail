@@ -7,7 +7,7 @@ Use a lane for one bounded unit of active work that needs isolation, provenance,
 From the original Trail workspace:
 
 ```sh
-trail lane spawn <lane> --from main --workdir-mode full-cow
+trail lane spawn <lane> --from main --workdir-mode native-cow
 trail lane status <lane>
 trail lane workdir <lane>
 ```
@@ -16,7 +16,7 @@ Choose intentionally:
 
 - `virtual`: no filesystem workdir; use structured patches.
 - `sparse`: selected paths only; supply `--paths`.
-- `full-cow`: portable full materialization.
+- `native-cow`: portable full materialization using native clone/reflink COW when available.
 - `fuse-cow`: runtime-mounted FUSE COW where supported.
 - `nfs-cow`: macOS loopback NFS COW.
 - `dokan-cow`: Windows Dokan COW.

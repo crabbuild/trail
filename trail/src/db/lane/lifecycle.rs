@@ -37,9 +37,9 @@ impl Trail {
         } else if !sparse_paths.is_empty() {
             LaneWorkdirMode::Sparse
         } else if custom_workdir || materialize == Some(true) {
-            LaneWorkdirMode::FullCow
+            LaneWorkdirMode::NativeCow
         } else if self.default_lane_materialize_for_ref(from)? {
-            LaneWorkdirMode::FullCow
+            LaneWorkdirMode::NativeCow
         } else {
             LaneWorkdirMode::Virtual
         };
@@ -90,11 +90,11 @@ impl Trail {
             let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, &source.root_id)?;
             if root.file_count > LARGE_LANE_MATERIALIZE_FILE_THRESHOLD {
                 return Err(Error::InvalidInput(format!(
-                    "automatic layered workdir selection found no available mount backend for a {}-path root; install/enable FUSE, use nfs-cow on macOS, Dokan on Windows, or explicitly accept full-cow",
+                    "automatic layered workdir selection found no available mount backend for a {}-path root; install/enable FUSE, use nfs-cow on macOS, Dokan on Windows, or explicitly accept native-cow",
                     root.file_count
                 )));
             }
-            Ok(LaneWorkdirMode::FullCow)
+            Ok(LaneWorkdirMode::NativeCow)
         }
     }
 
@@ -156,7 +156,7 @@ impl Trail {
     ) -> Result<LaneSpawnReport> {
         let workdir_mode = if materialize {
             if sparse_paths.is_empty() {
-                LaneWorkdirMode::FullCow
+                LaneWorkdirMode::NativeCow
             } else {
                 LaneWorkdirMode::Sparse
             }
@@ -222,7 +222,7 @@ impl Trail {
                 LaneWorkdirMode::NfsCow => {
                     self.prepare_nfs_cow_lane_workdir(name, dir, workdir.is_some())?;
                 }
-                LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => {
+                LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => {
                     self.materialize_lane_workdir_at_paths_with_neighbors(
                         &source.root_id,
                         dir,
@@ -377,8 +377,10 @@ impl Trail {
         Ok(LaneWorkdirReport {
             lane_id: branch.lane_id,
             workdir: Some(dir.to_string_lossy().to_string()),
-            workdir_mode: LaneWorkdirMode::FullCow,
-            cow_backend: (LaneWorkdirMode::FullCow).cow_backend().map(str::to_string),
+            workdir_mode: LaneWorkdirMode::NativeCow,
+            cow_backend: (LaneWorkdirMode::NativeCow)
+                .cow_backend()
+                .map(str::to_string),
             sparse_paths: Vec::new(),
             transparent_cow_available: false,
         })
@@ -568,7 +570,7 @@ impl Trail {
             }
         }
         if branch.workdir.is_some() {
-            Ok(LaneWorkdirMode::FullCow)
+            Ok(LaneWorkdirMode::NativeCow)
         } else {
             Ok(LaneWorkdirMode::Virtual)
         }
@@ -753,11 +755,17 @@ fn parse_lane_workdir_mode(value: &str) -> Result<LaneWorkdirMode> {
                     .to_string(),
             ));
         }
+        "full-cow" | "full_cow" => {
+            return Err(Error::InvalidInput(
+                "unsupported lane workdir mode `full-cow`; this mode was renamed to `native-cow` to describe filesystem-native clone/reflink materialization; remove and recreate the lane with `native-cow`"
+                    .to_string(),
+            ));
+        }
         _ => {}
     }
     LaneWorkdirMode::parse(value).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, full-cow, fuse-cow, nfs-cow, or dokan-cow"
+            "unknown lane workdir mode `{value}`; expected auto, virtual, sparse, native-cow, fuse-cow, nfs-cow, or dokan-cow"
         ))
     })
 }
@@ -767,7 +775,7 @@ fn platform_workspace_backend(mode: &LaneWorkdirMode) -> &'static str {
         LaneWorkdirMode::NfsCow => "nfs",
         LaneWorkdirMode::FuseCow => "fuse",
         LaneWorkdirMode::DokanCow => "dokan",
-        LaneWorkdirMode::Sparse | LaneWorkdirMode::FullCow => "clone",
+        LaneWorkdirMode::Sparse | LaneWorkdirMode::NativeCow => "clone",
         LaneWorkdirMode::Virtual => "virtual",
     }
 }
@@ -797,10 +805,10 @@ fn validate_lane_workdir_mode_request(
                 ));
             }
         }
-        LaneWorkdirMode::FullCow => {
+        LaneWorkdirMode::NativeCow => {
             if !sparse_paths.is_empty() {
                 return Err(Error::InvalidInput(
-                    "full-cow lane workdir mode cannot be combined with sparse paths".to_string(),
+                    "native-cow lane workdir mode cannot be combined with sparse paths".to_string(),
                 ));
             }
         }
@@ -879,5 +887,10 @@ mod hard_cutover_tests {
         let overlay_message = overlay_error.to_string();
         assert!(overlay_message.contains("hard-cutover modes `fuse-cow` and `dokan-cow`"));
         assert!(overlay_message.contains("remove and recreate the lane"));
+
+        let native_error = parse_lane_workdir_mode("full-cow").unwrap_err();
+        let native_message = native_error.to_string();
+        assert!(native_message.contains("renamed to `native-cow`"));
+        assert!(native_message.contains("remove and recreate the lane"));
     }
 }
