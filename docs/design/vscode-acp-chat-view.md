@@ -177,7 +177,7 @@ turn and whether the turn produced a durable Trail checkpoint.
 |  +-- tool: edit file
 |  +-- diff: docs/integrations/acp.md
 |
-* checkpoint ch_...  Ready for review
+* checkpoint checkpoint_...  Ready for review
 ```
 
 This is the one distinctive visual move. Everything else should be restrained:

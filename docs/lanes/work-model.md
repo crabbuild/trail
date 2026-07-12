@@ -113,7 +113,7 @@ lane: docs-lane
         |     +-- message(role=assistant)
         |     +-- event(type=tool_call)
         |     +-- event(type=patch_applied)
-        |     +-- operation(change_id=ch_...)
+        |     +-- operation(change_id=change_...)
         |
         +-- turn: turn_002
               |
@@ -562,7 +562,7 @@ Workdir: DirtyTracked
 Observed record output:
 
 ```text
-Recorded lane workdir ch_4ee8...
+Recorded lane workdir change_4ee8...
   Modified README.md
 ```
 
@@ -627,7 +627,7 @@ Observed merge result:
 
 ```text
 Queued refs/lanes/svelte-readme into refs/branches/main
-merged as ch_f348...
+merged as change_f348...
 ```
 
 This demonstrates the intended large-repo pattern:

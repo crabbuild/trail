@@ -122,7 +122,7 @@ pub(crate) fn render_agent_dashboard(
                 task.tool_events
             );
             if let Some(checkpoint) = &task.latest_checkpoint {
-                println!("Last checkpoint: {}", checkpoint.0);
+                println!("Last checkpoint: {}", checkpoint.checkpoint_alias());
             }
         }
         if let Some(ready) = &report.ready {
@@ -530,10 +530,13 @@ pub(crate) fn render_agent_review_flow(
             report.validation.status, report.ready.status, report.ready.ready
         );
         if let Some(checkpoint) = &report.task.latest_checkpoint {
-            println!("Last checkpoint: {}", checkpoint.0);
+            println!("Last checkpoint: {}", checkpoint.checkpoint_alias());
         }
         if let Some(marker) = &report.reviewed {
-            println!("Reviewed checkpoint: {}", marker.checkpoint.0);
+            println!(
+                "Reviewed checkpoint: {}",
+                marker.checkpoint.checkpoint_alias()
+            );
         } else {
             println!("Reviewed checkpoint: none");
         }
@@ -831,7 +834,7 @@ pub(crate) fn render_agent_summary(
             report.task.tool_events
         );
         if let Some(checkpoint) = &report.latest_checkpoint {
-            println!("Last checkpoint: {}", checkpoint.0);
+            println!("Last checkpoint: {}", checkpoint.checkpoint_alias());
         }
         if report.validation.is_empty() {
             println!("Validation: no test or eval gate recorded");
@@ -1209,7 +1212,7 @@ pub(crate) fn render_agent_tools(report: &AgentToolsReport, json: bool, quiet: b
                         .unwrap_or_else(|| "no prompt preview".to_string());
                     println!("       turn {} {} - {}", turn.index, turn.status, prompt);
                     if let Some(checkpoint) = &turn.checkpoint {
-                        println!("         checkpoint: {}", checkpoint.0);
+                        println!("         checkpoint: {}", checkpoint.checkpoint_alias());
                     }
                     println!("         inspect: {}", turn.turn_command);
                     if let Some(command) = &turn.diff_command {
@@ -1339,7 +1342,10 @@ pub(crate) fn render_agent_review_map(
                         file.score
                     );
                     if let Some(marker) = &file.reviewed {
-                        println!("        Reviewed at: {}", marker.checkpoint.0);
+                        println!(
+                            "        Reviewed at: {}",
+                            marker.checkpoint.checkpoint_alias()
+                        );
                     }
                     if !file.reasons.is_empty() {
                         println!("        Reasons: {}", file.reasons.join(", "));
@@ -1415,7 +1421,10 @@ pub(crate) fn render_agent_confidence(
         );
         print_agent_risk_line(&report.risk);
         if let Some(marker) = &report.reviewed {
-            println!("Reviewed checkpoint: {}", marker.checkpoint.0);
+            println!(
+                "Reviewed checkpoint: {}",
+                marker.checkpoint.checkpoint_alias()
+            );
         }
         if report.factors.is_empty() {
             println!("Factors: none");
@@ -1754,7 +1763,8 @@ pub(crate) fn render_agent_new(report: &AgentNewReport, json: bool, quiet: bool)
         if let Some(marker) = &report.reviewed {
             println!(
                 "Reviewed: {} at {}",
-                marker.checkpoint.0, marker.reviewed_at
+                marker.checkpoint.checkpoint_alias(),
+                marker.reviewed_at
             );
         } else {
             println!("Reviewed: not marked yet");
@@ -1800,10 +1810,16 @@ pub(crate) fn render_agent_mark_reviewed(
         println!("Agent reviewed: {}", agent_task_display_title(&report.task));
         print_agent_task_id_if_needed(&report.task);
         print_agent_task_workdir(&report.task);
-        println!("Checkpoint: {}", report.marker.checkpoint.0);
+        println!(
+            "Checkpoint: {}",
+            report.marker.checkpoint.checkpoint_alias()
+        );
         println!("Changed files: {}", report.marker.changed_paths);
         if let Some(previous) = &report.previous {
-            println!("Previous reviewed: {}", previous.checkpoint.0);
+            println!(
+                "Previous reviewed: {}",
+                previous.checkpoint.checkpoint_alias()
+            );
         }
         if let Some(note) = &report.marker.note {
             println!("Note: {note}");
@@ -1827,12 +1843,18 @@ pub(crate) fn render_agent_mark_file_reviewed(
         println!("Task: {}", agent_task_display_title(&report.task));
         print_agent_task_id_if_needed(&report.task);
         print_agent_task_workdir(&report.task);
-        println!("Checkpoint: {}", report.marker.checkpoint.0);
+        println!(
+            "Checkpoint: {}",
+            report.marker.checkpoint.checkpoint_alias()
+        );
         if let Some(note) = &report.marker.note {
             println!("Note: {note}");
         }
         if let Some(previous) = &report.previous {
-            println!("Previous file marker: {}", previous.checkpoint.0);
+            println!(
+                "Previous file marker: {}",
+                previous.checkpoint.checkpoint_alias()
+            );
         }
         println!("{}", report.summary);
         print_suggestions(&report.suggestions);
@@ -2136,7 +2158,7 @@ pub(crate) fn render_agent_turn(report: &AgentTurnReport, json: bool, quiet: boo
         );
         println!("Before: {}", report.before_change.0);
         if let Some(checkpoint) = &report.checkpoint {
-            println!("Checkpoint: {}", checkpoint.0);
+            println!("Checkpoint: {}", checkpoint.checkpoint_alias());
         } else {
             println!("Checkpoint: none");
         }
@@ -2216,7 +2238,7 @@ pub(crate) fn render_agent_review(
             report.transcript_turns, report.tool_events
         );
         if let Some(checkpoint) = &report.latest_checkpoint {
-            println!("Last checkpoint: {}", checkpoint.0);
+            println!("Last checkpoint: {}", checkpoint.checkpoint_alias());
         }
         print_agent_risk_line(&report.risk);
         println!("{}", report.summary);
@@ -2408,7 +2430,7 @@ pub(crate) fn render_agent_run(report: &AgentRunReport, json: bool, quiet: bool)
         }
         if let Some(recorded) = &report.recorded {
             if let Some(operation) = &recorded.operation {
-                println!("Checkpoint: {}", operation.0);
+                println!("Checkpoint: {}", operation.checkpoint_alias());
             }
         }
         print_suggestions(&report.task.suggestions);
@@ -2442,7 +2464,7 @@ pub(crate) fn render_agent_continue(
         }
         if let Some(recorded) = &report.run.recorded {
             if let Some(operation) = &recorded.operation {
-                println!("Checkpoint: {}", operation.0);
+                println!("Checkpoint: {}", operation.checkpoint_alias());
             }
         }
         print_suggestions(&report.suggestions);
@@ -2464,7 +2486,7 @@ fn print_agent_task_summary(task: &AgentTaskReport) {
     println!("Changed files: {}", task.changed_paths.len());
     println!("Turns: {}  Tool events: {}", task.turns, task.tool_events);
     if let Some(checkpoint) = &task.latest_checkpoint {
-        println!("Last checkpoint: {}", checkpoint.0);
+        println!("Last checkpoint: {}", checkpoint.checkpoint_alias());
     }
 }
 
@@ -2622,7 +2644,7 @@ fn print_agent_change_group(group: &AgentChangeGroup) {
         println!("  Status: {status}");
     }
     if let Some(checkpoint) = &group.checkpoint {
-        println!("  Checkpoint: {}", checkpoint.0);
+        println!("  Checkpoint: {}", checkpoint.checkpoint_alias());
     }
     if let Some(assistant) = &group.assistant_preview {
         println!("  Assistant: {assistant}");
@@ -2698,7 +2720,7 @@ fn print_agent_timeline_item(item: &AgentTimelineItem) {
         println!("    Before: {}", before.0);
     }
     if let Some(checkpoint) = &item.checkpoint {
-        println!("    Checkpoint: {}", checkpoint.0);
+        println!("    Checkpoint: {}", checkpoint.checkpoint_alias());
     }
     if !item.operations.is_empty() {
         let operations = item
@@ -2738,11 +2760,15 @@ fn print_agent_checkpoint_entry(entry: &AgentCheckpointEntry) {
         println!("    Before: {}  target `{target}`", before.0);
     }
     if let Some(checkpoint) = &entry.checkpoint {
+        let checkpoint_alias = checkpoint.checkpoint_alias();
         let target = entry
             .checkpoint_target
             .as_deref()
-            .unwrap_or(checkpoint.0.as_str());
-        println!("    Checkpoint: {}  target `{target}`", checkpoint.0);
+            .unwrap_or(checkpoint_alias.as_str());
+        println!(
+            "    Checkpoint: {}  target `{target}`",
+            checkpoint.checkpoint_alias()
+        );
     }
     println!("    Changed files: {}", entry.changed_paths.len());
     if let Some(command) = &entry.diff_command {
@@ -2780,7 +2806,7 @@ fn print_agent_file_entry(file: &AgentFileEntry) {
                 println!("      {label}: {}", touch.id);
             }
             if let Some(checkpoint) = &touch.checkpoint {
-                println!("        checkpoint: {}", checkpoint.0);
+                println!("        checkpoint: {}", checkpoint.checkpoint_alias());
             }
         }
     }
@@ -2851,7 +2877,7 @@ fn print_agent_story_turn(turn: &AgentStoryTurn) {
         turn.changed_paths.len()
     );
     if let Some(checkpoint) = &turn.checkpoint {
-        println!("     Checkpoint: {}", checkpoint.0);
+        println!("     Checkpoint: {}", checkpoint.checkpoint_alias());
     }
     for tool in &turn.tool_summaries {
         println!("     tool: {tool}");

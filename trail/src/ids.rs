@@ -7,6 +7,14 @@ use sha2::{Digest, Sha256};
 
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) const WORKSPACE_ID_PREFIX: &str = "workspace_";
+pub(crate) const CHANGE_ID_PREFIX: &str = "change_";
+pub(crate) const OBJECT_ID_PREFIX: &str = "object_";
+pub(crate) const MESSAGE_ID_PREFIX: &str = "message_";
+pub(crate) const ANCHOR_ID_PREFIX: &str = "anchor_";
+pub(crate) const CHECKPOINT_ALIAS_PREFIX: &str = "checkpoint_";
+pub(crate) const LINE_ALIAS_PREFIX: &str = "line_";
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(pub String);
 
@@ -36,7 +44,7 @@ pub struct AnchorId(pub String);
 
 impl WorkspaceId {
     pub fn new(seed: &[u8]) -> Self {
-        Self(format!("wk_{}", short_hash(seed, 16)))
+        Self(format!("{WORKSPACE_ID_PREFIX}{}", short_hash(seed, 16)))
     }
 }
 
@@ -54,7 +62,23 @@ impl ChangeId {
         hasher.update(now.to_be_bytes());
         hasher.update(nonce.to_be_bytes());
         hasher.update(hint.as_bytes());
-        Self(format!("ch_{}", hex::encode(hasher.finalize())))
+        Self(format!(
+            "{CHANGE_ID_PREFIX}{}",
+            hex::encode(hasher.finalize())
+        ))
+    }
+
+    pub fn checkpoint_alias(&self) -> String {
+        format!(
+            "{CHECKPOINT_ALIAS_PREFIX}{}",
+            self.0.strip_prefix(CHANGE_ID_PREFIX).unwrap_or(&self.0)
+        )
+    }
+
+    pub fn from_checkpoint_alias(value: &str) -> Option<Self> {
+        value
+            .strip_prefix(CHECKPOINT_ALIAS_PREFIX)
+            .map(|hash| Self(format!("{CHANGE_ID_PREFIX}{hash}")))
     }
 }
 
@@ -82,6 +106,25 @@ impl LineId {
     pub fn encode_key(&self) -> Vec<u8> {
         encode_compound_id(&self.origin_change.0, self.local_seq)
     }
+
+    pub fn alias(&self) -> String {
+        let origin = self
+            .origin_change
+            .0
+            .strip_prefix(CHANGE_ID_PREFIX)
+            .unwrap_or(&self.origin_change.0);
+        format!("{LINE_ALIAS_PREFIX}{origin}:{}", self.local_seq)
+    }
+
+    pub fn from_alias(value: &str) -> Option<Self> {
+        let (origin, local_seq) = value.rsplit_once(':')?;
+        let origin = origin.strip_prefix(LINE_ALIAS_PREFIX)?;
+        let local_seq = local_seq.parse::<u64>().ok()?;
+        Some(Self::new(
+            ChangeId(format!("{CHANGE_ID_PREFIX}{origin}")),
+            local_seq,
+        ))
+    }
 }
 
 impl MessageId {
@@ -90,7 +133,10 @@ impl MessageId {
         hasher.update(change_id.0.as_bytes());
         hasher.update(role.as_bytes());
         hasher.update(body.as_bytes());
-        Self(format!("msg_{}", hex::encode(hasher.finalize())))
+        Self(format!(
+            "{MESSAGE_ID_PREFIX}{}",
+            hex::encode(hasher.finalize())
+        ))
     }
 }
 
@@ -100,7 +146,10 @@ impl AnchorId {
         hasher.update(file_id.encode_key());
         hasher.update(line_id.encode_key());
         hasher.update(label.as_bytes());
-        Self(format!("anc_{}", hex::encode(hasher.finalize())))
+        Self(format!(
+            "{ANCHOR_ID_PREFIX}{}",
+            hex::encode(hasher.finalize())
+        ))
     }
 }
 
@@ -112,7 +161,10 @@ impl ObjectId {
         hasher.update(version.to_le_bytes());
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
-        Self(format!("obj_{}", hex::encode(hasher.finalize())))
+        Self(format!(
+            "{OBJECT_ID_PREFIX}{}",
+            hex::encode(hasher.finalize())
+        ))
     }
 }
 
@@ -142,7 +194,7 @@ pub(crate) fn short_hash(seed: &[u8], bytes: usize) -> String {
 }
 
 fn encode_compound_id(change_id: &str, local_seq: u64) -> Vec<u8> {
-    let digest = if let Some(hex_id) = change_id.strip_prefix("ch_") {
+    let digest = if let Some(hex_id) = change_id_hash(change_id) {
         hex::decode(hex_id).unwrap_or_else(|_| Sha256::digest(change_id.as_bytes()).to_vec())
     } else {
         Sha256::digest(change_id.as_bytes()).to_vec()
@@ -156,6 +208,54 @@ fn encode_compound_id(change_id: &str, local_seq: u64) -> Vec<u8> {
     out
 }
 
+pub(crate) fn is_change_id(value: &str) -> bool {
+    value.starts_with(CHANGE_ID_PREFIX)
+}
+
+pub(crate) fn change_id_hash(value: &str) -> Option<&str> {
+    value.strip_prefix(CHANGE_ID_PREFIX)
+}
+
+pub(crate) fn is_object_id(value: &str) -> bool {
+    value.starts_with(OBJECT_ID_PREFIX)
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_use_full_entity_prefixes() {
+        let workspace = WorkspaceId::new(b"workspace");
+        let change = ChangeId::allocate(&workspace, "actor", 1, "test");
+        let object = ObjectId::for_bytes("Blob", 1, b"content");
+        let message = MessageId::new(&change, "assistant", "done");
+        let file = FileId::new(change.clone(), 1);
+        let line = LineId::new(change.clone(), 2);
+        let anchor = AnchorId::new(&file, &line, "example");
+
+        assert!(workspace.0.starts_with(WORKSPACE_ID_PREFIX));
+        assert!(change.0.starts_with(CHANGE_ID_PREFIX));
+        assert!(object.0.starts_with(OBJECT_ID_PREFIX));
+        assert!(message.0.starts_with(MESSAGE_ID_PREFIX));
+        assert!(anchor.0.starts_with(ANCHOR_ID_PREFIX));
+        assert_eq!(
+            ChangeId::from_checkpoint_alias(&change.checkpoint_alias()),
+            Some(change.clone())
+        );
+        assert_eq!(LineId::from_alias(&line.alias()), Some(line));
+    }
+
+    #[test]
+    fn canonical_prefixes_are_recognized() {
+        let digest = "ab".repeat(32);
+        assert!(is_change_id(&format!("change_{digest}")));
+        assert!(is_object_id("object_current"));
+        assert!(!is_change_id(&format!("ch_{digest}")));
+        assert!(!is_object_id("obj_legacy"));
+    }
 }

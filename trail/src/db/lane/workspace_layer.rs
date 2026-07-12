@@ -3754,7 +3754,7 @@ mod tests {
             ".generated/b",
             seed_b1.path(),
         );
-        let wrong_source = ObjectId("obj_not_the_lane_head".to_string());
+        let wrong_source = ObjectId("object_not_the_lane_head".to_string());
         let error = db
             .replace_declared_workspace_layers_at_source(
                 "dependencies",

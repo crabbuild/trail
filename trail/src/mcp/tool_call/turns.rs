@@ -196,7 +196,7 @@ mod tests {
                 "path": "README.md",
                 "edits": [{
                     "type": "modify_line",
-                    "line_id": "ch_seed:1",
+                    "line_id": "line_seed:1",
                     "expected_text": "old",
                     "new_text": "new"
                 }]
@@ -214,7 +214,7 @@ mod tests {
                 new_text,
             } => {
                 assert_eq!(path, "README.md");
-                assert_eq!(line_id, "ch_seed:1");
+                assert_eq!(line_id, "line_seed:1");
                 assert_eq!(expected_text.as_deref(), Some("old"));
                 assert_eq!(new_text, "new");
             }

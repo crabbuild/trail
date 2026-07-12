@@ -65,11 +65,11 @@ pub(crate) fn parse_map_key_spec(spec: &str) -> Result<Vec<u8>> {
 
 pub(crate) fn parse_compound_map_key(spec: &str) -> Result<Vec<u8>> {
     let (change_id, local_seq) = spec.rsplit_once(':').ok_or_else(|| {
-        Error::InvalidInput("compound map key must look like id:ch_...:<local_seq>".to_string())
+        Error::InvalidInput("compound map key must look like id:change_...:<local_seq>".to_string())
     })?;
-    if !change_id.starts_with("ch_") {
+    if !crate::ids::is_change_id(change_id) {
         return Err(Error::InvalidInput(
-            "compound map key change id must start with ch_".to_string(),
+            "compound map key change id must start with change_".to_string(),
         ));
     }
     let local_seq = local_seq.parse::<u64>().map_err(|_| {
@@ -160,7 +160,7 @@ pub(crate) fn path_map_value_summary(value: &[u8]) -> serde_json::Value {
 pub(crate) fn text_order_value_summary(value: &[u8]) -> serde_json::Value {
     match decode_cbor_value::<LineEntry>(value) {
         Ok(entry) => serde_json::json!({
-            "line_id": line_id_key_value(&entry.line_id),
+            "line_id": entry.line_id.alias(),
             "text_hash": entry.text_hash,
             "text": utf8_preview(&entry.text, 240),
             "newline": entry.newline,

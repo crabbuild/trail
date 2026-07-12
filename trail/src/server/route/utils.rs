@@ -228,7 +228,7 @@ mod tests {
             "path": "README.md",
             "edits": [{
                 "type": "modify_line",
-                "line_id": format!("ch_seed_{seed}:1"),
+                "line_id": format!("line_seed_{seed}:1"),
                 "expected_text": format!("old-{seed}"),
                 "new_text": format!("new-{seed}")
             }]

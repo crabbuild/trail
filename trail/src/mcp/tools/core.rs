@@ -23,8 +23,8 @@ pub(super) fn tools() -> Value {
             "title": "Trail Diff",
             "description": "Show a ref range, root range, or dirty worktree diff with optional patches and stable line ids.",
             "inputSchema": object_schema(json!({
-                "range": { "type": "string", "description": "Ref range such as main..feature or ch_a..ch_b." },
-                "root": { "type": "string", "description": "Root id range such as obj_a..obj_b." },
+                "range": { "type": "string", "description": "Ref range such as main..feature or change_a..change_b." },
+                "root": { "type": "string", "description": "Root id range such as object_a..object_b." },
                 "dirty": { "type": "boolean", "description": "Diff the current branch head against the materialized worktree." },
                 "patch": { "type": "boolean" },
                 "show_line_ids": { "type": "boolean" },

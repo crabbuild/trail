@@ -2335,7 +2335,7 @@ impl Trail {
             target_kind: "reviewed".to_string(),
             target: reviewed
                 .as_ref()
-                .map(|marker| format!("since {}", marker.checkpoint.0))
+                .map(|marker| format!("since {}", marker.checkpoint.checkpoint_alias()))
                 .unwrap_or_else(|| "whole task".to_string()),
             turn_id: None,
             operation_id: None,
@@ -4010,17 +4010,20 @@ impl Trail {
         view: &AgentTaskViewReport,
         change_id: &str,
     ) -> Result<AgentResolvedDiffTarget> {
+        let canonical_change_id = ChangeId::from_checkpoint_alias(change_id)
+            .map(|change| change.0)
+            .unwrap_or_else(|| change_id.to_string());
         if let Some(transcript) = &view.transcript {
             if let Some(turn) = transcript.turns.iter().find(|turn| {
                 turn.checkpoint
                     .as_ref()
                     .or(turn.turn.after_change.as_ref())
-                    .is_some_and(|checkpoint| checkpoint.0 == change_id)
+                    .is_some_and(|checkpoint| checkpoint.0 == canonical_change_id)
             }) {
                 return self.agent_diff_target_from_turn(turn, "checkpoint", change_id.to_string());
             }
         }
-        self.agent_diff_target_for_operation(view, change_id, "checkpoint")
+        self.agent_diff_target_for_operation(view, &canonical_change_id, "checkpoint")
     }
 
     fn resolve_agent_rewind_target(&self, lane: &str, target: &str) -> Result<String> {
@@ -4029,6 +4032,9 @@ impl Trail {
             return Err(Error::InvalidInput(
                 "agent rewind target cannot be empty".to_string(),
             ));
+        }
+        if let Some(change_id) = ChangeId::from_checkpoint_alias(target) {
+            return Ok(change_id.0);
         }
         let normalized = target.to_ascii_lowercase();
         if !agent_rewind_target_needs_resolution(&normalized) {
@@ -8751,7 +8757,10 @@ fn agent_diagnosis_assessment(
         evidence.push(format!("Git preflight failed: {error}"));
     }
     if let Some(checkpoint) = &ready.task.latest_checkpoint {
-        evidence.push(format!("latest checkpoint `{}`", checkpoint.0));
+        evidence.push(format!(
+            "latest checkpoint `{}`",
+            checkpoint.checkpoint_alias()
+        ));
     }
     evidence.push(format!(
         "{} friendly checkpoint target(s) available",
@@ -10140,7 +10149,7 @@ fn agent_new_summary(
             return match reviewed {
                 Some(marker) => format!(
                     "No new changes touched `{path}` since reviewed checkpoint `{}`.",
-                    marker.checkpoint.0
+                    marker.checkpoint.checkpoint_alias()
                 ),
                 None => format!(
                     "`{path}` has no recorded changes in {}.",
@@ -10162,7 +10171,7 @@ fn agent_new_summary(
                 format!(
                     "{} has no new changes{scope} since reviewed checkpoint `{}`.",
                     agent_task_label(task),
-                    marker.checkpoint.0
+                    marker.checkpoint.checkpoint_alias()
                 )
             })
             .unwrap_or_else(|| {
@@ -10173,8 +10182,8 @@ fn agent_new_summary(
             }),
         "new_changes" => {
             let checkpoint = reviewed
-                .map(|marker| marker.checkpoint.0.as_str())
-                .unwrap_or("task start");
+                .map(|marker| marker.checkpoint.checkpoint_alias())
+                .unwrap_or_else(|| "task start".to_string());
             format!(
                 "{} has {} new changed file(s){scope} and {} changed line(s) since `{checkpoint}`. {}",
                 agent_task_label(task),
@@ -10301,18 +10310,18 @@ fn agent_mark_reviewed_summary(
         Some(previous) if previous.checkpoint == marker.checkpoint => format!(
             "{} was already reviewed at checkpoint `{}`; refreshed the reviewed marker.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
         Some(previous) => format!(
             "{} marked reviewed at checkpoint `{}`; previous reviewed checkpoint was `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0,
-            previous.checkpoint.0
+            marker.checkpoint.checkpoint_alias(),
+            previous.checkpoint.checkpoint_alias()
         ),
         None => format!(
             "{} marked reviewed at checkpoint `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
     }
 }
@@ -10340,18 +10349,18 @@ fn agent_mark_file_reviewed_summary(
         Some(previous) if previous.checkpoint == marker.checkpoint => format!(
             "`{path}` in {} was already marked reviewed at checkpoint `{}`; refreshed the file marker.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
         Some(previous) => format!(
             "`{path}` in {} marked reviewed at checkpoint `{}`; previous file marker was `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0,
-            previous.checkpoint.0
+            marker.checkpoint.checkpoint_alias(),
+            previous.checkpoint.checkpoint_alias()
         ),
         None => format!(
             "`{path}` in {} marked reviewed at checkpoint `{}`.",
             agent_task_label(task),
-            marker.checkpoint.0
+            marker.checkpoint.checkpoint_alias()
         ),
     }
 }
@@ -10885,7 +10894,10 @@ fn agent_report_markdown(
         view.task.turns, view.task.tool_events
     ));
     if let Some(checkpoint) = &view.task.latest_checkpoint {
-        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Latest checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     out.push_str(&format!(
         "- Risk: {:?} ({}/100)\n\n",
@@ -10951,7 +10963,10 @@ fn agent_report_markdown(
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
             for tool in &turn.tool_summaries {
                 out.push_str(&format!("   - Tool: {tool}\n"));
@@ -11000,7 +11015,10 @@ fn agent_receipt_markdown(
         report.task.turns, report.task.tool_events
     ));
     if let Some(checkpoint) = &report.task.latest_checkpoint {
-        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Latest checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     out.push_str(&format!(
         "- Risk: {:?} ({}/100)\n\n",
@@ -11094,7 +11112,10 @@ fn agent_receipt_markdown(
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
             for tool in &turn.tool_summaries {
                 out.push_str(&format!("   - Tool: {tool}\n"));
@@ -11167,7 +11188,10 @@ fn agent_handoff_markdown(
         report.task.tool_events
     ));
     if let Some(checkpoint) = &report.task.latest_checkpoint {
-        out.push_str(&format!("- Latest checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Latest checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     if let Some(workdir) = &report.task.workdir {
         out.push_str(&format!("- Workdir: `{workdir}`\n"));
@@ -11271,7 +11295,10 @@ fn agent_handoff_markdown(
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
             for tool in &turn.tool_summaries {
                 out.push_str(&format!("   - Tool: {tool}\n"));
@@ -11326,7 +11353,10 @@ fn agent_pr_body(receipt: &AgentReceiptReport) -> String {
         receipt.risk.level, receipt.risk.score
     ));
     if let Some(checkpoint) = &receipt.latest_checkpoint {
-        out.push_str(&format!("- Trail checkpoint: `{}`\n", checkpoint.0));
+        out.push_str(&format!(
+            "- Trail checkpoint: `{}`\n",
+            checkpoint.checkpoint_alias()
+        ));
     }
     out.push_str(&format!("- Agent task: `{}`\n\n", receipt.task.name));
 
@@ -11397,7 +11427,10 @@ fn agent_pr_body(receipt: &AgentReceiptReport) -> String {
                 turn.changed_paths.len()
             ));
             if let Some(checkpoint) = &turn.checkpoint {
-                out.push_str(&format!("   - Checkpoint: `{}`\n", checkpoint.0));
+                out.push_str(&format!(
+                    "   - Checkpoint: `{}`\n",
+                    checkpoint.checkpoint_alias()
+                ));
             }
         }
         out.push('\n');
@@ -11432,7 +11465,7 @@ fn agent_checkpoint_entry(lane: &str, group: &AgentChangeGroup) -> AgentCheckpoi
         if is_turn {
             format!("turn:{}", group.index)
         } else {
-            checkpoint.0.clone()
+            checkpoint.checkpoint_alias()
         }
     });
     let rewind_before_command = before_target

@@ -162,9 +162,7 @@ impl Trail {
 }
 
 fn short_rewind_change_id(change_id: &ChangeId) -> String {
-    change_id
-        .0
-        .strip_prefix("ch_")
+    crate::ids::change_id_hash(&change_id.0)
         .unwrap_or(&change_id.0)
         .chars()
         .take(12)

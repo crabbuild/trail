@@ -241,7 +241,7 @@ fn line_change_marker(kind: &LineChangeKind) -> &'static str {
 }
 
 fn format_line_id(line_id: &trail::LineId) -> String {
-    format!("{}:{}", line_id.origin_change.0, line_id.local_seq)
+    line_id.alias()
 }
 
 fn format_optional_line_number(line: Option<u64>) -> String {
@@ -312,10 +312,7 @@ pub(crate) fn render_why(result: &WhyResult, json: bool, quiet: bool) -> Result<
             "{}:{} {}",
             result.path, result.line_number, result.current_text
         );
-        println!(
-            "Line ID: {}:{}",
-            result.line_id.origin_change.0, result.line_id.local_seq
-        );
+        println!("Line ID: {}", result.line_id.alias());
         println!("Introduced by: {}", result.introduced_by.0);
         println!("Last content change: {}", result.last_content_change.0);
         for item in &result.history {

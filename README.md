@@ -541,12 +541,13 @@ workspace IDs, and actor names will differ on your machine.
 
 | Prefix | Meaning | Example use |
 | --- | --- | --- |
-| `wk_` | Workspace ID derived when `.trail/` is initialized | Identifies one local Trail workspace |
-| `ch_` | Change/operation ID allocated when Trail records an operation | Appears as `Head`, `Initial operation`, timeline entries, and `show` selectors |
-| `obj_` | Content-addressed object ID | Identifies stored roots, operations, text objects, blobs, and other durable objects |
-| `msg_` | Message ID | Used for durable operation, agent, or review messages |
-| `anc_` | Anchor ID | Used for durable labels tied to file and line identity |
-| `ch_...:<n>` | Stable file or line identity with an origin change and local sequence | Appears in `why` output as a `Line ID` |
+| `workspace_` | Workspace ID derived when `.trail/` is initialized | Identifies one local Trail workspace |
+| `change_` | Change/operation ID allocated when Trail records an operation | Appears as `Head`, `Initial operation`, timeline entries, checkpoints, and `show` selectors |
+| `object_` | Content-addressed object ID | Identifies stored roots, operations, text objects, blobs, and other durable objects |
+| `message_` | Message ID | Used for durable operation, agent, or review messages |
+| `anchor_` | Anchor ID | Used for durable labels tied to file and line identity |
+| `checkpoint_` | User-facing checkpoint alias | Resolves to the underlying `change_` operation and its resulting `object_` root |
+| `line_...:<n>` | User-facing stable line identity | Resolves to an origin `change_` plus its local sequence |
 
 ## Example output
 
@@ -557,9 +558,9 @@ workspace IDs, and actor names will differ on your machine.
 ```text
 $ trail init --working-tree
 Initialized Trail workspace
-Workspace: wk_24ec99f68d1db8716f4df8a87580e3da
+Workspace: workspace_24ec99f68d1db8716f4df8a87580e3da
 Branch: main
-Initial operation: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Initial operation: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
 Imported: 1 files (1 text, 0 opaque, 0 binary)
 ```
 
@@ -569,8 +570,8 @@ Imported: 1 files (1 text, 0 opaque, 0 binary)
 ```text
 $ trail status
 Branch: main
-Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+Head: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Root: object_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
 Worktree: clean
 ```
 
@@ -580,8 +581,8 @@ Worktree: clean
 ```text
 $ trail status
 Branch: main
-Head: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+Head: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Root: object_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
 Worktree: dirty
   Modified README.md
 ```
@@ -591,7 +592,7 @@ Worktree: dirty
 
 ```text
 $ trail record -m "record current edit"
-Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+Recorded change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
   Modified README.md
 ```
 
@@ -600,24 +601,24 @@ Recorded ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
 
 ```text
 $ trail timeline --limit 10
-ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa ManualRecord main record current edit
-ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize Trail workspace
+change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa ManualRecord main record current edit
+change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 GitImport main Initialize Trail workspace
 ```
 
 6. Inspect one operation from the timeline. `show` expands the operation kind,
    actor, message, parent, before/after roots, and path-level summary.
 
 ```text
-$ trail show ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
-Operation: ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+$ trail show change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
+Operation: change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa
 Kind: ManualRecord
 Branch: main
 Actor: demo
 Message: record current edit
 Parents:
-  ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Before root: obj_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
-After root: obj_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
+  change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Before root: object_46b1a72c6ff5e66a7b3026113243681493e79c2e659b6ef9658a2db57fdac431
+After root: object_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
   Modified README.md (+1 -0)
 ```
 
@@ -628,9 +629,9 @@ After root: obj_7e39865c8542fe846b528c28debed69daecc4b53c34ff17f8a4da8bacbb773a4
 ```text
 $ trail why README.md:2
 README.md:2 First recorded line
-Line ID: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6:2
-Introduced by: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
-Last content change: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Line ID: line_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6:2
+Introduced by: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
+Last content change: change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6
 ```
 
 8. Show file history. `history` lists operations that affected the selected
@@ -639,8 +640,8 @@ Last content change: ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f
 ```text
 $ trail history README.md
 README.md
-ch_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 Added README.md
-ch_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa Modified README.md
+change_5a44178a04acec35b4c27590303d665d462a229aa9bf627bb24e2c0f685fdcd6 Added README.md
+change_3d5a38ae49a7cd4b6873f003c97863f30ebc3efa61749b463c222d5d34809bfa Modified README.md
 ```
 
 9. After making another edit without recording it, inspect the dirty diff. The

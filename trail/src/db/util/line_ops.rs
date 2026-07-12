@@ -61,7 +61,7 @@ pub(crate) fn materialize_lines(lines: &[LineEntry]) -> Vec<u8> {
 
 pub(crate) fn encode_small_text_table(lines: &[LineEntry]) -> Vec<u8> {
     let default_origin_change = most_common_origin_change(lines)
-        .unwrap_or_else(|| ChangeId("ch_empty_small_text_table".to_string()));
+        .unwrap_or_else(|| ChangeId("change_empty_small_text_table".to_string()));
     let mut out = Vec::new();
     out.push(SMALL_TEXT_TABLE_VERSION);
     write_change_id(&mut out, &default_origin_change);
@@ -231,7 +231,7 @@ fn decode_newline(code: u8) -> Result<NewlineKind> {
 }
 
 fn write_change_id(out: &mut Vec<u8>, change_id: &ChangeId) {
-    if let Some(hex_id) = change_id.0.strip_prefix("ch_") {
+    if let Some(hex_id) = change_id.0.strip_prefix(crate::ids::CHANGE_ID_PREFIX) {
         if hex_id.len() == 64 {
             if let Ok(bytes) = hex::decode(hex_id) {
                 out.push(0);
@@ -248,7 +248,11 @@ fn read_change_id(data: &[u8], cursor: &mut usize) -> Result<ChangeId> {
     match read_u8(data, cursor)? {
         0 => {
             let bytes = read_exact(data, cursor, 32)?;
-            Ok(ChangeId(format!("ch_{}", hex::encode(bytes))))
+            Ok(ChangeId(format!(
+                "{}{}",
+                crate::ids::CHANGE_ID_PREFIX,
+                hex::encode(bytes)
+            )))
         }
         1 => {
             let bytes = read_len_bytes(data, cursor)?;
@@ -525,7 +529,7 @@ mod tests {
     }
 
     fn change_id(byte: u8) -> ChangeId {
-        ChangeId(format!("ch_{}", hex::encode([byte; 32])))
+        ChangeId(format!("change_{}", hex::encode([byte; 32])))
     }
 
     fn line(

@@ -694,7 +694,7 @@ trail --workspace "$PLAYGROUND" agent undo-last latest --prompt 'Add hook suppor
 ```
 
 Direct `agent rewind --to <CHECKPOINT_OR_LABEL>` still works, but
-`agent undo-last` avoids copying `ch_...` ids from transcripts.
+`agent undo-last` avoids copying `change_...` ids from transcripts.
 
 If the task is ready, check apply readiness:
 

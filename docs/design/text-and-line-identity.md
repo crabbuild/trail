@@ -101,6 +101,10 @@ flowchart LR
 - origin `ChangeId`
 - local sequence
 
+The user-facing form is `line_<change-hash>:<local-sequence>`. Trail resolves
+that alias to the stored origin `ChangeId` and local sequence; users do not
+need to interpret the line as a change identifier.
+
 New lines introduced by an operation get IDs tied to that operation. Existing lines keep their IDs when content or position changes can be matched according to the line preservation logic.
 
 ## Preserving Identity Across Edits

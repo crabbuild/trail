@@ -120,7 +120,10 @@ impl Trail {
         if let Some(root_id) = refish.strip_prefix("root:") {
             return self.ref_from_root(&ObjectId(root_id.to_string()));
         }
-        if refish.starts_with("ch_") {
+        if let Some(change_id) = ChangeId::from_checkpoint_alias(refish) {
+            return self.ref_from_change(&change_id);
+        }
+        if crate::ids::is_change_id(refish) {
             return self.ref_from_change(&ChangeId(refish.to_string()));
         }
         if refish.starts_with("refs/") {
@@ -132,7 +135,7 @@ impl Trail {
         if let Ok(record) = self.get_ref(&lane_ref(refish)) {
             return Ok(record);
         }
-        if refish.starts_with("obj_") {
+        if crate::ids::is_object_id(refish) {
             return self.ref_from_root(&ObjectId(refish.to_string()));
         }
         Err(Error::RefNotFound(refish.to_string()))

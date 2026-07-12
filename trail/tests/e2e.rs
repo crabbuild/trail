@@ -1036,6 +1036,9 @@ fn init_record_why_and_fsck_work() {
 
     let init = Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
     assert_eq!(init.imported.files, 1);
+    assert!(init.workspace_id.0.starts_with("workspace_"));
+    assert!(init.operation.0.starts_with("change_"));
+    assert!(init.root_id.0.starts_with("object_"));
 
     fs::write(temp.path().join("README.md"), "hello\nTrail\n").unwrap();
     let mut db = Trail::open(temp.path()).unwrap();
@@ -1048,6 +1051,8 @@ fn init_record_why_and_fsck_work() {
         )
         .unwrap();
     assert!(record.operation.is_some());
+    assert!(record.operation.as_ref().unwrap().0.starts_with("change_"));
+    assert!(record.root_id.0.starts_with("object_"));
     assert_eq!(record.changed_paths.len(), 1);
 
     let why = db.why("README.md:2", Some("main")).unwrap();
@@ -4469,10 +4474,11 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
             .contains("agent why")));
 
     let checkpoint = changes["groups"][0]["checkpoint"].as_str().unwrap();
+    let checkpoint_alias = checkpoint.replacen("change_", "checkpoint_", 1);
     let before_turn = changes["groups"][0]["before_change"].as_str().unwrap();
     let checkpoint_diff = run_trail_json(
         temp.path(),
-        &["agent", "diff", "latest", "--checkpoint", checkpoint],
+        &["agent", "diff", "latest", "--checkpoint", &checkpoint_alias],
     );
     assert_eq!(checkpoint_diff["after_change"], checkpoint);
 
@@ -6727,7 +6733,7 @@ fn lane_patch_requires_base_change_unless_allow_stale() {
     assert!(err.to_string().contains("allow_stale=true"));
 
     let stale_base: PatchDocument = serde_json::from_value(serde_json::json!({
-        "base_change": "ch_stale",
+        "base_change": "change_stale",
         "edits": [
             {"op": "write", "path": "README.md", "content": "stale base\n"}
         ]
@@ -18041,10 +18047,7 @@ fn same_position_rewrite_preserves_line_identity() {
         .iter()
         .any(|entry| entry.kind == trail::LineChangeKind::Modified));
 
-    let line_id = format!(
-        "{}:{}",
-        before.line_id.origin_change.0, before.line_id.local_seq
-    );
+    let line_id = before.line_id.alias();
     let cli_by_line = run_trail_json(temp.path(), &["why", "--line-id", &line_id, "--at", "main"]);
     assert_eq!(cli_by_line["current_text"], "lane rewrote this line");
     let cli_at_root = run_trail_json(
@@ -18373,6 +18376,7 @@ fn anchors_follow_stable_line_identity() {
     let created = db
         .create_anchor("note.txt:2", "important line", Some("main"))
         .unwrap();
+    assert!(created.anchor.id.0.starts_with("anchor_"));
     assert_eq!(db.list_anchors().unwrap().len(), 1);
     let resolved = db
         .resolve_anchor(&created.anchor.id.0, Some("main"))
@@ -18434,8 +18438,12 @@ fn local_api_and_mcp_expose_review_provenance_and_anchors() {
     let why: serde_json::Value = why.body_json().unwrap();
     assert_eq!(why["current_text"], "lane");
     let line_id = format!(
-        "{}:{}",
-        why["line_id"]["origin_change"].as_str().unwrap(),
+        "line_{}:{}",
+        why["line_id"]["origin_change"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("change_")
+            .unwrap(),
         why["line_id"]["local_seq"].as_u64().unwrap()
     );
 
@@ -18693,6 +18701,14 @@ fn refish_aliases_accept_branch_lane_and_root_selectors() {
     assert!(root_preview.dry_run);
     assert_eq!(root_preview.change_id, branch.from);
     assert_eq!(root_preview.root_id, branch.root_id);
+
+    let checkpoint_selector = branch.from.checkpoint_alias();
+    let checkpoint_preview = db
+        .checkout_with_options(&checkpoint_selector, true, true, None, false)
+        .unwrap();
+    assert!(checkpoint_preview.dry_run);
+    assert_eq!(checkpoint_preview.change_id, branch.from);
+    assert_eq!(checkpoint_preview.root_id, branch.root_id);
 
     let raw_root = branch.root_id.0.clone();
     drop(db);
@@ -19640,7 +19656,7 @@ fn lane_patch_can_replace_stable_line_with_expected_text() {
     db.spawn_lane("doc-bot", Some("main"), false, None, None)
         .unwrap();
     let why = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
-    let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+    let line_id = why.line_id.alias();
     let missing_expected: PatchDocument = serde_json::from_value(serde_json::json!({
         "message": "line-id patch without guard",
         "edits": [{
@@ -19691,7 +19707,7 @@ fn lane_patch_can_replace_stable_line_with_expected_text() {
         "edits": [{
             "op": "replace_line",
             "path": "README.md",
-            "line_id": format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq),
+            "line_id": why.line_id.alias(),
             "expected_text": "two",
             "new_text": "stale"
         }]
@@ -19699,7 +19715,7 @@ fn lane_patch_can_replace_stable_line_with_expected_text() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "doc-bot", stale_patch).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(_)));
-    assert!(err.to_string().contains("expected text mismatch"));
+    assert!(err.to_string().contains("expected text mismatch"), "{err}");
 }
 
 #[test]
@@ -19717,14 +19733,8 @@ fn lane_patch_rejected_line_id_batch_rolls_back_candidate_objects() {
     let second = db
         .why("README.md:2", Some("refs/lanes/atomic-line-bot"))
         .unwrap();
-    let first_line_id = format!(
-        "{}:{}",
-        first.line_id.origin_change.0, first.line_id.local_seq
-    );
-    let second_line_id = format!(
-        "{}:{}",
-        second.line_id.origin_change.0, second.line_id.local_seq
-    );
+    let first_line_id = first.line_id.alias();
+    let second_line_id = second.line_id.alias();
 
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let count_rows = |table: &str| -> i64 {
@@ -19758,7 +19768,7 @@ fn lane_patch_rejected_line_id_batch_rolls_back_candidate_objects() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "atomic-line-bot", patch).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(_)));
-    assert!(err.to_string().contains("expected text mismatch"));
+    assert!(err.to_string().contains("expected text mismatch"), "{err}");
 
     assert_eq!(count_rows("objects"), objects_before);
     assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
@@ -19845,7 +19855,7 @@ fn lane_patch_replace_line_fuzzes_batch_expected_text_edits() {
                 Some("refs/lanes/line-fuzz-bot"),
             )
             .unwrap();
-        let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+        let line_id = why.line_id.alias();
         expected_ids.push(why.line_id);
         edits.push(serde_json::json!({
             "op": "replace_line",
@@ -25275,6 +25285,10 @@ fn show_history_and_code_from_use_recorded_indexes() {
         }
         other => panic!("expected operation show result, got {other:?}"),
     }
+    match db.show(&applied.operation.checkpoint_alias()).unwrap() {
+        ShowResult::Operation { value } => assert_eq!(value.operation.change_id, applied.operation),
+        other => panic!("expected checkpoint alias to show operation, got {other:?}"),
+    }
 
     let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
     let message_id: String = conn
@@ -25282,6 +25296,7 @@ fn show_history_and_code_from_use_recorded_indexes() {
             row.get(0)
         })
         .unwrap();
+    assert!(message_id.starts_with("message_"));
     match db.show(&message_id).unwrap() {
         ShowResult::Message { value } => assert_eq!(value.body, "lane adds line"),
         other => panic!("expected message show result, got {other:?}"),
@@ -25291,7 +25306,8 @@ fn show_history_and_code_from_use_recorded_indexes() {
     assert!(file_history.file_history.len() >= 2);
 
     let why = db.why("README.md:2", Some("refs/lanes/doc-bot")).unwrap();
-    let line_id = format!("{}:{}", why.line_id.origin_change.0, why.line_id.local_seq);
+    let line_id = why.line_id.alias();
+    assert!(line_id.starts_with("line_"));
     let line_history = db.history_for_line_id(&line_id).unwrap();
     assert!(!line_history.line_history.is_empty());
 
@@ -25389,7 +25405,7 @@ fn gc_prunes_unreachable_known_objects_and_preserves_reachable_roots() {
     conn.execute(
         "INSERT INTO objects \
          (object_id, kind, version, codec, hash_alg, size_bytes, bytes, created_at) \
-         VALUES ('obj_unreachable_test', 'Blob', 1, 'cbor', 'sha256', 0, x'', 0)",
+         VALUES ('object_unreachable_test', 'Blob', 1, 'cbor', 'sha256', 0, x'', 0)",
         [],
     )
     .unwrap();
@@ -25403,7 +25419,7 @@ fn gc_prunes_unreachable_known_objects_and_preserves_reachable_roots() {
     assert!(report.pruned_objects >= 1);
     let still_exists: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM objects WHERE object_id = 'obj_unreachable_test'",
+            "SELECT COUNT(*) FROM objects WHERE object_id = 'object_unreachable_test'",
             [],
             |row| row.get(0),
         )

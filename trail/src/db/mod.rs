@@ -1117,7 +1117,7 @@ mod tests {
                 "op": op,
                 "path": path,
                 "line_id": if seed % 2 == 0 {
-                    serde_json::json!("change_abc:1")
+                    serde_json::json!("line_abc:1")
                 } else {
                     serde_json::json!(1)
                 },

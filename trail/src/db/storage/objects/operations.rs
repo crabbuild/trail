@@ -134,7 +134,7 @@ mod tests {
         let db = Trail::open(temp.path()).unwrap();
         let operation = Operation {
             version: OP_OBJECT_VERSION,
-            change_id: ChangeId("ch_secret_message".to_string()),
+            change_id: ChangeId("change_secret_message".to_string()),
             kind: OperationKind::ManualCheckpoint,
             parents: Vec::new(),
             before_root: None,
@@ -155,7 +155,7 @@ mod tests {
             .conn
             .query_row(
                 "SELECT message FROM operations WHERE change_id = ?1",
-                params!["ch_secret_message"],
+                params!["change_secret_message"],
                 |row| row.get(0),
             )
             .unwrap();

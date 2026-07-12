@@ -96,7 +96,7 @@ mutating the lane.
     {
       "op": "replace_line",
       "path": "README.md",
-      "line_id": "ch_abc:2",
+      "line_id": "line_abc:2",
       "expected_text": "old text",
       "new_text": "new text"
     }

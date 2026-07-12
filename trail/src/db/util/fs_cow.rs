@@ -436,7 +436,7 @@ mod tests {
     use super::*;
 
     fn parallel_cow_clone_test_entry(bytes: &[u8]) -> FileEntry {
-        let change = ChangeId("ch_test".to_string());
+        let change = ChangeId("change_test".to_string());
         FileEntry {
             file_id: FileId::new(change.clone(), 1),
             kind: FileKind::Text,

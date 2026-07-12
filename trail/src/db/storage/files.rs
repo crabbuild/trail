@@ -831,7 +831,7 @@ mod tests {
                 &head.root_id,
                 &previous,
                 &target,
-                &ChangeId("ch_collision_test".to_string()),
+                &ChangeId("change_collision_test".to_string()),
             )
             .unwrap_err();
 
@@ -865,7 +865,10 @@ mod tests {
         let prolly_nodes_before = count_rows("prolly_nodes");
 
         let err = db
-            .build_root_from_file_entries(files, &ChangeId("ch_full_collision_test".to_string()))
+            .build_root_from_file_entries(
+                files,
+                &ChangeId("change_full_collision_test".to_string()),
+            )
             .unwrap_err();
 
         assert!(
@@ -907,7 +910,7 @@ mod tests {
         let err = db
             .build_root_from_disk_files(
                 &disk_files,
-                &ChangeId("ch_disk_file_collision_test".to_string()),
+                &ChangeId("change_disk_file_collision_test".to_string()),
                 None,
             )
             .unwrap_err();
@@ -941,7 +944,7 @@ mod tests {
         let err = db
             .build_root_from_worktree_paths(
                 &["README.md".to_string(), "readme.md".to_string()],
-                &ChangeId("ch_path_list_collision_test".to_string()),
+                &ChangeId("change_path_list_collision_test".to_string()),
             )
             .unwrap_err();
 
@@ -976,7 +979,7 @@ mod tests {
             .build_root_from_git_tracked_paths_incremental(
                 &["readme.md".to_string()],
                 &head.root_id,
-                &ChangeId("ch_git_incremental_collision_test".to_string()),
+                &ChangeId("change_git_incremental_collision_test".to_string()),
             )
             .unwrap_err();
 

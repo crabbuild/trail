@@ -23,10 +23,11 @@ impl Trail {
     }
 
     pub fn history_for_line_id(&self, line_id: &str) -> Result<HistoryResult> {
+        let storage_line_id = line_id_key_value(&parse_line_id_key(line_id)?);
         Ok(HistoryResult {
             selector: line_id.to_string(),
             file_history: Vec::new(),
-            line_history: self.line_history_by_line_id(line_id)?,
+            line_history: self.line_history_by_line_id(&storage_line_id)?,
         })
     }
 
@@ -34,7 +35,7 @@ impl Trail {
         let mut changes = Vec::new();
         if let Some(lane) = selector.strip_prefix("lane:") {
             changes.extend(self.lane_change_ids(lane)?);
-        } else if selector.starts_with("msg_") {
+        } else if selector.starts_with(crate::ids::MESSAGE_ID_PREFIX) {
             let change_id: Option<String> = self
                 .conn
                 .query_row(
@@ -49,8 +50,13 @@ impl Trail {
                 )));
             };
             changes.push(ChangeId(change_id));
-        } else if selector.starts_with("ch_") {
-            changes.push(ChangeId(selector.to_string()));
+        } else if crate::ids::is_change_id(selector)
+            || ChangeId::from_checkpoint_alias(selector).is_some()
+        {
+            changes.push(
+                ChangeId::from_checkpoint_alias(selector)
+                    .unwrap_or_else(|| ChangeId(selector.to_string())),
+            );
         } else if selector.starts_with("session_") {
             changes.extend(self.session_change_ids(selector)?);
         } else if let Ok(lane) = self.lane_branch(selector) {

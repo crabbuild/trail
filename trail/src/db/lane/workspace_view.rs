@@ -1583,7 +1583,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let change = ChangeId("ch_layered_native_equivalence".to_string());
+        let change = ChangeId("change_layered_native_equivalence".to_string());
         let layered = db
             .build_root_for_selected_disk_files_incremental(
                 &root,
