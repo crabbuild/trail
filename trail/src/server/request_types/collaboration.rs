@@ -105,17 +105,16 @@ pub(crate) struct AnchorCreateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeQueueAddRequest {
-    pub(crate) source: String,
-    #[serde(alias = "into", alias = "target_branch")]
-    pub(crate) target: String,
+pub(crate) struct LaneMergeQueueAddRequest {
+    pub(crate) lane: String,
+    pub(crate) into: String,
     #[serde(default)]
     pub(crate) priority: i64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MergeQueueRunRequest {
+pub(crate) struct LaneMergeQueueRunRequest {
     #[serde(default)]
     pub(crate) limit: Option<usize>,
 }

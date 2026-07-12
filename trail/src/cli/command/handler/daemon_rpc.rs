@@ -827,23 +827,22 @@ fn handle_lane_merge_queue_command(
         LaneMergeQueueSubcommand::Add(args) => {
             let body = serde_json::json!({
                 "lane": args.lane,
-                "target": args.into,
+                "into": args.into,
                 "priority": args.priority,
             });
-            let report: LaneMergeQueueAddReport = client.post_json("/v1/merge-queue", &body)?;
+            let report: LaneMergeQueueAddReport =
+                client.post_json("/v1/lanes/merges/queue", &body)?;
             render_lane_merge_queue_add(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneMergeQueueSubcommand::List => {
-            let entries: Vec<LaneMergeQueueEntry> = client.get_json("/v1/merge-queue")?;
+            let entries: Vec<LaneMergeQueueEntry> = client.get_json("/v1/lanes/merges/queue")?;
             render_lane_merge_queue_list(&entries, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneMergeQueueSubcommand::Explain(args) => {
-            let report: LaneMergeQueueExplainReport = client.get_json(&format!(
-                "/v1/merge-queue/explain?selector={}",
-                args.selector
-            ))?;
+            let report: LaneMergeQueueExplainReport =
+                client.get_json(&format!("/v1/lanes/merges/queue/{}/explain", args.selector))?;
             render_lane_merge_queue_explain(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
@@ -852,13 +851,14 @@ fn handle_lane_merge_queue_command(
                 Some(limit) => serde_json::json!({ "limit": limit }),
                 None => serde_json::json!({}),
             };
-            let report: LaneMergeQueueRunReport = client.post_json("/v1/merge-queue/run", &body)?;
+            let report: LaneMergeQueueRunReport =
+                client.post_json("/v1/lanes/merges/queue/run", &body)?;
             render_lane_merge_queue_run(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }
         LaneMergeQueueSubcommand::Remove(args) => {
             let report: LaneMergeQueueRemoveReport =
-                client.delete_json(&format!("/v1/merge-queue/{}", args.selector))?;
+                client.delete_json(&format!("/v1/lanes/merges/queue/{}", args.selector))?;
             render_lane_merge_queue_remove(&report, ctx.json, &ctx.render)?;
             Ok(true)
         }

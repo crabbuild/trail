@@ -78,7 +78,12 @@ pub(super) fn handle_lane_resources(
         return Ok(Some(json_response(200, "OK", &report)?));
     }
 
-    if parts.len() == 4 && parts[0] == "v1" && parts[1] == "lanes" && request.method == "GET" {
+    if parts.len() == 4
+        && parts[0] == "v1"
+        && parts[1] == "lanes"
+        && path != "/v1/lanes/merges/queue"
+        && request.method == "GET"
+    {
         let lane = db.resolve_lane_handle(parts[2])?;
         return Ok(Some(match parts[3] {
             "status" => {

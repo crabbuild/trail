@@ -92,6 +92,9 @@ fn http_actor(request: &HttpRequest) -> String {
 }
 
 fn http_request_lane(path: &str, parts: &[&str], body: Option<&Value>) -> Option<String> {
+    if path == "/v1/lanes/merges/queue" {
+        return body.and_then(|value| top_level_string_for_keys(value, &["lane"]));
+    }
     if parts.len() >= 3 && parts[0] == "v1" && parts[1] == "lanes" {
         return Some(parts[2].to_string());
     }
@@ -99,7 +102,6 @@ fn http_request_lane(path: &str, parts: &[&str], body: Option<&Value>) -> Option
         "/v1/lane/turns" | "/v1/sessions" | "/v1/leases" | "/v1/approvals" | "/v1/lane/runs" => {
             body.and_then(|value| top_level_string_for_keys(value, &["lane"]))
         }
-        "/v1/merge-queue" => body.and_then(|value| top_level_string_for_keys(value, &["source"])),
         _ => None,
     }
 }
@@ -117,11 +119,9 @@ fn http_request_target_ref(path: &str, parts: &[&str], body: Option<&Value>) -> 
             .and_then(|value| top_level_string_for_keys(value, &["into"]))
             .map(|target| http_branch_ref(&target));
     }
-    if path == "/v1/merge-queue" {
+    if path == "/v1/lanes/merges/queue" {
         return body
-            .and_then(|value| {
-                top_level_string_for_keys(value, &["target", "target_branch", "into"])
-            })
+            .and_then(|value| top_level_string_for_keys(value, &["into"]))
             .map(|target| http_branch_ref(&target));
     }
     None

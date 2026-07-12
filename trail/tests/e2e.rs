@@ -23848,11 +23848,14 @@ fn local_http_bodyless_mutations_reject_request_bodies() {
         &mut db,
         &api_request(
             "DELETE",
-            &format!("/v1/merge-queue/{}", queued.queue_id),
+            &format!("/v1/lanes/merges/queue/{}", queued.queue_id),
             serde_json::json!({ "unexpected": true }),
         ),
     );
-    assert_rejected(&bad_queue_remove, "DELETE /v1/merge-queue/{queue_id}");
+    assert_rejected(
+        &bad_queue_remove,
+        "DELETE /v1/lanes/merges/queue/{selector}",
+    );
     assert!(db
         .list_lane_merge_queue()
         .unwrap()
@@ -24224,6 +24227,74 @@ fn lane_merge_queue_rejects_branch_sources() {
 }
 
 #[test]
+fn local_api_drives_lane_merge_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("api-bot", Some("main"), false, None, None)
+        .unwrap();
+    let add = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/merges/queue",
+            serde_json::json!({
+                "lane": "api-bot",
+                "into": "main",
+                "priority": 10
+            }),
+        ),
+    );
+    assert_eq!(add.status, 201);
+    let add: serde_json::Value = add.body_json().unwrap();
+    assert_eq!(add["entry"]["lane"], "api-bot");
+    assert!(add["entry"]["queue_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("lmq_"));
+
+    let list = trail::server::handle_http_request(
+        &mut db,
+        &api_request("GET", "/v1/lanes/merges/queue", serde_json::Value::Null),
+    );
+    assert_eq!(list.status, 200);
+    assert_eq!(
+        list.body_json::<serde_json::Value>().unwrap()[0]["lane"],
+        "api-bot"
+    );
+
+    let aliased_body = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/lanes/merges/queue",
+            serde_json::json!({"source": "api-bot", "target": "main"}),
+        ),
+    );
+    assert_eq!(aliased_body.status, 400);
+
+    let legacy = trail::server::handle_http_request(
+        &mut db,
+        &api_request(
+            "POST",
+            "/v1/merge-queue",
+            serde_json::json!({"source": "api-bot", "target": "main"}),
+        ),
+    );
+    assert_eq!(legacy.status, 400);
+
+    let openapi = trail::server::openapi_spec();
+    assert!(openapi["paths"].get("/v1/lanes/merges/queue").is_some());
+    assert!(openapi["paths"].get("/v1/merge-queue").is_none());
+    assert_eq!(
+        openapi["components"]["schemas"]["LaneMergeQueueAddRequest"]["required"],
+        serde_json::json!(["lane", "into"])
+    );
+}
+
+#[test]
 fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_state() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\nworld\n").unwrap();
@@ -24265,7 +24336,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         &mut db,
         &api_request(
             "GET",
-            &format!("/v1/merge-queue/{queue_id}/explain"),
+            &format!("/v1/lanes/merges/queue/{queue_id}/explain"),
             serde_json::Value::Null,
         ),
     );
@@ -24282,16 +24353,13 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         &mut db,
         &api_request(
             "GET",
-            "/v1/merge-queue/explain?selector=refs/lanes/explain-bot",
+            "/v1/lanes/merges/queue/explain-bot/explain",
             serde_json::Value::Null,
         ),
     );
     assert_eq!(api_ref_explain.status, 200);
     let api_ref_explain: serde_json::Value = api_ref_explain.body_json().unwrap();
-    assert_eq!(
-        api_ref_explain["entry"]["source_ref"],
-        "refs/lanes/explain-bot"
-    );
+    assert_eq!(api_ref_explain["entry"]["lane"], "explain-bot");
 
     let tools = trail::mcp::handle_json_rpc(
         &mut db,
@@ -24336,7 +24404,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
         temp.path(),
         &["lane", "merge-queue", "explain", "explain-bot"],
     );
-    assert_eq!(cli["entry"]["source_ref"], "refs/lanes/explain-bot");
+    assert_eq!(cli["entry"]["lane"], "explain-bot");
     assert!(cli["blockers"]
         .as_array()
         .unwrap()
@@ -24370,7 +24438,7 @@ fn merge_queue_explain_reports_dry_run_conflicts_without_recording_conflict_stat
     let daemon_cli = run_trail_json_daemon(
         temp.path(),
         &daemon_url,
-        &["lane", "merge-queue", "explain", "refs/lanes/explain-bot"],
+        &["lane", "merge-queue", "explain", "explain-bot"],
     );
     assert_eq!(daemon_cli["entry"]["queue_id"], queue_id);
     assert!(daemon_cli["blockers"]
@@ -25053,10 +25121,10 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
         &mut db,
         &api_request(
             "POST",
-            "/v1/merge-queue",
+            "/v1/lanes/merges/queue",
             serde_json::json!({
-                "source": "api-queue-bot",
-                "target": "main",
+                "lane": "api-queue-bot",
+                "into": "main",
                 "priority": 5
             }),
         ),
@@ -25068,7 +25136,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
 
     let listed = trail::server::handle_http_request(
         &mut db,
-        &api_request("GET", "/v1/merge-queue", serde_json::Value::Null),
+        &api_request("GET", "/v1/lanes/merges/queue", serde_json::Value::Null),
     );
     assert_eq!(listed.status, 200);
     let listed: serde_json::Value = listed.body_json().unwrap();
@@ -25135,7 +25203,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
 
     let run = trail::server::handle_http_request(
         &mut db,
-        &api_request("POST", "/v1/merge-queue/run", serde_json::json!({})),
+        &api_request("POST", "/v1/lanes/merges/queue/run", serde_json::json!({})),
     );
     assert_eq!(run.status, 200);
     let run: serde_json::Value = run.body_json().unwrap();
@@ -25279,7 +25347,7 @@ fn local_api_and_mcp_drive_merge_queue_and_conflicts() {
         &mut db,
         &api_request(
             "DELETE",
-            &format!("/v1/merge-queue/{cancel_queue_id}"),
+            &format!("/v1/lanes/merges/queue/{cancel_queue_id}"),
             serde_json::Value::Null,
         ),
     );

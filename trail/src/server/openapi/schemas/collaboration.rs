@@ -78,19 +78,19 @@ pub(super) fn collaboration_schemas() -> Value {
                 "branch": { "type": "string" }
             }
         },
-        "MergeQueueAddRequest": {
+        "LaneMergeQueueAddRequest": {
             "type": "object",
-            "required": ["source", "target"],
+            "required": ["lane", "into"],
+            "additionalProperties": false,
             "properties": {
-                "source": { "type": "string" },
-                "target": { "type": "string" },
+                "lane": { "type": "string" },
                 "into": { "type": "string" },
-                "target_branch": { "type": "string" },
                 "priority": { "type": "integer" }
             }
         },
-        "MergeQueueRunRequest": {
+        "LaneMergeQueueRunRequest": {
             "type": "object",
+            "additionalProperties": false,
             "properties": { "limit": { "type": "integer", "minimum": 1 } }
         },
         "ConflictSetSummary": {

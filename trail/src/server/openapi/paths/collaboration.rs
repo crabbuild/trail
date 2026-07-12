@@ -79,25 +79,20 @@ pub(super) fn collaboration_paths() -> Value {
                 openapi_path_param("anchor_id", "string")
             ], None, true)
         },
-        "/v1/merge-queue": {
-            "get": openapi_operation("mergeQueueList", "List merge queue", "List merge queue entries.", vec![], None, true),
-            "post": openapi_operation("mergeQueueAdd", "Queue merge", "Queue a lane or branch for serialized merge.", vec![], Some("MergeQueueAddRequest"), true)
+        "/v1/lanes/merges/queue": {
+            "get": openapi_operation("laneMergeQueueList", "List lane merge queue", "List lane merge queue entries.", vec![], None, true),
+            "post": openapi_operation("laneMergeQueueAdd", "Queue lane merge", "Queue a lane for serialized merge.", vec![], Some("LaneMergeQueueAddRequest"), true)
         },
-        "/v1/merge-queue/run": {
-            "post": openapi_operation("mergeQueueRun", "Run merge queue", "Run queued merges serially.", vec![], Some("MergeQueueRunRequest"), true)
+        "/v1/lanes/merges/queue/run": {
+            "post": openapi_operation("laneMergeQueueRun", "Run lane merge queue", "Run queued lane merges serially.", vec![], Some("LaneMergeQueueRunRequest"), true)
         },
-        "/v1/merge-queue/explain": {
-            "get": openapi_operation("mergeQueueExplainByQuery", "Explain merge queue entry", "Explain why a queued merge is ready or blocked.", vec![
-                openapi_query("selector", "string")
-            ], None, true)
-        },
-        "/v1/merge-queue/{selector}": {
-            "delete": openapi_operation("mergeQueueRemove", "Remove queue entry", "Cancel a queued or conflicted merge queue entry.", vec![
+        "/v1/lanes/merges/queue/{selector}": {
+            "delete": openapi_operation("laneMergeQueueRemove", "Remove lane queue entry", "Cancel a queued or conflicted lane merge queue entry.", vec![
                 openapi_path_param("selector", "string")
             ], None, true)
         },
-        "/v1/merge-queue/{selector}/explain": {
-            "get": openapi_operation("mergeQueueExplain", "Explain merge queue entry", "Explain why a queued merge is ready or blocked.", vec![
+        "/v1/lanes/merges/queue/{selector}/explain": {
+            "get": openapi_operation("laneMergeQueueExplain", "Explain lane merge queue entry", "Explain why a queued lane merge is ready or blocked.", vec![
                 openapi_path_param("selector", "string")
             ], None, true)
         },
