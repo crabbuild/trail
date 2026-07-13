@@ -147,6 +147,7 @@ impl Trail {
                 lane_id TEXT NOT NULL,
                 trail_session_id TEXT NOT NULL,
                 cwd TEXT NOT NULL,
+                path_mappings_json TEXT NOT NULL DEFAULT '[]',
                 provider TEXT,
                 model TEXT,
                 upstream_command_json TEXT,
@@ -807,6 +808,12 @@ impl Trail {
                 "TEXT NOT NULL DEFAULT 'unknown'",
             )?;
             ensure_column(&self.conn, "lane_events", "session_id", "TEXT")?;
+            ensure_column(
+                &self.conn,
+                "lane_acp_sessions",
+                "path_mappings_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
             ensure_column(
                 &self.conn,
                 "worktree_file_index",

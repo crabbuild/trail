@@ -22,6 +22,13 @@ pub struct LaneSessionContextReport {
     pub recent_operations: Vec<TimelineEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcpPathMapping {
+    pub original: String,
+    pub effective: String,
+    pub isolated: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneAcpSession {
     pub acp_session_id: String,
@@ -29,6 +36,7 @@ pub struct LaneAcpSession {
     pub lane_id: String,
     pub trail_session_id: String,
     pub cwd: String,
+    pub path_mappings: Vec<AcpPathMapping>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub upstream_command_json: Option<String>,

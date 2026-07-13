@@ -20,7 +20,9 @@ mod transport;
 
 use protocol::{Direction, Frame};
 use schema::AcpV1Contract;
-use transform::{TransformOptions, TransformPipeline};
+use transform::{
+    passthrough_session_mappings, PathMapping, TransformOptions, TransformPipeline, WorkspaceMapper,
+};
 use transport::{FrameObserver, RelayFinishReason, StdioRelay};
 
 pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
@@ -522,6 +524,8 @@ struct SessionState {
     trail_session_id: String,
     original_cwd: String,
     effective_cwd: String,
+    materialized_root: Option<String>,
+    path_mappings: Vec<AcpPathMapping>,
     materialized: bool,
 }
 
@@ -794,17 +798,29 @@ impl CaptureCoordinator {
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let session = self.ensure_capture_session(
+        let mut session = self.ensure_capture_session(
             &method,
             requested_acp_session_id.as_deref(),
             &original_cwd,
         )?;
 
-        if session.effective_cwd != original_cwd {
-            params.insert(
-                "cwd".to_string(),
-                Value::String(session.effective_cwd.clone()),
-            );
+        if let Some(materialized_root) = &session.materialized_root {
+            let mapper = WorkspaceMapper::new(
+                self.options.workspace_root.clone(),
+                PathBuf::from(materialized_root),
+            )?;
+            let mappings = mapper.map_session_params(params)?;
+            session.effective_cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or(&original_cwd)
+                .to_string();
+            session.path_mappings = mappings.into_iter().map(acp_path_mapping).collect();
+        } else {
+            session.path_mappings = passthrough_session_mappings(params)?
+                .into_iter()
+                .map(acp_path_mapping)
+                .collect();
         }
         if self.options.inject_mcp {
             inject_trail_mcp_server(params, &self.options)?;
@@ -838,16 +854,18 @@ impl CaptureCoordinator {
             let db = self.open_db()?;
             if let Some(mapping) = db.try_lane_acp_session(acp_session_id)? {
                 let lane_name = db.resolve_lane_handle(&mapping.lane_id)?;
-                let effective_cwd =
-                    self.materialized_cwd_for_existing_lane(&lane_name, original_cwd)?;
+                let materialized_root = self.materialized_root_for_existing_lane(&lane_name)?;
+                let effective_cwd = original_cwd.to_string();
                 let state = SessionState {
                     acp_session_id: acp_session_id.to_string(),
                     upstream_session_id: mapping.upstream_session_id,
                     lane_name,
                     trail_session_id: mapping.trail_session_id,
                     original_cwd: original_cwd.to_string(),
-                    materialized: effective_cwd != original_cwd,
                     effective_cwd,
+                    materialized: materialized_root.is_some(),
+                    materialized_root,
+                    path_mappings: mapping.path_mappings,
                 };
                 return Ok(state);
             }
@@ -875,15 +893,23 @@ impl CaptureCoordinator {
         }
 
         let details = db.lane_details(&lane_name)?;
-        let effective_cwd = if self.options.materialize {
-            details
-                .branch
-                .workdir
-                .clone()
-                .unwrap_or_else(|| original_cwd.to_string())
+        let materialized_root = if self.options.materialize {
+            details.branch.workdir.clone()
         } else {
-            original_cwd.to_string()
+            None
         };
+        let initial_mapping = if let Some(root) = &materialized_root {
+            WorkspaceMapper::new(self.options.workspace_root.clone(), PathBuf::from(root))?
+                .map(PathBuf::from(original_cwd).as_path())?
+        } else {
+            PathMapping {
+                original: PathBuf::from(original_cwd),
+                effective: PathBuf::from(original_cwd),
+                isolated: false,
+            }
+        };
+        let effective_cwd = initial_mapping.effective.to_string_lossy().to_string();
+        let path_mappings = vec![acp_path_mapping(initial_mapping)];
         let title = Some(format!("ACP {method}"));
         let session = db.start_lane_session(&lane_name, title, None)?.session;
         db.add_lane_session_event(
@@ -896,6 +922,7 @@ impl CaptureCoordinator {
                 "requested_acp_session_id": acp_session_id,
                 "cwd": original_cwd,
                 "effective_cwd": effective_cwd,
+                "path_mappings": path_mappings,
                 "provider": self.options.provider,
                 "model": self.options.model,
                 "materialized": self.options.materialize
@@ -913,22 +940,20 @@ impl CaptureCoordinator {
             trail_session_id: session.session_id,
             original_cwd: original_cwd.to_string(),
             effective_cwd,
-            materialized: self.options.materialize && details.branch.workdir.is_some(),
+            materialized: materialized_root.is_some(),
+            materialized_root,
+            path_mappings,
         })
     }
 
-    fn materialized_cwd_for_existing_lane(
-        &self,
-        lane_name: &str,
-        original_cwd: &str,
-    ) -> Result<String> {
+    fn materialized_root_for_existing_lane(&self, lane_name: &str) -> Result<Option<String>> {
         if !self.options.materialize {
-            return Ok(original_cwd.to_string());
+            return Ok(None);
         }
         let mut db = self.open_db()?;
         let report =
             db.ensure_lane_workdir_materialized(lane_name, self.options.workdir.clone())?;
-        Ok(report.workdir.unwrap_or_else(|| original_cwd.to_string()))
+        Ok(report.workdir)
     }
 
     fn finish_session_request(&mut self, message: &Value, pending: PendingSession) -> Result<()> {
@@ -959,6 +984,7 @@ impl CaptureCoordinator {
             &session.lane_name,
             &session.trail_session_id,
             &session.effective_cwd,
+            &session.path_mappings,
             self.options.provider.as_deref(),
             self.options.model.as_deref(),
             self.upstream_command_json.as_deref(),
@@ -975,6 +1001,7 @@ impl CaptureCoordinator {
                 "upstream_session_id": response_session_id(message),
                 "cwd": session.original_cwd,
                 "effective_cwd": session.effective_cwd,
+                "path_mappings": session.path_mappings,
                 "status": status
             }))),
         )?;
@@ -1686,14 +1713,23 @@ impl CaptureCoordinator {
             return Ok(None);
         };
         let lane_name = db.resolve_lane_handle(&mapping.lane_id)?;
+        let materialized_root = db.lane_details(&lane_name)?.branch.workdir;
+        let original_cwd = mapping
+            .path_mappings
+            .iter()
+            .find(|path| path.effective == mapping.cwd)
+            .map(|path| path.original.clone())
+            .unwrap_or_else(|| mapping.cwd.clone());
         Ok(Some(SessionState {
             acp_session_id: mapping.acp_session_id,
             upstream_session_id: mapping.upstream_session_id,
             lane_name,
             trail_session_id: mapping.trail_session_id,
-            original_cwd: mapping.cwd.clone(),
+            original_cwd,
             effective_cwd: mapping.cwd,
-            materialized: false,
+            materialized: mapping.path_mappings.iter().any(|path| path.isolated),
+            materialized_root,
+            path_mappings: mapping.path_mappings,
         }))
     }
 
@@ -1829,6 +1865,14 @@ fn inject_trail_mcp_server(
         servers.push(server);
     }
     Ok(())
+}
+
+fn acp_path_mapping(mapping: PathMapping) -> AcpPathMapping {
+    AcpPathMapping {
+        original: mapping.original.to_string_lossy().to_string(),
+        effective: mapping.effective.to_string_lossy().to_string(),
+        isolated: mapping.isolated,
+    }
 }
 
 fn trail_mcp_server(options: &AcpRelayOptions) -> Value {

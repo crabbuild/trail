@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -6,6 +10,224 @@ use super::protocol::{CorrelationKey, Direction, EnvelopeKind, Frame, RequestId}
 use super::schema::AcpV1Contract;
 use super::AcpRelayOptions;
 use crate::{Error, Result};
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PathMapping {
+    pub original: PathBuf,
+    pub effective: PathBuf,
+    pub isolated: bool,
+}
+
+pub(crate) struct WorkspaceMapper {
+    workspace_root: PathBuf,
+    materialized_root: PathBuf,
+}
+
+impl WorkspaceMapper {
+    pub(crate) fn new(workspace_root: PathBuf, materialized_root: PathBuf) -> Result<Self> {
+        let workspace_root = resolve_existing_ancestors(&workspace_root)?;
+        let materialized_root = resolve_existing_ancestors(&materialized_root)?;
+        Ok(Self {
+            workspace_root,
+            materialized_root,
+        })
+    }
+
+    pub(crate) fn map(&self, path: &Path) -> Result<PathMapping> {
+        let original = path.to_path_buf();
+        if looks_like_foreign_absolute_path(path) {
+            return Ok(PathMapping {
+                effective: original.clone(),
+                original,
+                isolated: false,
+            });
+        }
+        if !path.is_absolute() {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().to_string(),
+                reason: "ACP workspace paths must be absolute".to_string(),
+            });
+        }
+        let resolved = resolve_existing_ancestors(path)?;
+        let Ok(relative) = resolved.strip_prefix(&self.workspace_root) else {
+            return Ok(PathMapping {
+                effective: original.clone(),
+                original,
+                isolated: false,
+            });
+        };
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(Error::InvalidPath {
+                path: path.to_string_lossy().to_string(),
+                reason: "ACP workspace mapping escapes its workspace root".to_string(),
+            });
+        }
+        let effective = if relative.as_os_str().is_empty() {
+            self.materialized_root.clone()
+        } else {
+            self.materialized_root.join(relative)
+        };
+        let resolved_effective = resolve_existing_ancestors(&effective)?;
+        if !resolved_effective.starts_with(&self.materialized_root) {
+            return Err(Error::InvalidPath {
+                path: effective.to_string_lossy().to_string(),
+                reason: "ACP workspace mapping escapes its materialized root".to_string(),
+            });
+        }
+        fs::create_dir_all(&effective)?;
+        Ok(PathMapping {
+            original,
+            effective,
+            isolated: true,
+        })
+    }
+
+    pub(crate) fn map_session_params(
+        &self,
+        params: &mut Map<String, Value>,
+    ) -> Result<Vec<PathMapping>> {
+        let mut mappings = Vec::new();
+        let mut effective_roots = HashSet::new();
+        if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+            let mapping = self.map(Path::new(cwd))?;
+            params.insert(
+                "cwd".to_string(),
+                Value::String(mapping.effective.to_string_lossy().to_string()),
+            );
+            effective_roots.insert(mapping.effective.clone());
+            mappings.push(mapping);
+        }
+
+        if let Some(additional) = params.get_mut("additionalDirectories") {
+            let directories = additional.as_array_mut().ok_or_else(|| {
+                Error::InvalidInput(
+                    "ACP session additionalDirectories must be an array".to_string(),
+                )
+            })?;
+            let mut forwarded = Vec::with_capacity(directories.len());
+            for directory in directories.iter() {
+                let path = directory.as_str().ok_or_else(|| {
+                    Error::InvalidInput(
+                        "ACP session additionalDirectories entries must be strings".to_string(),
+                    )
+                })?;
+                let mapping = self.map(Path::new(path))?;
+                if effective_roots.insert(mapping.effective.clone()) {
+                    forwarded.push(Value::String(
+                        mapping.effective.to_string_lossy().to_string(),
+                    ));
+                    mappings.push(mapping);
+                }
+            }
+            *directories = forwarded;
+        }
+        Ok(mappings)
+    }
+}
+
+pub(crate) fn passthrough_session_mappings(
+    params: &Map<String, Value>,
+) -> Result<Vec<PathMapping>> {
+    let mut mappings = Vec::new();
+    let mut roots = HashSet::new();
+    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+        let path = PathBuf::from(cwd);
+        roots.insert(path.clone());
+        mappings.push(PathMapping {
+            original: path.clone(),
+            effective: path,
+            isolated: false,
+        });
+    }
+    if let Some(additional) = params.get("additionalDirectories") {
+        let directories = additional.as_array().ok_or_else(|| {
+            Error::InvalidInput("ACP session additionalDirectories must be an array".to_string())
+        })?;
+        for directory in directories {
+            let path = directory.as_str().ok_or_else(|| {
+                Error::InvalidInput(
+                    "ACP session additionalDirectories entries must be strings".to_string(),
+                )
+            })?;
+            let path = PathBuf::from(path);
+            if roots.insert(path.clone()) {
+                mappings.push(PathMapping {
+                    original: path.clone(),
+                    effective: path,
+                    isolated: false,
+                });
+            }
+        }
+    }
+    Ok(mappings)
+}
+
+fn resolve_existing_ancestors(path: &Path) -> Result<PathBuf> {
+    let normalized = normalize_absolute(path)?;
+    let mut ancestor = normalized.as_path();
+    let mut suffix = Vec::<OsString>::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(canonical) => {
+                return Ok(suffix
+                    .iter()
+                    .rev()
+                    .fold(canonical, |resolved, component| resolved.join(component)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| Error::InvalidPath {
+                    path: path.to_string_lossy().to_string(),
+                    reason: "ACP path has no existing ancestor".to_string(),
+                })?;
+                suffix.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| Error::InvalidPath {
+                    path: path.to_string_lossy().to_string(),
+                    reason: "ACP path has no existing ancestor".to_string(),
+                })?;
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+}
+
+fn normalize_absolute(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(Error::InvalidPath {
+                        path: path.to_string_lossy().to_string(),
+                        reason: "ACP path escapes its filesystem root".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn looks_like_foreign_absolute_path(path: &Path) -> bool {
+    if path.is_absolute() {
+        return false;
+    }
+    let value = path.to_string_lossy().as_bytes().to_vec();
+    value.starts_with(b"\\\\")
+        || value.starts_with(b"//")
+        || (value.len() >= 3
+            && value[0].is_ascii_alphabetic()
+            && value[1] == b':'
+            && matches!(value[2], b'\\' | b'/'))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NegotiationState {

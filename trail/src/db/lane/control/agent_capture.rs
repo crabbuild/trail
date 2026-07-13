@@ -4035,6 +4035,7 @@ mod tests {
             "hybrid",
             &session.session_id,
             &temp.path().to_string_lossy(),
+            &[],
             Some("codex"),
             None,
             None,
