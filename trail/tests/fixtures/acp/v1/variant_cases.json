@@ -1,0 +1,77 @@
+[
+  {"union":"ContentBlock","name":"text","value":{"type":"text","text":"hello"}},
+  {"union":"ContentBlock","name":"image","value":{"type":"image","data":"aW1hZ2U=","mimeType":"image/png"}},
+  {"union":"ContentBlock","name":"audio","value":{"type":"audio","data":"YXVkaW8=","mimeType":"audio/wav"}},
+  {"union":"ContentBlock","name":"resource_link","value":{"type":"resource_link","name":"README","uri":"file:///README.md"}},
+  {"union":"ContentBlock","name":"resource","value":{"type":"resource","resource":{"uri":"file:///context.txt","text":"context"}}},
+
+  {"union":"EmbeddedResourceResource","name":"TextResourceContents","value":{"uri":"file:///text.txt","text":"text"}},
+  {"union":"EmbeddedResourceResource","name":"BlobResourceContents","value":{"uri":"file:///blob.bin","blob":"YmxvYg=="}},
+
+  {"union":"McpServer","name":"http","value":{"type":"http","name":"http","url":"https://example.test/mcp","headers":[]}},
+  {"union":"McpServer","name":"sse","value":{"type":"sse","name":"sse","url":"https://example.test/sse","headers":[]}},
+  {"union":"McpServer","name":"stdio","value":{"name":"stdio","command":"/usr/bin/env","args":["true"],"env":[]}},
+
+  {"union":"PermissionOptionKind","name":"allow_once","value":"allow_once"},
+  {"union":"PermissionOptionKind","name":"allow_always","value":"allow_always"},
+  {"union":"PermissionOptionKind","name":"reject_once","value":"reject_once"},
+  {"union":"PermissionOptionKind","name":"reject_always","value":"reject_always"},
+
+  {"union":"RequestPermissionOutcome","name":"cancelled","value":{"outcome":"cancelled"}},
+  {"union":"RequestPermissionOutcome","name":"selected","value":{"outcome":"selected","optionId":"allow"}},
+
+  {"union":"SessionConfigOption","name":"select","value":{"id":"model","name":"Model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"}]}},
+  {"union":"SessionConfigOption","name":"boolean","value":{"id":"autoFix","name":"Auto fix","type":"boolean","currentValue":true}},
+
+  {"union":"SessionUpdate","name":"user_message_chunk","value":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"user"}}},
+  {"union":"SessionUpdate","name":"agent_message_chunk","value":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"agent"}}},
+  {"union":"SessionUpdate","name":"agent_thought_chunk","value":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thought"}}},
+  {"union":"SessionUpdate","name":"tool_call","value":{"sessionUpdate":"tool_call","toolCallId":"tool","title":"Tool"}},
+  {"union":"SessionUpdate","name":"tool_call_update","value":{"sessionUpdate":"tool_call_update","toolCallId":"tool","status":"completed"}},
+  {"union":"SessionUpdate","name":"plan","value":{"sessionUpdate":"plan","entries":[]}},
+  {"union":"SessionUpdate","name":"available_commands_update","value":{"sessionUpdate":"available_commands_update","availableCommands":[]}},
+  {"union":"SessionUpdate","name":"current_mode_update","value":{"sessionUpdate":"current_mode_update","currentModeId":"code"}},
+  {"union":"SessionUpdate","name":"config_option_update","value":{"sessionUpdate":"config_option_update","configOptions":[]}},
+  {"union":"SessionUpdate","name":"session_info_update","value":{"sessionUpdate":"session_info_update","title":"Title"}},
+  {"union":"SessionUpdate","name":"usage_update","value":{"sessionUpdate":"usage_update","used":1,"size":100}},
+
+  {"union":"TerminalExitStatus","name":"exit_code","value":{"exitCode":0,"signal":null}},
+  {"union":"TerminalExitStatus","name":"signal","value":{"exitCode":null,"signal":"SIGTERM"}},
+
+  {"union":"ToolCallContent","name":"content","value":{"type":"content","content":{"type":"text","text":"output"}}},
+  {"union":"ToolCallContent","name":"diff","value":{"type":"diff","path":"/tmp/file","newText":"new"}},
+  {"union":"ToolCallContent","name":"terminal","value":{"type":"terminal","terminalId":"terminal-1"}},
+
+  {"union":"ToolCallStatus","name":"pending","value":"pending"},
+  {"union":"ToolCallStatus","name":"in_progress","value":"in_progress"},
+  {"union":"ToolCallStatus","name":"completed","value":"completed"},
+  {"union":"ToolCallStatus","name":"failed","value":"failed"},
+
+  {"union":"ToolKind","name":"read","value":"read"},
+  {"union":"ToolKind","name":"edit","value":"edit"},
+  {"union":"ToolKind","name":"delete","value":"delete"},
+  {"union":"ToolKind","name":"move","value":"move"},
+  {"union":"ToolKind","name":"search","value":"search"},
+  {"union":"ToolKind","name":"execute","value":"execute"},
+  {"union":"ToolKind","name":"think","value":"think"},
+  {"union":"ToolKind","name":"fetch","value":"fetch"},
+  {"union":"ToolKind","name":"switch_mode","value":"switch_mode"},
+  {"union":"ToolKind","name":"other","value":"other"},
+
+  {"union":"PlanEntryPriority","name":"high","value":"high"},
+  {"union":"PlanEntryPriority","name":"medium","value":"medium"},
+  {"union":"PlanEntryPriority","name":"low","value":"low"},
+
+  {"union":"PlanEntryStatus","name":"pending","value":"pending"},
+  {"union":"PlanEntryStatus","name":"in_progress","value":"in_progress"},
+  {"union":"PlanEntryStatus","name":"completed","value":"completed"},
+
+  {"union":"Role","name":"assistant","value":"assistant"},
+  {"union":"Role","name":"user","value":"user"},
+
+  {"union":"StopReason","name":"end_turn","value":"end_turn"},
+  {"union":"StopReason","name":"max_tokens","value":"max_tokens"},
+  {"union":"StopReason","name":"max_turn_requests","value":"max_turn_requests"},
+  {"union":"StopReason","name":"refusal","value":"refusal"},
+  {"union":"StopReason","name":"cancelled","value":"cancelled"}
+]
