@@ -3,8 +3,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -339,10 +338,15 @@ pub(crate) fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
 }
 
 pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
+    let observer = capture_observer(&options)?;
+    StdioRelay::new(observer).run(&options)
+}
+
+fn capture_observer(options: &AcpRelayOptions) -> Result<Arc<CaptureObserver>> {
     let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options.clone())?));
     let pipeline = TransformPipeline::new(
         Arc::new(AcpV1Contract::load()?),
-        TransformOptions::from_relay(&options),
+        TransformOptions::from_relay(options),
     );
     let connection_id = format!(
         "conn_{}",
@@ -363,15 +367,53 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
         Arc::clone(&coordinator),
         connection_id.clone(),
     )?;
-    let observer = Arc::new(CaptureObserver {
+    Ok(Arc::new(CaptureObserver {
         coordinator,
         pipeline: Mutex::new(pipeline),
         ingress,
         connection_id,
         connection_sequence: AtomicU64::new(0),
         finish_reason: Mutex::new(None),
-    });
-    StdioRelay::new(observer).run(&options)
+    }))
+}
+
+#[doc(hidden)]
+pub struct AcpRelayBenchmarkSample {
+    pub forwarded: Vec<u8>,
+    pub latency_micros: u128,
+    pub transformed: bool,
+}
+
+/// Runs raw frames through the same transformation and capture observer used by
+/// the stdio relay, without process or pipe overhead. This is intentionally
+/// exposed only for the correctness-preserving relay benchmark.
+#[doc(hidden)]
+pub fn benchmark_acp_relay_frames(
+    options: AcpRelayOptions,
+    frames: Vec<(bool, Vec<u8>)>,
+) -> Result<Vec<AcpRelayBenchmarkSample>> {
+    let observer = capture_observer(&options)?;
+    let mut samples = Vec::with_capacity(frames.len());
+    for (agent_to_client, raw) in frames {
+        let direction = if agent_to_client {
+            Direction::AgentToClient
+        } else {
+            Direction::ClientToAgent
+        };
+        let mut frame = Frame::parse(direction, raw).map_err(Error::Io)?;
+        let started = Instant::now();
+        observer.observe(&mut frame)?;
+        let transformed = frame.forward_bytes() != frame.raw_bytes();
+        samples.push(AcpRelayBenchmarkSample {
+            forwarded: frame.forward_bytes().to_vec(),
+            latency_micros: started.elapsed().as_micros(),
+            transformed,
+        });
+    }
+    observer.finish(RelayFinishReason::EditorEof);
+    observer.flush(Duration::from_secs(120));
+    drop(observer);
+    Ok(samples)
 }
 
 struct CaptureObserver {
@@ -411,6 +453,14 @@ impl FrameObserver for CaptureObserver {
                     coordinator.remember_initialize_request(frame.value());
                 }
             }
+            let sequence = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
+            self.ingress.append(capture_frame(
+                &self.connection_id,
+                frame.direction(),
+                sequence,
+                frame.value(),
+                false,
+            ))?;
             return Ok(());
         }
 

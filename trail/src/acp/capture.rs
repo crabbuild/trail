@@ -17,7 +17,7 @@ use super::CaptureCoordinator;
 use crate::model::{AgentCaptureTransport, AgentHookReceiptInput};
 use crate::{Error, Result, Trail};
 
-const CAPTURE_QUEUE_CAPACITY: usize = 4_096;
+pub(crate) const ACP_CAPTURE_QUEUE_CAPACITY: usize = 4_096;
 const CAPTURE_MESSAGE_LIMIT: usize = 512 * 1024;
 const CAPTURE_PROJECT_LOCK_WAIT: Duration = Duration::from_millis(250);
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
@@ -39,6 +39,8 @@ pub(crate) enum CaptureCommand {
     Frame(CapturedFrame),
     Finish(RelayFinishReason),
     Barrier(mpsc::Sender<()>),
+    #[cfg(test)]
+    SimulateWorkerPanic,
 }
 
 #[derive(Default)]
@@ -101,7 +103,7 @@ impl CaptureIngress {
         let spill_mode = Arc::new(AtomicBool::new(false));
         let stopping = Arc::new(AtomicBool::new(false));
         let pending_finish = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::sync_channel(CAPTURE_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::sync_channel(ACP_CAPTURE_QUEUE_CAPACITY);
         let (done_tx, done_rx) = mpsc::channel();
         let worker_health = Arc::clone(&health);
         let worker_spill = Arc::clone(&spill);
@@ -111,16 +113,24 @@ impl CaptureIngress {
         let worker = thread::Builder::new()
             .name("trail-acp-capture".to_string())
             .spawn(move || {
-                capture_worker(
-                    rx,
-                    &workspace_root,
-                    coordinator,
-                    worker_health,
-                    worker_spill,
-                    worker_spill_mode,
-                    worker_stopping,
-                    worker_pending_finish,
-                );
+                let panic_health = Arc::clone(&worker_health);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    capture_worker(
+                        rx,
+                        &workspace_root,
+                        coordinator,
+                        worker_health,
+                        worker_spill,
+                        worker_spill_mode,
+                        worker_stopping,
+                        worker_pending_finish,
+                    );
+                }));
+                if outcome.is_err() {
+                    panic_health.record_error(&Error::InvalidInput(
+                        "ACP capture worker panicked".to_string(),
+                    ));
+                }
                 let _ = done_tx.send(());
             })
             .map_err(Error::Io)?;
@@ -411,6 +421,10 @@ fn capture_worker(
                     CaptureCommand::Barrier(barrier) => {
                         let _ = barrier.send(());
                     }
+                    #[cfg(test)]
+                    CaptureCommand::SimulateWorkerPanic => {
+                        panic!("simulated ACP capture worker panic")
+                    }
                 }
             }
             let drain_deadline = Instant::now() + CAPTURE_SHUTDOWN_DRAIN_BUDGET;
@@ -533,6 +547,10 @@ fn capture_worker(
                     }
                 }
                 let _ = barrier.send(());
+            }
+            #[cfg(test)]
+            Ok(CaptureCommand::SimulateWorkerPanic) => {
+                panic!("simulated ACP capture worker panic")
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 stopping.store(true, Ordering::Release);
@@ -825,7 +843,7 @@ mod tests {
 
     #[test]
     fn queue_overflow_spills_every_frame_and_shutdown_is_bounded() {
-        const FRAME_COUNT: u64 = CAPTURE_QUEUE_CAPACITY as u64 + 2;
+        const FRAME_COUNT: u64 = ACP_CAPTURE_QUEUE_CAPACITY as u64 + 2;
 
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("README.md"), "overflow fixture\n").unwrap();
@@ -895,5 +913,83 @@ mod tests {
             .map(|frame| frame.sequence)
             .collect::<HashSet<_>>();
         assert_eq!(preserved.len(), usize::try_from(FRAME_COUNT).unwrap());
+    }
+
+    fn test_ingress(temp: &Path, connection_id: &str) -> CaptureIngress {
+        fs::write(temp.join("README.md"), "capture fault fixture\n").unwrap();
+        Trail::init(temp, "main", InitImportMode::WorkingTree, false).unwrap();
+        let options = AcpRelayOptions {
+            workspace_root: temp.to_path_buf(),
+            db_dir: temp.join(".trail"),
+            lane: None,
+            from_ref: None,
+            provider: Some("fixture".to_string()),
+            model: None,
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["fixture".to_string()],
+            upstream_env: BTreeMap::new(),
+        };
+        CaptureIngress::new(
+            temp.to_path_buf(),
+            temp.join(".trail"),
+            Arc::new(Mutex::new(CaptureCoordinator::new(options).unwrap())),
+            connection_id.to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn worker_panic_degrades_capture_and_subsequent_frames_spill_durably() {
+        let temp = tempfile::tempdir().unwrap();
+        let ingress = test_ingress(temp.path(), "panic-connection");
+        ingress
+            .tx
+            .as_ref()
+            .unwrap()
+            .send(CaptureCommand::SimulateWorkerPanic)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ingress.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "capture worker did not panic");
+            thread::sleep(Duration::from_millis(1));
+        }
+        ingress
+            .append(capture_frame(
+                "panic-connection",
+                Direction::AgentToClient,
+                1,
+                &serde_json::json!({"jsonrpc":"2.0","method":"ext/after-panic"}),
+                false,
+            ))
+            .unwrap();
+        let report = ingress.shutdown(Duration::from_millis(100));
+        assert!(report.degraded);
+        assert_eq!(report.spilled, 1);
+    }
+
+    #[test]
+    fn spill_write_failure_marks_capture_unhealthy_without_blocking_forwarding() {
+        let temp = tempfile::tempdir().unwrap();
+        let ingress = test_ingress(temp.path(), "spill-failure");
+        let spill_dir = temp.path().join(".trail/acp-ingress");
+        fs::remove_dir(&spill_dir).unwrap();
+        fs::write(&spill_dir, "not a directory").unwrap();
+        ingress.spill_mode.store(true, Ordering::Release);
+
+        ingress
+            .append(capture_frame(
+                "spill-failure",
+                Direction::ClientToAgent,
+                1,
+                &serde_json::json!({"jsonrpc":"2.0","method":"ext/spill-failure"}),
+                false,
+            ))
+            .unwrap();
+        let report = ingress.shutdown(Duration::from_millis(250));
+        assert!(!report.healthy);
+        assert!(report.degraded);
+        assert_eq!(report.spilled, 0);
     }
 }

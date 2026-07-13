@@ -8,7 +8,8 @@ use super::protocol::{Direction, Frame};
 use super::AcpRelayOptions;
 use crate::{Error, Result};
 
-const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const ACP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_millis(750);
 
@@ -177,7 +178,16 @@ where
 fn read_frame<R: BufRead>(reader: &mut R, direction: Direction) -> io::Result<Option<Frame>> {
     loop {
         let mut raw = Vec::new();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
+        let bytes = reader
+            .take((ACP_MAX_FRAME_BYTES + 1) as u64)
+            .read_until(b'\n', &mut raw)?;
+        if raw.len() > ACP_MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ACP frame exceeds the {ACP_MAX_FRAME_BYTES}-byte transport limit"),
+            ));
+        }
+        if bytes == 0 {
             return Ok(None);
         }
         if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
@@ -297,5 +307,32 @@ mod tests {
             *observer.directions.lock().unwrap(),
             vec![Direction::ClientToAgent]
         );
+    }
+
+    #[test]
+    fn frame_limit_accepts_the_boundary_and_rejects_one_byte_above_it() {
+        let prefix = br#"{"jsonrpc":"2.0","method":"ext/limit","params":{"data":""#;
+        let suffix = b"\"}}\n";
+        let payload_len = ACP_MAX_FRAME_BYTES - prefix.len() - suffix.len();
+        let mut boundary = Vec::with_capacity(ACP_MAX_FRAME_BYTES);
+        boundary.extend_from_slice(prefix);
+        boundary.resize(boundary.len() + payload_len, b'x');
+        boundary.extend_from_slice(suffix);
+        assert_eq!(boundary.len(), ACP_MAX_FRAME_BYTES);
+
+        let mut reader = io::Cursor::new(boundary.clone());
+        let frame = read_frame(&mut reader, Direction::ClientToAgent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.raw_bytes().len(), ACP_MAX_FRAME_BYTES);
+
+        boundary.insert(boundary.len() - suffix.len(), b'x');
+        let mut reader = io::Cursor::new(boundary);
+        let error = match read_frame(&mut reader, Direction::ClientToAgent) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized frame was accepted"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("transport limit"));
     }
 }

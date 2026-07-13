@@ -78,3 +78,7 @@ workspace = true
 [[bench]]
 name = "sqlite_vector_memory_bench"
 harness = false
+
+[[bench]]
+name = "acp_relay_bench"
+harness = false
