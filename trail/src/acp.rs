@@ -796,6 +796,78 @@ enum PendingOperation {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcpV1SessionUpdateKind {
+    UserMessageChunk,
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    ToolCall,
+    ToolCallUpdate,
+    Plan,
+    AvailableCommandsUpdate,
+    CurrentModeUpdate,
+    ConfigOptionUpdate,
+    SessionInfoUpdate,
+    UsageUpdate,
+    Extension,
+}
+
+impl AcpV1SessionUpdateKind {
+    #[cfg(test)]
+    const ALL: [Self; 11] = [
+        Self::UserMessageChunk,
+        Self::AgentMessageChunk,
+        Self::AgentThoughtChunk,
+        Self::ToolCall,
+        Self::ToolCallUpdate,
+        Self::Plan,
+        Self::AvailableCommandsUpdate,
+        Self::CurrentModeUpdate,
+        Self::ConfigOptionUpdate,
+        Self::SessionInfoUpdate,
+        Self::UsageUpdate,
+    ];
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "user_message_chunk" => Self::UserMessageChunk,
+            "agent_message_chunk" => Self::AgentMessageChunk,
+            "agent_thought_chunk" => Self::AgentThoughtChunk,
+            "tool_call" => Self::ToolCall,
+            "tool_call_update" => Self::ToolCallUpdate,
+            "plan" => Self::Plan,
+            "available_commands_update" => Self::AvailableCommandsUpdate,
+            "current_mode_update" => Self::CurrentModeUpdate,
+            "config_option_update" => Self::ConfigOptionUpdate,
+            "session_info_update" => Self::SessionInfoUpdate,
+            "usage_update" => Self::UsageUpdate,
+            _ => Self::Extension,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserMessageChunk => "user_message_chunk",
+            Self::AgentMessageChunk => "agent_message_chunk",
+            Self::AgentThoughtChunk => "agent_thought_chunk",
+            Self::ToolCall => "tool_call",
+            Self::ToolCallUpdate => "tool_call_update",
+            Self::Plan => "plan",
+            Self::AvailableCommandsUpdate => "available_commands_update",
+            Self::CurrentModeUpdate => "current_mode_update",
+            Self::ConfigOptionUpdate => "config_option_update",
+            Self::SessionInfoUpdate => "session_info_update",
+            Self::UsageUpdate => "usage_update",
+            Self::Extension => "extension",
+        }
+    }
+
+    fn is_stable(self) -> bool {
+        self != Self::Extension
+    }
+}
+
 struct CaptureCoordinator {
     options: AcpRelayOptions,
     pending_operations: HashMap<(Direction, String), PendingOperation>,
@@ -1353,6 +1425,19 @@ impl CaptureCoordinator {
             self.upstream_command_json.as_deref(),
             status,
         )?;
+        let initial_mode = message
+            .pointer("/result/modes/currentModeId")
+            .and_then(Value::as_str);
+        if let Some(mode_id) = initial_mode {
+            db.update_lane_acp_session_configuration(&acp_session_id, Some(mode_id), None)?;
+        }
+        let initial_config = message
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+            .map(|options| session_config_values_from_options(options));
+        if let Some(config) = initial_config.as_ref() {
+            db.replace_lane_acp_session_configuration_options(&acp_session_id, config)?;
+        }
         db.add_lane_session_event(
             &session.lane_name,
             &session.trail_session_id,
@@ -1368,6 +1453,19 @@ impl CaptureCoordinator {
                 "status": status
             }))),
         )?;
+        if initial_mode.is_some() || initial_config.is_some() {
+            db.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_session_configuration",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "acp_session_id": acp_session_id,
+                    "modes": message.pointer("/result/modes"),
+                    "config_options": message.pointer("/result/configOptions")
+                }))),
+            )?;
+        }
         for payload in std::mem::take(&mut self.pending_connection_events) {
             db.add_lane_session_event(
                 &session.lane_name,
@@ -1635,6 +1733,8 @@ impl CaptureCoordinator {
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let variant = AcpV1SessionUpdateKind::parse(update_kind);
+        self.persist_session_update_state(acp_session_id, variant, update)?;
         if let Some(replay) = self.replay_by_session.get_mut(acp_session_id) {
             replay
                 .updates
@@ -1646,8 +1746,12 @@ impl CaptureCoordinator {
             return Ok(());
         };
 
-        let result = match update_kind {
-            "agent_message_chunk" => {
+        active.push_event(
+            "acp_session_update",
+            Some(session_update_projection(variant, update_kind, update)),
+        );
+        let result = match variant {
+            AcpV1SessionUpdateKind::AgentMessageChunk => {
                 let key = update
                     .get("messageId")
                     .and_then(Value::as_str)
@@ -1672,9 +1776,11 @@ impl CaptureCoordinator {
                 }
                 Ok(())
             }
-            "tool_call" => self.capture_tool_call_start(&mut active, update),
-            "tool_call_update" => self.capture_tool_call_update(&mut active, update),
-            "plan" => {
+            AcpV1SessionUpdateKind::ToolCall => self.capture_tool_call_start(&mut active, update),
+            AcpV1SessionUpdateKind::ToolCallUpdate => {
+                self.capture_tool_call_update(&mut active, update)
+            }
+            AcpV1SessionUpdateKind::Plan => {
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_plan_update")?;
                 active.push_event(
@@ -1683,8 +1789,8 @@ impl CaptureCoordinator {
                 );
                 Ok(())
             }
-            kind if ignore_session_update(kind) => Ok(()),
-            "available_commands_update" => {
+            AcpV1SessionUpdateKind::AgentThoughtChunk => Ok(()),
+            AcpV1SessionUpdateKind::AvailableCommandsUpdate => {
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_available_commands_update")?;
                 active.push_event(
@@ -1693,7 +1799,7 @@ impl CaptureCoordinator {
                 );
                 Ok(())
             }
-            "usage_update" => {
+            AcpV1SessionUpdateKind::UsageUpdate => {
                 active.usage = turn_envelope_usage(update);
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_usage_update")?;
@@ -1703,13 +1809,13 @@ impl CaptureCoordinator {
                 );
                 Ok(())
             }
-            _ => {
+            AcpV1SessionUpdateKind::UserMessageChunk
+            | AcpV1SessionUpdateKind::CurrentModeUpdate
+            | AcpV1SessionUpdateKind::ConfigOptionUpdate
+            | AcpV1SessionUpdateKind::SessionInfoUpdate
+            | AcpV1SessionUpdateKind::Extension => {
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_session_update")?;
-                active.push_event(
-                    &format!("acp_{update_kind}"),
-                    Some(redact_json(Value::Object(update.clone()))),
-                );
                 Ok(())
             }
         };
@@ -1734,21 +1840,55 @@ impl CaptureCoordinator {
         let Some(session) = session else {
             return Ok(());
         };
-        if ignore_session_update(update_kind) {
-            return Ok(());
-        }
-        let payload = if update_kind == "available_commands_update" {
-            summarize_available_commands(update)
-        } else {
-            redact_json(Value::Object(update.clone()))
-        };
+        let variant = AcpV1SessionUpdateKind::parse(update_kind);
         let mut db = self.open_db()?;
         db.add_lane_session_event(
             &session.lane_name,
             &session.trail_session_id,
-            &format!("acp_{update_kind}"),
-            Some(payload),
+            "acp_session_update",
+            Some(session_update_projection(variant, update_kind, update)),
         )?;
+        if variant == AcpV1SessionUpdateKind::AvailableCommandsUpdate {
+            db.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_available_commands_update",
+                Some(summarize_available_commands(update)),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn persist_session_update_state(
+        &mut self,
+        acp_session_id: &str,
+        variant: AcpV1SessionUpdateKind,
+        update: &Map<String, Value>,
+    ) -> Result<()> {
+        match variant {
+            AcpV1SessionUpdateKind::CurrentModeUpdate => {
+                let Some(mode_id) = update.get("currentModeId").and_then(Value::as_str) else {
+                    return Ok(());
+                };
+                self.open_db()?.update_lane_acp_session_configuration(
+                    acp_session_id,
+                    Some(mode_id),
+                    None,
+                )?;
+            }
+            AcpV1SessionUpdateKind::ConfigOptionUpdate => {
+                let values = session_config_values(update);
+                self.open_db()?
+                    .replace_lane_acp_session_configuration_options(acp_session_id, &values)?;
+            }
+            AcpV1SessionUpdateKind::SessionInfoUpdate if update.contains_key("title") => {
+                let session = self.resolve_session_state(acp_session_id)?;
+                let title = update.get("title").and_then(Value::as_str);
+                self.open_db()?
+                    .update_lane_session_title(&session.trail_session_id, title)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -2221,7 +2361,15 @@ impl CaptureCoordinator {
         }
         let session = self.resolve_session_state(acp_session_id)?;
         let mut db = self.open_db()?;
-        let mapping = db.update_lane_acp_session_configuration(acp_session_id, mode_id, config)?;
+        let authoritative_config = message
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+            .map(|options| session_config_values_from_options(options));
+        let mapping = if let Some(config_options) = authoritative_config.as_ref() {
+            db.replace_lane_acp_session_configuration_options(acp_session_id, config_options)?
+        } else {
+            db.update_lane_acp_session_configuration(acp_session_id, mode_id, config)?
+        };
         db.add_lane_session_event(
             &session.lane_name,
             &session.trail_session_id,
@@ -2236,6 +2384,7 @@ impl CaptureCoordinator {
                 "mode_id": mode_id,
                 "config_id": config.as_ref().map(|(id, _)| *id),
                 "value": config.as_ref().map(|(_, value)| *value),
+                "authoritative_config_options": message.pointer("/result/configOptions"),
                 "cancel_requested": cancel_requested,
                 "current_mode_id": mapping.current_mode_id,
                 "config_options": mapping.config_options
@@ -2511,6 +2660,14 @@ fn replay_turns(replay: ReplayAccumulator) -> Vec<ReplayTurn> {
     let mut turns = Vec::new();
     let mut current = ReplayTurn::default();
     for (sequence, (kind, update)) in replay.updates.into_iter().enumerate() {
+        let variant = AcpV1SessionUpdateKind::parse(&kind);
+        let mut projection = session_update_projection(variant, &kind, &update);
+        if let Some(object) = projection.as_object_mut() {
+            object.insert(
+                "replaySequence".to_string(),
+                Value::from(u64::try_from(sequence).unwrap_or(u64::MAX)),
+            );
+        }
         match kind.as_str() {
             "user_message_chunk" => {
                 let message_id = update
@@ -2567,6 +2724,9 @@ fn replay_turns(replay: ReplayAccumulator) -> Vec<ReplayTurn> {
                 replay_event_payload(sequence, update),
             )),
         }
+        current
+            .events
+            .push(("acp_session_update".to_string(), projection));
     }
     if current.has_content() {
         turns.push(current);
@@ -3086,8 +3246,46 @@ fn summarize_available_commands(update: &Map<String, Value>) -> Value {
     }))
 }
 
-fn ignore_session_update(update_kind: &str) -> bool {
-    update_kind == "agent_thought_chunk"
+fn session_update_projection(
+    variant: AcpV1SessionUpdateKind,
+    update_kind: &str,
+    update: &Map<String, Value>,
+) -> Value {
+    let mut structured = bounded_prompt_content(Some(&Value::Object(update.clone())));
+    let thought_content_excluded = variant == AcpV1SessionUpdateKind::AgentThoughtChunk;
+    if thought_content_excluded {
+        if let Some(object) = structured.as_object_mut() {
+            object.remove("content");
+        }
+    }
+    serde_json::json!({
+        "protocol": "acp",
+        "acpVariant": update_kind,
+        "stable": variant.is_stable(),
+        "thoughtContentExcluded": thought_content_excluded,
+        "update": structured
+    })
+}
+
+fn session_config_values(update: &Map<String, Value>) -> Map<String, Value> {
+    let Some(options) = update.get("configOptions").and_then(Value::as_array) else {
+        return Map::new();
+    };
+    session_config_values_from_options(options)
+}
+
+fn session_config_values_from_options(options: &[Value]) -> Map<String, Value> {
+    let mut values = Map::new();
+    for option in options {
+        let Some(id) = option.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = option.get("currentValue") else {
+            continue;
+        };
+        values.insert(id.to_string(), value.clone());
+    }
+    values
 }
 
 fn command_display_name(value: &Value) -> Option<String> {
@@ -3381,10 +3579,43 @@ mod tests {
     }
 
     #[test]
-    fn agent_thought_chunks_are_not_captured() {
-        assert!(ignore_session_update("agent_thought_chunk"));
-        assert!(!ignore_session_update("agent_message_chunk"));
-        assert!(!ignore_session_update("tool_call"));
+    fn stable_session_update_inventory_matches_the_pinned_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/acp/v1/schema.json")).unwrap();
+        let pinned = schema["$defs"]["SessionUpdate"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| {
+                branch["properties"]["sessionUpdate"]["const"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let implemented = AcpV1SessionUpdateKind::ALL
+            .iter()
+            .map(|variant| variant.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(implemented, pinned);
+    }
+
+    #[test]
+    fn thought_update_projection_excludes_content_but_preserves_metadata() {
+        let update = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "messageId": "thought-1",
+            "content": {"type": "text", "text": "private"},
+            "_meta": {"extension": "preserved"}
+        });
+        let projected = session_update_projection(
+            AcpV1SessionUpdateKind::AgentThoughtChunk,
+            "agent_thought_chunk",
+            update.as_object().unwrap(),
+        );
+        assert_eq!(projected["thoughtContentExcluded"], true);
+        assert!(projected["update"].get("content").is_none());
+        assert_eq!(projected["update"]["_meta"]["extension"], "preserved");
+        assert!(!projected.to_string().contains("private"));
     }
 
     #[test]

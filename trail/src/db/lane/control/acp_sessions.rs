@@ -143,6 +143,32 @@ impl Trail {
         self.lane_acp_session(acp_session_id)
     }
 
+    pub fn replace_lane_acp_session_configuration_options(
+        &mut self,
+        acp_session_id: &str,
+        config_options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<LaneAcpSession> {
+        let _lock = self.acquire_write_lock()?;
+        let acp_session_id = validate_external_id("ACP session id", acp_session_id)?;
+        self.lane_acp_session(acp_session_id)?;
+        for config_id in config_options.keys() {
+            validate_external_id("ACP config id", config_id)?;
+        }
+        let config_options =
+            crate::db::redact_sensitive_json(serde_json::Value::Object(config_options.clone()));
+        self.conn.execute(
+            "UPDATE lane_acp_sessions
+             SET config_options_json = ?1, updated_at = ?2
+             WHERE acp_session_id = ?3",
+            params![
+                serde_json::to_string(&config_options)?,
+                now_ts(),
+                acp_session_id
+            ],
+        )?;
+        self.lane_acp_session(acp_session_id)
+    }
+
     pub fn lane_acp_session(&self, acp_session_id: &str) -> Result<LaneAcpSession> {
         self.try_lane_acp_session(acp_session_id)?
             .ok_or_else(|| Error::InvalidInput(format!("ACP session `{acp_session_id}` not found")))

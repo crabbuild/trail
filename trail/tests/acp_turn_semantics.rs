@@ -24,6 +24,7 @@ import json
 import sys
 
 pending_prompt = None
+config_values = {}
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
@@ -39,7 +40,18 @@ for line in sys.stdin:
         if str(request_id).endswith("-error"):
             response = {"jsonrpc":"2.0","id":request_id,"error":{"code":-32002,"message":"configuration rejected"}}
         else:
-            response = {"jsonrpc":"2.0","id":request_id,"result":{}}
+            result = {}
+            if method == "session/set_config_option":
+                config_id = message["params"]["configId"]
+                value = message["params"]["value"]
+                config_values[config_id] = "deep" if config_id == "model" else value
+                result["configOptions"] = [
+                    {"id":key,"name":key,"type":"boolean","currentValue":current}
+                    if isinstance(current, bool)
+                    else {"id":key,"name":key,"type":"select","currentValue":current,"options":[{"value":current,"name":current}]}
+                    for key, current in config_values.items()
+                ]
+            response = {"jsonrpc":"2.0","id":request_id,"result":result}
         print(json.dumps(response, separators=(",", ":")), flush=True)
     elif method == "session/prompt" and request_id == "prompt-cancel":
         pending_prompt = request_id
@@ -210,7 +222,7 @@ fn prompt_configuration_and_both_cancellation_directions_are_projected() {
     let mapping = db.lane_acp_session("turn-session").unwrap();
     assert_eq!(mapping.current_mode_id.as_deref(), Some("code"));
     assert_eq!(mapping.config_options["autoFix"], true);
-    assert_eq!(mapping.config_options["model"], "fast");
+    assert_eq!(mapping.config_options["model"], "deep");
     assert_eq!(mapping.config_options["afterCancel"], true);
     let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
     assert_eq!(session.turns.len(), 2);
