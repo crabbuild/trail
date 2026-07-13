@@ -189,6 +189,10 @@ pub(crate) fn render_index_rebuild(
     if json {
         return render_json(report);
     }
+    render_document(&index_rebuild_document(report), options)
+}
+
+fn index_rebuild_document(report: &IndexRebuildReport) -> TerminalDocument {
     let mut document =
         TerminalDocument::new("Rebuilt indexes", UiTone::Success).block(UiBlock::Metadata(vec![
             ("Operations".to_string(), report.operations.to_string()),
@@ -202,7 +206,26 @@ pub(crate) fn render_index_rebuild(
                 report.line_history_rows.to_string(),
             ),
             ("Messages".to_string(), report.messages.to_string()),
+            (
+                "Path roots repaired".to_string(),
+                report.path_index_repaired_roots.len().to_string(),
+            ),
+            (
+                "Live refs repaired".to_string(),
+                report.path_index_repaired_refs.len().to_string(),
+            ),
         ]));
+    if !report.path_index_repaired_refs.is_empty() {
+        let refs = report
+            .path_index_repaired_refs
+            .iter()
+            .map(|repair| repair.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        document = document.block(UiBlock::Notice(format!(
+            "Upgraded persistent path-invariant indexes for: {refs}"
+        )));
+    }
     if report.rich_text_hydrated > 0 {
         document = document.block(UiBlock::Notice(format!(
             "Hydrated {} lazy text object(s)",
@@ -218,7 +241,7 @@ pub(crate) fn render_index_rebuild(
                 .collect(),
         ));
     }
-    render_document(&document, options)
+    document
 }
 
 pub(crate) fn render_worktree_index(
@@ -291,4 +314,45 @@ pub(crate) fn render_gc(report: &GcReport, json: bool, options: &RenderOptions) 
         );
     }
     render_document(&document, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trail::{ChangeId, ObjectId};
+
+    #[test]
+    fn index_rebuild_document_reports_path_index_repairs() {
+        let report = IndexRebuildReport {
+            path_index_repaired_roots: vec![PathIndexRootRepair {
+                old_root: ObjectId("old-root".to_string()),
+                new_root: ObjectId("new-root".to_string()),
+                case_fold_map_root: "fold-root".to_string(),
+            }],
+            path_index_repaired_refs: vec![PathIndexRefRepair {
+                name: "refs/branches/main".to_string(),
+                old_change: ChangeId("old-change".to_string()),
+                new_change: ChangeId("new-change".to_string()),
+                old_root: ObjectId("old-root".to_string()),
+                new_root: ObjectId("new-root".to_string()),
+            }],
+            ..IndexRebuildReport::default()
+        };
+
+        let document = index_rebuild_document(&report);
+
+        let metadata = document
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                UiBlock::Metadata(values) => Some(values),
+                _ => None,
+            })
+            .unwrap();
+        assert!(metadata.contains(&("Path roots repaired".to_string(), "1".to_string())));
+        assert!(metadata.contains(&("Live refs repaired".to_string(), "1".to_string())));
+        assert!(document.blocks.iter().any(|block| {
+            matches!(block, UiBlock::Notice(text) if text.contains("refs/branches/main"))
+        }));
+    }
 }

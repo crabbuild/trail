@@ -53,6 +53,26 @@ existing rebuild operation backfills the current root/index state.
 Compatibility read/materialization operations may still read old roots; only
 mutation safety requires the index.
 
+Repair covers every mutable live `refs/branches/*` and `refs/lanes/*` head in
+one command, not only the checked-out branch. Distinct refs that share a legacy
+root share one rebuilt fold tree and one equivalent immutable root. Historical
+roots remain unchanged. Each repaired ref advances by CAS through its own
+auditable `ManualCheckpoint` maintenance operation with the old head as parent,
+the old/new equivalent roots as `before_root`/`after_root`, and no visible file
+changes. All roots and lane/Git metadata are preflighted before any ref is
+published; authoritative SQLite ref/lane/checkpoint/mapping updates commit as a
+unit. Content-addressed nodes or objects created during a failed preflight may
+remain unreachable and are reclaimed by normal GC, but no live ref advances.
+
+Derived baselines follow the equivalent root identity without touching visible
+files. A clean checked-out worktree baseline is retargeted, clean lane manifests
+and workspace checkpoint markers are retargeted or conservatively invalidated,
+and clean Git mapping rows are copied from the old root/change to each repaired
+root/maintenance change while preserving their recorded Git head, direction,
+and branch. Ref files are derived mirrors of SQLite refs and are reconciled on
+every rebuild, making an interrupted mirror write retryable. A second rebuild
+after successful repair publishes no additional root, operation, or ref.
+
 ## Structural evidence
 
 Expose path-invariant metrics on patch/record scale scenarios:

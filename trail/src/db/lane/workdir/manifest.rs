@@ -17,6 +17,57 @@ struct CleanWorkdirManifestEntry {
 }
 
 impl Trail {
+    pub(crate) fn preflight_clean_workdir_manifest_root_retarget(
+        &self,
+        dir: &Path,
+        manifest_path: Option<&Path>,
+        old_root_id: &ObjectId,
+    ) -> Result<bool> {
+        let path = manifest_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| clean_workdir_manifest_path(dir));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let manifest: CleanWorkdirManifest = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::Corrupt(format!(
+                "clean workdir manifest `{}` cannot be retargeted: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(manifest.version == CLEAN_WORKDIR_MANIFEST_VERSION && manifest.root_id == old_root_id.0)
+    }
+
+    /// Retargets a clean derived manifest when two immutable roots have
+    /// byte-for-byte identical visible file maps. This changes only the
+    /// baseline identity; stamps and content summaries remain authoritative.
+    pub(crate) fn retarget_clean_workdir_manifest_root(
+        &self,
+        dir: &Path,
+        manifest_path: Option<&Path>,
+        old_root_id: &ObjectId,
+        new_root_id: &ObjectId,
+    ) -> Result<bool> {
+        let path = manifest_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| clean_workdir_manifest_path(dir));
+        let Some(mut manifest) = self.read_clean_workdir_manifest_from_path(&path)? else {
+            return Ok(false);
+        };
+        if manifest.version != CLEAN_WORKDIR_MANIFEST_VERSION {
+            remove_clean_workdir_manifest_path(&path)?;
+            return Ok(false);
+        }
+        if manifest.root_id != old_root_id.0 {
+            return Ok(false);
+        }
+        manifest.root_id = new_root_id.0.clone();
+        self.write_clean_workdir_manifest_entries_to_path(&path, new_root_id, manifest.files)?;
+        Ok(true)
+    }
+
     pub(crate) fn cached_workdir_manifest_status(
         &self,
         dir: &Path,

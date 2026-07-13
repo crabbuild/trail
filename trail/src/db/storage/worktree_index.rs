@@ -719,6 +719,31 @@ impl Trail {
         )?;
         Ok(())
     }
+
+    pub(crate) fn retarget_clean_daemon_worktree_baseline(
+        &self,
+        old_root_id: &ObjectId,
+        new_root_id: &ObjectId,
+    ) {
+        let Some(cache) = &self.daemon_worktree_cache else {
+            return;
+        };
+        {
+            let mut state = cache.state.lock().expect("daemon worktree cache poisoned");
+            if !state.initialized
+                || state.overflow
+                || !state.dirty_paths.is_empty()
+                || state.baseline_root_id.as_ref() != Some(old_root_id)
+            {
+                return;
+            }
+            state.baseline_root_id = Some(new_root_id.clone());
+            state.generation = state.generation.saturating_add(1);
+        }
+        if let Some(persist) = &cache.persist {
+            persist_daemon_worktree_state(persist, &cache.state);
+        }
+    }
 }
 
 fn cached_worktree_file_stamp(

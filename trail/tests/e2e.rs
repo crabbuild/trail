@@ -18,8 +18,8 @@ use trail::{
     Actor, ConflictManualFile, ConflictManualResolution, Error, InitImportMode, LaneGateOptions,
     LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails, LaneTurnEndReport,
     LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, MaterializationFallbackReason,
-    OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
-    WorkdirBackend, WorktreeState,
+    ObjectId, OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
+    WorkdirBackend, WorktreeRoot, WorktreeState, WORKTREE_ROOT_KIND,
 };
 
 fn git_available() -> bool {
@@ -1584,6 +1584,52 @@ fn run_trail_json(workspace: &Path, args: &[&str]) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn make_current_branch_root_legacy(workspace: &Path) -> ObjectId {
+    let sqlite_path = workspace.join(".trail/index/trail.sqlite");
+    let conn = Connection::open(sqlite_path).unwrap();
+    let root_id: String = conn
+        .query_row(
+            "SELECT root_id FROM refs WHERE name = 'refs/branches/main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (version, bytes): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT version, bytes FROM objects WHERE object_id = ?1 AND kind = ?2",
+            rusqlite::params![root_id, WORKTREE_ROOT_KIND],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut root: WorktreeRoot = serde_cbor::from_slice(&bytes).unwrap();
+    assert!(root.file_count > 0);
+    assert!(root.case_fold_map_root.take().is_some());
+    let legacy_bytes = serde_cbor::to_vec(&root).unwrap();
+    let legacy_root = ObjectId::for_bytes(
+        WORKTREE_ROOT_KIND,
+        u16::try_from(version).unwrap(),
+        &legacy_bytes,
+    );
+    conn.execute(
+        "INSERT INTO objects (object_id, kind, version, codec, hash_alg, size_bytes, bytes, created_at) \
+         VALUES (?1, ?2, ?3, 'cbor', 'sha256', ?4, ?5, 0)",
+        rusqlite::params![
+            legacy_root.0.as_str(),
+            WORKTREE_ROOT_KIND,
+            version,
+            legacy_bytes.len() as i64,
+            legacy_bytes
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE refs SET root_id = ?1 WHERE name = 'refs/branches/main'",
+        rusqlite::params![legacy_root.0.as_str()],
+    )
+    .unwrap();
+    legacy_root
+}
+
 fn run_trail_json_daemon(workspace: &Path, daemon_url: &str, args: &[&str]) -> serde_json::Value {
     let output = Command::new(trail_bin())
         .arg("--workspace")
@@ -1807,6 +1853,110 @@ fn cli_json_errors_are_machine_readable() {
         .as_str()
         .unwrap()
         .contains("still-not-a-command"));
+}
+
+#[test]
+fn cli_path_index_required_human_json_rebuild_and_retry_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let legacy_root = make_current_branch_root_legacy(temp.path());
+
+    let status = run_trail_json(temp.path(), &["status"]);
+    assert_eq!(status["head"]["root_id"], legacy_root.0);
+    assert_eq!(status["worktree_state"], "Clean");
+    fs::write(temp.path().join("README.md"), "changed\n").unwrap();
+
+    let human = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["record", "-m", "blocked before upgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(9));
+    let human_stderr = String::from_utf8(human.stderr).unwrap();
+    assert!(
+        human_stderr.contains("Trail workspace upgrade is required"),
+        "{human_stderr}"
+    );
+    assert!(
+        human_stderr.contains("trail index rebuild"),
+        "{human_stderr}"
+    );
+    assert!(!human_stderr.contains("trail --help"), "{human_stderr}");
+
+    let json = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["record", "-m", "blocked before upgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(9));
+    assert!(json.stdout.is_empty());
+    let json_error: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(json_error["error"]["code"], "PATH_INDEX_REQUIRED");
+    assert_eq!(json_error["error"]["exit_code"], 9);
+    assert!(json_error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("trail index rebuild"));
+
+    let rebuilt = run_trail_json(temp.path(), &["index", "rebuild"]);
+    assert_eq!(
+        rebuilt["path_index_repaired_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rebuilt["path_index_repaired_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rebuilt["path_index_repaired_refs"][0]["old_root"],
+        legacy_root.0
+    );
+    let repaired_root = rebuilt["path_index_repaired_refs"][0]["new_root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    let load_root = |root_id: &str| -> WorktreeRoot {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT bytes FROM objects WHERE object_id = ?1",
+                rusqlite::params![root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_cbor::from_slice(&bytes).unwrap()
+    };
+    let legacy = load_root(&legacy_root.0);
+    let repaired = load_root(&repaired_root);
+    assert_eq!(repaired.path_map_root, legacy.path_map_root);
+    assert_eq!(repaired.file_index_map_root, legacy.file_index_map_root);
+    assert_eq!(repaired.file_count, legacy.file_count);
+    assert_eq!(repaired.total_text_bytes, legacy.total_text_bytes);
+    assert_eq!(repaired.created_by, legacy.created_by);
+    assert!(repaired.case_fold_map_root.is_some());
+    drop(conn);
+
+    let recorded = run_trail_json(temp.path(), &["record", "-m", "after upgrade"]);
+    assert_eq!(recorded["changed_paths"].as_array().unwrap().len(), 1);
+    let second = run_trail_json(temp.path(), &["index", "rebuild"]);
+    assert!(second["path_index_repaired_roots"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(second["path_index_repaired_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

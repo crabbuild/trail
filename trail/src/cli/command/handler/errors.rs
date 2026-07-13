@@ -167,7 +167,20 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
-        Error::InvalidInput(_) | Error::InvalidPath { .. } | Error::PathIndexRequired(_) => {
+        Error::PathIndexRequired(_) => {
+            let mut diagnostic =
+                UiDiagnostic::new(err.code(), "Trail workspace upgrade is required");
+            diagnostic.consequence = Some(
+                "Trail blocked this mutation until every live branch and lane head has a persistent path-invariant index."
+                    .to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: "trail index rebuild".to_string(),
+                reason: "Upgrade legacy live roots and retry the mutation.".to_string(),
+            });
+            diagnostic
+        }
+        Error::InvalidInput(_) | Error::InvalidPath { .. } => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Trail cannot use the supplied input");
             diagnostic.recovery = Some(UiNextAction {
@@ -329,6 +342,20 @@ mod tests {
             diagnostic.recovery.unwrap().command,
             "trail git import-update"
         );
+    }
+
+    #[test]
+    fn path_index_required_recommends_workspace_upgrade() {
+        let diagnostic = diagnostic_for_error(&Error::PathIndexRequired(
+            "legacy root has no case-fold index".into(),
+        ));
+        assert_eq!(diagnostic.code, "PATH_INDEX_REQUIRED");
+        assert_eq!(diagnostic.summary, "Trail workspace upgrade is required");
+        assert!(diagnostic
+            .consequence
+            .as_deref()
+            .is_some_and(|value| value.contains("mutation")));
+        assert_eq!(diagnostic.recovery.unwrap().command, "trail index rebuild");
     }
 
     #[test]
