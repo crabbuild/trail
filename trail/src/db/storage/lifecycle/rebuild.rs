@@ -1273,21 +1273,41 @@ mod path_index_rebuild_tests {
         let modern = daemon_db.resolve_branch_ref("main").unwrap();
         let (legacy_root, _) = publish_legacy_root(&daemon_db, &modern);
         daemon_db.enable_daemon_worktree_cache().unwrap();
+        // This regression exercises persisted snapshot reuse across handles,
+        // not asynchronous OS event delivery. Stop the watcher after warmup
+        // so delayed backend events cannot turn the fixed baseline fixture
+        // dirty while the index-repair assertions are running.
+        drop(
+            daemon_db
+                .daemon_worktree_cache
+                .as_mut()
+                .unwrap()
+                .watcher
+                .take(),
+        );
         let persisted_reader = Trail::open(workspace.path()).unwrap();
-        assert!(matches!(
-            persisted_reader.daemon_worktree_snapshot(),
-            Some(DaemonWorktreeSnapshot::Clean { root_id: Some(root), .. }) if root == legacy_root
-        ));
+        let persisted_snapshot = persisted_reader.daemon_worktree_snapshot();
+        assert!(
+            matches!(
+                persisted_snapshot,
+                Some(DaemonWorktreeSnapshot::Clean { root_id: Some(ref root), .. }) if root == &legacy_root
+            ),
+            "unexpected persisted daemon snapshot: {persisted_snapshot:?}"
+        );
         drop(persisted_reader);
 
         let mut repair_db = Trail::open(workspace.path()).unwrap();
         repair_db.rebuild_indexes().unwrap();
         let repaired = repair_db.resolve_branch_ref("main").unwrap();
         assert_ne!(repaired.root_id, legacy_root);
-        assert!(matches!(
-            repair_db.daemon_worktree_snapshot(),
-            Some(DaemonWorktreeSnapshot::Clean { root_id: Some(root), .. }) if root == legacy_root
-        ));
+        let repaired_snapshot = repair_db.daemon_worktree_snapshot();
+        assert!(
+            matches!(
+                repaired_snapshot,
+                Some(DaemonWorktreeSnapshot::Clean { root_id: Some(ref root), .. }) if root == &legacy_root
+            ),
+            "unexpected repaired daemon snapshot: {repaired_snapshot:?}"
+        );
         repair_db
             .conn
             .execute("DELETE FROM worktree_file_index", [])
