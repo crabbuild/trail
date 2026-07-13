@@ -11,6 +11,30 @@ struct PathFileRead {
 }
 
 impl Trail {
+    pub(crate) fn build_case_fold_map_tree<'a, I>(&self, paths: I) -> Result<Tree>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let mut mappings = BTreeMap::new();
+        for path in paths {
+            let folded = case_insensitive_path_key(path);
+            if let Some(previous) = mappings.insert(folded, path.clone()) {
+                if previous != *path {
+                    return Err(Error::InvalidPath {
+                        path: path.clone(),
+                        reason: format!("case-insensitive path collision with `{previous}`"),
+                    });
+                }
+            }
+        }
+
+        let mut builder = SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
+        for (folded, canonical) in mappings {
+            builder.add(folded.into_bytes(), canonical.into_bytes())?;
+        }
+        Ok(builder.build()?)
+    }
+
     pub(crate) fn build_root_from_git_tracked_paths(
         &self,
         paths: &[String],
@@ -34,6 +58,7 @@ impl Trail {
     ) -> Result<RootBuildResult> {
         let paths = normalize_root_build_paths(paths)?;
         validate_no_case_fold_collisions(paths.iter())?;
+        let case_fold_tree = self.build_case_fold_map_tree(paths.iter())?;
 
         let mut files = BTreeMap::new();
         let mut disk_manifest = BTreeMap::new();
@@ -79,6 +104,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: files.len() as u64,
             total_text_bytes,
             created_by: change_id.clone(),
@@ -269,6 +295,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: None,
             file_count: file_count as u64,
             total_text_bytes: total_text_bytes as u64,
             created_by: change_id.clone(),
@@ -522,6 +549,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: None,
             file_count: file_count as u64,
             total_text_bytes: total_text_bytes as u64,
             created_by: change_id.clone(),
@@ -613,6 +641,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: None,
             file_count: file_count as u64,
             total_text_bytes: total_text_bytes as u64,
             created_by: change_id.clone(),
@@ -672,6 +701,7 @@ impl Trail {
     ) -> Result<RootBuildResult> {
         validate_no_case_fold_collisions(files.keys())?;
         validate_no_case_fold_collisions(disk_manifest.keys())?;
+        let case_fold_tree = self.build_case_fold_map_tree(files.keys())?;
 
         let mut path_builder =
             SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
@@ -688,6 +718,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: files.len() as u64,
             total_text_bytes,
             created_by: change_id.clone(),
@@ -799,6 +830,90 @@ fn root_stats(files: &BTreeMap<String, FileEntry>) -> (ImportStats, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_case_fold_mapping(
+        db: &Trail,
+        root_id: &ObjectId,
+        folded_path: &str,
+        canonical_path: &str,
+    ) {
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, root_id).unwrap();
+        let tree = root_map_tree_from_root_hex(root.case_fold_map_root.as_deref()).unwrap();
+        assert_eq!(
+            db.root_prolly.get(&tree, folded_path.as_bytes()).unwrap(),
+            Some(canonical_path.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn legacy_worktree_root_deserialization_defaults_case_fold_index_to_none() {
+        #[derive(Serialize)]
+        struct LegacyWorktreeRoot {
+            version: u16,
+            path_map_root: Option<String>,
+            file_index_map_root: Option<String>,
+            file_count: u64,
+            total_text_bytes: u64,
+            created_by: ChangeId,
+        }
+
+        let bytes = cbor(&LegacyWorktreeRoot {
+            version: ROOT_OBJECT_VERSION,
+            path_map_root: Some("path-root".to_string()),
+            file_index_map_root: Some("file-index-root".to_string()),
+            file_count: 2,
+            total_text_bytes: 12,
+            created_by: ChangeId("change_legacy_root".to_string()),
+        })
+        .unwrap();
+
+        let root: WorktreeRoot = from_cbor(&bytes).unwrap();
+        assert_eq!(root.case_fold_map_root, None);
+    }
+
+    #[test]
+    fn full_path_list_root_build_persists_ascii_and_unicode_case_fold_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::create_dir_all(temp.path().join("docs")).unwrap();
+        fs::write(temp.path().join("src/Ｋernel.rs"), "kernel\n").unwrap();
+        fs::write(temp.path().join("docs/ReadMe.md"), "readme\n").unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let built = db
+            .build_root_from_worktree_paths(
+                &["src/Ｋernel.rs".to_string(), "docs/ReadMe.md".to_string()],
+                &ChangeId("change_case_fold_path_root".to_string()),
+            )
+            .unwrap();
+
+        assert_case_fold_mapping(&db, &built.root_id, "docs/readme.md", "docs/ReadMe.md");
+        assert_case_fold_mapping(&db, &built.root_id, "src/kernel.rs", "src/Ｋernel.rs");
+    }
+
+    #[test]
+    fn full_file_entry_root_build_persists_ascii_and_unicode_case_fold_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::create_dir_all(temp.path().join("docs")).unwrap();
+        fs::write(temp.path().join("src/Ｋernel.rs"), "kernel\n").unwrap();
+        fs::write(temp.path().join("docs/ReadMe.md"), "readme\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let files = db.load_root_files(&head.root_id).unwrap();
+        let built = db
+            .build_root_from_file_entries(
+                files,
+                &ChangeId("change_case_fold_file_entry_root".to_string()),
+            )
+            .unwrap();
+
+        assert_case_fold_mapping(&db, &built.root_id, "docs/readme.md", "docs/ReadMe.md");
+        assert_case_fold_mapping(&db, &built.root_id, "src/kernel.rs", "src/Ｋernel.rs");
+    }
 
     #[test]
     fn touched_incremental_root_rejects_final_case_fold_collisions_before_objects() {

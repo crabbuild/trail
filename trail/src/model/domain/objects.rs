@@ -11,6 +11,8 @@ pub struct WorktreeRoot {
     pub version: u16,
     pub path_map_root: Option<String>,
     pub file_index_map_root: Option<String>,
+    #[serde(default)]
+    pub case_fold_map_root: Option<String>,
     pub file_count: u64,
     pub total_text_bytes: u64,
     pub created_by: ChangeId,
