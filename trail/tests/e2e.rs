@@ -59,6 +59,34 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn git_output_raw(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_object_count(cwd: &Path) -> u64 {
+    let output = git_output(cwd, &["count-objects", "-v"]);
+    let counts = output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .collect::<BTreeMap<_, _>>();
+    let loose = counts.get("count:").unwrap().parse::<u64>().unwrap();
+    let packed = counts.get("in-pack:").unwrap().parse::<u64>().unwrap();
+    loose + packed
+}
+
 fn trail_bin() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_trail")
         .map(PathBuf::from)
@@ -1202,6 +1230,74 @@ fn agent_apply_requires_mapping_before_git_or_trail_mutation() {
     assert!(matches!(err, Error::GitMappingRequired(_)));
     assert!(db.git_mappings(10).unwrap().is_empty());
     assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), git_head);
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_apply_preserves_git_only_symlinks() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("target.md"), "target\n").unwrap();
+    std::os::unix::fs::symlink("target.md", temp.path().join("link.md")).unwrap();
+    run_git(temp.path(), &["add", "target.md", "link.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "add readme",
+        "edits": [{"op": "write", "path": "README.md", "content": "agent change"}]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:link.md"]),
+        "target.md"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:target.md"]),
+        "target\n"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:README.md"]),
+        "agent change"
+    );
+}
+
+#[test]
+fn agent_apply_dry_run_writes_no_git_or_mapping_state() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let head_before = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    let index_before = fs::read(temp.path().join(".git/index")).unwrap();
+    let mappings_before = db.git_mappings(100).unwrap().len();
+    let objects_before = git_object_count(temp.path());
+
+    let report = db.agent_apply("apply-bot", true, None).unwrap();
+    assert!(report.dry_run);
+
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(db.git_mappings(100).unwrap().len(), mappings_before);
+    assert_eq!(git_object_count(temp.path()), objects_before);
 }
 
 fn only_conflict_path_class(db: &Trail) -> (String, String) {
