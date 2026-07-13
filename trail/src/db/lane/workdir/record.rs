@@ -231,7 +231,7 @@ impl Trail {
                             &previous_files,
                             &disk_manifest,
                             &selected_paths,
-                        );
+                        )?;
                         (summaries, previous_files, false, None)
                     } else if let Some(candidate_paths) = candidate_paths {
                         let resolution = self.resolve_record_case_fold_candidates_read_only(
@@ -246,7 +246,7 @@ impl Trail {
                             &previous_files,
                             &disk_manifest,
                             &candidate_paths,
-                        );
+                        )?;
                         (
                             summaries,
                             previous_files,
@@ -701,7 +701,7 @@ impl Trail {
                     &previous_files,
                     &disk_manifest,
                     &candidate_paths,
-                ),
+                )?,
                 case_fold,
             });
         }
@@ -731,7 +731,7 @@ impl Trail {
                             &previous_files,
                             &disk_manifest,
                             &selected_paths,
-                        ),
+                        )?,
                         case_fold: RecordChangedPathsCaseFold::NeedsValidation,
                     })
                 } else if let Some(candidate_paths) = candidate_paths {
@@ -749,7 +749,7 @@ impl Trail {
                             &previous_files,
                             &disk_manifest,
                             &candidate_paths,
-                        ),
+                        )?,
                         case_fold,
                     })
                 } else {
@@ -774,7 +774,7 @@ impl Trail {
                             &previous_files,
                             &disk_manifest,
                             &selected_paths,
-                        ),
+                        )?,
                         case_fold: RecordChangedPathsCaseFold::NeedsValidation,
                     })
                 } else {

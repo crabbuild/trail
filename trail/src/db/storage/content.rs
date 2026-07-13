@@ -118,16 +118,25 @@ impl Trail {
         root_id: &ObjectId,
         paths: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let paths = paths
+            .iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<BTreeSet<_>>>()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut out = BTreeMap::new();
+        if paths.is_empty() {
+            return Ok(out);
+        }
         self.note_operation_metrics(OperationMetricsDelta {
             root_point_key_count: saturating_u64_from_usize(paths.len()),
             ..OperationMetricsDelta::default()
         });
-        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
-        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
-        let mut out = BTreeMap::new();
-        for path in paths {
-            let path = normalize_relative_path(path)?;
-            if let Some(value) = self.root_prolly.get(&tree, path.as_bytes())? {
+        let values = self.root_prolly.get_many(&tree, &paths)?;
+        for (path, value) in paths.into_iter().zip(values) {
+            if let Some(value) = value {
                 out.insert(path, from_cbor(&value)?);
             }
         }
@@ -139,25 +148,35 @@ impl Trail {
         root_id: &ObjectId,
         selections: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
-        let mut root_metrics = OperationMetricsAccumulator::new(
-            self.operation_metrics.as_ref(),
-            OperationMetricsDelta {
-                root_point_key_count: saturating_u64_from_usize(selections.len()),
-                bounded_root_range_count: saturating_u64_from_usize(selections.len()),
-                ..OperationMetricsDelta::default()
-            },
-        );
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        let selections = SelectionSet::from_paths(selections)?;
         let mut out = BTreeMap::new();
-        for selection in selections {
-            let selection = normalize_relative_path(selection)?;
-            if let Some(value) = self.root_prolly.get(&tree, selection.as_bytes())? {
+        if selections.as_slice().is_empty() {
+            return Ok(out);
+        }
+        self.note_operation_metrics(OperationMetricsDelta {
+            root_point_key_count: saturating_u64_from_usize(selections.as_slice().len()),
+            ..OperationMetricsDelta::default()
+        });
+        let exact_values = self.root_prolly.get_many(&tree, selections.as_slice())?;
+        for (selection, value) in selections.as_slice().iter().zip(exact_values) {
+            if let Some(value) = value {
                 out.insert(selection.clone(), from_cbor(&value)?);
             }
+        }
 
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta::default(),
+        );
+        for selection in selections.as_slice() {
             let prefix = format!("{selection}/");
             let end = prefix_upper_bound(prefix.as_bytes());
+            root_metrics.delta.bounded_root_range_count = root_metrics
+                .delta
+                .bounded_root_range_count
+                .saturating_add(1);
             let iter = self
                 .root_prolly
                 .range(&tree, prefix.as_bytes(), end.as_deref())?;
@@ -167,9 +186,7 @@ impl Trail {
                     root_metrics.delta.root_range_row_count.saturating_add(1);
                 let path = String::from_utf8(key)
                     .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
-                if path_matches_selection(&path, &selection) {
-                    out.insert(path, from_cbor(&value)?);
-                }
+                out.insert(path, from_cbor(&value)?);
             }
         }
         Ok(out)
@@ -940,6 +957,35 @@ mod tests {
         (workspace, db, head)
     }
 
+    fn root_with_path_values(
+        db: &Trail,
+        source_root_id: &ObjectId,
+        values: BTreeMap<String, Vec<u8>>,
+    ) -> ObjectId {
+        let source: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, source_root_id).unwrap();
+        let mut builder = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
+        for (path, value) in &values {
+            builder
+                .add(path.as_bytes().to_vec(), value.clone())
+                .unwrap();
+        }
+        let path_tree = builder.build().unwrap();
+        let root = WorktreeRoot {
+            path_map_root: tree_root_hex(&path_tree),
+            file_count: values.len() as u64,
+            ..source
+        };
+        db.put_object(WORKTREE_ROOT_KIND, ROOT_OBJECT_VERSION, &root)
+            .unwrap()
+    }
+
+    fn fixture_entry(db: &Trail, root_id: &ObjectId) -> FileEntry {
+        db.load_root_files_for_paths(root_id, &["a.txt".to_string()])
+            .unwrap()
+            .remove("a.txt")
+            .unwrap()
+    }
+
     #[test]
     fn streaming_root_materialization_chunks_visit_sorted_files_once() {
         let (_workspace, db, head) = streaming_root_materialization_fixture();
@@ -1015,6 +1061,153 @@ mod tests {
             .root_file_entry(&head.root_id, "a.txt")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn exact_root_load_batches_unique_keys_without_parent_collapsing_or_case_folding() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let entry = fixture_entry(&db, &head.root_id);
+        let encoded = cbor(&entry).unwrap();
+        let root_id = root_with_path_values(
+            &db,
+            &head.root_id,
+            BTreeMap::from([
+                ("README.md".to_string(), encoded.clone()),
+                ("docs/child.txt".to_string(), encoded),
+            ]),
+        );
+        let metrics = db.operation_metrics.as_ref().unwrap();
+        let before = metrics.snapshot();
+
+        let files = db
+            .load_root_files_for_paths(
+                &root_id,
+                &[
+                    "README.md".to_string(),
+                    "README.md".to_string(),
+                    "readme.md".to_string(),
+                    "docs".to_string(),
+                    "docs/child.txt".to_string(),
+                    "missing.txt".to_string(),
+                ],
+            )
+            .unwrap();
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            files.keys().cloned().collect::<Vec<_>>(),
+            ["README.md", "docs/child.txt"]
+        );
+        assert_eq!(after.root_point_key_count - before.root_point_key_count, 5);
+        assert_eq!(
+            after.prolly_read_call_count - before.prolly_read_call_count,
+            1
+        );
+        assert_eq!(
+            after.full_root_range_count - before.full_root_range_count,
+            0
+        );
+        assert_eq!(
+            after.bounded_root_range_count - before.bounded_root_range_count,
+            0
+        );
+    }
+
+    #[test]
+    fn selected_root_load_collapses_overlap_and_ignores_ten_thousand_decoys() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let entry = fixture_entry(&db, &head.root_id);
+        let encoded = cbor(&entry).unwrap();
+        let mut values = BTreeMap::new();
+        for idx in 0..10_000 {
+            values.insert(format!("decoy/{idx:05}.txt"), encoded.clone());
+        }
+        values.insert("docs/a.txt".to_string(), encoded.clone());
+        values.insert("docs/sub/b.txt".to_string(), encoded.clone());
+        values.insert("docs-z/sibling.txt".to_string(), encoded);
+        let root_id = root_with_path_values(&db, &head.root_id, values);
+        let metrics = db.operation_metrics.as_ref().unwrap();
+        let before = metrics.snapshot();
+
+        let files = db
+            .load_root_files_for_selections(
+                &root_id,
+                &[
+                    "docs/sub".to_string(),
+                    "docs".to_string(),
+                    "docs/a.txt".to_string(),
+                    "docs".to_string(),
+                ],
+            )
+            .unwrap();
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            files.keys().cloned().collect::<Vec<_>>(),
+            ["docs/a.txt", "docs/sub/b.txt"]
+        );
+        assert_eq!(
+            after.full_root_range_count - before.full_root_range_count,
+            0
+        );
+        assert_eq!(after.root_point_key_count - before.root_point_key_count, 1);
+        assert_eq!(
+            after.bounded_root_range_count - before.bounded_root_range_count,
+            1
+        );
+        assert_eq!(after.root_range_row_count - before.root_range_row_count, 2);
+    }
+
+    #[test]
+    fn selected_root_load_does_not_report_work_when_root_resolution_fails() {
+        let (_workspace, db, _head) = streaming_root_materialization_fixture();
+        let metrics = db.operation_metrics.as_ref().unwrap();
+        let before = metrics.snapshot();
+
+        let err = db
+            .load_root_files_for_selections(
+                &ObjectId("missing-root".to_string()),
+                &["docs".to_string(), "docs/sub".to_string()],
+            )
+            .unwrap_err();
+        let after = metrics.snapshot();
+
+        assert!(matches!(err, Error::ObjectNotFound { .. }));
+        assert_eq!(after.root_point_key_count - before.root_point_key_count, 0);
+        assert_eq!(
+            after.bounded_root_range_count - before.bounded_root_range_count,
+            0
+        );
+        assert_eq!(after.root_range_row_count - before.root_range_row_count, 0);
+    }
+
+    #[test]
+    fn selected_root_load_counts_rows_consumed_before_decode_error() {
+        let (_workspace, db, head) = streaming_root_materialization_fixture();
+        let entry = fixture_entry(&db, &head.root_id);
+        let root_id = root_with_path_values(
+            &db,
+            &head.root_id,
+            BTreeMap::from([
+                ("docs/a.txt".to_string(), cbor(&entry).unwrap()),
+                ("docs/b.txt".to_string(), vec![0xff]),
+            ]),
+        );
+        let metrics = db.operation_metrics.as_ref().unwrap();
+        let before = metrics.snapshot();
+
+        let err = db
+            .load_root_files_for_selections(&root_id, &["docs".to_string()])
+            .unwrap_err();
+        let after = metrics.snapshot();
+
+        assert!(matches!(err, Error::Serialization(_)));
+        assert_eq!(after.root_point_key_count - before.root_point_key_count, 1);
+        assert_eq!(
+            after.bounded_root_range_count - before.bounded_root_range_count,
+            1
+        );
+        assert_eq!(after.root_range_row_count - before.root_range_row_count, 2);
     }
 
     #[test]

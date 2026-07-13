@@ -696,7 +696,7 @@ impl Trail {
         let disk_files = self.scan_files_under_for_paths(workdir_path, &target_paths)?;
         let disk_manifest = self.disk_manifest(&disk_files);
         let diffs =
-            self.diff_file_maps_to_manifest_for_paths(target_files, &disk_manifest, &target_paths);
+            self.diff_file_maps_to_manifest_for_paths(target_files, &disk_manifest, &target_paths)?;
         if let Some(diff) = diffs.first() {
             let detail = sparse_hydration_diff_detail(
                 diff,
@@ -779,13 +779,7 @@ impl Trail {
 
         let head_files = self.selected_file_entries(target_files, &candidate_paths);
         let disk_manifest = self.disk_manifest(&disk_files);
-        Ok(
-            self.diff_file_maps_to_manifest_for_paths(
-                &head_files,
-                &disk_manifest,
-                &candidate_paths,
-            ),
-        )
+        self.diff_file_maps_to_manifest_for_paths(&head_files, &disk_manifest, &candidate_paths)
     }
 }
 
