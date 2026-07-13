@@ -237,6 +237,33 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
+        Error::GitMappingRequired(_) => {
+            let mut diagnostic = UiDiagnostic::new(err.code(), "Git baseline mapping is required");
+            diagnostic.recovery = Some(UiNextAction {
+                command: "trail git import-update".to_string(),
+                reason: "Import the current Git snapshot before retrying the handoff.".to_string(),
+            });
+            diagnostic
+        }
+        Error::GitHeadChanged(_) => {
+            let mut diagnostic = UiDiagnostic::new(err.code(), "Git HEAD changed during handoff");
+            diagnostic.recovery = Some(UiNextAction {
+                command: "git status --short".to_string(),
+                reason: "Inspect the current Git branch and worktree before retrying.".to_string(),
+            });
+            diagnostic
+        }
+        Error::GitWorktreeDirty(_) => {
+            let mut diagnostic = UiDiagnostic::new(err.code(), "Git tracked worktree has changes");
+            diagnostic.recovery = Some(UiNextAction {
+                command: "git status --short".to_string(),
+                reason: "Inspect tracked Git changes before retrying the handoff.".to_string(),
+            });
+            diagnostic
+        }
+        Error::GitDeltaExportRequired(_) => {
+            UiDiagnostic::new(err.code(), "Mapped Git delta export is required")
+        }
         Error::DaemonUnavailable(_) | Error::DaemonError { .. } => {
             let mut diagnostic = UiDiagnostic::new(err.code(), "Trail daemon request failed");
             diagnostic.recovery = Some(UiNextAction {
@@ -292,6 +319,16 @@ mod tests {
         let diagnostic = diagnostic_for_error(&Error::DirtyWorktree);
         assert_eq!(diagnostic.code, "DIRTY_WORKTREE");
         assert_eq!(diagnostic.recovery.unwrap().command, "trail status");
+    }
+
+    #[test]
+    fn missing_git_mapping_recommends_explicit_reconciliation() {
+        let diagnostic = diagnostic_for_error(&Error::GitMappingRequired("missing".into()));
+        assert_eq!(diagnostic.code, "GIT_MAPPING_REQUIRED");
+        assert_eq!(
+            diagnostic.recovery.unwrap().command,
+            "trail git import-update"
+        );
     }
 
     #[test]
