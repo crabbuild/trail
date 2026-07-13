@@ -1855,16 +1855,34 @@ fn inject_trail_mcp_server(
     let servers = servers.as_array_mut().ok_or_else(|| {
         Error::InvalidInput("ACP session mcpServers must be an array".to_string())
     })?;
-    let already_present = servers.iter().any(|server| {
-        server
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name == "trail")
-    });
+    let already_present = servers
+        .iter()
+        .any(|existing| equivalent_trail_mcp_server(existing, &server));
     if !already_present {
         servers.push(server);
     }
     Ok(())
+}
+
+fn equivalent_trail_mcp_server(existing: &Value, expected: &Value) -> bool {
+    if existing.get("command") != expected.get("command")
+        || existing.get("args") != expected.get("args")
+    {
+        return false;
+    }
+    let Some(existing_env) = existing.get("env").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(expected_env) = expected.get("env").and_then(Value::as_array) else {
+        return false;
+    };
+    expected_env.iter().all(|expected_variable| {
+        let name = expected_variable.get("name");
+        let value = expected_variable.get("value");
+        existing_env.iter().any(|existing_variable| {
+            existing_variable.get("name") == name && existing_variable.get("value") == value
+        })
+    })
 }
 
 fn acp_path_mapping(mapping: PathMapping) -> AcpPathMapping {

@@ -268,7 +268,7 @@ printf '%s\n' '{}'
 }
 
 #[test]
-fn mcp_injection_preserves_order_and_deduplicates_trail_identity() {
+fn mcp_injection_preserves_same_name_servers_and_appends_trail_identity() {
     let temp = workspace();
     let received = temp.path().join("received.jsonl");
     let agent = write_agent(
@@ -302,10 +302,12 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s"}}}}'
     let forwarded: Value =
         serde_json::from_str(fs::read_to_string(received).unwrap().trim()).unwrap();
     let servers = forwarded["params"]["mcpServers"].as_array().unwrap();
-    assert_eq!(servers.len(), 2);
+    assert_eq!(servers.len(), 3);
     assert_eq!(servers[0]["name"], "first");
     assert_eq!(servers[1]["name"], "trail");
     assert_eq!(servers[1]["command"], "/custom/trail");
+    assert_eq!(servers[2]["name"], "trail");
+    assert_eq!(servers[2]["args"], serde_json::json!(["mcp"]));
 }
 
 #[test]
