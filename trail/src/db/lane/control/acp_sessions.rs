@@ -184,10 +184,11 @@ fn validate_acp_session_status(value: &str) -> Result<&'static str> {
         "loaded" => Ok("loaded"),
         "resumed" => Ok("resumed"),
         "closed" => Ok("closed"),
+        "deleted" => Ok("deleted"),
         "failed" => Ok("failed"),
         "cancelled" => Ok("cancelled"),
         other => Err(Error::InvalidInput(format!(
-            "ACP session status must be starting, active, loaded, resumed, closed, failed, or cancelled, got `{other}`"
+            "ACP session status must be starting, active, loaded, resumed, closed, deleted, failed, or cancelled, got `{other}`"
         ))),
     }
 }
