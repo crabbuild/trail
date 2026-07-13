@@ -616,6 +616,20 @@ impl Trail {
         pinned_paths: &[String],
         case_insensitive: bool,
     ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
+        self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+            root,
+            pinned_paths,
+            case_insensitive,
+        )
+        .map(|(files, _)| files)
+    }
+
+    fn scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+        &self,
+        root: &Path,
+        pinned_paths: &[String],
+        case_insensitive: bool,
+    ) -> Result<(BTreeMap<String, WorkdirFileStamp>, usize)> {
         let root = root.canonicalize()?;
         let mut files = self.scan_workdir_file_stamps(&root)?;
         let mut exact_paths = files.keys().cloned().collect::<BTreeSet<_>>();
@@ -625,10 +639,12 @@ impl Trail {
             .iter()
             .map(|path| case_insensitive_path_key(path))
             .collect::<BTreeSet<_>>();
+        let mut observed_insertions = 0;
         for (path, kind) in &observed {
-            if *kind != ObservedPathKind::RegularFile {
+            if exact_paths.contains(path) || *kind != ObservedPathKind::RegularFile {
                 continue;
             }
+            observed_insertions += 1;
             let Some(stamp) = open_observed_exact_regular_file_stamp(&root, path)? else {
                 continue;
             };
@@ -664,7 +680,7 @@ impl Trail {
             exact_paths.insert(path.clone());
             files.insert(path, WorkdirFileStamp::from_metadata(&metadata));
         }
-        Ok(files)
+        Ok((files, observed_insertions))
     }
 }
 
@@ -985,15 +1001,35 @@ mod tests {
             "README.md",
         ));
 
-        let stamps = db
-            .scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+        let (stamps, observed_insertions) = db
+            .scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
                 workspace.path(),
                 &["README.md".to_string()],
                 true,
             )
             .unwrap();
+        assert_eq!(observed_insertions, 1);
         assert!(stamps.contains_key("readme.md"));
         assert!(!stamps.contains_key("README.md"));
+    }
+
+    #[test]
+    fn visible_exact_pinned_file_needs_no_observed_insertion_open() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("visible.md"), "visible\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+
+        let (stamps, observed_insertions) = db
+            .scan_workdir_file_stamps_with_pinned_paths_case_sensitivity_and_insertion_count(
+                workspace.path(),
+                &["visible.md".to_string()],
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(observed_insertions, 0);
+        assert!(stamps.contains_key("visible.md"));
     }
 
     #[test]
