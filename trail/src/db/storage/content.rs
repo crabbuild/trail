@@ -627,7 +627,9 @@ impl Trail {
     ) -> Result<RootMaterializationReport> {
         self.validate_streaming_root_case_collisions(root_id, output_root)?;
         let empty = BTreeMap::new();
-        let clean_index_available = self.worktree_index_baseline_root()?.as_ref() == Some(root_id);
+        let baseline = self.worktree_index_baseline_root()?;
+        let clean_index_available =
+            self.clean_baseline_matches_visible_root(baseline.as_ref(), root_id);
         let mut report = RootMaterializationReport::default();
         self.for_each_root_file_chunk(root_id, MATERIALIZE_BATCH_FILES, |chunk| {
             let mut chunk_report = None;

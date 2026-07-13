@@ -67,11 +67,45 @@ remain unreachable and are reclaimed by normal GC, but no live ref advances.
 Derived baselines follow the equivalent root identity without touching visible
 files. A clean checked-out worktree baseline is retargeted, clean lane manifests
 and workspace checkpoint markers are retargeted or conservatively invalidated,
-and clean Git mapping rows are copied from the old root/change to each repaired
-root/maintenance change while preserving their recorded Git head, direction,
-and branch. Ref files are derived mirrors of SQLite refs and are reconciled on
-every rebuild, making an interrupted mirror write retryable. A second rebuild
-after successful repair publishes no additional root, operation, or ref.
+and clean Git mapping rows are copied from every distinct clean mapping for the
+old root to each repaired root/maintenance change while preserving their Git
+head, direction, and branch. Mapping discovery is root-wide rather than tied to
+the old ref change, because historical imports and exports can establish valid
+trust for the same immutable root under different changes. Duplicate source
+tuples are collapsed before insertion.
+
+Clean-state consumers may reuse a baseline whose root ID predates repair only
+after loading both immutable roots and proving equal path-map root, file-ID-map
+root, file count, and total text bytes. The exact-ID case remains the fast path;
+missing or corrupt roots fail closed. This equivalence applies only to states
+already proven clean. Dirty and overflow daemon snapshots are never promoted to
+clean, and a live daemon snapshot is not rewritten or deleted by repair.
+
+The maintenance operation row and its parent rows are indexed inside the same
+authoritative SQLite transaction that advances refs and lane heads. Therefore a
+process crash immediately after `COMMIT` still leaves operation lookup and
+ancestry complete before a later broad index rebuild runs. Ref files remain
+derived mirrors of SQLite refs and are reconciled on every rebuild.
+
+Lane manifests and workspace checkpoint markers have a durable SQLite repair
+queue (schema version 17). Each intent stores only ref name, repair kind, old
+root, new root, and new change; filesystem paths are resolved again from the
+current authoritative lane/view rows. Intents publish in the same transaction
+as the ref repair, then drain after commit, at every rebuild, and on open after
+an unlocked empty fast check plus a locked recheck. A new or already-retargeted
+mirror, a missing scope/mirror, or conservative invalidation clears the intent;
+an I/O failure leaves it for retry. Restore and backup verification use a
+no-recovery database open so copied absolute paths are never followed. Restore
+atomically rewrites lane workdirs and invalidates workspace-view/environment
+state that the backup does not contain before draining intents and entering
+normal recovery.
+
+Legacy-root validation is two-pass and bounded by the largest distinct live
+legacy root rather than the sum of all roots. The first pass validates one
+root's key range, count, normalization, and fold collisions and retains only its
+ID/count. After every root passes, the second pass re-ranges and builds one fold
+tree at a time. A second rebuild after successful repair publishes no additional
+root, operation, ref, or derived intent.
 
 ## Structural evidence
 

@@ -11,6 +11,7 @@ impl Trail {
         if user_version == TRAIL_SCHEMA_VERSION
             && current_environment_schema_complete(&self.conn)?
             && super::agent_capture::agent_capture_schema_complete(&self.conn)?
+            && current_path_index_repair_schema_complete(&self.conn)?
         {
             return Ok(());
         }
@@ -336,6 +337,17 @@ impl Trail {
             );
             CREATE INDEX IF NOT EXISTS git_mappings_change_idx ON git_mappings(crab_change);
             CREATE INDEX IF NOT EXISTS git_mappings_head_idx ON git_mappings(git_head);
+            CREATE TABLE IF NOT EXISTS pending_path_index_derived_repairs (
+                ref_name TEXT NOT NULL,
+                repair_kind TEXT NOT NULL CHECK (repair_kind IN ('lane_manifest', 'workspace_checkpoint')),
+                old_root TEXT NOT NULL,
+                new_root TEXT NOT NULL,
+                new_change TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (ref_name, repair_kind)
+            );
+            CREATE INDEX IF NOT EXISTS pending_path_index_derived_repairs_root_idx
+                ON pending_path_index_derived_repairs(new_root);
             CREATE TABLE IF NOT EXISTS worktree_file_index (
                 path TEXT PRIMARY KEY,
                 size_bytes INTEGER NOT NULL,
@@ -988,6 +1000,11 @@ impl Trail {
                  WHERE state = 'active'",
                 [],
             )?;
+            if !current_path_index_repair_schema_complete(&self.conn)? {
+                return Err(Error::Corrupt(
+                    "pending path-index derived-repair schema is incomplete".to_string(),
+                ));
+            }
             self.record_schema_version()?;
             Ok(())
         })();
@@ -1021,6 +1038,58 @@ fn migrate_lane_merge_queue_v16(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn current_path_index_repair_schema_complete(conn: &Connection) -> Result<bool> {
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'table' AND name = 'pending_path_index_derived_repairs'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(table_sql) = table_sql else {
+        return Ok(false);
+    };
+    let normalized_sql = table_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !normalized_sql.contains("CHECK (repair_kind IN ('lane_manifest', 'workspace_checkpoint'))")
+    {
+        return Ok(false);
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(pending_path_index_derived_repairs)")?;
+    let columns = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = vec![
+        ("ref_name".to_string(), "TEXT".to_string(), true, 1),
+        ("repair_kind".to_string(), "TEXT".to_string(), true, 2),
+        ("old_root".to_string(), "TEXT".to_string(), true, 0),
+        ("new_root".to_string(), "TEXT".to_string(), true, 0),
+        ("new_change".to_string(), "TEXT".to_string(), true, 0),
+        ("created_at".to_string(), "INTEGER".to_string(), true, 0),
+    ];
+    if columns != expected {
+        return Ok(false);
+    }
+
+    let indexed_column = conn
+        .query_row(
+            "SELECT name FROM pragma_index_info('pending_path_index_derived_repairs_root_idx') \
+             ORDER BY seqno LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(indexed_column.as_deref() == Some("new_root"))
 }
 
 fn ensure_environment_generation_outputs_v7(conn: &Connection) -> Result<()> {
@@ -1072,10 +1141,10 @@ fn ensure_environment_generation_outputs_v7(conn: &Connection) -> Result<()> {
 fn current_environment_schema_complete(conn: &Connection) -> Result<bool> {
     let required_tables = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('schema_meta', 'environment_component_states', 'environment_component_key_provenance', 'environment_component_bindings', 'environment_component_output_bindings', 'environment_component_dependencies', 'environment_cache_namespaces', 'environment_component_caches', 'environment_component_external_artifacts', 'environment_component_runtime_resources', 'environment_component_runtime_secrets', 'environment_generations', 'environment_generation_components', 'environment_generation_outputs', 'environment_generation_edges', 'environment_generation_caches', 'environment_generation_external_artifacts', 'environment_generation_runtime_resources', 'environment_generation_runtime_secrets', 'environment_secret_access_audit', 'environment_view_generations', 'environment_sync_attempts')",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('schema_meta', 'pending_path_index_derived_repairs', 'environment_component_states', 'environment_component_key_provenance', 'environment_component_bindings', 'environment_component_output_bindings', 'environment_component_dependencies', 'environment_cache_namespaces', 'environment_component_caches', 'environment_component_external_artifacts', 'environment_component_runtime_resources', 'environment_component_runtime_secrets', 'environment_generations', 'environment_generation_components', 'environment_generation_outputs', 'environment_generation_edges', 'environment_generation_caches', 'environment_generation_external_artifacts', 'environment_generation_runtime_resources', 'environment_generation_runtime_secrets', 'environment_secret_access_audit', 'environment_view_generations', 'environment_sync_attempts')",
             [],
             |row| row.get::<_, i64>(0),
-        )? == 22;
+        )? == 23;
     if !required_tables {
         return Ok(false);
     }

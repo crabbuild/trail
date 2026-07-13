@@ -2181,7 +2181,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 16
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 17
         }));
     }
 
@@ -2296,7 +2296,7 @@ fn schema_v16_discards_generic_merge_queue() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     let legacy_tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'merge_queue'",
@@ -2333,6 +2333,78 @@ fn schema_v16_discards_generic_merge_queue() {
 }
 
 #[test]
+fn schema_v17_adds_pending_path_index_derived_repairs_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let db_path = temp.path().join(".trail/index/trail.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS pending_path_index_derived_repairs;
+         PRAGMA user_version = 16;
+         UPDATE schema_meta SET value = '16' WHERE key = 'schema.version';",
+    )
+    .unwrap();
+    drop(conn);
+
+    Trail::open(temp.path()).unwrap();
+    let conn = Connection::open(db_path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17);
+    let table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'pending_path_index_derived_repairs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 1);
+    let columns = conn
+        .prepare("PRAGMA table_info(pending_path_index_derived_repairs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            "ref_name",
+            "repair_kind",
+            "old_root",
+            "new_root",
+            "new_change",
+            "created_at",
+        ]
+    );
+}
+
+#[test]
+fn schema_v17_current_version_rejects_malformed_pending_repair_table() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let db_path = temp.path().join(".trail/index/trail.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE pending_path_index_derived_repairs;
+         CREATE TABLE pending_path_index_derived_repairs (
+             ref_name TEXT PRIMARY KEY,
+             repair_kind TEXT NOT NULL
+         );
+         PRAGMA user_version = 17;
+         UPDATE schema_meta SET value = '17' WHERE key = 'schema.version';",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(Trail::open(temp.path()).is_err());
+}
+
+#[test]
 fn schema_v6_backfills_normalized_environment_component_states_legacy_projection() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -2361,7 +2433,7 @@ fn schema_v6_backfills_normalized_environment_component_states_legacy_projection
     let version = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     let node = conn
         .query_row(
@@ -2481,7 +2553,7 @@ fn schema_v9_backfills_typed_environment_edges_without_losing_upstream_keys() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     let active_edge = conn
         .query_row(
@@ -2538,7 +2610,7 @@ fn schema_v10_adds_typed_environment_cache_namespaces_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_cache_namespaces",
@@ -2602,7 +2674,7 @@ fn schema_v12_adds_agent_capture_tables_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "agent_hook_installations",
@@ -2666,7 +2738,7 @@ fn schema_v13_adds_external_artifact_provenance_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_external_artifacts",
@@ -2727,7 +2799,7 @@ fn schema_v14_adds_runtime_resource_lifecycle_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_runtime_resources",
@@ -2793,7 +2865,7 @@ fn schema_v15_adds_opaque_runtime_secret_references_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_runtime_secrets",
@@ -2873,7 +2945,7 @@ fn schema_v6_migrates_v5_single_bindings_to_output_bindings() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     let columns = conn
         .prepare("PRAGMA table_info(workspace_view_layers)")
@@ -3009,7 +3081,7 @@ fn schema_v7_migrates_immutable_outputs_to_policy_aware_nullable_layers() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     let binding = conn
         .query_row(
@@ -3085,7 +3157,7 @@ fn schema_v8_adds_current_and_immutable_environment_dependency_edges() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_dependencies",
@@ -3159,7 +3231,7 @@ fn schema_v6_backfills_normalized_environment_component_states() {
     let version = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     let node = conn
         .query_row(
@@ -7124,19 +7196,119 @@ fn backup_create_verify_and_restore_roundtrip() {
         false,
     )
     .unwrap();
-    db.spawn_lane("backup-bot", Some("main"), true, None, None)
-        .unwrap();
-    drop(db);
-
     let backup_parent = tempfile::tempdir().unwrap();
     let backup_path = backup_parent.path().join("trail-backup");
-    let created = run_trail_json(
-        temp.path(),
-        &["backup", "create", backup_path.to_str().unwrap()],
-    );
-    assert_eq!(created["branch"], "main");
-    assert!(created["sqlite_bytes"].as_u64().unwrap() > 0);
-    assert!(created["worktree_bytes"].as_u64().unwrap() > 0);
+    let external_workdirs = tempfile::tempdir().unwrap();
+    let external_workdir = external_workdirs.path().join("backup-bot");
+    let spawned = db
+        .spawn_lane_with_workdir(
+            "backup-bot",
+            Some("main"),
+            true,
+            None,
+            None,
+            Some(external_workdir.clone()),
+        )
+        .unwrap();
+    let lane_head = db.lane_details("backup-bot").unwrap().branch;
+    let manifest_path = PathBuf::from(spawned.workdir.unwrap())
+        .join(".trail")
+        .join("workdir-manifest.json");
+    let mut legacy_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    legacy_manifest["root_id"] = serde_json::Value::String("object_backup_pending_old".into());
+    let legacy_manifest_bytes = serde_json::to_vec_pretty(&legacy_manifest).unwrap();
+    fs::write(&manifest_path, &legacy_manifest_bytes).unwrap();
+    let source_view_dir = temp.path().join(".trail/views/source-backup-view");
+    let source_view_meta = source_view_dir.join("meta");
+    fs::create_dir_all(&source_view_meta).unwrap();
+    let source_checkpoint_path = source_view_meta.join("clean-checkpoint.json");
+    let source_checkpoint_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "view_id": "source-backup-view",
+        "operation": lane_head.head_change.0,
+        "root_id": "object_backup_checkpoint_old",
+        "journal_sequence": 0,
+    }))
+    .unwrap();
+    fs::write(&source_checkpoint_path, &source_checkpoint_bytes).unwrap();
+    let pending_conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO workspace_views \
+             (view_id, lane_id, base_change, base_root, backend, mountpoint, \
+              source_upper, generated_upper, scratch_upper, meta_dir, journal_path, \
+              generation, checkpoint_seq, checkpoint_root, status, created_at, updated_at) \
+             VALUES ('source-backup-view', ?1, ?2, ?3, 'test-cow', ?4, ?5, ?6, ?7, ?8, ?9, \
+                     1, 0, ?3, 'unmounted', 1, 1)",
+            rusqlite::params![
+                lane_head.lane_id,
+                lane_head.head_change.0,
+                lane_head.head_root.0,
+                external_workdir.to_string_lossy(),
+                source_view_dir.join("source-upper").to_string_lossy(),
+                source_view_dir.join("generated-upper").to_string_lossy(),
+                source_view_dir.join("scratch-upper").to_string_lossy(),
+                source_view_meta.to_string_lossy(),
+                source_view_meta
+                    .join("mutation-journal.jsonl")
+                    .to_string_lossy(),
+            ],
+        )
+        .unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO pending_path_index_derived_repairs \
+             (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+             VALUES (?1, 'lane_manifest', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                lane_head.ref_name,
+                "object_backup_pending_old",
+                lane_head.head_root.0,
+                lane_head.head_change.0,
+            ],
+        )
+        .unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO pending_path_index_derived_repairs \
+             (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+             VALUES (?1, 'workspace_checkpoint', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                lane_head.ref_name,
+                "object_backup_checkpoint_old",
+                lane_head.head_root.0,
+                lane_head.head_change.0,
+            ],
+        )
+        .unwrap();
+    drop(pending_conn);
+    let created = db.create_backup(&backup_path, false).unwrap();
+    assert_eq!(created.branch, "main");
+    assert!(created.sqlite_bytes > 0);
+    let backed_up_workdir = backup_path.join("worktrees/backup-bot");
+    fs::create_dir_all(backed_up_workdir.join(".trail")).unwrap();
+    fs::copy(
+        external_workdir.join("README.md"),
+        backed_up_workdir.join("README.md"),
+    )
+    .unwrap();
+    fs::copy(
+        &manifest_path,
+        backed_up_workdir.join(".trail/workdir-manifest.json"),
+    )
+    .unwrap();
+    drop(db);
+
+    let backup_conn = Connection::open(backup_path.join("index/trail.sqlite")).unwrap();
+    let backed_up_pending: i64 = backup_conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backed_up_pending, 2);
+    drop(backup_conn);
 
     let verified = run_trail_json(
         temp.path(),
@@ -7160,16 +7332,43 @@ fn backup_create_verify_and_restore_roundtrip() {
     assert_eq!(restored_report["rewritten_workdirs"], 1);
 
     let restored_db = Trail::open(restored.path()).unwrap();
+    let restored_conn =
+        Connection::open(restored.path().join(".trail/index/trail.sqlite")).unwrap();
+    assert_eq!(
+        restored_conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(restored_conn);
+    assert_eq!(fs::read(&manifest_path).unwrap(), legacy_manifest_bytes);
+    assert_eq!(
+        fs::read(&source_checkpoint_path).unwrap(),
+        source_checkpoint_bytes
+    );
     let why = restored_db.why("README.md:2", Some("main")).unwrap();
     assert_eq!(why.current_text, "backup");
     let fsck = restored_db.fsck().unwrap();
     assert!(fsck.errors.is_empty(), "{:?}", fsck.errors);
 
     let lane = restored_db.lane_details("backup-bot").unwrap();
+    assert!(restored_db
+        .lane_workspace_view("backup-bot")
+        .unwrap()
+        .is_none());
     let workdir = lane.branch.workdir.as_ref().unwrap();
     let restored_db_dir = restored.path().canonicalize().unwrap().join(".trail");
     assert!(workdir.starts_with(&restored_db_dir.to_string_lossy().to_string()));
     assert!(PathBuf::from(workdir).is_dir());
+    let restored_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(workdir).join(".trail/workdir-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored_manifest["root_id"], lane_head.head_root.0);
     let status = restored_db.lane_status("backup-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
 }

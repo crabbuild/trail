@@ -45,6 +45,34 @@ struct PersistedDaemonWorktreeSnapshot {
 }
 
 impl Trail {
+    /// Returns true only when a clean baseline identifies the same immutable
+    /// visible file state as `target_root_id`. Path-invariant indexes and
+    /// creator metadata are deliberately excluded because they do not change
+    /// materialized bytes, paths, modes, or file identities.
+    pub(crate) fn clean_baseline_matches_visible_root(
+        &self,
+        baseline_root_id: Option<&ObjectId>,
+        target_root_id: &ObjectId,
+    ) -> bool {
+        let Some(baseline_root_id) = baseline_root_id else {
+            return false;
+        };
+        if baseline_root_id == target_root_id {
+            return true;
+        }
+        let Ok(baseline) = self.get_object::<WorktreeRoot>(WORKTREE_ROOT_KIND, baseline_root_id)
+        else {
+            return false;
+        };
+        let Ok(target) = self.get_object::<WorktreeRoot>(WORKTREE_ROOT_KIND, target_root_id) else {
+            return false;
+        };
+        baseline.path_map_root == target.path_map_root
+            && baseline.file_index_map_root == target.file_index_map_root
+            && baseline.file_count == target.file_count
+            && baseline.total_text_bytes == target.total_text_bytes
+    }
+
     pub fn enable_daemon_worktree_cache(&mut self) -> Result<()> {
         let warmup = self.start_daemon_worktree_cache()?;
         warmup.run()
@@ -353,7 +381,8 @@ impl Trail {
         root_id: &ObjectId,
         files: &BTreeMap<String, FileEntry>,
     ) -> Result<Option<BTreeMap<String, WorktreeFileStamp>>> {
-        if self.worktree_index_baseline_root()?.as_ref() != Some(root_id) {
+        let baseline = self.worktree_index_baseline_root()?;
+        if !self.clean_baseline_matches_visible_root(baseline.as_ref(), root_id) {
             return Ok(None);
         }
         if files.is_empty() {
@@ -718,31 +747,6 @@ impl Trail {
             params![WORKTREE_INDEX_BASELINE_ROOT_KEY],
         )?;
         Ok(())
-    }
-
-    pub(crate) fn retarget_clean_daemon_worktree_baseline(
-        &self,
-        old_root_id: &ObjectId,
-        new_root_id: &ObjectId,
-    ) {
-        let Some(cache) = &self.daemon_worktree_cache else {
-            return;
-        };
-        {
-            let mut state = cache.state.lock().expect("daemon worktree cache poisoned");
-            if !state.initialized
-                || state.overflow
-                || !state.dirty_paths.is_empty()
-                || state.baseline_root_id.as_ref() != Some(old_root_id)
-            {
-                return;
-            }
-            state.baseline_root_id = Some(new_root_id.clone());
-            state.generation = state.generation.saturating_add(1);
-        }
-        if let Some(persist) = &cache.persist {
-            persist_daemon_worktree_state(persist, &cache.state);
-        }
     }
 }
 

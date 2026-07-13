@@ -103,10 +103,8 @@ impl Trail {
             }
         }
         let refresh = self.refresh_worktree_index_streaming_report()?;
-        if !refresh.changed
-            && self
-                .worktree_index_baseline_root()?
-                .is_some_and(|baseline| baseline == root_id.clone())
+        let baseline = self.worktree_index_baseline_root()?;
+        if !refresh.changed && self.clean_baseline_matches_visible_root(baseline.as_ref(), root_id)
         {
             return Ok(Vec::new());
         }
@@ -150,7 +148,13 @@ impl Trail {
             DaemonWorktreeSnapshot::Clean {
                 generation: _,
                 root_id: Some(root_id),
-            } if root_id == head.root_id => Ok(Some(clean_status_report(branch, head))),
+            } => {
+                if self.clean_baseline_matches_visible_root(Some(&root_id), &head.root_id) {
+                    Ok(Some(clean_status_report(branch, head)))
+                } else {
+                    Ok(None)
+                }
+            }
             DaemonWorktreeSnapshot::Dirty { generation, paths } => {
                 if paths.len() > self.daemon_dirty_path_limit() {
                     return Ok(None);

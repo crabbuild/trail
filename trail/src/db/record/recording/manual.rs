@@ -70,13 +70,16 @@ impl Trail {
             Some(DaemonWorktreeSnapshot::Clean {
                 generation: _,
                 root_id: Some(clean_root),
-            }) if clean_root == head.root_id => {
-                return Ok(RecordReport {
-                    branch,
-                    operation: None,
-                    root_id: head.root_id,
-                    changed_paths: Vec::new(),
-                });
+            }) => {
+                if self.clean_baseline_matches_visible_root(Some(&clean_root), &head.root_id) {
+                    return Ok(RecordReport {
+                        branch,
+                        operation: None,
+                        root_id: head.root_id,
+                        changed_paths: Vec::new(),
+                    });
+                }
+                None
             }
             Some(DaemonWorktreeSnapshot::Dirty { generation, paths })
                 if paths.len() <= self.daemon_dirty_path_limit() =>
@@ -144,10 +147,9 @@ impl Trail {
             record_generation = None;
         } else {
             let refresh = self.refresh_worktree_index_streaming_report()?;
+            let baseline = self.worktree_index_baseline_root()?;
             if !refresh.changed
-                && self
-                    .worktree_index_baseline_root()?
-                    .is_some_and(|baseline| baseline == head.root_id.clone())
+                && self.clean_baseline_matches_visible_root(baseline.as_ref(), &head.root_id)
             {
                 return Ok(RecordReport {
                     branch,

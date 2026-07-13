@@ -23,7 +23,7 @@ impl Trail {
         result
     }
 
-    fn index_operation_in_transaction(
+    pub(crate) fn index_operation_in_transaction(
         &self,
         operation: &Operation,
         operation_id: &ObjectId,

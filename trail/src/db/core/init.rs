@@ -250,6 +250,29 @@ impl Trail {
         db_dir: PathBuf,
         config: TrailConfig,
     ) -> Result<Self> {
+        let db = Self::open_at_without_recovery(workspace_root, db_dir, config)?;
+        db.recover_after_open()?;
+        Ok(db)
+    }
+
+    pub(crate) fn open_without_recovering_derived_paths(
+        workspace_root: impl AsRef<Path>,
+        db_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let workspace_root = workspace_root.as_ref().canonicalize()?;
+        let db_dir = db_dir.as_ref().canonicalize()?;
+        if !db_dir.is_dir() {
+            return Err(Error::WorkspaceNotFound(db_dir));
+        }
+        let config = read_config(&db_dir)?;
+        Self::open_at_without_recovery(workspace_root, db_dir, config)
+    }
+
+    fn open_at_without_recovery(
+        workspace_root: PathBuf,
+        db_dir: PathBuf,
+        config: TrailConfig,
+    ) -> Result<Self> {
         fs::create_dir_all(db_dir.join("index"))?;
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
         register_sqlite_vec_extension()?;
@@ -272,11 +295,21 @@ impl Trail {
             case_fold_index_metrics: Cell::new(CaseFoldIndexMetrics::default()),
         };
         db.init_schema()?;
-        db.recover_materialization_stages()?;
-        db.recover_workspace_views()?;
-        db.recover_workspace_environment_sync_attempts()?;
-        db.recover_workspace_runtime_leases()?;
         Ok(db)
+    }
+
+    pub(crate) fn recover_after_open(&self) -> Result<()> {
+        if self.has_pending_path_index_derived_repairs()? {
+            let _lock = self.acquire_write_lock()?;
+            if self.has_pending_path_index_derived_repairs()? {
+                self.drain_pending_path_index_derived_repairs()?;
+            }
+        }
+        self.recover_materialization_stages()?;
+        self.recover_workspace_views()?;
+        self.recover_workspace_environment_sync_attempts()?;
+        self.recover_workspace_runtime_leases()?;
+        Ok(())
     }
 
     pub fn workspace_root(&self) -> &Path {
