@@ -874,11 +874,12 @@ impl Trail {
             "INSERT INTO agent_hook_receipts
              (receipt_id, workspace_id, installation_id, mapping_id, provider,
               native_event, native_session_id, native_turn_id, transport, dedupe_key,
-              payload_digest, raw_object_id, raw_artifact_id, receive_sequence, status,
+              payload_digest, raw_object_id, raw_artifact_id, receive_sequence,
+              connection_id, direction, connection_sequence, status,
               attempt_count, next_attempt_at, diagnostic, occurred_at, received_at,
               processed_at, updated_at)
              VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
-                     NULL, 'received', 0, NULL, NULL, ?12, ?13, NULL, ?13)",
+                     NULL, ?12, ?13, ?14, 'received', 0, NULL, NULL, ?15, ?16, NULL, ?16)",
             params![
                 receipt_id,
                 workspace_id,
@@ -891,6 +892,17 @@ impl Trail {
                 input.dedupe_key,
                 payload_digest,
                 raw_object_id.0,
+                input.connection_id,
+                input.direction,
+                input
+                    .connection_sequence
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        Error::InvalidInput(
+                            "ACP connection sequence exceeds SQLite integer range".to_string(),
+                        )
+                    })?,
                 input.occurred_at,
                 now,
             ],
@@ -907,7 +919,8 @@ impl Trail {
             .query_row(
                 "SELECT receipt_id, workspace_id, installation_id, mapping_id, provider,
                         native_event, native_session_id, native_turn_id, transport, dedupe_key,
-                        payload_digest, raw_object_id, raw_artifact_id, receive_sequence, status,
+                        payload_digest, raw_object_id, raw_artifact_id, receive_sequence,
+                        connection_id, direction, connection_sequence, status,
                         attempt_count, next_attempt_at, diagnostic, occurred_at, received_at,
                         processed_at, updated_at
                  FROM agent_hook_receipts WHERE receipt_id = ?1",
@@ -918,6 +931,48 @@ impl Trail {
             .ok_or_else(|| {
                 Error::InvalidInput(format!("agent hook receipt `{receipt_id}` not found"))
             })
+    }
+
+    pub(crate) fn mark_agent_hook_receipt_processed(
+        &mut self,
+        receipt_id: &str,
+    ) -> Result<AgentHookReceipt> {
+        let _lock = self.acquire_write_lock()?;
+        let now = now_millis();
+        self.conn.execute(
+            "UPDATE agent_hook_receipts
+             SET status = 'processed', processed_at = COALESCE(processed_at, ?1), updated_at = ?1,
+                 diagnostic = NULL, next_attempt_at = NULL
+             WHERE receipt_id = ?2",
+            params![now, receipt_id],
+        )?;
+        self.agent_hook_receipt(receipt_id)
+    }
+
+    pub(crate) fn pending_acp_capture_payloads(&self) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT raw_object_id
+             FROM agent_hook_receipts
+             WHERE workspace_id = ?1 AND provider = 'trail-acp'
+               AND status IN ('received', 'retry')
+             ORDER BY received_at ASC, connection_id ASC, connection_sequence ASC,
+                      direction ASC, receipt_id ASC",
+        )?;
+        let object_ids = stmt
+            .query_map(params![self.config.workspace.id.0], |row| {
+                Ok(ObjectId(row.get(0)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        object_ids
+            .into_iter()
+            .map(|object_id| {
+                let object: AgentHookReceiptObject =
+                    self.get_object(AGENT_HOOK_RECEIPT_OBJECT_KIND, &object_id)?;
+                Ok(object.payload)
+            })
+            .collect()
     }
 
     pub fn list_agent_hook_receipts(
@@ -946,7 +1001,8 @@ impl Trail {
         let mut stmt = self.conn.prepare(
             "SELECT receipt_id, workspace_id, installation_id, mapping_id, provider,
                     native_event, native_session_id, native_turn_id, transport, dedupe_key,
-                    payload_digest, raw_object_id, raw_artifact_id, receive_sequence, status,
+                    payload_digest, raw_object_id, raw_artifact_id, receive_sequence,
+                    connection_id, direction, connection_sequence, status,
                     attempt_count, next_attempt_at, diagnostic, occurred_at, received_at,
                     processed_at, updated_at
              FROM agent_hook_receipts
@@ -2808,7 +2864,8 @@ impl Trail {
             .query_row(
                 "SELECT receipt_id, workspace_id, installation_id, mapping_id, provider,
                         native_event, native_session_id, native_turn_id, transport, dedupe_key,
-                        payload_digest, raw_object_id, raw_artifact_id, receive_sequence, status,
+                        payload_digest, raw_object_id, raw_artifact_id, receive_sequence,
+                        connection_id, direction, connection_sequence, status,
                         attempt_count, next_attempt_at, diagnostic, occurred_at, received_at,
                         processed_at, updated_at
                  FROM agent_hook_receipts
@@ -3067,9 +3124,20 @@ fn agent_hook_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentHook
                 Box::new(error),
             )
         })?;
-    let attempt_count = u32::try_from(row.get::<_, i64>(15)?).map_err(|error| {
+    let connection_sequence = row
+        .get::<_, Option<i64>>(16)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                16,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?;
+    let attempt_count = u32::try_from(row.get::<_, i64>(18)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            15,
+            18,
             rusqlite::types::Type::Integer,
             Box::new(error),
         )
@@ -3089,14 +3157,17 @@ fn agent_hook_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentHook
         raw_object_id: ObjectId(row.get(11)?),
         raw_artifact_id: row.get(12)?,
         receive_sequence,
-        status: row.get(14)?,
+        connection_id: row.get(14)?,
+        direction: row.get(15)?,
+        connection_sequence,
+        status: row.get(17)?,
         attempt_count,
-        next_attempt_at: row.get(16)?,
-        diagnostic: row.get(17)?,
-        occurred_at: row.get(18)?,
-        received_at: row.get(19)?,
-        processed_at: row.get(20)?,
-        updated_at: row.get(21)?,
+        next_attempt_at: row.get(19)?,
+        diagnostic: row.get(20)?,
+        occurred_at: row.get(21)?,
+        received_at: row.get(22)?,
+        processed_at: row.get(23)?,
+        updated_at: row.get(24)?,
     })
 }
 
@@ -3112,6 +3183,32 @@ fn validate_agent_receipt_input(input: &AgentHookReceiptInput) -> Result<()> {
     }
     if let Some(value) = input.native_turn_id.as_deref() {
         validate_agent_capture_id("native turn id", value, 1024)?;
+    }
+    match (
+        input.connection_id.as_deref(),
+        input.direction.as_deref(),
+        input.connection_sequence,
+    ) {
+        (None, None, None) => {}
+        (Some(connection_id), Some(direction), Some(sequence)) => {
+            validate_agent_capture_id("connection id", connection_id, 256)?;
+            if !matches!(direction, "client_to_agent" | "agent_to_client") {
+                return Err(Error::InvalidInput(format!(
+                    "ACP receipt direction must be client_to_agent or agent_to_client, got `{direction}`"
+                )));
+            }
+            i64::try_from(sequence).map_err(|_| {
+                Error::InvalidInput(
+                    "ACP connection sequence exceeds SQLite integer range".to_string(),
+                )
+            })?;
+        }
+        _ => {
+            return Err(Error::InvalidInput(
+                "ACP receipt connection identity requires id, direction, and sequence together"
+                    .to_string(),
+            ));
+        }
     }
     if input.occurred_at.is_some_and(|value| value < 0) {
         return Err(Error::InvalidInput(
@@ -3309,6 +3406,9 @@ mod tests {
             native_session_id: Some("native-1".to_string()),
             native_turn_id: Some("turn-1".to_string()),
             transport: AgentCaptureTransport::NativeHooks,
+            connection_id: None,
+            direction: None,
+            connection_sequence: None,
             dedupe_key: "native-1:AfterTool:1".to_string(),
             payload: serde_json::json!({
                 "tool": "shell",
@@ -3353,6 +3453,9 @@ mod tests {
             native_session_id: Some("native-1".to_string()),
             native_turn_id: None,
             transport: AgentCaptureTransport::NativeHooks,
+            connection_id: None,
+            direction: None,
+            connection_sequence: None,
             dedupe_key: "native-1:Stop:1".to_string(),
             payload: serde_json::json!({"result": 1}),
             occurred_at: None,
@@ -3375,6 +3478,9 @@ mod tests {
             native_session_id: Some("oversized-session".to_string()),
             native_turn_id: Some("oversized-turn".to_string()),
             transport: AgentCaptureTransport::NativeHooks,
+            connection_id: None,
+            direction: None,
+            connection_sequence: None,
             dedupe_key: "oversized:one".to_string(),
             payload: serde_json::json!({
                 "output": "x".repeat(AGENT_LIFECYCLE_MAX_PAYLOAD_BYTES + 1)
@@ -3408,6 +3514,9 @@ mod tests {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
                 transport: AgentCaptureTransport::NativeHooks,
+                connection_id: None,
+                direction: None,
+                connection_sequence: None,
                 dedupe_key: dedupe.to_string(),
                 payload,
                 occurred_at: None,
@@ -3565,6 +3674,9 @@ mod tests {
                 native_session_id: Some("native-workspace-change".to_string()),
                 native_turn_id: None,
                 transport: AgentCaptureTransport::NativeHooks,
+                connection_id: None,
+                direction: None,
+                connection_sequence: None,
                 dedupe_key: format!("native-workspace-change:{suffix}"),
                 payload,
                 occurred_at: None,
@@ -3722,6 +3834,9 @@ mod tests {
             native_session_id: Some("native-hooks-1".to_string()),
             native_turn_id: None,
             transport: AgentCaptureTransport::NativeHooks,
+            connection_id: None,
+            direction: None,
+            connection_sequence: None,
             dedupe_key: dedupe_key.to_string(),
             payload: serde_json::json!({"key": dedupe_key}),
             occurred_at: None,
@@ -3854,6 +3969,9 @@ mod tests {
                 native_session_id: Some("stale-session".to_string()),
                 native_turn_id: None,
                 transport: AgentCaptureTransport::NativeHooks,
+                connection_id: None,
+                direction: None,
+                connection_sequence: None,
                 dedupe_key: "stale:1".to_string(),
                 payload: serde_json::json!({"session_id":"stale-session"}),
                 occurred_at: None,
@@ -3910,6 +4028,9 @@ mod tests {
                             native_session_id: Some("concurrent-session".to_string()),
                             native_turn_id: None,
                             transport: AgentCaptureTransport::NativeHooks,
+                            connection_id: None,
+                            direction: None,
+                            connection_sequence: None,
                             dedupe_key: "concurrent:one".to_string(),
                             payload: serde_json::json!({"session_id":"concurrent-session"}),
                             occurred_at: None,
@@ -4056,6 +4177,9 @@ mod tests {
                 native_session_id: Some("native-hybrid-session".to_string()),
                 native_turn_id: Some("native-turn".to_string()),
                 transport: AgentCaptureTransport::NativeHooks,
+                connection_id: None,
+                direction: None,
+                connection_sequence: None,
                 dedupe_key: "hybrid:prompt".to_string(),
                 payload: serde_json::json!({
                     "session_id":"native-hybrid-session",
@@ -4103,6 +4227,9 @@ mod tests {
                 native_session_id: Some(session_id.to_string()),
                 native_turn_id: None,
                 transport: AgentCaptureTransport::NativeHooks,
+                connection_id: None,
+                direction: None,
+                connection_sequence: None,
                 dedupe_key: format!("{session_id}:{suffix}"),
                 payload,
                 occurred_at: None,

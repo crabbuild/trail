@@ -10,6 +10,7 @@ use crate::{Error, Result};
 
 const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RelayFinishReason {
@@ -22,6 +23,7 @@ pub(crate) enum RelayFinishReason {
 pub(crate) trait FrameObserver: Send + Sync + 'static {
     fn observe(&self, frame: &mut Frame) -> Result<()>;
     fn finish(&self, reason: RelayFinishReason);
+    fn flush(&self, _timeout: Duration) {}
 }
 
 pub(crate) struct StdioRelay<O: FrameObserver> {
@@ -100,6 +102,7 @@ impl<O: FrameObserver> StdioRelay<O> {
             Error::InvalidInput(format!("ACP relay pump failed before startup: {err}"))
         })?;
         self.observer.finish(finish_reason(&first));
+        self.observer.flush(ACP_CAPTURE_FLUSH_TIMEOUT);
 
         match first {
             PumpDone::Editor(editor_result) => {

@@ -3,7 +3,7 @@ use std::io;
 use serde_json::Value;
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum Direction {
     ClientToAgent,
     AgentToClient,

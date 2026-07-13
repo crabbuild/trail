@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
 
+mod capture;
 mod protocol;
 mod registry;
 mod schema;
@@ -18,6 +20,7 @@ mod setup;
 mod transform;
 mod transport;
 
+use capture::{capture_frame, CaptureIngress};
 use protocol::{Direction, Frame};
 use schema::AcpV1Contract;
 use transform::{
@@ -340,9 +343,31 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
         Arc::new(AcpV1Contract::load()?),
         TransformOptions::from_relay(&options),
     );
+    let connection_id = format!(
+        "conn_{}",
+        crate::ids::short_hash(
+            format!(
+                "{}:{}:{}",
+                std::process::id(),
+                acp_now_millis(),
+                options.workspace_root.display()
+            )
+            .as_bytes(),
+            24,
+        )
+    );
+    let ingress = CaptureIngress::new(
+        options.workspace_root.clone(),
+        options.db_dir.clone(),
+        Arc::clone(&coordinator),
+        connection_id.clone(),
+    )?;
     let observer = Arc::new(CaptureObserver {
         coordinator,
         pipeline: Mutex::new(pipeline),
+        ingress,
+        connection_id,
+        connection_sequence: AtomicU64::new(0),
     });
     StdioRelay::new(observer).run(&options)
 }
@@ -350,6 +375,9 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
 struct CaptureObserver {
     coordinator: Arc<Mutex<CaptureCoordinator>>,
     pipeline: Mutex<TransformPipeline>,
+    ingress: CaptureIngress,
+    connection_id: String,
+    connection_sequence: AtomicU64,
 }
 
 impl FrameObserver for CaptureObserver {
@@ -366,38 +394,44 @@ impl FrameObserver for CaptureObserver {
             return Ok(());
         }
 
-        let mut candidate = frame.value().clone();
-        let captured = capture_step(&self.coordinator, |capture| match frame.direction() {
-            Direction::ClientToAgent => capture.before_client_message(&mut candidate),
-            Direction::AgentToClient => capture.before_agent_message(&mut candidate),
-        });
-        if captured && candidate != *frame.value() {
-            if let Err(error) = self
-                .pipeline
-                .lock()
-                .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
-                .commit_candidate(frame, candidate)
-            {
-                eprintln!("trail acp relay transformation warning: {error}");
+        let inline_transform = frame.direction() == Direction::ClientToAgent
+            && matches!(
+                frame.method(),
+                Some("session/new" | "session/load" | "session/resume")
+            );
+        if inline_transform {
+            let mut candidate = frame.value().clone();
+            let captured = capture_step(&self.coordinator, |capture| {
+                capture.before_client_message(&mut candidate)
+            });
+            if captured && candidate != *frame.value() {
+                if let Err(error) = self
+                    .pipeline
+                    .lock()
+                    .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
+                    .commit_candidate(frame, candidate)
+                {
+                    eprintln!("trail acp relay transformation warning: {error}");
+                }
             }
         }
+        let sequence = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
+        self.ingress.append(capture_frame(
+            &self.connection_id,
+            frame.direction(),
+            sequence,
+            frame.value(),
+            !inline_transform,
+        ))?;
         Ok(())
     }
 
     fn finish(&self, reason: RelayFinishReason) {
-        let (status, summary) = match reason {
-            RelayFinishReason::EditorEof => ("cancelled", "editor input closed".to_string()),
-            RelayFinishReason::EditorError(error) => {
-                ("failed", format!("editor sent malformed ACP: {error}"))
-            }
-            RelayFinishReason::AgentEof => ("failed", "upstream output closed".to_string()),
-            RelayFinishReason::AgentError(error) => {
-                ("failed", format!("upstream sent malformed JSON: {error}"))
-            }
-        };
-        let _ = capture_step(&self.coordinator, |capture| {
-            capture.finish_open_turns(status, &summary)
-        });
+        self.ingress.finish(reason);
+    }
+
+    fn flush(&self, timeout: Duration) {
+        self.ingress.flush(timeout);
     }
 }
 
@@ -494,6 +528,13 @@ fn record_acp_lifecycle_event(
         db.add_lane_session_event(lane, session_id, kind.wire_name(), Some(serialized))?;
     }
     Ok(())
+}
+
+fn acp_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn capture_step<F>(coordinator: &Arc<Mutex<CaptureCoordinator>>, f: F) -> bool
