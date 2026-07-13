@@ -1308,7 +1308,7 @@ impl Trail {
                         return Err(Error::InvalidInput(format!(
                             "environment component `{}` has unknown dependency edge type `{other}`",
                             activation.component_id
-                        )))
+                        )));
                     }
                 };
                 if identity_input.as_ref().is_some_and(|input| {
@@ -1513,9 +1513,9 @@ impl Trail {
                     }
                     other => {
                         return Err(Error::InvalidInput(format!(
-                        "environment component `{}` output `{}` has unsupported policy `{other}`",
-                        activation.component_id, output.name
-                    )))
+                            "environment component `{}` output `{}` has unsupported policy `{other}`",
+                            activation.component_id, output.name
+                        )));
                     }
                 }
                 for (owner, existing) in &mount_paths {

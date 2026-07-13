@@ -1,13 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -16,17 +13,80 @@ use url::Url;
 use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
 
+mod capture;
+mod protocol;
 mod registry;
+mod schema;
 mod setup;
+mod transform;
+mod transport;
+
+use capture::{capture_frame, CaptureIngress};
+use protocol::{Direction, Frame};
+use schema::AcpV1Contract;
+use transform::{
+    passthrough_session_mappings, PathMapping, TransformOptions, TransformPipeline, WorkspaceMapper,
+};
+use transport::{FrameObserver, RelayFinishReason, StdioRelay};
 
 pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
 
 const ACP_CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(30);
+const ACP_CALLBACK_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const CLAUDE_ACP_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@latest";
 const CODEX_ACP_ADAPTER: &str = "@agentclientprotocol/codex-acp@latest";
 const ACP_MAX_PENDING_EVENTS_PER_TURN: usize = 128;
 const ACP_MAX_ASSISTANT_MESSAGE_BYTES: usize = 256 * 1024;
 const ACP_MAX_ASSISTANT_TOTAL_BYTES: usize = 1024 * 1024;
+
+/// Returns the immutable contract identity and build attestation exposed by
+/// `trail agent acp doctor`.
+pub fn acp_v1_conformance_evidence() -> AcpConformanceEvidence {
+    let source_revision = option_env!("TRAIL_SOURCE_REVISION")
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or("unverified");
+    let verified = source_revision != "unverified"
+        && option_env!("TRAIL_ACP_V1_CONFORMANCE_VERIFIED") == Some(source_revision);
+    AcpConformanceEvidence {
+        wire_version: 1,
+        schema_commit: schema::ACP_V1_SCHEMA_COMMIT.to_string(),
+        schema_sha256: schema::ACP_V1_SCHEMA_SHA256.to_string(),
+        meta_sha256: schema::ACP_V1_META_SHA256.to_string(),
+        transport: "stdio".to_string(),
+        method_count: 23,
+        evidence_status: if verified { "verified" } else { "unverified" }.to_string(),
+        build_identifier: format!("{}+{source_revision}", env!("CARGO_PKG_VERSION")),
+        exclusions: vec![
+            "ACP v2".to_string(),
+            "draft remote HTTP transport".to_string(),
+        ],
+    }
+}
+
+/// Exercises the same workspace mapper used by the relay, including the rule
+/// that roots outside the Trail workspace are preserved rather than isolated.
+pub fn validate_acp_path_mapping(workspace_root: &std::path::Path) -> Result<()> {
+    let mapper = WorkspaceMapper::new(workspace_root.to_path_buf(), workspace_root.to_path_buf())?;
+    let workspace = mapper.map(workspace_root)?;
+    if !workspace.isolated {
+        return Err(Error::InvalidPath {
+            path: workspace_root.display().to_string(),
+            reason: "ACP workspace root was not recognized as isolated".to_string(),
+        });
+    }
+    if let Some(external_root) = workspace_root.parent() {
+        if external_root != workspace_root {
+            let external = mapper.map(external_root)?;
+            if external.isolated || external.effective != external.original {
+                return Err(Error::InvalidPath {
+                    path: external_root.display().to_string(),
+                    reason: "ACP external root was not preserved".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct AcpRelayOptions {
@@ -91,8 +151,10 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
                 available,
                 relay_command: built_in_acp_relay_command("grok"),
                 notes: if available {
-                    vec!["uses Grok Build's native ACP server through `grok agent stdio`"
-                        .to_string()]
+                    vec![
+                        "uses Grok Build's native ACP server through `grok agent stdio`"
+                            .to_string(),
+                    ]
                 } else {
                     vec!["`grok` was not found on PATH".to_string()]
                 },
@@ -329,97 +391,226 @@ pub(crate) fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
 }
 
 pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
-    if options.upstream_command.is_empty() {
-        return Err(Error::InvalidInput(
-            "ACP relay requires an upstream command after `--`".to_string(),
-        ));
-    }
+    let observer = capture_observer(&options)?;
+    StdioRelay::new(observer).run(&options)
+}
 
-    let (upstream_program, upstream_args) = confined_acp_command(
-        &options.upstream_command,
-        &options.workspace_root,
-        &options.db_dir,
-        options.materialize,
+fn capture_observer(options: &AcpRelayOptions) -> Result<Arc<CaptureObserver>> {
+    let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options.clone())?));
+    let pipeline = TransformPipeline::new(
+        Arc::new(AcpV1Contract::load()?),
+        TransformOptions::from_relay(options),
+    );
+    let connection_id = format!(
+        "conn_{}",
+        crate::ids::short_hash(
+            format!(
+                "{}:{}:{}",
+                std::process::id(),
+                acp_now_millis(),
+                options.workspace_root.display()
+            )
+            .as_bytes(),
+            24,
+        )
+    );
+    let ingress = CaptureIngress::new(
+        options.workspace_root.clone(),
+        options.db_dir.clone(),
+        Arc::clone(&coordinator),
+        connection_id.clone(),
     )?;
-    let mut child = Command::new(upstream_program)
-        .args(upstream_args)
-        .envs(&options.upstream_env)
-        .current_dir(&options.workspace_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            Error::InvalidInput(format!(
-                "failed to launch upstream ACP agent `{}`: {err}",
-                options.upstream_command[0]
-            ))
-        })?;
+    Ok(Arc::new(CaptureObserver {
+        coordinator,
+        pipeline: Mutex::new(pipeline),
+        ingress,
+        connection_id,
+        connection_sequence: AtomicU64::new(0),
+        finish_reason: Mutex::new(None),
+    }))
+}
 
-    let child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::InvalidInput("failed to open upstream ACP stdin pipe".to_string()))?;
-    let child_stdout = child.stdout.take().ok_or_else(|| {
-        Error::InvalidInput("failed to open upstream ACP stdout pipe".to_string())
-    })?;
+#[doc(hidden)]
+pub struct AcpRelayBenchmarkSample {
+    pub forwarded: Vec<u8>,
+    pub latency_micros: u128,
+    pub transformed: bool,
+}
 
-    if let Some(stderr) = child.stderr.take() {
-        thread::spawn(move || {
-            let _ = copy_upstream_stderr(stderr);
+/// Runs raw frames through the same transformation and capture observer used by
+/// the stdio relay, without process or pipe overhead. This is intentionally
+/// exposed only for the correctness-preserving relay benchmark.
+#[doc(hidden)]
+pub fn benchmark_acp_relay_frames(
+    options: AcpRelayOptions,
+    frames: Vec<(bool, Vec<u8>)>,
+) -> Result<Vec<AcpRelayBenchmarkSample>> {
+    let observer = capture_observer(&options)?;
+    let mut samples = Vec::with_capacity(frames.len());
+    for (agent_to_client, raw) in frames {
+        let direction = if agent_to_client {
+            Direction::AgentToClient
+        } else {
+            Direction::ClientToAgent
+        };
+        let mut frame = Frame::parse(direction, raw).map_err(Error::Io)?;
+        let started = Instant::now();
+        observer.observe(&mut frame)?;
+        let transformed = frame.forward_bytes() != frame.raw_bytes();
+        samples.push(AcpRelayBenchmarkSample {
+            forwarded: frame.forward_bytes().to_vec(),
+            latency_micros: started.elapsed().as_micros(),
+            transformed,
         });
     }
+    observer.finish(RelayFinishReason::EditorEof);
+    observer.flush(Duration::from_secs(120));
+    drop(observer);
+    Ok(samples)
+}
 
-    let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options)?));
-    let (done_tx, done_rx) = mpsc::channel();
+struct CaptureObserver {
+    coordinator: Arc<Mutex<CaptureCoordinator>>,
+    pipeline: Mutex<TransformPipeline>,
+    ingress: CaptureIngress,
+    connection_id: String,
+    connection_sequence: AtomicU64,
+    finish_reason: Mutex<Option<RelayFinishReason>>,
+}
 
-    let editor_coordinator = Arc::clone(&coordinator);
-    let editor_done = done_tx.clone();
-    let editor_handle = thread::spawn(move || {
-        let result = pump_editor_to_agent(io::stdin().lock(), child_stdin, editor_coordinator);
-        let _ = editor_done.send(PumpDone::Editor(result));
-    });
-
-    let agent_coordinator = Arc::clone(&coordinator);
-    let agent_handle = thread::spawn(move || {
-        let result = pump_agent_to_editor(
-            BufReader::new(child_stdout),
-            io::stdout(),
-            agent_coordinator,
-        );
-        let _ = done_tx.send(PumpDone::Agent(result));
-    });
-
-    let first = done_rx.recv().map_err(|err| {
-        Error::InvalidInput(format!("ACP relay pump failed before startup: {err}"))
-    })?;
-    match first {
-        PumpDone::Editor(result) => {
-            result.map_err(Error::Io)?;
-            let status = child.wait().map_err(Error::Io)?;
-            if let Ok(PumpDone::Agent(result)) = done_rx.recv() {
-                result.map_err(Error::Io)?;
-            }
-            let _ = agent_handle.join();
-            let _ = editor_handle.join();
-            if status.success() {
-                Ok(())
-            } else {
-                Err(Error::InvalidInput(format!(
-                    "upstream ACP agent exited with status {status}"
-                )))
+impl FrameObserver for CaptureObserver {
+    fn observe(&self, frame: &mut Frame) -> Result<()> {
+        let outcome = self
+            .pipeline
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
+            .apply(frame)?;
+        if let Some(diagnostic) = outcome.diagnostic_message() {
+            eprintln!("trail acp relay negotiation warning: {diagnostic}");
+        }
+        if frame.direction() == Direction::AgentToClient
+            && frame
+                .value()
+                .pointer("/result/protocolVersion")
+                .and_then(Value::as_u64)
+                == Some(1)
+        {
+            if let Ok(mut coordinator) = self.coordinator.lock() {
+                coordinator.remember_initialize_selection(frame.value());
             }
         }
-        PumpDone::Agent(result) => {
-            result.map_err(Error::Io)?;
-            let status = child.wait().map_err(Error::Io)?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(Error::InvalidInput(format!(
-                    "upstream ACP agent exited with status {status}"
-                )))
+        if !outcome.capture_v1() {
+            if frame.direction() == Direction::ClientToAgent && frame.method() == Some("initialize")
+            {
+                if let Ok(mut coordinator) = self.coordinator.lock() {
+                    coordinator.remember_initialize_request(frame.value());
+                }
             }
+            let sequence = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
+            self.ingress.append(capture_frame(
+                &self.connection_id,
+                frame.direction(),
+                sequence,
+                frame.value(),
+                false,
+            ))?;
+            return Ok(());
+        }
+
+        if frame.direction() == Direction::ClientToAgent && frame.method() == Some("session/prompt")
+        {
+            let mut candidate = frame.value().clone();
+            let remapped = self
+                .coordinator
+                .lock()
+                .map_err(|_| {
+                    Error::InvalidInput("ACP capture coordinator lock poisoned".to_string())
+                })?
+                .remap_prompt_for_forwarding(&mut candidate);
+            if let Err(error) = remapped {
+                eprintln!("trail acp relay prompt mapping warning: {error}");
+            } else if candidate != *frame.value() {
+                self.pipeline
+                    .lock()
+                    .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
+                    .commit_candidate(frame, candidate)?;
+            }
+        }
+
+        let inline_session_request = frame.direction() == Direction::ClientToAgent
+            && matches!(
+                frame.method(),
+                Some("session/new" | "session/load" | "session/resume")
+            );
+        let inline_session_response = frame.direction() == Direction::AgentToClient
+            && self
+                .coordinator
+                .lock()
+                .map(|coordinator| coordinator.is_pending_session_response(frame.value()))
+                .unwrap_or(false);
+        let inline_client_callback = frame.direction() == Direction::AgentToClient
+            && frame.method().is_some_and(is_client_callback_method);
+        let inline_semantic =
+            inline_session_request || inline_session_response || inline_client_callback;
+        if inline_semantic {
+            let mut candidate = frame.value().clone();
+            let captured = capture_step(&self.coordinator, |capture| match frame.direction() {
+                Direction::ClientToAgent => capture.before_client_message(&mut candidate),
+                Direction::AgentToClient => capture.before_agent_message(&mut candidate),
+            });
+            if (inline_session_request || inline_client_callback)
+                && captured
+                && candidate != *frame.value()
+            {
+                if let Err(error) = self
+                    .pipeline
+                    .lock()
+                    .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
+                    .commit_candidate(frame, candidate)
+                {
+                    eprintln!("trail acp relay transformation warning: {error}");
+                }
+            }
+        }
+        let sequence = self.connection_sequence.fetch_add(1, Ordering::Relaxed);
+        self.ingress.append(capture_frame(
+            &self.connection_id,
+            frame.direction(),
+            sequence,
+            frame.value(),
+            !inline_semantic,
+        ))?;
+        Ok(())
+    }
+
+    fn finish(&self, reason: RelayFinishReason) {
+        if let Ok(mut finish_reason) = self.finish_reason.lock() {
+            *finish_reason = Some(reason.clone());
+        }
+        self.ingress.finish(reason);
+    }
+
+    fn flush(&self, timeout: Duration) {
+        let has_pending_client_callbacks = self
+            .coordinator
+            .lock()
+            .map(|coordinator| coordinator.has_pending_client_callbacks())
+            .unwrap_or(true);
+        let timeout = if has_pending_client_callbacks {
+            timeout.max(ACP_CALLBACK_CAPTURE_FLUSH_TIMEOUT)
+        } else {
+            timeout
+        };
+        self.ingress.flush(timeout);
+        let reason = self
+            .finish_reason
+            .lock()
+            .ok()
+            .and_then(|mut reason| reason.take());
+        if let Some(reason) = reason {
+            capture_step(&self.coordinator, |capture| {
+                capture.capture_callback_shutdown(&reason)
+            });
         }
     }
 }
@@ -483,6 +674,7 @@ pub(crate) fn command_in_path(command: &str) -> bool {
     env::split_paths(&path).any(|dir| dir.join(command).is_file())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_acp_lifecycle_event(
     db: &mut Trail,
     lane: &str,
@@ -568,74 +760,14 @@ fn record_acp_lifecycle_event(
     Ok(())
 }
 
-enum PumpDone {
-    Editor(io::Result<()>),
-    Agent(io::Result<()>),
+fn acp_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
-fn pump_editor_to_agent<R, W>(
-    mut reader: R,
-    mut writer: W,
-    coordinator: Arc<Mutex<CaptureCoordinator>>,
-) -> io::Result<()>
-where
-    R: BufRead,
-    W: Write,
-{
-    loop {
-        let mut message = match read_json_line(&mut reader) {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
-            Err(err) => {
-                capture_step(&coordinator, |capture| {
-                    capture.finish_open_turns("failed", "editor sent malformed JSON")
-                });
-                return Err(err);
-            }
-        };
-        capture_step(&coordinator, |capture| {
-            capture.before_client_message(&mut message)
-        });
-        write_json_line(&mut writer, &message)?;
-    }
-    capture_step(&coordinator, |capture| {
-        capture.finish_open_turns("cancelled", "editor input closed")
-    });
-    writer.flush()
-}
-
-fn pump_agent_to_editor<R, W>(
-    mut reader: R,
-    mut writer: W,
-    coordinator: Arc<Mutex<CaptureCoordinator>>,
-) -> io::Result<()>
-where
-    R: BufRead,
-    W: Write,
-{
-    loop {
-        let mut message = match read_json_line(&mut reader) {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
-            Err(err) => {
-                capture_step(&coordinator, |capture| {
-                    capture.finish_open_turns("failed", "upstream sent malformed JSON")
-                });
-                return Err(err);
-            }
-        };
-        capture_step(&coordinator, |capture| {
-            capture.before_agent_message(&mut message)
-        });
-        write_json_line(&mut writer, &message)?;
-    }
-    capture_step(&coordinator, |capture| {
-        capture.finish_open_turns("failed", "upstream output closed")
-    });
-    writer.flush()
-}
-
-fn capture_step<F>(coordinator: &Arc<Mutex<CaptureCoordinator>>, f: F)
+fn capture_step<F>(coordinator: &Arc<Mutex<CaptureCoordinator>>, f: F) -> bool
 where
     F: FnOnce(&mut CaptureCoordinator) -> Result<()>,
 {
@@ -644,49 +776,14 @@ where
             let result = Trail::with_write_lock_wait(ACP_CAPTURE_LOCK_WAIT, || f(&mut capture));
             if let Err(err) = result {
                 eprintln!("trail acp relay capture warning: {err}");
+                return false;
             }
+            true
         }
         Err(_) => {
             eprintln!("trail acp relay capture warning: capture coordinator lock poisoned");
+            false
         }
-    }
-}
-
-fn read_json_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            return Ok(None);
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str(line)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        return Ok(Some(value));
-    }
-}
-
-fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, value)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
-fn copy_upstream_stderr<R: Read>(reader: R) -> io::Result<()> {
-    let mut reader = BufReader::new(reader);
-    let mut buf = [0u8; 8192];
-    loop {
-        let bytes = reader.read(&mut buf)?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        let mut stderr = io::stderr().lock();
-        stderr.write_all(&buf[..bytes])?;
-        stderr.flush()?;
     }
 }
 
@@ -698,6 +795,8 @@ struct SessionState {
     trail_session_id: String,
     original_cwd: String,
     effective_cwd: String,
+    materialized_root: Option<String>,
+    path_mappings: Vec<AcpPathMapping>,
     materialized: bool,
 }
 
@@ -705,6 +804,7 @@ struct SessionState {
 struct PendingSession {
     method: String,
     session: SessionState,
+    mapping_existed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -845,34 +945,243 @@ impl ActiveTurn {
 #[derive(Clone, Debug)]
 struct PendingPermission {
     approval_id: Option<String>,
-    options_by_id: HashMap<String, String>,
+    options_by_id: BTreeMap<String, String>,
+    acp_session_id: String,
+}
+
+#[derive(Clone, Debug)]
+enum ClientCallbackOperation {
+    Permission(PendingPermission),
+    ReadFile {
+        acp_session_id: String,
+        effective_path: String,
+        forwarded_path: String,
+        line: Option<u64>,
+        limit: Option<u64>,
+    },
+    WriteFile {
+        acp_session_id: String,
+        effective_path: String,
+        forwarded_path: String,
+        content_sha256: String,
+        byte_len: u64,
+        redacted_content: Vec<u8>,
+    },
+    TerminalCreate {
+        acp_session_id: String,
+        command: Vec<String>,
+        effective_cwd: Option<String>,
+        forwarded_cwd: Option<String>,
+        output_byte_limit: Option<u64>,
+        env_names: Vec<String>,
+    },
+    TerminalOutput {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+    TerminalWait {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+    TerminalKill {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+    TerminalRelease {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+}
+
+impl ClientCallbackOperation {
+    fn acp_session_id(&self) -> &str {
+        match self {
+            Self::Permission(permission) => &permission.acp_session_id,
+            Self::ReadFile { acp_session_id, .. }
+            | Self::WriteFile { acp_session_id, .. }
+            | Self::TerminalCreate { acp_session_id, .. }
+            | Self::TerminalOutput { acp_session_id, .. }
+            | Self::TerminalWait { acp_session_id, .. }
+            | Self::TerminalKill { acp_session_id, .. }
+            | Self::TerminalRelease { acp_session_id, .. } => acp_session_id,
+        }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Permission(_) => "session/request_permission",
+            Self::ReadFile { .. } => "fs/read_text_file",
+            Self::WriteFile { .. } => "fs/write_text_file",
+            Self::TerminalCreate { .. } => "terminal/create",
+            Self::TerminalOutput { .. } => "terminal/output",
+            Self::TerminalWait { .. } => "terminal/wait_for_exit",
+            Self::TerminalKill { .. } => "terminal/kill",
+            Self::TerminalRelease { .. } => "terminal/release",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CapturedTerminal {
+    acp_session_id: String,
+    state: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplayAccumulator {
+    updates: Vec<(String, Map<String, Value>)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplayTurn {
+    user_message_id: Option<String>,
+    user_text: String,
+    assistant_message_id: Option<String>,
+    assistant_text: String,
+    events: Vec<(String, Value)>,
+}
+
+impl ReplayTurn {
+    fn has_content(&self) -> bool {
+        !self.user_text.is_empty() || !self.assistant_text.is_empty() || !self.events.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PendingOperation {
+    Session(PendingSession),
+    Prompt(PendingPrompt),
+    Close {
+        acp_session_id: String,
+    },
+    ClientCallback(ClientCallbackOperation),
+    Initialize {
+        requested_version: Value,
+    },
+    Authenticate {
+        method_id: String,
+    },
+    Logout,
+    SessionList {
+        cursor: Option<String>,
+    },
+    SessionDelete {
+        acp_session_id: String,
+    },
+    SetMode {
+        acp_session_id: String,
+        mode_id: String,
+    },
+    SetConfig {
+        acp_session_id: String,
+        config_id: String,
+        value: Value,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcpV1SessionUpdateKind {
+    UserMessageChunk,
+    AgentMessageChunk,
+    AgentThoughtChunk,
+    ToolCall,
+    ToolCallUpdate,
+    Plan,
+    AvailableCommandsUpdate,
+    CurrentModeUpdate,
+    ConfigOptionUpdate,
+    SessionInfoUpdate,
+    UsageUpdate,
+    Extension,
+}
+
+impl AcpV1SessionUpdateKind {
+    #[cfg(test)]
+    const ALL: [Self; 11] = [
+        Self::UserMessageChunk,
+        Self::AgentMessageChunk,
+        Self::AgentThoughtChunk,
+        Self::ToolCall,
+        Self::ToolCallUpdate,
+        Self::Plan,
+        Self::AvailableCommandsUpdate,
+        Self::CurrentModeUpdate,
+        Self::ConfigOptionUpdate,
+        Self::SessionInfoUpdate,
+        Self::UsageUpdate,
+    ];
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "user_message_chunk" => Self::UserMessageChunk,
+            "agent_message_chunk" => Self::AgentMessageChunk,
+            "agent_thought_chunk" => Self::AgentThoughtChunk,
+            "tool_call" => Self::ToolCall,
+            "tool_call_update" => Self::ToolCallUpdate,
+            "plan" => Self::Plan,
+            "available_commands_update" => Self::AvailableCommandsUpdate,
+            "current_mode_update" => Self::CurrentModeUpdate,
+            "config_option_update" => Self::ConfigOptionUpdate,
+            "session_info_update" => Self::SessionInfoUpdate,
+            "usage_update" => Self::UsageUpdate,
+            _ => Self::Extension,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserMessageChunk => "user_message_chunk",
+            Self::AgentMessageChunk => "agent_message_chunk",
+            Self::AgentThoughtChunk => "agent_thought_chunk",
+            Self::ToolCall => "tool_call",
+            Self::ToolCallUpdate => "tool_call_update",
+            Self::Plan => "plan",
+            Self::AvailableCommandsUpdate => "available_commands_update",
+            Self::CurrentModeUpdate => "current_mode_update",
+            Self::ConfigOptionUpdate => "config_option_update",
+            Self::SessionInfoUpdate => "session_info_update",
+            Self::UsageUpdate => "usage_update",
+            Self::Extension => "extension",
+        }
+    }
+
+    fn is_stable(self) -> bool {
+        self != Self::Extension
+    }
 }
 
 struct CaptureCoordinator {
     options: AcpRelayOptions,
-    pending_initialize: HashSet<String>,
-    pending_sessions: HashMap<String, PendingSession>,
-    pending_prompts: HashMap<String, PendingPrompt>,
-    pending_closes: HashMap<String, String>,
-    pending_permissions: HashMap<String, PendingPermission>,
+    pending_operations: HashMap<(Direction, String), PendingOperation>,
+    replay_by_session: HashMap<String, ReplayAccumulator>,
+    pending_connection_events: Vec<Value>,
+    cancelled_requests: HashSet<(Direction, String)>,
     sessions_by_acp: HashMap<String, SessionState>,
     active_turns: HashMap<String, ActiveTurn>,
+    terminals: HashMap<String, CapturedTerminal>,
     upstream_command_json: Option<String>,
 }
 
 impl CaptureCoordinator {
+    fn has_pending_client_callbacks(&self) -> bool {
+        self.pending_operations
+            .values()
+            .any(|operation| matches!(operation, PendingOperation::ClientCallback(_)))
+    }
+
     fn new(options: AcpRelayOptions) -> Result<Self> {
         let upstream_command_json =
             serde_json::to_string(&redact_command(&options.upstream_command)).ok();
         Ok(Self {
             options,
-            pending_initialize: HashSet::new(),
-            pending_sessions: HashMap::new(),
-            pending_prompts: HashMap::new(),
-            pending_closes: HashMap::new(),
-            pending_permissions: HashMap::new(),
+            pending_operations: HashMap::new(),
+            replay_by_session: HashMap::new(),
+            pending_connection_events: Vec::new(),
+            cancelled_requests: HashSet::new(),
             sessions_by_acp: HashMap::new(),
             active_turns: HashMap::new(),
+            terminals: HashMap::new(),
             upstream_command_json,
         })
     }
@@ -885,9 +1194,28 @@ impl CaptureCoordinator {
 
         match method_name(message) {
             Some("initialize") => {
-                if let Some(id) = rpc_id_key(message) {
-                    self.pending_initialize.insert(id);
-                }
+                let requested_version = message
+                    .pointer("/params/protocolVersion")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                self.register_client_operation(
+                    message,
+                    PendingOperation::Initialize { requested_version },
+                )?;
+            }
+            Some("authenticate") => {
+                let method_id = message
+                    .pointer("/params/methodId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.register_client_operation(
+                    message,
+                    PendingOperation::Authenticate { method_id },
+                )?;
+            }
+            Some("logout") => {
+                self.register_client_operation(message, PendingOperation::Logout)?;
             }
             Some("session/new") | Some("session/load") | Some("session/resume") => {
                 self.prepare_session_request(message)?;
@@ -898,11 +1226,155 @@ impl CaptureCoordinator {
             Some("session/cancel") => {
                 self.capture_cancel(message)?;
             }
+            Some("$/cancel_request") => {
+                self.capture_rpc_cancel(message, Direction::ClientToAgent)?;
+            }
+            Some("session/set_mode") => {
+                let params = params_object(message)?;
+                let acp_session_id = required_string(params, "sessionId", "session/set_mode")?;
+                let mode_id = required_string(params, "modeId", "session/set_mode")?;
+                self.register_client_operation(
+                    message,
+                    PendingOperation::SetMode {
+                        acp_session_id,
+                        mode_id,
+                    },
+                )?;
+            }
+            Some("session/set_config_option") => {
+                let params = params_object(message)?;
+                let acp_session_id =
+                    required_string(params, "sessionId", "session/set_config_option")?;
+                let config_id = required_string(params, "configId", "session/set_config_option")?;
+                let value = params.get("value").cloned().unwrap_or(Value::Null);
+                self.register_client_operation(
+                    message,
+                    PendingOperation::SetConfig {
+                        acp_session_id,
+                        config_id,
+                        value,
+                    },
+                )?;
+            }
             Some("session/close") => {
                 self.prepare_close_request(message)?;
             }
+            Some("session/list") => {
+                let cursor = message
+                    .pointer("/params/cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.register_client_operation(message, PendingOperation::SessionList { cursor })?;
+            }
+            Some("session/delete") => {
+                let acp_session_id = message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("ACP session/delete missing sessionId".to_string())
+                    })?
+                    .to_string();
+                self.register_client_operation(
+                    message,
+                    PendingOperation::SessionDelete { acp_session_id },
+                )?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn remap_prompt_for_forwarding(&self, message: &mut Value) -> Result<()> {
+        let params = params_object_mut(message)?;
+        let Some(acp_session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions_by_acp.get(acp_session_id) else {
+            return Ok(());
+        };
+        if session.materialized {
+            remap_prompt_resource_uris(
+                params.get_mut("prompt"),
+                Path::new(&session.original_cwd),
+                Path::new(&session.effective_cwd),
+            );
+        }
+        Ok(())
+    }
+
+    fn remember_initialize_request(&mut self, message: &Value) {
+        let Some(id) = rpc_id_key(message) else {
+            return;
+        };
+        let key = (Direction::ClientToAgent, id);
+        self.pending_operations
+            .entry(key)
+            .or_insert_with(|| PendingOperation::Initialize {
+                requested_version: message
+                    .pointer("/params/protocolVersion")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            });
+    }
+
+    fn remember_initialize_selection(&mut self, message: &Value) {
+        let Some(id) = rpc_id_key(message) else {
+            return;
+        };
+        let requested_version = match self
+            .pending_operations
+            .remove(&(Direction::ClientToAgent, id))
+        {
+            Some(PendingOperation::Initialize { requested_version }) => requested_version,
+            _ => Value::from(1),
+        };
+        self.pending_connection_events
+            .push(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "method": "initialize",
+                "request_id": message.get("id"),
+                "outcome": "success",
+                "result": message.get("result"),
+                "error": Value::Null,
+                "error_code": Value::Null,
+                "context": {"requested_version": requested_version}
+            })));
+    }
+
+    fn register_client_operation(
+        &mut self,
+        message: &Value,
+        operation: PendingOperation,
+    ) -> Result<()> {
+        let Some(id) = rpc_id_key(message) else {
+            return Ok(());
+        };
+        self.register_pending(Direction::ClientToAgent, id, operation)
+    }
+
+    fn is_pending_session_response(&self, message: &Value) -> bool {
+        let Some(id) = rpc_id_key(message) else {
+            return false;
+        };
+        matches!(
+            self.pending_operations.get(&(Direction::ClientToAgent, id)),
+            Some(PendingOperation::Session(_))
+        )
+    }
+
+    fn register_pending(
+        &mut self,
+        direction: Direction,
+        id: String,
+        operation: PendingOperation,
+    ) -> Result<()> {
+        let key = (direction, id.clone());
+        if self.pending_operations.contains_key(&key) {
+            return Err(Error::InvalidInput(format!(
+                "ACP peer reused in-flight request id `{id}` in {direction:?} direction"
+            )));
+        }
+        self.pending_operations.insert(key, operation);
         Ok(())
     }
 
@@ -915,6 +1387,18 @@ impl CaptureCoordinator {
         match method_name(message) {
             Some("session/update") => self.capture_session_update(message)?,
             Some("session/request_permission") => self.capture_permission_request(message)?,
+            Some(
+                "fs/read_text_file"
+                | "fs/write_text_file"
+                | "terminal/create"
+                | "terminal/output"
+                | "terminal/wait_for_exit"
+                | "terminal/kill"
+                | "terminal/release",
+            ) => self.capture_client_callback_request(message)?,
+            Some("$/cancel_request") => {
+                self.capture_rpc_cancel(message, Direction::AgentToClient)?;
+            }
             _ => {}
         }
         Ok(())
@@ -924,70 +1408,84 @@ impl CaptureCoordinator {
         let Some(id) = rpc_id_key(message) else {
             return Ok(());
         };
-        let Some(permission) = self.pending_permissions.remove(&id) else {
+        let key = (Direction::AgentToClient, id.clone());
+        let was_cancelled = self.cancelled_requests.remove(&key);
+        let Some(PendingOperation::ClientCallback(operation)) =
+            self.pending_operations.remove(&key)
+        else {
             return Ok(());
         };
-        let Some(approval_id) = permission.approval_id else {
-            return Ok(());
-        };
-        let decision = permission_decision(message, &permission.options_by_id);
-        let mut db = self.open_db()?;
-        db.decide_lane_approval(
-            &approval_id,
-            decision,
-            Some("acp-editor".to_string()),
-            Some("mirrored from ACP permission response".to_string()),
-        )?;
-        Ok(())
+        self.finish_client_callback(message, &id, operation, was_cancelled)
     }
 
     fn capture_agent_response(&mut self, message: &mut Value) -> Result<()> {
         let Some(id) = rpc_id_key(message) else {
             return Ok(());
         };
-
-        if self.pending_initialize.remove(&id) {
-            self.add_initialize_metadata(message);
+        let key = (Direction::ClientToAgent, id);
+        let was_cancelled = self.cancelled_requests.remove(&key);
+        let Some(operation) = self.pending_operations.remove(&key) else {
             return Ok(());
-        }
-
-        if let Some(pending) = self.pending_sessions.remove(&id) {
-            self.finish_session_request(message, pending)?;
-            return Ok(());
-        }
-
-        if let Some(pending) = self.pending_prompts.remove(&id) {
-            self.finish_prompt_request(message, pending)?;
-            return Ok(());
-        }
-
-        if let Some(acp_session_id) = self.pending_closes.remove(&id) {
-            self.finish_close_request(message, &acp_session_id)?;
-        }
-
-        Ok(())
-    }
-
-    fn add_initialize_metadata(&self, message: &mut Value) {
-        let Some(result) = message.get_mut("result").and_then(Value::as_object_mut) else {
-            return;
         };
-        let meta = ensure_object_field(result, "_meta");
-        meta.insert(
-            "trail".to_string(),
-            serde_json::json!({
-                "relay": true,
-                "capture": true,
-                "workspace": self.options.workspace_root.to_string_lossy(),
-                "dbDir": self.options.db_dir.to_string_lossy(),
-                "provider": self.options.provider,
-                "model": self.options.model
-            }),
-        );
+        match operation {
+            PendingOperation::Session(pending) => self.finish_session_request(message, pending),
+            PendingOperation::Prompt(pending) => {
+                self.finish_prompt_request(message, pending, was_cancelled)
+            }
+            PendingOperation::Close { acp_session_id } => {
+                self.finish_close_request(message, &acp_session_id)
+            }
+            PendingOperation::SessionDelete { acp_session_id } => {
+                self.finish_delete_request(message, &acp_session_id)
+            }
+            PendingOperation::Initialize { requested_version } => self
+                .capture_connection_lifecycle(
+                    "initialize",
+                    message,
+                    Some(serde_json::json!({"requested_version": requested_version})),
+                ),
+            PendingOperation::Authenticate { method_id } => self.capture_connection_lifecycle(
+                "authenticate",
+                message,
+                Some(serde_json::json!({"method_id": method_id})),
+            ),
+            PendingOperation::Logout => self.capture_connection_lifecycle("logout", message, None),
+            PendingOperation::SessionList { cursor } => self.capture_connection_lifecycle(
+                "session/list",
+                message,
+                Some(serde_json::json!({
+                    "request_cursor": cursor,
+                    "cancel_requested": was_cancelled
+                })),
+            ),
+            PendingOperation::SetMode {
+                acp_session_id,
+                mode_id,
+            } => self.finish_configuration_request(
+                message,
+                &acp_session_id,
+                Some(&mode_id),
+                None,
+                was_cancelled,
+            ),
+            PendingOperation::SetConfig {
+                acp_session_id,
+                config_id,
+                value,
+            } => self.finish_configuration_request(
+                message,
+                &acp_session_id,
+                None,
+                Some((&config_id, &value)),
+                was_cancelled,
+            ),
+            PendingOperation::ClientCallback(_) => Ok(()),
+        }
     }
 
     fn prepare_session_request(&mut self, message: &mut Value) -> Result<()> {
         let method = method_name(message).unwrap_or_default().to_string();
+        let is_load = method == "session/load";
         let request_id = rpc_id_key(message);
         let params = params_object_mut(message)?;
         let original_cwd = params
@@ -999,32 +1497,58 @@ impl CaptureCoordinator {
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let session = self.ensure_capture_session(
+        let mapping_existed = if let Some(acp_session_id) = requested_acp_session_id.as_deref() {
+            self.open_db()?
+                .try_lane_acp_session(acp_session_id)?
+                .is_some()
+        } else {
+            false
+        };
+        let mut session = self.ensure_capture_session(
             &method,
             requested_acp_session_id.as_deref(),
             &original_cwd,
         )?;
 
-        if session.effective_cwd != original_cwd {
-            params.insert(
-                "cwd".to_string(),
-                Value::String(session.effective_cwd.clone()),
-            );
+        if let Some(materialized_root) = &session.materialized_root {
+            let mapper = WorkspaceMapper::new(
+                self.options.workspace_root.clone(),
+                PathBuf::from(materialized_root),
+            )?;
+            let mappings = mapper.map_session_params(params)?;
+            session.effective_cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or(&original_cwd)
+                .to_string();
+            session.path_mappings = mappings.into_iter().map(acp_path_mapping).collect();
+        } else {
+            session.path_mappings = passthrough_session_mappings(params)?
+                .into_iter()
+                .map(acp_path_mapping)
+                .collect();
         }
         if self.options.inject_mcp {
             inject_trail_mcp_server(params, &self.options)?;
         }
 
         if let Some(request_id) = request_id {
-            self.pending_sessions.insert(
+            self.register_pending(
+                Direction::ClientToAgent,
                 request_id,
-                PendingSession {
+                PendingOperation::Session(PendingSession {
                     method,
                     session: session.clone(),
-                },
-            );
+                    mapping_existed,
+                }),
+            )?;
         }
         if let Some(acp_session_id) = requested_acp_session_id {
+            if is_load {
+                self.replay_by_session
+                    .entry(acp_session_id.clone())
+                    .or_default();
+            }
             self.sessions_by_acp.insert(acp_session_id, session);
         }
         Ok(())
@@ -1043,16 +1567,18 @@ impl CaptureCoordinator {
             let db = self.open_db()?;
             if let Some(mapping) = db.try_lane_acp_session(acp_session_id)? {
                 let lane_name = db.resolve_lane_handle(&mapping.lane_id)?;
-                let effective_cwd =
-                    self.materialized_cwd_for_existing_lane(&lane_name, original_cwd)?;
+                let materialized_root = self.materialized_root_for_existing_lane(&lane_name)?;
+                let effective_cwd = original_cwd.to_string();
                 let state = SessionState {
                     acp_session_id: acp_session_id.to_string(),
                     upstream_session_id: mapping.upstream_session_id,
                     lane_name,
                     trail_session_id: mapping.trail_session_id,
                     original_cwd: original_cwd.to_string(),
-                    materialized: effective_cwd != original_cwd,
                     effective_cwd,
+                    materialized: materialized_root.is_some(),
+                    materialized_root,
+                    path_mappings: mapping.path_mappings,
                 };
                 return Ok(state);
             }
@@ -1080,15 +1606,23 @@ impl CaptureCoordinator {
         }
 
         let details = db.lane_details(&lane_name)?;
-        let effective_cwd = if self.options.materialize {
-            details
-                .branch
-                .workdir
-                .clone()
-                .unwrap_or_else(|| original_cwd.to_string())
+        let materialized_root = if self.options.materialize {
+            details.branch.workdir.clone()
         } else {
-            original_cwd.to_string()
+            None
         };
+        let initial_mapping = if let Some(root) = &materialized_root {
+            WorkspaceMapper::new(self.options.workspace_root.clone(), PathBuf::from(root))?
+                .map(PathBuf::from(original_cwd).as_path())?
+        } else {
+            PathMapping {
+                original: PathBuf::from(original_cwd),
+                effective: PathBuf::from(original_cwd),
+                isolated: false,
+            }
+        };
+        let effective_cwd = initial_mapping.effective.to_string_lossy().to_string();
+        let path_mappings = vec![acp_path_mapping(initial_mapping)];
         let title = Some(format!("ACP {method}"));
         let session = db.start_lane_session(&lane_name, title, None)?.session;
         db.add_lane_session_event(
@@ -1101,6 +1635,7 @@ impl CaptureCoordinator {
                 "requested_acp_session_id": acp_session_id,
                 "cwd": original_cwd,
                 "effective_cwd": effective_cwd,
+                "path_mappings": path_mappings,
                 "provider": self.options.provider,
                 "model": self.options.model,
                 "materialized": self.options.materialize
@@ -1118,33 +1653,48 @@ impl CaptureCoordinator {
             trail_session_id: session.session_id,
             original_cwd: original_cwd.to_string(),
             effective_cwd,
-            materialized: self.options.materialize && details.branch.workdir.is_some(),
+            materialized: materialized_root.is_some(),
+            materialized_root,
+            path_mappings,
         })
     }
 
-    fn materialized_cwd_for_existing_lane(
-        &self,
-        lane_name: &str,
-        original_cwd: &str,
-    ) -> Result<String> {
+    fn materialized_root_for_existing_lane(&self, lane_name: &str) -> Result<Option<String>> {
         if !self.options.materialize {
-            return Ok(original_cwd.to_string());
+            return Ok(None);
         }
         let mut db = self.open_db()?;
         let report =
             db.ensure_lane_workdir_materialized(lane_name, self.options.workdir.clone())?;
-        Ok(report.workdir.unwrap_or_else(|| original_cwd.to_string()))
+        Ok(report.workdir)
     }
 
     fn finish_session_request(&mut self, message: &Value, pending: PendingSession) -> Result<()> {
-        let status = if message.get("error").is_some() {
-            "failed"
-        } else {
-            match pending.method.as_str() {
-                "session/load" => "loaded",
-                "session/resume" => "resumed",
-                _ => "active",
+        if message.get("error").is_some() {
+            if pending.method == "session/load" {
+                self.replay_by_session
+                    .remove(&pending.session.acp_session_id);
             }
+            let mut db = self.open_db()?;
+            db.add_lane_session_event(
+                &pending.session.lane_name,
+                &pending.session.trail_session_id,
+                "acp_session_request_failed",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "method": pending.method,
+                    "error": message.get("error")
+                }))),
+            )?;
+            if !pending.mapping_existed {
+                let _ = db.end_lane_session(&pending.session.trail_session_id, "failed");
+            }
+            return Ok(());
+        }
+        let status = match pending.method.as_str() {
+            "session/load" => "loaded",
+            "session/resume" => "resumed",
+            _ => "active",
         };
         let acp_session_id = response_session_id(message)
             .or_else(|| {
@@ -1164,11 +1714,25 @@ impl CaptureCoordinator {
             &session.lane_name,
             &session.trail_session_id,
             &session.effective_cwd,
+            &session.path_mappings,
             self.options.provider.as_deref(),
             self.options.model.as_deref(),
             self.upstream_command_json.as_deref(),
             status,
         )?;
+        let initial_mode = message
+            .pointer("/result/modes/currentModeId")
+            .and_then(Value::as_str);
+        if let Some(mode_id) = initial_mode {
+            db.update_lane_acp_session_configuration(&acp_session_id, Some(mode_id), None)?;
+        }
+        let initial_config = message
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+            .map(|options| session_config_values_from_options(options));
+        if let Some(config) = initial_config.as_ref() {
+            db.replace_lane_acp_session_configuration_options(&acp_session_id, config)?;
+        }
         db.add_lane_session_event(
             &session.lane_name,
             &session.trail_session_id,
@@ -1180,9 +1744,31 @@ impl CaptureCoordinator {
                 "upstream_session_id": response_session_id(message),
                 "cwd": session.original_cwd,
                 "effective_cwd": session.effective_cwd,
+                "path_mappings": session.path_mappings,
                 "status": status
             }))),
         )?;
+        if initial_mode.is_some() || initial_config.is_some() {
+            db.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_session_configuration",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "acp_session_id": acp_session_id,
+                    "modes": message.pointer("/result/modes"),
+                    "config_options": message.pointer("/result/configOptions")
+                }))),
+            )?;
+        }
+        for payload in std::mem::take(&mut self.pending_connection_events) {
+            db.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_connection_lifecycle",
+                Some(payload),
+            )?;
+        }
         record_acp_lifecycle_event(
             &mut db,
             &session.lane_name,
@@ -1192,16 +1778,11 @@ impl CaptureCoordinator {
             &acp_session_id,
             if status == "resumed" || status == "loaded" {
                 AgentLifecycleEventKind::SessionResumed
-            } else if status == "failed" {
-                AgentLifecycleEventKind::Diagnostic
             } else {
                 AgentLifecycleEventKind::SessionStarted
             },
             serde_json::json!({"method": pending.method, "status": status}),
         )?;
-        if status == "failed" {
-            let _ = db.end_lane_session(&session.trail_session_id, "failed");
-        }
         self.sessions_by_acp.insert(acp_session_id, session);
         Ok(())
     }
@@ -1210,12 +1791,14 @@ impl CaptureCoordinator {
         let Some(request_id) = rpc_id_key(message) else {
             return Ok(());
         };
+        let request_id_value = message.get("id").cloned();
         let params = params_object_mut(message)?;
         let acp_session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::InvalidInput("ACP session/prompt missing sessionId".to_string()))?
             .to_string();
+        self.flush_load_replay(&acp_session_id)?;
         let session = self.resolve_session_state(&acp_session_id)?;
         let prompt_text = prompt_text(params.get("prompt"));
         if session.materialized {
@@ -1263,11 +1846,23 @@ impl CaptureCoordinator {
             Some(redact_json(serde_json::json!({
                 "protocol": "acp",
                 "acp_session_id": &acp_session_id,
-                "request_id": message.get("id").cloned(),
+                "request_id": request_id_value,
                 "prompt_summary": summarize_text(&prompt_text),
             }))),
             None,
             None,
+        )?;
+        db.add_lane_turn_event(
+            &turn.turn.turn_id,
+            "acp_prompt_content",
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "acp_session_id": acp_session_id,
+                "readable_text": prompt_text,
+                "blocks": bounded_prompt_content(params.get("prompt"))
+            }))),
+            None,
+            Some(&user_message.message_id.0),
         )?;
         record_acp_lifecycle_event(
             &mut db,
@@ -1316,7 +1911,11 @@ impl CaptureCoordinator {
             root_span_id: root_span.clone(),
             materialized: session.materialized,
         };
-        self.pending_prompts.insert(request_id, pending.clone());
+        self.register_pending(
+            Direction::ClientToAgent,
+            request_id,
+            PendingOperation::Prompt(pending.clone()),
+        )?;
         self.active_turns.insert(
             acp_session_id,
             ActiveTurn {
@@ -1344,7 +1943,12 @@ impl CaptureCoordinator {
         Ok(())
     }
 
-    fn finish_prompt_request(&mut self, message: &Value, pending: PendingPrompt) -> Result<()> {
+    fn finish_prompt_request(
+        &mut self,
+        message: &Value,
+        pending: PendingPrompt,
+        cancel_requested: bool,
+    ) -> Result<()> {
         let status = prompt_status(message);
         let mut active = self.active_turns.remove(&pending.acp_session_id);
         let mut db = self.open_db()?;
@@ -1370,6 +1974,7 @@ impl CaptureCoordinator {
                 "protocol": "acp",
                 "acp_session_id": pending.acp_session_id,
                 "status": status,
+                "cancel_requested": cancel_requested,
                 "stop_reason": stop_reason(message),
                 "error": message.get("error").cloned()
             }))),
@@ -1430,13 +2035,25 @@ impl CaptureCoordinator {
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let variant = AcpV1SessionUpdateKind::parse(update_kind);
+        self.persist_session_update_state(acp_session_id, variant, update)?;
+        if let Some(replay) = self.replay_by_session.get_mut(acp_session_id) {
+            replay
+                .updates
+                .push((update_kind.to_string(), update.clone()));
+            return Ok(());
+        }
         let Some(mut active) = self.active_turns.remove(acp_session_id) else {
             self.capture_session_update_without_turn(acp_session_id, update_kind, update)?;
             return Ok(());
         };
 
-        let result = match update_kind {
-            "agent_message_chunk" => {
+        active.push_event(
+            "acp_session_update",
+            Some(session_update_projection(variant, update_kind, update)),
+        );
+        let result = match variant {
+            AcpV1SessionUpdateKind::AgentMessageChunk => {
                 let key = update
                     .get("messageId")
                     .and_then(Value::as_str)
@@ -1461,9 +2078,11 @@ impl CaptureCoordinator {
                 }
                 Ok(())
             }
-            "tool_call" => self.capture_tool_call_start(&mut active, update),
-            "tool_call_update" => self.capture_tool_call_update(&mut active, update),
-            "plan" => {
+            AcpV1SessionUpdateKind::ToolCall => self.capture_tool_call_start(&mut active, update),
+            AcpV1SessionUpdateKind::ToolCallUpdate => {
+                self.capture_tool_call_update(&mut active, update)
+            }
+            AcpV1SessionUpdateKind::Plan => {
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_plan_update")?;
                 active.push_event(
@@ -1472,8 +2091,8 @@ impl CaptureCoordinator {
                 );
                 Ok(())
             }
-            kind if ignore_session_update(kind) => Ok(()),
-            "available_commands_update" => {
+            AcpV1SessionUpdateKind::AgentThoughtChunk => Ok(()),
+            AcpV1SessionUpdateKind::AvailableCommandsUpdate => {
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_available_commands_update")?;
                 active.push_event(
@@ -1482,7 +2101,7 @@ impl CaptureCoordinator {
                 );
                 Ok(())
             }
-            "usage_update" => {
+            AcpV1SessionUpdateKind::UsageUpdate => {
                 active.usage = turn_envelope_usage(update);
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_usage_update")?;
@@ -1492,13 +2111,13 @@ impl CaptureCoordinator {
                 );
                 Ok(())
             }
-            _ => {
+            AcpV1SessionUpdateKind::UserMessageChunk
+            | AcpV1SessionUpdateKind::CurrentModeUpdate
+            | AcpV1SessionUpdateKind::ConfigOptionUpdate
+            | AcpV1SessionUpdateKind::SessionInfoUpdate
+            | AcpV1SessionUpdateKind::Extension => {
                 self.flush_turn_events(&mut active)?;
                 self.flush_assistant_messages(&mut active, "before_session_update")?;
-                active.push_event(
-                    &format!("acp_{update_kind}"),
-                    Some(redact_json(Value::Object(update.clone()))),
-                );
                 Ok(())
             }
         };
@@ -1523,20 +2142,130 @@ impl CaptureCoordinator {
         let Some(session) = session else {
             return Ok(());
         };
-        if ignore_session_update(update_kind) {
-            return Ok(());
-        }
-        let payload = if update_kind == "available_commands_update" {
-            summarize_available_commands(update)
-        } else {
-            redact_json(Value::Object(update.clone()))
-        };
+        let variant = AcpV1SessionUpdateKind::parse(update_kind);
         let mut db = self.open_db()?;
         db.add_lane_session_event(
             &session.lane_name,
             &session.trail_session_id,
-            &format!("acp_{update_kind}"),
-            Some(payload),
+            "acp_session_update",
+            Some(session_update_projection(variant, update_kind, update)),
+        )?;
+        if variant == AcpV1SessionUpdateKind::AvailableCommandsUpdate {
+            db.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_available_commands_update",
+                Some(summarize_available_commands(update)),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn persist_session_update_state(
+        &mut self,
+        acp_session_id: &str,
+        variant: AcpV1SessionUpdateKind,
+        update: &Map<String, Value>,
+    ) -> Result<()> {
+        match variant {
+            AcpV1SessionUpdateKind::CurrentModeUpdate => {
+                let Some(mode_id) = update.get("currentModeId").and_then(Value::as_str) else {
+                    return Ok(());
+                };
+                self.open_db()?.update_lane_acp_session_configuration(
+                    acp_session_id,
+                    Some(mode_id),
+                    None,
+                )?;
+            }
+            AcpV1SessionUpdateKind::ConfigOptionUpdate => {
+                let values = session_config_values(update);
+                self.open_db()?
+                    .replace_lane_acp_session_configuration_options(acp_session_id, &values)?;
+            }
+            AcpV1SessionUpdateKind::SessionInfoUpdate if update.contains_key("title") => {
+                let session = self.resolve_session_state(acp_session_id)?;
+                let title = update.get("title").and_then(Value::as_str);
+                self.open_db()?
+                    .update_lane_session_title(&session.trail_session_id, title)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn flush_load_replay(&mut self, acp_session_id: &str) -> Result<()> {
+        let Some(replay) = self.replay_by_session.remove(acp_session_id) else {
+            return Ok(());
+        };
+        if replay.updates.is_empty() {
+            return Ok(());
+        }
+        let session = self.resolve_session_state(acp_session_id)?;
+        let turns = replay_turns(replay);
+        let mut db = self.open_db()?;
+        for (turn_index, replay_turn) in turns.into_iter().enumerate() {
+            if !replay_turn.has_content() {
+                continue;
+            }
+            let turn = db.begin_lane_session_turn(
+                &session.lane_name,
+                &session.trail_session_id,
+                Some(redact_json(serde_json::json!({
+                    "kind": "acp_load_replay",
+                    "protocol": "acp",
+                    "acp_session_id": acp_session_id,
+                    "history_index": turn_index
+                }))),
+            )?;
+            let turn_id = turn.turn.turn_id;
+            if !replay_turn.user_text.is_empty() {
+                let message = db.add_lane_turn_message(&turn_id, "user", &replay_turn.user_text)?;
+                db.add_lane_turn_event(
+                    &turn_id,
+                    "acp_replay_message",
+                    Some(redact_json(serde_json::json!({
+                        "role": "user",
+                        "acp_message_id": replay_turn.user_message_id
+                    }))),
+                    None,
+                    Some(&message.message_id.0),
+                )?;
+            }
+            if !replay_turn.assistant_text.is_empty() {
+                let message =
+                    db.add_lane_turn_message(&turn_id, "assistant", &replay_turn.assistant_text)?;
+                db.add_lane_turn_event(
+                    &turn_id,
+                    "acp_replay_message",
+                    Some(redact_json(serde_json::json!({
+                        "role": "assistant",
+                        "acp_message_id": replay_turn.assistant_message_id
+                    }))),
+                    None,
+                    Some(&message.message_id.0),
+                )?;
+            }
+            for (event_type, payload) in replay_turn.events {
+                db.add_lane_turn_event(
+                    &turn_id,
+                    &event_type,
+                    Some(redact_json(payload)),
+                    None,
+                    None,
+                )?;
+            }
+            db.end_lane_turn(&turn_id, "completed")?;
+            let _ = db.create_turn_evidence_manifest(&turn_id);
+        }
+        db.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            "acp_load_replay_completed",
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "acp_session_id": acp_session_id
+            }))),
         )?;
         Ok(())
     }
@@ -1596,6 +2325,386 @@ impl CaptureCoordinator {
                 active.push_span_ended(&span_id, status, Some(Value::Object(update.clone())));
             }
         }
+        Ok(())
+    }
+
+    fn capture_client_callback_request(&mut self, message: &mut Value) -> Result<()> {
+        let id = rpc_id_key(message).ok_or_else(|| {
+            Error::InvalidInput("ACP client callback request missing id".to_string())
+        })?;
+        let method = method_name(message)
+            .ok_or_else(|| Error::InvalidInput("ACP client callback missing method".to_string()))?
+            .to_string();
+        let params = params_object_mut(message)?;
+        let acp_session_id = required_string(params, "sessionId", &method)?;
+        let session = self.resolve_session_state(&acp_session_id)?;
+        let operation = match method.as_str() {
+            "fs/read_text_file" => {
+                let effective_path = required_string(params, "path", &method)?;
+                let forwarded_path = reverse_callback_path(&session, &effective_path);
+                params.insert("path".to_string(), Value::String(forwarded_path.clone()));
+                ClientCallbackOperation::ReadFile {
+                    acp_session_id,
+                    effective_path,
+                    forwarded_path,
+                    line: params.get("line").and_then(Value::as_u64),
+                    limit: params.get("limit").and_then(Value::as_u64),
+                }
+            }
+            "fs/write_text_file" => {
+                let effective_path = required_string(params, "path", &method)?;
+                let forwarded_path = reverse_callback_path(&session, &effective_path);
+                let content = params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("ACP fs/write_text_file missing content".to_string())
+                    })?;
+                let redacted_content = crate::db::redact_sensitive_text(content);
+                let redacted_bytes = redacted_content.into_bytes();
+                let content_sha256 = hex::encode(Sha256::digest(&redacted_bytes));
+                let byte_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+                params.insert("path".to_string(), Value::String(forwarded_path.clone()));
+                ClientCallbackOperation::WriteFile {
+                    acp_session_id,
+                    effective_path,
+                    forwarded_path,
+                    content_sha256,
+                    byte_len,
+                    redacted_content: redacted_bytes,
+                }
+            }
+            "terminal/create" => {
+                let command = required_string(params, "command", &method)?;
+                let mut command_line = vec![command];
+                command_line.extend(
+                    params
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string),
+                );
+                let effective_cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let forwarded_cwd = effective_cwd
+                    .as_deref()
+                    .map(|cwd| reverse_callback_path(&session, cwd));
+                if let Some(cwd) = forwarded_cwd.as_ref() {
+                    params.insert("cwd".to_string(), Value::String(cwd.clone()));
+                }
+                ClientCallbackOperation::TerminalCreate {
+                    acp_session_id,
+                    command: redact_command(&command_line),
+                    effective_cwd,
+                    forwarded_cwd,
+                    output_byte_limit: params.get("outputByteLimit").and_then(Value::as_u64),
+                    env_names: params
+                        .get("env")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|variable| variable.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect(),
+                }
+            }
+            "terminal/output" | "terminal/wait_for_exit" | "terminal/kill" | "terminal/release" => {
+                let terminal_id = required_string(params, "terminalId", &method)?;
+                match method.as_str() {
+                    "terminal/output" => ClientCallbackOperation::TerminalOutput {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                    "terminal/wait_for_exit" => ClientCallbackOperation::TerminalWait {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                    "terminal/kill" => ClientCallbackOperation::TerminalKill {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                    _ => ClientCallbackOperation::TerminalRelease {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                }
+            }
+            _ => return Ok(()),
+        };
+        self.register_pending(
+            Direction::AgentToClient,
+            id,
+            PendingOperation::ClientCallback(operation),
+        )?;
+        Ok(())
+    }
+
+    fn finish_client_callback(
+        &mut self,
+        message: &Value,
+        request_id: &str,
+        operation: ClientCallbackOperation,
+        cancel_requested: bool,
+    ) -> Result<()> {
+        let acp_session_id = operation.acp_session_id().to_string();
+        self.capture_callback_event(
+            &acp_session_id,
+            "acp_client_callback_requested",
+            client_callback_request_payload(&operation, request_id),
+        )?;
+        let success = message.get("error").is_none();
+        let mut result_summary = Value::Null;
+        let mut artifact_id = None;
+        match &operation {
+            ClientCallbackOperation::Permission(permission) => {
+                let has_outcome = message.pointer("/result/outcome").is_some();
+                let decision = if has_outcome {
+                    permission_decision(message, &permission.options_by_id)
+                } else {
+                    "error"
+                };
+                result_summary = serde_json::json!({"decision": decision});
+                if has_outcome {
+                    if let Some(approval_id) = permission.approval_id.as_deref() {
+                        self.open_db()?.decide_lane_approval(
+                            approval_id,
+                            decision,
+                            Some("acp-editor".to_string()),
+                            Some("mirrored from ACP permission response".to_string()),
+                        )?;
+                    }
+                }
+                self.capture_callback_event(
+                    &acp_session_id,
+                    "acp_permission_finished",
+                    serde_json::json!({
+                        "protocol": "acp",
+                        "acp_session_id": acp_session_id,
+                        "decision": decision,
+                        "cancel_requested": cancel_requested
+                    }),
+                )?;
+            }
+            ClientCallbackOperation::ReadFile { .. } => {
+                if let Some(content) = message.pointer("/result/content").and_then(Value::as_str) {
+                    let redacted = crate::db::redact_sensitive_text(content);
+                    result_summary = serde_json::json!({
+                        "byte_len": content.len(),
+                        "sha256": hex::encode(Sha256::digest(redacted.as_bytes()))
+                    });
+                }
+            }
+            ClientCallbackOperation::WriteFile {
+                effective_path,
+                forwarded_path,
+                byte_len,
+                redacted_content,
+                ..
+            } => {
+                let session = self.resolve_session_state(&acp_session_id)?;
+                let active_turn_id = self
+                    .active_turns
+                    .get(&acp_session_id)
+                    .map(|active| active.turn_id.clone());
+                let artifact = self.open_db()?.record_lane_artifact(LaneArtifactInput {
+                    lane: session.lane_name,
+                    session_id: session.trail_session_id,
+                    turn_id: active_turn_id,
+                    provider: self
+                        .options
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "acp-agent".to_string()),
+                    artifact_kind: "acp_fs_write".to_string(),
+                    format: "text".to_string(),
+                    source: AgentEvidenceSource::Acp,
+                    source_locator_redacted: Some(forwarded_path.clone()),
+                    content: redacted_content.clone(),
+                    start_offset: None,
+                    end_offset: Some(u64::try_from(redacted_content.len()).unwrap_or(u64::MAX)),
+                    redaction_profile: Some("trail-sensitive-text-v1".to_string()),
+                    trust: "protocol".to_string(),
+                    supersedes_artifact_id: None,
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "protocol": "acp",
+                            "effective_path": effective_path,
+                            "forwarded_path": forwarded_path,
+                            "requested_byte_len": byte_len
+                        })
+                        .to_string(),
+                    ),
+                })?;
+                artifact_id = Some(artifact.artifact_id);
+                result_summary = serde_json::json!({"written": success});
+            }
+            ClientCallbackOperation::TerminalCreate { .. } if success => {
+                if let Some(terminal_id) = message
+                    .pointer("/result/terminalId")
+                    .and_then(Value::as_str)
+                {
+                    self.terminals.insert(
+                        terminal_id.to_string(),
+                        CapturedTerminal {
+                            acp_session_id: acp_session_id.clone(),
+                            state: "running".to_string(),
+                        },
+                    );
+                    result_summary = serde_json::json!({
+                        "terminal_id": terminal_id,
+                        "state": "running"
+                    });
+                }
+            }
+            ClientCallbackOperation::TerminalOutput { terminal_id, .. } => {
+                let output = message
+                    .pointer("/result/output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let redacted = crate::db::redact_sensitive_text(output);
+                let exit_status = message.pointer("/result/exitStatus").cloned();
+                if success {
+                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                        terminal.state =
+                            if exit_status.as_ref().is_some_and(|value| !value.is_null()) {
+                                "exited".to_string()
+                            } else {
+                                "running".to_string()
+                            };
+                    }
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "output_byte_len": output.len(),
+                    "output_sha256": hex::encode(Sha256::digest(redacted.as_bytes())),
+                    "truncated": message.pointer("/result/truncated"),
+                    "exit_status": exit_status
+                });
+            }
+            ClientCallbackOperation::TerminalWait { terminal_id, .. } => {
+                if success {
+                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                        terminal.state = "exited".to_string();
+                    }
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "exit_code": message.pointer("/result/exitCode"),
+                    "signal": message.pointer("/result/signal"),
+                    "state": success.then_some("exited")
+                });
+            }
+            ClientCallbackOperation::TerminalKill { terminal_id, .. } => {
+                if success {
+                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                        terminal.state = "killed".to_string();
+                    }
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "state": success.then_some("killed")
+                });
+            }
+            ClientCallbackOperation::TerminalRelease { terminal_id, .. } => {
+                if success {
+                    self.terminals.remove(terminal_id);
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "state": success.then_some("released")
+                });
+            }
+            _ => {}
+        }
+        self.capture_callback_event(
+            &acp_session_id,
+            "acp_client_callback_finished",
+            serde_json::json!({
+                "protocol": "acp",
+                "method": operation.method(),
+                "request_id": rpc_id_value(request_id),
+                "success": success,
+                "cancel_requested": cancel_requested,
+                "result": result_summary,
+                "error": message.get("error"),
+                "artifact_id": artifact_id
+            }),
+        )
+    }
+
+    fn capture_callback_shutdown(&mut self, reason: &RelayFinishReason) -> Result<()> {
+        let pending = self
+            .pending_operations
+            .iter()
+            .filter_map(|((direction, request_id), operation)| {
+                if *direction != Direction::AgentToClient {
+                    return None;
+                }
+                let PendingOperation::ClientCallback(callback) = operation else {
+                    return None;
+                };
+                Some((request_id.clone(), callback.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (request_id, callback) in pending {
+            self.pending_operations
+                .remove(&(Direction::AgentToClient, request_id.clone()));
+            self.finish_client_callback(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::from_str::<Value>(&request_id).unwrap_or(Value::Null),
+                    "error": {
+                        "code": -32099,
+                        "message": "relay shutdown with callback in flight",
+                        "data": {"finish_reason": format!("{reason:?}")}
+                    }
+                }),
+                &request_id,
+                callback,
+                false,
+            )?;
+        }
+        let terminals = self.terminals.drain().collect::<Vec<_>>();
+        for (terminal_id, terminal) in terminals {
+            self.capture_callback_event(
+                &terminal.acp_session_id,
+                "acp_terminal_abandoned",
+                serde_json::json!({
+                    "protocol": "acp",
+                    "terminal_id": terminal_id,
+                    "state": terminal.state,
+                    "finish_reason": format!("{reason:?}")
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_callback_event(
+        &mut self,
+        acp_session_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<()> {
+        if let Some(mut active) = self.active_turns.remove(acp_session_id) {
+            self.flush_turn_events(&mut active)?;
+            self.flush_assistant_messages(&mut active, "before_client_callback")?;
+            active.push_event(event_type, Some(redact_json(payload)));
+            self.flush_turn_events(&mut active)?;
+            self.active_turns.insert(acp_session_id.to_string(), active);
+            return Ok(());
+        }
+        let session = self.resolve_session_state(acp_session_id)?;
+        self.open_db()?.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            event_type,
+            Some(redact_json(payload)),
+        )?;
         Ok(())
     }
 
@@ -1694,7 +2803,7 @@ impl CaptureCoordinator {
         };
         let options_by_id = permission_options(params.get("options"));
         let mut approval_id = None;
-        if let Some(session) = self.resolve_session_state(acp_session_id).ok() {
+        if let Ok(session) = self.resolve_session_state(acp_session_id) {
             let active_turn_id = if let Some(mut active) = self.active_turns.remove(acp_session_id)
             {
                 let turn_id = active.turn_id.clone();
@@ -1720,13 +2829,17 @@ impl CaptureCoordinator {
             )?;
             approval_id = Some(report.approval.approval_id);
         }
-        self.pending_permissions.insert(
+        self.register_pending(
+            Direction::AgentToClient,
             id,
-            PendingPermission {
-                approval_id,
-                options_by_id,
-            },
-        );
+            PendingOperation::ClientCallback(ClientCallbackOperation::Permission(
+                PendingPermission {
+                    approval_id,
+                    options_by_id,
+                    acp_session_id: acp_session_id.to_string(),
+                },
+            )),
+        )?;
         Ok(())
     }
 
@@ -1752,6 +2865,69 @@ impl CaptureCoordinator {
         Ok(())
     }
 
+    fn capture_rpc_cancel(&mut self, message: &Value, direction: Direction) -> Result<()> {
+        let target = message.pointer("/params/requestId").ok_or_else(|| {
+            Error::InvalidInput("ACP $/cancel_request missing requestId".to_string())
+        })?;
+        let target_id = serde_json::to_string(target)?;
+        let key = (direction, target_id.clone());
+        let operation = self.pending_operations.get(&key).cloned();
+        let matched = operation.is_some();
+        if matched {
+            self.cancelled_requests.insert(key.clone());
+        }
+        let acp_session_id = match operation {
+            Some(PendingOperation::Session(pending)) => Some(pending.session.acp_session_id),
+            Some(PendingOperation::Prompt(pending)) => Some(pending.acp_session_id),
+            Some(PendingOperation::Close { acp_session_id })
+            | Some(PendingOperation::SessionDelete { acp_session_id })
+            | Some(PendingOperation::SetMode { acp_session_id, .. })
+            | Some(PendingOperation::SetConfig { acp_session_id, .. }) => Some(acp_session_id),
+            Some(PendingOperation::ClientCallback(operation)) => {
+                Some(operation.acp_session_id().to_string())
+            }
+            _ => None,
+        };
+        let payload = redact_json(serde_json::json!({
+            "protocol": "acp",
+            "method": "$/cancel_request",
+            "target_request_id": target,
+            "request_direction": format!("{direction:?}"),
+            "matched": matched
+        }));
+        if let Some(acp_session_id) = acp_session_id {
+            if let Some(mut active) = self.active_turns.remove(&acp_session_id) {
+                active.push_event("acp_request_cancelled", Some(payload.clone()));
+                self.flush_turn_events(&mut active)?;
+                self.active_turns.insert(acp_session_id.clone(), active);
+                return Ok(());
+            }
+            if let Ok(session) = self.resolve_session_state(&acp_session_id) {
+                self.open_db()?.add_lane_session_event(
+                    &session.lane_name,
+                    &session.trail_session_id,
+                    "acp_request_cancelled",
+                    Some(payload),
+                )?;
+            }
+        } else {
+            let sessions = self.sessions_by_acp.values().cloned().collect::<Vec<_>>();
+            if sessions.is_empty() {
+                self.pending_connection_events.push(payload);
+            } else {
+                for session in sessions {
+                    self.open_db()?.add_lane_session_event(
+                        &session.lane_name,
+                        &session.trail_session_id,
+                        "acp_request_cancelled",
+                        Some(payload.clone()),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_close_request(&mut self, message: &Value) -> Result<()> {
         let Some(id) = rpc_id_key(message) else {
             return Ok(());
@@ -1760,32 +2936,41 @@ impl CaptureCoordinator {
         let Some(acp_session_id) = params.get("sessionId").and_then(Value::as_str) else {
             return Ok(());
         };
-        self.pending_closes.insert(id, acp_session_id.to_string());
-        Ok(())
+        self.register_pending(
+            Direction::ClientToAgent,
+            id,
+            PendingOperation::Close {
+                acp_session_id: acp_session_id.to_string(),
+            },
+        )
     }
 
     fn finish_close_request(&mut self, message: &Value, acp_session_id: &str) -> Result<()> {
         let Some(session) = self.sessions_by_acp.get(acp_session_id).cloned() else {
             return Ok(());
         };
-        let status = if message.get("error").is_some() {
-            "failed"
-        } else {
-            "closed"
-        };
+        let succeeded = message.get("error").is_none();
+        let status = if succeeded { "closed" } else { "active" };
         let mut db = self.open_db()?;
-        db.update_lane_acp_session_status(acp_session_id, status)?;
+        if succeeded {
+            db.update_lane_acp_session_status(acp_session_id, status)?;
+        }
         db.add_lane_session_event(
             &session.lane_name,
             &session.trail_session_id,
-            "acp_session_closed",
+            if succeeded {
+                "acp_session_closed"
+            } else {
+                "acp_session_close_failed"
+            },
             Some(redact_json(serde_json::json!({
                 "protocol": "acp",
                 "acp_session_id": acp_session_id,
-                "status": status
+                "status": status,
+                "error": message.get("error")
             }))),
         )?;
-        if status == "closed" {
+        if succeeded {
             record_acp_lifecycle_event(
                 &mut db,
                 &session.lane_name,
@@ -1813,7 +2998,152 @@ impl CaptureCoordinator {
         Ok(())
     }
 
+    fn finish_delete_request(&mut self, message: &Value, acp_session_id: &str) -> Result<()> {
+        if message.get("error").is_some() {
+            return self.capture_session_lifecycle_failure(
+                acp_session_id,
+                "session/delete",
+                message.get("error"),
+            );
+        }
+        let Some(session) = self.resolve_session_state(acp_session_id).ok() else {
+            return Ok(());
+        };
+        let mut db = self.open_db()?;
+        db.update_lane_acp_session_status(acp_session_id, "deleted")?;
+        db.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            "acp_session_deleted",
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "method": "session/delete",
+                "acp_session_id": acp_session_id,
+                "status": "deleted"
+            }))),
+        )?;
+        self.sessions_by_acp.remove(acp_session_id);
+        Ok(())
+    }
+
+    fn finish_configuration_request(
+        &mut self,
+        message: &Value,
+        acp_session_id: &str,
+        mode_id: Option<&str>,
+        config: Option<(&str, &Value)>,
+        cancel_requested: bool,
+    ) -> Result<()> {
+        if message.get("error").is_some() {
+            return self.capture_session_lifecycle_failure(
+                acp_session_id,
+                if mode_id.is_some() {
+                    "session/set_mode"
+                } else {
+                    "session/set_config_option"
+                },
+                message.get("error"),
+            );
+        }
+        let session = self.resolve_session_state(acp_session_id)?;
+        let mut db = self.open_db()?;
+        let authoritative_config = message
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+            .map(|options| session_config_values_from_options(options));
+        let mapping = if let Some(config_options) = authoritative_config.as_ref() {
+            db.replace_lane_acp_session_configuration_options(acp_session_id, config_options)?
+        } else {
+            db.update_lane_acp_session_configuration(acp_session_id, mode_id, config)?
+        };
+        db.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            if mode_id.is_some() {
+                "acp_session_mode_changed"
+            } else {
+                "acp_session_config_changed"
+            },
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "acp_session_id": acp_session_id,
+                "mode_id": mode_id,
+                "config_id": config.as_ref().map(|(id, _)| *id),
+                "value": config.as_ref().map(|(_, value)| *value),
+                "authoritative_config_options": message.pointer("/result/configOptions"),
+                "cancel_requested": cancel_requested,
+                "current_mode_id": mapping.current_mode_id,
+                "config_options": mapping.config_options
+            }))),
+        )?;
+        Ok(())
+    }
+
+    fn capture_session_lifecycle_failure(
+        &mut self,
+        acp_session_id: &str,
+        method: &str,
+        error: Option<&Value>,
+    ) -> Result<()> {
+        let Some(session) = self.resolve_session_state(acp_session_id).ok() else {
+            return Ok(());
+        };
+        self.open_db()?.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            "acp_session_request_failed",
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "method": method,
+                "acp_session_id": acp_session_id,
+                "error": error
+            }))),
+        )?;
+        Ok(())
+    }
+
+    fn capture_connection_lifecycle(
+        &mut self,
+        method: &str,
+        message: &Value,
+        context: Option<Value>,
+    ) -> Result<()> {
+        let outcome = if message.get("error").is_some() {
+            "error"
+        } else {
+            "success"
+        };
+        let payload = redact_json(serde_json::json!({
+            "protocol": "acp",
+            "method": method,
+            "request_id": message.get("id"),
+            "outcome": outcome,
+            "result": message.get("result"),
+            "error": message.get("error"),
+            "error_code": message.pointer("/error/code"),
+            "context": context
+        }));
+        let sessions = self.sessions_by_acp.values().cloned().collect::<Vec<_>>();
+        if sessions.is_empty() {
+            self.pending_connection_events.push(payload);
+            return Ok(());
+        }
+        for session in sessions {
+            self.open_db()?.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_connection_lifecycle",
+                Some(payload.clone()),
+            )?;
+        }
+        Ok(())
+    }
+
     fn finish_open_turns(&mut self, status: &str, reason: &str) -> Result<()> {
+        let replay_sessions = self.replay_by_session.keys().cloned().collect::<Vec<_>>();
+        for acp_session_id in replay_sessions {
+            self.flush_load_replay(&acp_session_id)?;
+        }
         if self.active_turns.is_empty() {
             return Ok(());
         }
@@ -1873,8 +3203,13 @@ impl CaptureCoordinator {
                 Some(&active),
             );
             let _ = db.update_lane_acp_session_status(&acp_session_id, status);
-            self.pending_prompts
-                .retain(|_, pending| pending.acp_session_id != acp_session_id);
+            self.pending_operations.retain(|_, operation| {
+                !matches!(
+                    operation,
+                    PendingOperation::Prompt(pending)
+                        if pending.acp_session_id == acp_session_id
+                )
+            });
         }
         Ok(())
     }
@@ -1896,15 +3231,27 @@ impl CaptureCoordinator {
         let Some(mapping) = db.try_lane_acp_session(acp_session_id)? else {
             return Ok(None);
         };
+        if mapping.status == "deleted" {
+            return Ok(None);
+        }
         let lane_name = db.resolve_lane_handle(&mapping.lane_id)?;
+        let materialized_root = db.lane_details(&lane_name)?.branch.workdir;
+        let original_cwd = mapping
+            .path_mappings
+            .iter()
+            .find(|path| path.effective == mapping.cwd)
+            .map(|path| path.original.clone())
+            .unwrap_or_else(|| mapping.cwd.clone());
         Ok(Some(SessionState {
             acp_session_id: mapping.acp_session_id,
             upstream_session_id: mapping.upstream_session_id,
             lane_name,
             trail_session_id: mapping.trail_session_id,
-            original_cwd: mapping.cwd.clone(),
+            original_cwd,
             effective_cwd: mapping.cwd,
-            materialized: false,
+            materialized: mapping.path_mappings.iter().any(|path| path.isolated),
+            materialized_root,
+            path_mappings: mapping.path_mappings,
         }))
     }
 
@@ -1995,8 +3342,195 @@ impl CaptureCoordinator {
     }
 }
 
+fn replay_turns(replay: ReplayAccumulator) -> Vec<ReplayTurn> {
+    let mut turns = Vec::new();
+    let mut current = ReplayTurn::default();
+    for (sequence, (kind, update)) in replay.updates.into_iter().enumerate() {
+        let variant = AcpV1SessionUpdateKind::parse(&kind);
+        let mut projection = session_update_projection(variant, &kind, &update);
+        if let Some(object) = projection.as_object_mut() {
+            object.insert(
+                "replaySequence".to_string(),
+                Value::from(u64::try_from(sequence).unwrap_or(u64::MAX)),
+            );
+        }
+        match kind.as_str() {
+            "user_message_chunk" => {
+                let message_id = update
+                    .get("messageId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let starts_new_turn = current.has_content()
+                    && (!current.assistant_text.is_empty()
+                        || (message_id.is_some() && current.user_message_id != message_id));
+                if starts_new_turn {
+                    turns.push(std::mem::take(&mut current));
+                }
+                if current.user_message_id.is_none() {
+                    current.user_message_id = message_id;
+                }
+                current
+                    .user_text
+                    .push_str(&content_text(update.get("content")));
+            }
+            "agent_message_chunk" => {
+                if current.assistant_message_id.is_none() {
+                    current.assistant_message_id = update
+                        .get("messageId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                current
+                    .assistant_text
+                    .push_str(&content_text(update.get("content")));
+            }
+            "agent_thought_chunk" => {
+                current.events.push((
+                    "acp_agent_thought_chunk_excluded".to_string(),
+                    serde_json::json!({
+                        "protocol": "acp",
+                        "replay_sequence": sequence,
+                        "excluded": true
+                    }),
+                ));
+            }
+            "plan" => current.events.push((
+                "plan_update".to_string(),
+                replay_event_payload(sequence, update),
+            )),
+            "usage_update" => current.events.push((
+                "acp_usage_update".to_string(),
+                replay_event_payload(sequence, update),
+            )),
+            "tool_call" | "tool_call_update" => current
+                .events
+                .push((kind, replay_event_payload(sequence, update))),
+            _ => current.events.push((
+                format!("acp_{kind}"),
+                replay_event_payload(sequence, update),
+            )),
+        }
+        current
+            .events
+            .push(("acp_session_update".to_string(), projection));
+    }
+    if current.has_content() {
+        turns.push(current);
+    }
+    turns
+}
+
+fn replay_event_payload(sequence: usize, mut update: Map<String, Value>) -> Value {
+    update.insert(
+        "replaySequence".to_string(),
+        Value::from(u64::try_from(sequence).unwrap_or(u64::MAX)),
+    );
+    Value::Object(update)
+}
+
 fn method_name(message: &Value) -> Option<&str> {
     message.get("method").and_then(Value::as_str)
+}
+
+fn is_client_callback_method(method: &str) -> bool {
+    matches!(
+        method,
+        "session/request_permission"
+            | "fs/read_text_file"
+            | "fs/write_text_file"
+            | "terminal/create"
+            | "terminal/output"
+            | "terminal/wait_for_exit"
+            | "terminal/kill"
+            | "terminal/release"
+    )
+}
+
+fn reverse_callback_path(session: &SessionState, effective_path: &str) -> String {
+    let path = PathBuf::from(effective_path);
+    let mapping = session
+        .path_mappings
+        .iter()
+        .filter_map(|mapping| {
+            path.strip_prefix(PathBuf::from(&mapping.effective))
+                .ok()
+                .map(|suffix| (mapping, suffix.to_path_buf()))
+        })
+        .max_by_key(|(mapping, _)| PathBuf::from(&mapping.effective).components().count());
+    let Some((mapping, suffix)) = mapping else {
+        return effective_path.to_string();
+    };
+    if suffix.as_os_str().is_empty() {
+        return mapping.original.clone();
+    }
+    PathBuf::from(&mapping.original)
+        .join(suffix)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn client_callback_request_payload(operation: &ClientCallbackOperation, request_id: &str) -> Value {
+    let details = match operation {
+        ClientCallbackOperation::Permission(permission) => serde_json::json!({
+            "option_kinds": permission.options_by_id,
+            "approval_id": permission.approval_id
+        }),
+        ClientCallbackOperation::ReadFile {
+            effective_path,
+            forwarded_path,
+            line,
+            limit,
+            ..
+        } => serde_json::json!({
+            "effective_path": effective_path,
+            "forwarded_path": forwarded_path,
+            "line": line,
+            "limit": limit
+        }),
+        ClientCallbackOperation::WriteFile {
+            effective_path,
+            forwarded_path,
+            content_sha256,
+            byte_len,
+            ..
+        } => serde_json::json!({
+            "effective_path": effective_path,
+            "forwarded_path": forwarded_path,
+            "content_sha256": content_sha256,
+            "byte_len": byte_len
+        }),
+        ClientCallbackOperation::TerminalCreate {
+            command,
+            effective_cwd,
+            forwarded_cwd,
+            output_byte_limit,
+            env_names,
+            ..
+        } => serde_json::json!({
+            "command": command,
+            "effective_cwd": effective_cwd,
+            "forwarded_cwd": forwarded_cwd,
+            "output_byte_limit": output_byte_limit,
+            "env_names": env_names
+        }),
+        ClientCallbackOperation::TerminalOutput { terminal_id, .. }
+        | ClientCallbackOperation::TerminalWait { terminal_id, .. }
+        | ClientCallbackOperation::TerminalKill { terminal_id, .. }
+        | ClientCallbackOperation::TerminalRelease { terminal_id, .. } => {
+            serde_json::json!({"terminal_id": terminal_id})
+        }
+    };
+    serde_json::json!({
+        "protocol": "acp",
+        "method": operation.method(),
+        "request_id": rpc_id_value(request_id),
+        "acp_session_id": operation.acp_session_id(),
+        "details": details
+    })
+}
+
+fn rpc_id_value(serialized_id: &str) -> Value {
+    serde_json::from_str(serialized_id).unwrap_or_else(|_| Value::String(serialized_id.to_string()))
 }
 
 fn rpc_id_key(message: &Value) -> Option<String> {
@@ -2019,17 +3553,13 @@ fn params_object_mut(message: &mut Value) -> Result<&mut Map<String, Value>> {
         .ok_or_else(|| Error::InvalidInput("ACP message missing object params".to_string()))
 }
 
-fn ensure_object_field<'a>(
-    object: &'a mut Map<String, Value>,
-    key: &str,
-) -> &'a mut Map<String, Value> {
-    let value = object
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value.as_object_mut().expect("object was just inserted")
+fn required_string(params: &Map<String, Value>, field: &str, method: &str) -> Result<String> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| Error::InvalidInput(format!("ACP {method} missing {field}")))
 }
 
 fn inject_trail_mcp_server(
@@ -2043,16 +3573,42 @@ fn inject_trail_mcp_server(
     let servers = servers.as_array_mut().ok_or_else(|| {
         Error::InvalidInput("ACP session mcpServers must be an array".to_string())
     })?;
-    let already_present = servers.iter().any(|server| {
-        server
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| name == "trail")
-    });
+    let already_present = servers
+        .iter()
+        .any(|existing| equivalent_trail_mcp_server(existing, &server));
     if !already_present {
         servers.push(server);
     }
     Ok(())
+}
+
+fn equivalent_trail_mcp_server(existing: &Value, expected: &Value) -> bool {
+    if existing.get("command") != expected.get("command")
+        || existing.get("args") != expected.get("args")
+    {
+        return false;
+    }
+    let Some(existing_env) = existing.get("env").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(expected_env) = expected.get("env").and_then(Value::as_array) else {
+        return false;
+    };
+    expected_env.iter().all(|expected_variable| {
+        let name = expected_variable.get("name");
+        let value = expected_variable.get("value");
+        existing_env.iter().any(|existing_variable| {
+            existing_variable.get("name") == name && existing_variable.get("value") == value
+        })
+    })
+}
+
+fn acp_path_mapping(mapping: PathMapping) -> AcpPathMapping {
+    AcpPathMapping {
+        original: mapping.original.to_string_lossy().to_string(),
+        effective: mapping.effective.to_string_lossy().to_string(),
+        isolated: mapping.isolated,
+    }
 }
 
 fn trail_mcp_server(options: &AcpRelayOptions) -> Value {
@@ -2153,6 +3709,9 @@ fn usage_number_field(update: &Map<String, Value>, keys: &[&str]) -> Option<u64>
 }
 
 fn prompt_status(message: &Value) -> &'static str {
+    if message.pointer("/error/code").and_then(Value::as_i64) == Some(-32800) {
+        return "cancelled";
+    }
     if message.get("error").is_some() {
         return "failed";
     }
@@ -2238,6 +3797,49 @@ fn prompt_text(prompt: Option<&Value>) -> String {
         "[non-text ACP prompt content]".to_string()
     } else {
         redact_text(&text)
+    }
+}
+
+fn bounded_prompt_content(prompt: Option<&Value>) -> Value {
+    let mut value = redact_json(prompt.cloned().unwrap_or(Value::Array(Vec::new())));
+    bound_binary_content(&mut value, None);
+    value
+}
+
+fn bound_binary_content(value: &mut Value, parent_type: Option<&str>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                bound_binary_content(item, parent_type);
+            }
+        }
+        Value::Object(object) => {
+            let content_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .or(parent_type)
+                .map(str::to_string);
+            for key in ["data", "blob"] {
+                let is_binary =
+                    key == "blob" || matches!(content_type.as_deref(), Some("image" | "audio"));
+                if is_binary {
+                    if let Some(encoded) = object.get(key).and_then(Value::as_str) {
+                        object.insert(
+                            key.to_string(),
+                            serde_json::json!({
+                                "encoding": "base64",
+                                "encoded_bytes": encoded.len(),
+                                "sha256": hex::encode(Sha256::digest(encoded.as_bytes()))
+                            }),
+                        );
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                bound_binary_content(child, content_type.as_deref());
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2369,8 +3971,8 @@ fn relative_path_from_cwd(path: &str, cwd: &std::path::Path) -> Option<String> {
     }
 }
 
-fn permission_options(value: Option<&Value>) -> HashMap<String, String> {
-    let mut options = HashMap::new();
+fn permission_options(value: Option<&Value>) -> BTreeMap<String, String> {
+    let mut options = BTreeMap::new();
     let Some(Value::Array(items)) = value else {
         return options;
     };
@@ -2388,7 +3990,7 @@ fn permission_options(value: Option<&Value>) -> HashMap<String, String> {
     options
 }
 
-fn permission_decision(message: &Value, options_by_id: &HashMap<String, String>) -> &'static str {
+fn permission_decision(message: &Value, options_by_id: &BTreeMap<String, String>) -> &'static str {
     let Some(outcome) = message
         .get("result")
         .and_then(|result| result.get("outcome"))
@@ -2492,8 +4094,46 @@ fn summarize_available_commands(update: &Map<String, Value>) -> Value {
     }))
 }
 
-fn ignore_session_update(update_kind: &str) -> bool {
-    update_kind == "agent_thought_chunk"
+fn session_update_projection(
+    variant: AcpV1SessionUpdateKind,
+    update_kind: &str,
+    update: &Map<String, Value>,
+) -> Value {
+    let mut structured = bounded_prompt_content(Some(&Value::Object(update.clone())));
+    let thought_content_excluded = variant == AcpV1SessionUpdateKind::AgentThoughtChunk;
+    if thought_content_excluded {
+        if let Some(object) = structured.as_object_mut() {
+            object.remove("content");
+        }
+    }
+    serde_json::json!({
+        "protocol": "acp",
+        "acpVariant": update_kind,
+        "stable": variant.is_stable(),
+        "thoughtContentExcluded": thought_content_excluded,
+        "update": structured
+    })
+}
+
+fn session_config_values(update: &Map<String, Value>) -> Map<String, Value> {
+    let Some(options) = update.get("configOptions").and_then(Value::as_array) else {
+        return Map::new();
+    };
+    session_config_values_from_options(options)
+}
+
+fn session_config_values_from_options(options: &[Value]) -> Map<String, Value> {
+    let mut values = Map::new();
+    for option in options {
+        let Some(id) = option.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = option.get("currentValue") else {
+            continue;
+        };
+        values.insert(id.to_string(), value.clone());
+    }
+    values
 }
 
 fn command_display_name(value: &Value) -> Option<String> {
@@ -2607,15 +4247,52 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn json_line_round_trips_single_message() {
-        let mut input =
-            BufReader::new(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.as_slice());
-        let value = read_json_line(&mut input).unwrap().unwrap();
-        assert_eq!(value["method"], "initialize");
+    fn raw_json_frame_preserves_a_single_message() {
+        let raw = br#" {"jsonrpc":"2.0","id":1,"method":"initialize"}
+"#
+        .to_vec();
+        let frame = Frame::parse(Direction::ClientToAgent, raw.clone()).unwrap();
+        assert_eq!(frame.value()["method"], "initialize");
+        assert_eq!(frame.forward_bytes(), raw);
+    }
 
-        let mut out = Vec::new();
-        write_json_line(&mut out, &value).unwrap();
-        assert!(std::str::from_utf8(&out).unwrap().ends_with('\n'));
+    #[test]
+    fn pending_registry_scopes_same_ids_by_direction_and_rejects_reuse() {
+        let options = AcpRelayOptions {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            db_dir: PathBuf::from("/tmp/workspace/.trail"),
+            lane: None,
+            from_ref: None,
+            provider: None,
+            model: None,
+            materialize: false,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["agent".to_string()],
+            upstream_env: BTreeMap::new(),
+        };
+        let mut coordinator = CaptureCoordinator::new(options).unwrap();
+        coordinator
+            .register_pending(
+                Direction::ClientToAgent,
+                "same-id".to_string(),
+                PendingOperation::Logout,
+            )
+            .unwrap();
+        coordinator
+            .register_pending(
+                Direction::AgentToClient,
+                "same-id".to_string(),
+                PendingOperation::Logout,
+            )
+            .unwrap();
+        assert!(coordinator
+            .register_pending(
+                Direction::ClientToAgent,
+                "same-id".to_string(),
+                PendingOperation::Logout,
+            )
+            .is_err());
     }
 
     #[test]
@@ -2750,10 +4427,43 @@ mod tests {
     }
 
     #[test]
-    fn agent_thought_chunks_are_not_captured() {
-        assert!(ignore_session_update("agent_thought_chunk"));
-        assert!(!ignore_session_update("agent_message_chunk"));
-        assert!(!ignore_session_update("tool_call"));
+    fn stable_session_update_inventory_matches_the_pinned_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/acp/v1/schema.json")).unwrap();
+        let pinned = schema["$defs"]["SessionUpdate"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|branch| {
+                branch["properties"]["sessionUpdate"]["const"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let implemented = AcpV1SessionUpdateKind::ALL
+            .iter()
+            .map(|variant| variant.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(implemented, pinned);
+    }
+
+    #[test]
+    fn thought_update_projection_excludes_content_but_preserves_metadata() {
+        let update = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "messageId": "thought-1",
+            "content": {"type": "text", "text": "private"},
+            "_meta": {"extension": "preserved"}
+        });
+        let projected = session_update_projection(
+            AcpV1SessionUpdateKind::AgentThoughtChunk,
+            "agent_thought_chunk",
+            update.as_object().unwrap(),
+        );
+        assert_eq!(projected["thoughtContentExcluded"], true);
+        assert!(projected["update"].get("content").is_none());
+        assert_eq!(projected["update"]["_meta"]["extension"], "preserved");
+        assert!(!projected.to_string().contains("private"));
     }
 
     #[test]

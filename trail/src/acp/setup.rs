@@ -263,7 +263,7 @@ fn application_state_dir() -> Result<PathBuf> {
         let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
             Error::InvalidInput("cannot resolve application state directory".to_string())
         })?;
-        return Ok(home.join("Library/Application Support"));
+        Ok(home.join("Library/Application Support"))
     }
     #[cfg(target_os = "windows")]
     {

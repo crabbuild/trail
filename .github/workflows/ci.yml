@@ -4,8 +4,31 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
 
 jobs:
+  acp-v1-reference-interop:
+    name: ACP v1 official-type interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Official ACP v1 peer interoperability
+        run: scripts/test-acp-v1-reference-interop.sh
+
+  acp-v1-schema-drift:
+    name: ACP v1 upstream schema drift
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare pinned ACP v1 artifacts with upstream
+        run: scripts/check-acp-v1-schema-drift.sh
+
   test:
     runs-on: ubuntu-latest
     steps:

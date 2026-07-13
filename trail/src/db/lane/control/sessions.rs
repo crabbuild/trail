@@ -2,6 +2,21 @@ use super::acp_sessions::lane_acp_session_row;
 use super::*;
 
 impl Trail {
+    pub fn update_lane_session_title(
+        &mut self,
+        session_id: &str,
+        title: Option<&str>,
+    ) -> Result<LaneSession> {
+        let _lock = self.acquire_write_lock()?;
+        validate_session_id(session_id)?;
+        self.lane_session(session_id)?;
+        self.conn.execute(
+            "UPDATE lane_sessions SET title = ?1 WHERE session_id = ?2",
+            params![title, session_id],
+        )?;
+        self.lane_session(session_id)
+    }
+
     pub fn start_lane_session(
         &mut self,
         lane: &str,
@@ -284,7 +299,7 @@ impl Trail {
 
     fn acp_session_for_session(&self, session_id: &str) -> Result<Option<LaneAcpSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+            "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, path_mappings_json, provider, model, upstream_command_json, status, created_at, updated_at, current_mode_id, config_options_json \
              FROM lane_acp_sessions WHERE trail_session_id = ?1 ORDER BY updated_at DESC, acp_session_id DESC LIMIT 1",
         )?;
         stmt.query_row(params![session_id], lane_acp_session_row)

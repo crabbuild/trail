@@ -145,6 +145,9 @@ impl Trail {
                  raw_object_id TEXT NOT NULL REFERENCES objects(object_id),
                  raw_artifact_id TEXT REFERENCES lane_artifacts(artifact_id),
                  receive_sequence INTEGER,
+                 connection_id TEXT,
+                 direction TEXT,
+                 connection_sequence INTEGER,
                  status TEXT NOT NULL,
                  attempt_count INTEGER NOT NULL DEFAULT 0,
                  next_attempt_at INTEGER,
@@ -297,6 +300,21 @@ impl Trail {
              CREATE INDEX IF NOT EXISTS git_agent_links_turn_idx
                  ON git_agent_links(turn_id, created_at);",
         )?;
+        ensure_column(&self.conn, "agent_hook_receipts", "connection_id", "TEXT")?;
+        ensure_column(&self.conn, "agent_hook_receipts", "direction", "TEXT")?;
+        ensure_column(
+            &self.conn,
+            "agent_hook_receipts",
+            "connection_sequence",
+            "INTEGER",
+        )?;
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_hook_receipts_connection_sequence_idx
+             ON agent_hook_receipts(connection_id, direction, connection_sequence)
+             WHERE connection_id IS NOT NULL
+               AND direction IS NOT NULL
+               AND connection_sequence IS NOT NULL;",
+        )?;
         Ok(())
     }
 }
@@ -340,6 +358,9 @@ pub(in crate::db::storage) fn agent_capture_schema_complete(conn: &Connection) -
         && receipt_columns.contains("raw_object_id")
         && receipt_columns.contains("attempt_count")
         && receipt_columns.contains("next_attempt_at")
+        && receipt_columns.contains("connection_id")
+        && receipt_columns.contains("direction")
+        && receipt_columns.contains("connection_sequence")
         && artifact_columns.contains("retention_status")
         && artifact_columns.contains("trust"))
 }

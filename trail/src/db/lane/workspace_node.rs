@@ -258,7 +258,7 @@ impl Trail {
             other => {
                 return Err(Error::InvalidInput(format!(
                     "unsupported Node package manager `{other}`"
-                )))
+                )));
             }
         }
         .into_iter()

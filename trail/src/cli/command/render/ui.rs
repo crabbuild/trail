@@ -1101,7 +1101,7 @@ impl<'a, W: Write> Renderer<'a, W> {
                     )
                 } else {
                     value.to_string()
-                }
+                };
             }
         };
         let style = if strong {

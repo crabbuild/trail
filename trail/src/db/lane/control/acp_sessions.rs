@@ -8,6 +8,7 @@ impl Trail {
         lane: &str,
         trail_session_id: &str,
         cwd: &str,
+        path_mappings: &[AcpPathMapping],
         provider: Option<&str>,
         model: Option<&str>,
         upstream_command_json: Option<&str>,
@@ -26,6 +27,7 @@ impl Trail {
             ));
         }
         let status = validate_acp_session_status(status)?;
+        let path_mappings_json = serde_json::to_string(path_mappings)?;
         let branch = self.lane_branch(lane)?;
         let session = self.lane_session(trail_session_id)?;
         if session.lane_id != branch.lane_id {
@@ -42,13 +44,14 @@ impl Trail {
             .unwrap_or(now);
         self.conn.execute(
             "INSERT INTO lane_acp_sessions \
-             (acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             (acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, path_mappings_json, provider, model, upstream_command_json, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT(acp_session_id) DO UPDATE SET \
                 upstream_session_id = excluded.upstream_session_id, \
                 lane_id = excluded.lane_id, \
                 trail_session_id = excluded.trail_session_id, \
                 cwd = excluded.cwd, \
+                path_mappings_json = excluded.path_mappings_json, \
                 provider = excluded.provider, \
                 model = excluded.model, \
                 upstream_command_json = excluded.upstream_command_json, \
@@ -60,6 +63,7 @@ impl Trail {
                 branch.lane_id,
                 trail_session_id,
                 cwd,
+                path_mappings_json,
                 provider,
                 model,
                 upstream_command_json,
@@ -100,6 +104,71 @@ impl Trail {
         self.lane_acp_session(acp_session_id)
     }
 
+    pub fn update_lane_acp_session_configuration(
+        &mut self,
+        acp_session_id: &str,
+        mode_id: Option<&str>,
+        config: Option<(&str, &serde_json::Value)>,
+    ) -> Result<LaneAcpSession> {
+        let _lock = self.acquire_write_lock()?;
+        let acp_session_id = validate_external_id("ACP session id", acp_session_id)?;
+        let existing = self.lane_acp_session(acp_session_id)?;
+        let mode_id = mode_id
+            .map(|value| validate_external_id("ACP mode id", value))
+            .transpose()?
+            .or(existing.current_mode_id.as_deref());
+        let mut config_options = existing
+            .config_options
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if let Some((config_id, value)) = config {
+            let config_id = validate_external_id("ACP config id", config_id)?;
+            config_options.insert(
+                config_id.to_string(),
+                crate::db::redact_sensitive_json(value.clone()),
+            );
+        }
+        self.conn.execute(
+            "UPDATE lane_acp_sessions
+             SET current_mode_id = ?1, config_options_json = ?2, updated_at = ?3
+             WHERE acp_session_id = ?4",
+            params![
+                mode_id,
+                serde_json::to_string(&config_options)?,
+                now_ts(),
+                acp_session_id
+            ],
+        )?;
+        self.lane_acp_session(acp_session_id)
+    }
+
+    pub fn replace_lane_acp_session_configuration_options(
+        &mut self,
+        acp_session_id: &str,
+        config_options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<LaneAcpSession> {
+        let _lock = self.acquire_write_lock()?;
+        let acp_session_id = validate_external_id("ACP session id", acp_session_id)?;
+        self.lane_acp_session(acp_session_id)?;
+        for config_id in config_options.keys() {
+            validate_external_id("ACP config id", config_id)?;
+        }
+        let config_options =
+            crate::db::redact_sensitive_json(serde_json::Value::Object(config_options.clone()));
+        self.conn.execute(
+            "UPDATE lane_acp_sessions
+             SET config_options_json = ?1, updated_at = ?2
+             WHERE acp_session_id = ?3",
+            params![
+                serde_json::to_string(&config_options)?,
+                now_ts(),
+                acp_session_id
+            ],
+        )?;
+        self.lane_acp_session(acp_session_id)
+    }
+
     pub fn lane_acp_session(&self, acp_session_id: &str) -> Result<LaneAcpSession> {
         self.try_lane_acp_session(acp_session_id)?
             .ok_or_else(|| Error::InvalidInput(format!("ACP session `{acp_session_id}` not found")))
@@ -109,14 +178,14 @@ impl Trail {
         let sessions = if let Some(lane) = lane {
             let branch = self.lane_branch(lane)?;
             let mut stmt = self.conn.prepare(
-                "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+                "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, path_mappings_json, provider, model, upstream_command_json, status, created_at, updated_at, current_mode_id, config_options_json \
                  FROM lane_acp_sessions WHERE lane_id = ?1 ORDER BY updated_at DESC, acp_session_id DESC",
             )?;
             let rows = stmt.query_map(params![branch.lane_id], lane_acp_session_row)?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+                "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, path_mappings_json, provider, model, upstream_command_json, status, created_at, updated_at, current_mode_id, config_options_json \
                  FROM lane_acp_sessions ORDER BY updated_at DESC, acp_session_id DESC",
             )?;
             let rows = stmt.query_map([], lane_acp_session_row)?;
@@ -129,7 +198,7 @@ impl Trail {
         let acp_session_id = validate_external_id("ACP session id", acp_session_id)?;
         self.conn
             .query_row(
-                "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, provider, model, upstream_command_json, status, created_at, updated_at \
+                "SELECT acp_session_id, upstream_session_id, lane_id, trail_session_id, cwd, path_mappings_json, provider, model, upstream_command_json, status, created_at, updated_at, current_mode_id, config_options_json \
                  FROM lane_acp_sessions WHERE acp_session_id = ?1",
                 params![acp_session_id],
                 lane_acp_session_row,
@@ -140,18 +209,29 @@ impl Trail {
 }
 
 pub(super) fn lane_acp_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneAcpSession> {
+    let path_mappings_json: String = row.get(5)?;
+    let path_mappings = serde_json::from_str(&path_mappings_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let config_options_json: String = row.get(13)?;
+    let config_options = serde_json::from_str(&config_options_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(LaneAcpSession {
         acp_session_id: row.get(0)?,
         upstream_session_id: row.get(1)?,
         lane_id: row.get(2)?,
         trail_session_id: row.get(3)?,
         cwd: row.get(4)?,
-        provider: row.get(5)?,
-        model: row.get(6)?,
-        upstream_command_json: row.get(7)?,
-        status: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        path_mappings,
+        provider: row.get(6)?,
+        model: row.get(7)?,
+        upstream_command_json: row.get(8)?,
+        status: row.get(9)?,
+        current_mode_id: row.get(12)?,
+        config_options,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -175,10 +255,67 @@ fn validate_acp_session_status(value: &str) -> Result<&'static str> {
         "loaded" => Ok("loaded"),
         "resumed" => Ok("resumed"),
         "closed" => Ok("closed"),
+        "deleted" => Ok("deleted"),
         "failed" => Ok("failed"),
         "cancelled" => Ok("cancelled"),
         other => Err(Error::InvalidInput(format!(
-            "ACP session status must be starting, active, loaded, resumed, closed, failed, or cancelled, got `{other}`"
+            "ACP session status must be starting, active, loaded, resumed, closed, deleted, failed, or cancelled, got `{other}`"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_mappings_round_trip_through_create_list_and_update() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("README.md"), "mapping fixture\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.spawn_lane("mapping", None, false, None, None).unwrap();
+        let session = db
+            .start_lane_session("mapping", Some("mapping".to_string()), None)
+            .unwrap()
+            .session;
+        let mappings = vec![
+            AcpPathMapping {
+                original: "/workspace/packages/app".to_string(),
+                effective: "/lane/packages/app".to_string(),
+                isolated: true,
+            },
+            AcpPathMapping {
+                original: "/external".to_string(),
+                effective: "/external".to_string(),
+                isolated: false,
+            },
+        ];
+
+        let created = db
+            .upsert_lane_acp_session(
+                "acp-mapping",
+                Some("upstream-mapping"),
+                "mapping",
+                &session.session_id,
+                "/lane/packages/app",
+                &mappings,
+                Some("test"),
+                None,
+                None,
+                "active",
+            )
+            .unwrap();
+        assert_eq!(created.path_mappings, mappings);
+        assert_eq!(
+            db.list_lane_acp_sessions(Some("mapping")).unwrap().sessions[0].path_mappings,
+            mappings
+        );
+        assert_eq!(
+            db.update_lane_acp_session_status("acp-mapping", "closed")
+                .unwrap()
+                .path_mappings,
+            mappings
+        );
     }
 }

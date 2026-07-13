@@ -25,6 +25,7 @@ flate2.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 ignore.workspace = true
+jsonschema.workspace = true
 libc.workspace = true
 notify.workspace = true
 prolly = { package = "prolly-map", path = "../prolly" }
@@ -77,4 +78,8 @@ workspace = true
 
 [[bench]]
 name = "sqlite_vector_memory_bench"
+harness = false
+
+[[bench]]
+name = "acp_relay_bench"
 harness = false
