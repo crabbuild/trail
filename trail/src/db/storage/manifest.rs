@@ -229,10 +229,9 @@ impl Trail {
         let disk_paths = disk_files
             .iter()
             .map(|file| file.path.clone())
-            .collect::<BTreeSet<_>>();
-        self.prune_worktree_index_for_selections(candidate_paths, &disk_paths)?;
+            .collect::<Vec<_>>();
         let disk_manifest = self.disk_manifest(&disk_files);
-        self.update_worktree_index_from_disk_files_and_manifest(&disk_files, &disk_manifest)?;
+        self.sync_selected_worktree_index(candidate_paths, &disk_paths, &disk_manifest)?;
         let summaries =
             self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths);
         let paths = summaries

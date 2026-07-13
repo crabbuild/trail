@@ -91,12 +91,13 @@ define_operation_metric_counters!(
     prolly_write_value_bytes,
     prolly_tree_batch_call_count,
     prolly_tree_batch_mutation_count,
-    sqlite_full_scan_count,
-    sqlite_row_read_count,
-    sqlite_row_delete_count,
-    sqlite_row_upsert_count,
-    sqlite_statement_count,
-    sqlite_transaction_count,
+    selected_worktree_index_sqlite_envelope_count,
+    selected_worktree_index_sqlite_full_scan_count,
+    selected_worktree_index_sqlite_row_read_count,
+    selected_worktree_index_sqlite_row_delete_count,
+    selected_worktree_index_sqlite_row_upsert_count,
+    selected_worktree_index_sqlite_statement_count,
+    selected_worktree_index_sqlite_transaction_count,
     selection_comparison_count,
     policy_build_count,
     policy_dependency_bytes,
@@ -149,16 +150,24 @@ pub(crate) struct OperationMetricsReport {
     pub(crate) prolly_write_value_bytes: u64,
     pub(crate) prolly_tree_batch_call_count: u64,
     pub(crate) prolly_tree_batch_mutation_count: u64,
-    /// False in Slice A: exact SQLite statement/row/full-scan accounting is
-    /// deliberately deferred to the indexed-pruning slice. Zero counters must
-    /// not be interpreted as proof of zero SQLite work until this is true.
-    pub(crate) sqlite_accounting_complete: bool,
-    pub(crate) sqlite_full_scan_count: u64,
-    pub(crate) sqlite_row_read_count: u64,
-    pub(crate) sqlite_row_delete_count: u64,
-    pub(crate) sqlite_row_upsert_count: u64,
-    pub(crate) sqlite_statement_count: u64,
-    pub(crate) sqlite_transaction_count: u64,
+    /// This completeness claim covers only the selected worktree-index sync
+    /// envelope. It does not claim that every SQLite statement issued by the
+    /// containing status/diff/record operation is instrumented.
+    pub(crate) selected_worktree_index_sqlite_accounting_complete: bool,
+    pub(crate) selected_worktree_index_sqlite_envelope_count: u64,
+    /// Executions for which SQLite reported at least one FULLSCAN_STEP.
+    pub(crate) selected_worktree_index_sqlite_full_scan_count: u64,
+    /// Worktree-index rows decoded by exact/descendant candidate queries.
+    /// The schema_meta baseline row is deliberately excluded.
+    pub(crate) selected_worktree_index_sqlite_row_read_count: u64,
+    /// Worktree-index row mutations made durable by a successful COMMIT.
+    pub(crate) selected_worktree_index_sqlite_row_delete_count: u64,
+    pub(crate) selected_worktree_index_sqlite_row_upsert_count: u64,
+    /// Attempted SQL executions, including transaction control and failed
+    /// mutation/COMMIT/ROLLBACK attempts.
+    pub(crate) selected_worktree_index_sqlite_statement_count: u64,
+    /// Selected-sync transactions whose BEGIN IMMEDIATE succeeded.
+    pub(crate) selected_worktree_index_sqlite_transaction_count: u64,
     pub(crate) selection_comparison_count: u64,
     pub(crate) policy_build_count: u64,
     pub(crate) policy_dependency_bytes: u64,
@@ -491,13 +500,23 @@ impl OperationMetricsReport {
             prolly_write_value_bytes: delta.prolly_write_value_bytes,
             prolly_tree_batch_call_count: delta.prolly_tree_batch_call_count,
             prolly_tree_batch_mutation_count: delta.prolly_tree_batch_mutation_count,
-            sqlite_accounting_complete: false,
-            sqlite_full_scan_count: delta.sqlite_full_scan_count,
-            sqlite_row_read_count: delta.sqlite_row_read_count,
-            sqlite_row_delete_count: delta.sqlite_row_delete_count,
-            sqlite_row_upsert_count: delta.sqlite_row_upsert_count,
-            sqlite_statement_count: delta.sqlite_statement_count,
-            sqlite_transaction_count: delta.sqlite_transaction_count,
+            selected_worktree_index_sqlite_accounting_complete: delta
+                .selected_worktree_index_sqlite_envelope_count
+                > 0,
+            selected_worktree_index_sqlite_envelope_count: delta
+                .selected_worktree_index_sqlite_envelope_count,
+            selected_worktree_index_sqlite_full_scan_count: delta
+                .selected_worktree_index_sqlite_full_scan_count,
+            selected_worktree_index_sqlite_row_read_count: delta
+                .selected_worktree_index_sqlite_row_read_count,
+            selected_worktree_index_sqlite_row_delete_count: delta
+                .selected_worktree_index_sqlite_row_delete_count,
+            selected_worktree_index_sqlite_row_upsert_count: delta
+                .selected_worktree_index_sqlite_row_upsert_count,
+            selected_worktree_index_sqlite_statement_count: delta
+                .selected_worktree_index_sqlite_statement_count,
+            selected_worktree_index_sqlite_transaction_count: delta
+                .selected_worktree_index_sqlite_transaction_count,
             selection_comparison_count: delta.selection_comparison_count,
             policy_build_count: delta.policy_build_count,
             policy_dependency_bytes: delta.policy_dependency_bytes,

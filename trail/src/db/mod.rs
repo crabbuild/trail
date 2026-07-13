@@ -1345,12 +1345,13 @@ mod tests {
                     root_point_key_count: 16,
                     prolly_tree_batch_call_count: 17,
                     prolly_tree_batch_mutation_count: 18,
-                    sqlite_full_scan_count: 19,
-                    sqlite_row_read_count: 20,
-                    sqlite_row_delete_count: 21,
-                    sqlite_row_upsert_count: 22,
-                    sqlite_statement_count: 23,
-                    sqlite_transaction_count: 24,
+                    selected_worktree_index_sqlite_envelope_count: 1,
+                    selected_worktree_index_sqlite_full_scan_count: 19,
+                    selected_worktree_index_sqlite_row_read_count: 20,
+                    selected_worktree_index_sqlite_row_delete_count: 21,
+                    selected_worktree_index_sqlite_row_upsert_count: 22,
+                    selected_worktree_index_sqlite_statement_count: 23,
+                    selected_worktree_index_sqlite_transaction_count: 24,
                     selection_comparison_count: 25,
                     policy_build_count: 26,
                     policy_dependency_bytes: 27,
@@ -1391,13 +1392,14 @@ mod tests {
         assert_eq!(report.root_point_key_count, 16);
         assert_eq!(report.prolly_tree_batch_call_count, 17);
         assert_eq!(report.prolly_tree_batch_mutation_count, 18);
-        assert!(!report.sqlite_accounting_complete);
-        assert_eq!(report.sqlite_full_scan_count, 19);
-        assert_eq!(report.sqlite_row_read_count, 20);
-        assert_eq!(report.sqlite_row_delete_count, 21);
-        assert_eq!(report.sqlite_row_upsert_count, 22);
-        assert_eq!(report.sqlite_statement_count, 23);
-        assert_eq!(report.sqlite_transaction_count, 24);
+        assert!(report.selected_worktree_index_sqlite_accounting_complete);
+        assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 1);
+        assert_eq!(report.selected_worktree_index_sqlite_full_scan_count, 19);
+        assert_eq!(report.selected_worktree_index_sqlite_row_read_count, 20);
+        assert_eq!(report.selected_worktree_index_sqlite_row_delete_count, 21);
+        assert_eq!(report.selected_worktree_index_sqlite_row_upsert_count, 22);
+        assert_eq!(report.selected_worktree_index_sqlite_statement_count, 23);
+        assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 24);
         assert_eq!(report.selection_comparison_count, 25);
         assert_eq!(report.policy_build_count, 26);
         assert_eq!(report.policy_dependency_bytes, 27);
