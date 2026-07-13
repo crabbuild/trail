@@ -708,7 +708,8 @@ pub(crate) fn capture_frame(
 }
 
 fn bounded_redacted_message(message: &Value) -> Value {
-    let redacted = super::redact_json(message.clone());
+    let mut redacted = super::redact_json(message.clone());
+    redact_callback_secrets(&mut redacted);
     let bytes = serde_json::to_vec(&redacted).unwrap_or_default();
     if bytes.len() <= CAPTURE_MESSAGE_LIMIT {
         return redacted;
@@ -721,6 +722,48 @@ fn bounded_redacted_message(message: &Value) -> Value {
         "bytes": bytes.len(),
         "sha256": hex::encode(Sha256::digest(bytes))
     })
+}
+
+fn redact_callback_secrets(message: &mut Value) {
+    match message.get("method").and_then(Value::as_str) {
+        Some("fs/write_text_file") => {
+            let Some(content) = message
+                .pointer("/params/content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            let redacted = crate::db::redact_sensitive_text(&content);
+            if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
+                params.insert(
+                    "content".to_string(),
+                    serde_json::json!({
+                        "redacted": true,
+                        "byte_len": content.len(),
+                        "sha256": hex::encode(Sha256::digest(redacted.as_bytes()))
+                    }),
+                );
+            }
+        }
+        Some("terminal/create") => {
+            let Some(env) = message
+                .pointer_mut("/params/env")
+                .and_then(Value::as_array_mut)
+            else {
+                return;
+            };
+            for variable in env {
+                if let Some(variable) = variable.as_object_mut() {
+                    if variable.contains_key("value") {
+                        variable
+                            .insert("value".to_string(), Value::String("[REDACTED]".to_string()));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn direction_name(direction: Direction) -> &'static str {
@@ -750,6 +793,35 @@ mod tests {
     use super::*;
     use crate::acp::AcpRelayOptions;
     use crate::InitImportMode;
+
+    #[test]
+    fn callback_receipts_replace_file_content_and_terminal_environment_values() {
+        let write = bounded_redacted_message(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "fs/write_text_file",
+            "params": {
+                "sessionId": "s",
+                "path": "/repo/a.txt",
+                "content": "api_key=super-secret"
+            }
+        }));
+        assert_eq!(write["params"]["content"]["redacted"], true);
+        assert!(!write.to_string().contains("super-secret"));
+
+        let terminal = bounded_redacted_message(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "terminal",
+            "method": "terminal/create",
+            "params": {
+                "sessionId": "s",
+                "command": "echo",
+                "env": [{"name": "API_TOKEN", "value": "opaque-secret"}]
+            }
+        }));
+        assert_eq!(terminal["params"]["env"][0]["value"], "[REDACTED]");
+        assert!(!terminal.to_string().contains("opaque-secret"));
+    }
 
     #[test]
     fn queue_overflow_spills_every_frame_and_shutdown_is_bounded() {

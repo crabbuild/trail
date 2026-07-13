@@ -31,6 +31,7 @@ use transport::{FrameObserver, RelayFinishReason, StdioRelay};
 pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
 
 const ACP_CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(30);
+const ACP_CALLBACK_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const CLAUDE_ACP_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@latest";
 const CODEX_ACP_ADAPTER: &str = "@agentclientprotocol/codex-acp@latest";
 const ACP_MAX_PENDING_EVENTS_PER_TURN: usize = 128;
@@ -368,6 +369,7 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
         ingress,
         connection_id,
         connection_sequence: AtomicU64::new(0),
+        finish_reason: Mutex::new(None),
     });
     StdioRelay::new(observer).run(&options)
 }
@@ -378,6 +380,7 @@ struct CaptureObserver {
     ingress: CaptureIngress,
     connection_id: String,
     connection_sequence: AtomicU64,
+    finish_reason: Mutex<Option<RelayFinishReason>>,
 }
 
 impl FrameObserver for CaptureObserver {
@@ -422,14 +425,20 @@ impl FrameObserver for CaptureObserver {
                 .lock()
                 .map(|coordinator| coordinator.is_pending_session_response(frame.value()))
                 .unwrap_or(false);
-        let inline_semantic = inline_session_request || inline_session_response;
+        let inline_client_callback = frame.direction() == Direction::AgentToClient
+            && frame.method().is_some_and(is_client_callback_method);
+        let inline_semantic =
+            inline_session_request || inline_session_response || inline_client_callback;
         if inline_semantic {
             let mut candidate = frame.value().clone();
             let captured = capture_step(&self.coordinator, |capture| match frame.direction() {
                 Direction::ClientToAgent => capture.before_client_message(&mut candidate),
                 Direction::AgentToClient => capture.before_agent_message(&mut candidate),
             });
-            if inline_session_request && captured && candidate != *frame.value() {
+            if (inline_session_request || inline_client_callback)
+                && captured
+                && candidate != *frame.value()
+            {
                 if let Err(error) = self
                     .pipeline
                     .lock()
@@ -452,11 +461,25 @@ impl FrameObserver for CaptureObserver {
     }
 
     fn finish(&self, reason: RelayFinishReason) {
+        if let Ok(mut finish_reason) = self.finish_reason.lock() {
+            *finish_reason = Some(reason.clone());
+        }
         self.ingress.finish(reason);
     }
 
     fn flush(&self, timeout: Duration) {
-        self.ingress.flush(timeout);
+        self.ingress
+            .flush(timeout.max(ACP_CALLBACK_CAPTURE_FLUSH_TIMEOUT));
+        let reason = self
+            .finish_reason
+            .lock()
+            .ok()
+            .and_then(|mut reason| reason.take());
+        if let Some(reason) = reason {
+            capture_step(&self.coordinator, |capture| {
+                capture.capture_callback_shutdown(&reason)
+            });
+        }
     }
 }
 
@@ -740,8 +763,86 @@ impl ActiveTurn {
 #[derive(Clone, Debug)]
 struct PendingPermission {
     approval_id: Option<String>,
-    options_by_id: HashMap<String, String>,
+    options_by_id: BTreeMap<String, String>,
     acp_session_id: String,
+}
+
+#[derive(Clone, Debug)]
+enum ClientCallbackOperation {
+    Permission(PendingPermission),
+    ReadFile {
+        acp_session_id: String,
+        effective_path: String,
+        forwarded_path: String,
+        line: Option<u64>,
+        limit: Option<u64>,
+    },
+    WriteFile {
+        acp_session_id: String,
+        effective_path: String,
+        forwarded_path: String,
+        content_sha256: String,
+        byte_len: u64,
+        redacted_content: Vec<u8>,
+    },
+    TerminalCreate {
+        acp_session_id: String,
+        command: Vec<String>,
+        effective_cwd: Option<String>,
+        forwarded_cwd: Option<String>,
+        output_byte_limit: Option<u64>,
+        env_names: Vec<String>,
+    },
+    TerminalOutput {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+    TerminalWait {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+    TerminalKill {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+    TerminalRelease {
+        acp_session_id: String,
+        terminal_id: String,
+    },
+}
+
+impl ClientCallbackOperation {
+    fn acp_session_id(&self) -> &str {
+        match self {
+            Self::Permission(permission) => &permission.acp_session_id,
+            Self::ReadFile { acp_session_id, .. }
+            | Self::WriteFile { acp_session_id, .. }
+            | Self::TerminalCreate { acp_session_id, .. }
+            | Self::TerminalOutput { acp_session_id, .. }
+            | Self::TerminalWait { acp_session_id, .. }
+            | Self::TerminalKill { acp_session_id, .. }
+            | Self::TerminalRelease { acp_session_id, .. } => acp_session_id,
+        }
+    }
+
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Permission(_) => "session/request_permission",
+            Self::ReadFile { .. } => "fs/read_text_file",
+            Self::WriteFile { .. } => "fs/write_text_file",
+            Self::TerminalCreate { .. } => "terminal/create",
+            Self::TerminalOutput { .. } => "terminal/output",
+            Self::TerminalWait { .. } => "terminal/wait_for_exit",
+            Self::TerminalKill { .. } => "terminal/kill",
+            Self::TerminalRelease { .. } => "terminal/release",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CapturedTerminal {
+    acp_session_id: String,
+    state: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -771,7 +872,7 @@ enum PendingOperation {
     Close {
         acp_session_id: String,
     },
-    Permission(PendingPermission),
+    ClientCallback(ClientCallbackOperation),
     Initialize {
         requested_version: Value,
     },
@@ -876,6 +977,7 @@ struct CaptureCoordinator {
     cancelled_requests: HashSet<(Direction, String)>,
     sessions_by_acp: HashMap<String, SessionState>,
     active_turns: HashMap<String, ActiveTurn>,
+    terminals: HashMap<String, CapturedTerminal>,
     upstream_command_json: Option<String>,
 }
 
@@ -891,6 +993,7 @@ impl CaptureCoordinator {
             cancelled_requests: HashSet::new(),
             sessions_by_acp: HashMap::new(),
             active_turns: HashMap::new(),
+            terminals: HashMap::new(),
             upstream_command_json,
         })
     }
@@ -1078,6 +1181,15 @@ impl CaptureCoordinator {
         match method_name(message) {
             Some("session/update") => self.capture_session_update(message)?,
             Some("session/request_permission") => self.capture_permission_request(message)?,
+            Some(
+                "fs/read_text_file"
+                | "fs/write_text_file"
+                | "terminal/create"
+                | "terminal/output"
+                | "terminal/wait_for_exit"
+                | "terminal/kill"
+                | "terminal/release",
+            ) => self.capture_client_callback_request(message)?,
             Some("$/cancel_request") => {
                 self.capture_rpc_cancel(message, Direction::AgentToClient)?;
             }
@@ -1090,37 +1202,14 @@ impl CaptureCoordinator {
         let Some(id) = rpc_id_key(message) else {
             return Ok(());
         };
-        let key = (Direction::AgentToClient, id);
+        let key = (Direction::AgentToClient, id.clone());
         let was_cancelled = self.cancelled_requests.remove(&key);
-        let Some(PendingOperation::Permission(permission)) = self.pending_operations.remove(&key)
+        let Some(PendingOperation::ClientCallback(operation)) =
+            self.pending_operations.remove(&key)
         else {
             return Ok(());
         };
-        let Some(approval_id) = permission.approval_id else {
-            return Ok(());
-        };
-        let decision = permission_decision(message, &permission.options_by_id);
-        let mut db = self.open_db()?;
-        db.decide_lane_approval(
-            &approval_id,
-            decision,
-            Some("acp-editor".to_string()),
-            Some("mirrored from ACP permission response".to_string()),
-        )?;
-        if let Ok(session) = self.resolve_session_state(&permission.acp_session_id) {
-            db.add_lane_session_event(
-                &session.lane_name,
-                &session.trail_session_id,
-                "acp_permission_finished",
-                Some(redact_json(serde_json::json!({
-                    "protocol": "acp",
-                    "acp_session_id": permission.acp_session_id,
-                    "decision": decision,
-                    "cancel_requested": was_cancelled
-                }))),
-            )?;
-        }
-        Ok(())
+        self.finish_client_callback(message, &id, operation, was_cancelled)
     }
 
     fn capture_agent_response(&mut self, message: &mut Value) -> Result<()> {
@@ -1184,7 +1273,7 @@ impl CaptureCoordinator {
                 Some((&config_id, &value)),
                 was_cancelled,
             ),
-            PendingOperation::Permission(_) => Ok(()),
+            PendingOperation::ClientCallback(_) => Ok(()),
         }
     }
 
@@ -2026,6 +2115,386 @@ impl CaptureCoordinator {
         Ok(())
     }
 
+    fn capture_client_callback_request(&mut self, message: &mut Value) -> Result<()> {
+        let id = rpc_id_key(message).ok_or_else(|| {
+            Error::InvalidInput("ACP client callback request missing id".to_string())
+        })?;
+        let method = method_name(message)
+            .ok_or_else(|| Error::InvalidInput("ACP client callback missing method".to_string()))?
+            .to_string();
+        let params = params_object_mut(message)?;
+        let acp_session_id = required_string(params, "sessionId", &method)?;
+        let session = self.resolve_session_state(&acp_session_id)?;
+        let operation = match method.as_str() {
+            "fs/read_text_file" => {
+                let effective_path = required_string(params, "path", &method)?;
+                let forwarded_path = reverse_callback_path(&session, &effective_path);
+                params.insert("path".to_string(), Value::String(forwarded_path.clone()));
+                ClientCallbackOperation::ReadFile {
+                    acp_session_id,
+                    effective_path,
+                    forwarded_path,
+                    line: params.get("line").and_then(Value::as_u64),
+                    limit: params.get("limit").and_then(Value::as_u64),
+                }
+            }
+            "fs/write_text_file" => {
+                let effective_path = required_string(params, "path", &method)?;
+                let forwarded_path = reverse_callback_path(&session, &effective_path);
+                let content = params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("ACP fs/write_text_file missing content".to_string())
+                    })?;
+                let redacted_content = crate::db::redact_sensitive_text(content);
+                let redacted_bytes = redacted_content.into_bytes();
+                let content_sha256 = hex::encode(Sha256::digest(&redacted_bytes));
+                let byte_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
+                params.insert("path".to_string(), Value::String(forwarded_path.clone()));
+                ClientCallbackOperation::WriteFile {
+                    acp_session_id,
+                    effective_path,
+                    forwarded_path,
+                    content_sha256,
+                    byte_len,
+                    redacted_content: redacted_bytes,
+                }
+            }
+            "terminal/create" => {
+                let command = required_string(params, "command", &method)?;
+                let mut command_line = vec![command];
+                command_line.extend(
+                    params
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string),
+                );
+                let effective_cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let forwarded_cwd = effective_cwd
+                    .as_deref()
+                    .map(|cwd| reverse_callback_path(&session, cwd));
+                if let Some(cwd) = forwarded_cwd.as_ref() {
+                    params.insert("cwd".to_string(), Value::String(cwd.clone()));
+                }
+                ClientCallbackOperation::TerminalCreate {
+                    acp_session_id,
+                    command: redact_command(&command_line),
+                    effective_cwd,
+                    forwarded_cwd,
+                    output_byte_limit: params.get("outputByteLimit").and_then(Value::as_u64),
+                    env_names: params
+                        .get("env")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|variable| variable.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect(),
+                }
+            }
+            "terminal/output" | "terminal/wait_for_exit" | "terminal/kill" | "terminal/release" => {
+                let terminal_id = required_string(params, "terminalId", &method)?;
+                match method.as_str() {
+                    "terminal/output" => ClientCallbackOperation::TerminalOutput {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                    "terminal/wait_for_exit" => ClientCallbackOperation::TerminalWait {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                    "terminal/kill" => ClientCallbackOperation::TerminalKill {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                    _ => ClientCallbackOperation::TerminalRelease {
+                        acp_session_id,
+                        terminal_id,
+                    },
+                }
+            }
+            _ => return Ok(()),
+        };
+        self.register_pending(
+            Direction::AgentToClient,
+            id,
+            PendingOperation::ClientCallback(operation),
+        )?;
+        Ok(())
+    }
+
+    fn finish_client_callback(
+        &mut self,
+        message: &Value,
+        request_id: &str,
+        operation: ClientCallbackOperation,
+        cancel_requested: bool,
+    ) -> Result<()> {
+        let acp_session_id = operation.acp_session_id().to_string();
+        self.capture_callback_event(
+            &acp_session_id,
+            "acp_client_callback_requested",
+            client_callback_request_payload(&operation, request_id),
+        )?;
+        let success = message.get("error").is_none();
+        let mut result_summary = Value::Null;
+        let mut artifact_id = None;
+        match &operation {
+            ClientCallbackOperation::Permission(permission) => {
+                let has_outcome = message.pointer("/result/outcome").is_some();
+                let decision = if has_outcome {
+                    permission_decision(message, &permission.options_by_id)
+                } else {
+                    "error"
+                };
+                result_summary = serde_json::json!({"decision": decision});
+                if has_outcome {
+                    if let Some(approval_id) = permission.approval_id.as_deref() {
+                        self.open_db()?.decide_lane_approval(
+                            approval_id,
+                            decision,
+                            Some("acp-editor".to_string()),
+                            Some("mirrored from ACP permission response".to_string()),
+                        )?;
+                    }
+                }
+                self.capture_callback_event(
+                    &acp_session_id,
+                    "acp_permission_finished",
+                    serde_json::json!({
+                        "protocol": "acp",
+                        "acp_session_id": acp_session_id,
+                        "decision": decision,
+                        "cancel_requested": cancel_requested
+                    }),
+                )?;
+            }
+            ClientCallbackOperation::ReadFile { .. } => {
+                if let Some(content) = message.pointer("/result/content").and_then(Value::as_str) {
+                    let redacted = crate::db::redact_sensitive_text(content);
+                    result_summary = serde_json::json!({
+                        "byte_len": content.len(),
+                        "sha256": hex::encode(Sha256::digest(redacted.as_bytes()))
+                    });
+                }
+            }
+            ClientCallbackOperation::WriteFile {
+                effective_path,
+                forwarded_path,
+                byte_len,
+                redacted_content,
+                ..
+            } => {
+                let session = self.resolve_session_state(&acp_session_id)?;
+                let active_turn_id = self
+                    .active_turns
+                    .get(&acp_session_id)
+                    .map(|active| active.turn_id.clone());
+                let artifact = self.open_db()?.record_lane_artifact(LaneArtifactInput {
+                    lane: session.lane_name,
+                    session_id: session.trail_session_id,
+                    turn_id: active_turn_id,
+                    provider: self
+                        .options
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "acp-agent".to_string()),
+                    artifact_kind: "acp_fs_write".to_string(),
+                    format: "text".to_string(),
+                    source: AgentEvidenceSource::Acp,
+                    source_locator_redacted: Some(forwarded_path.clone()),
+                    content: redacted_content.clone(),
+                    start_offset: None,
+                    end_offset: Some(u64::try_from(redacted_content.len()).unwrap_or(u64::MAX)),
+                    redaction_profile: Some("trail-sensitive-text-v1".to_string()),
+                    trust: "protocol".to_string(),
+                    supersedes_artifact_id: None,
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "protocol": "acp",
+                            "effective_path": effective_path,
+                            "forwarded_path": forwarded_path,
+                            "requested_byte_len": byte_len
+                        })
+                        .to_string(),
+                    ),
+                })?;
+                artifact_id = Some(artifact.artifact_id);
+                result_summary = serde_json::json!({"written": success});
+            }
+            ClientCallbackOperation::TerminalCreate { .. } if success => {
+                if let Some(terminal_id) = message
+                    .pointer("/result/terminalId")
+                    .and_then(Value::as_str)
+                {
+                    self.terminals.insert(
+                        terminal_id.to_string(),
+                        CapturedTerminal {
+                            acp_session_id: acp_session_id.clone(),
+                            state: "running".to_string(),
+                        },
+                    );
+                    result_summary = serde_json::json!({
+                        "terminal_id": terminal_id,
+                        "state": "running"
+                    });
+                }
+            }
+            ClientCallbackOperation::TerminalOutput { terminal_id, .. } => {
+                let output = message
+                    .pointer("/result/output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let redacted = crate::db::redact_sensitive_text(output);
+                let exit_status = message.pointer("/result/exitStatus").cloned();
+                if success {
+                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                        terminal.state =
+                            if exit_status.as_ref().is_some_and(|value| !value.is_null()) {
+                                "exited".to_string()
+                            } else {
+                                "running".to_string()
+                            };
+                    }
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "output_byte_len": output.len(),
+                    "output_sha256": hex::encode(Sha256::digest(redacted.as_bytes())),
+                    "truncated": message.pointer("/result/truncated"),
+                    "exit_status": exit_status
+                });
+            }
+            ClientCallbackOperation::TerminalWait { terminal_id, .. } => {
+                if success {
+                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                        terminal.state = "exited".to_string();
+                    }
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "exit_code": message.pointer("/result/exitCode"),
+                    "signal": message.pointer("/result/signal"),
+                    "state": success.then_some("exited")
+                });
+            }
+            ClientCallbackOperation::TerminalKill { terminal_id, .. } => {
+                if success {
+                    if let Some(terminal) = self.terminals.get_mut(terminal_id) {
+                        terminal.state = "killed".to_string();
+                    }
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "state": success.then_some("killed")
+                });
+            }
+            ClientCallbackOperation::TerminalRelease { terminal_id, .. } => {
+                if success {
+                    self.terminals.remove(terminal_id);
+                }
+                result_summary = serde_json::json!({
+                    "terminal_id": terminal_id,
+                    "state": success.then_some("released")
+                });
+            }
+            _ => {}
+        }
+        self.capture_callback_event(
+            &acp_session_id,
+            "acp_client_callback_finished",
+            serde_json::json!({
+                "protocol": "acp",
+                "method": operation.method(),
+                "request_id": rpc_id_value(request_id),
+                "success": success,
+                "cancel_requested": cancel_requested,
+                "result": result_summary,
+                "error": message.get("error"),
+                "artifact_id": artifact_id
+            }),
+        )
+    }
+
+    fn capture_callback_shutdown(&mut self, reason: &RelayFinishReason) -> Result<()> {
+        let pending = self
+            .pending_operations
+            .iter()
+            .filter_map(|((direction, request_id), operation)| {
+                if *direction != Direction::AgentToClient {
+                    return None;
+                }
+                let PendingOperation::ClientCallback(callback) = operation else {
+                    return None;
+                };
+                Some((request_id.clone(), callback.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (request_id, callback) in pending {
+            self.pending_operations
+                .remove(&(Direction::AgentToClient, request_id.clone()));
+            self.finish_client_callback(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": serde_json::from_str::<Value>(&request_id).unwrap_or(Value::Null),
+                    "error": {
+                        "code": -32099,
+                        "message": "relay shutdown with callback in flight",
+                        "data": {"finish_reason": format!("{reason:?}")}
+                    }
+                }),
+                &request_id,
+                callback,
+                false,
+            )?;
+        }
+        let terminals = self.terminals.drain().collect::<Vec<_>>();
+        for (terminal_id, terminal) in terminals {
+            self.capture_callback_event(
+                &terminal.acp_session_id,
+                "acp_terminal_abandoned",
+                serde_json::json!({
+                    "protocol": "acp",
+                    "terminal_id": terminal_id,
+                    "state": terminal.state,
+                    "finish_reason": format!("{reason:?}")
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_callback_event(
+        &mut self,
+        acp_session_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<()> {
+        if let Some(mut active) = self.active_turns.remove(acp_session_id) {
+            self.flush_turn_events(&mut active)?;
+            self.flush_assistant_messages(&mut active, "before_client_callback")?;
+            active.push_event(event_type, Some(redact_json(payload)));
+            self.flush_turn_events(&mut active)?;
+            self.active_turns.insert(acp_session_id.to_string(), active);
+            return Ok(());
+        }
+        let session = self.resolve_session_state(acp_session_id)?;
+        self.open_db()?.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            event_type,
+            Some(redact_json(payload)),
+        )?;
+        Ok(())
+    }
+
     fn flush_turn_events(&self, active: &mut ActiveTurn) -> Result<()> {
         if active.pending_events.is_empty() {
             return Ok(());
@@ -2150,11 +2619,13 @@ impl CaptureCoordinator {
         self.register_pending(
             Direction::AgentToClient,
             id,
-            PendingOperation::Permission(PendingPermission {
-                approval_id,
-                options_by_id,
-                acp_session_id: acp_session_id.to_string(),
-            }),
+            PendingOperation::ClientCallback(ClientCallbackOperation::Permission(
+                PendingPermission {
+                    approval_id,
+                    options_by_id,
+                    acp_session_id: acp_session_id.to_string(),
+                },
+            )),
         )?;
         Ok(())
     }
@@ -2199,7 +2670,9 @@ impl CaptureCoordinator {
             | Some(PendingOperation::SessionDelete { acp_session_id })
             | Some(PendingOperation::SetMode { acp_session_id, .. })
             | Some(PendingOperation::SetConfig { acp_session_id, .. }) => Some(acp_session_id),
-            Some(PendingOperation::Permission(permission)) => Some(permission.acp_session_id),
+            Some(PendingOperation::ClientCallback(operation)) => {
+                Some(operation.acp_session_id().to_string())
+            }
             _ => None,
         };
         let payload = redact_json(serde_json::json!({
@@ -2746,6 +3219,107 @@ fn method_name(message: &Value) -> Option<&str> {
     message.get("method").and_then(Value::as_str)
 }
 
+fn is_client_callback_method(method: &str) -> bool {
+    matches!(
+        method,
+        "session/request_permission"
+            | "fs/read_text_file"
+            | "fs/write_text_file"
+            | "terminal/create"
+            | "terminal/output"
+            | "terminal/wait_for_exit"
+            | "terminal/kill"
+            | "terminal/release"
+    )
+}
+
+fn reverse_callback_path(session: &SessionState, effective_path: &str) -> String {
+    let path = PathBuf::from(effective_path);
+    let mapping = session
+        .path_mappings
+        .iter()
+        .filter_map(|mapping| {
+            path.strip_prefix(PathBuf::from(&mapping.effective))
+                .ok()
+                .map(|suffix| (mapping, suffix.to_path_buf()))
+        })
+        .max_by_key(|(mapping, _)| PathBuf::from(&mapping.effective).components().count());
+    let Some((mapping, suffix)) = mapping else {
+        return effective_path.to_string();
+    };
+    if suffix.as_os_str().is_empty() {
+        return mapping.original.clone();
+    }
+    PathBuf::from(&mapping.original)
+        .join(suffix)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn client_callback_request_payload(operation: &ClientCallbackOperation, request_id: &str) -> Value {
+    let details = match operation {
+        ClientCallbackOperation::Permission(permission) => serde_json::json!({
+            "option_kinds": permission.options_by_id,
+            "approval_id": permission.approval_id
+        }),
+        ClientCallbackOperation::ReadFile {
+            effective_path,
+            forwarded_path,
+            line,
+            limit,
+            ..
+        } => serde_json::json!({
+            "effective_path": effective_path,
+            "forwarded_path": forwarded_path,
+            "line": line,
+            "limit": limit
+        }),
+        ClientCallbackOperation::WriteFile {
+            effective_path,
+            forwarded_path,
+            content_sha256,
+            byte_len,
+            ..
+        } => serde_json::json!({
+            "effective_path": effective_path,
+            "forwarded_path": forwarded_path,
+            "content_sha256": content_sha256,
+            "byte_len": byte_len
+        }),
+        ClientCallbackOperation::TerminalCreate {
+            command,
+            effective_cwd,
+            forwarded_cwd,
+            output_byte_limit,
+            env_names,
+            ..
+        } => serde_json::json!({
+            "command": command,
+            "effective_cwd": effective_cwd,
+            "forwarded_cwd": forwarded_cwd,
+            "output_byte_limit": output_byte_limit,
+            "env_names": env_names
+        }),
+        ClientCallbackOperation::TerminalOutput { terminal_id, .. }
+        | ClientCallbackOperation::TerminalWait { terminal_id, .. }
+        | ClientCallbackOperation::TerminalKill { terminal_id, .. }
+        | ClientCallbackOperation::TerminalRelease { terminal_id, .. } => {
+            serde_json::json!({"terminal_id": terminal_id})
+        }
+    };
+    serde_json::json!({
+        "protocol": "acp",
+        "method": operation.method(),
+        "request_id": rpc_id_value(request_id),
+        "acp_session_id": operation.acp_session_id(),
+        "details": details
+    })
+}
+
+fn rpc_id_value(serialized_id: &str) -> Value {
+    serde_json::from_str(serialized_id).unwrap_or_else(|_| Value::String(serialized_id.to_string()))
+}
+
 fn rpc_id_key(message: &Value) -> Option<String> {
     message
         .get("id")
@@ -3123,8 +3697,8 @@ fn relative_path_from_cwd(path: &str, cwd: &std::path::Path) -> Option<String> {
     }
 }
 
-fn permission_options(value: Option<&Value>) -> HashMap<String, String> {
-    let mut options = HashMap::new();
+fn permission_options(value: Option<&Value>) -> BTreeMap<String, String> {
+    let mut options = BTreeMap::new();
     let Some(Value::Array(items)) = value else {
         return options;
     };
@@ -3142,7 +3716,7 @@ fn permission_options(value: Option<&Value>) -> HashMap<String, String> {
     options
 }
 
-fn permission_decision(message: &Value, options_by_id: &HashMap<String, String>) -> &'static str {
+fn permission_decision(message: &Value, options_by_id: &BTreeMap<String, String>) -> &'static str {
     let Some(outcome) = message
         .get("result")
         .and_then(|result| result.get("outcome"))

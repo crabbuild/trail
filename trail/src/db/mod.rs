@@ -856,7 +856,7 @@ mod util;
 
 #[doc(hidden)]
 pub use self::util::process_liveness::run_internal_process_watchdog;
-pub(crate) use self::util::redact_sensitive_json;
+pub(crate) use self::util::{redact_sensitive_json, redact_sensitive_text};
 
 #[cfg(test)]
 mod tests {
