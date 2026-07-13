@@ -5517,6 +5517,7 @@ dependencies = [
  "trail-environment-adapter-sdk",
  "unicode-normalization",
  "unicode-width",
+ "url",
  "walkdir",
  "widestring",
  "winapi",

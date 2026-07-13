@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -10,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
@@ -333,8 +335,14 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
         ));
     }
 
-    let mut child = Command::new(&options.upstream_command[0])
-        .args(&options.upstream_command[1..])
+    let (upstream_program, upstream_args) = confined_acp_command(
+        &options.upstream_command,
+        &options.workspace_root,
+        &options.db_dir,
+        options.materialize,
+    )?;
+    let mut child = Command::new(upstream_program)
+        .args(upstream_args)
         .envs(&options.upstream_env)
         .current_dir(&options.workspace_root)
         .stdin(Stdio::piped())
@@ -414,6 +422,55 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
             }
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn confined_acp_command(
+    command: &[String],
+    workspace_root: &Path,
+    db_dir: &Path,
+    materialized: bool,
+) -> Result<(OsString, Vec<OsString>)> {
+    #[cfg(target_os = "macos")]
+    {
+        if materialized {
+            let sandbox = PathBuf::from("/usr/bin/sandbox-exec");
+            if !sandbox.is_file() {
+                return Err(Error::InvalidInput(
+                    "materialized ACP agents require `/usr/bin/sandbox-exec` on macOS".to_string(),
+                ));
+            }
+            let workspace_root = workspace_root.canonicalize()?;
+            let db_dir = db_dir.canonicalize()?;
+            let profile = format!(
+                "(version 1)\n\
+                 (allow default)\n\
+                 (deny file-write* (subpath \"{}\"))\n\
+                 (allow file-write* (subpath \"{}\"))",
+                sandbox_profile_escape(&workspace_root),
+                sandbox_profile_escape(&db_dir),
+            );
+            let mut args = vec![
+                OsString::from("-p"),
+                OsString::from(profile),
+                OsString::from(&command[0]),
+            ];
+            args.extend(command[1..].iter().map(OsString::from));
+            return Ok((sandbox.into_os_string(), args));
+        }
+    }
+    let _ = (workspace_root, db_dir, materialized);
+    Ok((
+        OsString::from(&command[0]),
+        command[1..].iter().map(OsString::from).collect(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_profile_escape(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 pub(crate) fn command_in_path(command: &str) -> bool {
@@ -1149,26 +1206,32 @@ impl CaptureCoordinator {
         Ok(())
     }
 
-    fn prepare_prompt_request(&mut self, message: &Value) -> Result<()> {
+    fn prepare_prompt_request(&mut self, message: &mut Value) -> Result<()> {
         let Some(request_id) = rpc_id_key(message) else {
             return Ok(());
         };
-        let params = params_object(message)?;
+        let params = params_object_mut(message)?;
         let acp_session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::InvalidInput("ACP session/prompt missing sessionId".to_string())
-            })?;
-        let session = self.resolve_session_state(acp_session_id)?;
+            .ok_or_else(|| Error::InvalidInput("ACP session/prompt missing sessionId".to_string()))?
+            .to_string();
+        let session = self.resolve_session_state(&acp_session_id)?;
         let prompt_text = prompt_text(params.get("prompt"));
+        if session.materialized {
+            remap_prompt_resource_uris(
+                params.get_mut("prompt"),
+                Path::new(&session.original_cwd),
+                Path::new(&session.effective_cwd),
+            );
+        }
         let mut db = self.open_db()?;
         let branch = db.lane_branch(&session.lane_name)?;
         let initial_envelope = TurnEnvelope::new_acp_prompt(TurnEnvelopeAcpPromptInput {
             provider: self.options.provider.clone(),
             model: self.options.model.clone(),
             trail_session_id: session.trail_session_id.clone(),
-            acp_session_id: acp_session_id.to_string(),
+            acp_session_id: acp_session_id.clone(),
             upstream_session_id: session.upstream_session_id.clone(),
             upstream_command_hash: self.upstream_command_hash(),
             prompt_hash: prompt_hash(&prompt_text),
@@ -1199,7 +1262,7 @@ impl CaptureCoordinator {
             "acp_prompt_started",
             Some(redact_json(serde_json::json!({
                 "protocol": "acp",
-                "acp_session_id": acp_session_id,
+                "acp_session_id": &acp_session_id,
                 "request_id": message.get("id").cloned(),
                 "prompt_summary": summarize_text(&prompt_text),
             }))),
@@ -1212,7 +1275,7 @@ impl CaptureCoordinator {
             &session.trail_session_id,
             Some(&turn.turn.turn_id),
             self.options.provider.as_deref(),
-            acp_session_id,
+            &acp_session_id,
             AgentLifecycleEventKind::TurnStarted,
             serde_json::json!({"prompt_summary": summarize_text(&prompt_text)}),
         )?;
@@ -1222,7 +1285,7 @@ impl CaptureCoordinator {
             &session.trail_session_id,
             Some(&turn.turn.turn_id),
             self.options.provider.as_deref(),
-            acp_session_id,
+            &acp_session_id,
             AgentLifecycleEventKind::MessageUser,
             serde_json::json!({
                 "message_id": user_message.message_id,
@@ -1238,7 +1301,7 @@ impl CaptureCoordinator {
                 None,
                 Some(redact_json(serde_json::json!({
                     "protocol": "acp",
-                    "acp_session_id": acp_session_id,
+                    "acp_session_id": &acp_session_id,
                     "provider": self.options.provider,
                     "model": self.options.model
                 }))),
@@ -1247,7 +1310,7 @@ impl CaptureCoordinator {
             .map(|report| report.span.span_id);
 
         let pending = PendingPrompt {
-            acp_session_id: acp_session_id.to_string(),
+            acp_session_id: acp_session_id.clone(),
             lane_name: session.lane_name.clone(),
             turn_id: turn.turn.turn_id.clone(),
             root_span_id: root_span.clone(),
@@ -1255,7 +1318,7 @@ impl CaptureCoordinator {
         };
         self.pending_prompts.insert(request_id, pending.clone());
         self.active_turns.insert(
-            acp_session_id.to_string(),
+            acp_session_id,
             ActiveTurn {
                 lane_name: pending.lane_name,
                 trail_session_id: session.trail_session_id,
@@ -2097,6 +2160,67 @@ fn prompt_status(message: &Value) -> &'static str {
         Some("cancelled") => "cancelled",
         _ => "completed",
     }
+}
+
+fn remap_prompt_resource_uris(
+    prompt: Option<&mut Value>,
+    original_cwd: &Path,
+    effective_cwd: &Path,
+) {
+    let Some(Value::Array(blocks)) = prompt else {
+        return;
+    };
+    for block in blocks {
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let uri = match block_type.as_deref() {
+            Some("resource") => block
+                .get_mut("resource")
+                .and_then(Value::as_object_mut)
+                .and_then(|resource| resource.get_mut("uri")),
+            Some("resource_link") => block.get_mut("uri"),
+            _ => None,
+        };
+        let Some(uri) = uri else {
+            continue;
+        };
+        let Some(source) = uri.as_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(mapped) = remap_workspace_file_uri(&source, original_cwd, effective_cwd) {
+            *uri = Value::String(mapped);
+        }
+    }
+}
+
+fn remap_workspace_file_uri(
+    uri: &str,
+    original_cwd: &Path,
+    effective_cwd: &Path,
+) -> Option<String> {
+    let source_url = Url::parse(uri).ok()?;
+    if source_url.scheme() != "file" {
+        return None;
+    }
+    let source_path = source_url.to_file_path().ok()?;
+    let relative = source_path.strip_prefix(original_cwd).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    let query = source_url.query().map(str::to_string);
+    let fragment = source_url.fragment().map(str::to_string);
+    let mut mapped_url = Url::from_file_path(effective_cwd.join(relative)).ok()?;
+    mapped_url.set_query(query.as_deref());
+    mapped_url.set_fragment(fragment.as_deref());
+    Some(mapped_url.into())
 }
 
 fn prompt_text(prompt: Option<&Value>) -> String {

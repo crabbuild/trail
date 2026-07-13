@@ -5688,7 +5688,7 @@ fn acp_relay_captures_session_prompt_mcp_and_workdir_edits() {
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
     let stub_agent = temp.path().join("stub-acp-agent.sh");
-    let session_request_log = temp.path().join("session-new.jsonl");
+    let session_request_log = temp.path().join(".trail/session-new.jsonl");
     let lane_workdir = temp
         .path()
         .canonicalize()
@@ -5899,6 +5899,231 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
             .as_str()
             .unwrap()
             .contains("trail transcript acp-test")));
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_relay_remaps_workspace_file_resources_into_lane() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let stub_agent = temp.path().join("resource-acp-agent.sh");
+    let forwarded_prompt_log = temp.path().join(".trail/forwarded-resource-prompt.jsonl");
+    let lane_workdir = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".trail/worktrees/acp-resource-test");
+    fs::write(
+        &stub_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_resource_stub"}}}}'
+IFS= read -r prompt
+printf '%s\n' "$prompt" > "{}"
+resource_uri=${{prompt#*\"uri\":\"}}
+resource_uri=${{resource_uri%%\"*}}
+case "$resource_uri" in
+  file://*) resource_path=${{resource_uri#file://}} ;;
+  *) exit 41 ;;
+esac
+printf '%s\n' 'changed through forwarded resource' > "$resource_path"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            forwarded_prompt_log.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_agent, permissions).unwrap();
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-resource-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("test-stub")
+        .arg("--")
+        .arg(&stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdout = std::io::BufReader::new(stdout);
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_resource_stub","prompt":[{{"type":"resource","resource":{{"uri":"file://{}/README.md","text":"hello"}}}},{{"type":"resource_link","name":"source","uri":"file://{}/src/lib.rs"}},{{"type":"resource_link","name":"external","uri":"file:///outside/shared.md"}},{{"type":"resource_link","name":"remote","uri":"https://example.com/context"}}]}}}}"#,
+        temp.path().display(),
+        temp.path().display(),
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":2"#));
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "relay failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let forwarded_prompt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&forwarded_prompt_log).unwrap()).unwrap();
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][0]["resource"]["uri"],
+        format!("file://{}/README.md", lane_workdir.display())
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][1]["uri"],
+        format!("file://{}/src/lib.rs", lane_workdir.display())
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][2]["uri"],
+        "file:///outside/shared.md"
+    );
+    assert_eq!(
+        forwarded_prompt["params"]["prompt"][3]["uri"],
+        "https://example.com/context"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("README.md")).unwrap(),
+        "hello\n",
+        "the ACP agent must not edit the main workspace"
+    );
+    assert_eq!(
+        fs::read_to_string(lane_workdir.join("README.md")).unwrap(),
+        "changed through forwarded resource\n"
+    );
+
+    let db = Trail::open(temp.path()).unwrap();
+    let status = db.lane_status("acp-resource-test").unwrap();
+    assert!(status
+        .changed_paths
+        .iter()
+        .any(|path| path.path == "README.md"));
+    let mapping = db
+        .try_lane_acp_session("sess_resource_stub")
+        .unwrap()
+        .unwrap();
+    let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
+    let turn = db.show_lane_turn(&session.turns[0].turn_id).unwrap();
+    assert!(turn
+        .operations
+        .iter()
+        .any(|operation| operation.kind == OperationKind::LaneRecord));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn acp_relay_blocks_materialized_agent_writes_to_main_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let escaped_path = temp.path().join("ESCAPED.md");
+    let stub_agent = temp.path().join("escaping-acp-agent.sh");
+    fs::write(
+        &stub_agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+IFS= read -r init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'
+IFS= read -r session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess_escape_stub"}}}}'
+IFS= read -r prompt
+printf '%s\n' 'escaped' > "{}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#,
+            escaped_path.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub_agent).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_agent, permissions).unwrap();
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("acp")
+        .arg("relay")
+        .arg("--lane")
+        .arg("acp-escape-test")
+        .arg("--materialize")
+        .arg("--provider")
+        .arg("test-stub")
+        .arg("--")
+        .arg(&stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"sess_escape_stub","prompt":[{{"type":"text","text":"escape"}}]}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "relay unexpectedly allowed an ACP agent to write the main workspace"
+    );
+    assert!(
+        stderr.contains("Operation not permitted") || stderr.contains("Permission denied"),
+        "relay failed for an unexpected reason:\n{stderr}"
+    );
+    assert!(
+        !escaped_path.exists(),
+        "materialized ACP agent escaped its Trail lane"
+    );
 }
 
 #[cfg(unix)]
