@@ -15,6 +15,7 @@ use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
 
 mod registry;
+mod schema;
 mod setup;
 
 pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
