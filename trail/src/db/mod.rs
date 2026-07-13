@@ -2,14 +2,14 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +35,7 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
-const TRAIL_SCHEMA_VERSION: i64 = 16;
+const TRAIL_SCHEMA_VERSION: i64 = 17;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";
@@ -91,12 +91,54 @@ pub struct Trail {
     config: TrailConfig,
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
+    git_handoff_metrics: Cell<GitHandoffMetrics>,
+    case_fold_index_metrics: Cell<CaseFoldIndexMetrics>,
+    operation_metrics: Option<Arc<OperationMetricsState>>,
+}
+
+pub(crate) struct WorkspaceIgnorePolicySnapshot {
+    workspace_root: PathBuf,
+    metrics: Option<Arc<OperationMetricsState>>,
+    matcher: OnceLock<std::result::Result<::ignore::gitignore::Gitignore, String>>,
 }
 
 #[derive(Clone)]
-enum TrailProllyStore {
+struct TrailProllyStore {
+    backend: TrailProllyStoreBackend,
+    metrics: Option<Arc<OperationMetricsState>>,
+}
+
+#[derive(Clone)]
+enum TrailProllyStoreBackend {
     Sqlite(Arc<SqliteStore>),
     SlateDb(Arc<SlateDbStore>),
+}
+
+impl TrailProllyStore {
+    fn new(backend: TrailProllyStoreBackend, metrics: Option<Arc<OperationMetricsState>>) -> Self {
+        Self { backend, metrics }
+    }
+
+    fn note_prolly_read_call(&self, key_count: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.note_prolly_read_call(key_count);
+        }
+    }
+
+    fn note_prolly_read_values<'a, I>(&self, values: I)
+    where
+        I: IntoIterator<Item = &'a Vec<u8>>,
+    {
+        if let Some(metrics) = &self.metrics {
+            metrics.note_prolly_read_values(values);
+        }
+    }
+
+    fn note_prolly_write_call(&self, key_count: usize, value_bytes: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics.note_prolly_write_call(key_count, value_bytes);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -135,44 +177,59 @@ impl Store for TrailProllyStore {
     type Error = TrailProllyStoreError;
 
     fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store
+        self.note_prolly_read_call(1);
+        let result = match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store
                 .get(key)
                 .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly get failed", err)),
-            TrailProllyStore::SlateDb(store) => store.get(key).map_err(|err| {
+            TrailProllyStoreBackend::SlateDb(store) => store.get(key).map_err(|err| {
                 TrailProllyStoreError::with_source("SlateDB prolly get failed", err)
             }),
+        };
+        if let Ok(Some(value)) = &result {
+            self.note_prolly_read_values(std::iter::once(value));
         }
+        result
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store
+        self.note_prolly_write_call(1, value.len());
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store
                 .put(key, value)
                 .map_err(|err| TrailProllyStoreError::with_source("SQLite prolly put failed", err)),
-            TrailProllyStore::SlateDb(store) => store.put(key, value).map_err(|err| {
+            TrailProllyStoreBackend::SlateDb(store) => store.put(key, value).map_err(|err| {
                 TrailProllyStoreError::with_source("SlateDB prolly put failed", err)
             }),
         }
     }
 
     fn delete(&self, key: &[u8]) -> std::result::Result<(), Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.delete(key).map_err(|err| {
+        self.note_prolly_write_call(1, 0);
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store.delete(key).map_err(|err| {
                 TrailProllyStoreError::with_source("SQLite prolly delete failed", err)
             }),
-            TrailProllyStore::SlateDb(store) => store.delete(key).map_err(|err| {
+            TrailProllyStoreBackend::SlateDb(store) => store.delete(key).map_err(|err| {
                 TrailProllyStoreError::with_source("SlateDB prolly delete failed", err)
             }),
         }
     }
 
     fn batch(&self, ops: &[BatchOp]) -> std::result::Result<(), Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.batch(ops).map_err(|err| {
+        let value_bytes = ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Upsert { value, .. } => value.len(),
+                BatchOp::Delete { .. } => 0,
+            })
+            .fold(0usize, usize::saturating_add);
+        self.note_prolly_write_call(ops.len(), value_bytes);
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store.batch(ops).map_err(|err| {
                 TrailProllyStoreError::with_source("SQLite prolly batch failed", err)
             }),
-            TrailProllyStore::SlateDb(store) => store.batch(ops).map_err(|err| {
+            TrailProllyStoreBackend::SlateDb(store) => store.batch(ops).map_err(|err| {
                 TrailProllyStoreError::with_source("SlateDB prolly batch failed", err)
             }),
         }
@@ -182,45 +239,70 @@ impl Store for TrailProllyStore {
         &self,
         keys: &[&[u8]],
     ) -> std::result::Result<HashMap<Vec<u8>, Vec<u8>>, Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.batch_get(keys).map_err(|err| {
+        self.note_prolly_read_call(keys.len());
+        let result = match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store.batch_get(keys).map_err(|err| {
                 TrailProllyStoreError::with_source("SQLite prolly batch_get failed", err)
             }),
-            TrailProllyStore::SlateDb(store) => store.batch_get(keys).map_err(|err| {
+            TrailProllyStoreBackend::SlateDb(store) => store.batch_get(keys).map_err(|err| {
                 TrailProllyStoreError::with_source("SlateDB prolly batch_get failed", err)
             }),
+        };
+        if let Ok(values) = &result {
+            self.note_prolly_read_values(values.values());
         }
+        result
     }
 
     fn batch_get_ordered(
         &self,
         keys: &[&[u8]],
     ) -> std::result::Result<Vec<Option<Vec<u8>>>, Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.batch_get_ordered(keys).map_err(|err| {
-                TrailProllyStoreError::with_source("SQLite prolly batch_get_ordered failed", err)
-            }),
-            TrailProllyStore::SlateDb(store) => store.batch_get_ordered(keys).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly batch_get_ordered failed", err)
-            }),
+        self.note_prolly_read_call(keys.len());
+        let result = match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => {
+                store.batch_get_ordered(keys).map_err(|err| {
+                    TrailProllyStoreError::with_source(
+                        "SQLite prolly batch_get_ordered failed",
+                        err,
+                    )
+                })
+            }
+            TrailProllyStoreBackend::SlateDb(store) => {
+                store.batch_get_ordered(keys).map_err(|err| {
+                    TrailProllyStoreError::with_source(
+                        "SlateDB prolly batch_get_ordered failed",
+                        err,
+                    )
+                })
+            }
+        };
+        if let Ok(values) = &result {
+            self.note_prolly_read_values(values.iter().filter_map(Option::as_ref));
         }
+        result
     }
 
     fn batch_put(&self, entries: &[(&[u8], &[u8])]) -> std::result::Result<(), Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.batch_put(entries).map_err(|err| {
+        let value_bytes = entries
+            .iter()
+            .map(|(_, value)| value.len())
+            .fold(0usize, usize::saturating_add);
+        self.note_prolly_write_call(entries.len(), value_bytes);
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store.batch_put(entries).map_err(|err| {
                 TrailProllyStoreError::with_source("SQLite prolly batch_put failed", err)
             }),
-            TrailProllyStore::SlateDb(store) => store.batch_put(entries).map_err(|err| {
+            TrailProllyStoreBackend::SlateDb(store) => store.batch_put(entries).map_err(|err| {
                 TrailProllyStoreError::with_source("SlateDB prolly batch_put failed", err)
             }),
         }
     }
 
     fn supports_hints(&self) -> bool {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.supports_hints(),
-            TrailProllyStore::SlateDb(store) => store.supports_hints(),
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store.supports_hints(),
+            TrailProllyStoreBackend::SlateDb(store) => store.supports_hints(),
         }
     }
 
@@ -229,13 +311,17 @@ impl Store for TrailProllyStore {
         namespace: &[u8],
         key: &[u8],
     ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store.get_hint(namespace, key).map_err(|err| {
-                TrailProllyStoreError::with_source("SQLite prolly get_hint failed", err)
-            }),
-            TrailProllyStore::SlateDb(store) => store.get_hint(namespace, key).map_err(|err| {
-                TrailProllyStoreError::with_source("SlateDB prolly get_hint failed", err)
-            }),
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => {
+                store.get_hint(namespace, key).map_err(|err| {
+                    TrailProllyStoreError::with_source("SQLite prolly get_hint failed", err)
+                })
+            }
+            TrailProllyStoreBackend::SlateDb(store) => {
+                store.get_hint(namespace, key).map_err(|err| {
+                    TrailProllyStoreError::with_source("SlateDB prolly get_hint failed", err)
+                })
+            }
         }
     }
 
@@ -245,13 +331,13 @@ impl Store for TrailProllyStore {
         key: &[u8],
         value: &[u8],
     ) -> std::result::Result<(), Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => {
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => {
                 store.put_hint(namespace, key, value).map_err(|err| {
                     TrailProllyStoreError::with_source("SQLite prolly put_hint failed", err)
                 })
             }
-            TrailProllyStore::SlateDb(store) => {
+            TrailProllyStoreBackend::SlateDb(store) => {
                 store.put_hint(namespace, key, value).map_err(|err| {
                     TrailProllyStoreError::with_source("SlateDB prolly put_hint failed", err)
                 })
@@ -266,8 +352,13 @@ impl Store for TrailProllyStore {
         key: &[u8],
         value: &[u8],
     ) -> std::result::Result<(), Self::Error> {
-        match self {
-            TrailProllyStore::Sqlite(store) => store
+        let value_bytes = entries
+            .iter()
+            .map(|(_, value)| value.len())
+            .fold(0usize, usize::saturating_add);
+        self.note_prolly_write_call(entries.len(), value_bytes);
+        match &self.backend {
+            TrailProllyStoreBackend::Sqlite(store) => store
                 .batch_put_with_hint(entries, namespace, key, value)
                 .map_err(|err| {
                     TrailProllyStoreError::with_source(
@@ -275,7 +366,7 @@ impl Store for TrailProllyStore {
                         err,
                     )
                 }),
-            TrailProllyStore::SlateDb(store) => store
+            TrailProllyStoreBackend::SlateDb(store) => store
                 .batch_put_with_hint(entries, namespace, key, value)
                 .map_err(|err| {
                     TrailProllyStoreError::with_source(
@@ -287,19 +378,22 @@ impl Store for TrailProllyStore {
     }
 }
 
-fn open_prolly_store(config: &TrailConfig, sqlite_path: &Path) -> Result<TrailProllyStore> {
-    match config.storage.prolly_backend.as_str() {
-        "sqlite" => Ok(TrailProllyStore::Sqlite(Arc::new(SqliteStore::open(
-            sqlite_path,
-        )?))),
-        "slatedb" => open_slatedb_prolly_store(&config.storage),
+fn open_prolly_store(
+    config: &TrailConfig,
+    sqlite_path: &Path,
+    metrics: Option<Arc<OperationMetricsState>>,
+) -> Result<TrailProllyStore> {
+    let backend = match config.storage.prolly_backend.as_str() {
+        "sqlite" => TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open(sqlite_path)?)),
+        "slatedb" => open_slatedb_prolly_store(&config.storage)?,
         other => Err(Error::InvalidInput(format!(
             "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
-        ))),
-    }
+        )))?,
+    };
+    Ok(TrailProllyStore::new(backend, metrics))
 }
 
-fn open_slatedb_prolly_store(storage: &StorageConfig) -> Result<TrailProllyStore> {
+fn open_slatedb_prolly_store(storage: &StorageConfig) -> Result<TrailProllyStoreBackend> {
     let path = storage.slatedb_path.trim().trim_matches('/');
     if path.is_empty() {
         return Err(Error::InvalidInput(
@@ -309,7 +403,7 @@ fn open_slatedb_prolly_store(storage: &StorageConfig) -> Result<TrailProllyStore
 
     let object_store = build_slatedb_object_store(storage)?;
     let store = SlateDbStore::open(path, object_store)?;
-    Ok(TrailProllyStore::SlateDb(Arc::new(store)))
+    Ok(TrailProllyStoreBackend::SlateDb(Arc::new(store)))
 }
 
 fn build_slatedb_object_store(storage: &StorageConfig) -> Result<Arc<dyn ObjectStore>> {
@@ -407,6 +501,12 @@ pub enum InitImportMode {
     WorkingTree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitExportPolicy {
+    RequireMappedDelta,
+    AllowFullSnapshot,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DiskFile {
     path: String,
@@ -431,6 +531,37 @@ pub(crate) struct RootBuildResult {
 #[derive(Debug)]
 pub(crate) struct IncrementalRootBuildResult {
     root_id: ObjectId,
+}
+
+#[derive(Debug)]
+pub(crate) enum RecordCaseFoldResolutionState {
+    Indexed {
+        previous_tree: Tree,
+        mutations: Vec<prolly::Mutation>,
+    },
+    LegacyUnavailable,
+    Collision {
+        path: String,
+        previous: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordCaseFoldResolution {
+    selected_paths: Vec<String>,
+    expected_final_present_paths: BTreeSet<String>,
+    expected_observed_present_paths: BTreeSet<String>,
+    expected_absent_paths: BTreeSet<String>,
+    state: RecordCaseFoldResolutionState,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordCaseFoldPreflight {
+    selected_paths: Vec<String>,
+    expected_final_present_paths: BTreeSet<String>,
+    expected_observed_present_paths: BTreeSet<String>,
+    expected_absent_paths: BTreeSet<String>,
+    case_fold_tree: Tree,
 }
 
 #[derive(Debug)]
@@ -727,6 +858,7 @@ pub(crate) struct DaemonWorktreeCachePersist {
     workspace_root: PathBuf,
     pid: u32,
     active: Arc<AtomicBool>,
+    metrics: Option<Arc<OperationMetricsState>>,
 }
 
 #[derive(Debug)]
@@ -801,6 +933,96 @@ pub(crate) struct GitState {
     dirty: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GitIdentity {
+    head: String,
+    branch: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GitHandoffMetrics {
+    export_mode: GitExportMode,
+    changed_path_count: u64,
+    blob_write_count: u64,
+    git_plumbing_command_count: u64,
+    tracked_status_count: u64,
+    full_root_file_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CaseFoldIndexMetrics {
+    mode: CaseFoldIndexMode,
+    lookup_count: u64,
+    full_root_path_load_count: u64,
+    full_filesystem_path_scan_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum CaseFoldIndexMode {
+    #[default]
+    Unknown,
+    Indexed,
+}
+
+#[allow(dead_code)] // Reported by Task 5's scale harness; tests use it in this slice.
+impl CaseFoldIndexMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Indexed => "indexed",
+        }
+    }
+}
+
+pub(crate) type CaseFoldIndexMetricsReport = PathIndexMetricsReport;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum GitExportMode {
+    #[default]
+    Unknown,
+    MappedDelta,
+    FullSnapshot,
+}
+
+impl GitExportMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::MappedDelta => "mapped_delta",
+            Self::FullSnapshot => "full_snapshot",
+        }
+    }
+}
+
+impl From<GitHandoffMetrics> for GitHandoffMetricsReport {
+    fn from(metrics: GitHandoffMetrics) -> Self {
+        Self {
+            export_mode: metrics.export_mode.as_str().to_string(),
+            changed_path_count: metrics.changed_path_count,
+            blob_write_count: metrics.blob_write_count,
+            git_plumbing_command_count: metrics.git_plumbing_command_count,
+            tracked_status_count: metrics.tracked_status_count,
+            full_root_file_count: metrics.full_root_file_count,
+        }
+    }
+}
+
+pub(crate) fn validate_git_publication_state(expected_head: &str, state: &GitState) -> Result<()> {
+    if state.head.as_deref() != Some(expected_head) {
+        return Err(Error::GitHeadChanged(format!(
+            "expected Git HEAD `{expected_head}`, found `{}`",
+            state.head.as_deref().unwrap_or("<unborn>")
+        )));
+    }
+    if state.dirty {
+        return Err(Error::GitWorktreeDirty(
+            "current Git worktree has tracked changes; commit, stash, or revert them before `trail agent apply`"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct GitTreeNode {
     blobs: BTreeMap<String, GitBlobEntry>,
@@ -850,8 +1072,11 @@ mod agent;
 mod core;
 mod lane;
 mod merge;
+mod performance;
 mod record;
 mod storage;
+use self::performance::*;
+pub(crate) use storage::{observed_exact_paths_for_candidates, ObservedPathKind};
 mod util;
 
 #[doc(hidden)]
@@ -862,6 +1087,377 @@ pub(crate) use self::util::redact_sensitive_json;
 mod tests {
     use super::util::*;
     use super::*;
+
+    #[test]
+    fn operation_metrics_scope_nests_and_resets_after_errors_retries_and_cancellation() {
+        let metrics = Arc::new(OperationMetricsState::default());
+
+        let first: Result<()> = metrics.profile(OperationMetricsKind::Status, || {
+            metrics.add(OperationMetricsDelta {
+                input_path_count: 3,
+                ..OperationMetricsDelta::default()
+            });
+            metrics.profile(OperationMetricsKind::Diff, || {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: 2,
+                    ..OperationMetricsDelta::default()
+                });
+                Ok::<(), Error>(())
+            })?;
+            Err(Error::InvalidInput(
+                "expected metric test failure".to_string(),
+            ))
+        });
+        assert!(first.is_err());
+        let failed = metrics.last_report();
+        assert_eq!(failed.generation, 1);
+        assert_eq!(failed.operation, "status");
+        assert_eq!(failed.outcome, OperationMetricsOutcome::Error);
+        assert_eq!(failed.input_path_count, 3);
+        assert_eq!(failed.final_path_count, 2);
+
+        metrics
+            .profile(OperationMetricsKind::Status, || {
+                metrics.add(OperationMetricsDelta {
+                    input_path_count: 1,
+                    ..OperationMetricsDelta::default()
+                });
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        let retry = metrics.last_report();
+        assert_eq!(retry.generation, 2);
+        assert_eq!(retry.outcome, OperationMetricsOutcome::Success);
+        assert_eq!(retry.input_path_count, 1);
+        assert_eq!(retry.final_path_count, 0);
+
+        let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let metrics = Arc::clone(&metrics);
+            move || {
+                metrics.profile(OperationMetricsKind::Record, || -> Result<()> {
+                    metrics.add(OperationMetricsDelta {
+                        expanded_path_count: 7,
+                        ..OperationMetricsDelta::default()
+                    });
+                    panic!("cancel metric scope")
+                })
+            }
+        }));
+        assert!(cancelled.is_err());
+        let cancelled = metrics.last_report();
+        assert_eq!(cancelled.generation, 3);
+        assert_eq!(cancelled.operation, "record");
+        assert_eq!(
+            cancelled.outcome,
+            OperationMetricsOutcome::CancelledOrUnclassified
+        );
+        assert_eq!(cancelled.expanded_path_count, 7);
+        assert_eq!(cancelled.input_path_count, 0);
+    }
+
+    #[test]
+    fn trail_prolly_store_reports_calls_requested_keys_found_values_and_bytes_across_clones() {
+        let metrics = Arc::new(OperationMetricsState::default());
+        let store = TrailProllyStore::new(
+            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
+            Some(Arc::clone(&metrics)),
+        );
+        store.put(b"present", b"abc").unwrap();
+        let clone = store.clone();
+
+        metrics
+            .profile(OperationMetricsKind::Diff, || {
+                store.put(b"written", b"xyz").unwrap();
+                store
+                    .batch(&[
+                        BatchOp::Upsert {
+                            key: b"batch-written",
+                            value: b"de",
+                        },
+                        BatchOp::Delete {
+                            key: b"batch-missing",
+                        },
+                    ])
+                    .unwrap();
+                store
+                    .batch_put(&[(b"batch-put".as_slice(), b"fgh".as_slice())])
+                    .unwrap();
+                store.delete(b"delete-missing").unwrap();
+                store
+                    .batch_put_with_hint(
+                        &[(b"hinted-node".as_slice(), b"ijkl".as_slice())],
+                        b"test-namespace",
+                        b"test-key",
+                        b"performance-hint-not-a-node",
+                    )
+                    .unwrap();
+                assert_eq!(store.get(b"present").unwrap(), Some(b"abc".to_vec()));
+                assert_eq!(store.get(b"missing").unwrap(), None);
+                let unordered = clone.batch_get(&[b"present", b"missing", b"present"])?;
+                assert_eq!(unordered.len(), 1);
+                let ordered = store.batch_get_ordered(&[b"present", b"missing", b"present"])?;
+                assert_eq!(ordered.iter().filter(|value| value.is_some()).count(), 2);
+                Ok::<(), TrailProllyStoreError>(())
+            })
+            .unwrap();
+
+        let report = metrics.last_report();
+        assert_eq!(report.prolly_read_call_count, 4);
+        assert_eq!(report.prolly_read_key_count, 8);
+        assert_eq!(report.prolly_read_value_count, 4);
+        assert_eq!(report.prolly_read_value_bytes, 12);
+        assert_eq!(report.prolly_write_call_count, 5);
+        assert_eq!(report.prolly_write_key_count, 6);
+        assert_eq!(report.prolly_write_value_bytes, 12);
+    }
+
+    #[test]
+    #[ignore = "reproducible release-mode microbenchmark; run explicitly for performance evidence"]
+    fn operation_metrics_store_read_overhead_benchmark() {
+        const READS_PER_SAMPLE: u64 = 50_000;
+        const SAMPLES: usize = 7;
+
+        let raw = SqliteStore::open_in_memory().unwrap();
+        raw.put(b"present", b"abc").unwrap();
+        let disabled = TrailProllyStore::new(
+            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
+            None,
+        );
+        disabled.put(b"present", b"abc").unwrap();
+        let metrics = Arc::new(OperationMetricsState::default());
+        let measured = TrailProllyStore::new(
+            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
+            Some(Arc::clone(&metrics)),
+        );
+        measured.put(b"present", b"abc").unwrap();
+
+        let mut raw_samples = Vec::with_capacity(SAMPLES);
+        let mut disabled_samples = Vec::with_capacity(SAMPLES);
+        let mut measured_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let run_raw = || {
+                let started = Instant::now();
+                for _ in 0..READS_PER_SAMPLE {
+                    std::hint::black_box(raw.get(b"present").unwrap());
+                }
+                started.elapsed().as_nanos() as u64
+            };
+            let run_measured = || {
+                let started = Instant::now();
+                for _ in 0..READS_PER_SAMPLE {
+                    std::hint::black_box(measured.get(b"present").unwrap());
+                }
+                started.elapsed().as_nanos() as u64
+            };
+            let run_disabled = || {
+                let started = Instant::now();
+                for _ in 0..READS_PER_SAMPLE {
+                    std::hint::black_box(disabled.get(b"present").unwrap());
+                }
+                started.elapsed().as_nanos() as u64
+            };
+            match sample % 3 {
+                0 => {
+                    raw_samples.push(run_raw());
+                    disabled_samples.push(run_disabled());
+                    measured_samples.push(run_measured());
+                }
+                1 => {
+                    disabled_samples.push(run_disabled());
+                    measured_samples.push(run_measured());
+                    raw_samples.push(run_raw());
+                }
+                _ => {
+                    measured_samples.push(run_measured());
+                    raw_samples.push(run_raw());
+                    disabled_samples.push(run_disabled());
+                }
+            }
+        }
+        raw_samples.sort_unstable();
+        disabled_samples.sort_unstable();
+        measured_samples.sort_unstable();
+        let raw_ns_per_read = raw_samples[SAMPLES / 2] as f64 / READS_PER_SAMPLE as f64;
+        let disabled_ns_per_read = disabled_samples[SAMPLES / 2] as f64 / READS_PER_SAMPLE as f64;
+        let measured_ns_per_read = measured_samples[SAMPLES / 2] as f64 / READS_PER_SAMPLE as f64;
+        let disabled_overhead_percent =
+            ((disabled_ns_per_read / raw_ns_per_read) - 1.0).mul_add(100.0, 0.0);
+        let enabled_overhead_percent =
+            ((measured_ns_per_read / raw_ns_per_read) - 1.0).mul_add(100.0, 0.0);
+        println!(
+            "operation_metrics_store_read raw_ns_per_read={raw_ns_per_read:.2} disabled_ns_per_read={disabled_ns_per_read:.2} enabled_ns_per_read={measured_ns_per_read:.2} disabled_overhead_percent={disabled_overhead_percent:.2} enabled_overhead_percent={enabled_overhead_percent:.2} samples={SAMPLES} reads_per_sample={READS_PER_SAMPLE}"
+        );
+    }
+
+    #[test]
+    fn disabled_operation_metrics_skip_scopes_reports_and_store_counters() {
+        let disabled = None;
+        let result =
+            profile_operation_metrics(disabled.as_ref(), OperationMetricsKind::Status, || {
+                Ok::<_, Error>("unchanged")
+            })
+            .unwrap();
+        assert_eq!(result, "unchanged");
+        assert_eq!(operation_metrics_report(disabled.as_ref()), None);
+
+        let untouched = Arc::new(OperationMetricsState::default());
+        let store = TrailProllyStore::new(
+            TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open_in_memory().unwrap())),
+            None,
+        );
+        store.put(b"present", b"abc").unwrap();
+        assert_eq!(store.get(b"present").unwrap(), Some(b"abc".to_vec()));
+        untouched
+            .profile(OperationMetricsKind::Diff, || Ok::<(), Error>(()))
+            .unwrap();
+        let report = untouched.last_report();
+        assert_eq!(report.prolly_read_call_count, 0);
+        assert_eq!(report.prolly_write_call_count, 0);
+    }
+
+    #[test]
+    fn operation_metrics_env_parser_accepts_only_documented_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"] {
+            assert!(operation_metrics_env_value_is_truthy(value), "{value}");
+        }
+        for value in ["", "0", "false", "enabled", " true", "on ", "2"] {
+            assert!(!operation_metrics_env_value_is_truthy(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn operation_metrics_expose_truthful_structural_surface_and_daemon_cumulative_totals() {
+        let metrics = Arc::new(OperationMetricsState::default());
+        metrics.note_daemon_cumulative_rewrite(11);
+
+        metrics
+            .profile(OperationMetricsKind::Record, || {
+                metrics.add(OperationMetricsDelta {
+                    input_path_count: 1,
+                    canonical_path_count: 2,
+                    expanded_path_count: 3,
+                    final_path_count: 4,
+                    full_filesystem_walk_count: 5,
+                    bounded_filesystem_walk_count: 6,
+                    filesystem_entry_count: 7,
+                    filesystem_stat_count: 8,
+                    filesystem_read_count: 9,
+                    filesystem_read_bytes: 10,
+                    filesystem_hash_count: 11,
+                    filesystem_hash_bytes: 12,
+                    full_root_range_count: 13,
+                    bounded_root_range_count: 14,
+                    root_range_row_count: 15,
+                    root_point_key_count: 16,
+                    prolly_tree_batch_call_count: 17,
+                    prolly_tree_batch_mutation_count: 18,
+                    selected_worktree_index_sqlite_envelope_count: 1,
+                    selected_worktree_index_sqlite_full_scan_count: 19,
+                    selected_worktree_index_sqlite_row_read_count: 20,
+                    selected_worktree_index_sqlite_row_delete_count: 21,
+                    selected_worktree_index_sqlite_row_upsert_count: 22,
+                    selected_worktree_index_sqlite_statement_count: 23,
+                    selected_worktree_index_sqlite_transaction_count: 24,
+                    selection_comparison_count: 25,
+                    policy_build_count: 26,
+                    policy_dependency_bytes: 27,
+                    policy_dependency_file_count: 28,
+                    git_subprocess_count: 29,
+                    git_global_work_count: 30,
+                    git_output_bytes: 31,
+                    git_output_record_count: 32,
+                    daemon_snapshot_bytes: 33,
+                    daemon_snapshot_path_count: 34,
+                    manifest_bytes: 35,
+                    manifest_key_comparison_count: 36,
+                    journal_bytes: 37,
+                    upper_work_count: 38,
+                    ..OperationMetricsDelta::default()
+                });
+                metrics.note_daemon_cumulative_rewrite(13);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+
+        let report = metrics.last_report();
+        assert_eq!(report.input_path_count, 1);
+        assert_eq!(report.canonical_path_count, 2);
+        assert_eq!(report.expanded_path_count, 3);
+        assert_eq!(report.final_path_count, 4);
+        assert_eq!(report.full_filesystem_walk_count, 5);
+        assert_eq!(report.bounded_filesystem_walk_count, 6);
+        assert_eq!(report.filesystem_entry_count, 7);
+        assert_eq!(report.filesystem_stat_count, 8);
+        assert_eq!(report.filesystem_read_count, 9);
+        assert_eq!(report.filesystem_read_bytes, 10);
+        assert_eq!(report.filesystem_hash_count, 11);
+        assert_eq!(report.filesystem_hash_bytes, 12);
+        assert_eq!(report.full_root_range_count, 13);
+        assert_eq!(report.bounded_root_range_count, 14);
+        assert_eq!(report.root_range_row_count, 15);
+        assert_eq!(report.root_point_key_count, 16);
+        assert_eq!(report.prolly_tree_batch_call_count, 17);
+        assert_eq!(report.prolly_tree_batch_mutation_count, 18);
+        assert!(report.selected_worktree_index_sqlite_accounting_complete);
+        assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 1);
+        assert_eq!(report.selected_worktree_index_sqlite_full_scan_count, 19);
+        assert_eq!(report.selected_worktree_index_sqlite_row_read_count, 20);
+        assert_eq!(report.selected_worktree_index_sqlite_row_delete_count, 21);
+        assert_eq!(report.selected_worktree_index_sqlite_row_upsert_count, 22);
+        assert_eq!(report.selected_worktree_index_sqlite_statement_count, 23);
+        assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 24);
+        assert_eq!(report.selection_comparison_count, 25);
+        assert_eq!(report.policy_build_count, 26);
+        assert_eq!(report.policy_dependency_bytes, 27);
+        assert_eq!(report.policy_dependency_file_count, 28);
+        assert_eq!(report.git_subprocess_count, 29);
+        assert_eq!(report.git_global_work_count, 30);
+        assert_eq!(report.git_output_bytes, 31);
+        assert_eq!(report.git_output_record_count, 32);
+        assert_eq!(report.daemon_snapshot_bytes, 33);
+        assert_eq!(report.daemon_snapshot_path_count, 34);
+        assert_eq!(report.manifest_bytes, 35);
+        assert_eq!(report.manifest_key_comparison_count, 36);
+        assert_eq!(report.journal_bytes, 37);
+        assert_eq!(report.upper_work_count, 38);
+        assert_eq!(report.daemon_cumulative_rewrite_count, 1);
+        assert_eq!(report.daemon_cumulative_rewrite_bytes, 13);
+        assert_eq!(report.daemon_cumulative_rewrite_count_total, 2);
+        assert_eq!(report.daemon_cumulative_rewrite_bytes_total, 24);
+        assert!(report.wall_time_ns > 0);
+        assert!(report.rss_end_bytes <= report.rss_lifetime_high_water_bytes);
+        assert!(report.rss_start_bytes <= report.rss_lifetime_high_water_bytes);
+    }
+
+    #[test]
+    fn daemon_rewrite_count_and_bytes_are_snapshotted_as_one_event() {
+        const REWRITES: usize = 20_000;
+        const BYTES_PER_REWRITE: u64 = 7;
+        let metrics = Arc::new(OperationMetricsState::default());
+        let writer_metrics = Arc::clone(&metrics);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..REWRITES {
+                writer_metrics.note_daemon_cumulative_rewrite(BYTES_PER_REWRITE as usize);
+            }
+        });
+
+        while !writer.is_finished() {
+            let snapshot = metrics.snapshot();
+            assert_eq!(
+                snapshot.daemon_cumulative_rewrite_bytes,
+                snapshot
+                    .daemon_cumulative_rewrite_count
+                    .saturating_mul(BYTES_PER_REWRITE)
+            );
+        }
+        writer.join().unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.daemon_cumulative_rewrite_count, REWRITES as u64);
+        assert_eq!(
+            snapshot.daemon_cumulative_rewrite_bytes,
+            (REWRITES as u64).saturating_mul(BYTES_PER_REWRITE)
+        );
+    }
 
     #[test]
     fn case_fold_collision_validation_rejects_ambiguous_paths() {

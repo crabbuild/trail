@@ -8,19 +8,22 @@ impl Trail {
         actor: Actor,
         watch: bool,
     ) -> Result<RecordReport> {
-        self.record_with_options(
-            branch,
-            message,
-            actor,
-            RecordOptions {
-                kind: Some(if watch {
-                    OperationKind::WatchRecord
-                } else {
-                    OperationKind::ManualRecord
-                }),
-                ..RecordOptions::default()
-            },
-        )
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
+            self.record_with_options(
+                branch,
+                message,
+                actor,
+                RecordOptions {
+                    kind: Some(if watch {
+                        OperationKind::WatchRecord
+                    } else {
+                        OperationKind::ManualRecord
+                    }),
+                    ..RecordOptions::default()
+                },
+            )
+        })
     }
 
     pub fn record_with_options(
@@ -30,8 +33,11 @@ impl Trail {
         actor: Actor,
         options: RecordOptions,
     ) -> Result<RecordReport> {
-        let _lock = self.acquire_write_lock()?;
-        self.record_with_options_unlocked(branch, message, actor, options)
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
+            let _lock = self.acquire_write_lock()?;
+            self.record_with_options_unlocked(branch, message, actor, options)
+        })
     }
 
     pub(crate) fn record_with_options_unlocked(
@@ -41,10 +47,46 @@ impl Trail {
         actor: Actor,
         options: RecordOptions,
     ) -> Result<RecordReport> {
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
+            let result =
+                self.record_with_options_unlocked_profiled(branch, message, actor, options);
+            if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            result
+        })
+    }
+
+    fn record_with_options_unlocked_profiled(
+        &mut self,
+        branch: Option<&str>,
+        message: Option<String>,
+        actor: Actor,
+        options: RecordOptions,
+    ) -> Result<RecordReport> {
         let branch = branch.map(str::to_string).unwrap_or(self.current_branch()?);
         let ref_name = branch_ref(&branch);
         let head = self.get_ref(&ref_name)?;
+        self.note_operation_metrics(OperationMetricsDelta {
+            input_path_count: saturating_u64_from_usize(options.paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         let selected_paths = normalize_record_paths(&options.paths)?;
+        let explicit_selections = (!selected_paths.is_empty())
+            .then(|| SelectionSet::from_paths(&selected_paths))
+            .transpose()?;
+        self.note_operation_metrics(OperationMetricsDelta {
+            canonical_path_count: explicit_selections
+                .as_ref()
+                .map(|selections| saturating_u64_from_usize(selections.as_slice().len()))
+                .unwrap_or(0),
+            ..OperationMetricsDelta::default()
+        });
         let session_id = options
             .session_id
             .map(|session_id| {
@@ -70,13 +112,16 @@ impl Trail {
             Some(DaemonWorktreeSnapshot::Clean {
                 generation: _,
                 root_id: Some(clean_root),
-            }) if clean_root == head.root_id => {
-                return Ok(RecordReport {
-                    branch,
-                    operation: None,
-                    root_id: head.root_id,
-                    changed_paths: Vec::new(),
-                });
+            }) => {
+                if self.clean_baseline_matches_visible_root(Some(&clean_root), &head.root_id) {
+                    return Ok(RecordReport {
+                        branch,
+                        operation: None,
+                        root_id: head.root_id,
+                        changed_paths: Vec::new(),
+                    });
+                }
+                None
             }
             Some(DaemonWorktreeSnapshot::Dirty { generation, paths })
                 if paths.len() <= self.daemon_dirty_path_limit() =>
@@ -85,18 +130,25 @@ impl Trail {
             }
             _ => None,
         };
-        let fast_dirty_paths = if selected_paths.is_empty() && daemon_dirty_paths.is_none() {
-            self.scan_git_dirty_tracked_paths()?
+        let git_policy = if selected_paths.is_empty() && daemon_dirty_paths.is_none() {
+            Some(self.workspace_ignore_policy_snapshot())
         } else {
             None
         };
+        let fast_dirty_paths = match git_policy.as_ref() {
+            Some(policy) => self.scan_git_dirty_tracked_paths_with_policy(policy)?,
+            None => None,
+        };
         let disk_files;
         let build_selected_paths;
+        let build_selection_set;
         let previous_files;
         let record_generation;
         if let Some((generation, paths)) = daemon_dirty_paths {
             previous_files = self.load_root_files_for_selections(&head.root_id, &paths)?;
-            let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+            let policy = self.workspace_ignore_policy_snapshot();
+            let snapshot =
+                self.selected_worktree_snapshot_with_policy(&previous_files, &paths, &policy)?;
             self.reconcile_daemon_status_paths(
                 &head.root_id,
                 &paths,
@@ -113,6 +165,7 @@ impl Trail {
             }
             disk_files = snapshot.files;
             build_selected_paths = Some(snapshot.paths);
+            build_selection_set = None;
             record_generation = Some(generation);
         } else if let Some(paths) = fast_dirty_paths {
             if paths.is_empty() {
@@ -124,7 +177,13 @@ impl Trail {
                 });
             }
             previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
-            let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+            let snapshot = self.selected_worktree_snapshot_with_policy(
+                &previous_files,
+                &paths,
+                git_policy
+                    .as_ref()
+                    .expect("Git candidates have an operation policy snapshot"),
+            )?;
             if snapshot.paths.is_empty() {
                 return Ok(RecordReport {
                     branch,
@@ -135,19 +194,28 @@ impl Trail {
             }
             disk_files = snapshot.files;
             build_selected_paths = Some(snapshot.paths);
+            build_selection_set = None;
             record_generation = fallback_generation;
         } else if !selected_paths.is_empty() {
+            let selections = explicit_selections
+                .as_ref()
+                .expect("nonempty explicit record paths have a selection set");
             previous_files = self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-            disk_files =
-                self.scan_record_selection_files(&selected_paths, options.allow_ignored)?;
+            let policy = self.workspace_ignore_policy_snapshot();
+            disk_files = self.scan_record_selection_files_with_policy(
+                &selected_paths,
+                selections,
+                options.allow_ignored,
+                &policy,
+            )?;
             build_selected_paths = Some(selected_paths.clone());
+            build_selection_set = Some(selections.clone());
             record_generation = None;
         } else {
             let refresh = self.refresh_worktree_index_streaming_report()?;
+            let baseline = self.worktree_index_baseline_root()?;
             if !refresh.changed
-                && self
-                    .worktree_index_baseline_root()?
-                    .is_some_and(|baseline| baseline == head.root_id.clone())
+                && self.clean_baseline_matches_visible_root(baseline.as_ref(), &head.root_id)
             {
                 return Ok(RecordReport {
                     branch,
@@ -173,18 +241,31 @@ impl Trail {
             disk_files = self.scan_visible_files_for_paths(&paths)?;
             previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
             build_selected_paths = Some(paths);
+            build_selection_set = None;
             record_generation = fallback_generation;
         }
         let change_id = self.allocate_change_id(&actor.id, "record")?;
         let built = if let Some(paths) = build_selected_paths.as_deref() {
-            self.build_root_for_selected_record_incremental(
-                &head.root_id,
-                &previous_files,
-                &disk_files,
-                paths,
-                options.allow_ignored,
-                &change_id,
-            )?
+            if let Some(selections) = build_selection_set.as_ref() {
+                self.build_root_for_selected_record_incremental_with_selection_set(
+                    &head.root_id,
+                    &previous_files,
+                    &disk_files,
+                    paths,
+                    selections,
+                    options.allow_ignored,
+                    &change_id,
+                )?
+            } else {
+                self.build_root_for_selected_record_incremental(
+                    &head.root_id,
+                    &previous_files,
+                    &disk_files,
+                    paths,
+                    options.allow_ignored,
+                    &change_id,
+                )?
+            }
         } else {
             self.build_root_from_disk_files(&disk_files, &change_id, Some(&previous_files))?
         };

@@ -4,12 +4,24 @@ use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use rayon::prelude::*;
+use rusqlite::{Params, Statement, StatementStatus};
 
 const DAEMON_STATUS_DIRTY_PATH_LIMIT: usize = 16_384;
 const WORKTREE_INDEX_STAMP_LOOKUP_CHUNK: usize = 512;
 const WORKTREE_INDEX_BASELINE_ROOT_KEY: &str = "worktree.index.baseline_root";
 const DAEMON_WORKTREE_SNAPSHOT_FILE: &str = "worktree-daemon-cache.json";
 const DAEMON_WORKTREE_SNAPSHOT_VERSION: u32 = 1;
+const SELECT_WORKTREE_INDEX_EXACT_SQL: &str =
+    "SELECT path FROM worktree_file_index WHERE path COLLATE BINARY = ?1";
+const SELECT_WORKTREE_INDEX_DESCENDANTS_SQL: &str = "SELECT path FROM worktree_file_index \
+     WHERE path COLLATE BINARY >= ?1 AND path COLLATE BINARY < ?2 \
+     ORDER BY path COLLATE BINARY";
+const DELETE_WORKTREE_INDEX_PATH_SQL: &str =
+    "DELETE FROM worktree_file_index WHERE path COLLATE BINARY = ?1";
+const UPSERT_WORKTREE_INDEX_PATH_SQL: &str =
+    "INSERT OR REPLACE INTO worktree_file_index \
+     (path, size_bytes, modified_ns, changed_ns, device_id, inode, executable, kind, content_hash, last_seen_scan, updated_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 #[derive(Debug)]
 struct WorktreeIndexReadCandidate {
@@ -45,13 +57,45 @@ struct PersistedDaemonWorktreeSnapshot {
 }
 
 impl Trail {
+    /// Returns true only when a clean baseline identifies the same immutable
+    /// visible file state as `target_root_id`. Path-invariant indexes and
+    /// creator metadata are deliberately excluded because they do not change
+    /// materialized bytes, paths, modes, or file identities.
+    pub(crate) fn clean_baseline_matches_visible_root(
+        &self,
+        baseline_root_id: Option<&ObjectId>,
+        target_root_id: &ObjectId,
+    ) -> bool {
+        let Some(baseline_root_id) = baseline_root_id else {
+            return false;
+        };
+        if baseline_root_id == target_root_id {
+            return true;
+        }
+        let Ok(baseline) = self.get_object::<WorktreeRoot>(WORKTREE_ROOT_KIND, baseline_root_id)
+        else {
+            return false;
+        };
+        let Ok(target) = self.get_object::<WorktreeRoot>(WORKTREE_ROOT_KIND, target_root_id) else {
+            return false;
+        };
+        baseline.path_map_root == target.path_map_root
+            && baseline.file_index_map_root == target.file_index_map_root
+            && baseline.file_count == target.file_count
+            && baseline.total_text_bytes == target.total_text_bytes
+    }
+
     pub fn enable_daemon_worktree_cache(&mut self) -> Result<()> {
         let warmup = self.start_daemon_worktree_cache()?;
         warmup.run()
     }
 
     pub fn start_daemon_worktree_cache(&mut self) -> Result<DaemonWorktreeCacheWarmup> {
-        let cache = DaemonWorktreeCache::start(&self.workspace_root, &self.db_dir)?;
+        let cache = DaemonWorktreeCache::start(
+            &self.workspace_root,
+            &self.db_dir,
+            self.operation_metrics.clone(),
+        )?;
         let warmup = DaemonWorktreeCacheWarmup {
             workspace_root: self.workspace_root.clone(),
             db_dir: self.db_dir.clone(),
@@ -83,14 +127,36 @@ impl Trail {
     }
 
     pub(crate) fn daemon_worktree_snapshot(&self) -> Option<DaemonWorktreeSnapshot> {
-        if let Some(snapshot) = self
+        let snapshot = if let Some(snapshot) = self
             .daemon_worktree_cache
             .as_ref()
             .map(DaemonWorktreeCache::snapshot)
         {
-            return Some(snapshot);
+            Some(snapshot)
+        } else {
+            self.persisted_daemon_worktree_snapshot().ok().flatten()
+        };
+        if let Some(snapshot) = &snapshot {
+            let (input_path_count, canonical_path_count) = match snapshot {
+                DaemonWorktreeSnapshot::Dirty { paths, .. } => {
+                    let input_path_count = saturating_u64_from_usize(paths.len());
+                    let canonical_path_count = SelectionSet::from_paths(paths)
+                        .map(|selections| saturating_u64_from_usize(selections.as_slice().len()))
+                        .unwrap_or(0);
+                    (input_path_count, canonical_path_count)
+                }
+                DaemonWorktreeSnapshot::Clean { .. } | DaemonWorktreeSnapshot::Overflow { .. } => {
+                    (0, 0)
+                }
+            };
+            self.note_operation_metrics(OperationMetricsDelta {
+                input_path_count,
+                canonical_path_count,
+                daemon_snapshot_path_count: input_path_count,
+                ..OperationMetricsDelta::default()
+            });
         }
-        self.persisted_daemon_worktree_snapshot().ok().flatten()
+        snapshot
     }
 
     pub(crate) fn daemon_dirty_path_limit(&self) -> usize {
@@ -104,6 +170,10 @@ impl Trail {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(Error::Io(err)),
         };
+        self.note_operation_metrics(OperationMetricsDelta {
+            daemon_snapshot_bytes: saturating_u64_from_usize(bytes.len()),
+            ..OperationMetricsDelta::default()
+        });
         let snapshot: PersistedDaemonWorktreeSnapshot = serde_json::from_slice(&bytes)?;
         if snapshot.version != DAEMON_WORKTREE_SNAPSHOT_VERSION
             || snapshot.workspace_root != self.workspace_root.to_string_lossy()
@@ -185,6 +255,13 @@ impl Trail {
         &self,
         scan_id: i64,
     ) -> Result<WorktreeIndexRefresh> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let indexed_entries = self.worktree_index_count()?;
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
@@ -195,6 +272,7 @@ impl Trail {
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
 
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut count = 0u64;
         let mut indexed_seen = 0u64;
@@ -209,6 +287,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -223,6 +305,10 @@ impl Trail {
                 continue;
             }
 
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = fs::symlink_metadata(path)?;
             let stamp = WorktreeFileStamp::from_metadata(&metadata);
             if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
@@ -244,7 +330,11 @@ impl Trail {
 
         let has_deleted_index_entries = indexed_seen < indexed_entries;
         let changed = !read_candidates.is_empty() || has_deleted_index_entries;
-        let updates = read_worktree_index_candidates(&read_candidates, &self.config.text)?;
+        let updates = read_worktree_index_candidates(
+            &read_candidates,
+            &self.config.text,
+            self.operation_metrics.as_ref(),
+        )?;
         for update in updates {
             self.upsert_worktree_index_manifest_for_scan(
                 &update.path,
@@ -269,6 +359,13 @@ impl Trail {
     pub(crate) fn scan_worktree_manifest_indexed_with_stamps(
         &self,
     ) -> Result<BTreeMap<String, IndexedDiskManifest>> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -278,6 +375,7 @@ impl Trail {
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
 
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut manifest = BTreeMap::new();
         let mut seen = BTreeSet::new();
@@ -287,6 +385,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -301,12 +403,33 @@ impl Trail {
                 continue;
             }
 
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = fs::symlink_metadata(path)?;
             let stamp = WorktreeFileStamp::from_metadata(&metadata);
             let disk_manifest = if let Some(cached) = self.cached_worktree_manifest(&rel, stamp)? {
                 cached
             } else {
+                filesystem_metrics.delta.filesystem_read_count = filesystem_metrics
+                    .delta
+                    .filesystem_read_count
+                    .saturating_add(1);
                 let bytes = fs::read(path)?;
+                let bytes_len = saturating_u64_from_usize(bytes.len());
+                filesystem_metrics.delta.filesystem_read_bytes = filesystem_metrics
+                    .delta
+                    .filesystem_read_bytes
+                    .saturating_add(bytes_len);
+                filesystem_metrics.delta.filesystem_hash_count = filesystem_metrics
+                    .delta
+                    .filesystem_hash_count
+                    .saturating_add(1);
+                filesystem_metrics.delta.filesystem_hash_bytes = filesystem_metrics
+                    .delta
+                    .filesystem_hash_bytes
+                    .saturating_add(bytes_len);
                 let disk_manifest = DiskManifest {
                     kind: classify_file_kind(&bytes, &self.config.text),
                     executable: stamp.executable,
@@ -353,7 +476,8 @@ impl Trail {
         root_id: &ObjectId,
         files: &BTreeMap<String, FileEntry>,
     ) -> Result<Option<BTreeMap<String, WorktreeFileStamp>>> {
-        if self.worktree_index_baseline_root()?.as_ref() != Some(root_id) {
+        let baseline = self.worktree_index_baseline_root()?;
+        if !self.clean_baseline_matches_visible_root(baseline.as_ref(), root_id) {
             return Ok(None);
         }
         if files.is_empty() {
@@ -439,6 +563,13 @@ impl Trail {
     }
 
     fn scan_visible_worktree_paths(&self) -> Result<BTreeSet<String>> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -448,6 +579,7 @@ impl Trail {
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
 
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut paths = BTreeSet::new();
         for item in walker {
@@ -456,6 +588,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -550,6 +686,168 @@ impl Trail {
             ])?;
         }
         Ok(())
+    }
+
+    /// Synchronize only the selected portion of the worktree cache. The
+    /// metrics emitted here are complete for this SQL envelope, not for every
+    /// SQLite statement issued by the containing Trail operation.
+    pub(crate) fn sync_selected_worktree_index(
+        &self,
+        selections: &[String],
+        paths: &[String],
+        manifests: &BTreeMap<String, DiskManifest>,
+    ) -> Result<()> {
+        if selections.is_empty() && paths.is_empty() {
+            return Ok(());
+        }
+
+        let mut sqlite_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                selected_worktree_index_sqlite_envelope_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
+        note_selected_index_statement(&mut sqlite_metrics);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        sqlite_metrics
+            .delta
+            .selected_worktree_index_sqlite_transaction_count = sqlite_metrics
+            .delta
+            .selected_worktree_index_sqlite_transaction_count
+            .saturating_add(1);
+
+        let mut pending_row_deletes = 0u64;
+        let mut pending_row_upserts = 0u64;
+        let result = (|| {
+            let minimal_selections = minimal_component_selections(selections);
+            let mut cached_paths = BTreeSet::new();
+            {
+                let mut exact = self.conn.prepare(SELECT_WORKTREE_INDEX_EXACT_SQL)?;
+                let mut descendants = self.conn.prepare(SELECT_WORKTREE_INDEX_DESCENDANTS_SQL)?;
+                for selection in minimal_selections {
+                    cached_paths.extend(query_selected_index_paths(
+                        &mut exact,
+                        params![selection.as_str()],
+                        &mut sqlite_metrics,
+                    )?);
+                    let (lower, upper) = selected_path_descendant_bounds(&selection);
+                    cached_paths.extend(query_selected_index_paths(
+                        &mut descendants,
+                        params![lower, upper],
+                        &mut sqlite_metrics,
+                    )?);
+                }
+            }
+
+            let seen = paths.iter().map(String::as_str).collect::<HashSet<_>>();
+            let paths_to_delete = cached_paths
+                .into_iter()
+                .filter(|path| !seen.contains(path.as_str()))
+                .collect::<Vec<_>>();
+            if paths_to_delete.is_empty() && paths.is_empty() {
+                return Ok(());
+            }
+
+            {
+                let mut clear_baseline = self
+                    .conn
+                    .prepare("DELETE FROM schema_meta WHERE key = ?1")?;
+                execute_selected_index_statement(
+                    &mut clear_baseline,
+                    params![WORKTREE_INDEX_BASELINE_ROOT_KEY],
+                    &mut sqlite_metrics,
+                )?;
+            }
+
+            let scan_id = worktree_scan_id();
+            let now = now_ts();
+            let mut delete = self.conn.prepare(DELETE_WORKTREE_INDEX_PATH_SQL)?;
+            let mut upsert = self.conn.prepare(UPSERT_WORKTREE_INDEX_PATH_SQL)?;
+            for path in paths_to_delete {
+                let deleted = execute_selected_index_statement(
+                    &mut delete,
+                    params![path],
+                    &mut sqlite_metrics,
+                )?;
+                pending_row_deletes =
+                    pending_row_deletes.saturating_add(saturating_u64_from_usize(deleted));
+            }
+            for path in paths {
+                let abs = self.workspace_root.join(path_from_rel(path));
+                let metadata = match fs::symlink_metadata(&abs) {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        let deleted = execute_selected_index_statement(
+                            &mut delete,
+                            params![path],
+                            &mut sqlite_metrics,
+                        )?;
+                        pending_row_deletes =
+                            pending_row_deletes.saturating_add(saturating_u64_from_usize(deleted));
+                        continue;
+                    }
+                    Err(err) => return Err(Error::Io(err)),
+                };
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    let deleted = execute_selected_index_statement(
+                        &mut delete,
+                        params![path],
+                        &mut sqlite_metrics,
+                    )?;
+                    pending_row_deletes =
+                        pending_row_deletes.saturating_add(saturating_u64_from_usize(deleted));
+                    continue;
+                }
+                let stamp = WorktreeFileStamp::from_metadata(&metadata);
+                let disk_manifest = manifests.get(path).ok_or_else(|| {
+                    Error::Corrupt(format!("missing computed disk manifest for `{}`", path))
+                })?;
+                let upserted = execute_selected_index_statement(
+                    &mut upsert,
+                    params![
+                        path.as_str(),
+                        stamp.size_bytes as i64,
+                        stamp.modified_ns,
+                        stamp.changed_ns,
+                        stamp.device_id,
+                        stamp.inode,
+                        i64::from(stamp.executable),
+                        file_kind_index_label(&disk_manifest.kind),
+                        disk_manifest.content_hash.as_str(),
+                        scan_id,
+                        now
+                    ],
+                    &mut sqlite_metrics,
+                )?;
+                pending_row_upserts =
+                    pending_row_upserts.saturating_add(saturating_u64_from_usize(upserted));
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                note_selected_index_statement(&mut sqlite_metrics);
+                if let Err(err) = self.conn.execute_batch("COMMIT;") {
+                    note_selected_index_statement(&mut sqlite_metrics);
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err(Error::from(err));
+                }
+                sqlite_metrics
+                    .delta
+                    .selected_worktree_index_sqlite_row_delete_count = pending_row_deletes;
+                sqlite_metrics
+                    .delta
+                    .selected_worktree_index_sqlite_row_upsert_count = pending_row_upserts;
+                Ok(())
+            }
+            Err(err) => {
+                note_selected_index_statement(&mut sqlite_metrics);
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
+        }
     }
 
     pub(crate) fn delete_worktree_index_path(&self, path: &str) -> Result<()> {
@@ -673,31 +971,6 @@ impl Trail {
         Ok(())
     }
 
-    pub(crate) fn prune_worktree_index_for_selections(
-        &self,
-        selections: &[String],
-        seen: &BTreeSet<String>,
-    ) -> Result<()> {
-        let mut stmt = self.conn.prepare("SELECT path FROM worktree_file_index")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let cached_paths = rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)?;
-        drop(stmt);
-        for path in cached_paths {
-            if seen.contains(&path) {
-                continue;
-            }
-            if selections
-                .iter()
-                .any(|selection| path_matches_selection(&path, selection))
-            {
-                self.delete_worktree_index_path(&path)?;
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn worktree_index_baseline_root(&self) -> Result<Option<ObjectId>> {
         Ok(self
             .schema_meta_value(WORKTREE_INDEX_BASELINE_ROOT_KEY)?
@@ -721,6 +994,91 @@ impl Trail {
     }
 }
 
+fn minimal_component_selections(selections: &[String]) -> Vec<String> {
+    let unique = selections
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut minimal = BTreeSet::new();
+    for selection in unique {
+        let covered = selection
+            .match_indices('/')
+            .any(|(separator, _)| minimal.contains(&selection[..separator]));
+        if !covered {
+            minimal.insert(selection.to_string());
+        }
+    }
+    minimal.into_iter().collect()
+}
+
+fn selected_path_descendant_bounds(selection: &str) -> (String, String) {
+    let lower = format!("{selection}/");
+    let mut upper = lower.as_bytes().to_vec();
+    let terminal_separator = upper
+        .last_mut()
+        .expect("selected descendant lower bound always ends in slash");
+    debug_assert_eq!(*terminal_separator, b'/');
+    *terminal_separator = b'0';
+    let upper = String::from_utf8(upper)
+        .expect("incrementing an ASCII path separator preserves valid UTF-8");
+    (lower, upper)
+}
+
+fn note_selected_index_statement(metrics: &mut OperationMetricsAccumulator) {
+    metrics.delta.selected_worktree_index_sqlite_statement_count = metrics
+        .delta
+        .selected_worktree_index_sqlite_statement_count
+        .saturating_add(1);
+}
+
+fn note_selected_index_full_scan(
+    statement: &Statement<'_>,
+    metrics: &mut OperationMetricsAccumulator,
+) {
+    if statement.get_status(StatementStatus::FullscanStep) > 0 {
+        metrics.delta.selected_worktree_index_sqlite_full_scan_count = metrics
+            .delta
+            .selected_worktree_index_sqlite_full_scan_count
+            .saturating_add(1);
+    }
+}
+
+fn execute_selected_index_statement<P: Params>(
+    statement: &mut Statement<'_>,
+    params: P,
+    metrics: &mut OperationMetricsAccumulator,
+) -> Result<usize> {
+    statement.reset_status(StatementStatus::FullscanStep);
+    note_selected_index_statement(metrics);
+    let result = statement.execute(params).map_err(Error::from);
+    note_selected_index_full_scan(statement, metrics);
+    result
+}
+
+fn query_selected_index_paths<P: Params>(
+    statement: &mut Statement<'_>,
+    params: P,
+    metrics: &mut OperationMetricsAccumulator,
+) -> Result<Vec<String>> {
+    statement.reset_status(StatementStatus::FullscanStep);
+    note_selected_index_statement(metrics);
+    let result = (|| -> rusqlite::Result<Vec<String>> {
+        let mut rows = statement.query(params)?;
+        let mut paths = Vec::new();
+        while let Some(row) = rows.next()? {
+            paths.push(row.get::<_, String>(0)?);
+            metrics.delta.selected_worktree_index_sqlite_row_read_count = metrics
+                .delta
+                .selected_worktree_index_sqlite_row_read_count
+                .saturating_add(1);
+        }
+        Ok(paths)
+    })()
+    .map_err(Error::from);
+    note_selected_index_full_scan(statement, metrics);
+    result
+}
+
 fn cached_worktree_file_stamp(
     stmt: &mut rusqlite::Statement<'_>,
     path: &str,
@@ -742,25 +1100,42 @@ fn cached_worktree_file_stamp(
 fn read_worktree_index_candidates(
     candidates: &[WorktreeIndexReadCandidate],
     text_config: &TextConfig,
+    metrics: Option<&Arc<OperationMetricsState>>,
 ) -> Result<Vec<WorktreeIndexUpdate>> {
     if candidates.len() <= 1 {
         return candidates
             .iter()
-            .map(|candidate| read_worktree_index_candidate(candidate, text_config))
+            .map(|candidate| read_worktree_index_candidate(candidate, text_config, metrics))
             .collect();
     }
 
     candidates
         .par_iter()
-        .map(|candidate| read_worktree_index_candidate(candidate, text_config))
+        .map(|candidate| read_worktree_index_candidate(candidate, text_config, metrics))
         .collect()
 }
 
 fn read_worktree_index_candidate(
     candidate: &WorktreeIndexReadCandidate,
     text_config: &TextConfig,
+    metrics: Option<&Arc<OperationMetricsState>>,
 ) -> Result<WorktreeIndexUpdate> {
+    if let Some(metrics) = metrics {
+        metrics.add(OperationMetricsDelta {
+            filesystem_read_count: 1,
+            ..OperationMetricsDelta::default()
+        });
+    }
     let bytes = fs::read(&candidate.abs_path)?;
+    if let Some(metrics) = metrics {
+        let bytes_len = saturating_u64_from_usize(bytes.len());
+        metrics.add(OperationMetricsDelta {
+            filesystem_read_bytes: bytes_len,
+            filesystem_hash_count: 1,
+            filesystem_hash_bytes: bytes_len,
+            ..OperationMetricsDelta::default()
+        });
+    }
     Ok(WorktreeIndexUpdate {
         path: candidate.path.clone(),
         stamp: candidate.stamp,
@@ -806,7 +1181,11 @@ pub(crate) fn file_kind_from_index(value: &str) -> std::result::Result<FileKind,
 }
 
 impl DaemonWorktreeCache {
-    fn start(workspace_root: &Path, db_dir: &Path) -> Result<Self> {
+    fn start(
+        workspace_root: &Path,
+        db_dir: &Path,
+        metrics: Option<Arc<OperationMetricsState>>,
+    ) -> Result<Self> {
         let state = Arc::new(Mutex::new(DaemonWorktreeCacheState::default()));
         let root = workspace_root.to_path_buf();
         let persist = DaemonWorktreeCachePersist {
@@ -814,6 +1193,7 @@ impl DaemonWorktreeCache {
             workspace_root: workspace_root.to_path_buf(),
             pid: std::process::id(),
             active: Arc::new(AtomicBool::new(true)),
+            metrics,
         };
         persist_daemon_worktree_state(&persist, &state);
         let state_for_watcher = Arc::clone(&state);
@@ -969,11 +1349,11 @@ fn handle_daemon_watch_event(
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
-    if daemon_event_paths_all_default_ignored(root, &event.paths) {
-        return;
-    }
     if daemon_event_touches_ignore_file(root, &event.paths) {
         mark_daemon_cache_overflow(state, persist);
+        return;
+    }
+    if daemon_event_paths_all_default_ignored(root, &event.paths) {
         return;
     }
     if matches!(
@@ -1023,8 +1403,7 @@ fn daemon_event_paths_all_default_ignored(root: &Path, paths: &[PathBuf]) -> boo
 
 fn daemon_event_touches_ignore_file(root: &Path, paths: &[PathBuf]) -> bool {
     paths.iter().any(|path| {
-        daemon_event_relative_path(root, path)
-            .is_some_and(|path| path == ".trailignore" || path == ".gitignore")
+        daemon_event_relative_path(root, path).is_some_and(|path| is_ignore_policy_path(&path))
     })
 }
 
@@ -1174,6 +1553,9 @@ fn persist_daemon_worktree_state(
     let Ok(bytes) = serde_json::to_vec(&snapshot) else {
         return;
     };
+    if let Some(metrics) = &persist.metrics {
+        metrics.note_daemon_cumulative_rewrite(bytes.len());
+    }
     if fs::write(&tmp, bytes).is_err() {
         return;
     }
@@ -1215,6 +1597,359 @@ impl Drop for DaemonWorktreeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_worktree_index_paths(db: &Trail, paths: &[String]) {
+        db.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        {
+            let mut insert = db
+                .conn
+                .prepare(
+                    "INSERT OR REPLACE INTO worktree_file_index \
+                     (path, size_bytes, modified_ns, changed_ns, device_id, inode, executable, kind, content_hash, last_seen_scan, updated_at) \
+                     VALUES (?1, 1, 1, 1, 1, 1, 0, 'Text', 'seed', 1, 1)",
+                )
+                .unwrap();
+            for path in paths {
+                insert.execute(params![path]).unwrap();
+            }
+        }
+        db.conn.execute_batch("COMMIT;").unwrap();
+    }
+
+    fn selected_sync_manifest(path: &str, bytes: &[u8]) -> BTreeMap<String, DiskManifest> {
+        BTreeMap::from([(
+            path.to_string(),
+            DiskManifest {
+                kind: FileKind::Text,
+                executable: false,
+                content_hash: sha256_hex(bytes),
+            },
+        )])
+    }
+
+    fn profile_selected_worktree_index_sync(
+        db: &Trail,
+        selections: &[String],
+        paths: &[String],
+        manifests: &BTreeMap<String, DiskManifest>,
+    ) -> Result<OperationMetricsReport> {
+        let metrics = Arc::clone(
+            db.operation_metrics
+                .as_ref()
+                .expect("test operation metrics should be enabled"),
+        );
+        metrics.profile(OperationMetricsKind::Diff, || {
+            db.sync_selected_worktree_index(selections, paths, manifests)
+        })?;
+        Ok(metrics.last_report())
+    }
+
+    fn selected_sync_scale_fixture(
+        decoy_count: usize,
+    ) -> (OperationMetricsReport, u64, Vec<String>, Option<ObjectId>) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("live-dir")).unwrap();
+        fs::write(temp.path().join("live-dir/keep.txt"), b"live\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+
+        let mut seeded = (0..decoy_count)
+            .map(|index| format!("decoy/{index:05}.txt"))
+            .collect::<Vec<_>>();
+        seeded.extend([
+            "exact.txt".to_string(),
+            "deleted-dir/a.txt".to_string(),
+            "deleted-dir/nested/b.txt".to_string(),
+            "live-dir/keep.txt".to_string(),
+        ]);
+        seed_worktree_index_paths(&db, &seeded);
+        db.set_worktree_index_baseline(&ObjectId("selected-sync-baseline".to_string()))
+            .unwrap();
+
+        let selections = ["exact.txt", "deleted-dir", "live-dir"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let live_path = "live-dir/keep.txt".to_string();
+        let paths = vec![live_path.clone()];
+        let manifests = selected_sync_manifest(&live_path, b"live\n");
+        let report =
+            profile_selected_worktree_index_sync(&db, &selections, &paths, &manifests).unwrap();
+
+        let decoys = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM worktree_file_index WHERE path >= 'decoy/' AND path < 'decoy0'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            .max(0) as u64;
+        let selected_rows = db
+            .conn
+            .prepare(
+                "SELECT path FROM worktree_file_index \
+                 WHERE path = 'exact.txt' \
+                    OR (path >= 'deleted-dir/' AND path < 'deleted-dir0') \
+                    OR (path >= 'live-dir/' AND path < 'live-dir0') \
+                 ORDER BY path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let baseline = db.worktree_index_baseline_root().unwrap();
+        (report, decoys, selected_rows, baseline)
+    }
+
+    #[test]
+    fn selected_worktree_index_sync_is_bounded_independent_of_repository_rows() {
+        let (small, small_decoys, small_rows, small_baseline) = selected_sync_scale_fixture(0);
+        let (large, large_decoys, large_rows, large_baseline) = selected_sync_scale_fixture(10_000);
+
+        assert_eq!(small_decoys, 0);
+        assert_eq!(large_decoys, 10_000);
+        assert_eq!(small_rows, vec!["live-dir/keep.txt"]);
+        assert_eq!(large_rows, small_rows);
+        assert_eq!(small_baseline, None);
+        assert_eq!(large_baseline, None);
+        for report in [&small, &large] {
+            assert!(report.selected_worktree_index_sqlite_accounting_complete);
+            assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 1);
+            assert_eq!(report.selected_worktree_index_sqlite_full_scan_count, 0);
+            assert_eq!(report.selected_worktree_index_sqlite_row_read_count, 4);
+            assert_eq!(report.selected_worktree_index_sqlite_row_delete_count, 3);
+            assert_eq!(report.selected_worktree_index_sqlite_row_upsert_count, 1);
+            assert_eq!(report.selected_worktree_index_sqlite_statement_count, 13);
+            assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 1);
+        }
+    }
+
+    #[test]
+    fn selected_worktree_index_true_empty_input_preserves_baseline_without_an_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let baseline = ObjectId("empty-sync-baseline".to_string());
+        db.set_worktree_index_baseline(&baseline).unwrap();
+
+        let report = profile_selected_worktree_index_sync(&db, &[], &[], &BTreeMap::new()).unwrap();
+
+        assert_eq!(db.worktree_index_baseline_root().unwrap(), Some(baseline));
+        assert!(!report.selected_worktree_index_sqlite_accounting_complete);
+        assert_eq!(report.selected_worktree_index_sqlite_envelope_count, 0);
+        assert_eq!(report.selected_worktree_index_sqlite_statement_count, 0);
+        assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 0);
+    }
+
+    #[test]
+    fn selected_worktree_index_queries_use_binary_primary_key_searches() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+
+        let explain = |sql: &str, parameters: &[&str]| {
+            let sql = format!("EXPLAIN QUERY PLAN {sql}");
+            db.conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map(params_from_iter(parameters.iter().copied()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let exact = explain(SELECT_WORKTREE_INDEX_EXACT_SQL, &["src"]);
+        let range = explain(SELECT_WORKTREE_INDEX_DESCENDANTS_SQL, &["src/", "src0"]);
+
+        assert!(exact
+            .iter()
+            .any(|detail| detail.contains("SEARCH worktree_file_index")));
+        assert!(exact.iter().any(|detail| detail.contains("path=?")));
+        assert!(exact
+            .iter()
+            .all(|detail| !detail.contains("SCAN worktree_file_index")));
+        assert!(range
+            .iter()
+            .any(|detail| detail.contains("SEARCH worktree_file_index")));
+        assert!(range
+            .iter()
+            .any(|detail| { detail.contains("path>?") && detail.contains("path<?") }));
+        assert!(range
+            .iter()
+            .all(|detail| !detail.contains("SCAN worktree_file_index")));
+    }
+
+    #[test]
+    fn selected_worktree_index_binary_ranges_preserve_unicode_and_special_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let selected = "unicodé_%[目录]";
+        let selected_rows = [
+            selected.to_string(),
+            format!("{selected}/child_%.txt"),
+            format!("{selected}/nested/[leaf].txt"),
+        ];
+        let sibling_rows = [
+            format!("{selected}-sibling.txt"),
+            format!("{selected}.sibling.txt"),
+            format!("{selected}0sibling.txt"),
+            "UNICODÉ_%[目录]/case.txt".to_string(),
+        ];
+        let mut seeded = selected_rows.to_vec();
+        seeded.extend(sibling_rows.clone());
+        seed_worktree_index_paths(&db, &seeded);
+
+        let report = profile_selected_worktree_index_sync(
+            &db,
+            &[selected.to_string()],
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        for path in selected_rows {
+            assert_eq!(
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM worktree_file_index WHERE path = ?1",
+                        params![path],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "selected path must be deleted"
+            );
+        }
+        for path in sibling_rows {
+            assert_eq!(
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM worktree_file_index WHERE path = ?1",
+                        params![path],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "binary sibling must remain"
+            );
+        }
+        assert_eq!(report.selected_worktree_index_sqlite_full_scan_count, 0);
+        assert_eq!(report.selected_worktree_index_sqlite_row_read_count, 3);
+        assert_eq!(report.selected_worktree_index_sqlite_row_delete_count, 3);
+    }
+
+    #[test]
+    fn selected_worktree_index_sync_deduplicates_overlapping_component_selections() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        seed_worktree_index_paths(
+            &db,
+            &[
+                "tree/a.txt".to_string(),
+                "tree/sub/b.txt".to_string(),
+                "treehouse/keep.txt".to_string(),
+            ],
+        );
+        let selections = ["tree/sub", "tree", "tree/sub/b.txt", "tree"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        let report =
+            profile_selected_worktree_index_sync(&db, &selections, &[], &BTreeMap::new()).unwrap();
+
+        assert_eq!(report.selected_worktree_index_sqlite_row_read_count, 2);
+        assert_eq!(report.selected_worktree_index_sqlite_row_delete_count, 2);
+        assert_eq!(report.selected_worktree_index_sqlite_statement_count, 7);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM worktree_file_index WHERE path = 'treehouse/keep.txt'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_worktree_index_commit_failure_rolls_back_baseline_and_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        fs::create_dir_all(temp.path().join("live")).unwrap();
+        fs::write(temp.path().join("live/upsert.txt"), b"live\n").unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        seed_worktree_index_paths(&db, &["gone.txt".to_string()]);
+        let baseline = ObjectId("rollback-baseline".to_string());
+        db.set_worktree_index_baseline(&baseline).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE selected_sync_commit_parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE selected_sync_commit_child (
+                    parent_id INTEGER REFERENCES selected_sync_commit_parent(id)
+                        DEFERRABLE INITIALLY DEFERRED
+                 );
+                 CREATE TRIGGER selected_sync_fail_commit
+                 AFTER INSERT ON worktree_file_index
+                 WHEN NEW.path = 'live/upsert.txt'
+                 BEGIN
+                    INSERT INTO selected_sync_commit_child(parent_id) VALUES (1);
+                 END;",
+            )
+            .unwrap();
+        let live_path = "live/upsert.txt".to_string();
+        let manifests = selected_sync_manifest(&live_path, b"live\n");
+        let metrics = Arc::clone(db.operation_metrics.as_ref().unwrap());
+
+        let result = metrics.profile(OperationMetricsKind::Diff, || {
+            db.sync_selected_worktree_index(
+                &["gone.txt".to_string(), "live".to_string()],
+                &[live_path],
+                &manifests,
+            )
+        });
+
+        assert!(result.is_err());
+        let report = metrics.last_report();
+        assert!(report.selected_worktree_index_sqlite_accounting_complete);
+        assert_eq!(report.selected_worktree_index_sqlite_transaction_count, 1);
+        assert_eq!(report.selected_worktree_index_sqlite_row_read_count, 1);
+        assert_eq!(report.selected_worktree_index_sqlite_row_delete_count, 0);
+        assert_eq!(report.selected_worktree_index_sqlite_row_upsert_count, 0);
+        assert_eq!(report.selected_worktree_index_sqlite_statement_count, 10);
+        assert_eq!(db.worktree_index_baseline_root().unwrap(), Some(baseline));
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM worktree_file_index WHERE path = 'gone.txt'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM worktree_file_index WHERE path = 'live/upsert.txt'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn daemon_rename_both_tracks_file_paths_without_overflow() {
@@ -1290,6 +2025,178 @@ mod tests {
         assert_eq!(state.baseline_root_id, None);
         assert!(state.dirty_paths.contains("created"));
         assert!(state.dirty_paths.contains("removed"));
+    }
+
+    #[test]
+    fn daemon_root_and_nested_policy_file_events_mark_overflow() {
+        let temp = tempfile::tempdir().unwrap();
+        for path in [
+            ".trailignore",
+            ".gitignore",
+            "nested/.trailignore",
+            "nested/.gitignore",
+        ] {
+            let state = Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                baseline_root_id: Some(ObjectId("root".to_string())),
+                ..DaemonWorktreeCacheState::default()
+            }));
+            handle_daemon_watch_event(
+                temp.path(),
+                &state,
+                None,
+                Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(temp.path().join(path))),
+            );
+
+            let state = state.lock().unwrap();
+            assert!(state.overflow, "policy event {path} did not overflow");
+            assert_eq!(state.baseline_root_id, None, "{path}");
+            assert!(state.dirty_paths.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn daemon_non_policy_suffixes_remain_bounded_dirty_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(DaemonWorktreeCacheState {
+            initialized: true,
+            baseline_root_id: Some(ObjectId("root".to_string())),
+            ..DaemonWorktreeCacheState::default()
+        }));
+        for path in ["nested/not.trailignore", "nested/.gitignore.bak"] {
+            handle_daemon_watch_event(
+                temp.path(),
+                &state,
+                None,
+                Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(temp.path().join(path))),
+            );
+        }
+
+        let state = state.lock().unwrap();
+        assert!(!state.overflow);
+        assert!(state.dirty_paths.contains("nested/not.trailignore"));
+        assert!(state.dirty_paths.contains("nested/.gitignore.bak"));
+    }
+
+    #[test]
+    fn daemon_nested_trailignore_event_cannot_leave_status_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("nested")).unwrap();
+        fs::write(temp.path().join("nested/.trailignore"), "hidden.txt\n").unwrap();
+        fs::write(temp.path().join("nested/hidden.txt"), "hidden baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        db.daemon_worktree_cache = Some(DaemonWorktreeCache {
+            state: Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                baseline_root_id: Some(head.root_id),
+                generation: 1,
+                ..DaemonWorktreeCacheState::default()
+            })),
+            persist: None,
+            watcher: None,
+        });
+        fs::write(temp.path().join("nested/.trailignore"), "").unwrap();
+        let cache = db.daemon_worktree_cache.as_ref().unwrap();
+        handle_daemon_watch_event(
+            temp.path(),
+            &cache.state,
+            None,
+            Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(temp.path().join("nested/.trailignore"))),
+        );
+
+        let status = db.status(None).unwrap();
+
+        assert!(
+            status
+                .changed_paths
+                .iter()
+                .any(|change| change.path == "nested/hidden.txt"),
+            "nested policy change incorrectly produced {:?}",
+            status.changed_paths
+        );
+        let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
+        assert_eq!(report.git_global_work_count, 1);
+        assert_eq!(report.full_filesystem_walk_count, 1);
+    }
+
+    #[test]
+    fn invalid_daemon_selection_reports_zero_canonical_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.daemon_worktree_cache = Some(DaemonWorktreeCache {
+            state: Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                dirty_paths: BTreeSet::from(["../outside".to_string()]),
+                generation: 1,
+                ..DaemonWorktreeCacheState::default()
+            })),
+            persist: None,
+            watcher: None,
+        });
+        let metrics = db.operation_metrics.as_ref().unwrap();
+
+        profile_operation_metrics(Some(metrics), OperationMetricsKind::Status, || {
+            assert!(matches!(
+                db.daemon_worktree_snapshot(),
+                Some(DaemonWorktreeSnapshot::Dirty { .. })
+            ));
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+
+        let report = operation_metrics_report(Some(metrics)).unwrap();
+        assert_eq!(report.input_path_count, 1);
+        assert_eq!(report.canonical_path_count, 0);
+        assert_eq!(report.daemon_snapshot_path_count, 1);
+    }
+
+    #[test]
+    fn oversized_daemon_status_accounts_snapshot_once_before_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let raw_count = db.daemon_dirty_path_limit() + 1;
+        let dirty_paths = (0..raw_count)
+            .map(|index| format!("dirty/file_{index:05}.txt"))
+            .collect::<BTreeSet<_>>();
+        db.daemon_worktree_cache = Some(DaemonWorktreeCache {
+            state: Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                dirty_paths,
+                generation: 1,
+                ..DaemonWorktreeCacheState::default()
+            })),
+            persist: None,
+            watcher: None,
+        });
+
+        let _status = db.status(None).unwrap();
+
+        let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
+        assert_eq!(
+            report.input_path_count,
+            saturating_u64_from_usize(raw_count)
+        );
+        assert_eq!(
+            report.canonical_path_count,
+            saturating_u64_from_usize(raw_count)
+        );
+        assert_eq!(
+            report.daemon_snapshot_path_count,
+            saturating_u64_from_usize(raw_count)
+        );
     }
 
     #[test]
@@ -1434,7 +2341,7 @@ mod tests {
             preserve_similarity: 0.0,
         };
 
-        let updates = read_worktree_index_candidates(&candidates, &text_config).unwrap();
+        let updates = read_worktree_index_candidates(&candidates, &text_config, None).unwrap();
 
         let updates = updates
             .into_iter()

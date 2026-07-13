@@ -2038,6 +2038,7 @@ mod tests {
         let started = Instant::now();
         let mut paths = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
         let mut file_index = BatchBuilder::new(db.store.clone(), root_map_prolly_config());
+        let mut case_fold = SortedBatchBuilder::new(db.store.clone(), root_map_prolly_config());
         const PATHS: u64 = 1_000_000;
         for index in 0..PATHS {
             let path = format!("tree/{:04}/{:08}.txt", index / 10_000, index);
@@ -2046,13 +2047,21 @@ mod tests {
                 .add(path.as_bytes().to_vec(), cbor(&entry).unwrap())
                 .unwrap();
             file_index.add(entry.file_id.encode_key(), path.as_bytes().to_vec());
+            case_fold
+                .add(
+                    case_insensitive_path_key(&path).into_bytes(),
+                    path.as_bytes().to_vec(),
+                )
+                .unwrap();
         }
         let path_tree = paths.build().unwrap();
         let file_index_tree = file_index.build().unwrap();
+        let case_fold_tree = case_fold.build().unwrap();
         let root = WorktreeRoot {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: PATHS,
             total_text_bytes: PATHS * entry.size_bytes,
             created_by: change.clone(),

@@ -53,3 +53,41 @@ pub fn openapi_spec() -> Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_and_record_reports_document_path_index_metrics() {
+        let spec = openapi_spec();
+        let schemas = &spec["components"]["schemas"];
+        assert_eq!(
+            schemas["LanePatchReport"]["properties"]["path_index"]["$ref"],
+            "#/components/schemas/PathIndexMetricsReport"
+        );
+        assert_eq!(
+            schemas["LaneRecordReport"]["properties"]["path_index"]["$ref"],
+            "#/components/schemas/PathIndexMetricsReport"
+        );
+        assert_eq!(
+            schemas["PathIndexMetricsReport"]["required"],
+            serde_json::json!([
+                "mode",
+                "lookup_count",
+                "full_root_path_load_count",
+                "full_filesystem_path_scan_count"
+            ])
+        );
+        assert_eq!(
+            spec["paths"]["/v1/lanes/{lane_or_id}/patches"]["post"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/LanePatchReport"
+        );
+        assert_eq!(
+            spec["paths"]["/v1/lane/turns/{turn_id}/patches"]["post"]["responses"]["200"]
+                ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/LanePatchReport"
+        );
+    }
+}

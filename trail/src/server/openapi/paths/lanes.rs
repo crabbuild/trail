@@ -223,9 +223,9 @@ pub(super) fn lane_paths() -> Value {
             ], Some("LaneTestRequest"), true)
         },
         "/v1/lanes/{lane_or_id}/patches": {
-            "post": openapi_operation("laneApplyPatch", "Apply lane patch", "Apply a patch directly to a lane branch.", vec![
+            "post": openapi_operation_with_response_schema("laneApplyPatch", "Apply lane patch", "Apply a patch directly to a lane branch.", vec![
                 openapi_path_param("lane_or_id", "string")
-            ], Some("PatchRequest"), true)
+            ], Some("PatchRequest"), "LanePatchReport", true)
         }
     })
 }

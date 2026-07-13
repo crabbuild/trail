@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -14,8 +18,8 @@ use trail::{
     Actor, ConflictManualFile, ConflictManualResolution, Error, InitImportMode, LaneGateOptions,
     LaneMessageReport, LanePatchReport, LaneRewindReport, LaneTurnDetails, LaneTurnEndReport,
     LaneTurnEventReport, LaneTurnStartReport, LaneWorkdirMode, MaterializationFallbackReason,
-    OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
-    WorkdirBackend, WorktreeState,
+    ObjectId, OperationKind, PatchDocument, ShowResult, TextContent, TextRepresentation, Trail,
+    WorkdirBackend, WorktreeRoot, WorktreeState, WORKTREE_ROOT_KIND,
 };
 
 fn git_available() -> bool {
@@ -57,6 +61,34 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_output_raw(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn git_object_count(cwd: &Path) -> u64 {
+    let output = git_output(cwd, &["count-objects", "-v"]);
+    let counts = output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .collect::<BTreeMap<_, _>>();
+    let loose = counts.get("count:").unwrap().parse::<u64>().unwrap();
+    let packed = counts.get("in-pack:").unwrap().parse::<u64>().unwrap();
+    loose + packed
 }
 
 fn trail_bin() -> PathBuf {
@@ -1138,6 +1170,390 @@ fn apply_lane_patch_at_head(
     db.apply_lane_patch(lane, patch)
 }
 
+fn ready_agent_lane_with_mode(mode: InitImportMode) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", mode, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "one changed path",
+        "edits": [{"op": "write", "path": "AGENT.md", "content": "agent change\n"}]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+    (temp, db)
+}
+
+fn ready_agent_lane_with_changed_paths(changed_path_count: usize) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let edits = (0..changed_path_count)
+        .map(|index| {
+            serde_json::json!({
+                "op": "write",
+                "path": format!("agent-{index:03}.md"),
+                "content": format!("agent change {index}\n"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "many changed paths",
+        "edits": edits,
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+    (temp, db)
+}
+
+#[test]
+fn agent_apply_reports_one_tracked_status_query() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let dry_run = db.agent_apply("apply-bot", true, None).unwrap();
+    assert_eq!(dry_run.performance.tracked_status_count, 1);
+    assert_eq!(dry_run.performance.full_root_file_count, 0);
+    assert_eq!(dry_run.performance.export_mode, "mapped_delta");
+}
+
+#[test]
+fn agent_apply_actual_reports_mapped_delta_metrics() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+    assert_eq!(applied.performance.tracked_status_count, 1);
+    assert_eq!(applied.performance.full_root_file_count, 0);
+    assert_eq!(applied.performance.export_mode, "mapped_delta");
+    assert_eq!(applied.performance.changed_path_count, 1);
+    assert_eq!(applied.performance.blob_write_count, 1);
+}
+
+#[test]
+fn agent_apply_batches_git_plumbing_for_many_paths() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_changed_paths(100);
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+    assert_eq!(applied.performance.changed_path_count, 100);
+    assert_eq!(applied.performance.blob_write_count, 100);
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        applied
+            .git_export
+            .as_ref()
+            .unwrap()
+            .performance
+            .git_plumbing_command_count,
+        5
+    );
+    let tmp = temp.path().join(".trail/tmp");
+    if tmp.is_dir() {
+        assert!(!fs::read_dir(tmp).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-delta-")
+        }));
+    }
+}
+
+#[test]
+fn agent_apply_batch_preserves_modes_deletions_and_safe_special_paths() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("delete-me.txt"), "remove me\n").unwrap();
+    fs::write(temp.path().join("mode-change.sh"), "echo old\n").unwrap();
+    run_git(temp.path(), &["add", "delete-me.txt", "mode-change.sh"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let special_path = "dir with space/-leading-ünicode.sh";
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "mixed Git index batch",
+        "edits": [
+            {"op": "delete", "path": "delete-me.txt"},
+            {
+                "op": "write",
+                "path": "mode-change.sh",
+                "content": "echo changed\n",
+                "executable": true
+            },
+            {
+                "op": "write",
+                "path": special_path,
+                "content": "echo special\n",
+                "executable": true
+            }
+        ]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        git_output(temp.path(), &["ls-tree", "HEAD", "--", "delete-me.txt"]),
+        ""
+    );
+    for path in ["mode-change.sh", special_path] {
+        let entry = git_output(temp.path(), &["ls-tree", "HEAD", "--", path]);
+        assert!(
+            entry.starts_with("100755 blob "),
+            "expected executable Git entry for {path:?}, got {entry:?}"
+        );
+    }
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:mode-change.sh"]),
+        "echo changed\n"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", &format!("HEAD:{special_path}")]),
+        "echo special\n"
+    );
+}
+
+#[test]
+fn agent_apply_batch_hashes_exact_trail_bytes_without_git_filters() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.clean", "tr a-z A-Z"],
+    );
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.smudge", "cat"],
+    );
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.required", "true"],
+    );
+    fs::write(
+        temp.path().join(".gitattributes"),
+        "* filter=trail-uppercase\n.gitattributes -filter\n",
+    )
+    .unwrap();
+    run_git(temp.path(), &["add", ".gitattributes"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "preserve exact bytes",
+        "edits": [{
+            "op": "write",
+            "path": "payload.txt",
+            "content": "Exact Trail bytes\n"
+        }]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:payload.txt"]),
+        "Exact Trail bytes\n"
+    );
+}
+
+#[test]
+fn agent_apply_batches_git_plumbing_with_external_db_dir() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    #[cfg(target_os = "linux")]
+    let external_db = temp
+        .path()
+        .join(OsString::from_vec(b"external-trail-db-\xff".to_vec()));
+    #[cfg(not(target_os = "linux"))]
+    let external_db = temp.path().join("external-trail-db");
+    fs::create_dir(&workspace).unwrap();
+    run_git(&workspace, &["init"]);
+    run_git(&workspace, &["config", "user.email", "trail@example.test"]);
+    run_git(&workspace, &["config", "user.name", "Trail Test"]);
+    fs::write(workspace.join("README.md"), "base\n").unwrap();
+    run_git(&workspace, &["add", "README.md"]);
+    run_git(&workspace, &["commit", "-m", "initial"]);
+    Trail::init(&workspace, "main", InitImportMode::GitTracked, false).unwrap();
+    fs::rename(workspace.join(".trail"), &external_db).unwrap();
+
+    let mut db = Trail::open_with_db_dir(&workspace, &external_db).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "apply with external database",
+        "edits": [{
+            "op": "write",
+            "path": "external-db.txt",
+            "content": "external database path\n"
+        }]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        git_output_raw(&workspace, &["show", "HEAD:external-db.txt"]),
+        "external database path\n"
+    );
+    let tmp = external_db.join("tmp");
+    if tmp.is_dir() {
+        assert!(!fs::read_dir(tmp).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-delta-")
+        }));
+    }
+}
+
+#[test]
+fn agent_apply_requires_mapping_before_git_or_trail_mutation() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_mode(InitImportMode::WorkingTree);
+    let git_head = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    assert!(db.git_mappings(10).unwrap().is_empty());
+
+    let err = db.agent_apply("apply-bot", true, None).unwrap_err();
+    assert!(matches!(err, Error::GitMappingRequired(_)));
+    assert!(db.git_mappings(10).unwrap().is_empty());
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), git_head);
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_apply_preserves_git_only_symlinks() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("target.md"), "target\n").unwrap();
+    std::os::unix::fs::symlink("target.md", temp.path().join("link.md")).unwrap();
+    run_git(temp.path(), &["add", "target.md", "link.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    let link_tree_entry_before = git_output(temp.path(), &["ls-tree", "HEAD", "--", "link.md"]);
+    assert!(
+        link_tree_entry_before.starts_with("120000 blob "),
+        "expected a Git symlink entry, got {link_tree_entry_before:?}"
+    );
+
+    let init = Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    let root = db.inspect_root(&init.root_id.0).unwrap();
+    assert!(!root.files.iter().any(|file| file.path == "link.md"));
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "add readme",
+        "edits": [{"op": "write", "path": "README.md", "content": "agent change"}]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(
+        git_output(temp.path(), &["ls-tree", "HEAD", "--", "link.md"]),
+        link_tree_entry_before
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:link.md"]),
+        "target.md"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:target.md"]),
+        "target\n"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:README.md"]),
+        "agent change"
+    );
+}
+
+#[test]
+fn agent_apply_dry_run_writes_no_git_or_mapping_state() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let head_before = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    let index_before = fs::read(temp.path().join(".git/index")).unwrap();
+    let mappings_before = db.git_mappings(100).unwrap().len();
+    let objects_before = git_object_count(temp.path());
+
+    let report = db.agent_apply("apply-bot", true, None).unwrap();
+    assert!(report.dry_run);
+
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        fs::read(temp.path().join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(db.git_mappings(100).unwrap().len(), mappings_before);
+    assert_eq!(git_object_count(temp.path()), objects_before);
+}
+
 fn only_conflict_path_class(db: &Trail) -> (String, String) {
     let conflicts = db.list_conflicts().unwrap();
     assert_eq!(conflicts.len(), 1);
@@ -1166,6 +1582,52 @@ fn run_trail_json(workspace: &Path, args: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn make_current_branch_root_legacy(workspace: &Path) -> ObjectId {
+    let sqlite_path = workspace.join(".trail/index/trail.sqlite");
+    let conn = Connection::open(sqlite_path).unwrap();
+    let root_id: String = conn
+        .query_row(
+            "SELECT root_id FROM refs WHERE name = 'refs/branches/main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (version, bytes): (i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT version, bytes FROM objects WHERE object_id = ?1 AND kind = ?2",
+            rusqlite::params![root_id, WORKTREE_ROOT_KIND],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut root: WorktreeRoot = serde_cbor::from_slice(&bytes).unwrap();
+    assert!(root.file_count > 0);
+    assert!(root.case_fold_map_root.take().is_some());
+    let legacy_bytes = serde_cbor::to_vec(&root).unwrap();
+    let legacy_root = ObjectId::for_bytes(
+        WORKTREE_ROOT_KIND,
+        u16::try_from(version).unwrap(),
+        &legacy_bytes,
+    );
+    conn.execute(
+        "INSERT INTO objects (object_id, kind, version, codec, hash_alg, size_bytes, bytes, created_at) \
+         VALUES (?1, ?2, ?3, 'cbor', 'sha256', ?4, ?5, 0)",
+        rusqlite::params![
+            legacy_root.0.as_str(),
+            WORKTREE_ROOT_KIND,
+            version,
+            legacy_bytes.len() as i64,
+            legacy_bytes
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE refs SET root_id = ?1 WHERE name = 'refs/branches/main'",
+        rusqlite::params![legacy_root.0.as_str()],
+    )
+    .unwrap();
+    legacy_root
 }
 
 fn run_trail_json_daemon(workspace: &Path, daemon_url: &str, args: &[&str]) -> serde_json::Value {
@@ -1394,6 +1856,110 @@ fn cli_json_errors_are_machine_readable() {
 }
 
 #[test]
+fn cli_path_index_required_human_json_rebuild_and_retry_lifecycle() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let legacy_root = make_current_branch_root_legacy(temp.path());
+
+    let status = run_trail_json(temp.path(), &["status"]);
+    assert_eq!(status["head"]["root_id"], legacy_root.0);
+    assert_eq!(status["worktree_state"], "Clean");
+    fs::write(temp.path().join("README.md"), "changed\n").unwrap();
+
+    let human = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args(["record", "-m", "blocked before upgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(9));
+    let human_stderr = String::from_utf8(human.stderr).unwrap();
+    assert!(
+        human_stderr.contains("Trail workspace upgrade is required"),
+        "{human_stderr}"
+    );
+    assert!(
+        human_stderr.contains("trail index rebuild"),
+        "{human_stderr}"
+    );
+    assert!(!human_stderr.contains("trail --help"), "{human_stderr}");
+
+    let json = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["record", "-m", "blocked before upgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(9));
+    assert!(json.stdout.is_empty());
+    let json_error: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(json_error["error"]["code"], "PATH_INDEX_REQUIRED");
+    assert_eq!(json_error["error"]["exit_code"], 9);
+    assert!(json_error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("trail index rebuild"));
+
+    let rebuilt = run_trail_json(temp.path(), &["index", "rebuild"]);
+    assert_eq!(
+        rebuilt["path_index_repaired_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rebuilt["path_index_repaired_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rebuilt["path_index_repaired_refs"][0]["old_root"],
+        legacy_root.0
+    );
+    let repaired_root = rebuilt["path_index_repaired_refs"][0]["new_root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    let load_root = |root_id: &str| -> WorktreeRoot {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT bytes FROM objects WHERE object_id = ?1",
+                rusqlite::params![root_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_cbor::from_slice(&bytes).unwrap()
+    };
+    let legacy = load_root(&legacy_root.0);
+    let repaired = load_root(&repaired_root);
+    assert_eq!(repaired.path_map_root, legacy.path_map_root);
+    assert_eq!(repaired.file_index_map_root, legacy.file_index_map_root);
+    assert_eq!(repaired.file_count, legacy.file_count);
+    assert_eq!(repaired.total_text_bytes, legacy.total_text_bytes);
+    assert_eq!(repaired.created_by, legacy.created_by);
+    assert!(repaired.case_fold_map_root.is_some());
+    drop(conn);
+
+    let recorded = run_trail_json(temp.path(), &["record", "-m", "after upgrade"]);
+    assert_eq!(recorded["changed_paths"].as_array().unwrap().len(), 1);
+    let second = run_trail_json(temp.path(), &["index", "rebuild"]);
+    assert!(second["path_index_repaired_roots"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(second["path_index_repaired_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn cli_env_defaults_select_workspace_db_branch_and_format() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -1615,7 +2181,7 @@ fn doctor_reports_operational_health_across_cli_api_and_mcp() {
         assert!(clean.checks.iter().any(|check| {
             check.name == "schema_version"
                 && check.status == "ok"
-                && check.details.as_ref().unwrap()["sqlite_user_version"] == 16
+                && check.details.as_ref().unwrap()["sqlite_user_version"] == 17
         }));
     }
 
@@ -1730,7 +2296,7 @@ fn schema_v16_discards_generic_merge_queue() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     let legacy_tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'merge_queue'",
@@ -1767,6 +2333,78 @@ fn schema_v16_discards_generic_merge_queue() {
 }
 
 #[test]
+fn schema_v17_adds_pending_path_index_derived_repairs_transactionally() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let db_path = temp.path().join(".trail/index/trail.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS pending_path_index_derived_repairs;
+         PRAGMA user_version = 16;
+         UPDATE schema_meta SET value = '16' WHERE key = 'schema.version';",
+    )
+    .unwrap();
+    drop(conn);
+
+    Trail::open(temp.path()).unwrap();
+    let conn = Connection::open(db_path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17);
+    let table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'pending_path_index_derived_repairs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 1);
+    let columns = conn
+        .prepare("PRAGMA table_info(pending_path_index_derived_repairs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            "ref_name",
+            "repair_kind",
+            "old_root",
+            "new_root",
+            "new_change",
+            "created_at",
+        ]
+    );
+}
+
+#[test]
+fn schema_v17_current_version_rejects_malformed_pending_repair_table() {
+    let temp = tempfile::tempdir().unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+    let db_path = temp.path().join(".trail/index/trail.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE pending_path_index_derived_repairs;
+         CREATE TABLE pending_path_index_derived_repairs (
+             ref_name TEXT PRIMARY KEY,
+             repair_kind TEXT NOT NULL
+         );
+         PRAGMA user_version = 17;
+         UPDATE schema_meta SET value = '17' WHERE key = 'schema.version';",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(Trail::open(temp.path()).is_err());
+}
+
+#[test]
 fn schema_v6_backfills_normalized_environment_component_states_legacy_projection() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -1795,7 +2433,7 @@ fn schema_v6_backfills_normalized_environment_component_states_legacy_projection
     let version = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     let node = conn
         .query_row(
@@ -1915,7 +2553,7 @@ fn schema_v9_backfills_typed_environment_edges_without_losing_upstream_keys() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     let active_edge = conn
         .query_row(
@@ -1972,7 +2610,7 @@ fn schema_v10_adds_typed_environment_cache_namespaces_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_cache_namespaces",
@@ -2036,7 +2674,7 @@ fn schema_v12_adds_agent_capture_tables_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "agent_hook_installations",
@@ -2100,7 +2738,7 @@ fn schema_v13_adds_external_artifact_provenance_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_external_artifacts",
@@ -2161,7 +2799,7 @@ fn schema_v14_adds_runtime_resource_lifecycle_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_runtime_resources",
@@ -2227,7 +2865,7 @@ fn schema_v15_adds_opaque_runtime_secret_references_transactionally() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_runtime_secrets",
@@ -2307,7 +2945,7 @@ fn schema_v6_migrates_v5_single_bindings_to_output_bindings() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     let columns = conn
         .prepare("PRAGMA table_info(workspace_view_layers)")
@@ -2443,7 +3081,7 @@ fn schema_v7_migrates_immutable_outputs_to_policy_aware_nullable_layers() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     let binding = conn
         .query_row(
@@ -2519,7 +3157,7 @@ fn schema_v8_adds_current_and_immutable_environment_dependency_edges() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     for table in [
         "environment_component_dependencies",
@@ -2593,7 +3231,7 @@ fn schema_v6_backfills_normalized_environment_component_states() {
     let version = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     let node = conn
         .query_row(
@@ -6783,19 +7421,119 @@ fn backup_create_verify_and_restore_roundtrip() {
         false,
     )
     .unwrap();
-    db.spawn_lane("backup-bot", Some("main"), true, None, None)
-        .unwrap();
-    drop(db);
-
     let backup_parent = tempfile::tempdir().unwrap();
     let backup_path = backup_parent.path().join("trail-backup");
-    let created = run_trail_json(
-        temp.path(),
-        &["backup", "create", backup_path.to_str().unwrap()],
-    );
-    assert_eq!(created["branch"], "main");
-    assert!(created["sqlite_bytes"].as_u64().unwrap() > 0);
-    assert!(created["worktree_bytes"].as_u64().unwrap() > 0);
+    let external_workdirs = tempfile::tempdir().unwrap();
+    let external_workdir = external_workdirs.path().join("backup-bot");
+    let spawned = db
+        .spawn_lane_with_workdir(
+            "backup-bot",
+            Some("main"),
+            true,
+            None,
+            None,
+            Some(external_workdir.clone()),
+        )
+        .unwrap();
+    let lane_head = db.lane_details("backup-bot").unwrap().branch;
+    let manifest_path = PathBuf::from(spawned.workdir.unwrap())
+        .join(".trail")
+        .join("workdir-manifest.json");
+    let mut legacy_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    legacy_manifest["root_id"] = serde_json::Value::String("object_backup_pending_old".into());
+    let legacy_manifest_bytes = serde_json::to_vec_pretty(&legacy_manifest).unwrap();
+    fs::write(&manifest_path, &legacy_manifest_bytes).unwrap();
+    let source_view_dir = temp.path().join(".trail/views/source-backup-view");
+    let source_view_meta = source_view_dir.join("meta");
+    fs::create_dir_all(&source_view_meta).unwrap();
+    let source_checkpoint_path = source_view_meta.join("clean-checkpoint.json");
+    let source_checkpoint_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "view_id": "source-backup-view",
+        "operation": lane_head.head_change.0,
+        "root_id": "object_backup_checkpoint_old",
+        "journal_sequence": 0,
+    }))
+    .unwrap();
+    fs::write(&source_checkpoint_path, &source_checkpoint_bytes).unwrap();
+    let pending_conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO workspace_views \
+             (view_id, lane_id, base_change, base_root, backend, mountpoint, \
+              source_upper, generated_upper, scratch_upper, meta_dir, journal_path, \
+              generation, checkpoint_seq, checkpoint_root, status, created_at, updated_at) \
+             VALUES ('source-backup-view', ?1, ?2, ?3, 'test-cow', ?4, ?5, ?6, ?7, ?8, ?9, \
+                     1, 0, ?3, 'unmounted', 1, 1)",
+            rusqlite::params![
+                lane_head.lane_id,
+                lane_head.head_change.0,
+                lane_head.head_root.0,
+                external_workdir.to_string_lossy(),
+                source_view_dir.join("source-upper").to_string_lossy(),
+                source_view_dir.join("generated-upper").to_string_lossy(),
+                source_view_dir.join("scratch-upper").to_string_lossy(),
+                source_view_meta.to_string_lossy(),
+                source_view_meta
+                    .join("mutation-journal.jsonl")
+                    .to_string_lossy(),
+            ],
+        )
+        .unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO pending_path_index_derived_repairs \
+             (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+             VALUES (?1, 'lane_manifest', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                lane_head.ref_name,
+                "object_backup_pending_old",
+                lane_head.head_root.0,
+                lane_head.head_change.0,
+            ],
+        )
+        .unwrap();
+    pending_conn
+        .execute(
+            "INSERT INTO pending_path_index_derived_repairs \
+             (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+             VALUES (?1, 'workspace_checkpoint', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                lane_head.ref_name,
+                "object_backup_checkpoint_old",
+                lane_head.head_root.0,
+                lane_head.head_change.0,
+            ],
+        )
+        .unwrap();
+    drop(pending_conn);
+    let created = db.create_backup(&backup_path, false).unwrap();
+    assert_eq!(created.branch, "main");
+    assert!(created.sqlite_bytes > 0);
+    let backed_up_workdir = backup_path.join("worktrees/backup-bot");
+    fs::create_dir_all(backed_up_workdir.join(".trail")).unwrap();
+    fs::copy(
+        external_workdir.join("README.md"),
+        backed_up_workdir.join("README.md"),
+    )
+    .unwrap();
+    fs::copy(
+        &manifest_path,
+        backed_up_workdir.join(".trail/workdir-manifest.json"),
+    )
+    .unwrap();
+    drop(db);
+
+    let backup_conn = Connection::open(backup_path.join("index/trail.sqlite")).unwrap();
+    let backed_up_pending: i64 = backup_conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backed_up_pending, 2);
+    drop(backup_conn);
 
     let verified = run_trail_json(
         temp.path(),
@@ -6819,16 +7557,43 @@ fn backup_create_verify_and_restore_roundtrip() {
     assert_eq!(restored_report["rewritten_workdirs"], 1);
 
     let restored_db = Trail::open(restored.path()).unwrap();
+    let restored_conn =
+        Connection::open(restored.path().join(".trail/index/trail.sqlite")).unwrap();
+    assert_eq!(
+        restored_conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    drop(restored_conn);
+    assert_eq!(fs::read(&manifest_path).unwrap(), legacy_manifest_bytes);
+    assert_eq!(
+        fs::read(&source_checkpoint_path).unwrap(),
+        source_checkpoint_bytes
+    );
     let why = restored_db.why("README.md:2", Some("main")).unwrap();
     assert_eq!(why.current_text, "backup");
     let fsck = restored_db.fsck().unwrap();
     assert!(fsck.errors.is_empty(), "{:?}", fsck.errors);
 
     let lane = restored_db.lane_details("backup-bot").unwrap();
+    assert!(restored_db
+        .lane_workspace_view("backup-bot")
+        .unwrap()
+        .is_none());
     let workdir = lane.branch.workdir.as_ref().unwrap();
     let restored_db_dir = restored.path().canonicalize().unwrap().join(".trail");
     assert!(workdir.starts_with(&restored_db_dir.to_string_lossy().to_string()));
     assert!(PathBuf::from(workdir).is_dir());
+    let restored_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(workdir).join(".trail/workdir-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored_manifest["root_id"], lane_head.head_root.0);
     let status = restored_db.lane_status("backup-bot").unwrap();
     assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
 }
@@ -7533,6 +8298,13 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
             .branch
             .head_change
             .clone();
+        let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+        let objects_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        let prolly_nodes_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
         let patch: PatchDocument = serde_json::from_value(serde_json::json!({
             "edits": [
                 {"op": "write", "path": colliding_path, "content": "case collision\n"}
@@ -7547,6 +8319,18 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
         assert_eq!(
             db.lane_details("policy-bot").unwrap().branch.head_change,
             before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            objects_before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
         );
     }
 
@@ -7585,6 +8369,38 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "policy-bot", oversized_payload).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(message) if message.contains("max_patch_bytes")));
+}
+
+#[test]
+fn lane_patch_allows_case_only_rename_when_final_root_is_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("case-rename-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "edits": [
+            {"op": "rename", "from": "README.md", "to": "readme.md"}
+        ]
+    }))
+    .unwrap();
+
+    let report = apply_lane_patch_at_head(&mut db, "case-rename-bot", patch).unwrap();
+    assert_eq!(report.changed_paths.len(), 1);
+    assert_eq!(report.changed_paths[0].kind, trail::FileChangeKind::Renamed);
+    assert_eq!(
+        report.changed_paths[0].old_path.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(report.changed_paths[0].path, "readme.md");
+    assert_eq!(
+        db.why("readme.md:1", Some("refs/lanes/case-rename-bot"))
+            .unwrap()
+            .current_text,
+        "hello"
+    );
 }
 
 #[test]
@@ -21841,6 +22657,42 @@ fn materialized_lane_status_and_record_handle_workdir_renames() {
         fs::read_to_string(temp.path().join("docs/README.md")).unwrap(),
         "hello\n"
     );
+}
+
+#[test]
+fn materialized_lane_record_allows_case_only_rename_when_final_root_is_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane("record-case-rename", Some("main"), true, None, None)
+        .unwrap();
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    fs::rename(workdir.join("README.md"), workdir.join("rename-staging")).unwrap();
+    fs::rename(workdir.join("rename-staging"), workdir.join("readme.md")).unwrap();
+
+    let preview = db
+        .preview_lane_workdir_record("record-case-rename")
+        .unwrap();
+    assert!(preview.policy.allowed, "{:?}", preview.policy.error);
+    let recorded = db
+        .record_lane_workdir(
+            "record-case-rename",
+            Some("record case-only rename".to_string()),
+        )
+        .unwrap();
+    assert_eq!(recorded.changed_paths.len(), 1);
+    assert_eq!(
+        recorded.changed_paths[0].kind,
+        trail::FileChangeKind::Renamed
+    );
+    assert_eq!(
+        recorded.changed_paths[0].old_path.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(recorded.changed_paths[0].path, "readme.md");
 }
 
 #[test]

@@ -12,6 +12,8 @@ pub enum Error {
     WorkspaceExists(PathBuf),
     #[error("invalid path `{path}`: {reason}")]
     InvalidPath { path: String, reason: String },
+    #[error("path invariant index is required: {0}")]
+    PathIndexRequired(String),
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -38,6 +40,14 @@ pub enum Error {
     Corrupt(String),
     #[error("git interop failed: {0}")]
     Git(String),
+    #[error("Git baseline mapping is required: {0}")]
+    GitMappingRequired(String),
+    #[error("Git HEAD changed during handoff: {0}")]
+    GitHeadChanged(String),
+    #[error("Git tracked worktree is dirty: {0}")]
+    GitWorktreeDirty(String),
+    #[error("mapped Git delta export is required: {0}")]
+    GitDeltaExportRequired(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("native COW is unsupported for this source and destination")]
@@ -77,6 +87,7 @@ impl Error {
             Error::WorkspaceNotFound(_) => "WORKSPACE_NOT_FOUND",
             Error::WorkspaceExists(_) => "WORKSPACE_EXISTS",
             Error::InvalidPath { .. } => "INVALID_PATH",
+            Error::PathIndexRequired(_) => "PATH_INDEX_REQUIRED",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -89,6 +100,10 @@ impl Error {
             Error::StaleBranch(_) => "STALE_BRANCH",
             Error::Corrupt(_) => "DATABASE_CORRUPT",
             Error::Git(_) => "GIT_ERROR",
+            Error::GitMappingRequired(_) => "GIT_MAPPING_REQUIRED",
+            Error::GitHeadChanged(_) => "GIT_HEAD_CHANGED",
+            Error::GitWorktreeDirty(_) => "GIT_WORKTREE_DIRTY",
+            Error::GitDeltaExportRequired(_) => "GIT_DELTA_EXPORT_REQUIRED",
             Error::InvalidInput(_) => "INVALID_INPUT",
             Error::CloneUnsupported => "CLONE_UNSUPPORTED",
             Error::CloneCrossDevice => "CLONE_CROSS_DEVICE",
@@ -115,8 +130,12 @@ impl Error {
             Error::Conflict(_) => 6,
             Error::PatchRejected(_) => 7,
             Error::StaleBranch(_) | Error::WorkspaceLocked(_) => 8,
-            Error::InvalidPath { .. } => 9,
-            Error::Git(_) => 10,
+            Error::InvalidPath { .. } | Error::PathIndexRequired(_) => 9,
+            Error::Git(_)
+            | Error::GitMappingRequired(_)
+            | Error::GitHeadChanged(_)
+            | Error::GitWorktreeDirty(_)
+            | Error::GitDeltaExportRequired(_) => 10,
             Error::OperationNotFound(_) => 12,
             Error::RefNotFound(_) => 13,
             Error::IgnoredPath(_) => 14,
@@ -138,4 +157,45 @@ pub(crate) fn cbor<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
 
 pub(crate) fn from_cbor<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     serde_cbor::from_slice(bytes).map_err(|err| Error::Serialization(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_handoff_errors_have_stable_codes_and_exit_status() {
+        let errors = [
+            (
+                Error::GitMappingRequired("missing mapping".into()),
+                "GIT_MAPPING_REQUIRED",
+            ),
+            (
+                Error::GitHeadChanged("head changed".into()),
+                "GIT_HEAD_CHANGED",
+            ),
+            (
+                Error::GitWorktreeDirty("tracked changes".into()),
+                "GIT_WORKTREE_DIRTY",
+            ),
+            (
+                Error::GitDeltaExportRequired("mapped delta required".into()),
+                "GIT_DELTA_EXPORT_REQUIRED",
+            ),
+        ];
+        for (error, code) in errors {
+            assert_eq!(error.code(), code);
+            assert_eq!(error.exit_code(), 10);
+        }
+    }
+
+    #[test]
+    fn path_index_required_has_stable_code_and_exit_status() {
+        let error = Error::PathIndexRequired(
+            "legacy root has no case-fold index; run `trail index rebuild`".into(),
+        );
+
+        assert_eq!(error.code(), "PATH_INDEX_REQUIRED");
+        assert_eq!(error.exit_code(), 9);
+    }
 }

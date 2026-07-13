@@ -102,9 +102,7 @@ impl MaterializationFallbackReason {
         match self {
             MaterializationFallbackReason::CloneUnsupported => "clone-unsupported",
             MaterializationFallbackReason::CrossDevice => "cross-device",
-            MaterializationFallbackReason::NativeSourceUnavailable => {
-                "native-source-unavailable"
-            }
+            MaterializationFallbackReason::NativeSourceUnavailable => "native-source-unavailable",
         }
     }
 }
@@ -728,6 +726,8 @@ pub struct LanePatchReport {
     pub operation: ChangeId,
     pub root_id: ObjectId,
     pub changed_paths: Vec<FileDiffSummary>,
+    #[serde(default)]
+    pub path_index: PathIndexMetricsReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -736,6 +736,40 @@ pub struct LaneRecordReport {
     pub operation: Option<ChangeId>,
     pub root_id: ObjectId,
     pub changed_paths: Vec<FileDiffSummary>,
+    #[serde(default)]
+    pub path_index: PathIndexMetricsReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathIndexMetricsReport {
+    /// Path resolution used by this operation (`indexed` or `unknown`).
+    #[serde(default = "default_path_index_mode")]
+    pub mode: String,
+    /// Number of unique folded keys looked up in the persisted path index.
+    #[serde(default)]
+    pub lookup_count: u64,
+    /// Number of unbounded traversals that enumerate every persisted root path.
+    #[serde(default)]
+    pub full_root_path_load_count: u64,
+    /// Number of unbounded repository-shaped filesystem validation walks.
+    /// Explicitly selected sparse materializations are bounded and excluded.
+    #[serde(default)]
+    pub full_filesystem_path_scan_count: u64,
+}
+
+impl Default for PathIndexMetricsReport {
+    fn default() -> Self {
+        Self {
+            mode: default_path_index_mode(),
+            lookup_count: 0,
+            full_root_path_load_count: 0,
+            full_filesystem_path_scan_count: 0,
+        }
+    }
+}
+
+fn default_path_index_mode() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -970,8 +1004,14 @@ mod workdir_mode_tests {
             LaneWorkdirMode::parse("native_cow"),
             Some(LaneWorkdirMode::NativeCow)
         );
-        assert_eq!(LaneWorkdirMode::parse("fuse-cow"), Some(LaneWorkdirMode::FuseCow));
-        assert_eq!(LaneWorkdirMode::parse("fuse_cow"), Some(LaneWorkdirMode::FuseCow));
+        assert_eq!(
+            LaneWorkdirMode::parse("fuse-cow"),
+            Some(LaneWorkdirMode::FuseCow)
+        );
+        assert_eq!(
+            LaneWorkdirMode::parse("fuse_cow"),
+            Some(LaneWorkdirMode::FuseCow)
+        );
         assert_eq!(
             LaneWorkdirMode::parse("dokan-cow"),
             Some(LaneWorkdirMode::DokanCow)
@@ -1023,5 +1063,26 @@ mod workdir_mode_tests {
         assert_eq!(report.backend(), WorkdirBackend::Mixed);
         report.copied_files = 0;
         assert_eq!(report.backend(), WorkdirBackend::Clone);
+    }
+
+    #[test]
+    fn legacy_patch_and_record_reports_default_path_index_metrics() {
+        let patch: LanePatchReport = serde_json::from_value(serde_json::json!({
+            "lane_id": "lane-1",
+            "operation": "change-1",
+            "root_id": "root-1",
+            "changed_paths": []
+        }))
+        .unwrap();
+        assert_eq!(patch.path_index, PathIndexMetricsReport::default());
+
+        let record: LaneRecordReport = serde_json::from_value(serde_json::json!({
+            "lane_id": "lane-1",
+            "operation": null,
+            "root_id": "root-1",
+            "changed_paths": []
+        }))
+        .unwrap();
+        assert_eq!(record.path_index, PathIndexMetricsReport::default());
     }
 }

@@ -1749,6 +1749,7 @@ impl Trail {
         turn_id: Option<&str>,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
+        self.reset_case_fold_index_metrics();
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
         if let Some(turn_id) = turn_id {
@@ -1766,6 +1767,9 @@ impl Trail {
         }
 
         let head = self.get_ref(&branch.ref_name)?;
+        // Refreshing a native workspace index walks the repository-shaped
+        // checkout rather than an explicitly bounded sparse selection.
+        self.note_full_filesystem_path_scan();
         self.refresh_worktree_index_streaming_report()?;
         let summaries = self.diff_root_to_worktree_index(&head.root_id)?;
         if summaries.is_empty() {
@@ -1775,6 +1779,7 @@ impl Trail {
                 operation: None,
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
+                path_index: self.case_fold_index_metrics_report(),
             });
         }
 
@@ -1803,6 +1808,7 @@ impl Trail {
                 operation: None,
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
+                path_index: self.case_fold_index_metrics_report(),
             });
         }
         self.ensure_lane_record_file_size_policy(&built.files, &diff.summaries)?;
@@ -1856,6 +1862,7 @@ impl Trail {
             operation: Some(change_id),
             root_id: built.root_id,
             changed_paths: diff.summaries,
+            path_index: self.case_fold_index_metrics_report(),
         })
     }
 

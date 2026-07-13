@@ -6,6 +6,14 @@ impl Trail {
         &self,
         root_id: &ObjectId,
     ) -> Result<Vec<FileDiffSummary>> {
+        self.note_full_root_path_load();
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_root_range_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut root_iter = self.root_prolly.range(&tree, &[], None)?;
@@ -14,7 +22,7 @@ impl Trail {
              FROM worktree_file_index ORDER BY path ASC",
         )?;
         let mut index_rows = stmt.query([])?;
-        let mut left = next_root_file(&mut root_iter)?;
+        let mut left = next_root_file(&mut root_iter, &mut root_metrics)?;
         let mut right = next_index_file(&mut index_rows)?;
         let mut summaries = Vec::new();
 
@@ -24,7 +32,7 @@ impl Trail {
                     match left_path.cmp(right_path) {
                         std::cmp::Ordering::Less => {
                             summaries.push(deleted_manifest_summary(left_path.clone(), left_entry));
-                            left = next_root_file(&mut root_iter)?;
+                            left = next_root_file(&mut root_iter, &mut root_metrics)?;
                         }
                         std::cmp::Ordering::Greater => {
                             summaries.push(added_manifest_summary(right_path.clone(), right_entry));
@@ -41,14 +49,14 @@ impl Trail {
                                     right_entry,
                                 ));
                             }
-                            left = next_root_file(&mut root_iter)?;
+                            left = next_root_file(&mut root_iter, &mut root_metrics)?;
                             right = next_index_file(&mut index_rows)?;
                         }
                     }
                 }
                 (Some((left_path, left_entry)), None) => {
                     summaries.push(deleted_manifest_summary(left_path.clone(), left_entry));
-                    left = next_root_file(&mut root_iter)?;
+                    left = next_root_file(&mut root_iter, &mut root_metrics)?;
                 }
                 (None, Some((right_path, right_entry))) => {
                     summaries.push(added_manifest_summary(right_path.clone(), right_entry));
@@ -65,11 +73,19 @@ impl Trail {
         root_id: &ObjectId,
         manifest: &BTreeMap<String, DiskManifest>,
     ) -> Result<Vec<FileDiffSummary>> {
+        self.note_full_root_path_load();
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_root_range_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut root_iter = self.root_prolly.range(&tree, &[], None)?;
         let mut manifest_iter = manifest.iter();
-        let mut left = next_root_file(&mut root_iter)?;
+        let mut left = next_root_file(&mut root_iter, &mut root_metrics)?;
         let mut right = manifest_iter.next();
         let mut summaries = Vec::new();
 
@@ -79,7 +95,7 @@ impl Trail {
                     match left_path.cmp(right_path) {
                         std::cmp::Ordering::Less => {
                             summaries.push(deleted_manifest_summary(left_path.clone(), left_entry));
-                            left = next_root_file(&mut root_iter)?;
+                            left = next_root_file(&mut root_iter, &mut root_metrics)?;
                         }
                         std::cmp::Ordering::Greater => {
                             summaries.push(added_manifest_summary(right_path.clone(), right_entry));
@@ -96,14 +112,14 @@ impl Trail {
                                     right_entry,
                                 ));
                             }
-                            left = next_root_file(&mut root_iter)?;
+                            left = next_root_file(&mut root_iter, &mut root_metrics)?;
                             right = manifest_iter.next();
                         }
                     }
                 }
                 (Some((left_path, left_entry)), None) => {
                     summaries.push(deleted_manifest_summary(left_path.clone(), left_entry));
-                    left = next_root_file(&mut root_iter)?;
+                    left = next_root_file(&mut root_iter, &mut root_metrics)?;
                 }
                 (None, Some((right_path, right_entry))) => {
                     summaries.push(added_manifest_summary(right_path.clone(), right_entry));
@@ -116,6 +132,13 @@ impl Trail {
     }
 
     pub(crate) fn disk_manifest(&self, disk_files: &[DiskFile]) -> BTreeMap<String, DiskManifest> {
+        self.note_operation_metrics(OperationMetricsDelta {
+            filesystem_hash_count: saturating_u64_from_usize(disk_files.len()),
+            filesystem_hash_bytes: disk_files.iter().fold(0u64, |total, file| {
+                total.saturating_add(saturating_u64_from_usize(file.bytes.len()))
+            }),
+            ..OperationMetricsDelta::default()
+        });
         disk_files
             .iter()
             .map(|file| {
@@ -139,6 +162,10 @@ impl Trail {
         let mut paths = BTreeSet::new();
         paths.extend(left.keys().cloned());
         paths.extend(right.keys().cloned());
+        self.note_operation_metrics(OperationMetricsDelta {
+            manifest_key_comparison_count: saturating_u64_from_usize(paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         let mut summaries = Vec::new();
         for path in paths {
             match (left.get(&path), right.get(&path)) {
@@ -193,21 +220,21 @@ impl Trail {
         summaries
     }
 
-    pub(crate) fn selected_worktree_snapshot(
+    pub(crate) fn selected_worktree_snapshot_with_policy(
         &self,
         head_files: &BTreeMap<String, FileEntry>,
         candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<SelectedWorktreeSnapshot> {
-        let disk_files = self.scan_visible_files_for_paths(candidate_paths)?;
+        let disk_files = self.scan_visible_files_for_paths_with_policy(candidate_paths, policy)?;
         let disk_paths = disk_files
             .iter()
             .map(|file| file.path.clone())
-            .collect::<BTreeSet<_>>();
-        self.prune_worktree_index_for_selections(candidate_paths, &disk_paths)?;
+            .collect::<Vec<_>>();
         let disk_manifest = self.disk_manifest(&disk_files);
-        self.update_worktree_index_from_disk_files_and_manifest(&disk_files, &disk_manifest)?;
+        self.sync_selected_worktree_index(candidate_paths, &disk_paths, &disk_manifest)?;
         let summaries =
-            self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths);
+            self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths)?;
         let paths = summaries
             .iter()
             .map(|summary| summary.path.clone())
@@ -224,15 +251,16 @@ impl Trail {
         })
     }
 
-    pub(crate) fn selected_worktree_snapshot_read_only(
+    pub(crate) fn selected_worktree_snapshot_read_only_with_policy(
         &self,
         head_files: &BTreeMap<String, FileEntry>,
         candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<SelectedWorktreeSnapshot> {
-        let disk_files = self.scan_visible_files_for_paths(candidate_paths)?;
+        let disk_files = self.scan_visible_files_for_paths_with_policy(candidate_paths, policy)?;
         let disk_manifest = self.disk_manifest(&disk_files);
         let summaries =
-            self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths);
+            self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths)?;
         let paths = summaries
             .iter()
             .map(|summary| summary.path.clone())
@@ -249,22 +277,34 @@ impl Trail {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_worktree_snapshot_for_root(
         &self,
         root_id: &ObjectId,
         candidate_paths: &[String],
     ) -> Result<SelectedWorktreeSnapshot> {
-        let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
-        self.selected_worktree_snapshot(&head_files, candidate_paths)
+        let policy = self.workspace_ignore_policy_snapshot();
+        self.selected_worktree_snapshot_for_root_with_policy(root_id, candidate_paths, &policy)
     }
 
-    pub(crate) fn selected_worktree_snapshot_for_root_read_only(
+    pub(crate) fn selected_worktree_snapshot_for_root_with_policy(
         &self,
         root_id: &ObjectId,
         candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<SelectedWorktreeSnapshot> {
         let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
-        self.selected_worktree_snapshot_read_only(&head_files, candidate_paths)
+        self.selected_worktree_snapshot_with_policy(&head_files, candidate_paths, policy)
+    }
+
+    pub(crate) fn selected_worktree_snapshot_for_root_read_only_with_policy(
+        &self,
+        root_id: &ObjectId,
+        candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
+    ) -> Result<SelectedWorktreeSnapshot> {
+        let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
+        self.selected_worktree_snapshot_read_only_with_policy(&head_files, candidate_paths, policy)
     }
 
     pub(crate) fn diff_file_maps_to_manifest_for_paths(
@@ -272,22 +312,31 @@ impl Trail {
         left: &BTreeMap<String, FileEntry>,
         right: &BTreeMap<String, DiskManifest>,
         selected_paths: &[String],
-    ) -> Vec<FileDiffSummary> {
-        let mut paths = BTreeSet::new();
-        for selected in selected_paths {
-            paths.insert(selected.clone());
-            paths.extend(
-                left.keys()
-                    .filter(|path| path_matches_selection(path, selected))
-                    .cloned(),
-            );
-            paths.extend(
-                right
-                    .keys()
-                    .filter(|path| path_matches_selection(path, selected))
-                    .cloned(),
-            );
+    ) -> Result<Vec<FileDiffSummary>> {
+        let selections = SelectionSet::from_paths(selected_paths)?;
+        if selections.as_slice().is_empty() {
+            return Ok(Vec::new());
         }
+        let mut paths = BTreeSet::new();
+        paths.extend(left.keys().cloned());
+        paths.extend(right.keys().cloned());
+        let mut selection_comparison_count = 0u64;
+        paths.retain(|path| {
+            let (selected, comparisons) = selections.contains_counted(path);
+            selection_comparison_count = selection_comparison_count.saturating_add(comparisons);
+            selected
+        });
+        self.note_operation_metrics(OperationMetricsDelta {
+            selection_comparison_count,
+            ..OperationMetricsDelta::default()
+        });
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.note_operation_metrics(OperationMetricsDelta {
+            manifest_key_comparison_count: saturating_u64_from_usize(paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         let mut summaries = Vec::new();
         for path in paths {
             match (left.get(&path), right.get(&path)) {
@@ -339,7 +388,7 @@ impl Trail {
                 (None, None) => {}
             }
         }
-        summaries
+        Ok(summaries)
     }
 }
 
@@ -357,7 +406,10 @@ fn added_manifest_summary(path: String, entry: &DiskManifest) -> FileDiffSummary
     }
 }
 
-fn next_root_file<S>(iter: &mut prolly::RangeIter<'_, S>) -> Result<Option<(String, FileEntry)>>
+fn next_root_file<S>(
+    iter: &mut prolly::RangeIter<'_, S>,
+    metrics: &mut OperationMetricsAccumulator,
+) -> Result<Option<(String, FileEntry)>>
 where
     S: prolly::Store,
 {
@@ -365,6 +417,7 @@ where
         return Ok(None);
     };
     let (key, value) = item?;
+    metrics.delta.root_range_row_count = metrics.delta.root_range_row_count.saturating_add(1);
     let path = String::from_utf8(key)
         .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
     Ok(Some((path, from_cbor::<FileEntry>(&value)?)))
@@ -421,5 +474,135 @@ fn changed_manifest_summary(
         deletions: 0,
         line_changes: Vec::new(),
         patch: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_fixture() -> (tempfile::TempDir, Trail, FileEntry) {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        let entry = db
+            .load_root_files_for_paths(&head.root_id, &["README.md".to_string()])
+            .unwrap()
+            .remove("README.md")
+            .unwrap();
+        (workspace, db, entry)
+    }
+
+    fn disk_manifest(entry: &FileEntry) -> DiskManifest {
+        DiskManifest {
+            kind: entry.kind.clone(),
+            executable: entry.executable,
+            content_hash: entry.content_hash.clone(),
+        }
+    }
+
+    #[test]
+    fn selected_manifest_key_union_preserves_both_exact_rename_endpoints() {
+        let (_workspace, db, entry) = manifest_fixture();
+        let left = BTreeMap::from([("old.txt".to_string(), entry.clone())]);
+        let right = BTreeMap::from([("new.txt".to_string(), disk_manifest(&entry))]);
+
+        let summaries = db
+            .diff_file_maps_to_manifest_for_paths(
+                &left,
+                &right,
+                &["old.txt".to_string(), "new.txt".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| (summary.path.as_str(), summary.kind.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("new.txt", FileChangeKind::Added),
+                ("old.txt", FileChangeKind::Deleted),
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_manifest_key_union_filters_once_with_overlap_and_case_aliases() {
+        let (_workspace, db, entry) = manifest_fixture();
+        let mut changed_manifest = disk_manifest(&entry);
+        changed_manifest.content_hash = "different".to_string();
+        let left = BTreeMap::from([
+            ("README.md".to_string(), entry.clone()),
+            ("docs/old.txt".to_string(), entry.clone()),
+            ("unrelated/left.txt".to_string(), entry.clone()),
+        ]);
+        let right = BTreeMap::from([
+            ("docs/new.txt".to_string(), disk_manifest(&entry)),
+            ("readme.md".to_string(), disk_manifest(&entry)),
+            ("unrelated/right.txt".to_string(), changed_manifest),
+        ]);
+        let metrics = db.operation_metrics.as_ref().unwrap();
+        let before = metrics.snapshot();
+
+        let summaries = db
+            .diff_file_maps_to_manifest_for_paths(
+                &left,
+                &right,
+                &[
+                    "docs/new.txt".to_string(),
+                    "docs".to_string(),
+                    "README.md".to_string(),
+                    "readme.md".to_string(),
+                ],
+            )
+            .unwrap();
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.path.as_str())
+                .collect::<Vec<_>>(),
+            ["README.md", "docs/new.txt", "docs/old.txt", "readme.md"]
+        );
+        assert!(
+            after.selection_comparison_count - before.selection_comparison_count <= 12,
+            "each of six union keys should need at most exact plus interval membership"
+        );
+        assert_eq!(
+            after.manifest_key_comparison_count - before.manifest_key_comparison_count,
+            4
+        );
+    }
+
+    #[test]
+    fn selected_manifest_empty_selection_does_not_scan_maps_or_report_membership_work() {
+        let (_workspace, db, entry) = manifest_fixture();
+        let left = (0..1_000)
+            .map(|idx| (format!("left/{idx:04}.txt"), entry.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let right = (0..1_000)
+            .map(|idx| (format!("right/{idx:04}.txt"), disk_manifest(&entry)))
+            .collect::<BTreeMap<_, _>>();
+        let metrics = db.operation_metrics.as_ref().unwrap();
+        let before = metrics.snapshot();
+
+        let summaries = db
+            .diff_file_maps_to_manifest_for_paths(&left, &right, &[])
+            .unwrap();
+        let after = metrics.snapshot();
+
+        assert!(summaries.is_empty());
+        assert_eq!(
+            after.selection_comparison_count - before.selection_comparison_count,
+            0
+        );
+        assert_eq!(
+            after.manifest_key_comparison_count - before.manifest_key_comparison_count,
+            0
+        );
     }
 }

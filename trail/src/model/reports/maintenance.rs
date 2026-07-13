@@ -29,7 +29,29 @@ pub struct IndexRebuildReport {
     pub messages: u64,
     #[serde(default)]
     pub rich_text_hydrated: u64,
+    /// Immutable roots upgraded with the persistent path-invariant index.
+    #[serde(default)]
+    pub path_index_repaired_roots: Vec<PathIndexRootRepair>,
+    /// Mutable branch/lane refs advanced to equivalent indexed roots.
+    #[serde(default)]
+    pub path_index_repaired_refs: Vec<PathIndexRefRepair>,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathIndexRootRepair {
+    pub old_root: ObjectId,
+    pub new_root: ObjectId,
+    pub case_fold_map_root: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathIndexRefRepair {
+    pub name: String,
+    pub old_change: ChangeId,
+    pub new_change: ChangeId,
+    pub old_root: ObjectId,
+    pub new_root: ObjectId,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -107,4 +129,25 @@ pub struct BackupRestoreReport {
     pub checked_refs: u64,
     pub checked_roots: u64,
     pub checked_texts: u64,
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_index_rebuild_report_defaults_path_index_repairs() {
+        let report: IndexRebuildReport = serde_json::from_value(serde_json::json!({
+            "operations": 1,
+            "operation_parents": 0,
+            "file_history_rows": 0,
+            "line_history_rows": 0,
+            "messages": 0,
+            "errors": []
+        }))
+        .unwrap();
+
+        assert!(report.path_index_repaired_roots.is_empty());
+        assert!(report.path_index_repaired_refs.is_empty());
+    }
 }

@@ -74,8 +74,14 @@ impl Trail {
                 false
             };
 
-        let mut db = Trail::open(&workspace_root)?;
-        let rewritten_workdirs = db.rewrite_restored_lane_workdir_paths()?;
+        let mut db = Trail::open_without_recovering_derived_paths(&workspace_root, &db_dir)?;
+        let rewritten_workdirs = {
+            let _lock = db.acquire_write_lock()?;
+            let rewritten = db.rewrite_restored_lane_workdir_paths()?;
+            db.drain_pending_path_index_derived_repairs()?;
+            rewritten
+        };
+        db.recover_after_open()?;
         let fsck = db.fsck()?;
         if !fsck.errors.is_empty() {
             return Err(Error::Corrupt(format!(

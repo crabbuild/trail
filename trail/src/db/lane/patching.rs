@@ -6,6 +6,7 @@ impl Trail {
         lane: &str,
         patch: PatchDocument,
     ) -> Result<LanePatchReport> {
+        self.reset_case_fold_index_metrics();
         let _lock = self.acquire_write_lock()?;
         self.apply_lane_patch_locked(lane, patch, None)
     }
@@ -16,6 +17,7 @@ impl Trail {
         patch: PatchDocument,
         api_turn: Option<&LaneTurn>,
     ) -> Result<LanePatchReport> {
+        self.reset_case_fold_index_metrics();
         validate_ref_segment(lane)?;
         let lane_row = self.lane_branch(lane)?;
         let ref_name = lane_row.ref_name.clone();
@@ -72,6 +74,11 @@ impl Trail {
         self.ensure_lane_patch_policy(&lane_row, &patch, &touched_paths)?;
         let previous_touched = self.load_root_files_for_paths(&head.root_id, &touched_paths)?;
         self.preflight_replace_line_batch(&patch.edits, &previous_touched)?;
+        let case_fold_tree = self.ensure_patch_final_root_paths_safe(
+            &head.root_id,
+            &previous_touched,
+            &patch.edits,
+        )?;
         let actor = Actor::lane(lane);
         let change_id = self.allocate_change_id(&actor.id, "lane_patch")?;
         let mut target_touched = previous_touched.clone();
@@ -90,13 +97,12 @@ impl Trail {
             )?;
         }
 
-        self.ensure_patch_final_root_paths_safe(&head.root_id, &previous_touched, &target_touched)?;
-
-        let built = self.build_root_from_touched_file_entries_incremental(
+        let built = self.build_root_from_touched_file_entries_incremental_with_case_fold_tree(
             &head.root_id,
             &previous_touched,
             &target_touched,
             &change_id,
+            case_fold_tree,
         )?;
         let mut diff = self.diff_file_maps(&previous_touched, &target_touched)?;
         for (path, file_id, line) in manual_line_changes {
@@ -251,6 +257,7 @@ impl Trail {
             operation: change_id,
             root_id: built.root_id,
             changed_paths: changed_summaries,
+            path_index: self.case_fold_index_metrics_report(),
         })
     }
 
@@ -262,13 +269,7 @@ impl Trail {
         previous_touched: &BTreeMap<String, FileEntry>,
         target_touched: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
-        if !matches!(
-            self.cached_workdir_manifest_status(workdir_path, previous_root_id)?,
-            CachedWorkdirManifestStatus::Clean
-        ) {
-            return Ok(false);
-        }
-        if !self.clean_workdir_manifest_allows_file_subset_update(
+        if !self.clean_workdir_manifest_allows_touched_path_update(
             workdir_path,
             previous_root_id,
             previous_touched,

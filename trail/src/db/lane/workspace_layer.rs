@@ -1545,7 +1545,9 @@ impl Trail {
         )?;
 
         let mut core = ViewCore::new_lazy(
-            Trail::open(self.workspace_root())?,
+            // The outer environment mutation owns the workspace writer lock
+            // and its Trail handle already completed open-time recovery.
+            Trail::open_without_recovering_derived_paths(self.workspace_root(), self.db_dir())?,
             PathBuf::from(&view.source_upper),
             view.base_root.clone(),
         )?;
@@ -2106,7 +2108,9 @@ impl Trail {
         }
         let mut prepared_reset = if replace_private_upper {
             let mut core = ViewCore::new_lazy(
-                Trail::open(self.workspace_root())?,
+                // The outer layer mutation owns the workspace writer lock and
+                // its Trail handle already completed open-time recovery.
+                Trail::open_without_recovering_derived_paths(self.workspace_root(), self.db_dir())?,
                 PathBuf::from(&view.source_upper),
                 view.base_root.clone(),
             )?;
@@ -4373,6 +4377,99 @@ mod tests {
         assert!(replaced.lookup(package, "private.js").is_err());
         assert!(!paths.generated_upper.join("node_modules").exists());
         assert!(replaced.checkpoint_candidates().unwrap().paths.is_empty());
+    }
+
+    #[test]
+    fn retained_path_index_mirror_intent_does_not_self_lock_layer_replacement() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "root\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(workspace.path()).unwrap();
+        let mode = if cfg!(target_os = "macos") {
+            LaneWorkdirMode::NfsCow
+        } else if cfg!(target_os = "windows") {
+            LaneWorkdirMode::DokanCow
+        } else {
+            LaneWorkdirMode::FuseCow
+        };
+        db.spawn_lane_with_workdir_mode_paths_and_neighbors(
+            "retained-repair",
+            Some("main"),
+            mode,
+            None,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("pkg")).unwrap();
+        fs::write(built.path().join("pkg/index.js"), "immutable\n").unwrap();
+        let layer = db
+            .publish_workspace_layer_from_directory(&key(), built.path())
+            .unwrap();
+        db.attach_workspace_layer(
+            "retained-repair",
+            &layer.layer_id,
+            "node_modules",
+            "node",
+            &layer.cache_key,
+        )
+        .unwrap();
+
+        let branch = db.lane_branch("retained-repair").unwrap();
+        let head = db.get_ref(&branch.ref_name).unwrap();
+        let manifest = db
+            .workspace_view_paths_for_lane("retained-repair")
+            .unwrap()
+            .meta_dir
+            .join("workdir-manifest.json");
+        if manifest.exists() {
+            fs::remove_file(&manifest).unwrap();
+        }
+        fs::create_dir(&manifest).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pending_path_index_derived_repairs \
+                 (ref_name, repair_kind, old_root, new_root, new_change, created_at) \
+                 VALUES (?1, 'lane_manifest', ?2, ?2, ?3, ?4)",
+                params![branch.ref_name, head.root_id.0, head.change_id.0, now_ts()],
+            )
+            .unwrap();
+
+        db.replace_workspace_layer(
+            "retained-repair",
+            &layer.layer_id,
+            "node_modules",
+            "node",
+            &layer.cache_key,
+        )
+        .unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        fs::remove_dir(&manifest).unwrap();
+        db.rebuild_indexes().unwrap();
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_path_index_derived_repairs",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

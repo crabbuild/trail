@@ -25,3 +25,5 @@ mod schema;
 mod validation;
 mod worktree_index;
 mod worktree_scan;
+
+pub(crate) use worktree_scan::{observed_exact_paths_for_candidates, ObservedPathKind};
