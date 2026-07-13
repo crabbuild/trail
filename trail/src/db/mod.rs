@@ -35,13 +35,44 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
-const TRAIL_SCHEMA_VERSION: i64 = 17;
+const TRAIL_SCHEMA_VERSION: i64 = 18;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
 const MAIN_REF_PREFIX: &str = "refs/branches/";
 const LANE_REF_PREFIX: &str = "refs/lanes/";
 const ROOT_OBJECT_VERSION: u16 = 1;
 const TEXT_OBJECT_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchemaOpenMode {
+    FreshCreate,
+    Existing,
+}
+
+pub(crate) fn preflight_existing_schema(db_path: &Path) -> Result<()> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let encoded_path = db_path
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('?', "%3f")
+        .replace('#', "%23");
+    let uri = format!("file:{encoded_path}?immutable=1");
+    let conn =
+        rusqlite::Connection::open_with_flags(uri, flags).map_err(schema_reinitialize_error)?;
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(schema_reinitialize_error)?;
+    Trail::validate_schema_v18(&conn).map_err(schema_reinitialize_error)
+}
+
+fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
+    Error::SchemaReinitializeRequired {
+        found: err.to_string(),
+        guidance: "back up this workspace, then run `trail init --force` to create schema v18"
+            .into(),
+    }
+}
 
 thread_local! {
     static WRITE_LOCK_WAIT_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };

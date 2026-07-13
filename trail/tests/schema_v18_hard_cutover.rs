@@ -1,0 +1,342 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use rusqlite::Connection;
+use trail::{InitImportMode, Trail};
+
+struct SchemaFixture {
+    temp: tempfile::TempDir,
+}
+
+impl SchemaFixture {
+    fn versioned(version: i64) -> Self {
+        let fixture = Self::fresh_v18();
+        let conn = Connection::open(fixture.sqlite_path()).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        conn.execute(
+            "UPDATE schema_meta SET value = ?1 WHERE key = 'schema.version'",
+            [version.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        fixture
+    }
+
+    fn partial_v18(missing_table: &str) -> Self {
+        let fixture = Self::fresh_v18();
+        let conn = Connection::open(fixture.sqlite_path()).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(&format!("DROP TABLE {missing_table};"))
+            .unwrap();
+        drop(conn);
+        fixture
+    }
+
+    fn with_sql(mutator: impl FnOnce(&Connection)) -> Self {
+        let fixture = Self::fresh_v18();
+        let conn = Connection::open(fixture.sqlite_path()).unwrap();
+        mutator(&conn);
+        drop(conn);
+        fixture
+    }
+
+    fn mutated_master_sql(object: &str, from: &str, to: &str) -> Self {
+        Self::with_sql(|conn| {
+            conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE sqlite_master SET sql = replace(sql, ?2, ?3) WHERE name = ?1",
+                    (object, from, to),
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+            conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
+            let schema_version: i64 = conn
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap();
+            conn.pragma_update(None, "schema_version", schema_version + 1)
+                .unwrap();
+        })
+    }
+
+    fn fresh_v18() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        Self { temp }
+    }
+
+    fn root(&self) -> &Path {
+        self.temp.path()
+    }
+
+    fn sqlite_path(&self) -> PathBuf {
+        self.root().join(".trail/index/trail.sqlite")
+    }
+
+    fn snapshot_tree_bytes(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    visit(root, &path, files);
+                } else if file_type.is_file() {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let trail_dir = self.root().join(".trail");
+        let mut files = BTreeMap::new();
+        visit(&trail_dir, &trail_dir, &mut files);
+        files
+    }
+}
+
+fn open_error(root: &Path) -> trail::Error {
+    match Trail::open(root) {
+        Ok(_) => panic!("existing incompatible schema was opened"),
+        Err(err) => err,
+    }
+}
+
+fn assert_tree_unchanged(fixture: &SchemaFixture, before: &BTreeMap<PathBuf, Vec<u8>>) {
+    let after = fixture.snapshot_tree_bytes();
+    let changes = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|path| {
+            let old = before.get(path);
+            let new = after.get(path);
+            (old != new).then(|| {
+                format!(
+                    "{}: {:?} -> {:?} bytes",
+                    path.display(),
+                    old.map(Vec::len),
+                    new.map(Vec::len)
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(changes.is_empty(), "workspace bytes changed: {changes:?}");
+}
+
+#[test]
+fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
+    let fixture = SchemaFixture::versioned(17);
+    let before = fixture.snapshot_tree_bytes();
+    let err = open_error(fixture.root());
+    assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+    assert!(err.to_string().contains("trail init --force"));
+    assert_tree_unchanged(&fixture, &before);
+}
+
+#[test]
+fn partial_v18_is_rejected_without_repair() {
+    let fixture = SchemaFixture::partial_v18("changed_path_scopes");
+    let before = fixture.snapshot_tree_bytes();
+    let err = open_error(fixture.root());
+    assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+    assert_tree_unchanged(&fixture, &before);
+}
+
+#[test]
+fn existing_v0_v17_and_v19_are_rejected_without_mutation() {
+    for version in [0, 17, 19] {
+        let fixture = SchemaFixture::versioned(version);
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert!(err.to_string().contains("trail init --force"));
+        assert_tree_unchanged(&fixture, &before);
+    }
+}
+
+#[test]
+fn fresh_init_creates_the_exact_v18_ledger_shape() {
+    let fixture = SchemaFixture::fresh_v18();
+    let conn = Connection::open(fixture.sqlite_path()).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        18
+    );
+
+    let metadata = [
+        ("schema.version", "18"),
+        ("changed_path.observer_log_format_min", "1"),
+        ("changed_path.observer_log_format_max", "1"),
+    ];
+    for (key, expected) in metadata {
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, expected);
+    }
+
+    for table in [
+        "changed_path_scopes",
+        "changed_path_entries",
+        "changed_path_prefixes",
+        "changed_path_policy_dependencies",
+        "changed_path_intents",
+        "changed_path_intent_paths",
+        "changed_path_intent_prefixes",
+        "changed_path_reconciliations",
+        "changed_path_observer_segments",
+        "changed_path_observer_owners",
+    ] {
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("IF NOT EXISTS"));
+        assert!(!sql.contains("legacy_reconcile_required"));
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'changed_path_observer_leases'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+
+    let entry_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'changed_path_entries'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(entry_sql.contains("normalized_path TEXT COLLATE BINARY NOT NULL"));
+
+    let policy_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'changed_path_policy_dependencies'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(policy_sql.contains("dependency_identity TEXT COLLATE BINARY NOT NULL"));
+    assert!(policy_sql.contains("WITHOUT ROWID"));
+    assert!(policy_sql.contains("content_identity BLOB NOT NULL"));
+    assert!(policy_sql.contains("metadata_identity BLOB NOT NULL"));
+
+    let policy_index_columns = conn
+        .prepare(
+            "SELECT name, coll FROM pragma_index_xinfo(\
+                'changed_path_policy_dependencies_generation_idx'\
+             ) WHERE key = 1 ORDER BY seqno",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        policy_index_columns,
+        vec![
+            ("scope_id".to_string(), "BINARY".to_string()),
+            ("generation".to_string(), "BINARY".to_string()),
+            ("last_source_sequence".to_string(), "BINARY".to_string()),
+        ]
+    );
+
+    let delete_action: String = conn
+        .query_row(
+            "SELECT on_delete FROM pragma_foreign_key_list('changed_path_entries') \
+             WHERE [from] = 'intent_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delete_action, "SET NULL");
+
+    let index_columns = conn
+        .prepare(
+            "SELECT name, coll FROM pragma_index_xinfo('changed_path_entries_sequence_idx') \
+             WHERE key = 1 ORDER BY seqno",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        index_columns,
+        vec![
+            ("scope_id".to_string(), "BINARY".to_string()),
+            ("last_sequence".to_string(), "BINARY".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn malformed_v18_attributes_are_rejected_read_only() {
+    let fixtures = [
+        SchemaFixture::mutated_master_sql(
+            "changed_path_scopes",
+            "DEFAULT 'reconciling'",
+            "DEFAULT 'trusted'",
+        ),
+        SchemaFixture::mutated_master_sql(
+            "changed_path_entries",
+            "normalized_path TEXT COLLATE BINARY",
+            "normalized_path TEXT COLLATE NOCASE",
+        ),
+        SchemaFixture::mutated_master_sql(
+            "changed_path_entries",
+            "ON DELETE SET NULL",
+            "ON DELETE CASCADE",
+        ),
+        SchemaFixture::mutated_master_sql(
+            "changed_path_entries_sequence_idx",
+            "scope_id, last_sequence",
+            "last_sequence, scope_id",
+        ),
+        SchemaFixture::mutated_master_sql(
+            "changed_path_observer_segments",
+            "CHECK (log_format_version = 1)",
+            "CHECK (log_format_version BETWEEN 1 AND 2)",
+        ),
+        SchemaFixture::with_sql(|conn| {
+            conn.execute(
+                "UPDATE schema_meta SET value = '2' \
+                 WHERE key = 'changed_path.observer_log_format_max'",
+                [],
+            )
+            .unwrap();
+        }),
+    ];
+
+    for fixture in fixtures {
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_tree_unchanged(&fixture, &before);
+    }
+}

@@ -180,6 +180,30 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
+        Error::SchemaReinitializeRequired { .. } => {
+            let mut diagnostic =
+                UiDiagnostic::new(err.code(), "Trail workspace schema must be reinitialized");
+            diagnostic.consequence = Some(
+                "Trail rejected the workspace before opening any mutable storage.".to_string(),
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: "trail init --force".to_string(),
+                reason: "Back up the workspace, then create the required schema v18.".to_string(),
+            });
+            diagnostic
+        }
+        Error::ChangeLedgerReconcileRequired { command, .. } => {
+            let mut diagnostic = UiDiagnostic::new(
+                err.code(),
+                "Changed-path ledger trust could not be established",
+            );
+            diagnostic.recovery = Some(UiNextAction {
+                command: command.clone(),
+                reason: "Retry the operation that establishes a trusted changed-path snapshot."
+                    .to_string(),
+            });
+            diagnostic
+        }
         Error::InvalidInput(_) | Error::InvalidPath { .. } => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Trail cannot use the supplied input");

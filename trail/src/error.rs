@@ -14,6 +14,15 @@ pub enum Error {
     InvalidPath { path: String, reason: String },
     #[error("path invariant index is required: {0}")]
     PathIndexRequired(String),
+    #[error("workspace schema {found} cannot be opened; {guidance}")]
+    SchemaReinitializeRequired { found: String, guidance: String },
+    #[error("changed-path ledger reconciliation required for {scope}: {reason}; run `{command}`")]
+    ChangeLedgerReconcileRequired {
+        scope: String,
+        state: String,
+        reason: String,
+        command: String,
+    },
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -88,6 +97,8 @@ impl Error {
             Error::WorkspaceExists(_) => "WORKSPACE_EXISTS",
             Error::InvalidPath { .. } => "INVALID_PATH",
             Error::PathIndexRequired(_) => "PATH_INDEX_REQUIRED",
+            Error::SchemaReinitializeRequired { .. } => "SCHEMA_REINITIALIZE_REQUIRED",
+            Error::ChangeLedgerReconcileRequired { .. } => "CHANGE_LEDGER_RECONCILE_REQUIRED",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -139,6 +150,8 @@ impl Error {
             Error::OperationNotFound(_) => 12,
             Error::RefNotFound(_) => 13,
             Error::IgnoredPath(_) => 14,
+            Error::SchemaReinitializeRequired { .. } => 15,
+            Error::ChangeLedgerReconcileRequired { .. } => 16,
             Error::InvalidInput(_)
             | Error::WorkspaceExists(_)
             | Error::CloneUnsupported
@@ -197,5 +210,33 @@ mod tests {
 
         assert_eq!(error.code(), "PATH_INDEX_REQUIRED");
         assert_eq!(error.exit_code(), 9);
+    }
+
+    #[test]
+    fn schema_and_ledger_recovery_errors_have_stable_contracts() {
+        let schema = Error::SchemaReinitializeRequired {
+            found: "version 17".into(),
+            guidance: "back up this workspace, then run `trail init --force` to create schema v18"
+                .into(),
+        };
+        assert_eq!(schema.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_eq!(schema.exit_code(), 15);
+        assert_eq!(
+            schema.to_string(),
+            "workspace schema version 17 cannot be opened; back up this workspace, then run `trail init --force` to create schema v18"
+        );
+
+        let reconcile = Error::ChangeLedgerReconcileRequired {
+            scope: "workspace:main".into(),
+            state: "untrusted_gap".into(),
+            reason: "observer startup failed".into(),
+            command: "trail status".into(),
+        };
+        assert_eq!(reconcile.code(), "CHANGE_LEDGER_RECONCILE_REQUIRED");
+        assert_eq!(reconcile.exit_code(), 16);
+        assert_eq!(
+            reconcile.to_string(),
+            "changed-path ledger reconciliation required for workspace:main: observer startup failed; run `trail status`"
+        );
     }
 }

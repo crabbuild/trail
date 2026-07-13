@@ -95,8 +95,7 @@ impl Trail {
         fs::write(db_dir.join(HEAD_FILE), format!("{branch}\n"))?;
         write_default_trailignore(&workspace_root)?;
 
-        let mut db = Self::open_at(workspace_root, db_dir, config)?;
-        db.init_schema()?;
+        let mut db = Self::open_at(workspace_root, db_dir, config, SchemaOpenMode::FreshCreate)?;
 
         let actor = Actor::system();
         let change_id = db.allocate_change_id(&actor.id, "init")?;
@@ -214,7 +213,7 @@ impl Trail {
             let db_dir = current.join(".trail");
             if db_dir.is_dir() {
                 let config = read_config(&db_dir)?;
-                return Self::open_at(current, db_dir, config);
+                return Self::open_at(current, db_dir, config, SchemaOpenMode::Existing);
             }
             if !current.pop() {
                 return Err(Error::WorkspaceNotFound(start.as_ref().to_path_buf()));
@@ -229,7 +228,7 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(workspace_root));
         }
         let config = read_config(&db_dir)?;
-        Self::open_at(workspace_root, db_dir, config)
+        Self::open_at(workspace_root, db_dir, config, SchemaOpenMode::Existing)
     }
 
     pub fn open_with_db_dir(
@@ -242,15 +241,16 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
         let config = read_config(&db_dir)?;
-        Self::open_at(workspace_root, db_dir, config)
+        Self::open_at(workspace_root, db_dir, config, SchemaOpenMode::Existing)
     }
 
     pub(crate) fn open_at(
         workspace_root: PathBuf,
         db_dir: PathBuf,
         config: TrailConfig,
+        schema_mode: SchemaOpenMode,
     ) -> Result<Self> {
-        let db = Self::open_at_without_recovery(workspace_root, db_dir, config)?;
+        let db = Self::open_at_without_recovery(workspace_root, db_dir, config, schema_mode)?;
         db.recover_after_open()?;
         Ok(db)
     }
@@ -265,16 +265,20 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
         let config = read_config(&db_dir)?;
-        Self::open_at_without_recovery(workspace_root, db_dir, config)
+        Self::open_at_without_recovery(workspace_root, db_dir, config, SchemaOpenMode::Existing)
     }
 
     fn open_at_without_recovery(
         workspace_root: PathBuf,
         db_dir: PathBuf,
         config: TrailConfig,
+        schema_mode: SchemaOpenMode,
     ) -> Result<Self> {
-        fs::create_dir_all(db_dir.join("index"))?;
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
+        match schema_mode {
+            SchemaOpenMode::FreshCreate => fs::create_dir_all(db_dir.join("index"))?,
+            SchemaOpenMode::Existing => preflight_existing_schema(&sqlite_path)?,
+        }
         register_sqlite_vec_extension()?;
         let operation_metrics =
             operation_metrics_are_enabled().then(|| Arc::new(OperationMetricsState::default()));
@@ -297,7 +301,9 @@ impl Trail {
             case_fold_index_metrics: Cell::new(CaseFoldIndexMetrics::default()),
             operation_metrics,
         };
-        db.init_schema()?;
+        if schema_mode == SchemaOpenMode::FreshCreate {
+            db.create_schema_v18()?;
+        }
         Ok(db)
     }
 
