@@ -1247,9 +1247,16 @@ fn agent_apply_preserves_git_only_symlinks() {
     std::os::unix::fs::symlink("target.md", temp.path().join("link.md")).unwrap();
     run_git(temp.path(), &["add", "target.md", "link.md"]);
     run_git(temp.path(), &["commit", "-m", "initial"]);
+    let link_tree_entry_before = git_output(temp.path(), &["ls-tree", "HEAD", "--", "link.md"]);
+    assert!(
+        link_tree_entry_before.starts_with("120000 blob "),
+        "expected a Git symlink entry, got {link_tree_entry_before:?}"
+    );
 
-    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let init = Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
     let mut db = Trail::open(temp.path()).unwrap();
+    let root = db.inspect_root(&init.root_id.0).unwrap();
+    assert!(!root.files.iter().any(|file| file.path == "link.md"));
     db.spawn_lane("apply-bot", Some("main"), false, None, None)
         .unwrap();
     let patch: PatchDocument = serde_json::from_value(serde_json::json!({
@@ -1262,6 +1269,10 @@ fn agent_apply_preserves_git_only_symlinks() {
 
     db.agent_apply("apply-bot", false, None).unwrap();
 
+    assert_eq!(
+        git_output(temp.path(), &["ls-tree", "HEAD", "--", "link.md"]),
+        link_tree_entry_before
+    );
     assert_eq!(
         git_output_raw(temp.path(), &["show", "HEAD:link.md"]),
         "target.md"
