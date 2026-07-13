@@ -50,6 +50,17 @@ pub struct GitExportReport {
     pub commit: String,
     pub parent: Option<String>,
     pub mapping: Option<GitMapping>,
+    #[serde(default)]
+    pub performance: GitHandoffMetricsReport,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GitHandoffMetricsReport {
+    pub export_mode: String,
+    pub changed_path_count: u64,
+    pub blob_write_count: u64,
+    pub tracked_status_count: u64,
+    pub full_root_file_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

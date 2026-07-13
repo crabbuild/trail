@@ -17,18 +17,58 @@ impl Trail {
 
     pub fn git_export_commit(&mut self, range: &str, message: &str) -> Result<GitExportReport> {
         let _lock = self.acquire_write_lock()?;
+        let git_state = self.current_git_state()?.ok_or_else(|| {
+            Error::Git(format!(
+                "git export requires a Git working tree at {}",
+                self.workspace_root.display()
+            ))
+        })?;
+        self.git_export_commit_with_state(
+            range,
+            message,
+            git_state,
+            GitExportPolicy::AllowFullSnapshot,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn git_export_commit_mapped(
+        &mut self,
+        range: &str,
+        message: &str,
+        state: Option<GitState>,
+    ) -> Result<GitExportReport> {
+        let _lock = self.acquire_write_lock()?;
+        let git_state = match state {
+            Some(state) => state,
+            None => self.current_git_state()?.ok_or_else(|| {
+                Error::Git(format!(
+                    "git export requires a Git working tree at {}",
+                    self.workspace_root.display()
+                ))
+            })?,
+        };
+        self.git_export_commit_with_state(
+            range,
+            message,
+            git_state,
+            GitExportPolicy::RequireMappedDelta,
+        )
+    }
+
+    fn git_export_commit_with_state(
+        &mut self,
+        range: &str,
+        message: &str,
+        git_state: GitState,
+        policy: GitExportPolicy,
+    ) -> Result<GitExportReport> {
         let message = message.trim();
         if message.is_empty() {
             return Err(Error::InvalidInput(
                 "git export commit message cannot be empty".to_string(),
             ));
         }
-        let Some(git_state) = self.current_git_state()? else {
-            return Err(Error::Git(format!(
-                "git export requires a Git working tree at {}",
-                self.workspace_root.display()
-            )));
-        };
         let (left, right) = parse_range(range)?;
         let left_ref = self.resolve_refish(left)?;
         let right_ref = self.resolve_refish(right)?;
@@ -52,6 +92,38 @@ impl Trail {
             }
             self.ensure_lane_merge_readiness(lane)?;
         }
+        let can_export_delta = match (git_state.head.as_deref(), git_state.dirty) {
+            (Some(head), false) => {
+                if self.git_clean_head_matches_root_mapping(head, &left_ref.root_id)? {
+                    true
+                } else {
+                    match policy {
+                        GitExportPolicy::RequireMappedDelta => {
+                            return Err(Error::GitMappingRequired(format!(
+                                "clean Git HEAD `{head}` has no mapping for Trail root `{}`",
+                                left_ref.root_id.0
+                            )));
+                        }
+                        GitExportPolicy::AllowFullSnapshot => self
+                            .ensure_git_clean_head_root_mapping(
+                                &branch,
+                                &left_ref.change_id,
+                                &left_ref.root_id,
+                                head,
+                            )?,
+                    }
+                }
+            }
+            _ => match policy {
+                GitExportPolicy::RequireMappedDelta => {
+                    return Err(Error::GitMappingRequired(format!(
+                        "mapped delta export requires a clean Git HEAD for Trail root `{}`",
+                        left_ref.root_id.0
+                    )));
+                }
+                GitExportPolicy::AllowFullSnapshot => false,
+            },
+        };
         let mut patch_left = BTreeMap::new();
         let mut patch_right = BTreeMap::new();
         let _diff = self.diff_root_file_maps(
@@ -60,26 +132,16 @@ impl Trail {
             &mut patch_left,
             &mut patch_right,
         )?;
-        let can_export_delta = git_state
-            .head
-            .as_deref()
-            .filter(|_| !git_state.dirty)
-            .map(|head| {
-                self.ensure_git_clean_head_root_mapping(
-                    &branch,
-                    &left_ref.change_id,
-                    &left_ref.root_id,
-                    head,
+        let (tree_oid, export_mode) =
+            if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
+                (
+                    self.git_write_tree_from_head_delta(head, &patch_left, &patch_right)?,
+                    "mapped_delta",
                 )
-            })
-            .transpose()?
-            .unwrap_or(false);
-        let tree_oid = if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
-            self.git_write_tree_from_head_delta(head, &patch_left, &patch_right)?
-        } else {
-            let files = self.load_root_files(&right_ref.root_id)?;
-            self.git_write_tree(&files)?
-        };
+            } else {
+                let files = self.load_root_files(&right_ref.root_id)?;
+                (self.git_write_tree(&files)?, "full_snapshot")
+            };
         let commit = self.git_commit_tree(&tree_oid, git_state.head.as_deref(), message)?;
         let mapping = self.insert_git_mapping_for_state(
             "export",
@@ -97,6 +159,10 @@ impl Trail {
             commit,
             parent: git_state.head,
             mapping,
+            performance: GitHandoffMetricsReport {
+                export_mode: export_mode.to_string(),
+                ..GitHandoffMetricsReport::default()
+            },
         })
     }
 
@@ -216,5 +282,51 @@ impl Trail {
             false,
         )?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn mapped_git_export_requires_preexisting_clean_mapping() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+        run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+        fs::write(temp.path().join("README.md"), "one\n").unwrap();
+        run_git(temp.path(), &["add", "README.md"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+        let init = Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let record = db
+            .record(Some("main"), Some("change".into()), Actor::human(), false)
+            .unwrap();
+        run_git(temp.path(), &["checkout", "--", "README.md"]);
+        let range = format!("{}..{}", init.operation.0, record.operation.unwrap().0);
+        let err = db
+            .git_export_commit_mapped(&range, "mapped", None)
+            .unwrap_err();
+        assert!(matches!(err, Error::GitMappingRequired(_)));
+        assert!(db.git_mappings(10).unwrap().is_empty());
     }
 }

@@ -407,6 +407,13 @@ pub enum InitImportMode {
     WorkingTree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum GitExportPolicy {
+    RequireMappedDelta,
+    AllowFullSnapshot,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DiskFile {
     path: String,
