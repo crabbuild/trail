@@ -27,6 +27,7 @@ jobs:
       - name: Scale Threshold Checker Tests
         run: >-
           python3 -m unittest
+          scripts/test_cli_scale_bench_source.py
           scripts/test_check_cli_scale_thresholds.py
           scripts/test_extract_agent_git_performance.py
       - name: Scale Benchmark Smoke

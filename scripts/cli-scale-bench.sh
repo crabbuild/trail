@@ -429,7 +429,7 @@ PY
       git -C "$GIT_REPO" config user.email "trail@example.com"
       git -C "$GIT_REPO" config user.name "Trail"
       run_timed "$scale" git_commit_initial git -C "$GIT_REPO" commit -m "scale initial"
-      run_timed "$scale" git_clone_unmapped git clone --quiet "$GIT_REPO" "$GIT_UNMAPPED_REPO"
+      run_timed "$scale" git_clone_unmapped git clone --no-local --quiet "$GIT_REPO" "$GIT_UNMAPPED_REPO"
       git -C "$GIT_UNMAPPED_REPO" config user.email "trail@example.com"
       git -C "$GIT_UNMAPPED_REPO" config user.name "Trail"
       run_timed "$scale" git_init_from_git "$BIN" --workspace "$GIT_REPO" --json init --from-git
