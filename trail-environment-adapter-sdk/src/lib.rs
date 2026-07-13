@@ -1041,7 +1041,9 @@ pub enum AdapterPlanBuildError {
     StagingCommandCount { actual: usize },
     #[error("adapter protocol-v2 plans support at most sixteen caches; received {actual}")]
     CacheCount { actual: usize },
-    #[error("external-artifact plans require kind `external` and cannot mix actions, caches, or filesystem outputs")]
+    #[error(
+        "external-artifact plans require kind `external` and cannot mix actions, caches, or filesystem outputs"
+    )]
     ExternalArtifactPlanConflict,
     #[error("adapter protocol-v2 plans support at most 32 external artifacts; received {actual}")]
     ExternalArtifactCount { actual: usize },

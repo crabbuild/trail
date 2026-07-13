@@ -1,3 +1,5 @@
-edition = "2021"
+edition = "2024"
+# Keep style changes bounded while the language edition moves to Rust 2024.
+style_edition = "2021"
 newline_style = "Unix"
 use_field_init_shorthand = true

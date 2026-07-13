@@ -381,7 +381,7 @@ impl RuntimeProvider for CliRuntimeProvider {
                 other => {
                     return Err(Error::Corrupt(format!(
                         "unsupported persisted restart policy `{other}`"
-                    )))
+                    )));
                 }
             },
         ];

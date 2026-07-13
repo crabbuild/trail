@@ -121,13 +121,13 @@ impl Trail {
                     return Err(Error::InvalidInput(format!(
                         "workspace view `{}` mount worker stopped before becoming ready",
                         view.view_id
-                    )))
+                    )));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     return Err(Error::InvalidInput(format!(
                         "workspace view `{}` mount worker exited unexpectedly",
                         view.view_id
-                    )))
+                    )));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -204,7 +204,7 @@ impl Trail {
                 return Err(Error::InvalidInput(format!(
                     "lane `{lane}` uses `{}` rather than a layered workspace view",
                     mode.as_str()
-                )))
+                )));
             }
         }
         let _ = fs::remove_file(&stop_path);
@@ -655,7 +655,7 @@ impl Trail {
                 return Err(Error::InvalidInput(format!(
                     "lane `{lane}` uses `{}` rather than a layered workspace view",
                     mode.as_str()
-                )))
+                )));
             }
         };
         let environment_generation = self

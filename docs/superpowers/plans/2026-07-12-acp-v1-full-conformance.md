@@ -4,9 +4,9 @@
 
 **Goal:** Make Trail a transparent, durable, and exhaustively tested ACP wire-protocol v1 proxy between any conformant stdio client/editor and agent, with complete Trail semantic capture and no known stable-v1 gaps.
 
-**Architecture:** Keep the relay a transparent byte-preserving proxy. Parse each newline-delimited frame only for classification, negotiation, intentional atomic transformations, and capture. Pin the official ACP v1 schema and method metadata for validation and offline conformance; use `jsonschema` rather than the official Rust schema crate because that crate requires Rust 1.88 and Trail's declared MSRV is 1.81. Move persistence off the forwarding path by appending direction-ordered ACP receipts to Trail's existing durable agent-capture ingress and replaying them asynchronously.
+**Architecture:** Keep the relay a transparent byte-preserving proxy. Parse each newline-delimited frame only for classification, negotiation, intentional atomic transformations, and capture. Pin the official ACP v1 schema and method metadata for validation and offline conformance; use `jsonschema` so conformance remains pinned to the raw official artifacts and independent of one peer implementation crate. Move persistence off the forwarding path by appending direction-ordered ACP receipts to Trail's existing durable agent-capture ingress and replaying them asynchronously.
 
-**Tech Stack:** Rust 2021/MSRV 1.81, `serde`, `serde_json`, `jsonschema` 0.29.1 with default features disabled, `sha2`, stdio JSON-RPC 2.0, SQLite/WAL, Trail's existing agent-receipt and lane-capture models, Cargo unit/integration/E2E tests.
+**Tech Stack:** Rust 2024/MSRV 1.89, `serde`, `serde_json`, `jsonschema` 0.29.1 with default features disabled, `sha2`, stdio JSON-RPC 2.0, SQLite/WAL, Trail's existing agent-receipt and lane-capture models, Cargo unit/integration/E2E tests.
 
 ## Global Constraints
 
@@ -18,7 +18,7 @@
 - Enable v1 validation, transformations, and semantic capture only after the upstream `initialize` response selects `protocolVersion: 1`; forward other negotiated versions without claiming conformance.
 - Never wait for the Trail database writer lock on a protocol forwarding thread.
 - Redact credentials, tokens, environment secrets, and secret-shaped metadata before durable persistence or stderr diagnostics.
-- Keep every new production dependency compatible with Rust 1.81 and all five release targets.
+- Keep every new production dependency compatible with Rust 1.89 and all five release targets.
 - Commit only files named by the active task; preserve unrelated worktree changes.
 
 ---
@@ -135,11 +135,11 @@ Run: `cargo test -p trail acp::schema::tests::pinned_v1_artifacts_match_manifest
 
 Expected: PASS.
 
-Run: `cargo +1.81.0 check -p trail --all-targets`
+Run: `cargo +1.89.0 check -p trail --all-targets`
 
 Expected: PASS, including the new dependency graph.
 
-If the toolchain is absent, first run `rustup toolchain install 1.81.0 --profile minimal` and repeat the check.
+If the toolchain is absent, first run `rustup toolchain install 1.89.0 --profile minimal` and repeat the check.
 
 - [ ] **Step 7: Commit**
 
@@ -725,7 +725,7 @@ The script downloads the two files from the manifest repository's current stable
 
 - [ ] **Step 4: Add the official-type reference peers**
 
-Create a standalone Cargo package with its own empty `[workspace]` table and exact dependency `agent-client-protocol-schema = "=1.4.0"`. Keep it outside CrabDB's workspace members so Trail retains MSRV 1.81; compile the reference peer with Rust 1.88 or newer in the interoperability job. Its `client` and `agent` modes must serialize and deserialize through official `agent_client_protocol_schema::v1` request, response, notification, content, update, and error types rather than hand-written JSON.
+Create a standalone Cargo package with its own empty `[workspace]` table and exact dependency `agent-client-protocol-schema = "=1.4.0"`. Keep it outside CrabDB's workspace members so the interoperability peer remains independent from Trail's production dependency graph; compile the reference peer with Rust 1.88 or newer in the interoperability job. Its `client` and `agent` modes must serialize and deserialize through official `agent_client_protocol_schema::v1` request, response, notification, content, update, and error types rather than hand-written JSON.
 
 The script builds the standalone peer into `target/acp-reference`, exports its absolute path as `TRAIL_ACP_REFERENCE_PEER`, and runs `acp_interop`. Exercise official client → Trail → official agent and official client → Trail → fixture agent scenarios. Verify initialize, auth, new/load/resume, prompt streaming, permission, filesystem, terminal, cancellation, close/delete, and clean shutdown.
 
@@ -831,7 +831,7 @@ Expected: both PASS.
 
 Run: `cargo clippy -p trail --all-targets -- -D warnings`
 
-Run: `cargo +1.81.0 check -p trail --all-targets`
+Run: `cargo +1.89.0 check -p trail --all-targets`
 
 Expected: PASS.
 

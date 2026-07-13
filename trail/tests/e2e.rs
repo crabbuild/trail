@@ -3407,16 +3407,14 @@ fn agent_acp_setup_and_hidden_runner_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|command| command == "write_file"));
-    assert!(agent_tools["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["name"] == "write README"
+    assert!(agent_tools["tools"].as_array().unwrap().iter().any(|tool| {
+        tool["name"] == "write README"
             && tool["turns"][0]["changed_paths"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|path| path["path"] == "README.md")));
+                .any(|path| path["path"] == "README.md")
+    }));
     let impact = run_trail_json(temp.path(), &["agent", "impact", "latest"]);
     assert_eq!(impact["task"]["lane"], view["task"]["lane"]);
     assert_eq!(impact["highest_impact"], "low");
@@ -3878,14 +3876,11 @@ fn agent_acp_setup_and_hidden_runner_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|item| item.as_str().unwrap().contains("Git preflight failed")));
-    assert!(diagnose["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item
-            .as_str()
+    assert!(diagnose["evidence"].as_array().unwrap().iter().any(|item| {
+        item.as_str()
             .unwrap()
-            .contains("friendly checkpoint target")));
+            .contains("friendly checkpoint target")
+    }));
     assert!(diagnose["recovery_options"]
         .as_array()
         .unwrap()
@@ -5225,14 +5220,12 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .unwrap()
         .iter()
         .any(|step| step["command"] == format!("trail agent action {task_name}")));
-    assert!(task_guide["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|step| step["command"]
+    assert!(task_guide["steps"].as_array().unwrap().iter().any(|step| {
+        step["command"]
             .as_str()
             .unwrap()
-            .contains("trail agent ask --selector")));
+            .contains("trail agent ask --selector")
+    }));
     assert!(task_guide["concepts"]
         .as_array()
         .unwrap()
@@ -6031,14 +6024,13 @@ fn acp_relay_closes_failed_turn_on_malformed_upstream_json() {
         .unwrap();
     let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
     assert_eq!(session.turns[0].status, "failed");
-    assert!(session
-        .events
-        .iter()
-        .any(|event| event.event_type == "acp_relay_turn_closed"
+    assert!(session.events.iter().any(|event| {
+        event.event_type == "acp_relay_turn_closed"
             && event
                 .payload
                 .as_ref()
-                .is_some_and(|payload| payload.to_string().contains("malformed JSON"))));
+                .is_some_and(|payload| payload.to_string().contains("malformed JSON"))
+    }));
 }
 
 #[cfg(unix)]

@@ -151,7 +151,7 @@ pub(super) fn handle_lane_resources(
                 return Err(Error::InvalidInput(format!(
                     "unknown API endpoint `{}`",
                     request.path
-                )))
+                )));
             }
         }));
     }

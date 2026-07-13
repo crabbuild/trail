@@ -2964,7 +2964,7 @@ fn map_agent_hook_installation(
                     format!("unknown agent hook installation scope `{other}`"),
                 )
                 .into(),
-            ))
+            ));
         }
     };
     let inventory: String = row.get(7)?;

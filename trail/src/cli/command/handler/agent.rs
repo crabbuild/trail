@@ -1006,18 +1006,21 @@ fn handle_agent_hook_receive(ctx: &RuntimeContext, args: AgentHookReceiveArgs) -
                 ..input
             },
         };
-        if let Err(spool_error) = spool_agent_hook_receipt(ctx, &envelope) {
-            render_native_receipt_diagnostic(
-                ctx,
-                "Native receipt was not recorded",
-                format!("{error}; fallback spool also failed: {spool_error}"),
-            );
-        } else {
-            render_native_receipt_diagnostic(
-                ctx,
-                "Native receipt was spooled for later replay",
-                error.to_string(),
-            );
+        match spool_agent_hook_receipt(ctx, &envelope) {
+            Err(spool_error) => {
+                render_native_receipt_diagnostic(
+                    ctx,
+                    "Native receipt was not recorded",
+                    format!("{error}; fallback spool also failed: {spool_error}"),
+                );
+            }
+            _ => {
+                render_native_receipt_diagnostic(
+                    ctx,
+                    "Native receipt was spooled for later replay",
+                    error.to_string(),
+                );
+            }
         }
     }
     acknowledge_agent_hook(&provider, &args.native_event)

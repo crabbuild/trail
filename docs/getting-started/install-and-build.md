@@ -5,7 +5,9 @@ Trail is a Rust workspace with two crates:
 - `trail`: the CLI, library API, HTTP daemon, and MCP server.
 - `prolly`: the prolly-tree storage library used by Trail.
 
-The workspace declares Rust 1.81 in `Cargo.toml`.
+Trail's parent-owned crates use Rust edition 2024 and declare Rust 1.89 as the
+minimum supported toolchain in `Cargo.toml`. The independently versioned
+`prolly` submodule retains its own edition and compiler policy.
 
 ## Install a Release
 

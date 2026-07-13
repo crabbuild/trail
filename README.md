@@ -459,7 +459,8 @@ The Windows binary currently links the Dokany 2.0.6 runtime. Linux FUSE,
 macFUSE, and the Dokan driver are otherwise relevant only to their
 corresponding mounted-workspace modes.
 
-To build from source instead, install Rust 1.81 or newer and use the Makefile:
+To build from source instead, install Rust 1.89 or newer and use the Makefile.
+Trail's parent-owned crates use Rust edition 2024:
 
 ```sh
 # Build the debug binary at target/debug/trail.

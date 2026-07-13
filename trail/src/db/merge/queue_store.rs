@@ -16,8 +16,7 @@ impl Trail {
         &self,
         limit: Option<usize>,
     ) -> Result<Vec<LaneMergeQueueEntry>> {
-        let sql =
-            "SELECT q.queue_id, q.lane_id, l.name, q.target_ref, q.status, q.priority, q.created_at, q.updated_at \
+        let sql = "SELECT q.queue_id, q.lane_id, l.name, q.target_ref, q.status, q.priority, q.created_at, q.updated_at \
              FROM lane_merge_queue q JOIN lanes l ON l.lane_id = q.lane_id \
              WHERE q.status = 'queued' ORDER BY q.priority DESC, q.created_at ASC";
         match limit {

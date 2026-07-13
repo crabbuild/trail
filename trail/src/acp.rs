@@ -149,8 +149,10 @@ pub fn acp_provider_profile(agent: &str) -> Result<AcpProviderProfile> {
                 available,
                 relay_command: built_in_acp_relay_command("grok"),
                 notes: if available {
-                    vec!["uses Grok Build's native ACP server through `grok agent stdio`"
-                        .to_string()]
+                    vec![
+                        "uses Grok Build's native ACP server through `grok agent stdio`"
+                            .to_string(),
+                    ]
                 } else {
                     vec!["`grok` was not found on PATH".to_string()]
                 },

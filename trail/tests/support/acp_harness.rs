@@ -99,7 +99,7 @@ pub fn read_json(reader: &mut impl BufRead) -> Value {
     serde_json::from_str(line.trim_end()).expect("parse ACP frame")
 }
 
-pub fn relay_stdio(child: &mut Child) -> (impl Write, impl BufRead) {
+pub fn relay_stdio(child: &mut Child) -> (impl Write + use<>, impl BufRead + use<>) {
     let stdin = child.stdin.take().expect("relay stdin");
     let stdout = BufReader::new(child.stdout.take().expect("relay stdout"));
     (stdin, stdout)

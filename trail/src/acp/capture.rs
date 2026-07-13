@@ -461,12 +461,17 @@ fn capture_worker(
                     frame
                 })
                 .collect::<Vec<_>>();
-            if let Err(error) = spill.append_many(&frames) {
-                if health.record_error(&error) {
-                    eprintln!("trail acp capture warning: shutdown spill failed: {error}");
+            match spill.append_many(&frames) {
+                Err(error) => {
+                    if health.record_error(&error) {
+                        eprintln!("trail acp capture warning: shutdown spill failed: {error}");
+                    }
                 }
-            } else if frames.is_empty() {
-                let _ = spill.complete_claimed();
+                _ => {
+                    if frames.is_empty() {
+                        let _ = spill.complete_claimed();
+                    }
+                }
             }
             if let Some(reason) = take_finish(&pending_finish) {
                 let _ = process_finish(&coordinator, reason);
@@ -485,14 +490,17 @@ fn capture_worker(
                         .last_projected_sequence
                         .store(frame.sequence, Ordering::Release);
                     if pending.is_empty() {
-                        if let Err(error) = spill.complete_claimed() {
-                            if health.record_error(&error) {
-                                eprintln!(
-                                    "trail acp capture warning: spill acknowledgement failed: {error}"
-                                );
+                        match spill.complete_claimed() {
+                            Err(error) => {
+                                if health.record_error(&error) {
+                                    eprintln!(
+                                        "trail acp capture warning: spill acknowledgement failed: {error}"
+                                    );
+                                }
                             }
-                        } else {
-                            spill_mode.store(false, Ordering::Release);
+                            _ => {
+                                spill_mode.store(false, Ordering::Release);
+                            }
                         }
                     }
                 }
@@ -504,14 +512,19 @@ fn capture_worker(
                         }
                         frame
                     }));
-                    if let Err(spill_error) = spill.append_many(&retry) {
-                        if health.record_error(&spill_error) {
-                            eprintln!(
-                                "trail acp capture warning: {error}; failed to preserve spill: {spill_error}"
-                            );
+                    match spill.append_many(&retry) {
+                        Err(spill_error) => {
+                            if health.record_error(&spill_error) {
+                                eprintln!(
+                                    "trail acp capture warning: {error}; failed to preserve spill: {spill_error}"
+                                );
+                            }
                         }
-                    } else if health.record_error(&error) {
-                        eprintln!("trail acp capture warning: {error}");
+                        _ => {
+                            if health.record_error(&error) {
+                                eprintln!("trail acp capture warning: {error}");
+                            }
+                        }
                     }
                     spill.release_claimed();
                     spill_mode.store(true, Ordering::Release);

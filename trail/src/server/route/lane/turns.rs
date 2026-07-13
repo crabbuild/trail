@@ -105,7 +105,7 @@ pub(super) fn handle_turn_routes(
                 return Err(Error::InvalidInput(format!(
                     "unknown API endpoint `{}`",
                     request.path
-                )))
+                )));
             }
         }));
     }

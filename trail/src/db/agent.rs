@@ -2941,12 +2941,12 @@ impl Trail {
             let view = self.agent_task_view(&lane)?;
             let (status, suggestions) = if merge.conflicts.is_empty() {
                 let mut suggestions = vec![StatusSuggestion {
-                        command: format!("trail agent land {lane}"),
-                        reason: format!(
-                            "create a Git commit using default message `{}` and fast-forward the current branch",
-                            default_agent_apply_message_for_task(&view.task)
-                        ),
-                    }];
+                    command: format!("trail agent land {lane}"),
+                    reason: format!(
+                        "create a Git commit using default message `{}` and fast-forward the current branch",
+                        default_agent_apply_message_for_task(&view.task)
+                    ),
+                }];
                 agent_push_suggestion(
                     &mut suggestions,
                     format!("trail agent finish {lane}"),
@@ -5822,7 +5822,10 @@ fn agent_guide_current_state(task: Option<&AgentTaskReport>, next: &AgentNextRep
             task.tool_events,
             next.primary.reason
         ),
-        None => format!("No agent task is recorded yet. Next: {}.", next.primary.reason),
+        None => format!(
+            "No agent task is recorded yet. Next: {}.",
+            next.primary.reason
+        ),
     }
 }
 
@@ -7397,33 +7400,35 @@ fn agent_confidence_factors(
 ) -> Vec<AgentConfidenceFactor> {
     let mut factors = Vec::new();
 
-    let (review_state, review_delta, review_message, review_command) =
-        match progress.status.as_str() {
-            "up_to_date" => (
-                "pass",
-                0,
-                "current checkpoint has been marked reviewed".to_string(),
-                Some(format!("trail agent review-flow {lane}")),
+    let (review_state, review_delta, review_message, review_command) = match progress
+        .status
+        .as_str()
+    {
+        "up_to_date" => (
+            "pass",
+            0,
+            "current checkpoint has been marked reviewed".to_string(),
+            Some(format!("trail agent review-flow {lane}")),
+        ),
+        "new_changes" => (
+            "warn",
+            -18,
+            format!(
+                "{} changed file(s) and {} changed line(s) have not been reviewed since the last marker",
+                progress.changed_paths, progress.changed_lines
             ),
-            "new_changes" => (
-                "warn",
-                -18,
-                format!(
-                    "{} changed file(s) and {} changed line(s) have not been reviewed since the last marker",
-                    progress.changed_paths, progress.changed_lines
-                ),
-                Some(format!("trail agent review-flow {lane}")),
+            Some(format!("trail agent review-flow {lane}")),
+        ),
+        _ => (
+            "warn",
+            -22,
+            format!(
+                "{} changed file(s) and {} changed line(s) have not been marked reviewed yet",
+                progress.changed_paths, progress.changed_lines
             ),
-            _ => (
-                "warn",
-                -22,
-                format!(
-                    "{} changed file(s) and {} changed line(s) have not been marked reviewed yet",
-                    progress.changed_paths, progress.changed_lines
-                ),
-                Some(format!("trail agent review-flow {lane}")),
-            ),
-        };
+            Some(format!("trail agent review-flow {lane}")),
+        ),
+    };
     factors.push(agent_confidence_factor(
         "review",
         review_state,
@@ -10312,10 +10317,18 @@ fn agent_archive_summary(
 ) -> String {
     let label = agent_task_label(task);
     match (archived, previous_archived) {
-        (true, true) => format!("{label} was already archived; it remains hidden from the default agent inbox."),
-        (true, false) => format!("{label} archived; it is hidden from the default agent inbox and can be restored with `agent unarchive`."),
-        (false, true) => format!("{label} restored; it will appear in the default agent inbox again."),
-        (false, false) => format!("{label} was not archived; it remains visible in the default agent inbox."),
+        (true, true) => {
+            format!("{label} was already archived; it remains hidden from the default agent inbox.")
+        }
+        (true, false) => format!(
+            "{label} archived; it is hidden from the default agent inbox and can be restored with `agent unarchive`."
+        ),
+        (false, true) => {
+            format!("{label} restored; it will appear in the default agent inbox again.")
+        }
+        (false, false) => {
+            format!("{label} was not archived; it remains visible in the default agent inbox.")
+        }
     }
 }
 
