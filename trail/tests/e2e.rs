@@ -7724,6 +7724,13 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
             .branch
             .head_change
             .clone();
+        let conn = Connection::open(temp.path().join(".trail/index/trail.sqlite")).unwrap();
+        let objects_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        let prolly_nodes_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
         let patch: PatchDocument = serde_json::from_value(serde_json::json!({
             "edits": [
                 {"op": "write", "path": colliding_path, "content": "case collision\n"}
@@ -7738,6 +7745,18 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
         assert_eq!(
             db.lane_details("policy-bot").unwrap().branch.head_change,
             before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            objects_before
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
         );
     }
 
@@ -7776,6 +7795,38 @@ fn lane_patch_rejects_hardened_paths_and_quota_violations() {
     .unwrap();
     let err = apply_lane_patch_at_head(&mut db, "policy-bot", oversized_payload).unwrap_err();
     assert!(matches!(err, Error::PatchRejected(message) if message.contains("max_patch_bytes")));
+}
+
+#[test]
+fn lane_patch_allows_case_only_rename_when_final_root_is_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("case-rename-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "edits": [
+            {"op": "rename", "from": "README.md", "to": "readme.md"}
+        ]
+    }))
+    .unwrap();
+
+    let report = apply_lane_patch_at_head(&mut db, "case-rename-bot", patch).unwrap();
+    assert_eq!(report.changed_paths.len(), 1);
+    assert_eq!(report.changed_paths[0].kind, trail::FileChangeKind::Renamed);
+    assert_eq!(
+        report.changed_paths[0].old_path.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(report.changed_paths[0].path, "readme.md");
+    assert_eq!(
+        db.why("readme.md:1", Some("refs/lanes/case-rename-bot"))
+            .unwrap()
+            .current_text,
+        "hello"
+    );
 }
 
 #[test]
@@ -22032,6 +22083,42 @@ fn materialized_lane_status_and_record_handle_workdir_renames() {
         fs::read_to_string(temp.path().join("docs/README.md")).unwrap(),
         "hello\n"
     );
+}
+
+#[test]
+fn materialized_lane_record_allows_case_only_rename_when_final_root_is_safe() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let mut db = Trail::open(temp.path()).unwrap();
+    let spawned = db
+        .spawn_lane("record-case-rename", Some("main"), true, None, None)
+        .unwrap();
+    let workdir = PathBuf::from(spawned.workdir.unwrap());
+    fs::rename(workdir.join("README.md"), workdir.join("rename-staging")).unwrap();
+    fs::rename(workdir.join("rename-staging"), workdir.join("readme.md")).unwrap();
+
+    let preview = db
+        .preview_lane_workdir_record("record-case-rename")
+        .unwrap();
+    assert!(preview.policy.allowed, "{:?}", preview.policy.error);
+    let recorded = db
+        .record_lane_workdir(
+            "record-case-rename",
+            Some("record case-only rename".to_string()),
+        )
+        .unwrap();
+    assert_eq!(recorded.changed_paths.len(), 1);
+    assert_eq!(
+        recorded.changed_paths[0].kind,
+        trail::FileChangeKind::Renamed
+    );
+    assert_eq!(
+        recorded.changed_paths[0].old_path.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(recorded.changed_paths[0].path, "readme.md");
 }
 
 #[test]

@@ -72,6 +72,11 @@ impl Trail {
         self.ensure_lane_patch_policy(&lane_row, &patch, &touched_paths)?;
         let previous_touched = self.load_root_files_for_paths(&head.root_id, &touched_paths)?;
         self.preflight_replace_line_batch(&patch.edits, &previous_touched)?;
+        let case_fold_tree = self.ensure_patch_final_root_paths_safe(
+            &head.root_id,
+            &previous_touched,
+            &patch.edits,
+        )?;
         let actor = Actor::lane(lane);
         let change_id = self.allocate_change_id(&actor.id, "lane_patch")?;
         let mut target_touched = previous_touched.clone();
@@ -90,13 +95,12 @@ impl Trail {
             )?;
         }
 
-        self.ensure_patch_final_root_paths_safe(&head.root_id, &previous_touched, &target_touched)?;
-
-        let built = self.build_root_from_touched_file_entries_incremental(
+        let built = self.build_root_from_touched_file_entries_incremental_with_case_fold_tree(
             &head.root_id,
             &previous_touched,
             &target_touched,
             &change_id,
+            case_fold_tree,
         )?;
         let mut diff = self.diff_file_maps(&previous_touched, &target_touched)?;
         for (path, file_id, line) in manual_line_changes {

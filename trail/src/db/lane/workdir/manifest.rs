@@ -559,24 +559,84 @@ impl Trail {
     ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
         let root = root.canonicalize()?;
         let mut files = self.scan_workdir_file_stamps(&root)?;
+        let case_insensitive = is_case_insensitive_filesystem(&root)?;
+        let mut exact_paths = files.keys().cloned().collect::<BTreeSet<_>>();
+        let mut folded_counts = BTreeMap::<String, usize>::new();
+        for path in &exact_paths {
+            *folded_counts
+                .entry(case_insensitive_path_key(path))
+                .or_default() += 1;
+        }
+        let mut folded_paths = folded_counts.keys().cloned().collect::<BTreeSet<_>>();
         for path in pinned_paths {
             let path = normalize_relative_path(path)?;
+            if !pinned_path_needs_probe(case_insensitive, &exact_paths, &folded_paths, &path) {
+                continue;
+            }
             let abs = safe_join(&root, &path)?;
             let metadata = match fs::symlink_metadata(&abs) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     files.remove(&path);
+                    remove_observed_path(
+                        &mut exact_paths,
+                        &mut folded_paths,
+                        &mut folded_counts,
+                        &path,
+                    );
                     continue;
                 }
                 Err(err) => return Err(Error::Io(err)),
             };
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 files.remove(&path);
+                remove_observed_path(
+                    &mut exact_paths,
+                    &mut folded_paths,
+                    &mut folded_counts,
+                    &path,
+                );
                 continue;
+            }
+            if exact_paths.insert(path.clone()) {
+                let folded = case_insensitive_path_key(&path);
+                *folded_counts.entry(folded.clone()).or_default() += 1;
+                folded_paths.insert(folded);
             }
             files.insert(path, WorkdirFileStamp::from_metadata(&metadata));
         }
         Ok(files)
+    }
+}
+
+fn pinned_path_needs_probe(
+    case_insensitive: bool,
+    exact_paths: &BTreeSet<String>,
+    folded_paths: &BTreeSet<String>,
+    path: &str,
+) -> bool {
+    !case_insensitive
+        || exact_paths.contains(path)
+        || !folded_paths.contains(&case_insensitive_path_key(path))
+}
+
+fn remove_observed_path(
+    exact_paths: &mut BTreeSet<String>,
+    folded_paths: &mut BTreeSet<String>,
+    folded_counts: &mut BTreeMap<String, usize>,
+    path: &str,
+) {
+    if !exact_paths.remove(path) {
+        return;
+    }
+    let folded = case_insensitive_path_key(path);
+    let Some(count) = folded_counts.get_mut(&folded) else {
+        return;
+    };
+    *count -= 1;
+    if *count == 0 {
+        folded_counts.remove(&folded);
+        folded_paths.remove(&folded);
     }
 }
 
@@ -743,5 +803,41 @@ mod tests {
         .unwrap();
 
         assert!(!clean_workdir_manifest_path(workdir.path()).exists());
+    }
+
+    #[test]
+    fn pinned_path_probe_skips_different_spelling_already_seen_by_directory_scan() {
+        let exact_paths = ["readme.md".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let folded_paths = exact_paths
+            .iter()
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>();
+
+        assert!(!pinned_path_needs_probe(
+            true,
+            &exact_paths,
+            &folded_paths,
+            "README.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            true,
+            &exact_paths,
+            &folded_paths,
+            "readme.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            true,
+            &exact_paths,
+            &folded_paths,
+            "other.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            false,
+            &exact_paths,
+            &folded_paths,
+            "README.md"
+        ));
     }
 }

@@ -164,7 +164,7 @@ impl Trail {
                 disk_manifest,
                 candidate_paths,
             } => {
-                let (summaries, previous_files, use_disk_manifest_for_clean) =
+                let (summaries, previous_files, use_disk_manifest_for_clean, case_fold_tree) =
                     if let Some(mut selected_paths) = sparse_paths.clone() {
                         selected_paths.extend(disk_manifest.keys().cloned());
                         selected_paths.sort();
@@ -176,8 +176,14 @@ impl Trail {
                             &disk_manifest,
                             &selected_paths,
                         );
-                        (summaries, previous_files, false)
+                        (summaries, previous_files, false, None)
                     } else if let Some(candidate_paths) = candidate_paths {
+                        let preflight = self.preflight_record_case_fold_candidates(
+                            &head.root_id,
+                            &candidate_paths,
+                            &disk_manifest,
+                        )?;
+                        let candidate_paths = preflight.selected_paths;
                         let previous_files =
                             self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
                         let summaries = self.diff_file_maps_to_manifest_for_paths(
@@ -185,7 +191,12 @@ impl Trail {
                             &disk_manifest,
                             &candidate_paths,
                         );
-                        (summaries, previous_files, true)
+                        (
+                            summaries,
+                            previous_files,
+                            true,
+                            Some(preflight.case_fold_tree),
+                        )
                     } else {
                         let summaries =
                             self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?;
@@ -195,7 +206,7 @@ impl Trail {
                             .collect::<Vec<_>>();
                         let previous_files =
                             self.load_root_files_for_paths(&head.root_id, &selected_paths)?;
-                        (summaries, previous_files, true)
+                        (summaries, previous_files, true, None)
                     };
                 let materialized_paths = disk_manifest.keys().cloned().collect::<Vec<_>>();
                 if summaries.is_empty() {
@@ -236,15 +247,31 @@ impl Trail {
                     .iter()
                     .map(|summary| summary.path.clone())
                     .collect::<Vec<_>>();
+                let selected_disk_paths = selected_paths
+                    .iter()
+                    .filter(|path| disk_manifest.contains_key(*path))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let disk_files =
-                    self.scan_files_under_for_paths(record_scan_root, &selected_paths)?;
-                let built = self.build_root_for_selected_disk_files_incremental(
-                    &head.root_id,
-                    &previous_files,
-                    &disk_files,
-                    &selected_paths,
-                    &change_id,
-                )?;
+                    self.scan_files_under_for_paths(record_scan_root, &selected_disk_paths)?;
+                let built = if let Some(case_fold_tree) = case_fold_tree {
+                    self.build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+                        &head.root_id,
+                        &previous_files,
+                        &disk_files,
+                        &selected_paths,
+                        &change_id,
+                        case_fold_tree,
+                    )?
+                } else {
+                    self.build_root_for_selected_disk_files_incremental(
+                        &head.root_id,
+                        &previous_files,
+                        &disk_files,
+                        &selected_paths,
+                        &change_id,
+                    )?
+                };
                 let clean_disk_manifest = use_disk_manifest_for_clean.then_some(disk_manifest);
                 (
                     built,
@@ -609,6 +636,15 @@ impl Trail {
                         &selected_paths,
                     ))
                 } else if let Some(candidate_paths) = candidate_paths {
+                    let candidate_paths = match self.preflight_record_case_fold_candidates(
+                        &head.root_id,
+                        &candidate_paths,
+                        &disk_manifest,
+                    ) {
+                        Ok(preflight) => preflight.selected_paths,
+                        Err(Error::InvalidPath { .. }) => candidate_paths,
+                        Err(err) => return Err(err),
+                    };
                     let previous_files =
                         self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
                     Ok(self.diff_file_maps_to_manifest_for_paths(

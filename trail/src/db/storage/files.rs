@@ -11,6 +11,35 @@ struct PathFileRead {
 }
 
 impl Trail {
+    #[allow(dead_code)] // Task 5 resets metrics around scale scenarios.
+    pub(crate) fn reset_case_fold_index_metrics(&self) {
+        self.case_fold_index_metrics
+            .set(CaseFoldIndexMetrics::default());
+    }
+
+    #[allow(dead_code)] // Task 5 reports these metrics from scale scenarios.
+    pub(crate) fn case_fold_index_metrics_report(&self) -> CaseFoldIndexMetricsReport {
+        let metrics = self.case_fold_index_metrics.get();
+        CaseFoldIndexMetricsReport {
+            mode: metrics.mode.as_str().to_string(),
+            lookup_count: metrics.lookup_count,
+            full_root_path_load_count: metrics.full_root_path_load_count,
+        }
+    }
+
+    pub(crate) fn note_full_root_path_load(&self) {
+        let mut metrics = self.case_fold_index_metrics.get();
+        metrics.full_root_path_load_count = metrics.full_root_path_load_count.saturating_add(1);
+        self.case_fold_index_metrics.set(metrics);
+    }
+
+    fn note_case_fold_index_lookups(&self, lookup_count: usize) {
+        let mut metrics = self.case_fold_index_metrics.get();
+        metrics.mode = CaseFoldIndexMode::Indexed;
+        metrics.lookup_count = metrics.lookup_count.saturating_add(lookup_count as u64);
+        self.case_fold_index_metrics.set(metrics);
+    }
+
     pub(crate) fn build_case_fold_map_tree<'a, I>(&self, paths: I) -> Result<Tree>
     where
         I: IntoIterator<Item = &'a String>,
@@ -34,8 +63,6 @@ impl Trail {
         Ok(builder.build()?)
     }
 
-    // Task 3 integrates this primitive into the hot incremental root builders.
-    #[allow(dead_code)]
     pub(crate) fn validate_and_update_case_fold_index(
         &self,
         previous_root: &WorktreeRoot,
@@ -67,6 +94,7 @@ impl Trail {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        self.note_case_fold_index_lookups(touched_keys.len());
         let existing = self.root_prolly.get_many(&previous_tree, &touched_keys)?;
         let mut before = BTreeMap::new();
         for (folded, canonical) in touched_keys.into_iter().zip(existing) {
@@ -116,6 +144,92 @@ impl Trail {
         }
 
         Ok(self.root_prolly.batch(&previous_tree, mutations)?)
+    }
+
+    pub(crate) fn preflight_record_case_fold_candidates(
+        &self,
+        previous_root_id: &ObjectId,
+        candidate_paths: &[String],
+        disk_manifest: &BTreeMap<String, DiskManifest>,
+    ) -> Result<RecordCaseFoldPreflight> {
+        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
+        let previous_tree = match previous_root.case_fold_map_root.as_deref() {
+            Some(case_fold_root) => root_map_tree_from_root_hex(Some(case_fold_root))?,
+            None if previous_root.file_count == 0 => self.root_prolly.create(),
+            None => {
+                return Err(Error::PathIndexRequired(
+                    "legacy root has no case-fold index; run `trail index rebuild`".to_string(),
+                ));
+            }
+        };
+
+        let mut candidates_by_folded = BTreeMap::<String, BTreeSet<String>>::new();
+        for path in candidate_paths {
+            let path = normalize_relative_path(path)?;
+            candidates_by_folded
+                .entry(case_insensitive_path_key(&path))
+                .or_default()
+                .insert(path);
+        }
+        let touched_keys = candidates_by_folded.keys().cloned().collect::<Vec<_>>();
+        self.note_case_fold_index_lookups(touched_keys.len());
+        let existing = self.root_prolly.get_many(&previous_tree, &touched_keys)?;
+
+        let mut selected_paths = BTreeSet::new();
+        let mut mutations = Vec::new();
+        for ((folded, candidates), existing) in
+            candidates_by_folded.into_iter().zip(existing.into_iter())
+        {
+            selected_paths.extend(candidates.iter().cloned());
+            let previous = existing
+                .map(|value| validate_case_fold_index_value(&folded, value))
+                .transpose()?;
+            if let Some(previous) = &previous {
+                selected_paths.insert(previous.clone());
+            }
+
+            let mut present = candidates
+                .iter()
+                .filter(|path| disk_manifest.contains_key(*path))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(previous) = &previous {
+                if disk_manifest.contains_key(previous) || !candidates.contains(previous) {
+                    present.insert(previous.clone());
+                }
+            }
+            if present.len() > 1 {
+                let mut paths = present.into_iter();
+                let previous = paths.next().expect("present path exists");
+                let path = paths.next().expect("collision path exists");
+                return Err(Error::InvalidPath {
+                    path,
+                    reason: format!("case-insensitive path collision with `{previous}`"),
+                });
+            }
+            let final_path = present.into_iter().next();
+            if previous == final_path {
+                continue;
+            }
+            let key = folded.into_bytes();
+            mutations.push(match final_path {
+                Some(path) => prolly::Mutation::Upsert {
+                    key,
+                    val: path.into_bytes(),
+                },
+                None => prolly::Mutation::Delete { key },
+            });
+        }
+
+        let case_fold_tree = if mutations.is_empty() {
+            previous_tree
+        } else {
+            self.root_prolly.batch(&previous_tree, mutations)?
+        };
+        Ok(RecordCaseFoldPreflight {
+            selected_paths: selected_paths.into_iter().collect(),
+            case_fold_tree,
+        })
     }
 
     pub(crate) fn build_root_from_git_tracked_paths(
@@ -211,18 +325,35 @@ impl Trail {
         change_id: &ChangeId,
     ) -> Result<GitTrackedRootBuildResult> {
         let paths = normalize_root_build_paths(paths)?;
-        self.ensure_git_tracked_incremental_final_paths_safe(previous_root_id, &paths)?;
+        let mut accepted_paths = Vec::new();
+        for path in paths {
+            let abs = self.workspace_root.join(path_from_rel(&path));
+            let metadata = match fs::symlink_metadata(&abs) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                continue;
+            }
+            accepted_paths.push(path);
+        }
 
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
         let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
             root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
         let previous_tree = path_tree.clone();
-        let new_paths = paths.iter().map(String::as_str).collect::<HashSet<_>>();
+        let new_paths = accepted_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         let mut previous_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
         let mut file_count = previous_root.file_count as i128;
         let mut total_text_bytes = previous_root.total_text_bytes as i128;
         let mut stats = ImportStats::default();
+        let mut removed_entries = Vec::new();
+        let mut existing_accepted_paths = HashSet::new();
         for item in self.root_prolly.range(&previous_tree, &[], None)? {
             let (key, value) = item?;
             let path = String::from_utf8(key)
@@ -230,8 +361,23 @@ impl Trail {
             let entry: FileEntry = from_cbor(&value)?;
             add_entry_import_stats(&mut stats, &entry);
             if new_paths.contains(path.as_str()) {
+                existing_accepted_paths.insert(path);
                 continue;
             }
+            removed_entries.push((path, entry));
+        }
+        let removals = removed_entries
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let additions = accepted_paths
+            .iter()
+            .filter(|path| !existing_accepted_paths.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let case_fold_tree =
+            self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)?;
+        for (path, entry) in removed_entries {
             path_tree = self.root_prolly.delete(&path_tree, path.as_bytes())?;
             file_index_tree = self
                 .root_prolly
@@ -248,7 +394,7 @@ impl Trail {
         let mut disk_manifest = BTreeMap::new();
         let mut file_seq = 1;
         let mut line_seq = 1;
-        for chunk in paths.chunks(PATH_READ_BATCH) {
+        for chunk in accepted_paths.chunks(PATH_READ_BATCH) {
             let normalized_paths = chunk.to_vec();
             let mut read_paths = Vec::new();
             for path in normalized_paths {
@@ -257,37 +403,11 @@ impl Trail {
                     .get(&previous_tree, path.as_bytes())?
                     .map(|value| from_cbor::<FileEntry>(&value))
                     .transpose()?;
-                let abs = self.workspace_root.join(path_from_rel(&path));
-                let metadata = match fs::symlink_metadata(&abs) {
-                    Ok(metadata) => metadata,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        if let Some(previous_entry) = previous_same_path {
-                            path_tree = self.root_prolly.delete(&path_tree, path.as_bytes())?;
-                            file_index_tree = self
-                                .root_prolly
-                                .delete(&file_index_tree, &previous_entry.file_id.encode_key())?;
-                            file_count -= 1;
-                            total_text_bytes -= entry_text_bytes(&previous_entry) as i128;
-                            remove_entry_import_stats(&mut stats, &previous_entry);
-                        }
-                        continue;
-                    }
-                    Err(err) => return Err(Error::Io(err)),
-                };
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    if let Some(previous_entry) = previous_same_path {
-                        path_tree = self.root_prolly.delete(&path_tree, path.as_bytes())?;
-                        file_index_tree = self
-                            .root_prolly
-                            .delete(&file_index_tree, &previous_entry.file_id.encode_key())?;
-                        file_count -= 1;
-                        total_text_bytes -= entry_text_bytes(&previous_entry) as i128;
-                        remove_entry_import_stats(&mut stats, &previous_entry);
-                    }
-                    continue;
-                }
-
                 if let Some(previous_entry) = previous_same_path {
+                    // The first stat preceded the previous-root range. Refresh
+                    // metadata before trusting the unchanged-file cache, while
+                    // still avoiding a content read for a true cache hit.
+                    let metadata = fresh_regular_file_metadata(&self.workspace_root, &path)?;
                     if previous_entry.executable == executable_from_metadata(&metadata) {
                         if let Some(cached_manifest) =
                             self.cached_worktree_manifest_for_metadata(&path, &metadata)?
@@ -305,7 +425,7 @@ impl Trail {
                 read_paths.push(path);
             }
 
-            let reads = read_path_file_batch(&self.workspace_root, &read_paths)?;
+            let reads = read_known_regular_path_file_batch(&self.workspace_root, &read_paths)?;
             for read in reads {
                 let path = read.path;
                 let content_hash = read.content_hash;
@@ -381,7 +501,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
-            case_fold_map_root: None,
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: file_count as u64,
             total_text_bytes: total_text_bytes as u64,
             created_by: change_id.clone(),
@@ -392,31 +512,6 @@ impl Trail {
             disk_manifest,
             stats,
         })
-    }
-
-    fn ensure_git_tracked_incremental_final_paths_safe(
-        &self,
-        previous_root_id: &ObjectId,
-        paths: &[String],
-    ) -> Result<()> {
-        let mut final_paths = self
-            .load_root_paths(previous_root_id)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for path in paths {
-            final_paths.remove(path);
-            let abs = self.workspace_root.join(path_from_rel(path));
-            let metadata = match fs::symlink_metadata(&abs) {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(Error::Io(err)),
-            };
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                continue;
-            }
-            final_paths.insert(path.clone());
-        }
-        validate_no_case_fold_collisions(final_paths.iter())
     }
 
     pub(crate) fn build_root_from_disk_files(
@@ -517,6 +612,10 @@ impl Trail {
         selected_paths: &[String],
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
+        let selected_paths = selected_paths
+            .iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<Vec<_>>>()?;
         let selected_disk_files = disk_files
             .iter()
             .filter(|file| {
@@ -526,12 +625,57 @@ impl Trail {
             })
             .cloned()
             .collect::<Vec<_>>();
-        self.ensure_selected_disk_final_root_paths_safe(
-            previous_root_id,
-            selected_paths,
-            &selected_disk_files,
-        )?;
+        validate_disk_file_root_paths(&selected_disk_files)?;
 
+        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
+        let removals = previous
+            .keys()
+            .filter(|path| {
+                selected_paths
+                    .iter()
+                    .any(|selected| path_matches_selection(path, selected))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let additions = selected_disk_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let case_fold_tree =
+            self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)?;
+        self.build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+            previous_root_id,
+            previous,
+            &selected_disk_files,
+            &selected_paths,
+            change_id,
+            case_fold_tree,
+        )
+    }
+
+    pub(crate) fn build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+        &self,
+        previous_root_id: &ObjectId,
+        previous: &BTreeMap<String, FileEntry>,
+        disk_files: &[DiskFile],
+        selected_paths: &[String],
+        change_id: &ChangeId,
+        case_fold_tree: Tree,
+    ) -> Result<RootBuildResult> {
+        let selected_paths = selected_paths
+            .iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        let selected_disk_files = disk_files
+            .iter()
+            .filter(|file| {
+                selected_paths
+                    .iter()
+                    .any(|selected| path_matches_selection(&file.path, selected))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_disk_file_root_paths(&selected_disk_files)?;
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
         let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
@@ -541,7 +685,7 @@ impl Trail {
 
         let mut files = previous.clone();
         let mut removed_entries = Vec::new();
-        for selected in selected_paths {
+        for selected in &selected_paths {
             let removed_paths = files
                 .keys()
                 .filter(|path| path_matches_selection(path, selected))
@@ -635,7 +779,7 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
-            case_fold_map_root: None,
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: file_count as u64,
             total_text_bytes: total_text_bytes as u64,
             created_by: change_id.clone(),
@@ -649,24 +793,6 @@ impl Trail {
         })
     }
 
-    fn ensure_selected_disk_final_root_paths_safe(
-        &self,
-        previous_root_id: &ObjectId,
-        selected_paths: &[String],
-        selected_disk_files: &[DiskFile],
-    ) -> Result<()> {
-        let mut paths = self
-            .load_root_paths(previous_root_id)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for selected in selected_paths {
-            let selected = normalize_relative_path(selected)?;
-            paths.retain(|path| !path_matches_selection(path, &selected));
-        }
-        paths.extend(selected_disk_files.iter().map(|file| file.path.clone()));
-        validate_no_case_fold_collisions(paths.iter())
-    }
-
     pub(crate) fn build_root_from_touched_file_entries_incremental(
         &self,
         previous_root_id: &ObjectId,
@@ -674,8 +800,27 @@ impl Trail {
         target: &BTreeMap<String, FileEntry>,
         change_id: &ChangeId,
     ) -> Result<IncrementalRootBuildResult> {
-        self.ensure_touched_final_root_paths_safe(previous_root_id, previous, target)?;
+        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
+        let (removals, additions) = touched_path_map_changes(previous, target);
+        let case_fold_tree =
+            self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)?;
+        self.build_root_from_touched_file_entries_incremental_with_case_fold_tree(
+            previous_root_id,
+            previous,
+            target,
+            change_id,
+            case_fold_tree,
+        )
+    }
 
+    pub(crate) fn build_root_from_touched_file_entries_incremental_with_case_fold_tree(
+        &self,
+        previous_root_id: &ObjectId,
+        previous: &BTreeMap<String, FileEntry>,
+        target: &BTreeMap<String, FileEntry>,
+        change_id: &ChangeId,
+        case_fold_tree: Tree,
+    ) -> Result<IncrementalRootBuildResult> {
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
         let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
         let mut file_index_tree =
@@ -727,35 +872,13 @@ impl Trail {
             version: ROOT_OBJECT_VERSION,
             path_map_root: tree_root_hex(&path_tree),
             file_index_map_root: tree_root_hex(&file_index_tree),
-            case_fold_map_root: None,
+            case_fold_map_root: tree_root_hex(&case_fold_tree),
             file_count: file_count as u64,
             total_text_bytes: total_text_bytes as u64,
             created_by: change_id.clone(),
         };
         let root_id = self.put_object(WORKTREE_ROOT_KIND, ROOT_OBJECT_VERSION, &root)?;
         Ok(IncrementalRootBuildResult { root_id })
-    }
-
-    fn ensure_touched_final_root_paths_safe(
-        &self,
-        previous_root_id: &ObjectId,
-        previous: &BTreeMap<String, FileEntry>,
-        target: &BTreeMap<String, FileEntry>,
-    ) -> Result<()> {
-        validate_no_case_fold_collisions(target.keys())?;
-        if target.keys().all(|path| previous.contains_key(path)) {
-            return Ok(());
-        }
-
-        let mut paths = self
-            .load_root_paths(previous_root_id)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for path in previous.keys() {
-            paths.remove(path);
-        }
-        paths.extend(target.keys().cloned());
-        validate_no_case_fold_collisions(paths.iter())
     }
 
     pub(crate) fn build_root_from_file_entries(
@@ -857,6 +980,23 @@ fn insert_case_fold_mapping(mappings: &mut BTreeMap<String, String>, path: &str)
     Ok(())
 }
 
+fn touched_path_map_changes(
+    previous: &BTreeMap<String, FileEntry>,
+    target: &BTreeMap<String, FileEntry>,
+) -> (Vec<String>, Vec<String>) {
+    let removals = previous
+        .keys()
+        .filter(|path| !target.contains_key(*path))
+        .cloned()
+        .collect();
+    let additions = target
+        .keys()
+        .filter(|path| !previous.contains_key(*path))
+        .cloned()
+        .collect();
+    (removals, additions)
+}
+
 fn normalize_root_build_paths(paths: &[String]) -> Result<Vec<String>> {
     let mut normalized = BTreeSet::new();
     for path in paths {
@@ -891,6 +1031,66 @@ fn read_path_file_batch(root: &Path, paths: &[String]) -> Result<Vec<PathFileRea
         .map(|path| read_path_file(root, path))
         .collect::<Result<Vec<_>>>()
         .map(|reads| reads.into_iter().flatten().collect())
+}
+
+fn read_known_regular_path_file_batch(root: &Path, paths: &[String]) -> Result<Vec<PathFileRead>> {
+    paths
+        .par_iter()
+        .map(|path| {
+            let abs = root.join(path_from_rel(path));
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            #[cfg(not(unix))]
+            {
+                let metadata = fs::symlink_metadata(&abs)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(Error::InvalidInput(format!(
+                        "tracked path `{path}` changed file type during import"
+                    )));
+                }
+            }
+            let mut file = options.open(&abs)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(Error::InvalidInput(format!(
+                    "tracked path `{path}` changed file type during import"
+                )));
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            #[cfg(not(unix))]
+            {
+                let final_metadata = fs::symlink_metadata(&abs)?;
+                if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
+                    return Err(Error::InvalidInput(format!(
+                        "tracked path `{path}` changed file type during import"
+                    )));
+                }
+            }
+            let content_hash = sha256_hex(&bytes);
+            Ok(PathFileRead {
+                path: path.clone(),
+                bytes,
+                executable: executable_from_metadata(&metadata),
+                content_hash,
+            })
+        })
+        .collect()
+}
+
+fn fresh_regular_file_metadata(root: &Path, path: &str) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(root.join(path_from_rel(path)))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::InvalidInput(format!(
+            "tracked path `{path}` changed file type during import"
+        )));
+    }
+    Ok(metadata)
 }
 
 fn read_path_file(root: &Path, path: &str) -> Result<Option<PathFileRead>> {
@@ -1720,7 +1920,7 @@ mod tests {
 
         let err = db
             .build_root_from_git_tracked_paths_incremental(
-                &["readme.md".to_string()],
+                &["README.md".to_string(), "readme.md".to_string()],
                 &head.root_id,
                 &ChangeId("change_git_incremental_collision_test".to_string()),
             )
@@ -1732,5 +1932,366 @@ mod tests {
         );
         assert_eq!(count_rows("objects"), objects_before);
         assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    fn assert_indexed_case_fold_metrics(db: &Trail, max_lookups: u64) {
+        let metrics = db.case_fold_index_metrics_report();
+        assert_eq!(metrics.mode, "indexed");
+        assert!(
+            metrics.lookup_count <= max_lookups,
+            "expected at most {max_lookups} indexed lookups, got {metrics:?}"
+        );
+        assert_eq!(metrics.full_root_path_load_count, 0);
+    }
+
+    #[test]
+    fn git_tracked_incremental_root_updates_index_for_accepted_regular_file_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("old.txt"), "old\n").unwrap();
+        fs::write(temp.path().join("keep.txt"), "keep\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        fs::remove_file(temp.path().join("old.txt")).unwrap();
+        fs::write(temp.path().join("new.txt"), "new\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("keep.txt", temp.path().join("linked.txt")).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        db.reset_case_fold_index_metrics();
+        let mut paths = vec![
+            "keep.txt".to_string(),
+            "missing.txt".to_string(),
+            "new.txt".to_string(),
+        ];
+        #[cfg(unix)]
+        paths.push("linked.txt".to_string());
+        let built = db
+            .build_root_from_git_tracked_paths_incremental(
+                &paths,
+                &head.root_id,
+                &ChangeId("change_git_indexed_domain".to_string()),
+            )
+            .unwrap();
+
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &built.root_id).unwrap();
+        let entries = root_map_entries(&db, root.case_fold_map_root.as_deref());
+        assert_eq!(
+            entries,
+            vec![
+                (b"keep.txt".to_vec(), b"keep.txt".to_vec()),
+                (b"new.txt".to_vec(), b"new.txt".to_vec()),
+            ]
+        );
+        assert_indexed_case_fold_metrics(&db, 2);
+    }
+
+    #[test]
+    fn selected_directory_incremental_root_indexes_actual_removed_and_added_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("docs")).unwrap();
+        fs::write(temp.path().join("docs/old.md"), "old\n").unwrap();
+        fs::write(temp.path().join("keep.md"), "keep\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let previous = db
+            .load_root_files_for_selections(&head.root_id, &["docs".to_string()])
+            .unwrap();
+        let disk_files = vec![DiskFile {
+            path: "docs/New.md".to_string(),
+            bytes: b"new\n".to_vec(),
+            executable: false,
+        }];
+        db.reset_case_fold_index_metrics();
+        let built = db
+            .build_root_for_selected_disk_files_incremental(
+                &head.root_id,
+                &previous,
+                &disk_files,
+                &["docs".to_string()],
+                &ChangeId("change_selected_directory_index".to_string()),
+            )
+            .unwrap();
+
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &built.root_id).unwrap();
+        let entries = root_map_entries(&db, root.case_fold_map_root.as_deref());
+        assert_eq!(
+            entries,
+            vec![
+                (b"docs/new.md".to_vec(), b"docs/New.md".to_vec()),
+                (b"keep.md".to_vec(), b"keep.md".to_vec()),
+            ]
+        );
+        assert_indexed_case_fold_metrics(&db, 2);
+    }
+
+    #[test]
+    fn touched_incremental_root_handles_case_only_rename_and_reuses_unchanged_index() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &["README.md".to_string()])
+            .unwrap();
+        let mut renamed = BTreeMap::new();
+        renamed.insert(
+            "readme.md".to_string(),
+            previous.get("README.md").unwrap().clone(),
+        );
+        db.reset_case_fold_index_metrics();
+        let renamed_root = db
+            .build_root_from_touched_file_entries_incremental(
+                &head.root_id,
+                &previous,
+                &renamed,
+                &ChangeId("change_case_only_rename_index".to_string()),
+            )
+            .unwrap();
+        assert_case_fold_mapping(&db, &renamed_root.root_id, "readme.md", "readme.md");
+        assert_indexed_case_fold_metrics(&db, 1);
+
+        let renamed_root_value: WorktreeRoot = db
+            .get_object(WORKTREE_ROOT_KIND, &renamed_root.root_id)
+            .unwrap();
+        let renamed_files = db.load_root_files(&renamed_root.root_id).unwrap();
+        let mut content_only = renamed_files.clone();
+        content_only.get_mut("readme.md").unwrap().content_hash = "changed".to_string();
+        db.reset_case_fold_index_metrics();
+        let content_root = db
+            .build_root_from_touched_file_entries_incremental(
+                &renamed_root.root_id,
+                &renamed_files,
+                &content_only,
+                &ChangeId("change_content_only_index_reuse".to_string()),
+            )
+            .unwrap();
+        let content_root_value: WorktreeRoot = db
+            .get_object(WORKTREE_ROOT_KIND, &content_root.root_id)
+            .unwrap();
+        assert_eq!(
+            content_root_value.case_fold_map_root,
+            renamed_root_value.case_fold_map_root
+        );
+        assert_indexed_case_fold_metrics(&db, 0);
+    }
+
+    #[test]
+    fn patch_and_record_policy_preflights_return_indexed_trees_without_full_root_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &["README.md".to_string()])
+            .unwrap();
+        db.reset_case_fold_index_metrics();
+        let patch_tree = db
+            .ensure_patch_final_root_paths_safe(
+                &head.root_id,
+                &previous,
+                &[PatchEdit::Rename {
+                    from: "README.md".to_string(),
+                    to: "readme.md".to_string(),
+                }],
+            )
+            .unwrap();
+        assert!(tree_root_hex(&patch_tree).is_some());
+        assert_indexed_case_fold_metrics(&db, 1);
+
+        let summary = FileDiffSummary {
+            path: "readme.md".to_string(),
+            old_path: Some("README.md".to_string()),
+            kind: FileChangeKind::Renamed,
+            before_hash: None,
+            after_hash: None,
+            additions: 0,
+            deletions: 0,
+            line_changes: Vec::new(),
+            patch: None,
+        };
+        db.reset_case_fold_index_metrics();
+        let record_tree = db
+            .ensure_record_final_root_paths_safe_from_summaries(&head.root_id, &[summary])
+            .unwrap();
+        assert!(tree_root_hex(&record_tree).is_some());
+        assert_indexed_case_fold_metrics(&db, 1);
+    }
+
+    #[test]
+    fn touched_incremental_deletion_to_empty_root_keeps_empty_index_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let previous = db.load_root_files(&head.root_id).unwrap();
+        db.reset_case_fold_index_metrics();
+        let built = db
+            .build_root_from_touched_file_entries_incremental(
+                &head.root_id,
+                &previous,
+                &BTreeMap::new(),
+                &ChangeId("change_delete_to_empty_index".to_string()),
+            )
+            .unwrap();
+
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &built.root_id).unwrap();
+        assert_eq!(root.file_count, 0);
+        assert_eq!(root.case_fold_map_root, None);
+        assert_indexed_case_fold_metrics(&db, 1);
+    }
+
+    #[test]
+    fn touched_incremental_legacy_root_fails_before_tree_or_object_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let mut legacy: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        legacy.case_fold_map_root = None;
+        let legacy_root_id = db
+            .put_object(WORKTREE_ROOT_KIND, ROOT_OBJECT_VERSION, &legacy)
+            .unwrap();
+        let previous = db.load_root_files(&legacy_root_id).unwrap();
+        let mut target = previous.clone();
+        target.insert(
+            "new.md".to_string(),
+            previous.get("README.md").unwrap().clone(),
+        );
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_nodes_before = count_rows("prolly_nodes");
+
+        let err = db
+            .build_root_from_touched_file_entries_incremental(
+                &legacy_root_id,
+                &previous,
+                &target,
+                &ChangeId("change_legacy_index_failure".to_string()),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "PATH_INDEX_REQUIRED");
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    #[test]
+    fn high_level_patch_and_record_use_one_bounded_index_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.spawn_lane("metric-patch", Some("main"), false, None, None)
+            .unwrap();
+        db.reset_case_fold_index_metrics();
+        db.apply_lane_patch(
+            "metric-patch",
+            PatchDocument {
+                base_change: None,
+                allow_stale: true,
+                allow_ignored: false,
+                session_id: None,
+                message: None,
+                edits: vec![PatchEdit::Write {
+                    path: "notes.md".to_string(),
+                    content: "notes\n".to_string(),
+                    executable: false,
+                }],
+            },
+        )
+        .unwrap();
+        assert_indexed_case_fold_metrics(&db, 1);
+
+        let spawned = db
+            .spawn_lane("metric-record", Some("main"), true, None, None)
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        fs::write(workdir.join("recorded.md"), "recorded\n").unwrap();
+        db.reset_case_fold_index_metrics();
+        db.record_lane_workdir("metric-record", None).unwrap();
+        assert_indexed_case_fold_metrics(&db, 1);
+    }
+
+    #[test]
+    fn record_candidate_preflight_distinguishes_partial_collision_from_explicit_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let disk_manifest = [(
+            "readme.md".to_string(),
+            DiskManifest {
+                kind: FileKind::Text,
+                executable: false,
+                content_hash: sha256_hex(b"hello\n"),
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let err = match db.preflight_record_case_fold_candidates(
+            &head.root_id,
+            &["readme.md".to_string()],
+            &disk_manifest,
+        ) {
+            Ok(_) => panic!("expected partial-manifest collision"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
+            "expected partial-manifest collision, got {err:?}"
+        );
+
+        let preflight = db
+            .preflight_record_case_fold_candidates(
+                &head.root_id,
+                &["README.md".to_string(), "readme.md".to_string()],
+                &disk_manifest,
+            )
+            .unwrap();
+        assert_eq!(
+            preflight.selected_paths,
+            vec!["README.md".to_string(), "readme.md".to_string()]
+        );
+        assert_eq!(
+            db.root_prolly
+                .get(&preflight.case_fold_tree, b"readme.md")
+                .unwrap(),
+            Some(b"readme.md".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_regular_file_batch_rejects_symlink_swap_and_disappearance() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("tracked.txt"), "tracked\n").unwrap();
+        fs::write(temp.path().join("target.txt"), "target\n").unwrap();
+        let paths = vec!["tracked.txt".to_string()];
+
+        fs::remove_file(temp.path().join("tracked.txt")).unwrap();
+        std::os::unix::fs::symlink("target.txt", temp.path().join("tracked.txt")).unwrap();
+        assert!(fresh_regular_file_metadata(temp.path(), "tracked.txt").is_err());
+        assert!(read_known_regular_path_file_batch(temp.path(), &paths).is_err());
+
+        fs::remove_file(temp.path().join("tracked.txt")).unwrap();
+        assert!(read_known_regular_path_file_batch(temp.path(), &paths).is_err());
     }
 }

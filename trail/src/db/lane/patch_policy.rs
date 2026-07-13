@@ -16,17 +16,59 @@ impl Trail {
         &self,
         head_root_id: &ObjectId,
         previous_touched: &BTreeMap<String, FileEntry>,
-        target_touched: &BTreeMap<String, FileEntry>,
-    ) -> Result<()> {
-        let mut paths = self
-            .load_root_paths(head_root_id)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for path in previous_touched.keys() {
-            paths.remove(path);
+        edits: &[PatchEdit],
+    ) -> Result<Tree> {
+        let mut target_paths = previous_touched.keys().cloned().collect::<BTreeSet<_>>();
+        for edit in edits {
+            match edit {
+                PatchEdit::Write { path, .. } | PatchEdit::WriteBytes { path, .. } => {
+                    target_paths.insert(normalize_relative_path(path)?);
+                }
+                PatchEdit::ReplaceLine { path, .. } => {
+                    let path = normalize_relative_path(path)?;
+                    if !target_paths.contains(&path) {
+                        return Err(Error::PatchRejected(format!(
+                            "replace_line path `{path}` is absent"
+                        )));
+                    }
+                }
+                PatchEdit::Delete { path } => {
+                    let path = normalize_relative_path(path)?;
+                    if !target_paths.remove(&path) {
+                        return Err(Error::PatchRejected(format!(
+                            "delete path `{path}` is absent"
+                        )));
+                    }
+                }
+                PatchEdit::Rename { from, to } => {
+                    let from = normalize_relative_path(from)?;
+                    let to = normalize_relative_path(to)?;
+                    if target_paths.contains(&to) {
+                        return Err(Error::PatchRejected(format!(
+                            "rename destination `{to}` already exists"
+                        )));
+                    }
+                    if !target_paths.remove(&from) {
+                        return Err(Error::PatchRejected(format!(
+                            "rename source `{from}` is absent"
+                        )));
+                    }
+                    target_paths.insert(to);
+                }
+            }
         }
-        paths.extend(target_touched.keys().cloned());
-        validate_no_case_fold_collisions(paths.iter())
+        let removals = previous_touched
+            .keys()
+            .filter(|path| !target_paths.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let additions = target_paths
+            .iter()
+            .filter(|path| !previous_touched.contains_key(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, head_root_id)?;
+        self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)
     }
 
     pub(crate) fn ensure_lane_record_policy(
@@ -42,22 +84,23 @@ impl Trail {
         &self,
         head_root_id: &ObjectId,
         summaries: &[FileDiffSummary],
-    ) -> Result<()> {
-        let mut paths = self
-            .load_root_paths(head_root_id)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    ) -> Result<Tree> {
+        let mut removals = Vec::new();
+        let mut additions = Vec::new();
         for summary in summaries {
             let path = normalize_relative_path(&summary.path)?;
             if let Some(old_path) = &summary.old_path {
-                paths.remove(&normalize_relative_path(old_path)?);
+                removals.push(normalize_relative_path(old_path)?);
             }
-            paths.remove(&path);
-            if summary.kind != FileChangeKind::Deleted {
-                paths.insert(path);
+            match summary.kind {
+                FileChangeKind::Added => additions.push(path),
+                FileChangeKind::Deleted => removals.push(path),
+                FileChangeKind::Renamed => additions.push(path),
+                FileChangeKind::Modified | FileChangeKind::TypeChanged => {}
             }
         }
-        validate_no_case_fold_collisions(paths.iter())
+        let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, head_root_id)?;
+        self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)
     }
 
     pub(crate) fn preview_lane_record_policy(
@@ -220,7 +263,6 @@ impl Trail {
         if paths.is_empty() {
             return Ok(());
         }
-        validate_no_case_fold_collisions(paths.iter())?;
         self.ensure_changed_path_limit(paths.len())?;
         self.ensure_sparse_policy_paths_allowed(branch, &paths)?;
         self.ensure_claim_policy_paths_allowed(branch, &paths)
@@ -240,7 +282,6 @@ impl Trail {
         if paths.is_empty() {
             return Ok(preview);
         }
-        validate_no_case_fold_collisions(paths.iter())?;
 
         let max_changed_paths = self.config.lane.max_changed_paths;
         if max_changed_paths > 0 && paths.len() as u64 > max_changed_paths {

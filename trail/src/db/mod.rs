@@ -92,6 +92,7 @@ pub struct Trail {
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
     git_handoff_metrics: Cell<GitHandoffMetrics>,
+    case_fold_index_metrics: Cell<CaseFoldIndexMetrics>,
 }
 
 #[derive(Clone)]
@@ -438,6 +439,11 @@ pub(crate) struct RootBuildResult {
 #[derive(Debug)]
 pub(crate) struct IncrementalRootBuildResult {
     root_id: ObjectId,
+}
+
+pub(crate) struct RecordCaseFoldPreflight {
+    selected_paths: Vec<String>,
+    case_fold_tree: Tree,
 }
 
 #[derive(Debug)]
@@ -822,6 +828,38 @@ pub(crate) struct GitHandoffMetrics {
     git_plumbing_command_count: u64,
     tracked_status_count: u64,
     full_root_file_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CaseFoldIndexMetrics {
+    mode: CaseFoldIndexMode,
+    lookup_count: u64,
+    full_root_path_load_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum CaseFoldIndexMode {
+    #[default]
+    Unknown,
+    Indexed,
+}
+
+#[allow(dead_code)] // Reported by Task 5's scale harness; tests use it in this slice.
+impl CaseFoldIndexMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Indexed => "indexed",
+        }
+    }
+}
+
+#[allow(dead_code)] // Public inside the crate for Task 5's scale harness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaseFoldIndexMetricsReport {
+    pub(crate) mode: String,
+    pub(crate) lookup_count: u64,
+    pub(crate) full_root_path_load_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

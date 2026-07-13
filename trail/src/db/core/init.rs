@@ -269,6 +269,7 @@ impl Trail {
             object_cache: Mutex::new(ObjectCache::default()),
             daemon_worktree_cache: None,
             git_handoff_metrics: Cell::new(GitHandoffMetrics::default()),
+            case_fold_index_metrics: Cell::new(CaseFoldIndexMetrics::default()),
         };
         db.init_schema()?;
         db.recover_materialization_stages()?;
