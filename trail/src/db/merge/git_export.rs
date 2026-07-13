@@ -329,4 +329,56 @@ mod tests {
         assert!(matches!(err, Error::GitMappingRequired(_)));
         assert!(db.git_mappings(10).unwrap().is_empty());
     }
+
+    #[test]
+    fn mapped_git_export_reports_mapped_delta_mode() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+        run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+        fs::write(temp.path().join("README.md"), "one\n").unwrap();
+        run_git(temp.path(), &["add", "README.md"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+        let init = Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+        fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let record = db
+            .record(Some("main"), Some("change".into()), Actor::human(), false)
+            .unwrap();
+        run_git(temp.path(), &["checkout", "--", "README.md"]);
+        let range = format!("{}..{}", init.operation.0, record.operation.unwrap().0);
+
+        let report = db.git_export_commit_mapped(&range, "mapped", None).unwrap();
+
+        assert_eq!(report.performance.export_mode, "mapped_delta");
+    }
+
+    #[test]
+    fn general_git_export_reports_full_snapshot_mode_without_mapping() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+        run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+        fs::write(temp.path().join("README.md"), "one\n").unwrap();
+        run_git(temp.path(), &["add", "README.md"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+        let init = Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        fs::write(temp.path().join("README.md"), "one\ntwo\n").unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        assert!(db.git_mappings(10).unwrap().is_empty());
+        let record = db
+            .record(Some("main"), Some("change".into()), Actor::human(), false)
+            .unwrap();
+        let range = format!("{}..{}", init.operation.0, record.operation.unwrap().0);
+
+        let report = db.git_export_commit(&range, "full snapshot").unwrap();
+
+        assert_eq!(report.performance.export_mode, "full_snapshot");
+    }
 }
