@@ -114,6 +114,16 @@ impl Frame {
         Ok(())
     }
 
+    pub(crate) fn replace_value_and_commit(&mut self, candidate: Value) -> io::Result<()> {
+        let original = std::mem::replace(&mut self.parsed, candidate);
+        if let Err(error) = self.commit_transform() {
+            self.parsed = original;
+            self.transformed = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn correlation_key(&self) -> Option<CorrelationKey> {
         self.id.clone().map(|id| CorrelationKey {
             direction: match self.kind {

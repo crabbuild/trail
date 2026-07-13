@@ -15,9 +15,12 @@ mod protocol;
 mod registry;
 mod schema;
 mod setup;
+mod transform;
 mod transport;
 
 use protocol::{Direction, Frame};
+use schema::AcpV1Contract;
+use transform::{TransformOptions, TransformPipeline};
 use transport::{FrameObserver, RelayFinishReason, StdioRelay};
 
 pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
@@ -331,27 +334,50 @@ pub(crate) fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
 
 pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
     let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options.clone())?));
-    let observer = Arc::new(CaptureObserver { coordinator });
+    let pipeline = TransformPipeline::new(
+        Arc::new(AcpV1Contract::load()?),
+        TransformOptions::from_relay(&options),
+    );
+    let observer = Arc::new(CaptureObserver {
+        coordinator,
+        pipeline: Mutex::new(pipeline),
+    });
     StdioRelay::new(observer).run(&options)
 }
 
 struct CaptureObserver {
     coordinator: Arc<Mutex<CaptureCoordinator>>,
+    pipeline: Mutex<TransformPipeline>,
 }
 
 impl FrameObserver for CaptureObserver {
     fn observe(&self, frame: &mut Frame) -> Result<()> {
-        let original = frame.value().clone();
-        capture_step(&self.coordinator, |capture| match frame.direction() {
-            Direction::ClientToAgent => {
-                capture.before_client_message(frame.value_mut_for_transform())
-            }
-            Direction::AgentToClient => {
-                capture.before_agent_message(frame.value_mut_for_transform())
-            }
+        let outcome = self
+            .pipeline
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
+            .apply(frame)?;
+        if let Some(diagnostic) = outcome.diagnostic_message() {
+            eprintln!("trail acp relay negotiation warning: {diagnostic}");
+        }
+        if !outcome.capture_v1() {
+            return Ok(());
+        }
+
+        let mut candidate = frame.value().clone();
+        let captured = capture_step(&self.coordinator, |capture| match frame.direction() {
+            Direction::ClientToAgent => capture.before_client_message(&mut candidate),
+            Direction::AgentToClient => capture.before_agent_message(&mut candidate),
         });
-        if frame.value() != &original {
-            frame.commit_transform().map_err(Error::Io)?;
+        if captured && candidate != *frame.value() {
+            if let Err(error) = self
+                .pipeline
+                .lock()
+                .map_err(|_| Error::InvalidInput("ACP transform lock poisoned".to_string()))?
+                .commit_candidate(frame, candidate)
+            {
+                eprintln!("trail acp relay transformation warning: {error}");
+            }
         }
         Ok(())
     }
@@ -367,7 +393,7 @@ impl FrameObserver for CaptureObserver {
                 ("failed", format!("upstream sent malformed JSON: {error}"))
             }
         };
-        capture_step(&self.coordinator, |capture| {
+        let _ = capture_step(&self.coordinator, |capture| {
             capture.finish_open_turns(status, &summary)
         });
     }
@@ -468,7 +494,7 @@ fn record_acp_lifecycle_event(
     Ok(())
 }
 
-fn capture_step<F>(coordinator: &Arc<Mutex<CaptureCoordinator>>, f: F)
+fn capture_step<F>(coordinator: &Arc<Mutex<CaptureCoordinator>>, f: F) -> bool
 where
     F: FnOnce(&mut CaptureCoordinator) -> Result<()>,
 {
@@ -477,10 +503,13 @@ where
             let result = Trail::with_write_lock_wait(ACP_CAPTURE_LOCK_WAIT, || f(&mut capture));
             if let Err(err) = result {
                 eprintln!("trail acp relay capture warning: {err}");
+                return false;
             }
+            true
         }
         Err(_) => {
             eprintln!("trail acp relay capture warning: capture coordinator lock poisoned");
+            false
         }
     }
 }
@@ -645,7 +674,6 @@ struct PendingPermission {
 
 struct CaptureCoordinator {
     options: AcpRelayOptions,
-    pending_initialize: HashSet<String>,
     pending_sessions: HashMap<String, PendingSession>,
     pending_prompts: HashMap<String, PendingPrompt>,
     pending_closes: HashMap<String, String>,
@@ -661,7 +689,6 @@ impl CaptureCoordinator {
             serde_json::to_string(&redact_command(&options.upstream_command)).ok();
         Ok(Self {
             options,
-            pending_initialize: HashSet::new(),
             pending_sessions: HashMap::new(),
             pending_prompts: HashMap::new(),
             pending_closes: HashMap::new(),
@@ -679,11 +706,7 @@ impl CaptureCoordinator {
         }
 
         match method_name(message) {
-            Some("initialize") => {
-                if let Some(id) = rpc_id_key(message) {
-                    self.pending_initialize.insert(id);
-                }
-            }
+            Some("initialize") => {}
             Some("session/new") | Some("session/load") | Some("session/resume") => {
                 self.prepare_session_request(message)?;
             }
@@ -741,11 +764,6 @@ impl CaptureCoordinator {
             return Ok(());
         };
 
-        if self.pending_initialize.remove(&id) {
-            self.add_initialize_metadata(message);
-            return Ok(());
-        }
-
         if let Some(pending) = self.pending_sessions.remove(&id) {
             self.finish_session_request(message, pending)?;
             return Ok(());
@@ -761,24 +779,6 @@ impl CaptureCoordinator {
         }
 
         Ok(())
-    }
-
-    fn add_initialize_metadata(&self, message: &mut Value) {
-        let Some(result) = message.get_mut("result").and_then(Value::as_object_mut) else {
-            return;
-        };
-        let meta = ensure_object_field(result, "_meta");
-        meta.insert(
-            "trail".to_string(),
-            serde_json::json!({
-                "relay": true,
-                "capture": true,
-                "workspace": self.options.workspace_root.to_string_lossy(),
-                "dbDir": self.options.db_dir.to_string_lossy(),
-                "provider": self.options.provider,
-                "model": self.options.model
-            }),
-        );
     }
 
     fn prepare_session_request(&mut self, message: &mut Value) -> Result<()> {
@@ -1806,19 +1806,6 @@ fn params_object_mut(message: &mut Value) -> Result<&mut Map<String, Value>> {
         .get_mut("params")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| Error::InvalidInput("ACP message missing object params".to_string()))
-}
-
-fn ensure_object_field<'a>(
-    object: &'a mut Map<String, Value>,
-    key: &str,
-) -> &'a mut Map<String, Value> {
-    let value = object
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value.as_object_mut().expect("object was just inserted")
 }
 
 fn inject_trail_mcp_server(
