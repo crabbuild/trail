@@ -741,6 +741,7 @@ impl ActiveTurn {
 struct PendingPermission {
     approval_id: Option<String>,
     options_by_id: HashMap<String, String>,
+    acp_session_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -767,13 +768,32 @@ impl ReplayTurn {
 enum PendingOperation {
     Session(PendingSession),
     Prompt(PendingPrompt),
-    Close { acp_session_id: String },
+    Close {
+        acp_session_id: String,
+    },
     Permission(PendingPermission),
-    Initialize { requested_version: Value },
-    Authenticate { method_id: String },
+    Initialize {
+        requested_version: Value,
+    },
+    Authenticate {
+        method_id: String,
+    },
     Logout,
-    SessionList { cursor: Option<String> },
-    SessionDelete { acp_session_id: String },
+    SessionList {
+        cursor: Option<String>,
+    },
+    SessionDelete {
+        acp_session_id: String,
+    },
+    SetMode {
+        acp_session_id: String,
+        mode_id: String,
+    },
+    SetConfig {
+        acp_session_id: String,
+        config_id: String,
+        value: Value,
+    },
 }
 
 struct CaptureCoordinator {
@@ -781,6 +801,7 @@ struct CaptureCoordinator {
     pending_operations: HashMap<(Direction, String), PendingOperation>,
     replay_by_session: HashMap<String, ReplayAccumulator>,
     pending_connection_events: Vec<Value>,
+    cancelled_requests: HashSet<(Direction, String)>,
     sessions_by_acp: HashMap<String, SessionState>,
     active_turns: HashMap<String, ActiveTurn>,
     upstream_command_json: Option<String>,
@@ -795,6 +816,7 @@ impl CaptureCoordinator {
             pending_operations: HashMap::new(),
             replay_by_session: HashMap::new(),
             pending_connection_events: Vec::new(),
+            cancelled_requests: HashSet::new(),
             sessions_by_acp: HashMap::new(),
             active_turns: HashMap::new(),
             upstream_command_json,
@@ -840,6 +862,36 @@ impl CaptureCoordinator {
             }
             Some("session/cancel") => {
                 self.capture_cancel(message)?;
+            }
+            Some("$/cancel_request") => {
+                self.capture_rpc_cancel(message, Direction::ClientToAgent)?;
+            }
+            Some("session/set_mode") => {
+                let params = params_object(message)?;
+                let acp_session_id = required_string(params, "sessionId", "session/set_mode")?;
+                let mode_id = required_string(params, "modeId", "session/set_mode")?;
+                self.register_client_operation(
+                    message,
+                    PendingOperation::SetMode {
+                        acp_session_id,
+                        mode_id,
+                    },
+                )?;
+            }
+            Some("session/set_config_option") => {
+                let params = params_object(message)?;
+                let acp_session_id =
+                    required_string(params, "sessionId", "session/set_config_option")?;
+                let config_id = required_string(params, "configId", "session/set_config_option")?;
+                let value = params.get("value").cloned().unwrap_or(Value::Null);
+                self.register_client_operation(
+                    message,
+                    PendingOperation::SetConfig {
+                        acp_session_id,
+                        config_id,
+                        value,
+                    },
+                )?;
             }
             Some("session/close") => {
                 self.prepare_close_request(message)?;
@@ -954,6 +1006,9 @@ impl CaptureCoordinator {
         match method_name(message) {
             Some("session/update") => self.capture_session_update(message)?,
             Some("session/request_permission") => self.capture_permission_request(message)?,
+            Some("$/cancel_request") => {
+                self.capture_rpc_cancel(message, Direction::AgentToClient)?;
+            }
             _ => {}
         }
         Ok(())
@@ -963,9 +1018,9 @@ impl CaptureCoordinator {
         let Some(id) = rpc_id_key(message) else {
             return Ok(());
         };
-        let Some(PendingOperation::Permission(permission)) = self
-            .pending_operations
-            .remove(&(Direction::AgentToClient, id))
+        let key = (Direction::AgentToClient, id);
+        let was_cancelled = self.cancelled_requests.remove(&key);
+        let Some(PendingOperation::Permission(permission)) = self.pending_operations.remove(&key)
         else {
             return Ok(());
         };
@@ -980,6 +1035,19 @@ impl CaptureCoordinator {
             Some("acp-editor".to_string()),
             Some("mirrored from ACP permission response".to_string()),
         )?;
+        if let Ok(session) = self.resolve_session_state(&permission.acp_session_id) {
+            db.add_lane_session_event(
+                &session.lane_name,
+                &session.trail_session_id,
+                "acp_permission_finished",
+                Some(redact_json(serde_json::json!({
+                    "protocol": "acp",
+                    "acp_session_id": permission.acp_session_id,
+                    "decision": decision,
+                    "cancel_requested": was_cancelled
+                }))),
+            )?;
+        }
         Ok(())
     }
 
@@ -987,15 +1055,16 @@ impl CaptureCoordinator {
         let Some(id) = rpc_id_key(message) else {
             return Ok(());
         };
-        let Some(operation) = self
-            .pending_operations
-            .remove(&(Direction::ClientToAgent, id))
-        else {
+        let key = (Direction::ClientToAgent, id);
+        let was_cancelled = self.cancelled_requests.remove(&key);
+        let Some(operation) = self.pending_operations.remove(&key) else {
             return Ok(());
         };
         match operation {
             PendingOperation::Session(pending) => self.finish_session_request(message, pending),
-            PendingOperation::Prompt(pending) => self.finish_prompt_request(message, pending),
+            PendingOperation::Prompt(pending) => {
+                self.finish_prompt_request(message, pending, was_cancelled)
+            }
             PendingOperation::Close { acp_session_id } => {
                 self.finish_close_request(message, &acp_session_id)
             }
@@ -1017,7 +1086,31 @@ impl CaptureCoordinator {
             PendingOperation::SessionList { cursor } => self.capture_connection_lifecycle(
                 "session/list",
                 message,
-                Some(serde_json::json!({"request_cursor": cursor})),
+                Some(serde_json::json!({
+                    "request_cursor": cursor,
+                    "cancel_requested": was_cancelled
+                })),
+            ),
+            PendingOperation::SetMode {
+                acp_session_id,
+                mode_id,
+            } => self.finish_configuration_request(
+                message,
+                &acp_session_id,
+                Some(&mode_id),
+                None,
+                was_cancelled,
+            ),
+            PendingOperation::SetConfig {
+                acp_session_id,
+                config_id,
+                value,
+            } => self.finish_configuration_request(
+                message,
+                &acp_session_id,
+                None,
+                Some((&config_id, &value)),
+                was_cancelled,
             ),
             PendingOperation::Permission(_) => Ok(()),
         }
@@ -1359,6 +1452,18 @@ impl CaptureCoordinator {
             None,
             None,
         )?;
+        db.add_lane_turn_event(
+            &turn.turn.turn_id,
+            "acp_prompt_content",
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "acp_session_id": acp_session_id,
+                "readable_text": prompt_text,
+                "blocks": bounded_prompt_content(params.get("prompt"))
+            }))),
+            None,
+            Some(&user_message.message_id.0),
+        )?;
         record_acp_lifecycle_event(
             &mut db,
             &session.lane_name,
@@ -1438,7 +1543,12 @@ impl CaptureCoordinator {
         Ok(())
     }
 
-    fn finish_prompt_request(&mut self, message: &Value, pending: PendingPrompt) -> Result<()> {
+    fn finish_prompt_request(
+        &mut self,
+        message: &Value,
+        pending: PendingPrompt,
+        cancel_requested: bool,
+    ) -> Result<()> {
         let status = prompt_status(message);
         let mut active = self.active_turns.remove(&pending.acp_session_id);
         let mut db = self.open_db()?;
@@ -1464,6 +1574,7 @@ impl CaptureCoordinator {
                 "protocol": "acp",
                 "acp_session_id": pending.acp_session_id,
                 "status": status,
+                "cancel_requested": cancel_requested,
                 "stop_reason": stop_reason(message),
                 "error": message.get("error").cloned()
             }))),
@@ -1902,6 +2013,7 @@ impl CaptureCoordinator {
             PendingOperation::Permission(PendingPermission {
                 approval_id,
                 options_by_id,
+                acp_session_id: acp_session_id.to_string(),
             }),
         )?;
         Ok(())
@@ -1926,6 +2038,67 @@ impl CaptureCoordinator {
         );
         self.flush_turn_events(&mut active)?;
         self.active_turns.insert(acp_session_id.to_string(), active);
+        Ok(())
+    }
+
+    fn capture_rpc_cancel(&mut self, message: &Value, direction: Direction) -> Result<()> {
+        let target = message.pointer("/params/requestId").ok_or_else(|| {
+            Error::InvalidInput("ACP $/cancel_request missing requestId".to_string())
+        })?;
+        let target_id = serde_json::to_string(target)?;
+        let key = (direction, target_id.clone());
+        let operation = self.pending_operations.get(&key).cloned();
+        let matched = operation.is_some();
+        if matched {
+            self.cancelled_requests.insert(key.clone());
+        }
+        let acp_session_id = match operation {
+            Some(PendingOperation::Session(pending)) => Some(pending.session.acp_session_id),
+            Some(PendingOperation::Prompt(pending)) => Some(pending.acp_session_id),
+            Some(PendingOperation::Close { acp_session_id })
+            | Some(PendingOperation::SessionDelete { acp_session_id })
+            | Some(PendingOperation::SetMode { acp_session_id, .. })
+            | Some(PendingOperation::SetConfig { acp_session_id, .. }) => Some(acp_session_id),
+            Some(PendingOperation::Permission(permission)) => Some(permission.acp_session_id),
+            _ => None,
+        };
+        let payload = redact_json(serde_json::json!({
+            "protocol": "acp",
+            "method": "$/cancel_request",
+            "target_request_id": target,
+            "request_direction": format!("{direction:?}"),
+            "matched": matched
+        }));
+        if let Some(acp_session_id) = acp_session_id {
+            if let Some(mut active) = self.active_turns.remove(&acp_session_id) {
+                active.push_event("acp_request_cancelled", Some(payload.clone()));
+                self.flush_turn_events(&mut active)?;
+                self.active_turns.insert(acp_session_id.clone(), active);
+                return Ok(());
+            }
+            if let Ok(session) = self.resolve_session_state(&acp_session_id) {
+                self.open_db()?.add_lane_session_event(
+                    &session.lane_name,
+                    &session.trail_session_id,
+                    "acp_request_cancelled",
+                    Some(payload),
+                )?;
+            }
+        } else {
+            let sessions = self.sessions_by_acp.values().cloned().collect::<Vec<_>>();
+            if sessions.is_empty() {
+                self.pending_connection_events.push(payload);
+            } else {
+                for session in sessions {
+                    self.open_db()?.add_lane_session_event(
+                        &session.lane_name,
+                        &session.trail_session_id,
+                        "acp_request_cancelled",
+                        Some(payload.clone()),
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2024,6 +2197,50 @@ impl CaptureCoordinator {
             }))),
         )?;
         self.sessions_by_acp.remove(acp_session_id);
+        Ok(())
+    }
+
+    fn finish_configuration_request(
+        &mut self,
+        message: &Value,
+        acp_session_id: &str,
+        mode_id: Option<&str>,
+        config: Option<(&str, &Value)>,
+        cancel_requested: bool,
+    ) -> Result<()> {
+        if message.get("error").is_some() {
+            return self.capture_session_lifecycle_failure(
+                acp_session_id,
+                if mode_id.is_some() {
+                    "session/set_mode"
+                } else {
+                    "session/set_config_option"
+                },
+                message.get("error"),
+            );
+        }
+        let session = self.resolve_session_state(acp_session_id)?;
+        let mut db = self.open_db()?;
+        let mapping = db.update_lane_acp_session_configuration(acp_session_id, mode_id, config)?;
+        db.add_lane_session_event(
+            &session.lane_name,
+            &session.trail_session_id,
+            if mode_id.is_some() {
+                "acp_session_mode_changed"
+            } else {
+                "acp_session_config_changed"
+            },
+            Some(redact_json(serde_json::json!({
+                "protocol": "acp",
+                "acp_session_id": acp_session_id,
+                "mode_id": mode_id,
+                "config_id": config.as_ref().map(|(id, _)| *id),
+                "value": config.as_ref().map(|(_, value)| *value),
+                "cancel_requested": cancel_requested,
+                "current_mode_id": mapping.current_mode_id,
+                "config_options": mapping.config_options
+            }))),
+        )?;
         Ok(())
     }
 
@@ -2389,6 +2606,15 @@ fn params_object_mut(message: &mut Value) -> Result<&mut Map<String, Value>> {
         .ok_or_else(|| Error::InvalidInput("ACP message missing object params".to_string()))
 }
 
+fn required_string(params: &Map<String, Value>, field: &str, method: &str) -> Result<String> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| Error::InvalidInput(format!("ACP {method} missing {field}")))
+}
+
 fn inject_trail_mcp_server(
     params: &mut Map<String, Value>,
     options: &AcpRelayOptions,
@@ -2536,6 +2762,9 @@ fn usage_number_field(update: &Map<String, Value>, keys: &[&str]) -> Option<u64>
 }
 
 fn prompt_status(message: &Value) -> &'static str {
+    if message.pointer("/error/code").and_then(Value::as_i64) == Some(-32800) {
+        return "cancelled";
+    }
     if message.get("error").is_some() {
         return "failed";
     }
@@ -2560,6 +2789,49 @@ fn prompt_text(prompt: Option<&Value>) -> String {
         "[non-text ACP prompt content]".to_string()
     } else {
         redact_text(&text)
+    }
+}
+
+fn bounded_prompt_content(prompt: Option<&Value>) -> Value {
+    let mut value = redact_json(prompt.cloned().unwrap_or(Value::Array(Vec::new())));
+    bound_binary_content(&mut value, None);
+    value
+}
+
+fn bound_binary_content(value: &mut Value, parent_type: Option<&str>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                bound_binary_content(item, parent_type);
+            }
+        }
+        Value::Object(object) => {
+            let content_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .or(parent_type)
+                .map(str::to_string);
+            for key in ["data", "blob"] {
+                let is_binary =
+                    key == "blob" || matches!(content_type.as_deref(), Some("image" | "audio"));
+                if is_binary {
+                    if let Some(encoded) = object.get(key).and_then(Value::as_str) {
+                        object.insert(
+                            key.to_string(),
+                            serde_json::json!({
+                                "encoding": "base64",
+                                "encoded_bytes": encoded.len(),
+                                "sha256": hex::encode(Sha256::digest(encoded.as_bytes()))
+                            }),
+                        );
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                bound_binary_content(child, content_type.as_deref());
+            }
+        }
+        _ => {}
     }
 }
 

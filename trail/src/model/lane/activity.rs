@@ -41,6 +41,8 @@ pub struct LaneAcpSession {
     pub model: Option<String>,
     pub upstream_command_json: Option<String>,
     pub status: String,
+    pub current_mode_id: Option<String>,
+    pub config_options: serde_json::Value,
     pub created_at: i64,
     pub updated_at: i64,
 }

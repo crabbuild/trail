@@ -152,6 +152,8 @@ impl Trail {
                 model TEXT,
                 upstream_command_json TEXT,
                 status TEXT NOT NULL,
+                current_mode_id TEXT,
+                config_options_json TEXT NOT NULL DEFAULT '{}',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -813,6 +815,13 @@ impl Trail {
                 "lane_acp_sessions",
                 "path_mappings_json",
                 "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(&self.conn, "lane_acp_sessions", "current_mode_id", "TEXT")?;
+            ensure_column(
+                &self.conn,
+                "lane_acp_sessions",
+                "config_options_json",
+                "TEXT NOT NULL DEFAULT '{}'",
             )?;
             ensure_column(
                 &self.conn,
