@@ -119,10 +119,10 @@ the Git ref or recording a successful mapping.
 
 Add stable errors for:
 
-- `git_mapping_required`: the HEAD/base-root trust record is missing.
-- `git_head_changed`: Git HEAD changed after planning.
-- `git_worktree_dirty`: tracked worktree changes block publication.
-- `git_delta_export_required`: a high-level caller attempted full snapshot
+- `GIT_MAPPING_REQUIRED`: the HEAD/base-root trust record is missing.
+- `GIT_HEAD_CHANGED`: Git HEAD changed after planning.
+- `GIT_WORKTREE_DIRTY`: tracked worktree changes block publication.
+- `GIT_DELTA_EXPORT_REQUIRED`: a high-level caller attempted full snapshot
   export.
 
 Human diagnostics explain the condition and give one safe next command. JSON,
@@ -140,7 +140,7 @@ Add three scenarios:
 
 1. Mapped, clean high-level dry-run.
 2. Mapped, clean high-level actual apply.
-3. Missing mapping, which must fail quickly with `git_mapping_required` and no
+3. Missing mapping, which must fail quickly with `GIT_MAPPING_REQUIRED` and no
    Git object or Trail mapping writes.
 
 The benchmark records wall time, RSS, changed-path count, Git command count,
