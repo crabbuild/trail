@@ -107,7 +107,8 @@ impl Trail {
         {
             return Ok(diff);
         }
-        let fast_dirty_paths = self.scan_git_dirty_tracked_paths()?;
+        let git_policy = self.workspace_ignore_policy_snapshot();
+        let fast_dirty_paths = self.scan_git_dirty_tracked_paths_with_policy(&git_policy)?;
         let disk_files;
         let build_selected_paths;
         let previous_files;
@@ -120,7 +121,8 @@ impl Trail {
                 });
             }
             previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
-            let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+            let snapshot =
+                self.selected_worktree_snapshot_with_policy(&previous_files, &paths, &git_policy)?;
             if snapshot.paths.is_empty() {
                 return Ok(DiffSummary {
                     from: branch,
@@ -217,7 +219,9 @@ impl Trail {
         };
 
         let previous_files = self.load_root_files_for_selections(root_id, &paths)?;
-        let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+        let policy = self.workspace_ignore_policy_snapshot();
+        let snapshot =
+            self.selected_worktree_snapshot_with_policy(&previous_files, &paths, &policy)?;
         self.reconcile_daemon_status_paths(root_id, &paths, &snapshot.summaries, generation);
         if snapshot.paths.is_empty() {
             return Ok(Some(DiffSummary {

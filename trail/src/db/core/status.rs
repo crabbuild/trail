@@ -20,18 +20,23 @@ impl Trail {
         let current_branch = self.current_branch()?;
         let branch = branch.map(str::to_string).unwrap_or(current_branch.clone());
         let head = self.resolve_branch_ref(&branch)?;
+        let daemon_snapshot = if branch == current_branch {
+            self.daemon_worktree_snapshot()
+        } else {
+            None
+        };
         if branch == current_branch {
-            if let Some(report) = self.status_from_daemon_cache(&branch, &head)? {
+            if let Some(report) =
+                self.status_from_daemon_snapshot(&branch, &head, daemon_snapshot.as_ref())?
+            {
                 return Ok(report);
             }
         }
-        let snapshot_generation = self
-            .daemon_worktree_snapshot()
-            .map(|snapshot| match snapshot {
-                DaemonWorktreeSnapshot::Clean { generation, .. }
-                | DaemonWorktreeSnapshot::Dirty { generation, .. }
-                | DaemonWorktreeSnapshot::Overflow { generation } => generation,
-            });
+        let snapshot_generation = daemon_snapshot.as_ref().map(|snapshot| match snapshot {
+            DaemonWorktreeSnapshot::Clean { generation, .. }
+            | DaemonWorktreeSnapshot::Dirty { generation, .. }
+            | DaemonWorktreeSnapshot::Overflow { generation } => *generation,
+        });
         let changed_paths =
             self.status_changed_paths_uncached(&current_branch, &branch, &head.root_id)?;
         if branch == current_branch {
@@ -127,12 +132,13 @@ impl Trail {
         root_id: &ObjectId,
     ) -> Result<Vec<FileDiffSummary>> {
         if branch == current_branch {
-            if let Some(paths) = self.scan_git_dirty_tracked_paths()? {
+            let policy = self.workspace_ignore_policy_snapshot();
+            if let Some(paths) = self.scan_git_dirty_tracked_paths_with_policy(&policy)? {
                 if paths.is_empty() {
                     return Ok(Vec::new());
                 }
                 return Ok(self
-                    .selected_worktree_snapshot_for_root(root_id, &paths)?
+                    .selected_worktree_snapshot_for_root_with_policy(root_id, &paths, &policy)?
                     .summaries);
             }
         }
@@ -156,12 +162,15 @@ impl Trail {
         root_id: &ObjectId,
     ) -> Result<Vec<FileDiffSummary>> {
         if branch == current_branch {
-            if let Some(paths) = self.scan_git_dirty_tracked_paths()? {
+            let policy = self.workspace_ignore_policy_snapshot();
+            if let Some(paths) = self.scan_git_dirty_tracked_paths_with_policy(&policy)? {
                 if paths.is_empty() {
                     return Ok(Vec::new());
                 }
                 return Ok(self
-                    .selected_worktree_snapshot_for_root_read_only(root_id, &paths)?
+                    .selected_worktree_snapshot_for_root_read_only_with_policy(
+                        root_id, &paths, &policy,
+                    )?
                     .summaries);
             }
         }
@@ -170,12 +179,13 @@ impl Trail {
         self.diff_root_to_disk_manifest(root_id, &disk_manifest)
     }
 
-    fn status_from_daemon_cache(
+    fn status_from_daemon_snapshot(
         &self,
         branch: &str,
         head: &RefRecord,
+        snapshot: Option<&DaemonWorktreeSnapshot>,
     ) -> Result<Option<StatusReport>> {
-        let Some(snapshot) = self.daemon_worktree_snapshot() else {
+        let Some(snapshot) = snapshot else {
             return Ok(None);
         };
         match snapshot {
@@ -193,13 +203,18 @@ impl Trail {
                 if paths.len() > self.daemon_dirty_path_limit() {
                     return Ok(None);
                 }
-                let snapshot = self.selected_worktree_snapshot_for_root(&head.root_id, &paths)?;
+                let policy = self.workspace_ignore_policy_snapshot();
+                let snapshot = self.selected_worktree_snapshot_for_root_with_policy(
+                    &head.root_id,
+                    &paths,
+                    &policy,
+                )?;
                 let changed_paths = snapshot.summaries;
                 self.reconcile_daemon_status_paths(
                     &head.root_id,
                     &paths,
                     &changed_paths,
-                    generation,
+                    *generation,
                 );
                 let worktree_state = worktree_state_from_changes(&changed_paths);
                 let suggestions = self.status_suggestions(branch, &worktree_state, &changed_paths);

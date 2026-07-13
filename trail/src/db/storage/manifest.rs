@@ -220,12 +220,13 @@ impl Trail {
         summaries
     }
 
-    pub(crate) fn selected_worktree_snapshot(
+    pub(crate) fn selected_worktree_snapshot_with_policy(
         &self,
         head_files: &BTreeMap<String, FileEntry>,
         candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<SelectedWorktreeSnapshot> {
-        let disk_files = self.scan_visible_files_for_paths(candidate_paths)?;
+        let disk_files = self.scan_visible_files_for_paths_with_policy(candidate_paths, policy)?;
         let disk_paths = disk_files
             .iter()
             .map(|file| file.path.clone())
@@ -250,12 +251,13 @@ impl Trail {
         })
     }
 
-    pub(crate) fn selected_worktree_snapshot_read_only(
+    pub(crate) fn selected_worktree_snapshot_read_only_with_policy(
         &self,
         head_files: &BTreeMap<String, FileEntry>,
         candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<SelectedWorktreeSnapshot> {
-        let disk_files = self.scan_visible_files_for_paths(candidate_paths)?;
+        let disk_files = self.scan_visible_files_for_paths_with_policy(candidate_paths, policy)?;
         let disk_manifest = self.disk_manifest(&disk_files);
         let summaries =
             self.diff_file_maps_to_manifest_for_paths(head_files, &disk_manifest, candidate_paths)?;
@@ -275,22 +277,34 @@ impl Trail {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_worktree_snapshot_for_root(
         &self,
         root_id: &ObjectId,
         candidate_paths: &[String],
     ) -> Result<SelectedWorktreeSnapshot> {
-        let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
-        self.selected_worktree_snapshot(&head_files, candidate_paths)
+        let policy = self.workspace_ignore_policy_snapshot();
+        self.selected_worktree_snapshot_for_root_with_policy(root_id, candidate_paths, &policy)
     }
 
-    pub(crate) fn selected_worktree_snapshot_for_root_read_only(
+    pub(crate) fn selected_worktree_snapshot_for_root_with_policy(
         &self,
         root_id: &ObjectId,
         candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
     ) -> Result<SelectedWorktreeSnapshot> {
         let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
-        self.selected_worktree_snapshot_read_only(&head_files, candidate_paths)
+        self.selected_worktree_snapshot_with_policy(&head_files, candidate_paths, policy)
+    }
+
+    pub(crate) fn selected_worktree_snapshot_for_root_read_only_with_policy(
+        &self,
+        root_id: &ObjectId,
+        candidate_paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
+    ) -> Result<SelectedWorktreeSnapshot> {
+        let head_files = self.load_root_files_for_selections(root_id, candidate_paths)?;
+        self.selected_worktree_snapshot_read_only_with_policy(&head_files, candidate_paths, policy)
     }
 
     pub(crate) fn diff_file_maps_to_manifest_for_paths(

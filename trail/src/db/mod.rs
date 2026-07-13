@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +94,12 @@ pub struct Trail {
     git_handoff_metrics: Cell<GitHandoffMetrics>,
     case_fold_index_metrics: Cell<CaseFoldIndexMetrics>,
     operation_metrics: Option<Arc<OperationMetricsState>>,
+}
+
+pub(crate) struct WorkspaceIgnorePolicySnapshot {
+    workspace_root: PathBuf,
+    metrics: Option<Arc<OperationMetricsState>>,
+    matcher: OnceLock<std::result::Result<::ignore::gitignore::Gitignore, String>>,
 }
 
 #[derive(Clone)]

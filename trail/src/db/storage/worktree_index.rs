@@ -137,16 +137,22 @@ impl Trail {
             self.persisted_daemon_worktree_snapshot().ok().flatten()
         };
         if let Some(snapshot) = &snapshot {
-            let path_count = match snapshot {
+            let (input_path_count, canonical_path_count) = match snapshot {
                 DaemonWorktreeSnapshot::Dirty { paths, .. } => {
-                    saturating_u64_from_usize(paths.len())
+                    let input_path_count = saturating_u64_from_usize(paths.len());
+                    let canonical_path_count = SelectionSet::from_paths(paths)
+                        .map(|selections| saturating_u64_from_usize(selections.as_slice().len()))
+                        .unwrap_or(0);
+                    (input_path_count, canonical_path_count)
                 }
-                DaemonWorktreeSnapshot::Clean { .. } | DaemonWorktreeSnapshot::Overflow { .. } => 0,
+                DaemonWorktreeSnapshot::Clean { .. } | DaemonWorktreeSnapshot::Overflow { .. } => {
+                    (0, 0)
+                }
             };
             self.note_operation_metrics(OperationMetricsDelta {
-                input_path_count: path_count,
-                canonical_path_count: path_count,
-                daemon_snapshot_path_count: path_count,
+                input_path_count,
+                canonical_path_count,
+                daemon_snapshot_path_count: input_path_count,
                 ..OperationMetricsDelta::default()
             });
         }
@@ -266,6 +272,7 @@ impl Trail {
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
 
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut count = 0u64;
         let mut indexed_seen = 0u64;
@@ -368,6 +375,7 @@ impl Trail {
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
 
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut manifest = BTreeMap::new();
         let mut seen = BTreeSet::new();
@@ -571,6 +579,7 @@ impl Trail {
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
 
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut paths = BTreeSet::new();
         for item in walker {
@@ -1340,11 +1349,11 @@ fn handle_daemon_watch_event(
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
-    if daemon_event_paths_all_default_ignored(root, &event.paths) {
-        return;
-    }
     if daemon_event_touches_ignore_file(root, &event.paths) {
         mark_daemon_cache_overflow(state, persist);
+        return;
+    }
+    if daemon_event_paths_all_default_ignored(root, &event.paths) {
         return;
     }
     if matches!(
@@ -1394,8 +1403,7 @@ fn daemon_event_paths_all_default_ignored(root: &Path, paths: &[PathBuf]) -> boo
 
 fn daemon_event_touches_ignore_file(root: &Path, paths: &[PathBuf]) -> bool {
     paths.iter().any(|path| {
-        daemon_event_relative_path(root, path)
-            .is_some_and(|path| path == ".trailignore" || path == ".gitignore")
+        daemon_event_relative_path(root, path).is_some_and(|path| is_ignore_policy_path(&path))
     })
 }
 
@@ -2017,6 +2025,178 @@ mod tests {
         assert_eq!(state.baseline_root_id, None);
         assert!(state.dirty_paths.contains("created"));
         assert!(state.dirty_paths.contains("removed"));
+    }
+
+    #[test]
+    fn daemon_root_and_nested_policy_file_events_mark_overflow() {
+        let temp = tempfile::tempdir().unwrap();
+        for path in [
+            ".trailignore",
+            ".gitignore",
+            "nested/.trailignore",
+            "nested/.gitignore",
+        ] {
+            let state = Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                baseline_root_id: Some(ObjectId("root".to_string())),
+                ..DaemonWorktreeCacheState::default()
+            }));
+            handle_daemon_watch_event(
+                temp.path(),
+                &state,
+                None,
+                Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(temp.path().join(path))),
+            );
+
+            let state = state.lock().unwrap();
+            assert!(state.overflow, "policy event {path} did not overflow");
+            assert_eq!(state.baseline_root_id, None, "{path}");
+            assert!(state.dirty_paths.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn daemon_non_policy_suffixes_remain_bounded_dirty_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(DaemonWorktreeCacheState {
+            initialized: true,
+            baseline_root_id: Some(ObjectId("root".to_string())),
+            ..DaemonWorktreeCacheState::default()
+        }));
+        for path in ["nested/not.trailignore", "nested/.gitignore.bak"] {
+            handle_daemon_watch_event(
+                temp.path(),
+                &state,
+                None,
+                Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )))
+                .add_path(temp.path().join(path))),
+            );
+        }
+
+        let state = state.lock().unwrap();
+        assert!(!state.overflow);
+        assert!(state.dirty_paths.contains("nested/not.trailignore"));
+        assert!(state.dirty_paths.contains("nested/.gitignore.bak"));
+    }
+
+    #[test]
+    fn daemon_nested_trailignore_event_cannot_leave_status_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("nested")).unwrap();
+        fs::write(temp.path().join("nested/.trailignore"), "hidden.txt\n").unwrap();
+        fs::write(temp.path().join("nested/hidden.txt"), "hidden baseline\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let head = db.resolve_branch_ref("main").unwrap();
+        db.daemon_worktree_cache = Some(DaemonWorktreeCache {
+            state: Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                baseline_root_id: Some(head.root_id),
+                generation: 1,
+                ..DaemonWorktreeCacheState::default()
+            })),
+            persist: None,
+            watcher: None,
+        });
+        fs::write(temp.path().join("nested/.trailignore"), "").unwrap();
+        let cache = db.daemon_worktree_cache.as_ref().unwrap();
+        handle_daemon_watch_event(
+            temp.path(),
+            &cache.state,
+            None,
+            Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(temp.path().join("nested/.trailignore"))),
+        );
+
+        let status = db.status(None).unwrap();
+
+        assert!(
+            status
+                .changed_paths
+                .iter()
+                .any(|change| change.path == "nested/hidden.txt"),
+            "nested policy change incorrectly produced {:?}",
+            status.changed_paths
+        );
+        let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
+        assert_eq!(report.git_global_work_count, 1);
+        assert_eq!(report.full_filesystem_walk_count, 1);
+    }
+
+    #[test]
+    fn invalid_daemon_selection_reports_zero_canonical_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.daemon_worktree_cache = Some(DaemonWorktreeCache {
+            state: Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                dirty_paths: BTreeSet::from(["../outside".to_string()]),
+                generation: 1,
+                ..DaemonWorktreeCacheState::default()
+            })),
+            persist: None,
+            watcher: None,
+        });
+        let metrics = db.operation_metrics.as_ref().unwrap();
+
+        profile_operation_metrics(Some(metrics), OperationMetricsKind::Status, || {
+            assert!(matches!(
+                db.daemon_worktree_snapshot(),
+                Some(DaemonWorktreeSnapshot::Dirty { .. })
+            ));
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+
+        let report = operation_metrics_report(Some(metrics)).unwrap();
+        assert_eq!(report.input_path_count, 1);
+        assert_eq!(report.canonical_path_count, 0);
+        assert_eq!(report.daemon_snapshot_path_count, 1);
+    }
+
+    #[test]
+    fn oversized_daemon_status_accounts_snapshot_once_before_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let raw_count = db.daemon_dirty_path_limit() + 1;
+        let dirty_paths = (0..raw_count)
+            .map(|index| format!("dirty/file_{index:05}.txt"))
+            .collect::<BTreeSet<_>>();
+        db.daemon_worktree_cache = Some(DaemonWorktreeCache {
+            state: Arc::new(Mutex::new(DaemonWorktreeCacheState {
+                initialized: true,
+                dirty_paths,
+                generation: 1,
+                ..DaemonWorktreeCacheState::default()
+            })),
+            persist: None,
+            watcher: None,
+        });
+
+        let _status = db.status(None).unwrap();
+
+        let report = operation_metrics_report(db.operation_metrics.as_ref()).unwrap();
+        assert_eq!(
+            report.input_path_count,
+            saturating_u64_from_usize(raw_count)
+        );
+        assert_eq!(
+            report.canonical_path_count,
+            saturating_u64_from_usize(raw_count)
+        );
+        assert_eq!(
+            report.daemon_snapshot_path_count,
+            saturating_u64_from_usize(raw_count)
+        );
     }
 
     #[test]

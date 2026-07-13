@@ -1,5 +1,25 @@
 use super::*;
 
+pub(crate) fn is_ignore_policy_path(path: &str) -> bool {
+    path_from_rel(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".trailignore" | ".gitignore"))
+}
+
+/// Counts construction of a configured ignore walker. The ignore crate does
+/// not expose the dynamically discovered ignore files or bytes loaded by a
+/// walker, so dependency-file and dependency-byte metrics remain exact only
+/// for the root files explicitly probed by `WorkspaceIgnorePolicySnapshot`.
+pub(crate) fn note_walkbuilder_policy_build(metrics: Option<&Arc<OperationMetricsState>>) {
+    if let Some(metrics) = metrics {
+        metrics.add(OperationMetricsDelta {
+            policy_build_count: 1,
+            ..OperationMetricsDelta::default()
+        });
+    }
+}
+
 pub(crate) fn write_default_trailignore(workspace_root: &Path) -> Result<()> {
     let path = workspace_root.join(".trailignore");
     if path.exists() {

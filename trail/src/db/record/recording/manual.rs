@@ -77,8 +77,14 @@ impl Trail {
             ..OperationMetricsDelta::default()
         });
         let selected_paths = normalize_record_paths(&options.paths)?;
+        let explicit_selections = (!selected_paths.is_empty())
+            .then(|| SelectionSet::from_paths(&selected_paths))
+            .transpose()?;
         self.note_operation_metrics(OperationMetricsDelta {
-            canonical_path_count: saturating_u64_from_usize(selected_paths.len()),
+            canonical_path_count: explicit_selections
+                .as_ref()
+                .map(|selections| saturating_u64_from_usize(selections.as_slice().len()))
+                .unwrap_or(0),
             ..OperationMetricsDelta::default()
         });
         let session_id = options
@@ -124,10 +130,14 @@ impl Trail {
             }
             _ => None,
         };
-        let fast_dirty_paths = if selected_paths.is_empty() && daemon_dirty_paths.is_none() {
-            self.scan_git_dirty_tracked_paths()?
+        let git_policy = if selected_paths.is_empty() && daemon_dirty_paths.is_none() {
+            Some(self.workspace_ignore_policy_snapshot())
         } else {
             None
+        };
+        let fast_dirty_paths = match git_policy.as_ref() {
+            Some(policy) => self.scan_git_dirty_tracked_paths_with_policy(policy)?,
+            None => None,
         };
         let disk_files;
         let build_selected_paths;
@@ -136,7 +146,9 @@ impl Trail {
         let record_generation;
         if let Some((generation, paths)) = daemon_dirty_paths {
             previous_files = self.load_root_files_for_selections(&head.root_id, &paths)?;
-            let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+            let policy = self.workspace_ignore_policy_snapshot();
+            let snapshot =
+                self.selected_worktree_snapshot_with_policy(&previous_files, &paths, &policy)?;
             self.reconcile_daemon_status_paths(
                 &head.root_id,
                 &paths,
@@ -165,7 +177,13 @@ impl Trail {
                 });
             }
             previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
-            let snapshot = self.selected_worktree_snapshot(&previous_files, &paths)?;
+            let snapshot = self.selected_worktree_snapshot_with_policy(
+                &previous_files,
+                &paths,
+                git_policy
+                    .as_ref()
+                    .expect("Git candidates have an operation policy snapshot"),
+            )?;
             if snapshot.paths.is_empty() {
                 return Ok(RecordReport {
                     branch,
@@ -179,15 +197,19 @@ impl Trail {
             build_selection_set = None;
             record_generation = fallback_generation;
         } else if !selected_paths.is_empty() {
-            let selections = SelectionSet::from_paths(&selected_paths)?;
+            let selections = explicit_selections
+                .as_ref()
+                .expect("nonempty explicit record paths have a selection set");
             previous_files = self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-            disk_files = self.scan_record_selection_files(
+            let policy = self.workspace_ignore_policy_snapshot();
+            disk_files = self.scan_record_selection_files_with_policy(
                 &selected_paths,
-                &selections,
+                selections,
                 options.allow_ignored,
+                &policy,
             )?;
             build_selected_paths = Some(selected_paths.clone());
-            build_selection_set = Some(selections);
+            build_selection_set = Some(selections.clone());
             record_generation = None;
         } else {
             let refresh = self.refresh_worktree_index_streaming_report()?;

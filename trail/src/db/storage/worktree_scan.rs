@@ -1,7 +1,10 @@
 use super::*;
 
 impl Trail {
-    pub(crate) fn scan_git_dirty_tracked_paths(&self) -> Result<Option<Vec<String>>> {
+    pub(crate) fn scan_git_dirty_tracked_paths_with_policy(
+        &self,
+        policy: &WorkspaceIgnorePolicySnapshot,
+    ) -> Result<Option<Vec<String>>> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
@@ -28,6 +31,7 @@ impl Trail {
             .collect::<Vec<_>>();
         self.note_operation_metrics(OperationMetricsDelta {
             git_output_record_count: saturating_u64_from_usize(records.len()),
+            input_path_count: saturating_u64_from_usize(records.len()),
             ..OperationMetricsDelta::default()
         });
         let mut idx = 0;
@@ -38,10 +42,10 @@ impl Trail {
             }
             let status = &record[..2];
             let path = normalize_relative_path(&String::from_utf8_lossy(&record[3..]))?;
-            if path == ".trailignore" || path == ".gitignore" {
+            if is_ignore_policy_path(&path) {
                 return Ok(None);
             }
-            if !self.ignore_check(&path)?.ignored {
+            if !policy.check(&path)?.ignored {
                 paths.insert(path);
             }
             if status == b"??" {
@@ -54,43 +58,60 @@ impl Trail {
                     return Ok(None);
                 };
                 let old_path = normalize_relative_path(&String::from_utf8_lossy(old_record))?;
-                if old_path == ".trailignore" || old_path == ".gitignore" {
+                if is_ignore_policy_path(&old_path) {
                     return Ok(None);
                 }
-                if !self.ignore_check(&old_path)?.ignored {
+                if !policy.check(&old_path)?.ignored {
                     paths.insert(old_path);
                 }
             }
             idx += 1;
         }
+        let exact_paths = paths.into_iter().collect::<Vec<_>>();
+        let canonical_paths = SelectionSet::from_paths(&exact_paths)?;
         self.note_operation_metrics(OperationMetricsDelta {
-            input_path_count: saturating_u64_from_usize(records.len()),
-            canonical_path_count: saturating_u64_from_usize(paths.len()),
+            canonical_path_count: saturating_u64_from_usize(canonical_paths.as_slice().len()),
             ..OperationMetricsDelta::default()
         });
-        Ok(Some(paths.into_iter().collect()))
+        Ok(Some(exact_paths))
     }
 
     pub(crate) fn scan_visible_files_for_paths(&self, paths: &[String]) -> Result<Vec<DiskFile>> {
+        let policy = self.workspace_ignore_policy_snapshot();
+        self.scan_visible_files_for_paths_with_policy(paths, &policy)
+    }
+
+    pub(crate) fn scan_visible_files_for_paths_with_policy(
+        &self,
+        paths: &[String],
+        policy: &WorkspaceIgnorePolicySnapshot,
+    ) -> Result<Vec<DiskFile>> {
         let root = self.workspace_root.canonicalize()?;
+        let selections = SelectionSet::from_paths(paths)?;
         let mut files = BTreeMap::new();
         let mut filesystem_metrics = OperationMetricsAccumulator::new(
             self.operation_metrics.as_ref(),
             OperationMetricsDelta::default(),
         );
-        for path in paths {
-            if self.ignore_check(path)?.ignored {
-                continue;
-            }
-            let abs = self.workspace_root.join(path_from_rel(path));
+        for path in selections.as_slice() {
+            let abs = safe_join(&root, path)?;
             filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
                 .delta
                 .filesystem_stat_count
                 .saturating_add(1);
             let metadata = match fs::symlink_metadata(&abs) {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(metadata) => Some(metadata),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => return Err(Error::Io(err)),
+            };
+            if policy
+                .check_with_is_dir(path, metadata.as_ref().is_some_and(fs::Metadata::is_dir))?
+                .ignored
+            {
+                continue;
+            }
+            let Some(metadata) = metadata else {
+                continue;
             };
             if metadata.file_type().is_symlink() {
                 continue;
@@ -254,6 +275,7 @@ impl Trail {
             .git_exclude(self.config.recording.ignore_gitignored)
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut files = Vec::new();
         for item in walker {
@@ -308,6 +330,7 @@ impl Trail {
             .git_exclude(self.config.recording.ignore_gitignored)
             .git_global(self.config.recording.ignore_gitignored)
             .add_custom_ignore_filename(".trailignore");
+        note_walkbuilder_policy_build(self.operation_metrics.as_ref());
         let walker = builder.build();
         let mut paths = Vec::new();
         let mut total_bytes = 0u64;
@@ -376,6 +399,7 @@ fn scan_files_under_selection(
         .git_exclude(use_git_ignores)
         .git_global(use_git_ignores)
         .add_custom_ignore_filename(".trailignore");
+    note_walkbuilder_policy_build(metrics);
     let walker = builder.build();
     for item in walker {
         let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -716,5 +740,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("safe directory"));
+    }
+
+    #[test]
+    fn walkbuilder_scans_report_each_policy_build() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+        fs::write(temp.path().join("src/nested/file.txt"), "visible\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let metrics = db.operation_metrics.as_ref().unwrap();
+
+        profile_operation_metrics(Some(metrics), OperationMetricsKind::StatusReadOnly, || {
+            db.scan_files_under(temp.path())?;
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+        let full = operation_metrics_report(Some(metrics)).unwrap();
+        assert_eq!(full.full_filesystem_walk_count, 1);
+        assert_eq!(full.policy_build_count, 1);
+        assert_eq!(full.policy_dependency_file_count, 0);
+        assert_eq!(full.policy_dependency_bytes, 0);
+
+        profile_operation_metrics(Some(metrics), OperationMetricsKind::Status, || {
+            let policy = db.workspace_ignore_policy_snapshot();
+            db.scan_visible_files_for_paths_with_policy(&["src".to_string()], &policy)?;
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+        let bounded = operation_metrics_report(Some(metrics)).unwrap();
+        assert_eq!(bounded.bounded_filesystem_walk_count, 1);
+        assert_eq!(bounded.policy_build_count, 2);
+        assert_eq!(bounded.policy_dependency_file_count, 1);
+        assert!(bounded.policy_dependency_bytes > 0);
     }
 }
