@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
 
+mod protocol;
 mod registry;
 mod schema;
 mod setup;
