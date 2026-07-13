@@ -29,10 +29,14 @@ def extract_performance_metrics(payload: object) -> dict[str, object]:
     blob_writes = nonnegative_json_integer(
         performance.get("blob_write_count"), "blob_write_count"
     )
+    plumbing_commands = nonnegative_json_integer(
+        performance.get("git_plumbing_command_count"), "git_plumbing_command_count"
+    )
     return {
         "agent_git_export_mode": export_mode,
         "agent_git_changed_paths": changed_paths,
         "agent_git_blob_writes": blob_writes,
+        "agent_git_plumbing_commands": plumbing_commands,
     }
 
 

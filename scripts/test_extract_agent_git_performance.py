@@ -17,6 +17,7 @@ class AgentGitPerformanceTests(unittest.TestCase):
             "export_mode": "mapped_delta",
             "changed_path_count": 1,
             "blob_write_count": 1,
+            "git_plumbing_command_count": 5,
         }
         performance.update(overrides)
         return {"git_export": {"performance": performance}}
@@ -28,6 +29,7 @@ class AgentGitPerformanceTests(unittest.TestCase):
                 "agent_git_export_mode": "mapped_delta",
                 "agent_git_changed_paths": 1,
                 "agent_git_blob_writes": 1,
+                "agent_git_plumbing_commands": 5,
             },
         )
 
@@ -45,6 +47,10 @@ class AgentGitPerformanceTests(unittest.TestCase):
             ("blob_write_count", "1"),
             ("blob_write_count", 1.5),
             ("blob_write_count", -1),
+            ("git_plumbing_command_count", False),
+            ("git_plumbing_command_count", "5"),
+            ("git_plumbing_command_count", 4.5),
+            ("git_plumbing_command_count", -1),
         ]:
             with self.subTest(key=key, value=value):
                 with self.assertRaisesRegex(ValueError, "nonnegative JSON integer"):
@@ -61,7 +67,8 @@ class AgentGitPerformanceTests(unittest.TestCase):
                 output.read_text(),
                 "agent_git_export_mode\tmapped_delta\n"
                 "agent_git_changed_paths\t1\n"
-                "agent_git_blob_writes\t1\n",
+                "agent_git_blob_writes\t1\n"
+                "agent_git_plumbing_commands\t5\n",
             )
 
 

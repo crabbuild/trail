@@ -819,6 +819,7 @@ pub(crate) struct GitHandoffMetrics {
     export_mode: GitExportMode,
     changed_path_count: u64,
     blob_write_count: u64,
+    git_plumbing_command_count: u64,
     tracked_status_count: u64,
     full_root_file_count: u64,
 }
@@ -847,6 +848,7 @@ impl From<GitHandoffMetrics> for GitHandoffMetricsReport {
             export_mode: metrics.export_mode.as_str().to_string(),
             changed_path_count: metrics.changed_path_count,
             blob_write_count: metrics.blob_write_count,
+            git_plumbing_command_count: metrics.git_plumbing_command_count,
             tracked_status_count: metrics.tracked_status_count,
             full_root_file_count: metrics.full_root_file_count,
         }

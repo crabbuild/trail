@@ -35,6 +35,18 @@ impl Trail {
         self.git_handoff_metrics.set(metrics);
     }
 
+    fn add_git_blob_writes(&self, count: u64) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.blob_write_count = metrics.blob_write_count.saturating_add(count);
+        self.git_handoff_metrics.set(metrics);
+    }
+
+    pub(crate) fn record_git_plumbing_command(&self) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.git_plumbing_command_count = metrics.git_plumbing_command_count.saturating_add(1);
+        self.git_handoff_metrics.set(metrics);
+    }
+
     fn record_tracked_git_status(&self) {
         let mut metrics = self.git_handoff_metrics.get();
         metrics.tracked_status_count = metrics.tracked_status_count.saturating_add(1);
@@ -201,46 +213,115 @@ impl Trail {
 
         let tmp_dir = self.db_dir.join("tmp");
         fs::create_dir_all(&tmp_dir)?;
-        let index_path = tmp_dir.join(format!("git-index-{}-{}", std::process::id(), now_ts()));
+        let batch_dir = tempfile::Builder::new()
+            .prefix("git-delta-")
+            .tempdir_in(&tmp_dir)?;
+        let blob_dir = batch_dir.path().join("blobs");
+        fs::create_dir(&blob_dir)?;
+        let index_path = batch_dir.path().join("index");
 
         let result = (|| {
+            self.record_git_plumbing_command();
             self.git_output_with_index(&["read-tree".to_string(), head.to_string()], &index_path)?;
-            for path in changed_paths {
-                if let Some(entry) = patch_right.get(&path) {
+
+            let mut additions = Vec::new();
+            for (ordinal, path) in changed_paths.iter().enumerate() {
+                if let Some(entry) = patch_right.get(path) {
                     let bytes = self.materialize_entry_bytes(entry)?;
-                    let oid =
-                        self.git_output_with_input(&["hash-object", "-w", "--stdin"], &bytes)?;
-                    self.record_git_blob_write();
-                    let mode = if entry.executable { "100755" } else { "100644" };
-                    self.git_output_with_index(
-                        &[
-                            "update-index".to_string(),
-                            "--add".to_string(),
-                            "--cacheinfo".to_string(),
-                            mode.to_string(),
-                            oid,
-                            path,
-                        ],
-                        &index_path,
-                    )?;
-                } else {
-                    self.git_output_with_index(
-                        &[
-                            "update-index".to_string(),
-                            "--force-remove".to_string(),
-                            "--".to_string(),
-                            path,
-                        ],
-                        &index_path,
-                    )?;
+                    let synthetic_name = format!("blob-{ordinal:020}");
+                    fs::write(blob_dir.join(&synthetic_name), bytes)?;
+                    let synthetic_path = blob_dir
+                        .join(&synthetic_name)
+                        .strip_prefix(&self.workspace_root)
+                        .map_err(|_| {
+                            Error::Git(format!(
+                                "Git blob batch directory `{}` is outside workspace `{}`",
+                                blob_dir.display(),
+                                self.workspace_root.display()
+                            ))
+                        })?
+                        .to_string_lossy()
+                        .into_owned();
+                    if synthetic_path.contains(['\n', '\r']) {
+                        return Err(Error::Git(
+                            "Git blob batch path contains a line separator".to_string(),
+                        ));
+                    }
+                    additions.push((
+                        path.clone(),
+                        if entry.executable { "100755" } else { "100644" },
+                        synthetic_path,
+                    ));
                 }
             }
+
+            let oids = if additions.is_empty() {
+                Vec::new()
+            } else {
+                let mut hash_input = Vec::new();
+                for (_, _, synthetic_path) in &additions {
+                    hash_input.extend_from_slice(synthetic_path.as_bytes());
+                    hash_input.push(b'\n');
+                }
+                self.record_git_plumbing_command();
+                let output = self.git_output_bytes_with_input(
+                    &["hash-object", "-w", "--stdin-paths"],
+                    &hash_input,
+                    None,
+                )?;
+                let oids = parse_git_hash_object_oids(&output, additions.len())?;
+                self.add_git_blob_writes(oids.len() as u64);
+                oids
+            };
+
+            let oid_length = oids.first().map_or(head.len(), String::len);
+            if !matches!(oid_length, 40 | 64) {
+                return Err(Error::Git(format!(
+                    "unsupported Git object ID length {oid_length}"
+                )));
+            }
+            let zero_oid = "0".repeat(oid_length);
+            let oid_by_path = additions
+                .iter()
+                .zip(oids)
+                .map(|((path, mode, _), oid)| (path.as_str(), (*mode, oid)))
+                .collect::<BTreeMap<_, _>>();
+            let mut index_input = Vec::new();
+            for path in &changed_paths {
+                if path.as_bytes().contains(&0) {
+                    return Err(Error::InvalidPath {
+                        path: path.clone(),
+                        reason: "Git index paths cannot contain NUL bytes".to_string(),
+                    });
+                }
+                if let Some((mode, oid)) = oid_by_path.get(path.as_str()) {
+                    index_input.extend_from_slice(mode.as_bytes());
+                    index_input.push(b' ');
+                    index_input.extend_from_slice(oid.as_bytes());
+                } else {
+                    index_input.extend_from_slice(b"0 ");
+                    index_input.extend_from_slice(zero_oid.as_bytes());
+                }
+                index_input.push(b'\t');
+                index_input.extend_from_slice(path.as_bytes());
+                index_input.push(0);
+            }
+
+            self.record_git_plumbing_command();
+            self.git_output_bytes_with_input(
+                &["update-index", "-z", "--index-info"],
+                &index_input,
+                Some(&index_path),
+            )?;
+            self.record_git_plumbing_command();
             self.git_output_with_index(&["write-tree".to_string()], &index_path)
         })();
-
-        let _ = fs::remove_file(&index_path);
-        let _ = fs::remove_file(index_path.with_extension("lock"));
-        result
+        let cleanup = batch_dir.close();
+        match (result, cleanup) {
+            (Ok(tree), Ok(())) => Ok(tree),
+            (Ok(_), Err(err)) => Err(Error::Io(err)),
+            (Err(err), _) => Err(err),
+        }
     }
 
     pub(crate) fn git_insert_tree_path(
@@ -367,6 +448,48 @@ impl Trail {
         self.git_checked_output(&args, output)
     }
 
+    fn git_output_bytes_with_input(
+        &self,
+        args: &[&str],
+        input: &[u8],
+        index_path: Option<&Path>,
+    ) -> Result<Vec<u8>> {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(&self.workspace_root).args(args);
+        if let Some(index_path) = index_path {
+            command.env("GIT_INDEX_FILE", index_path);
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|err| Error::Git(err.to_string()))?;
+        let write_result = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::Git("failed to open git stdin".to_string()))?
+            .write_all(input);
+        if let Err(err) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Io(err));
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|err| Error::Git(err.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Git(format!(
+                "git {} failed in {}: {}",
+                args.join(" "),
+                self.workspace_root.display(),
+                stderr.trim()
+            )));
+        }
+        Ok(output.stdout)
+    }
+
     pub(crate) fn git_checked_output(
         &self,
         args: &[String],
@@ -385,9 +508,71 @@ impl Trail {
     }
 }
 
+fn parse_git_hash_object_oids(output: &[u8], expected_count: usize) -> Result<Vec<String>> {
+    let output = std::str::from_utf8(output)
+        .map_err(|err| Error::Git(format!("git hash-object returned non-UTF-8 output: {err}")))?;
+    let mut lines = output.split('\n').collect::<Vec<_>>();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    if lines.len() != expected_count {
+        return Err(Error::Git(format!(
+            "git hash-object returned {} object IDs for {expected_count} paths",
+            lines.len()
+        )));
+    }
+    let mut oid_length = None;
+    let mut oids = Vec::with_capacity(lines.len());
+    for (index, oid) in lines.into_iter().enumerate() {
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Git(format!(
+                "git hash-object returned invalid object ID at position {index}: `{oid}`"
+            )));
+        }
+        if oid_length
+            .replace(oid.len())
+            .is_some_and(|length| length != oid.len())
+        {
+            return Err(Error::Git(
+                "git hash-object returned mixed object ID lengths".to_string(),
+            ));
+        }
+        oids.push(oid.to_string());
+    }
+    Ok(oids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_hash_batch_output_preserves_order_and_validates_count() {
+        let first = "1".repeat(40);
+        let second = "a".repeat(40);
+        let output = format!("{first}\n{second}\n");
+        assert_eq!(
+            parse_git_hash_object_oids(output.as_bytes(), 2).unwrap(),
+            vec![first, second]
+        );
+        assert!(matches!(
+            parse_git_hash_object_oids(output.as_bytes(), 1),
+            Err(Error::Git(message)) if message.contains("2 object IDs for 1 paths")
+        ));
+    }
+
+    #[test]
+    fn git_hash_batch_output_rejects_invalid_or_mixed_oids() {
+        assert!(matches!(
+            parse_git_hash_object_oids(b"not-an-oid\n", 1),
+            Err(Error::Git(message)) if message.contains("invalid object ID")
+        ));
+        let mixed = format!("{}\n{}\n", "1".repeat(40), "2".repeat(64));
+        assert!(matches!(
+            parse_git_hash_object_oids(mixed.as_bytes(), 2),
+            Err(Error::Git(message)) if message.contains("mixed object ID lengths")
+        ));
+    }
 
     #[test]
     fn git_publication_state_rejects_changed_head() {

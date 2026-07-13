@@ -59,6 +59,8 @@ pub struct GitHandoffMetricsReport {
     pub export_mode: String,
     pub changed_path_count: u64,
     pub blob_write_count: u64,
+    #[serde(default)]
+    pub git_plumbing_command_count: u64,
     pub tracked_status_count: u64,
     pub full_root_file_count: u64,
 }
@@ -119,4 +121,23 @@ pub struct CheckoutReport {
     pub output_root: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_paths: Vec<FileDiffSummary>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_handoff_metrics_defaults_new_plumbing_counter_for_legacy_json() {
+        let report: GitHandoffMetricsReport = serde_json::from_value(serde_json::json!({
+            "export_mode": "mapped_delta",
+            "changed_path_count": 2,
+            "blob_write_count": 2,
+            "tracked_status_count": 1,
+            "full_root_file_count": 0
+        }))
+        .unwrap();
+
+        assert_eq!(report.git_plumbing_command_count, 0);
+    }
 }

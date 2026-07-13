@@ -148,6 +148,7 @@ jobs:
               git_structural_thresholds=(
                 "agent_git_changed_paths=$changed_paths"
                 "agent_git_blob_writes=$changed_paths"
+                agent_git_plumbing_commands=5
               )
               git_metric_equalities=(
                 --metric-equals

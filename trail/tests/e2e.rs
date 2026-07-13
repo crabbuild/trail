@@ -1188,6 +1188,37 @@ fn ready_agent_lane_with_mode(mode: InitImportMode) -> (tempfile::TempDir, Trail
     (temp, db)
 }
 
+fn ready_agent_lane_with_changed_paths(changed_path_count: usize) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let edits = (0..changed_path_count)
+        .map(|index| {
+            serde_json::json!({
+                "op": "write",
+                "path": format!("agent-{index:03}.md"),
+                "content": format!("agent change {index}\n"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "many changed paths",
+        "edits": edits,
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+    (temp, db)
+}
+
 #[test]
 fn agent_apply_reports_one_tracked_status_query() {
     if !git_available() {
@@ -1214,6 +1245,103 @@ fn agent_apply_actual_reports_mapped_delta_metrics() {
     assert_eq!(applied.performance.export_mode, "mapped_delta");
     assert_eq!(applied.performance.changed_path_count, 1);
     assert_eq!(applied.performance.blob_write_count, 1);
+}
+
+#[test]
+fn agent_apply_batches_git_plumbing_for_many_paths() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_changed_paths(100);
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+    assert_eq!(applied.performance.changed_path_count, 100);
+    assert_eq!(applied.performance.blob_write_count, 100);
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        applied
+            .git_export
+            .as_ref()
+            .unwrap()
+            .performance
+            .git_plumbing_command_count,
+        5
+    );
+    let tmp = temp.path().join(".trail/tmp");
+    if tmp.is_dir() {
+        assert!(!fs::read_dir(tmp).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-delta-")
+        }));
+    }
+}
+
+#[test]
+fn agent_apply_batch_preserves_modes_deletions_and_safe_special_paths() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("delete-me.txt"), "remove me\n").unwrap();
+    fs::write(temp.path().join("mode-change.sh"), "echo old\n").unwrap();
+    run_git(temp.path(), &["add", "delete-me.txt", "mode-change.sh"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let special_path = "dir with space/-leading-ünicode.sh";
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "mixed Git index batch",
+        "edits": [
+            {"op": "delete", "path": "delete-me.txt"},
+            {
+                "op": "write",
+                "path": "mode-change.sh",
+                "content": "echo changed\n",
+                "executable": true
+            },
+            {
+                "op": "write",
+                "path": special_path,
+                "content": "echo special\n",
+                "executable": true
+            }
+        ]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        git_output(temp.path(), &["ls-tree", "HEAD", "--", "delete-me.txt"]),
+        ""
+    );
+    for path in ["mode-change.sh", special_path] {
+        let entry = git_output(temp.path(), &["ls-tree", "HEAD", "--", path]);
+        assert!(
+            entry.starts_with("100755 blob "),
+            "expected executable Git entry for {path:?}, got {entry:?}"
+        );
+    }
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:mode-change.sh"]),
+        "echo changed\n"
+    );
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", &format!("HEAD:{special_path}")]),
+        "echo special\n"
+    );
 }
 
 #[test]

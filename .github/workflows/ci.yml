@@ -81,6 +81,7 @@ jobs:
           object_count=20000
           agent_git_changed_paths=1
           agent_git_blob_writes=1
+          agent_git_plumbing_commands=5
           --metric-equals
           agent_git_export_mode=mapped_delta
           agent_git_changed_paths=1

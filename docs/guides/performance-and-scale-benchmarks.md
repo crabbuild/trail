@@ -105,9 +105,15 @@ no-materialize task that changes
 `k = max(1, min(100, files / 1000))` paths, records the review gate, and runs
 both dry-run and actual apply. Its structural metrics require
 `export_mode=mapped_delta`, exactly `k` changed paths, and at most `k` blob
-writes. The missing-mapping fixture is initialized from the working tree and
-must return `GIT_MAPPING_REQUIRED` without changing Git HEAD, the Git index, or
-Trail's mapping table.
+writes. `agent_git_plumbing_commands` is specifically the mapped-export
+plumbing subprocess count: `read-tree`, the optional batch `hash-object`, one
+batch `update-index`, `write-tree`, and `commit-tree`. It excludes the final
+porcelain fast-forward and is gated as a constant ceiling of 5, independent of
+`k`; deletion-only exports may be lower because they do not hash new blobs.
+Full-snapshot exports do not use this mapped-export counter. The missing-mapping
+fixture is initialized from the working tree and must return
+`GIT_MAPPING_REQUIRED` without changing Git HEAD, the Git index, or Trail's
+mapping table.
 
 ## Current Evidence
 

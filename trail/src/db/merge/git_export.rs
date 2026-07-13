@@ -142,6 +142,9 @@ impl Trail {
             self.add_git_full_root_file_count(files.len() as u64);
             self.git_write_tree(&files)?
         };
+        if can_export_delta {
+            self.record_git_plumbing_command();
+        }
         let commit = self.git_commit_tree(&tree_oid, git_state.head.as_deref(), message)?;
         let mapping = self.insert_git_mapping_for_state(
             "export",
