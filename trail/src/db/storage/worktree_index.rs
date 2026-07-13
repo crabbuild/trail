@@ -79,7 +79,11 @@ impl Trail {
     }
 
     pub fn start_daemon_worktree_cache(&mut self) -> Result<DaemonWorktreeCacheWarmup> {
-        let cache = DaemonWorktreeCache::start(&self.workspace_root, &self.db_dir)?;
+        let cache = DaemonWorktreeCache::start(
+            &self.workspace_root,
+            &self.db_dir,
+            self.operation_metrics.clone(),
+        )?;
         let warmup = DaemonWorktreeCacheWarmup {
             workspace_root: self.workspace_root.clone(),
             db_dir: self.db_dir.clone(),
@@ -111,14 +115,30 @@ impl Trail {
     }
 
     pub(crate) fn daemon_worktree_snapshot(&self) -> Option<DaemonWorktreeSnapshot> {
-        if let Some(snapshot) = self
+        let snapshot = if let Some(snapshot) = self
             .daemon_worktree_cache
             .as_ref()
             .map(DaemonWorktreeCache::snapshot)
         {
-            return Some(snapshot);
+            Some(snapshot)
+        } else {
+            self.persisted_daemon_worktree_snapshot().ok().flatten()
+        };
+        if let Some(snapshot) = &snapshot {
+            let path_count = match snapshot {
+                DaemonWorktreeSnapshot::Dirty { paths, .. } => {
+                    saturating_u64_from_usize(paths.len())
+                }
+                DaemonWorktreeSnapshot::Clean { .. } | DaemonWorktreeSnapshot::Overflow { .. } => 0,
+            };
+            self.note_operation_metrics(OperationMetricsDelta {
+                input_path_count: path_count,
+                canonical_path_count: path_count,
+                daemon_snapshot_path_count: path_count,
+                ..OperationMetricsDelta::default()
+            });
         }
-        self.persisted_daemon_worktree_snapshot().ok().flatten()
+        snapshot
     }
 
     pub(crate) fn daemon_dirty_path_limit(&self) -> usize {
@@ -132,6 +152,10 @@ impl Trail {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(Error::Io(err)),
         };
+        self.note_operation_metrics(OperationMetricsDelta {
+            daemon_snapshot_bytes: saturating_u64_from_usize(bytes.len()),
+            ..OperationMetricsDelta::default()
+        });
         let snapshot: PersistedDaemonWorktreeSnapshot = serde_json::from_slice(&bytes)?;
         if snapshot.version != DAEMON_WORKTREE_SNAPSHOT_VERSION
             || snapshot.workspace_root != self.workspace_root.to_string_lossy()
@@ -213,6 +237,13 @@ impl Trail {
         &self,
         scan_id: i64,
     ) -> Result<WorktreeIndexRefresh> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let indexed_entries = self.worktree_index_count()?;
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
@@ -237,6 +268,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -251,6 +286,10 @@ impl Trail {
                 continue;
             }
 
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = fs::symlink_metadata(path)?;
             let stamp = WorktreeFileStamp::from_metadata(&metadata);
             if let Some(cached_stamp) = cached_worktree_file_stamp(&mut cached_stmt, &rel)? {
@@ -272,7 +311,11 @@ impl Trail {
 
         let has_deleted_index_entries = indexed_seen < indexed_entries;
         let changed = !read_candidates.is_empty() || has_deleted_index_entries;
-        let updates = read_worktree_index_candidates(&read_candidates, &self.config.text)?;
+        let updates = read_worktree_index_candidates(
+            &read_candidates,
+            &self.config.text,
+            self.operation_metrics.as_ref(),
+        )?;
         for update in updates {
             self.upsert_worktree_index_manifest_for_scan(
                 &update.path,
@@ -297,6 +340,13 @@ impl Trail {
     pub(crate) fn scan_worktree_manifest_indexed_with_stamps(
         &self,
     ) -> Result<BTreeMap<String, IndexedDiskManifest>> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -315,6 +365,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -329,12 +383,33 @@ impl Trail {
                 continue;
             }
 
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = fs::symlink_metadata(path)?;
             let stamp = WorktreeFileStamp::from_metadata(&metadata);
             let disk_manifest = if let Some(cached) = self.cached_worktree_manifest(&rel, stamp)? {
                 cached
             } else {
+                filesystem_metrics.delta.filesystem_read_count = filesystem_metrics
+                    .delta
+                    .filesystem_read_count
+                    .saturating_add(1);
                 let bytes = fs::read(path)?;
+                let bytes_len = saturating_u64_from_usize(bytes.len());
+                filesystem_metrics.delta.filesystem_read_bytes = filesystem_metrics
+                    .delta
+                    .filesystem_read_bytes
+                    .saturating_add(bytes_len);
+                filesystem_metrics.delta.filesystem_hash_count = filesystem_metrics
+                    .delta
+                    .filesystem_hash_count
+                    .saturating_add(1);
+                filesystem_metrics.delta.filesystem_hash_bytes = filesystem_metrics
+                    .delta
+                    .filesystem_hash_bytes
+                    .saturating_add(bytes_len);
                 let disk_manifest = DiskManifest {
                     kind: classify_file_kind(&bytes, &self.config.text),
                     executable: stamp.executable,
@@ -468,6 +543,13 @@ impl Trail {
     }
 
     fn scan_visible_worktree_paths(&self) -> Result<BTreeSet<String>> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root = self.workspace_root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -485,6 +567,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -771,25 +857,42 @@ fn cached_worktree_file_stamp(
 fn read_worktree_index_candidates(
     candidates: &[WorktreeIndexReadCandidate],
     text_config: &TextConfig,
+    metrics: Option<&Arc<OperationMetricsState>>,
 ) -> Result<Vec<WorktreeIndexUpdate>> {
     if candidates.len() <= 1 {
         return candidates
             .iter()
-            .map(|candidate| read_worktree_index_candidate(candidate, text_config))
+            .map(|candidate| read_worktree_index_candidate(candidate, text_config, metrics))
             .collect();
     }
 
     candidates
         .par_iter()
-        .map(|candidate| read_worktree_index_candidate(candidate, text_config))
+        .map(|candidate| read_worktree_index_candidate(candidate, text_config, metrics))
         .collect()
 }
 
 fn read_worktree_index_candidate(
     candidate: &WorktreeIndexReadCandidate,
     text_config: &TextConfig,
+    metrics: Option<&Arc<OperationMetricsState>>,
 ) -> Result<WorktreeIndexUpdate> {
+    if let Some(metrics) = metrics {
+        metrics.add(OperationMetricsDelta {
+            filesystem_read_count: 1,
+            ..OperationMetricsDelta::default()
+        });
+    }
     let bytes = fs::read(&candidate.abs_path)?;
+    if let Some(metrics) = metrics {
+        let bytes_len = saturating_u64_from_usize(bytes.len());
+        metrics.add(OperationMetricsDelta {
+            filesystem_read_bytes: bytes_len,
+            filesystem_hash_count: 1,
+            filesystem_hash_bytes: bytes_len,
+            ..OperationMetricsDelta::default()
+        });
+    }
     Ok(WorktreeIndexUpdate {
         path: candidate.path.clone(),
         stamp: candidate.stamp,
@@ -835,7 +938,11 @@ pub(crate) fn file_kind_from_index(value: &str) -> std::result::Result<FileKind,
 }
 
 impl DaemonWorktreeCache {
-    fn start(workspace_root: &Path, db_dir: &Path) -> Result<Self> {
+    fn start(
+        workspace_root: &Path,
+        db_dir: &Path,
+        metrics: Option<Arc<OperationMetricsState>>,
+    ) -> Result<Self> {
         let state = Arc::new(Mutex::new(DaemonWorktreeCacheState::default()));
         let root = workspace_root.to_path_buf();
         let persist = DaemonWorktreeCachePersist {
@@ -843,6 +950,7 @@ impl DaemonWorktreeCache {
             workspace_root: workspace_root.to_path_buf(),
             pid: std::process::id(),
             active: Arc::new(AtomicBool::new(true)),
+            metrics,
         };
         persist_daemon_worktree_state(&persist, &state);
         let state_for_watcher = Arc::clone(&state);
@@ -1203,6 +1311,9 @@ fn persist_daemon_worktree_state(
     let Ok(bytes) = serde_json::to_vec(&snapshot) else {
         return;
     };
+    if let Some(metrics) = &persist.metrics {
+        metrics.note_daemon_cumulative_rewrite(bytes.len());
+    }
     if fs::write(&tmp, bytes).is_err() {
         return;
     }
@@ -1463,7 +1574,7 @@ mod tests {
             preserve_similarity: 0.0,
         };
 
-        let updates = read_worktree_index_candidates(&candidates, &text_config).unwrap();
+        let updates = read_worktree_index_candidates(&candidates, &text_config, None).unwrap();
 
         let updates = updates
             .into_iter()

@@ -75,13 +75,40 @@ impl Trail {
         let is_dir = abs.is_dir();
         let mut builder = ::ignore::gitignore::GitignoreBuilder::new(&self.workspace_root);
         let trailignore = self.workspace_root.join(".trailignore");
-        if trailignore.exists() {
+        let gitignore = self.workspace_root.join(".gitignore");
+        // A single metadata probe preserves `Path::exists` semantics (all
+        // errors mean absent) while also exposing the bytes the matcher will
+        // read, without adding a metrics-only syscall.
+        let trailignore_metadata = fs::metadata(&trailignore).ok();
+        let gitignore_metadata = fs::metadata(&gitignore).ok();
+        let trailignore_exists = trailignore_metadata.is_some();
+        let gitignore_exists = gitignore_metadata.is_some();
+        let dependency_bytes = trailignore_metadata
+            .as_ref()
+            .map(fs::Metadata::len)
+            .unwrap_or(0)
+            .saturating_add(
+                gitignore_metadata
+                    .as_ref()
+                    .map(fs::Metadata::len)
+                    .unwrap_or(0),
+            );
+        self.note_operation_metrics(OperationMetricsDelta {
+            policy_build_count: 1,
+            policy_dependency_file_count: u64::from(trailignore_exists)
+                .saturating_add(u64::from(gitignore_exists)),
+            policy_dependency_bytes: dependency_bytes,
+            // Candidate directory classification plus the two dependency
+            // probes above. `Path::is_dir` also treats probe errors as false.
+            filesystem_stat_count: 3,
+            ..OperationMetricsDelta::default()
+        });
+        if trailignore_exists {
             if let Some(err) = builder.add(trailignore) {
                 return Err(Error::InvalidInput(err.to_string()));
             }
         }
-        let gitignore = self.workspace_root.join(".gitignore");
-        if gitignore.exists() {
+        if gitignore_exists {
             if let Some(err) = builder.add(gitignore) {
                 return Err(Error::InvalidInput(err.to_string()));
             }

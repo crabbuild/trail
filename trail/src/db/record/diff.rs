@@ -2,7 +2,10 @@ use super::*;
 
 impl Trail {
     pub fn diff_range(&self, spec: &str, patches: bool) -> Result<DiffSummary> {
-        self.diff_range_with_options(spec, patches, false)
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
+            self.diff_range_with_options(spec, patches, false)
+        })
     }
 
     pub fn diff_range_with_options(
@@ -11,12 +14,18 @@ impl Trail {
         patches: bool,
         line_changes: bool,
     ) -> Result<DiffSummary> {
-        let (left, right) = parse_range(spec)?;
-        self.diff_refs_with_options(left, right, patches, line_changes)
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
+            let (left, right) = parse_range(spec)?;
+            self.diff_refs_with_options(left, right, patches, line_changes)
+        })
     }
 
     pub fn diff_refs(&self, left: &str, right: &str, patches: bool) -> Result<DiffSummary> {
-        self.diff_refs_with_options(left, right, patches, false)
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
+            self.diff_refs_with_options(left, right, patches, false)
+        })
     }
 
     pub fn diff_refs_with_options(
@@ -26,33 +35,70 @@ impl Trail {
         patches: bool,
         line_changes: bool,
     ) -> Result<DiffSummary> {
-        let left_ref = self.resolve_refish(left)?;
-        let right_ref = self.resolve_refish(right)?;
-        self.diff_root_files(
-            left.to_string(),
-            right.to_string(),
-            &left_ref.root_id,
-            &right_ref.root_id,
-            patches,
-            line_changes,
-        )
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
+            let left_ref = self.resolve_refish(left)?;
+            let right_ref = self.resolve_refish(right)?;
+            let result = self.diff_root_files(
+                left.to_string(),
+                right.to_string(),
+                &left_ref.root_id,
+                &right_ref.root_id,
+                patches,
+                line_changes,
+            );
+            if let (Some(metrics), Ok(summary)) = (&result_metrics, &result) {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: saturating_u64_from_usize(summary.files.len()),
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            result
+        })
     }
 
     pub fn diff_roots(&self, spec: &str, patches: bool, line_changes: bool) -> Result<DiffSummary> {
-        let (left, right) = parse_range(spec)?;
-        let left_id = ObjectId(left.to_string());
-        let right_id = ObjectId(right.to_string());
-        self.diff_root_files(
-            left.to_string(),
-            right.to_string(),
-            &left_id,
-            &right_id,
-            patches,
-            line_changes,
-        )
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
+            let (left, right) = parse_range(spec)?;
+            let left_id = ObjectId(left.to_string());
+            let right_id = ObjectId(right.to_string());
+            let result = self.diff_root_files(
+                left.to_string(),
+                right.to_string(),
+                &left_id,
+                &right_id,
+                patches,
+                line_changes,
+            );
+            if let (Some(metrics), Ok(summary)) = (&result_metrics, &result) {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: saturating_u64_from_usize(summary.files.len()),
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            result
+        })
     }
 
     pub fn diff_dirty(&mut self, patches: bool, line_changes: bool) -> Result<DiffSummary> {
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {
+            let result = self.diff_dirty_profiled(patches, line_changes);
+            if let (Some(metrics), Ok(summary)) = (&result_metrics, &result) {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: saturating_u64_from_usize(summary.files.len()),
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            result
+        })
+    }
+
+    fn diff_dirty_profiled(&mut self, patches: bool, line_changes: bool) -> Result<DiffSummary> {
         let _lock = self.acquire_write_lock()?;
         let branch = self.current_branch()?;
         let head = self.resolve_branch_ref(&branch)?;

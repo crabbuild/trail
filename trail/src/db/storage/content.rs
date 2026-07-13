@@ -118,6 +118,10 @@ impl Trail {
         root_id: &ObjectId,
         paths: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
+        self.note_operation_metrics(OperationMetricsDelta {
+            root_point_key_count: saturating_u64_from_usize(paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
@@ -135,6 +139,14 @@ impl Trail {
         root_id: &ObjectId,
         selections: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                root_point_key_count: saturating_u64_from_usize(selections.len()),
+                bounded_root_range_count: saturating_u64_from_usize(selections.len()),
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
@@ -151,6 +163,8 @@ impl Trail {
                 .range(&tree, prefix.as_bytes(), end.as_deref())?;
             for item in iter {
                 let (key, value) = item?;
+                root_metrics.delta.root_range_row_count =
+                    root_metrics.delta.root_range_row_count.saturating_add(1);
                 let path = String::from_utf8(key)
                     .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
                 if path_matches_selection(&path, &selection) {
@@ -166,6 +180,10 @@ impl Trail {
         root_id: &ObjectId,
         selections: &[String],
     ) -> Result<BTreeMap<String, FileEntry>> {
+        self.note_operation_metrics(OperationMetricsDelta {
+            root_point_key_count: saturating_u64_from_usize(selections.len()),
+            ..OperationMetricsDelta::default()
+        });
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut out = BTreeMap::new();
@@ -218,12 +236,21 @@ impl Trail {
         prefix: &str,
         out: &mut BTreeMap<String, FileEntry>,
     ) -> Result<()> {
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                bounded_root_range_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let end = prefix_upper_bound(prefix.as_bytes());
         let iter = self
             .root_prolly
             .range(tree, prefix.as_bytes(), end.as_deref())?;
         for item in iter {
             let (key, value) = item?;
+            root_metrics.delta.root_range_row_count =
+                root_metrics.delta.root_range_row_count.saturating_add(1);
             let path = String::from_utf8(key)
                 .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
             out.insert(path, from_cbor(&value)?);
@@ -245,12 +272,21 @@ impl Trail {
 
     pub(crate) fn load_root_paths(&self, root_id: &ObjectId) -> Result<Vec<String>> {
         self.note_full_root_path_load();
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_root_range_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let iter = self.root_prolly.range(&tree, &[], None)?;
         let mut paths = Vec::new();
         for item in iter {
             let (key, _) = item?;
+            root_metrics.delta.root_range_row_count =
+                root_metrics.delta.root_range_row_count.saturating_add(1);
             let path = String::from_utf8(key)
                 .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
             paths.push(path);
@@ -268,6 +304,13 @@ impl Trail {
         F: FnMut(BTreeMap<String, FileEntry>) -> Result<()>,
     {
         self.note_full_root_path_load();
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_root_range_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let iter = self.root_prolly.range(&tree, &[], None)?;
@@ -275,6 +318,8 @@ impl Trail {
         let mut chunk = BTreeMap::new();
         for item in iter {
             let (key, value) = item?;
+            root_metrics.delta.root_range_row_count =
+                root_metrics.delta.root_range_row_count.saturating_add(1);
             let path = String::from_utf8(key)
                 .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
             let entry: FileEntry = from_cbor(&value)?;

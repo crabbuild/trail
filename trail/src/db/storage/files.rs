@@ -82,6 +82,11 @@ impl Trail {
         if mutations.is_empty() {
             return Ok(previous_tree);
         }
+        self.note_operation_metrics(OperationMetricsDelta {
+            prolly_tree_batch_call_count: 1,
+            prolly_tree_batch_mutation_count: saturating_u64_from_usize(mutations.len()),
+            ..OperationMetricsDelta::default()
+        });
         Ok(self.root_prolly.batch(&previous_tree, mutations)?)
     }
 
@@ -312,6 +317,13 @@ impl Trail {
                 if mutations.is_empty() {
                     previous_tree
                 } else {
+                    self.note_operation_metrics(OperationMetricsDelta {
+                        prolly_tree_batch_call_count: 1,
+                        prolly_tree_batch_mutation_count: saturating_u64_from_usize(
+                            mutations.len(),
+                        ),
+                        ..OperationMetricsDelta::default()
+                    });
                     self.root_prolly.batch(&previous_tree, mutations)?
                 }
             }
@@ -458,8 +470,17 @@ impl Trail {
         let mut stats = ImportStats::default();
         let mut removed_entries = Vec::new();
         let mut existing_accepted_paths = HashSet::new();
+        let mut root_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_root_range_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         for item in self.root_prolly.range(&previous_tree, &[], None)? {
             let (key, value) = item?;
+            root_metrics.delta.root_range_row_count =
+                root_metrics.delta.root_range_row_count.saturating_add(1);
             let path = String::from_utf8(key)
                 .map_err(|err| Error::Corrupt(format!("non UTF-8 path key: {err}")))?;
             let entry: FileEntry = from_cbor(&value)?;
@@ -2133,6 +2154,37 @@ mod tests {
         );
         assert_eq!(count_rows("objects"), objects_before);
         assert_eq!(count_rows("prolly_nodes"), prolly_nodes_before);
+    }
+
+    #[test]
+    fn full_root_metrics_preserve_rows_consumed_before_decode_error() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), "a\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let mut root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref()).unwrap();
+        let tree = db
+            .root_prolly
+            .put(&tree, b"zz-corrupt".to_vec(), vec![0xff])
+            .unwrap();
+        root.path_map_root = tree_root_hex(&tree);
+        let corrupt_root_id = db
+            .put_object(WORKTREE_ROOT_KIND, ROOT_OBJECT_VERSION, &root)
+            .unwrap();
+        let metrics = db.operation_metrics.clone().unwrap();
+
+        let result = metrics.profile(OperationMetricsKind::Diff, || {
+            db.diff_root_to_disk_manifest(&corrupt_root_id, &BTreeMap::new())
+        });
+
+        assert!(result.is_err());
+        let report = metrics.last_report();
+        assert_eq!(report.outcome, OperationMetricsOutcome::Error);
+        assert_eq!(report.full_root_range_count, 1);
+        assert_eq!(report.root_range_row_count, 2);
     }
 
     fn assert_indexed_case_fold_metrics(db: &Trail, max_lookups: u64) {

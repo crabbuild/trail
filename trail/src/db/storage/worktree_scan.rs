@@ -8,6 +8,14 @@ impl Trail {
             .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
             .output()
             .map_err(|err| Error::Git(err.to_string()))?;
+        self.note_operation_metrics(OperationMetricsDelta {
+            git_subprocess_count: 1,
+            git_global_work_count: 1,
+            git_output_bytes: saturating_u64_from_usize(
+                output.stdout.len().saturating_add(output.stderr.len()),
+            ),
+            ..OperationMetricsDelta::default()
+        });
         if !output.status.success() {
             return Ok(None);
         }
@@ -18,6 +26,10 @@ impl Trail {
             .split(|byte| *byte == 0)
             .filter(|record| !record.is_empty())
             .collect::<Vec<_>>();
+        self.note_operation_metrics(OperationMetricsDelta {
+            git_output_record_count: saturating_u64_from_usize(records.len()),
+            ..OperationMetricsDelta::default()
+        });
         let mut idx = 0;
         while idx < records.len() {
             let record = records[idx];
@@ -51,17 +63,30 @@ impl Trail {
             }
             idx += 1;
         }
+        self.note_operation_metrics(OperationMetricsDelta {
+            input_path_count: saturating_u64_from_usize(records.len()),
+            canonical_path_count: saturating_u64_from_usize(paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         Ok(Some(paths.into_iter().collect()))
     }
 
     pub(crate) fn scan_visible_files_for_paths(&self, paths: &[String]) -> Result<Vec<DiskFile>> {
         let root = self.workspace_root.canonicalize()?;
         let mut files = BTreeMap::new();
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta::default(),
+        );
         for path in paths {
             if self.ignore_check(path)?.ignored {
                 continue;
             }
             let abs = self.workspace_root.join(path_from_rel(path));
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = match fs::symlink_metadata(&abs) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -71,7 +96,8 @@ impl Trail {
                 continue;
             }
             if metadata.is_file() {
-                let (bytes, metadata) = read_selected_regular_file(abs)?;
+                let (bytes, metadata) =
+                    read_selected_regular_file(abs, self.operation_metrics.as_ref())?;
                 files.insert(
                     path.clone(),
                     DiskFile {
@@ -85,10 +111,12 @@ impl Trail {
                     &root,
                     &abs,
                     self.config.recording.ignore_gitignored,
+                    self.operation_metrics.as_ref(),
                     &mut files,
                 )?;
             }
         }
+        filesystem_metrics.delta.expanded_path_count = saturating_u64_from_usize(files.len());
         Ok(files.into_values().collect())
     }
 
@@ -103,6 +131,14 @@ impl Trail {
             .arg("-z")
             .output()
             .map_err(|err| Error::Git(err.to_string()))?;
+        self.note_operation_metrics(OperationMetricsDelta {
+            git_subprocess_count: 1,
+            git_global_work_count: 1,
+            git_output_bytes: saturating_u64_from_usize(
+                output.stdout.len().saturating_add(output.stderr.len()),
+            ),
+            ..OperationMetricsDelta::default()
+        });
         if !output.status.success() {
             if required {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -114,6 +150,15 @@ impl Trail {
             }
             return Ok(None);
         }
+        let output_record_count = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|raw| !raw.is_empty())
+            .count();
+        self.note_operation_metrics(OperationMetricsDelta {
+            git_output_record_count: saturating_u64_from_usize(output_record_count),
+            ..OperationMetricsDelta::default()
+        });
         let mut paths = Vec::new();
         for raw in output.stdout.split(|byte| *byte == 0) {
             if raw.is_empty() {
@@ -127,6 +172,11 @@ impl Trail {
             paths.push(path);
         }
         paths.sort();
+        self.note_operation_metrics(OperationMetricsDelta {
+            input_path_count: saturating_u64_from_usize(output_record_count),
+            canonical_path_count: saturating_u64_from_usize(paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         Ok(Some(paths))
     }
 
@@ -141,12 +191,20 @@ impl Trail {
     ) -> Result<Vec<DiskFile>> {
         let root = root.canonicalize()?;
         let mut files = BTreeMap::new();
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta::default(),
+        );
         for path in paths {
             let path = normalize_relative_path(path)?;
             if is_default_ignored(&path) {
                 continue;
             }
             let abs = safe_join(&root, &path)?;
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = match fs::symlink_metadata(&abs) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -156,7 +214,8 @@ impl Trail {
                 continue;
             }
             if metadata.is_file() {
-                let (bytes, metadata) = read_selected_regular_file(abs)?;
+                let (bytes, metadata) =
+                    read_selected_regular_file(abs, self.operation_metrics.as_ref())?;
                 files.insert(
                     path.clone(),
                     DiskFile {
@@ -170,14 +229,23 @@ impl Trail {
                     &root,
                     &abs,
                     self.config.recording.ignore_gitignored,
+                    self.operation_metrics.as_ref(),
                     &mut files,
                 )?;
             }
         }
+        filesystem_metrics.delta.expanded_path_count = saturating_u64_from_usize(files.len());
         Ok(files.into_values().collect())
     }
 
     pub(crate) fn scan_files_under(&self, root: &Path) -> Result<Vec<DiskFile>> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root = root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -194,6 +262,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -207,7 +279,8 @@ impl Trail {
             if is_default_ignored(&rel) {
                 continue;
             }
-            let (bytes, metadata) = read_selected_regular_file(path.to_path_buf())?;
+            let (bytes, metadata) =
+                read_selected_regular_file(path.to_path_buf(), self.operation_metrics.as_ref())?;
             files.push(DiskFile {
                 path: rel,
                 bytes,
@@ -215,10 +288,18 @@ impl Trail {
             });
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
+        filesystem_metrics.delta.expanded_path_count = saturating_u64_from_usize(files.len());
         Ok(files)
     }
 
     fn scan_file_paths_under(&self, root: &Path) -> Result<WorktreePathScan> {
+        let mut filesystem_metrics = OperationMetricsAccumulator::new(
+            self.operation_metrics.as_ref(),
+            OperationMetricsDelta {
+                full_filesystem_walk_count: 1,
+                ..OperationMetricsDelta::default()
+            },
+        );
         let root = root.canonicalize()?;
         let mut builder = WalkBuilder::new(&root);
         builder
@@ -236,6 +317,10 @@ impl Trail {
             if path == root {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+                .delta
+                .filesystem_entry_count
+                .saturating_add(1);
             let rel = path
                 .strip_prefix(&root)
                 .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -249,6 +334,10 @@ impl Trail {
             if is_default_ignored(&rel) {
                 continue;
             }
+            filesystem_metrics.delta.filesystem_stat_count = filesystem_metrics
+                .delta
+                .filesystem_stat_count
+                .saturating_add(1);
             let metadata = match fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -261,6 +350,7 @@ impl Trail {
             paths.push(rel);
         }
         paths.sort();
+        filesystem_metrics.delta.expanded_path_count = saturating_u64_from_usize(paths.len());
         Ok(WorktreePathScan { paths, total_bytes })
     }
 }
@@ -269,8 +359,16 @@ fn scan_files_under_selection(
     root: &Path,
     selected_root: &Path,
     use_git_ignores: bool,
+    metrics: Option<&Arc<OperationMetricsState>>,
     files: &mut BTreeMap<String, DiskFile>,
 ) -> Result<()> {
+    let mut filesystem_metrics = OperationMetricsAccumulator::new(
+        metrics,
+        OperationMetricsDelta {
+            bounded_filesystem_walk_count: 1,
+            ..OperationMetricsDelta::default()
+        },
+    );
     let mut builder = WalkBuilder::new(selected_root);
     builder
         .hidden(false)
@@ -285,6 +383,10 @@ fn scan_files_under_selection(
         if path == selected_root {
             continue;
         }
+        filesystem_metrics.delta.filesystem_entry_count = filesystem_metrics
+            .delta
+            .filesystem_entry_count
+            .saturating_add(1);
         let rel = path
             .strip_prefix(root)
             .map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -298,7 +400,7 @@ fn scan_files_under_selection(
         if is_default_ignored(&rel) {
             continue;
         }
-        let (bytes, metadata) = read_selected_regular_file(path.to_path_buf())?;
+        let (bytes, metadata) = read_selected_regular_file(path.to_path_buf(), metrics)?;
         files.insert(
             rel.clone(),
             DiskFile {
@@ -473,7 +575,10 @@ fn observed_exact_paths_for_candidates_impl(
     Ok((observed, directory_scans))
 }
 
-fn read_selected_regular_file(path: PathBuf) -> Result<(Vec<u8>, fs::Metadata)> {
+fn read_selected_regular_file(
+    path: PathBuf,
+    metrics: Option<&Arc<OperationMetricsState>>,
+) -> Result<(Vec<u8>, fs::Metadata)> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -483,6 +588,12 @@ fn read_selected_regular_file(path: PathBuf) -> Result<(Vec<u8>, fs::Metadata)> 
     }
     #[cfg(not(unix))]
     {
+        if let Some(metrics) = metrics {
+            metrics.add(OperationMetricsDelta {
+                filesystem_stat_count: 1,
+                ..OperationMetricsDelta::default()
+            });
+        }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(Error::InvalidInput(format!(
@@ -492,6 +603,12 @@ fn read_selected_regular_file(path: PathBuf) -> Result<(Vec<u8>, fs::Metadata)> 
         }
     }
     let mut file = options.open(&path)?;
+    if let Some(metrics) = metrics {
+        metrics.add(OperationMetricsDelta {
+            filesystem_stat_count: 1,
+            ..OperationMetricsDelta::default()
+        });
+    }
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(Error::InvalidInput(format!(
@@ -500,9 +617,28 @@ fn read_selected_regular_file(path: PathBuf) -> Result<(Vec<u8>, fs::Metadata)> 
         )));
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    if let Some(metrics) = metrics {
+        metrics.add(OperationMetricsDelta {
+            filesystem_read_count: 1,
+            ..OperationMetricsDelta::default()
+        });
+    }
+    let read_result = file.read_to_end(&mut bytes);
+    if let Some(metrics) = metrics {
+        metrics.add(OperationMetricsDelta {
+            filesystem_read_bytes: saturating_u64_from_usize(bytes.len()),
+            ..OperationMetricsDelta::default()
+        });
+    }
+    read_result?;
     #[cfg(not(unix))]
     {
+        if let Some(metrics) = metrics {
+            metrics.add(OperationMetricsDelta {
+                filesystem_stat_count: 1,
+                ..OperationMetricsDelta::default()
+            });
+        }
         let final_metadata = fs::symlink_metadata(&path)?;
         if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
             return Err(Error::InvalidInput(format!(
@@ -525,7 +661,7 @@ mod tests {
         fs::write(temp.path().join("target.txt"), "target\n").unwrap();
         std::os::unix::fs::symlink("target.txt", temp.path().join("selected.txt")).unwrap();
 
-        assert!(read_selected_regular_file(temp.path().join("selected.txt")).is_err());
+        assert!(read_selected_regular_file(temp.path().join("selected.txt"), None).is_err());
     }
 
     #[test]

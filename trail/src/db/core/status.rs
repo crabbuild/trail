@@ -2,6 +2,21 @@ use super::*;
 
 impl Trail {
     pub fn status(&self, branch: Option<&str>) -> Result<StatusReport> {
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Status, || {
+            let result = self.status_profiled(branch);
+            if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            result
+        })
+    }
+
+    fn status_profiled(&self, branch: Option<&str>) -> Result<StatusReport> {
         let current_branch = self.current_branch()?;
         let branch = branch.map(str::to_string).unwrap_or(current_branch.clone());
         let head = self.resolve_branch_ref(&branch)?;
@@ -34,6 +49,25 @@ impl Trail {
     }
 
     pub(crate) fn status_read_only(&self, branch: Option<&str>) -> Result<StatusReport> {
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(
+            metrics.as_ref(),
+            OperationMetricsKind::StatusReadOnly,
+            || {
+                let result = self.status_read_only_profiled(branch);
+                if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                    metrics.add(OperationMetricsDelta {
+                        final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                        ..OperationMetricsDelta::default()
+                    });
+                }
+                result
+            },
+        )
+    }
+
+    fn status_read_only_profiled(&self, branch: Option<&str>) -> Result<StatusReport> {
         let current_branch = self.current_branch()?;
         let branch = branch.map(str::to_string).unwrap_or(current_branch.clone());
         let head = self.resolve_branch_ref(&branch)?;

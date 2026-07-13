@@ -276,7 +276,9 @@ impl Trail {
         fs::create_dir_all(db_dir.join("index"))?;
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
         register_sqlite_vec_extension()?;
-        let store = open_prolly_store(&config, &sqlite_path)?;
+        let operation_metrics =
+            operation_metrics_are_enabled().then(|| Arc::new(OperationMetricsState::default()));
+        let store = open_prolly_store(&config, &sqlite_path, operation_metrics.clone())?;
         let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());
@@ -293,6 +295,7 @@ impl Trail {
             daemon_worktree_cache: None,
             git_handoff_metrics: Cell::new(GitHandoffMetrics::default()),
             case_fold_index_metrics: Cell::new(CaseFoldIndexMetrics::default()),
+            operation_metrics,
         };
         db.init_schema()?;
         Ok(db)

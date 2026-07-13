@@ -8,19 +8,22 @@ impl Trail {
         actor: Actor,
         watch: bool,
     ) -> Result<RecordReport> {
-        self.record_with_options(
-            branch,
-            message,
-            actor,
-            RecordOptions {
-                kind: Some(if watch {
-                    OperationKind::WatchRecord
-                } else {
-                    OperationKind::ManualRecord
-                }),
-                ..RecordOptions::default()
-            },
-        )
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
+            self.record_with_options(
+                branch,
+                message,
+                actor,
+                RecordOptions {
+                    kind: Some(if watch {
+                        OperationKind::WatchRecord
+                    } else {
+                        OperationKind::ManualRecord
+                    }),
+                    ..RecordOptions::default()
+                },
+            )
+        })
     }
 
     pub fn record_with_options(
@@ -30,8 +33,11 @@ impl Trail {
         actor: Actor,
         options: RecordOptions,
     ) -> Result<RecordReport> {
-        let _lock = self.acquire_write_lock()?;
-        self.record_with_options_unlocked(branch, message, actor, options)
+        let metrics = self.operation_metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
+            let _lock = self.acquire_write_lock()?;
+            self.record_with_options_unlocked(branch, message, actor, options)
+        })
     }
 
     pub(crate) fn record_with_options_unlocked(
@@ -41,10 +47,40 @@ impl Trail {
         actor: Actor,
         options: RecordOptions,
     ) -> Result<RecordReport> {
+        let metrics = self.operation_metrics.clone();
+        let result_metrics = metrics.clone();
+        profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
+            let result =
+                self.record_with_options_unlocked_profiled(branch, message, actor, options);
+            if let (Some(metrics), Ok(report)) = (&result_metrics, &result) {
+                metrics.add(OperationMetricsDelta {
+                    final_path_count: saturating_u64_from_usize(report.changed_paths.len()),
+                    ..OperationMetricsDelta::default()
+                });
+            }
+            result
+        })
+    }
+
+    fn record_with_options_unlocked_profiled(
+        &mut self,
+        branch: Option<&str>,
+        message: Option<String>,
+        actor: Actor,
+        options: RecordOptions,
+    ) -> Result<RecordReport> {
         let branch = branch.map(str::to_string).unwrap_or(self.current_branch()?);
         let ref_name = branch_ref(&branch);
         let head = self.get_ref(&ref_name)?;
+        self.note_operation_metrics(OperationMetricsDelta {
+            input_path_count: saturating_u64_from_usize(options.paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         let selected_paths = normalize_record_paths(&options.paths)?;
+        self.note_operation_metrics(OperationMetricsDelta {
+            canonical_path_count: saturating_u64_from_usize(selected_paths.len()),
+            ..OperationMetricsDelta::default()
+        });
         let session_id = options
             .session_id
             .map(|session_id| {
