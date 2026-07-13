@@ -16,6 +16,7 @@ impl Trail {
     }
 
     pub fn git_export_commit(&mut self, range: &str, message: &str) -> Result<GitExportReport> {
+        self.reset_git_handoff_metrics();
         let _lock = self.acquire_write_lock()?;
         let git_state = self.current_git_state()?.ok_or_else(|| {
             Error::Git(format!(
@@ -31,7 +32,6 @@ impl Trail {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn git_export_commit_mapped(
         &mut self,
         range: &str,
@@ -126,22 +126,22 @@ impl Trail {
         };
         let mut patch_left = BTreeMap::new();
         let mut patch_right = BTreeMap::new();
-        let _diff = self.diff_root_file_maps(
+        let diff = self.diff_root_file_maps(
             &left_ref.root_id,
             &right_ref.root_id,
             &mut patch_left,
             &mut patch_right,
         )?;
-        let (tree_oid, export_mode) =
-            if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
-                (
-                    self.git_write_tree_from_head_delta(head, &patch_left, &patch_right)?,
-                    "mapped_delta",
-                )
-            } else {
-                let files = self.load_root_files(&right_ref.root_id)?;
-                (self.git_write_tree(&files)?, "full_snapshot")
-            };
+        self.set_git_changed_path_count(diff.summaries.len() as u64);
+        let tree_oid = if let (true, Some(head)) = (can_export_delta, git_state.head.as_deref()) {
+            self.set_git_export_mode(GitExportMode::MappedDelta);
+            self.git_write_tree_from_head_delta(head, &patch_left, &patch_right)?
+        } else {
+            let files = self.load_root_files(&right_ref.root_id)?;
+            self.set_git_export_mode(GitExportMode::FullSnapshot);
+            self.add_git_full_root_file_count(files.len() as u64);
+            self.git_write_tree(&files)?
+        };
         let commit = self.git_commit_tree(&tree_oid, git_state.head.as_deref(), message)?;
         let mapping = self.insert_git_mapping_for_state(
             "export",
@@ -159,10 +159,7 @@ impl Trail {
             commit,
             parent: git_state.head,
             mapping,
-            performance: GitHandoffMetricsReport {
-                export_mode: export_mode.to_string(),
-                ..GitHandoffMetricsReport::default()
-            },
+            performance: self.git_handoff_metrics_report(),
         })
     }
 

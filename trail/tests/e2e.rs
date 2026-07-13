@@ -1138,6 +1138,72 @@ fn apply_lane_patch_at_head(
     db.apply_lane_patch(lane, patch)
 }
 
+fn ready_agent_lane_with_mode(mode: InitImportMode) -> (tempfile::TempDir, Trail) {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "README.md"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", mode, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "one changed path",
+        "edits": [{"op": "write", "path": "AGENT.md", "content": "agent change\n"}]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+    (temp, db)
+}
+
+#[test]
+fn agent_apply_reports_one_tracked_status_query() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let dry_run = db.agent_apply("apply-bot", true, None).unwrap();
+    assert_eq!(dry_run.performance.tracked_status_count, 1);
+    assert_eq!(dry_run.performance.full_root_file_count, 0);
+    assert_eq!(dry_run.performance.export_mode, "mapped_delta");
+}
+
+#[test]
+fn agent_apply_actual_reports_mapped_delta_metrics() {
+    if !git_available() {
+        return;
+    }
+
+    let (_temp, mut db) = ready_agent_lane_with_mode(InitImportMode::GitTracked);
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+    assert_eq!(applied.performance.tracked_status_count, 1);
+    assert_eq!(applied.performance.full_root_file_count, 0);
+    assert_eq!(applied.performance.export_mode, "mapped_delta");
+    assert_eq!(applied.performance.changed_path_count, 1);
+    assert_eq!(applied.performance.blob_write_count, 1);
+}
+
+#[test]
+fn agent_apply_requires_mapping_before_git_or_trail_mutation() {
+    if !git_available() {
+        return;
+    }
+
+    let (temp, mut db) = ready_agent_lane_with_mode(InitImportMode::WorkingTree);
+    let git_head = git_output(temp.path(), &["rev-parse", "HEAD"]);
+    assert!(db.git_mappings(10).unwrap().is_empty());
+
+    let err = db.agent_apply("apply-bot", true, None).unwrap_err();
+    assert!(matches!(err, Error::GitMappingRequired(_)));
+    assert!(db.git_mappings(10).unwrap().is_empty());
+    assert_eq!(git_output(temp.path(), &["rev-parse", "HEAD"]), git_head);
+}
+
 fn only_conflict_path_class(db: &Trail) -> (String, String) {
     let conflicts = db.list_conflicts().unwrap();
     assert_eq!(conflicts.len(), 1);

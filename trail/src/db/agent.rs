@@ -2825,6 +2825,7 @@ impl Trail {
         dry_run: bool,
         message: Option<String>,
     ) -> Result<AgentApplyReport> {
+        self.reset_git_handoff_metrics();
         let lane = self
             .resolve_agent_selector(selector)?
             .ok_or_else(|| Error::InvalidInput("no agent tasks have been recorded".to_string()))?;
@@ -2851,6 +2852,7 @@ impl Trail {
                 merge: None,
                 git_export: None,
                 fast_forwarded: false,
+                performance: self.git_handoff_metrics_report(),
                 warnings: vec![
                     "agent task has already been applied; use `trail agent continue` for follow-up work to avoid reusing old lane history"
                         .to_string(),
@@ -2858,24 +2860,15 @@ impl Trail {
                 suggestions: agent_already_applied_suggestions(&view.task),
             });
         }
-        let git_branch = self.current_git_branch()?;
-        let git_state = self.current_git_state()?.ok_or_else(|| {
+        let git_identity = self.current_git_identity()?.ok_or_else(|| {
             Error::Git(format!(
-                "agent apply requires a Git working tree at {}; Trail branch `{crab_branch}` is the internal apply base",
+                "agent apply requires a Git working tree with a HEAD commit at {}; Trail branch `{crab_branch}` is the internal apply base",
                 self.workspace_root.display()
             ))
         })?;
-        if git_state.dirty {
-            return Err(Error::Git(
-                "current Git worktree has tracked changes; commit, stash, or revert them before `trail agent apply`".to_string(),
-            ));
-        }
-        self.ensure_git_head_matches_root(
-            &target_ref.change_id,
-            &target_ref.root_id,
-            git_state.head.as_deref(),
-            &crab_branch,
-        )?;
+        let git_branch = git_identity.branch.clone();
+        self.ensure_git_head_matches_root(&target_ref.root_id, &git_identity.head)?;
+        self.set_git_export_mode(GitExportMode::MappedDelta);
 
         let _fuse_mount = self.maybe_mount_fuse_cow_workdir_for_lane(&lane)?;
         let _nfs_mount = self.maybe_mount_nfs_cow_workdir_for_lane(&lane)?;
@@ -2883,6 +2876,8 @@ impl Trail {
         let _dokan_mount = self.maybe_mount_dokan_cow_workdir_for_lane(&lane)?;
         let would_record = self.lane_workdir_dirty(&lane)?;
         if dry_run && would_record {
+            let git_state = self.tracked_git_state(&git_identity)?;
+            validate_git_publication_state(&git_identity.head, &git_state)?;
             let view = self.agent_task_view(&lane)?;
             let plan = AgentGitApplyPlan {
                 crab_branch,
@@ -2903,6 +2898,7 @@ impl Trail {
                 merge: None,
                 git_export: None,
                 fast_forwarded: false,
+                performance: self.git_handoff_metrics_report(),
                 warnings: vec![
                     "lane workdir has unrecorded changes; actual apply will record them first"
                         .to_string(),
@@ -2921,25 +2917,33 @@ impl Trail {
         };
         self.ensure_agent_checkpoint_reviewed(&lane)?;
 
-        let merge = self.merge_lane_user_with_options(&lane, &crab_branch, dry_run, true)?;
-        let range = if merge.changed_paths.is_empty() {
+        let merge_preview = self.merge_lane_user_with_options(&lane, &crab_branch, true, true)?;
+        self.set_git_changed_path_count(merge_preview.changed_paths.len() as u64);
+        let preview_range = if merge_preview.changed_paths.is_empty() {
             None
         } else {
-            Some(format!("{}..{}", target_ref.change_id.0, merge.operation.0))
+            Some(format!(
+                "{}..{}",
+                target_ref.change_id.0, merge_preview.operation.0
+            ))
         };
-        let plan = AgentGitApplyPlan {
+        let preview_plan = AgentGitApplyPlan {
             crab_branch: crab_branch.clone(),
             git_branch: git_branch.clone(),
             base_change: target_ref.change_id.clone(),
-            result_change: range.as_ref().map(|_| merge.operation.clone()),
-            range: range.clone(),
+            result_change: preview_range
+                .as_ref()
+                .map(|_| merge_preview.operation.clone()),
+            range: preview_range.clone(),
             would_record,
-            would_create_git_commit: range.is_some(),
-            would_fast_forward: range.is_some(),
+            would_create_git_commit: preview_range.is_some(),
+            would_fast_forward: preview_range.is_some(),
         };
         if dry_run {
+            let git_state = self.tracked_git_state(&git_identity)?;
+            validate_git_publication_state(&git_identity.head, &git_state)?;
             let view = self.agent_task_view(&lane)?;
-            let (status, suggestions) = if merge.conflicts.is_empty() {
+            let (status, suggestions) = if merge_preview.conflicts.is_empty() {
                 let mut suggestions = vec![StatusSuggestion {
                         command: format!("trail agent land {lane}"),
                         reason: format!(
@@ -2966,26 +2970,49 @@ impl Trail {
                 task: view.task,
                 status,
                 dry_run,
-                git_apply_plan: plan,
+                git_apply_plan: preview_plan,
                 recorded,
-                merge: Some(merge),
+                merge: Some(merge_preview),
                 git_export: None,
                 fast_forwarded: false,
+                performance: self.git_handoff_metrics_report(),
                 warnings: Vec::new(),
                 suggestions,
             });
         }
 
+        let git_state = self.tracked_git_state(&git_identity)?;
+        validate_git_publication_state(&git_identity.head, &git_state)?;
+        self.ensure_git_identity_unchanged(&git_identity)?;
+
+        let merge = self.merge_lane_user_with_options(&lane, &crab_branch, false, true)?;
+        self.set_git_changed_path_count(merge.changed_paths.len() as u64);
+        let range = if merge.changed_paths.is_empty() {
+            None
+        } else {
+            Some(format!("{}..{}", target_ref.change_id.0, merge.operation.0))
+        };
+        let plan = AgentGitApplyPlan {
+            crab_branch: crab_branch.clone(),
+            git_branch,
+            base_change: target_ref.change_id.clone(),
+            result_change: range.as_ref().map(|_| merge.operation.clone()),
+            range: range.clone(),
+            would_record,
+            would_create_git_commit: range.is_some(),
+            would_fast_forward: range.is_some(),
+        };
         let git_export = if let Some(range) = &range {
             let view = self.agent_task_view(&lane)?;
             let message = message
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| default_agent_apply_message_for_task(&view.task));
-            Some(self.git_export_commit(range, &message)?)
+            Some(self.git_export_commit_mapped(range, &message, Some(git_state))?)
         } else {
             None
         };
         if let Some(export) = &git_export {
+            self.ensure_git_identity_unchanged(&git_identity)?;
             self.git_fast_forward(&export.commit)?;
         }
         let view = self.agent_task_view(&lane)?;
@@ -3002,6 +3029,7 @@ impl Trail {
             merge: Some(merge),
             git_export,
             fast_forwarded: range.is_some(),
+            performance: self.git_handoff_metrics_report(),
             warnings: Vec::new(),
             suggestions: vec![StatusSuggestion {
                 command: format!("trail agent view {lane}"),
@@ -4087,46 +4115,35 @@ impl Trail {
         Ok(normalized)
     }
 
-    fn current_git_branch(&self) -> Result<Option<String>> {
-        if self.current_git_state()?.is_none() {
-            return Ok(None);
+    fn ensure_git_head_matches_root(&self, root_id: &ObjectId, git_head: &str) -> Result<()> {
+        if self.git_clean_head_matches_root_mapping(git_head, root_id)? {
+            return Ok(());
         }
-        let branch = self.git_output(&["branch".to_string(), "--show-current".to_string()])?;
-        Ok((!branch.trim().is_empty()).then_some(branch))
+        Err(Error::GitMappingRequired(format!(
+            "clean Git HEAD `{git_head}` has no mapping for Trail root `{}`",
+            root_id.0
+        )))
     }
 
-    fn ensure_git_head_matches_root(
-        &self,
-        change_id: &ChangeId,
-        root_id: &ObjectId,
-        git_head: Option<&str>,
-        crab_branch: &str,
-    ) -> Result<()> {
-        let Some(git_head) = git_head else {
-            return Err(Error::Git(
-                "agent apply requires a Git HEAD commit before it can fast-forward".to_string(),
-            ));
-        };
-        if self.ensure_git_clean_head_root_mapping(crab_branch, change_id, root_id, git_head)? {
+    fn ensure_git_identity_unchanged(&self, expected: &GitIdentity) -> Result<()> {
+        let current = self.current_git_identity()?;
+        if current.as_ref().is_some_and(|identity| {
+            identity.head == expected.head && identity.branch == expected.branch
+        }) {
             return Ok(());
         }
-        let files = self.load_root_files(root_id)?;
-        let crab_tree = self.git_write_tree(&files)?;
-        let git_tree =
-            self.git_output(&["rev-parse".to_string(), format!("{git_head}^{{tree}}")])?;
-        if crab_tree == git_tree {
-            self.insert_git_mapping_for_state(
-                "verify",
-                crab_branch,
-                change_id,
-                root_id,
-                Some(git_head.to_string()),
-                false,
-            )?;
-            return Ok(());
-        }
-        Err(Error::Git(format!(
-            "current Git HEAD does not match Trail branch `{crab_branch}`; run `trail git import-update --branch {crab_branch}` or apply from a Git branch that matches Trail `{crab_branch}`"
+        Err(Error::GitHeadChanged(format!(
+            "expected Git HEAD `{}` on branch `{}`, found `{}` on branch `{}`",
+            expected.head,
+            expected.branch.as_deref().unwrap_or("<detached>"),
+            current
+                .as_ref()
+                .map(|identity| identity.head.as_str())
+                .unwrap_or("<unborn>"),
+            current
+                .as_ref()
+                .and_then(|identity| identity.branch.as_deref())
+                .unwrap_or("<detached>")
         )))
     }
 

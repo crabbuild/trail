@@ -1,34 +1,87 @@
 use super::*;
 
 impl Trail {
-    pub(crate) fn current_git_state(&self) -> Result<Option<GitState>> {
-        let inside = Command::new("git")
-            .arg("-C")
-            .arg(&self.workspace_root)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .output()
-            .map_err(|err| Error::Git(err.to_string()))?;
-        if !inside.status.success() {
-            return Ok(None);
-        }
+    pub(crate) fn reset_git_handoff_metrics(&self) {
+        self.git_handoff_metrics.set(GitHandoffMetrics::default());
+    }
 
+    pub(crate) fn git_handoff_metrics_report(&self) -> GitHandoffMetricsReport {
+        self.git_handoff_metrics.get().into()
+    }
+
+    pub(crate) fn set_git_export_mode(&self, export_mode: GitExportMode) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.export_mode = export_mode;
+        self.git_handoff_metrics.set(metrics);
+    }
+
+    pub(crate) fn set_git_changed_path_count(&self, changed_path_count: u64) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.changed_path_count = changed_path_count;
+        self.git_handoff_metrics.set(metrics);
+    }
+
+    pub(crate) fn add_git_full_root_file_count(&self, full_root_file_count: u64) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.full_root_file_count = metrics
+            .full_root_file_count
+            .saturating_add(full_root_file_count);
+        self.git_handoff_metrics.set(metrics);
+    }
+
+    fn record_git_blob_write(&self) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.blob_write_count = metrics.blob_write_count.saturating_add(1);
+        self.git_handoff_metrics.set(metrics);
+    }
+
+    fn record_tracked_git_status(&self) {
+        let mut metrics = self.git_handoff_metrics.get();
+        metrics.tracked_status_count = metrics.tracked_status_count.saturating_add(1);
+        self.git_handoff_metrics.set(metrics);
+    }
+
+    pub(crate) fn current_git_identity(&self) -> Result<Option<GitIdentity>> {
         let head_output = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
             .args(["rev-parse", "--verify", "HEAD"])
             .output()
             .map_err(|err| Error::Git(err.to_string()))?;
-        let head = if head_output.status.success() {
-            Some(
-                String::from_utf8_lossy(&head_output.stdout)
-                    .trim()
-                    .to_string(),
-            )
-            .filter(|head| !head.is_empty())
-        } else {
-            None
-        };
+        if !head_output.status.success() {
+            return Ok(None);
+        }
+        let head = String::from_utf8_lossy(&head_output.stdout)
+            .trim()
+            .to_string();
+        if head.is_empty() {
+            return Ok(None);
+        }
 
+        let branch_output = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace_root)
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .output()
+            .map_err(|err| Error::Git(err.to_string()))?;
+        let branch = branch_output
+            .status
+            .success()
+            .then(|| {
+                String::from_utf8_lossy(&branch_output.stdout)
+                    .trim()
+                    .to_string()
+            })
+            .filter(|branch| !branch.is_empty());
+        Ok(Some(GitIdentity { head, branch }))
+    }
+
+    pub(crate) fn tracked_git_state(&self, identity: &GitIdentity) -> Result<GitState> {
+        self.tracked_git_state_for_head(Some(identity.head.clone()))
+    }
+
+    fn tracked_git_state_for_head(&self, head: Option<String>) -> Result<GitState> {
+        self.record_tracked_git_status();
         let status = Command::new("git")
             .arg("-C")
             .arg(&self.workspace_root)
@@ -43,11 +96,26 @@ impl Trail {
                 stderr.trim()
             )));
         }
-
-        Ok(Some(GitState {
+        Ok(GitState {
             head,
             dirty: !status.stdout.is_empty(),
-        }))
+        })
+    }
+
+    pub(crate) fn current_git_state(&self) -> Result<Option<GitState>> {
+        if let Some(identity) = self.current_git_identity()? {
+            return self.tracked_git_state(&identity).map(Some);
+        }
+        let inside = Command::new("git")
+            .arg("-C")
+            .arg(&self.workspace_root)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .map_err(|err| Error::Git(err.to_string()))?;
+        if !inside.status.success() {
+            return Ok(None);
+        }
+        self.tracked_git_state_for_head(None).map(Some)
     }
 
     pub(crate) fn git_write_tree(&self, files: &BTreeMap<String, FileEntry>) -> Result<String> {
@@ -55,6 +123,7 @@ impl Trail {
         for (path, entry) in files {
             let bytes = self.materialize_entry_bytes(entry)?;
             let oid = self.git_output_with_input(&["hash-object", "-w", "--stdin"], &bytes)?;
+            self.record_git_blob_write();
             let blob = GitBlobEntry {
                 mode: if entry.executable { "100755" } else { "100644" },
                 oid,
@@ -141,6 +210,7 @@ impl Trail {
                     let bytes = self.materialize_entry_bytes(entry)?;
                     let oid =
                         self.git_output_with_input(&["hash-object", "-w", "--stdin"], &bytes)?;
+                    self.record_git_blob_write();
                     let mode = if entry.executable { "100755" } else { "100644" };
                     self.git_output_with_index(
                         &[
@@ -312,5 +382,38 @@ impl Trail {
             )));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_publication_state_rejects_changed_head() {
+        assert!(matches!(
+            validate_git_publication_state(
+                "old",
+                &GitState {
+                    head: Some("new".into()),
+                    dirty: false,
+                }
+            ),
+            Err(Error::GitHeadChanged(_))
+        ));
+    }
+
+    #[test]
+    fn git_publication_state_rejects_dirty_worktree() {
+        assert!(matches!(
+            validate_git_publication_state(
+                "head",
+                &GitState {
+                    head: Some("head".into()),
+                    dirty: true,
+                }
+            ),
+            Err(Error::GitWorktreeDirty(_))
+        ));
     }
 }

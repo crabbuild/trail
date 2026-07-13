@@ -91,6 +91,7 @@ pub struct Trail {
     config: TrailConfig,
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
+    git_handoff_metrics: Cell<GitHandoffMetrics>,
 }
 
 #[derive(Clone)]
@@ -408,7 +409,6 @@ pub enum InitImportMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum GitExportPolicy {
     RequireMappedDelta,
     AllowFullSnapshot,
@@ -806,6 +806,67 @@ pub(crate) struct PendingConflictMerge {
 pub(crate) struct GitState {
     head: Option<String>,
     dirty: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GitIdentity {
+    head: String,
+    branch: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GitHandoffMetrics {
+    export_mode: GitExportMode,
+    changed_path_count: u64,
+    blob_write_count: u64,
+    tracked_status_count: u64,
+    full_root_file_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum GitExportMode {
+    #[default]
+    Unknown,
+    MappedDelta,
+    FullSnapshot,
+}
+
+impl GitExportMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::MappedDelta => "mapped_delta",
+            Self::FullSnapshot => "full_snapshot",
+        }
+    }
+}
+
+impl From<GitHandoffMetrics> for GitHandoffMetricsReport {
+    fn from(metrics: GitHandoffMetrics) -> Self {
+        Self {
+            export_mode: metrics.export_mode.as_str().to_string(),
+            changed_path_count: metrics.changed_path_count,
+            blob_write_count: metrics.blob_write_count,
+            tracked_status_count: metrics.tracked_status_count,
+            full_root_file_count: metrics.full_root_file_count,
+        }
+    }
+}
+
+pub(crate) fn validate_git_publication_state(expected_head: &str, state: &GitState) -> Result<()> {
+    if state.head.as_deref() != Some(expected_head) {
+        return Err(Error::GitHeadChanged(format!(
+            "expected Git HEAD `{expected_head}`, found `{}`",
+            state.head.as_deref().unwrap_or("<unborn>")
+        )));
+    }
+    if state.dirty {
+        return Err(Error::GitWorktreeDirty(
+            "current Git worktree has tracked changes; commit, stash, or revert them before `trail agent apply`"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]

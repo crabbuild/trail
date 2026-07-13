@@ -268,6 +268,7 @@ impl Trail {
             config,
             object_cache: Mutex::new(ObjectCache::default()),
             daemon_worktree_cache: None,
+            git_handoff_metrics: Cell::new(GitHandoffMetrics::default()),
         };
         db.init_schema()?;
         db.recover_materialization_stages()?;

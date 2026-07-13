@@ -1180,6 +1180,8 @@ pub struct AgentApplyReport {
     pub merge: Option<MergeReport>,
     pub git_export: Option<GitExportReport>,
     pub fast_forwarded: bool,
+    #[serde(default)]
+    pub performance: GitHandoffMetricsReport,
     pub warnings: Vec<String>,
     pub suggestions: Vec<StatusSuggestion>,
 }
