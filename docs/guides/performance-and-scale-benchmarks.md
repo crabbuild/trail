@@ -14,6 +14,10 @@ The smoke target defaults to 1,000 synthetic files and is intended for pull-requ
 python3 scripts/check-cli-scale-thresholds.py <results.tsv> name=max_seconds ... --metrics <metrics.tsv> key=max_value ...
 ```
 
+Structural string invariants use `--metric-equals key=value`. The Git handoff
+gate combines wall-time ceilings, numeric ceilings, and exact export-mode
+checks in one invocation.
+
 ## Local and Large Runs
 
 ```sh
@@ -71,6 +75,9 @@ Important hot-path rows:
 - `git_dirty_diff`
 - `git_dirty_record`
 - `git_status_after_dirty_record`
+- `agent_git_apply_dry_run`
+- `agent_git_apply`
+- `agent_git_apply_missing_mapping`
 - `daemon_wait_for_health`
 - `daemon_wait_for_hot_cache`
 - `daemon_persisted_snapshot_status`
@@ -91,6 +98,16 @@ Important hot-path rows:
 - `daemon_cli_code_from`
 
 `git_dirty_*` rows measure the non-daemon Git dirty-path fallback for large repositories with a committed Git baseline. This fallback is useful for correctness and smaller repositories, but 1M measurements show it is not a production hot path by itself. `daemon_wait_for_health` and `daemon_wait_for_hot_cache` measure daemon startup and cache warmup, not steady-state command latency. `daemon_persisted_snapshot_*` rows hide daemon endpoint discovery while keeping the live daemon process and persisted watcher snapshot, so they verify separate Trail handles can avoid the full direct fallback without using HTTP RPC. Use `daemon_cli_*` rows for repeated agent-command hot paths.
+
+The `agent_git_apply_*` rows exercise the high-level committed Git handoff,
+not only Trail's internal lane merge. The mapped fixture creates a
+no-materialize task that changes
+`k = max(1, min(100, files / 1000))` paths, records the review gate, and runs
+both dry-run and actual apply. Its structural metrics require
+`export_mode=mapped_delta`, exactly `k` changed paths, and at most `k` blob
+writes. The missing-mapping fixture is initialized from the working tree and
+must return `GIT_MAPPING_REQUIRED` without changing Git HEAD, the Git index, or
+Trail's mapping table.
 
 ## Current Evidence
 
@@ -151,6 +168,11 @@ Large agent orchestration should use the daemon and no-materialize/sparse workdi
 - If filesystem access is needed, materialize selected paths with `--paths` and hydrate more paths lazily through `lane read`.
 - Keep the daemon running for repeated CLI calls so status, record, trace, gate, handoff, and merge queue commands use a hot SQLite connection and watcher-backed dirty path cache.
 - Separate Trail handles can reuse the daemon's watcher-backed dirty snapshot only while the persisted snapshot is initialized, belongs to the same workspace, and the daemon PID is still alive. If the snapshot is missing, stale, overflowed, or too large, commands fall back to Git dirty paths when a committed Git baseline is available, then to the full persisted-index scan.
+- Before high-level `trail agent apply`, reconcile the current Git HEAD with
+  Trail using `trail git import-update` when `GIT_MAPPING_REQUIRED` is
+  reported. A mapped apply builds from the trusted HEAD tree and touches only
+  changed paths. Missing trust is intentionally a fast error; Trail does not
+  silently scan and hash the full repository to manufacture a mapping.
 
 ## Known Limits
 

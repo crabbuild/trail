@@ -58,6 +58,67 @@ run_timed() {
   fi
 }
 
+run_timed_expected_error() {
+  local scale="$1"
+  local name="$2"
+  local expected_exit="$3"
+  local expected_code="$4"
+  shift 4
+  run_timed "$scale" "$name" bash -s -- "$expected_exit" "$expected_code" "$@" <<'SH'
+set -euo pipefail
+expected_exit="$1"
+expected_code="$2"
+shift 2
+stdout="$(mktemp)"
+stderr="$(mktemp)"
+cleanup() {
+  rm -f "$stdout" "$stderr"
+}
+trap cleanup EXIT
+set +e
+"$@" >"$stdout" 2>"$stderr"
+code=$?
+set -e
+cat "$stdout"
+cat "$stderr" >&2
+if [ "$code" -ne "$expected_exit" ]; then
+  printf 'expected exit %s, got %s\n' "$expected_exit" "$code" >&2
+  exit 1
+fi
+python3 - "$expected_code" "$stdout" "$stderr" <<'PY'
+import json, pathlib, sys
+
+expected = sys.argv[1]
+
+def codes(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "code" and isinstance(child, str):
+                yield child
+            yield from codes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from codes(child)
+
+found = set()
+for filename in sys.argv[2:]:
+    text = pathlib.Path(filename).read_text(errors="replace")
+    candidates = [text, *text.splitlines()]
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            found.update(codes(json.loads(candidate)))
+        except json.JSONDecodeError:
+            pass
+if expected not in found:
+    print(f"expected JSON error code {expected!r}, found {sorted(found)!r}", file=sys.stderr)
+    sys.exit(1)
+PY
+SH
+}
+
 repo_source_bytes() {
   python3 - "$1" <<'PY'
 import pathlib, sys
@@ -270,6 +331,7 @@ for scale in ${SCALES//,/ }; do
   WORK="$RUN_ROOT/$scale"
   REPO="$WORK/repo"
   GIT_REPO="$WORK/git-repo"
+  GIT_UNMAPPED_REPO="$WORK/git-unmapped-repo"
   RESULTS="$WORK/results.tsv"
   rm -rf "$WORK"
   mkdir -p "$REPO" "$WORK/out"
@@ -367,7 +429,98 @@ PY
       git -C "$GIT_REPO" config user.email "trail@example.com"
       git -C "$GIT_REPO" config user.name "Trail"
       run_timed "$scale" git_commit_initial git -C "$GIT_REPO" commit -m "scale initial"
+      run_timed "$scale" git_clone_unmapped git clone --quiet "$GIT_REPO" "$GIT_UNMAPPED_REPO"
+      git -C "$GIT_UNMAPPED_REPO" config user.email "trail@example.com"
+      git -C "$GIT_UNMAPPED_REPO" config user.name "Trail"
       run_timed "$scale" git_init_from_git "$BIN" --workspace "$GIT_REPO" --json init --from-git
+      run_timed "$scale" agent_git_spawn "$BIN" --workspace "$GIT_REPO" --json lane spawn agent-gitapplybot --from main --no-materialize
+      python3 - "$GIT_REPO" "$WORK/agent-git-apply.json" "$scale" "$WORK/out/agent_git_spawn.stdout" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+files = int(sys.argv[3])
+base_change = json.loads(pathlib.Path(sys.argv[4]).read_text())["base_change"]
+changed_paths = max(1, min(100, files // 1000))
+edits = []
+for i in range(changed_paths):
+    idx = (i * 7919 + 43) % files
+    d, f = divmod(idx, 100)
+    rel = pathlib.Path(f"pkg_{d:05d}") / f"module_{f:03d}.rs"
+    edits.append({
+        "op": "write",
+        "path": str(rel),
+        "content": (root / rel).read_text() + f"\n// agent Git apply {i}\n",
+    })
+json.dump({"base_change": base_change, "message": "scale Git apply", "edits": edits}, out.open("w"))
+PY
+      run_timed "$scale" agent_git_apply_patch "$BIN" --workspace "$GIT_REPO" --json lane apply-patch agent-gitapplybot --patch "$WORK/agent-git-apply.json"
+      run_timed "$scale" agent_git_mark_reviewed "$BIN" --workspace "$GIT_REPO" --json agent mark-reviewed latest --note "scale Git apply reviewed"
+      run_timed "$scale" agent_git_ready "$BIN" --workspace "$GIT_REPO" --json agent ready latest
+      run_timed "$scale" agent_git_apply_dry_run "$BIN" --workspace "$GIT_REPO" --json agent apply latest --dry-run
+      run_timed "$scale" agent_git_apply "$BIN" --workspace "$GIT_REPO" --json agent apply latest
+      python3 - "$WORK/out/agent_git_apply.stdout" "$WORK/agent-git-metrics.tsv" <<'PY'
+import json, pathlib, sys
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+export = payload.get("git_export")
+if not isinstance(export, dict) or not isinstance(export.get("performance"), dict):
+    raise SystemExit("agent Git apply JSON did not contain git_export.performance")
+performance = export["performance"]
+required = ["export_mode", "changed_path_count", "blob_write_count"]
+missing = [key for key in required if key not in performance]
+if missing:
+    raise SystemExit(f"agent Git apply JSON omitted performance metrics: {missing}")
+pathlib.Path(sys.argv[2]).write_text(
+    f"agent_git_export_mode\t{performance['export_mode']}\n"
+    f"agent_git_changed_paths\t{int(performance['changed_path_count'])}\n"
+    f"agent_git_blob_writes\t{int(performance['blob_write_count'])}\n"
+)
+PY
+      GIT_UNMAPPED_HEAD_BEFORE="$(git -C "$GIT_UNMAPPED_REPO" rev-parse HEAD)"
+      GIT_UNMAPPED_INDEX_BEFORE="$(git hash-object "$GIT_UNMAPPED_REPO/.git/index")"
+      run_timed "$scale" git_unmapped_init_working_tree "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json init --working-tree
+      run_timed "$scale" git_unmapped_mappings "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json git mappings
+      python3 - "$WORK/out/git_unmapped_mappings.stdout" <<'PY'
+import json, pathlib, sys
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if payload != []:
+    raise SystemExit(f"working-tree init unexpectedly created Git mappings: {payload!r}")
+PY
+      run_timed "$scale" agent_git_unmapped_spawn "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json lane spawn agent-gitunmappedbot --from main --no-materialize
+      python3 - "$GIT_UNMAPPED_REPO" "$WORK/agent-git-unmapped.json" "$WORK/out/agent_git_unmapped_spawn.stdout" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+base_change = json.loads(pathlib.Path(sys.argv[3]).read_text())["base_change"]
+rel = pathlib.Path("pkg_00000/module_000.rs")
+json.dump({
+    "base_change": base_change,
+    "message": "scale missing Git mapping",
+    "edits": [{
+        "op": "write",
+        "path": str(rel),
+        "content": (root / rel).read_text() + "\n// missing Git mapping\n",
+    }],
+}, out.open("w"))
+PY
+      run_timed "$scale" agent_git_unmapped_apply_patch "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json lane apply-patch agent-gitunmappedbot --patch "$WORK/agent-git-unmapped.json"
+      run_timed "$scale" agent_git_unmapped_mark_reviewed "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json agent mark-reviewed latest --note "scale missing mapping reviewed"
+      run_timed "$scale" agent_git_unmapped_ready "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json agent ready latest
+      run_timed_expected_error "$scale" agent_git_apply_missing_mapping 10 GIT_MAPPING_REQUIRED "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json agent apply latest --dry-run
+      if [ "$(git -C "$GIT_UNMAPPED_REPO" rev-parse HEAD)" != "$GIT_UNMAPPED_HEAD_BEFORE" ]; then
+        printf 'missing-mapping apply changed Git HEAD\n' >&2
+        exit 1
+      fi
+      if [ "$(git hash-object "$GIT_UNMAPPED_REPO/.git/index")" != "$GIT_UNMAPPED_INDEX_BEFORE" ]; then
+        printf 'missing-mapping apply changed Git index\n' >&2
+        exit 1
+      fi
+      run_timed "$scale" git_unmapped_mappings_after_apply "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json git mappings
+      python3 - "$WORK/out/git_unmapped_mappings_after_apply.stdout" <<'PY'
+import json, pathlib, sys
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if payload != []:
+    raise SystemExit(f"missing-mapping apply unexpectedly wrote mappings: {payload!r}")
+PY
       run_timed "$scale" git_mutate_tracked python3 - "$GIT_REPO" "$scale" <<'PY'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1])
@@ -729,6 +882,9 @@ PY
       object_kind_stats "$GIT_REPO" "git"
       dbstat_bytes "$GIT_REPO" "git"
       workdir_manifest_bytes "$GIT_REPO" "git"
+    fi
+    if [ -f "$WORK/agent-git-metrics.tsv" ]; then
+      cat "$WORK/agent-git-metrics.tsv"
     fi
     printf 'daemon_rss_bytes\t%s\n' "$DAEMON_RSS"
     du -sk "$REPO" "$REPO/.trail" 2>/dev/null | awk '{print "du_kb_" $2 "\t" $1}'

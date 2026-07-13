@@ -91,6 +91,47 @@ jobs:
           fi
           for results in "${result_files[@]}"; do
             metrics="$(dirname "$results")/metrics.tsv"
+            scale="$(basename "$(dirname "$results")")"
+            git_apply_thresholds=()
+            git_structural_thresholds=()
+            git_metric_equalities=()
+            if [ "${{ github.event.inputs.run_git_import || '1' }}" = "1" ]; then
+              changed_paths=$((scale / 1000))
+              if [ "$changed_paths" -lt 1 ]; then changed_paths=1; fi
+              if [ "$changed_paths" -gt 100 ]; then changed_paths=100; fi
+              case "$scale" in
+                100000)
+                  git_apply_thresholds=(
+                    agent_git_apply_dry_run=2
+                    agent_git_apply=3
+                    agent_git_apply_missing_mapping=1
+                  )
+                  ;;
+                1000000)
+                  git_apply_thresholds=(
+                    agent_git_apply_dry_run=5
+                    agent_git_apply=8
+                    agent_git_apply_missing_mapping=1
+                  )
+                  ;;
+                *)
+                  git_apply_thresholds=(
+                    agent_git_apply_dry_run=15
+                    agent_git_apply=20
+                    agent_git_apply_missing_mapping=5
+                  )
+                  ;;
+              esac
+              git_structural_thresholds=(
+                "agent_git_changed_paths=$changed_paths"
+                "agent_git_blob_writes=$changed_paths"
+              )
+              git_metric_equalities=(
+                --metric-equals
+                agent_git_export_mode=mapped_delta
+                "agent_git_changed_paths=$changed_paths"
+              )
+            fi
             python3 scripts/check-cli-scale-thresholds.py "$results" \
               daemon_wait_for_health=60 \
               daemon_wait_for_hot_cache=120 \
@@ -116,13 +157,16 @@ jobs:
               merge_agent_apply=10 \
               merge_queue_run=10 \
               "${git_thresholds[@]}" \
+              "${git_apply_thresholds[@]}" \
               "${materialized_thresholds[@]}" \
               "${backup_thresholds[@]}" \
               --metrics "$metrics" \
               sqlite_bytes=4000000000 \
               dbstat_repo_prolly_nodes=2500000000 \
               object_kind_repo_TextContent_bytes=1200000000 \
-              object_count=2000000
+              object_count=2000000 \
+              "${git_structural_thresholds[@]}" \
+              "${git_metric_equalities[@]}"
           done
       - name: Upload scale results
         uses: actions/upload-artifact@v4
