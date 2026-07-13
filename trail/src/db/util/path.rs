@@ -340,6 +340,10 @@ impl SelectionSet {
         &self.paths
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
     #[cfg(test)]
     pub(crate) fn contains(&self, normalized_path: &str) -> bool {
         self.contains_counted(normalized_path).0

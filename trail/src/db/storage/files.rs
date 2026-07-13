@@ -718,13 +718,39 @@ impl Trail {
         allow_ignored: bool,
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
-        let selected_disk_files =
-            self.selected_record_disk_files(disk_files, selected_paths, allow_ignored)?;
-        self.build_root_for_selected_disk_files_incremental(
+        let selections = SelectionSet::from_paths(selected_paths)?;
+        self.build_root_for_selected_record_incremental_with_selection_set(
             previous_root_id,
             previous,
-            &selected_disk_files,
+            disk_files,
             selected_paths,
+            &selections,
+            allow_ignored,
+            change_id,
+        )
+    }
+
+    pub(crate) fn build_root_for_selected_record_incremental_with_selection_set(
+        &self,
+        previous_root_id: &ObjectId,
+        previous: &BTreeMap<String, FileEntry>,
+        disk_files: &[DiskFile],
+        selected_paths: &[String],
+        selections: &SelectionSet,
+        allow_ignored: bool,
+        change_id: &ChangeId,
+    ) -> Result<RootBuildResult> {
+        let selected_disk_files = self.selected_record_disk_files_with_selection_set(
+            disk_files,
+            selected_paths,
+            &selections,
+            allow_ignored,
+        )?;
+        self.build_root_for_selected_disk_files_incremental_with_selected_inputs(
+            previous_root_id,
+            previous,
+            selected_disk_files,
+            &selections,
             change_id,
         )
     }
@@ -737,30 +763,32 @@ impl Trail {
         selected_paths: &[String],
         change_id: &ChangeId,
     ) -> Result<RootBuildResult> {
-        let selected_paths = selected_paths
-            .iter()
-            .map(|path| normalize_relative_path(path))
-            .collect::<Result<Vec<_>>>()?;
-        let selected_disk_files = disk_files
-            .iter()
-            .filter(|file| {
-                selected_paths
-                    .iter()
-                    .any(|selected| path_matches_selection(&file.path, selected))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        validate_disk_file_root_paths(&selected_disk_files)?;
+        let selections = SelectionSet::from_paths(selected_paths)?;
+        let selected_disk_files =
+            self.selected_disk_files_for_selection_set(disk_files, &selections);
+        self.build_root_for_selected_disk_files_incremental_with_selected_inputs(
+            previous_root_id,
+            previous,
+            selected_disk_files,
+            &selections,
+            change_id,
+        )
+    }
 
+    fn build_root_for_selected_disk_files_incremental_with_selected_inputs(
+        &self,
+        previous_root_id: &ObjectId,
+        previous: &BTreeMap<String, FileEntry>,
+        selected_disk_files: Vec<DiskFile>,
+        selections: &SelectionSet,
+        change_id: &ChangeId,
+    ) -> Result<RootBuildResult> {
+        validate_disk_file_root_paths(&selected_disk_files)?;
+        let removed_entries = self.selected_previous_entries(previous, selections);
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let removals = previous
-            .keys()
-            .filter(|path| {
-                selected_paths
-                    .iter()
-                    .any(|selected| path_matches_selection(path, selected))
-            })
-            .cloned()
+        let removals = removed_entries
+            .iter()
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         let additions = selected_disk_files
             .iter()
@@ -768,11 +796,11 @@ impl Trail {
             .collect::<Vec<_>>();
         let case_fold_tree =
             self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)?;
-        self.build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+        self.build_root_for_selected_disk_files_incremental_from_selected_inputs(
             previous_root_id,
             previous,
-            &selected_disk_files,
-            &selected_paths,
+            selected_disk_files,
+            removed_entries,
             change_id,
             case_fold_tree,
         )
@@ -818,10 +846,7 @@ impl Trail {
             ));
         }
 
-        let normalized_selected_paths = selected_paths
-            .iter()
-            .map(|path| normalize_relative_path(path))
-            .collect::<Result<Vec<_>>>()?;
+        let selections = SelectionSet::from_paths(selected_paths)?;
         validate_disk_file_root_paths(disk_files)?;
         let scanned_present_paths = disk_files
             .iter()
@@ -833,28 +858,22 @@ impl Trail {
                     .to_string(),
             ));
         }
-        let selected_disk_files = disk_files
-            .iter()
-            .filter(|file| {
-                normalized_selected_paths
-                    .iter()
-                    .any(|selected| path_matches_selection(&file.path, selected))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let selected_disk_files =
+            self.selected_disk_files_for_selection_set(disk_files, &selections);
         validate_disk_file_root_paths(&selected_disk_files)?;
         let actual_present_paths = selected_disk_files
             .iter()
             .map(|file| file.path.clone())
             .collect::<BTreeSet<_>>();
+        let removed_entries = self.selected_previous_entries(previous, &selections);
+        let removed_paths = removed_entries
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<HashSet<_>>();
         let mut actual_final_present_paths = previous
             .keys()
             .filter(|path| expected_domain.contains(*path))
-            .filter(|path| {
-                !normalized_selected_paths
-                    .iter()
-                    .any(|selected| path_matches_selection(path, selected))
-            })
+            .filter(|path| !removed_paths.contains(path.as_str()))
             .cloned()
             .collect::<BTreeSet<_>>();
         actual_final_present_paths.extend(actual_present_paths);
@@ -865,77 +884,58 @@ impl Trail {
             ));
         }
 
-        self.build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+        self.build_root_for_selected_disk_files_incremental_from_selected_inputs(
             previous_root_id,
             previous,
-            &selected_disk_files,
-            &normalized_selected_paths,
+            selected_disk_files,
+            removed_entries,
             change_id,
             preflight.case_fold_tree,
         )
     }
 
-    pub(crate) fn build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+    fn build_root_for_selected_disk_files_incremental_from_selected_inputs(
         &self,
         previous_root_id: &ObjectId,
         previous: &BTreeMap<String, FileEntry>,
-        disk_files: &[DiskFile],
-        selected_paths: &[String],
+        mut selected_disk_files: Vec<DiskFile>,
+        removed_entries: Vec<(String, FileEntry)>,
         change_id: &ChangeId,
         case_fold_tree: Tree,
     ) -> Result<RootBuildResult> {
-        let selected_paths = selected_paths
-            .iter()
-            .map(|path| normalize_relative_path(path))
-            .collect::<Result<Vec<_>>>()?;
-        let selected_disk_files = disk_files
-            .iter()
-            .filter(|file| {
-                selected_paths
-                    .iter()
-                    .any(|selected| path_matches_selection(&file.path, selected))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        validate_disk_file_root_paths(&selected_disk_files)?;
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let mut path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
-        let mut file_index_tree =
+        let path_tree = root_map_tree_from_root_hex(previous_root.path_map_root.as_deref())?;
+        let file_index_tree =
             root_map_tree_from_root_hex(previous_root.file_index_map_root.as_deref())?;
         let mut file_count = previous_root.file_count as i128;
         let mut total_text_bytes = previous_root.total_text_bytes as i128;
 
         let mut files = previous.clone();
-        let mut removed_entries = Vec::new();
-        for selected in &selected_paths {
-            let removed_paths = files
-                .keys()
-                .filter(|path| path_matches_selection(path, selected))
-                .cloned()
-                .collect::<Vec<_>>();
-            for path in removed_paths {
-                if let Some(entry) = files.remove(&path) {
-                    path_tree = self.root_prolly.delete(&path_tree, path.as_bytes())?;
-                    file_index_tree = self
-                        .root_prolly
-                        .delete(&file_index_tree, &entry.file_id.encode_key())?;
-                    file_count -= 1;
-                    total_text_bytes -= entry_text_bytes(&entry) as i128;
-                    removed_entries.push((path, entry));
-                }
-            }
-        }
-
-        let mut previous_by_hash: HashMap<String, Vec<(String, FileEntry)>> = HashMap::new();
+        let mut previous_by_hash: HashMap<String, VecDeque<(String, FileEntry)>> = HashMap::new();
+        let mut path_mutation_intents = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
+        let mut file_index_mutation_intents = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
+        let selected_disk_paths = selected_disk_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
         for (path, entry) in removed_entries {
-            previous_by_hash
-                .entry(entry.content_hash.clone())
-                .or_default()
-                .push((path, entry));
+            let is_rename_candidate = !selected_disk_paths.contains(&path);
+            files.remove(&path);
+            path_mutation_intents.insert(path.as_bytes().to_vec(), None);
+            file_index_mutation_intents.insert(entry.file_id.encode_key(), None);
+            file_count -= 1;
+            total_text_bytes -= entry_text_bytes(&entry) as i128;
+            if is_rename_candidate {
+                previous_by_hash
+                    .entry(entry.content_hash.clone())
+                    .or_default()
+                    .push_back((path, entry));
+            }
         }
 
         let mut file_seq = 1;
         let mut line_seq = 1;
+        selected_disk_files.sort_by(|left, right| left.path.cmp(&right.path));
         for disk_file in selected_disk_files {
             let DiskFile {
                 path,
@@ -963,28 +963,24 @@ impl Trail {
                 }
             } else {
                 let previous_entry = previous_by_hash
-                    .get(&content_hash)
-                    .and_then(|matches| matches.first().map(|(_, entry)| entry));
+                    .get_mut(&content_hash)
+                    .and_then(VecDeque::pop_front)
+                    .map(|(_, entry)| entry);
                 let built = self.build_file_entry(
                     &path,
                     bytes,
                     content_hash,
                     executable,
                     change_id,
-                    previous_entry,
+                    previous_entry.as_ref(),
                     &mut file_seq,
                     &mut line_seq,
                 )?;
                 built.entry
             };
-            path_tree =
-                self.root_prolly
-                    .put(&path_tree, path.as_bytes().to_vec(), cbor(&entry)?)?;
-            file_index_tree = self.root_prolly.put(
-                &file_index_tree,
-                entry.file_id.encode_key(),
-                path.as_bytes().to_vec(),
-            )?;
+            path_mutation_intents.insert(path.as_bytes().to_vec(), Some(cbor(&entry)?));
+            file_index_mutation_intents
+                .insert(entry.file_id.encode_key(), Some(path.as_bytes().to_vec()));
             file_count += 1;
             total_text_bytes += entry_text_bytes(&entry) as i128;
             files.insert(path, entry);
@@ -995,6 +991,10 @@ impl Trail {
                 "selected incremental root update produced negative root stats".to_string(),
             ));
         }
+
+        let path_tree = self.apply_root_tree_mutation_intents(path_tree, path_mutation_intents)?;
+        let file_index_tree =
+            self.apply_root_tree_mutation_intents(file_index_tree, file_index_mutation_intents)?;
 
         let (stats, _) = root_stats(&files);
         let root = WorktreeRoot {
@@ -1013,6 +1013,79 @@ impl Trail {
             disk_manifest: BTreeMap::new(),
             stats,
         })
+    }
+
+    fn selected_disk_files_for_selection_set(
+        &self,
+        disk_files: &[DiskFile],
+        selections: &SelectionSet,
+    ) -> Vec<DiskFile> {
+        if selections.is_empty() {
+            return Vec::new();
+        }
+        let mut comparison_count = 0u64;
+        let selected = disk_files
+            .iter()
+            .filter(|file| {
+                let (matches, comparisons) = selections.contains_counted(&file.path);
+                comparison_count = comparison_count.saturating_add(comparisons);
+                matches
+            })
+            .cloned()
+            .collect();
+        self.note_operation_metrics(OperationMetricsDelta {
+            selection_comparison_count: comparison_count,
+            ..OperationMetricsDelta::default()
+        });
+        selected
+    }
+
+    fn selected_previous_entries(
+        &self,
+        previous: &BTreeMap<String, FileEntry>,
+        selections: &SelectionSet,
+    ) -> Vec<(String, FileEntry)> {
+        if selections.is_empty() {
+            return Vec::new();
+        }
+        let mut comparison_count = 0u64;
+        let selected = previous
+            .iter()
+            .filter(|(path, _)| {
+                let (matches, comparisons) = selections.contains_counted(path);
+                comparison_count = comparison_count.saturating_add(comparisons);
+                matches
+            })
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect();
+        self.note_operation_metrics(OperationMetricsDelta {
+            selection_comparison_count: comparison_count,
+            ..OperationMetricsDelta::default()
+        });
+        selected
+    }
+
+    fn apply_root_tree_mutation_intents(
+        &self,
+        tree: Tree,
+        intents: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<Tree> {
+        if intents.is_empty() {
+            return Ok(tree);
+        }
+        let mutations = intents
+            .into_iter()
+            .map(|(key, value)| match value {
+                Some(val) => prolly::Mutation::Upsert { key, val },
+                None => prolly::Mutation::Delete { key },
+            })
+            .collect::<Vec<_>>();
+        self.note_operation_metrics(OperationMetricsDelta {
+            prolly_tree_batch_call_count: 1,
+            prolly_tree_batch_mutation_count: saturating_u64_from_usize(mutations.len()),
+            ..OperationMetricsDelta::default()
+        });
+        Ok(self.root_prolly.batch(&tree, mutations)?)
     }
 
     pub(crate) fn build_root_from_touched_file_entries_incremental(
@@ -2277,6 +2350,236 @@ mod tests {
             ]
         );
         assert_indexed_case_fold_metrics(&db, 2);
+    }
+
+    #[test]
+    fn selected_same_content_multi_rename_consumes_unique_file_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("old")).unwrap();
+        fs::write(temp.path().join("old/a.bin"), [0, 1, 2, 3]).unwrap();
+        fs::write(temp.path().join("old/b.bin"), [0, 1, 2, 3]).unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let selections = vec![
+            "old/a.bin".to_string(),
+            "old/b.bin".to_string(),
+            "new/a.bin".to_string(),
+            "new/b.bin".to_string(),
+        ];
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &selections)
+            .unwrap();
+        let old_ids = previous
+            .values()
+            .map(|entry| entry.file_id.clone())
+            .collect::<BTreeSet<_>>();
+        let disk_files = vec![
+            DiskFile {
+                path: "new/b.bin".to_string(),
+                bytes: vec![0, 1, 2, 3],
+                executable: false,
+            },
+            DiskFile {
+                path: "new/a.bin".to_string(),
+                bytes: vec![0, 1, 2, 3],
+                executable: false,
+            },
+        ];
+
+        let built = db
+            .build_root_for_selected_disk_files_incremental(
+                &head.root_id,
+                &previous,
+                &disk_files,
+                &selections,
+                &ChangeId("change_selected_same_content_renames".to_string()),
+            )
+            .unwrap();
+        let built_root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &built.root_id).unwrap();
+
+        db.validate_worktree_root(&built_root).unwrap();
+        let new_ids = built
+            .files
+            .values()
+            .map(|entry| entry.file_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(new_ids, old_ids);
+        assert_eq!(new_ids.len(), 2);
+        let diff = db.diff_file_maps(&previous, &built.files).unwrap();
+        assert_eq!(diff.changes.len(), 2);
+        assert_eq!(diff.summaries.len(), 2);
+        for (index, change) in diff.changes.iter().enumerate() {
+            let name = if index == 0 { "a" } else { "b" };
+            assert_eq!(change.kind, FileChangeKind::Renamed);
+            assert_eq!(change.path, format!("new/{name}.bin"));
+            assert_eq!(
+                change.old_path.as_deref(),
+                Some(format!("old/{name}.bin").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn selected_same_content_survivor_is_not_a_rename_source() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.bin"), [0, 1, 2, 3]).unwrap();
+        fs::write(temp.path().join("b.bin"), [0, 1, 2, 3]).unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let selections = vec![
+            "a.bin".to_string(),
+            "b.bin".to_string(),
+            "c.bin".to_string(),
+        ];
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &selections)
+            .unwrap();
+        let a_id = previous["a.bin"].file_id.clone();
+        let b_id = previous["b.bin"].file_id.clone();
+        let disk_files = vec![
+            DiskFile {
+                path: "c.bin".to_string(),
+                bytes: vec![0, 1, 2, 3],
+                executable: false,
+            },
+            DiskFile {
+                path: "a.bin".to_string(),
+                bytes: vec![0, 1, 2, 3],
+                executable: false,
+            },
+        ];
+
+        let built = db
+            .build_root_for_selected_disk_files_incremental(
+                &head.root_id,
+                &previous,
+                &disk_files,
+                &selections,
+                &ChangeId("change_selected_survivor_and_rename".to_string()),
+            )
+            .unwrap();
+        let built_root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &built.root_id).unwrap();
+
+        db.validate_worktree_root(&built_root).unwrap();
+        assert_eq!(built.files["a.bin"].file_id, a_id);
+        assert_eq!(built.files["c.bin"].file_id, b_id);
+        assert_ne!(built.files["a.bin"].file_id, built.files["c.bin"].file_id);
+    }
+
+    #[test]
+    fn selected_record_1000_candidates_use_linear_membership_and_two_tree_batches() {
+        const SELECTED_COUNT: usize = 1_000;
+        const DECOY_COUNT: usize = 1_000;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("seed.bin"), [0, 1, 2, 3]).unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let template = db
+            .load_root_files(&head.root_id)
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap();
+        let mut previous = BTreeMap::new();
+        let mut selected_paths = Vec::with_capacity(SELECTED_COUNT);
+        let mut disk_files = Vec::with_capacity(SELECTED_COUNT + DECOY_COUNT);
+        for index in 0..SELECTED_COUNT {
+            let path = format!("selected/{index:04}.bin");
+            let mut entry = template.clone();
+            entry.file_id = FileId::new(
+                ChangeId("change_selected_scale_source".to_string()),
+                index as u64,
+            );
+            previous.insert(path.clone(), entry);
+            selected_paths.push(path.clone());
+            let mut bytes = vec![0, 0xff];
+            bytes.extend_from_slice(&(index as u32).to_be_bytes());
+            disk_files.push(DiskFile {
+                path,
+                bytes,
+                executable: false,
+            });
+        }
+        for index in 0..DECOY_COUNT {
+            let path = format!("unrelated/{index:04}.bin");
+            let mut entry = template.clone();
+            entry.file_id = FileId::new(
+                ChangeId("change_selected_scale_decoy".to_string()),
+                index as u64,
+            );
+            previous.insert(path.clone(), entry);
+            disk_files.push(DiskFile {
+                path,
+                bytes: vec![0, 0xfe, (index % 251) as u8],
+                executable: false,
+            });
+        }
+        let previous_build = db
+            .build_root_from_file_entries(
+                previous.clone(),
+                &ChangeId("change_selected_scale_root".to_string()),
+            )
+            .unwrap();
+        let previous_root: WorktreeRoot = db
+            .get_object(WORKTREE_ROOT_KIND, &previous_build.root_id)
+            .unwrap();
+        let case_fold_tree =
+            root_map_tree_from_root_hex(previous_root.case_fold_map_root.as_deref()).unwrap();
+        let selections = SelectionSet::from_paths(&selected_paths).unwrap();
+        let metrics = db.operation_metrics.clone().unwrap();
+
+        let built = metrics
+            .profile(OperationMetricsKind::Record, || {
+                let selected_disk_files =
+                    db.selected_disk_files_for_selection_set(&disk_files, &selections);
+                let removed_entries = db.selected_previous_entries(&previous, &selections);
+                db.build_root_for_selected_disk_files_incremental_from_selected_inputs(
+                    &previous_build.root_id,
+                    &previous,
+                    selected_disk_files,
+                    removed_entries,
+                    &ChangeId("change_selected_scale_update".to_string()),
+                    case_fold_tree,
+                )
+            })
+            .unwrap();
+        let report = metrics.last_report();
+
+        assert!(report.selection_comparison_count > 0);
+        assert!(
+            report.selection_comparison_count <= 2 * (previous.len() + disk_files.len()) as u64,
+            "selected membership work was not linear: {report:?}"
+        );
+        assert_eq!(report.prolly_tree_batch_call_count, 2);
+        assert!(
+            report.prolly_tree_batch_mutation_count <= 4 * SELECTED_COUNT as u64,
+            "selected tree mutations were not proportional: {report:?}"
+        );
+
+        let diff = db.diff_file_maps(&previous, &built.files).unwrap();
+        assert_eq!(built.files.len(), SELECTED_COUNT + DECOY_COUNT);
+        assert_eq!(diff.changes.len(), SELECTED_COUNT);
+        assert_eq!(diff.summaries.len(), SELECTED_COUNT);
+        for (index, change) in diff.changes.iter().enumerate() {
+            assert_eq!(change.path, format!("selected/{index:04}.bin"));
+            assert_eq!(change.kind, FileChangeKind::Modified);
+            assert_eq!(
+                change.file_id,
+                Some(FileId::new(
+                    ChangeId("change_selected_scale_source".to_string()),
+                    index as u64,
+                ))
+            );
+            assert_eq!(diff.summaries[index].path, change.path);
+            assert_eq!(diff.summaries[index].kind, FileChangeKind::Modified);
+        }
     }
 
     #[test]

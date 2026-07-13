@@ -131,6 +131,7 @@ impl Trail {
         };
         let disk_files;
         let build_selected_paths;
+        let build_selection_set;
         let previous_files;
         let record_generation;
         if let Some((generation, paths)) = daemon_dirty_paths {
@@ -152,6 +153,7 @@ impl Trail {
             }
             disk_files = snapshot.files;
             build_selected_paths = Some(snapshot.paths);
+            build_selection_set = None;
             record_generation = Some(generation);
         } else if let Some(paths) = fast_dirty_paths {
             if paths.is_empty() {
@@ -174,12 +176,18 @@ impl Trail {
             }
             disk_files = snapshot.files;
             build_selected_paths = Some(snapshot.paths);
+            build_selection_set = None;
             record_generation = fallback_generation;
         } else if !selected_paths.is_empty() {
+            let selections = SelectionSet::from_paths(&selected_paths)?;
             previous_files = self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-            disk_files =
-                self.scan_record_selection_files(&selected_paths, options.allow_ignored)?;
+            disk_files = self.scan_record_selection_files(
+                &selected_paths,
+                &selections,
+                options.allow_ignored,
+            )?;
             build_selected_paths = Some(selected_paths.clone());
+            build_selection_set = Some(selections);
             record_generation = None;
         } else {
             let refresh = self.refresh_worktree_index_streaming_report()?;
@@ -211,18 +219,31 @@ impl Trail {
             disk_files = self.scan_visible_files_for_paths(&paths)?;
             previous_files = self.load_root_files_for_paths(&head.root_id, &paths)?;
             build_selected_paths = Some(paths);
+            build_selection_set = None;
             record_generation = fallback_generation;
         }
         let change_id = self.allocate_change_id(&actor.id, "record")?;
         let built = if let Some(paths) = build_selected_paths.as_deref() {
-            self.build_root_for_selected_record_incremental(
-                &head.root_id,
-                &previous_files,
-                &disk_files,
-                paths,
-                options.allow_ignored,
-                &change_id,
-            )?
+            if let Some(selections) = build_selection_set.as_ref() {
+                self.build_root_for_selected_record_incremental_with_selection_set(
+                    &head.root_id,
+                    &previous_files,
+                    &disk_files,
+                    paths,
+                    selections,
+                    options.allow_ignored,
+                    &change_id,
+                )?
+            } else {
+                self.build_root_for_selected_record_incremental(
+                    &head.root_id,
+                    &previous_files,
+                    &disk_files,
+                    paths,
+                    options.allow_ignored,
+                    &change_id,
+                )?
+            }
         } else {
             self.build_root_from_disk_files(&disk_files, &change_id, Some(&previous_files))?
         };
