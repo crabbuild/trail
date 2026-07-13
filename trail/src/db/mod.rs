@@ -441,8 +441,34 @@ pub(crate) struct IncrementalRootBuildResult {
     root_id: ObjectId,
 }
 
+#[derive(Debug)]
+pub(crate) enum RecordCaseFoldResolutionState {
+    Indexed {
+        previous_tree: Tree,
+        mutations: Vec<prolly::Mutation>,
+    },
+    LegacyUnavailable,
+    Collision {
+        path: String,
+        previous: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct RecordCaseFoldResolution {
+    selected_paths: Vec<String>,
+    expected_final_present_paths: BTreeSet<String>,
+    expected_observed_present_paths: BTreeSet<String>,
+    expected_absent_paths: BTreeSet<String>,
+    state: RecordCaseFoldResolutionState,
+}
+
+#[derive(Debug)]
 pub(crate) struct RecordCaseFoldPreflight {
     selected_paths: Vec<String>,
+    expected_final_present_paths: BTreeSet<String>,
+    expected_observed_present_paths: BTreeSet<String>,
+    expected_absent_paths: BTreeSet<String>,
     case_fold_tree: Tree,
 }
 
@@ -960,6 +986,7 @@ mod lane;
 mod merge;
 mod record;
 mod storage;
+pub(crate) use storage::{observed_exact_paths_for_candidates, ObservedPathKind};
 mod util;
 
 #[doc(hidden)]

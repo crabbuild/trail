@@ -84,7 +84,7 @@ impl Trail {
         &self,
         head_root_id: &ObjectId,
         summaries: &[FileDiffSummary],
-    ) -> Result<Tree> {
+    ) -> Result<()> {
         let mut removals = Vec::new();
         let mut additions = Vec::new();
         for summary in summaries {
@@ -100,7 +100,7 @@ impl Trail {
             }
         }
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, head_root_id)?;
-        self.validate_and_update_case_fold_index(&previous_root, &removals, &additions)
+        self.validate_case_fold_index_update_read_only(&previous_root, &removals, &additions)
     }
 
     pub(crate) fn preview_lane_record_policy(

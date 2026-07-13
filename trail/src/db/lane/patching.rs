@@ -266,13 +266,7 @@ impl Trail {
         previous_touched: &BTreeMap<String, FileEntry>,
         target_touched: &BTreeMap<String, FileEntry>,
     ) -> Result<bool> {
-        if !matches!(
-            self.cached_workdir_manifest_status(workdir_path, previous_root_id)?,
-            CachedWorkdirManifestStatus::Clean
-        ) {
-            return Ok(false);
-        }
-        if !self.clean_workdir_manifest_allows_file_subset_update(
+        if !self.clean_workdir_manifest_allows_touched_path_update(
             workdir_path,
             previous_root_id,
             previous_touched,

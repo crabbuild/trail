@@ -69,6 +69,30 @@ impl Trail {
         removals: &[String],
         additions: &[String],
     ) -> Result<Tree> {
+        let (previous_tree, mutations) =
+            self.plan_case_fold_index_update(previous_root, removals, additions)?;
+        if mutations.is_empty() {
+            return Ok(previous_tree);
+        }
+        Ok(self.root_prolly.batch(&previous_tree, mutations)?)
+    }
+
+    pub(crate) fn validate_case_fold_index_update_read_only(
+        &self,
+        previous_root: &WorktreeRoot,
+        removals: &[String],
+        additions: &[String],
+    ) -> Result<()> {
+        self.plan_case_fold_index_update(previous_root, removals, additions)?;
+        Ok(())
+    }
+
+    fn plan_case_fold_index_update(
+        &self,
+        previous_root: &WorktreeRoot,
+        removals: &[String],
+        additions: &[String],
+    ) -> Result<(Tree, Vec<prolly::Mutation>)> {
         for path in removals.iter().chain(additions) {
             let normalized = normalize_relative_path(path)?;
             if normalized != *path {
@@ -139,30 +163,16 @@ impl Trail {
                 })
             })
             .collect::<Vec<_>>();
-        if mutations.is_empty() {
-            return Ok(previous_tree);
-        }
-
-        Ok(self.root_prolly.batch(&previous_tree, mutations)?)
+        Ok((previous_tree, mutations))
     }
 
-    pub(crate) fn preflight_record_case_fold_candidates(
+    pub(crate) fn resolve_record_case_fold_candidates_read_only(
         &self,
         previous_root_id: &ObjectId,
         candidate_paths: &[String],
         disk_manifest: &BTreeMap<String, DiskManifest>,
-    ) -> Result<RecordCaseFoldPreflight> {
+    ) -> Result<RecordCaseFoldResolution> {
         let previous_root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, previous_root_id)?;
-        let previous_tree = match previous_root.case_fold_map_root.as_deref() {
-            Some(case_fold_root) => root_map_tree_from_root_hex(Some(case_fold_root))?,
-            None if previous_root.file_count == 0 => self.root_prolly.create(),
-            None => {
-                return Err(Error::PathIndexRequired(
-                    "legacy root has no case-fold index; run `trail index rebuild`".to_string(),
-                ));
-            }
-        };
-
         let mut candidates_by_folded = BTreeMap::<String, BTreeSet<String>>::new();
         for path in candidate_paths {
             let path = normalize_relative_path(path)?;
@@ -171,16 +181,43 @@ impl Trail {
                 .or_default()
                 .insert(path);
         }
+        let mut selected_paths = candidates_by_folded
+            .values()
+            .flat_map(|paths| paths.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let candidate_present_paths = selected_paths
+            .iter()
+            .filter(|path| disk_manifest.contains_key(*path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        let previous_tree = match previous_root.case_fold_map_root.as_deref() {
+            Some(case_fold_root) => root_map_tree_from_root_hex(Some(case_fold_root))?,
+            None if previous_root.file_count == 0 => self.root_prolly.create(),
+            None => {
+                return Ok(RecordCaseFoldResolution {
+                    expected_absent_paths: selected_paths
+                        .difference(&candidate_present_paths)
+                        .cloned()
+                        .collect(),
+                    selected_paths: selected_paths.into_iter().collect(),
+                    expected_final_present_paths: candidate_present_paths.clone(),
+                    expected_observed_present_paths: candidate_present_paths,
+                    state: RecordCaseFoldResolutionState::LegacyUnavailable,
+                });
+            }
+        };
+
         let touched_keys = candidates_by_folded.keys().cloned().collect::<Vec<_>>();
         self.note_case_fold_index_lookups(touched_keys.len());
         let existing = self.root_prolly.get_many(&previous_tree, &touched_keys)?;
 
-        let mut selected_paths = BTreeSet::new();
         let mut mutations = Vec::new();
+        let mut expected_final_present_paths = BTreeSet::new();
+        let mut collision = None;
         for ((folded, candidates), existing) in
             candidates_by_folded.into_iter().zip(existing.into_iter())
         {
-            selected_paths.extend(candidates.iter().cloned());
             let previous = existing
                 .map(|value| validate_case_fold_index_value(&folded, value))
                 .transpose()?;
@@ -202,12 +239,13 @@ impl Trail {
                 let mut paths = present.into_iter();
                 let previous = paths.next().expect("present path exists");
                 let path = paths.next().expect("collision path exists");
-                return Err(Error::InvalidPath {
-                    path,
-                    reason: format!("case-insensitive path collision with `{previous}`"),
-                });
+                collision.get_or_insert((path, previous));
+                continue;
             }
             let final_path = present.into_iter().next();
+            if let Some(path) = &final_path {
+                expected_final_present_paths.insert(path.clone());
+            }
             if previous == final_path {
                 continue;
             }
@@ -221,13 +259,71 @@ impl Trail {
             });
         }
 
-        let case_fold_tree = if mutations.is_empty() {
-            previous_tree
+        let state = if let Some((path, previous)) = collision {
+            RecordCaseFoldResolutionState::Collision { path, previous }
         } else {
-            self.root_prolly.batch(&previous_tree, mutations)?
+            RecordCaseFoldResolutionState::Indexed {
+                previous_tree,
+                mutations,
+            }
+        };
+        let expected_observed_present_paths = selected_paths
+            .iter()
+            .filter(|path| disk_manifest.contains_key(*path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_absent_paths = selected_paths
+            .difference(&expected_observed_present_paths)
+            .cloned()
+            .collect();
+        Ok(RecordCaseFoldResolution {
+            selected_paths: selected_paths.into_iter().collect(),
+            expected_final_present_paths,
+            expected_observed_present_paths,
+            expected_absent_paths,
+            state,
+        })
+    }
+
+    pub(crate) fn finalize_record_case_fold_resolution(
+        &self,
+        resolution: RecordCaseFoldResolution,
+    ) -> Result<RecordCaseFoldPreflight> {
+        let RecordCaseFoldResolution {
+            selected_paths,
+            expected_final_present_paths,
+            expected_observed_present_paths,
+            expected_absent_paths,
+            state,
+        } = resolution;
+        let case_fold_tree = match state {
+            RecordCaseFoldResolutionState::Indexed {
+                previous_tree,
+                mutations,
+            } => {
+                if mutations.is_empty() {
+                    previous_tree
+                } else {
+                    self.root_prolly.batch(&previous_tree, mutations)?
+                }
+            }
+            RecordCaseFoldResolutionState::LegacyUnavailable => {
+                return Err(Error::PathIndexRequired(
+                    "legacy root has no case-fold index; run `trail index rebuild`".to_string(),
+                ));
+            }
+            RecordCaseFoldResolutionState::Collision { path, previous } => {
+                return Err(Error::InvalidPath {
+                    path,
+                    reason: format!("case-insensitive path collision with `{previous}`"),
+                });
+            }
         };
         Ok(RecordCaseFoldPreflight {
-            selected_paths: selected_paths.into_iter().collect(),
+            selected_paths,
+            expected_final_present_paths,
+            expected_observed_present_paths,
+            expected_absent_paths,
             case_fold_tree,
         })
     }
@@ -650,6 +746,103 @@ impl Trail {
             &selected_paths,
             change_id,
             case_fold_tree,
+        )
+    }
+
+    pub(crate) fn build_root_for_selected_disk_files_incremental_with_record_preflight(
+        &self,
+        worktree_root: &Path,
+        previous_root_id: &ObjectId,
+        previous: &BTreeMap<String, FileEntry>,
+        disk_files: &[DiskFile],
+        selected_paths: &[String],
+        change_id: &ChangeId,
+        preflight: RecordCaseFoldPreflight,
+    ) -> Result<RootBuildResult> {
+        let mut expected_domain = preflight.expected_observed_present_paths.clone();
+        expected_domain.extend(preflight.expected_absent_paths.iter().cloned());
+        if expected_domain
+            != preflight
+                .selected_paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(Error::Corrupt(
+                "record case-fold preflight has an inconsistent path domain".to_string(),
+            ));
+        }
+        let observed = observed_exact_paths_for_candidates(
+            worktree_root,
+            &preflight.selected_paths,
+            is_case_insensitive_filesystem(worktree_root)?,
+        )?;
+        let observed_paths = observed.keys().cloned().collect::<BTreeSet<_>>();
+        if observed_paths != preflight.expected_observed_present_paths
+            || observed
+                .values()
+                .any(|kind| *kind != ObservedPathKind::RegularFile)
+        {
+            return Err(Error::InvalidInput(
+                "record candidate paths changed after case-fold preflight (directory spellings)"
+                    .to_string(),
+            ));
+        }
+
+        let normalized_selected_paths = selected_paths
+            .iter()
+            .map(|path| normalize_relative_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        validate_disk_file_root_paths(disk_files)?;
+        let scanned_present_paths = disk_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        if scanned_present_paths != preflight.expected_observed_present_paths {
+            return Err(Error::InvalidInput(
+                "record candidate paths changed after case-fold preflight (selected scan)"
+                    .to_string(),
+            ));
+        }
+        let selected_disk_files = disk_files
+            .iter()
+            .filter(|file| {
+                normalized_selected_paths
+                    .iter()
+                    .any(|selected| path_matches_selection(&file.path, selected))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_disk_file_root_paths(&selected_disk_files)?;
+        let actual_present_paths = selected_disk_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut actual_final_present_paths = previous
+            .keys()
+            .filter(|path| expected_domain.contains(*path))
+            .filter(|path| {
+                !normalized_selected_paths
+                    .iter()
+                    .any(|selected| path_matches_selection(path, selected))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        actual_final_present_paths.extend(actual_present_paths);
+        if actual_final_present_paths != preflight.expected_final_present_paths {
+            return Err(Error::InvalidInput(
+                "record candidate paths changed after case-fold preflight (final domain)"
+                    .to_string(),
+            ));
+        }
+
+        self.build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+            previous_root_id,
+            previous,
+            &selected_disk_files,
+            &normalized_selected_paths,
+            change_id,
+            preflight.case_fold_tree,
         )
     }
 
@@ -2116,11 +2309,22 @@ mod tests {
             patch: None,
         };
         db.reset_case_fold_index_metrics();
-        let record_tree = db
-            .ensure_record_final_root_paths_safe_from_summaries(&head.root_id, &[summary])
+        let prolly_before_record_preview = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap();
-        assert!(tree_root_hex(&record_tree).is_some());
+        db.ensure_record_final_root_paths_safe_from_summaries(&head.root_id, &[summary])
+            .unwrap();
         assert_indexed_case_fold_metrics(&db, 1);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_before_record_preview
+        );
     }
 
     #[test]
@@ -2223,9 +2427,63 @@ mod tests {
             .unwrap();
         let workdir = PathBuf::from(spawned.workdir.unwrap());
         fs::write(workdir.join("recorded.md"), "recorded\n").unwrap();
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before_preview = count_rows("objects");
+        let prolly_before_preview = count_rows("prolly_nodes");
+        db.reset_case_fold_index_metrics();
+        let preview = db.preview_lane_workdir_record("metric-record").unwrap();
+        assert!(preview.policy.allowed, "{:?}", preview.policy.error);
+        assert_indexed_case_fold_metrics(&db, 1);
+        assert_eq!(count_rows("objects"), objects_before_preview);
+        assert_eq!(count_rows("prolly_nodes"), prolly_before_preview);
+
         db.reset_case_fold_index_metrics();
         db.record_lane_workdir("metric-record", None).unwrap();
         assert_indexed_case_fold_metrics(&db, 1);
+    }
+
+    #[test]
+    fn missing_manifest_record_preview_validates_without_persisting_index_nodes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let mut db = Trail::open(temp.path()).unwrap();
+        let spawned = db
+            .spawn_lane("missing-manifest-preview", Some("main"), true, None, None)
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        fs::remove_file(workdir.join(".trail/workdir-manifest.json")).unwrap();
+        fs::write(workdir.join("added.md"), "added\n").unwrap();
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_before = count_rows("prolly_nodes");
+        db.reset_case_fold_index_metrics();
+
+        let preview = db
+            .preview_lane_workdir_record("missing-manifest-preview")
+            .unwrap();
+
+        assert!(preview.policy.allowed, "{:?}", preview.policy.error);
+        assert!(preview
+            .changed_paths
+            .iter()
+            .any(|summary| summary.path == "added.md"));
+        assert_indexed_case_fold_metrics(&db, 1);
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_before);
     }
 
     #[test]
@@ -2246,26 +2504,37 @@ mod tests {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
 
-        let err = match db.preflight_record_case_fold_candidates(
-            &head.root_id,
-            &["readme.md".to_string()],
-            &disk_manifest,
-        ) {
-            Ok(_) => panic!("expected partial-manifest collision"),
-            Err(err) => err,
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
         };
-        assert!(
-            matches!(err, Error::InvalidPath { ref reason, .. } if reason.contains("case-insensitive path collision")),
-            "expected partial-manifest collision, got {err:?}"
-        );
+        let objects_before = count_rows("objects");
+        let prolly_before = count_rows("prolly_nodes");
+        let resolution = db
+            .resolve_record_case_fold_candidates_read_only(
+                &head.root_id,
+                &["readme.md".to_string()],
+                &disk_manifest,
+            )
+            .unwrap();
+        assert!(matches!(
+            resolution.state,
+            RecordCaseFoldResolutionState::Collision { .. }
+        ));
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_before);
 
-        let preflight = db
-            .preflight_record_case_fold_candidates(
+        let resolution = db
+            .resolve_record_case_fold_candidates_read_only(
                 &head.root_id,
                 &["README.md".to_string(), "readme.md".to_string()],
                 &disk_manifest,
             )
             .unwrap();
+        let preflight = db.finalize_record_case_fold_resolution(resolution).unwrap();
         assert_eq!(
             preflight.selected_paths,
             vec!["README.md".to_string(), "readme.md".to_string()]
@@ -2276,6 +2545,245 @@ mod tests {
                 .unwrap(),
             Some(b"readme.md".to_vec())
         );
+    }
+
+    #[test]
+    fn legacy_record_status_read_does_not_require_or_write_case_fold_index() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let mut db = Trail::open(temp.path()).unwrap();
+        let spawned = db
+            .spawn_lane("legacy-read", Some("main"), true, None, None)
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        let branch = db.lane_branch("legacy-read").unwrap();
+        let mut head = db.get_ref(&branch.ref_name).unwrap();
+        let mut legacy: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        legacy.case_fold_map_root = None;
+        let legacy_root_id = db
+            .put_object(WORKTREE_ROOT_KIND, ROOT_OBJECT_VERSION, &legacy)
+            .unwrap();
+        head.root_id = legacy_root_id.clone();
+        let files = db.load_root_files(&legacy_root_id).unwrap();
+        db.write_clean_workdir_manifest(&workdir, &legacy_root_id, &files, files.keys())
+            .unwrap();
+        fs::write(workdir.join("README.md"), "changed\n").unwrap();
+
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+        let prolly_before = count_rows("prolly_nodes");
+        db.reset_case_fold_index_metrics();
+
+        let summaries = db
+            .lane_workdir_record_changed_paths(&branch, &head, &workdir)
+            .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].path, "README.md");
+        assert_eq!(db.case_fold_index_metrics_report().lookup_count, 0);
+        assert_eq!(count_rows("objects"), objects_before);
+        assert_eq!(count_rows("prolly_nodes"), prolly_before);
+
+        db.set_ref(
+            &head.name,
+            &head.change_id,
+            &legacy_root_id,
+            &head.operation_id,
+        )
+        .unwrap();
+        let objects_before_preview = count_rows("objects");
+        let prolly_before_preview = count_rows("prolly_nodes");
+        db.reset_case_fold_index_metrics();
+        let preview = db.preview_lane_workdir_record("legacy-read").unwrap();
+        assert!(!preview.policy.allowed);
+        assert!(preview
+            .policy
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("case-fold index")));
+        assert_eq!(db.case_fold_index_metrics_report().lookup_count, 0);
+        assert_eq!(count_rows("objects"), objects_before_preview);
+        assert_eq!(count_rows("prolly_nodes"), prolly_before_preview);
+    }
+
+    #[test]
+    fn record_preflight_rejects_final_disk_domain_mismatch_before_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let disk_manifest = [(
+            "readme.md".to_string(),
+            DiskManifest {
+                kind: FileKind::Text,
+                executable: false,
+                content_hash: sha256_hex(b"hello\n"),
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let resolution = db
+            .resolve_record_case_fold_candidates_read_only(
+                &head.root_id,
+                &["README.md".to_string(), "readme.md".to_string()],
+                &disk_manifest,
+            )
+            .unwrap();
+        let preflight = db.finalize_record_case_fold_resolution(resolution).unwrap();
+        let previous = db
+            .load_root_files_for_paths(
+                &head.root_id,
+                &["README.md".to_string(), "readme.md".to_string()],
+            )
+            .unwrap();
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+
+        let err = db
+            .build_root_for_selected_disk_files_incremental_with_record_preflight(
+                temp.path(),
+                &head.root_id,
+                &previous,
+                &[],
+                &["README.md".to_string(), "readme.md".to_string()],
+                &ChangeId("change_record_domain_mismatch".to_string()),
+                preflight,
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("changed after case-fold preflight"));
+        assert_eq!(count_rows("objects"), objects_before);
+    }
+
+    #[test]
+    fn record_preflight_rejects_reappearance_disappearance_and_type_change() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let disk_manifest = [(
+            "readme.md".to_string(),
+            DiskManifest {
+                kind: FileKind::Text,
+                executable: false,
+                content_hash: sha256_hex(b"hello\n"),
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let selected_paths = vec!["README.md".to_string(), "readme.md".to_string()];
+        let previous = db
+            .load_root_files_for_paths(&head.root_id, &selected_paths)
+            .unwrap();
+        let stale_disk_file = DiskFile {
+            path: "readme.md".to_string(),
+            bytes: b"hello\n".to_vec(),
+            executable: false,
+        };
+        let count_rows = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let objects_before = count_rows("objects");
+
+        let renamed = temp.path().join("rename-tmp");
+        fs::rename(temp.path().join("README.md"), &renamed).unwrap();
+        fs::rename(&renamed, temp.path().join("readme.md")).unwrap();
+
+        if !is_case_insensitive_filesystem(temp.path()).unwrap() {
+            let resolution = db
+                .resolve_record_case_fold_candidates_read_only(
+                    &head.root_id,
+                    &selected_paths,
+                    &disk_manifest,
+                )
+                .unwrap();
+            let preflight = db.finalize_record_case_fold_resolution(resolution).unwrap();
+            fs::write(temp.path().join("README.md"), "reappeared\n").unwrap();
+            let err = db
+                .build_root_for_selected_disk_files_incremental_with_record_preflight(
+                    temp.path(),
+                    &head.root_id,
+                    &previous,
+                    std::slice::from_ref(&stale_disk_file),
+                    &selected_paths,
+                    &ChangeId("change_record_reappearance".to_string()),
+                    preflight,
+                )
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("changed after case-fold preflight"));
+            fs::remove_file(temp.path().join("README.md")).unwrap();
+        }
+
+        let resolution = db
+            .resolve_record_case_fold_candidates_read_only(
+                &head.root_id,
+                &selected_paths,
+                &disk_manifest,
+            )
+            .unwrap();
+        let preflight = db.finalize_record_case_fold_resolution(resolution).unwrap();
+        fs::remove_file(temp.path().join("readme.md")).unwrap();
+        let err = db
+            .build_root_for_selected_disk_files_incremental_with_record_preflight(
+                temp.path(),
+                &head.root_id,
+                &previous,
+                std::slice::from_ref(&stale_disk_file),
+                &selected_paths,
+                &ChangeId("change_record_disappearance".to_string()),
+                preflight,
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("changed after case-fold preflight"));
+
+        let resolution = db
+            .resolve_record_case_fold_candidates_read_only(
+                &head.root_id,
+                &selected_paths,
+                &disk_manifest,
+            )
+            .unwrap();
+        let preflight = db.finalize_record_case_fold_resolution(resolution).unwrap();
+        fs::create_dir(temp.path().join("readme.md")).unwrap();
+        let err = db
+            .build_root_for_selected_disk_files_incremental_with_record_preflight(
+                temp.path(),
+                &head.root_id,
+                &previous,
+                &[stale_disk_file],
+                &selected_paths,
+                &ChangeId("change_record_type_change".to_string()),
+                preflight,
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("changed after case-fold preflight"));
+        assert_eq!(count_rows("objects"), objects_before);
     }
 
     #[cfg(unix)]

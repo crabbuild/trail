@@ -1,5 +1,34 @@
 use super::*;
 
+enum RecordChangedPathsCaseFold {
+    AlreadySafe,
+    NeedsValidation,
+    LegacyUnavailable,
+    Collision { path: String, previous: String },
+}
+
+struct RecordChangedPaths {
+    summaries: Vec<FileDiffSummary>,
+    case_fold: RecordChangedPathsCaseFold,
+}
+
+fn record_changed_paths_case_fold(
+    state: &RecordCaseFoldResolutionState,
+) -> RecordChangedPathsCaseFold {
+    match state {
+        RecordCaseFoldResolutionState::Indexed { .. } => RecordChangedPathsCaseFold::AlreadySafe,
+        RecordCaseFoldResolutionState::LegacyUnavailable => {
+            RecordChangedPathsCaseFold::LegacyUnavailable
+        }
+        RecordCaseFoldResolutionState::Collision { path, previous } => {
+            RecordChangedPathsCaseFold::Collision {
+                path: path.clone(),
+                previous: previous.clone(),
+            }
+        }
+    }
+}
+
 impl Trail {
     pub fn preview_lane_workdir_record(&self, lane: &str) -> Result<LaneRecordPreviewReport> {
         validate_ref_segment(lane)?;
@@ -14,17 +43,33 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(workdir_path));
         }
         let head = self.get_ref(&branch.ref_name)?;
-        let changed_paths =
-            self.lane_workdir_record_changed_paths(&branch, &head, &workdir_path)?;
+        let changed =
+            self.lane_workdir_record_changed_paths_with_case_fold(&branch, &head, &workdir_path)?;
+        let changed_paths = changed.summaries;
         let (ignored_paths, risky_paths) =
             self.preview_lane_workdir_path_warnings(&workdir_path)?;
         let oversized_files =
             self.lane_record_oversized_files_on_disk(&workdir_path, &changed_paths)?;
         let mut policy = self.preview_lane_record_policy(&branch, &changed_paths)?;
-        if policy.error.is_none() {
-            if let Err(err) = self
-                .ensure_record_final_root_paths_safe_from_summaries(&head.root_id, &changed_paths)
-            {
+        if policy.error.is_none() && !changed_paths.is_empty() {
+            let case_fold_result: Result<()> = match changed.case_fold {
+                RecordChangedPathsCaseFold::AlreadySafe => Ok(()),
+                RecordChangedPathsCaseFold::NeedsValidation => self
+                    .ensure_record_final_root_paths_safe_from_summaries(
+                        &head.root_id,
+                        &changed_paths,
+                    ),
+                RecordChangedPathsCaseFold::LegacyUnavailable => Err(Error::PathIndexRequired(
+                    "legacy root has no case-fold index; run `trail index rebuild`".to_string(),
+                )),
+                RecordChangedPathsCaseFold::Collision { path, previous } => {
+                    Err(Error::InvalidPath {
+                        path,
+                        reason: format!("case-insensitive path collision with `{previous}`"),
+                    })
+                }
+            };
+            if let Err(err) = case_fold_result {
                 policy.allowed = false;
                 policy.error = Some(err.to_string());
             }
@@ -164,7 +209,7 @@ impl Trail {
                 disk_manifest,
                 candidate_paths,
             } => {
-                let (summaries, previous_files, use_disk_manifest_for_clean, case_fold_tree) =
+                let (summaries, previous_files, use_disk_manifest_for_clean, record_preflight) =
                     if let Some(mut selected_paths) = sparse_paths.clone() {
                         selected_paths.extend(disk_manifest.keys().cloned());
                         selected_paths.sort();
@@ -178,12 +223,12 @@ impl Trail {
                         );
                         (summaries, previous_files, false, None)
                     } else if let Some(candidate_paths) = candidate_paths {
-                        let preflight = self.preflight_record_case_fold_candidates(
+                        let resolution = self.resolve_record_case_fold_candidates_read_only(
                             &head.root_id,
                             &candidate_paths,
                             &disk_manifest,
                         )?;
-                        let candidate_paths = preflight.selected_paths;
+                        let candidate_paths = resolution.selected_paths.clone();
                         let previous_files =
                             self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
                         let summaries = self.diff_file_maps_to_manifest_for_paths(
@@ -195,7 +240,7 @@ impl Trail {
                             summaries,
                             previous_files,
                             true,
-                            Some(preflight.case_fold_tree),
+                            Some(self.finalize_record_case_fold_resolution(resolution)?),
                         )
                     } else {
                         let summaries =
@@ -247,21 +292,33 @@ impl Trail {
                     .iter()
                     .map(|summary| summary.path.clone())
                     .collect::<Vec<_>>();
-                let selected_disk_paths = selected_paths
-                    .iter()
-                    .filter(|path| disk_manifest.contains_key(*path))
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let selected_disk_paths = record_preflight
+                    .as_ref()
+                    .map(|preflight| {
+                        preflight
+                            .expected_observed_present_paths
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| {
+                        selected_paths
+                            .iter()
+                            .filter(|path| disk_manifest.contains_key(*path))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    });
                 let disk_files =
                     self.scan_files_under_for_paths(record_scan_root, &selected_disk_paths)?;
-                let built = if let Some(case_fold_tree) = case_fold_tree {
-                    self.build_root_for_selected_disk_files_incremental_with_case_fold_tree(
+                let built = if let Some(record_preflight) = record_preflight {
+                    self.build_root_for_selected_disk_files_incremental_with_record_preflight(
+                        record_scan_root,
                         &head.root_id,
                         &previous_files,
                         &disk_files,
                         &selected_paths,
                         &change_id,
-                        case_fold_tree,
+                        record_preflight,
                     )?
                 } else {
                     self.build_root_for_selected_disk_files_incremental(
@@ -595,6 +652,17 @@ impl Trail {
         head: &RefRecord,
         workdir_path: &Path,
     ) -> Result<Vec<FileDiffSummary>> {
+        Ok(self
+            .lane_workdir_record_changed_paths_with_case_fold(branch, head, workdir_path)?
+            .summaries)
+    }
+
+    fn lane_workdir_record_changed_paths_with_case_fold(
+        &self,
+        branch: &LaneBranch,
+        head: &RefRecord,
+        workdir_path: &Path,
+    ) -> Result<RecordChangedPaths> {
         let lane_record = self.lane_record(&branch.lane_id)?;
         let workdir_mode = self.lane_workdir_mode_for(&lane_record, branch)?;
         if workdir_mode.is_transparent_cow() {
@@ -605,12 +673,22 @@ impl Trail {
                 .source_upper;
             let disk_files = self.scan_files_under_for_paths(&source_upper, &candidate_paths)?;
             let disk_manifest = self.disk_manifest(&disk_files);
-            let previous_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
-            return Ok(self.diff_file_maps_to_manifest_for_paths(
-                &previous_files,
-                &disk_manifest,
+            let resolution = self.resolve_record_case_fold_candidates_read_only(
+                &head.root_id,
                 &candidate_paths,
-            ));
+                &disk_manifest,
+            )?;
+            let case_fold = record_changed_paths_case_fold(&resolution.state);
+            let candidate_paths = resolution.selected_paths;
+            let previous_files = self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
+            return Ok(RecordChangedPaths {
+                summaries: self.diff_file_maps_to_manifest_for_paths(
+                    &previous_files,
+                    &disk_manifest,
+                    &candidate_paths,
+                ),
+                case_fold,
+            });
         }
         let sparse_paths = self.lane_sparse_workdir_paths(branch, workdir_path)?;
         let layered_manifest_path = self.lane_layered_clean_manifest_path(branch)?;
@@ -619,7 +697,10 @@ impl Trail {
             layered_manifest_path.as_deref(),
             &head.root_id,
         )? {
-            CachedWorkdirManifestStatus::Clean => Ok(Vec::new()),
+            CachedWorkdirManifestStatus::Clean => Ok(RecordChangedPaths {
+                summaries: Vec::new(),
+                case_fold: RecordChangedPathsCaseFold::AlreadySafe,
+            }),
             CachedWorkdirManifestStatus::Dirty {
                 disk_manifest,
                 candidate_paths,
@@ -630,30 +711,38 @@ impl Trail {
                     selected_paths.dedup();
                     let previous_files =
                         self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-                    Ok(self.diff_file_maps_to_manifest_for_paths(
-                        &previous_files,
-                        &disk_manifest,
-                        &selected_paths,
-                    ))
+                    Ok(RecordChangedPaths {
+                        summaries: self.diff_file_maps_to_manifest_for_paths(
+                            &previous_files,
+                            &disk_manifest,
+                            &selected_paths,
+                        ),
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 } else if let Some(candidate_paths) = candidate_paths {
-                    let candidate_paths = match self.preflight_record_case_fold_candidates(
+                    let resolution = self.resolve_record_case_fold_candidates_read_only(
                         &head.root_id,
                         &candidate_paths,
                         &disk_manifest,
-                    ) {
-                        Ok(preflight) => preflight.selected_paths,
-                        Err(Error::InvalidPath { .. }) => candidate_paths,
-                        Err(err) => return Err(err),
-                    };
+                    )?;
+                    let case_fold = record_changed_paths_case_fold(&resolution.state);
+                    let candidate_paths = resolution.selected_paths;
                     let previous_files =
                         self.load_root_files_for_paths(&head.root_id, &candidate_paths)?;
-                    Ok(self.diff_file_maps_to_manifest_for_paths(
-                        &previous_files,
-                        &disk_manifest,
-                        &candidate_paths,
-                    ))
+                    Ok(RecordChangedPaths {
+                        summaries: self.diff_file_maps_to_manifest_for_paths(
+                            &previous_files,
+                            &disk_manifest,
+                            &candidate_paths,
+                        ),
+                        case_fold,
+                    })
                 } else {
-                    self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)
+                    Ok(RecordChangedPaths {
+                        summaries: self
+                            .diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?,
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 }
             }
             CachedWorkdirManifestStatus::Missing => {
@@ -665,13 +754,20 @@ impl Trail {
                     selected_paths.dedup();
                     let previous_files =
                         self.load_root_files_for_selections(&head.root_id, &selected_paths)?;
-                    Ok(self.diff_file_maps_to_manifest_for_paths(
-                        &previous_files,
-                        &disk_manifest,
-                        &selected_paths,
-                    ))
+                    Ok(RecordChangedPaths {
+                        summaries: self.diff_file_maps_to_manifest_for_paths(
+                            &previous_files,
+                            &disk_manifest,
+                            &selected_paths,
+                        ),
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 } else {
-                    self.diff_root_to_disk_manifest(&head.root_id, &disk_manifest)
+                    Ok(RecordChangedPaths {
+                        summaries: self
+                            .diff_root_to_disk_manifest(&head.root_id, &disk_manifest)?,
+                        case_fold: RecordChangedPathsCaseFold::NeedsValidation,
+                    })
                 }
             }
         }

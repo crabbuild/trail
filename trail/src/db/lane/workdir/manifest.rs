@@ -389,7 +389,7 @@ impl Trail {
         Ok(true)
     }
 
-    pub(crate) fn clean_workdir_manifest_allows_file_subset_update(
+    pub(crate) fn clean_workdir_manifest_allows_touched_path_update(
         &self,
         dir: &Path,
         previous_root_id: &ObjectId,
@@ -407,15 +407,58 @@ impl Trail {
             return Ok(false);
         }
 
-        let mut paths = manifest.files.keys().cloned().collect::<BTreeSet<_>>();
-        for path in previous.keys() {
-            if !target.contains_key(path) {
-                paths.remove(path);
+        let case_insensitive = is_case_insensitive_filesystem(dir)?;
+        let candidate_paths = previous
+            .keys()
+            .chain(target.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let observed =
+            observed_exact_paths_for_candidates(dir, &candidate_paths, case_insensitive)?;
+
+        for (path, entry) in previous {
+            let Some(cached) = manifest.files.get(path) else {
+                return Ok(false);
+            };
+            if cached.kind != entry.kind || cached.content_hash != entry.content_hash {
+                return Ok(false);
+            }
+            if observed.get(path) != Some(&ObservedPathKind::RegularFile) {
+                return Ok(false);
+            }
+            let metadata = match fs::symlink_metadata(safe_join(dir, path)?) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => return Err(Error::Io(err)),
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || cached.stamp != WorkdirFileStamp::from_metadata(&metadata)
+            {
+                return Ok(false);
             }
         }
-        paths.extend(target.keys().cloned());
-        if is_case_insensitive_filesystem(dir)? {
-            validate_no_case_fold_collisions(paths.iter())?;
+
+        let removed_paths = previous
+            .keys()
+            .filter(|path| !target.contains_key(*path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for path in target.keys().filter(|path| !previous.contains_key(*path)) {
+            let folded = case_insensitive_path_key(path);
+            let observed_aliases = observed
+                .keys()
+                .filter(|observed_path| case_insensitive_path_key(observed_path) == folded)
+                .collect::<Vec<_>>();
+            let aliases_are_removed_previous = observed_aliases.iter().all(|observed_path| {
+                removed_paths.contains(*observed_path)
+                    && case_insensitive_path_key(observed_path) == folded
+            });
+            if !observed_aliases.is_empty() && !aliases_are_removed_previous {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -561,16 +604,21 @@ impl Trail {
         let mut files = self.scan_workdir_file_stamps(&root)?;
         let case_insensitive = is_case_insensitive_filesystem(&root)?;
         let mut exact_paths = files.keys().cloned().collect::<BTreeSet<_>>();
-        let mut folded_counts = BTreeMap::<String, usize>::new();
-        for path in &exact_paths {
-            *folded_counts
-                .entry(case_insensitive_path_key(path))
-                .or_default() += 1;
-        }
-        let mut folded_paths = folded_counts.keys().cloned().collect::<BTreeSet<_>>();
+        let observed = observed_exact_paths_for_candidates(&root, pinned_paths, case_insensitive)?;
+        let actual_paths = observed.keys().cloned().collect::<BTreeSet<_>>();
+        let folded_paths = actual_paths
+            .iter()
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>();
         for path in pinned_paths {
             let path = normalize_relative_path(path)?;
-            if !pinned_path_needs_probe(case_insensitive, &exact_paths, &folded_paths, &path) {
+            if !pinned_path_needs_probe(
+                case_insensitive,
+                &exact_paths,
+                &actual_paths,
+                &folded_paths,
+                &path,
+            ) {
                 continue;
             }
             let abs = safe_join(&root, &path)?;
@@ -578,31 +626,17 @@ impl Trail {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     files.remove(&path);
-                    remove_observed_path(
-                        &mut exact_paths,
-                        &mut folded_paths,
-                        &mut folded_counts,
-                        &path,
-                    );
+                    exact_paths.remove(&path);
                     continue;
                 }
                 Err(err) => return Err(Error::Io(err)),
             };
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 files.remove(&path);
-                remove_observed_path(
-                    &mut exact_paths,
-                    &mut folded_paths,
-                    &mut folded_counts,
-                    &path,
-                );
+                exact_paths.remove(&path);
                 continue;
             }
-            if exact_paths.insert(path.clone()) {
-                let folded = case_insensitive_path_key(&path);
-                *folded_counts.entry(folded.clone()).or_default() += 1;
-                folded_paths.insert(folded);
-            }
+            exact_paths.insert(path.clone());
             files.insert(path, WorkdirFileStamp::from_metadata(&metadata));
         }
         Ok(files)
@@ -612,32 +646,14 @@ impl Trail {
 fn pinned_path_needs_probe(
     case_insensitive: bool,
     exact_paths: &BTreeSet<String>,
+    actual_paths: &BTreeSet<String>,
     folded_paths: &BTreeSet<String>,
     path: &str,
 ) -> bool {
     !case_insensitive
         || exact_paths.contains(path)
+        || actual_paths.contains(path)
         || !folded_paths.contains(&case_insensitive_path_key(path))
-}
-
-fn remove_observed_path(
-    exact_paths: &mut BTreeSet<String>,
-    folded_paths: &mut BTreeSet<String>,
-    folded_counts: &mut BTreeMap<String, usize>,
-    path: &str,
-) {
-    if !exact_paths.remove(path) {
-        return;
-    }
-    let folded = case_insensitive_path_key(path);
-    let Some(count) = folded_counts.get_mut(&folded) else {
-        return;
-    };
-    *count -= 1;
-    if *count == 0 {
-        folded_counts.remove(&folded);
-        folded_paths.remove(&folded);
-    }
 }
 
 fn clean_workdir_manifest_path(dir: &Path) -> PathBuf {
@@ -807,37 +823,168 @@ mod tests {
 
     #[test]
     fn pinned_path_probe_skips_different_spelling_already_seen_by_directory_scan() {
-        let exact_paths = ["readme.md".to_string()]
+        let visible_paths = ["readme.md".to_string()]
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let folded_paths = exact_paths
+        let actual_paths = visible_paths.clone();
+        let folded_paths = actual_paths
             .iter()
             .map(|path| case_insensitive_path_key(path))
             .collect::<BTreeSet<_>>();
 
         assert!(!pinned_path_needs_probe(
             true,
-            &exact_paths,
+            &visible_paths,
+            &actual_paths,
             &folded_paths,
             "README.md"
         ));
         assert!(pinned_path_needs_probe(
             true,
-            &exact_paths,
+            &visible_paths,
+            &actual_paths,
             &folded_paths,
             "readme.md"
         ));
         assert!(pinned_path_needs_probe(
             true,
-            &exact_paths,
+            &visible_paths,
+            &actual_paths,
             &folded_paths,
             "other.md"
         ));
         assert!(pinned_path_needs_probe(
             false,
-            &exact_paths,
+            &visible_paths,
+            &actual_paths,
             &folded_paths,
             "README.md"
         ));
+
+        let ignored_visible = BTreeSet::new();
+        assert!(!pinned_path_needs_probe(
+            true,
+            &ignored_visible,
+            &actual_paths,
+            &folded_paths,
+            "README.md"
+        ));
+        assert!(pinned_path_needs_probe(
+            true,
+            &ignored_visible,
+            &actual_paths,
+            &folded_paths,
+            "readme.md"
+        ));
+    }
+
+    #[test]
+    fn ignored_actual_spelling_prevents_fabricated_pinned_alias() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("readme.md"), "ignored\n").unwrap();
+        fs::write(workspace.path().join(".trailignore"), "readme.md\n").unwrap();
+        Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = Trail::open(workspace.path()).unwrap();
+        let visible = db.scan_workdir_file_stamps(workspace.path()).unwrap();
+        assert!(!visible.contains_key("readme.md"));
+
+        let observed =
+            observed_exact_paths_for_candidates(workspace.path(), &["README.md".to_string()], true)
+                .unwrap();
+        let actual_paths = observed.keys().cloned().collect::<BTreeSet<_>>();
+        let folded_paths = actual_paths
+            .iter()
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>();
+        assert!(actual_paths.contains("readme.md"));
+        assert!(!pinned_path_needs_probe(
+            true,
+            &BTreeSet::new(),
+            &actual_paths,
+            &folded_paths,
+            "README.md",
+        ));
+    }
+
+    #[test]
+    fn touched_manifest_guard_does_not_probe_unrelated_large_manifest_paths() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        let metadata = fs::symlink_metadata(workdir.path().join("a.txt")).unwrap();
+        let template = CleanWorkdirManifestEntry {
+            stamp: WorkdirFileStamp::from_metadata(&metadata),
+            kind: files["a.txt"].kind.clone(),
+            content_hash: files["a.txt"].content_hash.clone(),
+        };
+        let mut entries = BTreeMap::new();
+        entries.insert("a.txt".to_string(), template.clone());
+        for idx in 0..10_000 {
+            entries.insert(format!("missing/{idx:05}.txt"), template.clone());
+        }
+        db.write_clean_workdir_manifest_entries(workdir.path(), &head.root_id, entries)
+            .unwrap();
+        let previous = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let target = previous.clone();
+
+        assert!(db
+            .clean_workdir_manifest_allows_touched_path_update(
+                workdir.path(),
+                &head.root_id,
+                &previous,
+                &target,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn touched_manifest_guard_allows_case_only_rename_from_removed_path() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        db.write_clean_workdir_manifest(workdir.path(), &head.root_id, &files, files.keys())
+            .unwrap();
+        let previous = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let target = [("A.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(db
+            .clean_workdir_manifest_allows_touched_path_update(
+                workdir.path(),
+                &head.root_id,
+                &previous,
+                &target,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn touched_manifest_guard_rejects_external_new_target() {
+        let (_workspace, workdir, db, head, files) =
+            workdir_manifest_from_materialization_stamps_fixture();
+        db.write_clean_workdir_manifest(workdir.path(), &head.root_id, &files, files.keys())
+            .unwrap();
+        fs::write(workdir.path().join("external.txt"), "external\n").unwrap();
+        let previous = [("a.txt".to_string(), files["a.txt"].clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let target = [
+            ("a.txt".to_string(), files["a.txt"].clone()),
+            ("external.txt".to_string(), files["a.txt"].clone()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        assert!(!db
+            .clean_workdir_manifest_allows_touched_path_update(
+                workdir.path(),
+                &head.root_id,
+                &previous,
+                &target,
+            )
+            .unwrap());
     }
 }
