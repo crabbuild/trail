@@ -110,7 +110,7 @@ pub(super) fn lane_schemas() -> Value {
             "properties": {
                 "mode": { "type": "string", "enum": ["unknown", "indexed"], "description": "Path resolution used by this operation." },
                 "lookup_count": { "type": "integer", "minimum": 0, "description": "Unique folded keys looked up in the persisted path index." },
-                "full_root_path_load_count": { "type": "integer", "minimum": 0, "description": "Eager loads of every path in a persisted root." },
+                "full_root_path_load_count": { "type": "integer", "minimum": 0, "description": "Unbounded traversals that enumerate every path in a persisted root." },
                 "full_filesystem_path_scan_count": { "type": "integer", "minimum": 0, "description": "Unbounded repository-shaped filesystem validation walks; explicitly selected sparse materializations are excluded." }
             }
         },

@@ -6,6 +6,7 @@ impl Trail {
         &self,
         root_id: &ObjectId,
     ) -> Result<Vec<FileDiffSummary>> {
+        self.note_full_root_path_load();
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut root_iter = self.root_prolly.range(&tree, &[], None)?;
@@ -65,6 +66,7 @@ impl Trail {
         root_id: &ObjectId,
         manifest: &BTreeMap<String, DiskManifest>,
     ) -> Result<Vec<FileDiffSummary>> {
+        self.note_full_root_path_load();
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let mut root_iter = self.root_prolly.range(&tree, &[], None)?;

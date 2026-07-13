@@ -267,6 +267,7 @@ impl Trail {
     where
         F: FnMut(BTreeMap<String, FileEntry>) -> Result<()>,
     {
+        self.note_full_root_path_load();
         let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
         let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
         let iter = self.root_prolly.range(&tree, &[], None)?;

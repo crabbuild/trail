@@ -89,7 +89,9 @@ Patch and record JSON reports include an operation-scoped `path_index` object:
 - `lookup_count`: number of folded-key index lookups. This must be no greater
   than the unique folded old/new paths touched by the completed operation;
   content-only writes to existing exact paths can require zero lookups.
-- `full_root_path_load_count`: eager loads of every path in a persisted root.
+- `full_root_path_load_count`: unbounded traversals that enumerate every path
+  in a persisted root. A fallback that loads both the previous and target roots
+  counts twice.
 - `full_filesystem_path_scan_count`: unbounded repository-shaped filesystem
   traversals used for path validation. A full materialized workdir validation
   counts as one, including a clean no-op. Walking an explicitly selected sparse
@@ -100,6 +102,14 @@ retries, and no-ops. This prevents a prior operation from making a later report
 look unbounded. The benchmark extractor independently folds changed paths with
 the same NFKC, per-codepoint lowercase, then NFC sequence as the Rust index and
 rejects malformed or internally inconsistent reports.
+
+A full materialized lane patch normally updates a valid clean manifest from its
+touched subset. If that manifest is missing or stale, the correctness fallback
+loads both complete roots and reports
+`full_root_path_load_count=2`. Likewise, a full materialized record without a
+usable manifest compares one complete root to the disk manifest and reports
+`full_root_path_load_count=1`. These are deliberately visible cold paths; the
+no-materialize and explicitly sparse benchmark operations must remain zero.
 
 Important hot-path rows:
 

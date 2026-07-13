@@ -748,7 +748,7 @@ pub struct PathIndexMetricsReport {
     /// Number of unique folded keys looked up in the persisted path index.
     #[serde(default)]
     pub lookup_count: u64,
-    /// Number of times every path in a persisted root was loaded eagerly.
+    /// Number of unbounded traversals that enumerate every persisted root path.
     #[serde(default)]
     pub full_root_path_load_count: u64,
     /// Number of unbounded repository-shaped filesystem validation walks.
