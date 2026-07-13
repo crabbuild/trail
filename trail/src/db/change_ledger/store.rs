@@ -13,6 +13,7 @@ struct ScopeRow {
     state: TrustState,
     reason: String,
     durable_offset: u64,
+    folded_offset: u64,
     max_candidate_rows: u64,
     max_prefix_rows: u64,
 }
@@ -102,11 +103,12 @@ impl<'a> ChangedPathLedger<'a> {
             ));
         }
 
-        let tx = self.conn.unchecked_transaction()?;
-        cas_guard(&tx, expected, false)?;
+        let mut tx = self.conn.unchecked_transaction()?;
+        let scope = evidence_write_guard(&tx, expected)?;
+        let mut savepoint = tx.savepoint()?;
         let scope_id = expected.scope_id.to_text();
         let incoming = prefix.path.as_str();
-        let mut statement = tx.prepare(
+        let mut statement = savepoint.prepare(
             "SELECT normalized_prefix, completeness_reason, source_mask,
                     first_sequence, last_sequence
              FROM changed_path_prefixes
@@ -153,19 +155,19 @@ impl<'a> ChangedPathLedger<'a> {
             source_mask |= row.2;
         }
         for (path, ..) in &overlaps {
-            tx.execute(
+            savepoint.execute(
                 "DELETE FROM changed_path_prefixes
                  WHERE scope_id = ?1 AND normalized_prefix = ?2 COLLATE BINARY",
                 params![scope_id, path],
             )?;
         }
         let now = now_ts();
-        tx.execute(
+        savepoint.execute(
             "INSERT INTO changed_path_prefixes(
                  scope_id, normalized_prefix, completeness_reason, event_flags,
                  source_mask, first_sequence, last_sequence, provider_id,
                  provider_sequence, intent_id, created_at, updated_at
-             ) VALUES(?1, ?2, ?3, 0, ?4, ?5, ?6, 'reconciliation', ?6, NULL, ?7, ?7)",
+             ) VALUES(?1, ?2, ?3, 0, ?4, ?5, ?6, 'reconciliation', NULL, NULL, ?7, ?7)",
             params![
                 scope_id,
                 merged_path,
@@ -176,7 +178,20 @@ impl<'a> ChangedPathLedger<'a> {
                 now,
             ],
         )?;
-        enforce_caps(&tx, expected)?;
+        let overflowed = caps_exceeded(&savepoint, &scope, &scope_id)?;
+        if overflowed {
+            savepoint.rollback()?;
+        }
+        savepoint.commit()?;
+        if overflowed {
+            mark_scope_overflow(&tx, expected)?;
+            tx.commit()?;
+            return Err(reconcile_error(
+                expected,
+                TrustState::Overflow,
+                "persisted evidence cap exceeded",
+            ));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -226,19 +241,46 @@ impl<'a> ChangedPathLedger<'a> {
         &self,
         expected: &ExpectedScope,
     ) -> Result<CandidateSnapshot> {
-        let scope = load_scope(self.conn, expected)?;
+        self.snapshot_candidates_in_transaction(expected, || {})
+    }
+
+    #[cfg(test)]
+    fn snapshot_candidates_with_phase_hook<F>(
+        &self,
+        expected: &ExpectedScope,
+        after_scope_read: F,
+    ) -> Result<CandidateSnapshot>
+    where
+        F: FnOnce(),
+    {
+        self.snapshot_candidates_in_transaction(expected, after_scope_read)
+    }
+
+    fn snapshot_candidates_in_transaction<F>(
+        &self,
+        expected: &ExpectedScope,
+        after_scope_read: F,
+    ) -> Result<CandidateSnapshot>
+    where
+        F: FnOnce(),
+    {
+        let tx = self.conn.unchecked_transaction()?;
+        let scope = load_scope(&tx, expected)?;
         if scope.state != TrustState::Trusted {
             return Err(reconcile_error(expected, scope.state, &scope.reason));
         }
-        let scope_id = expected.scope_id.to_text();
-        let exact_count = row_count(self.conn, "changed_path_entries", &scope_id)?;
-        let prefix_count = row_count(self.conn, "changed_path_prefixes", &scope_id)?;
-        if exact_count > scope.max_candidate_rows || prefix_count > scope.max_prefix_rows {
-            self.mark_untrusted(
+        if scope.durable_offset != scope.folded_offset {
+            return Err(reconcile_error(
                 expected,
-                TrustState::Overflow,
-                "persisted evidence cap exceeded",
-            )?;
+                TrustState::UntrustedGap,
+                "durable observer evidence is not fully folded",
+            ));
+        }
+        after_scope_read();
+        let scope_id = expected.scope_id.to_text();
+        let exact_count = row_count(&tx, "changed_path_entries", &scope_id)?;
+        let prefix_count = row_count(&tx, "changed_path_prefixes", &scope_id)?;
+        if exact_count > scope.max_candidate_rows || prefix_count > scope.max_prefix_rows {
             return Err(reconcile_error(
                 expected,
                 TrustState::Overflow,
@@ -246,8 +288,7 @@ impl<'a> ChangedPathLedger<'a> {
             ));
         }
 
-        let exact_path_values = self
-            .conn
+        let exact_path_values = tx
             .prepare(
                 "SELECT normalized_path FROM changed_path_entries
                  WHERE scope_id = ?1 ORDER BY normalized_path COLLATE BINARY",
@@ -259,8 +300,7 @@ impl<'a> ChangedPathLedger<'a> {
             .map(|path| LedgerPath::parse(path))
             .collect::<Result<Vec<_>>>()?;
 
-        let prefix_values = self
-            .conn
+        let prefix_values = tx
             .prepare(
                 "SELECT normalized_prefix, completeness_reason,
                         first_sequence, last_sequence
@@ -288,23 +328,34 @@ impl<'a> ChangedPathLedger<'a> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let sequence = self.conn.query_row(
-            "SELECT COALESCE(MAX(last_sequence), 0) FROM changed_path_entries
-             WHERE scope_id = ?1 AND (source_mask & ?2) != 0",
+        let sequence = tx.query_row(
+            "SELECT COALESCE(MAX(provider_sequence), 0)
+             FROM (
+                 SELECT provider_sequence FROM changed_path_entries
+                 WHERE scope_id = ?1 AND (source_mask & ?2) != 0
+                   AND provider_sequence IS NOT NULL
+                 UNION ALL
+                 SELECT provider_sequence FROM changed_path_prefixes
+                 WHERE scope_id = ?1 AND (source_mask & ?2) != 0
+                   AND provider_sequence IS NOT NULL
+             )",
             params![scope_id, EvidenceSource::Observer.mask()],
             |row| row.get::<_, i64>(0),
         )?;
-        Ok(CandidateSnapshot {
+        let snapshot = CandidateSnapshot {
             expected: expected.clone(),
             cut: EvidenceCut {
                 source: EvidenceSource::Observer,
                 sequence: db_u64(sequence, "observer sequence")?,
                 durable_offset: scope.durable_offset,
+                folded_offset: scope.folded_offset,
             },
             exact_paths,
             prefixes,
             trust: TrustState::Trusted,
-        })
+        };
+        tx.commit()?;
+        Ok(snapshot)
     }
 
     pub(crate) fn acknowledge(
@@ -326,17 +377,25 @@ impl<'a> ChangedPathLedger<'a> {
         let through = cut.sequence.min(owned.through_sequence);
         let tx = self.conn.unchecked_transaction()?;
         cas_guard(&tx, expected, true)?;
+        let scope = load_scope(&tx, expected)?;
+        validate_cut_boundaries(expected, &scope, cut)?;
         let scope_id = expected.scope_id.to_text();
         for path in &owned.exact_paths {
             tx.execute(
                 "DELETE FROM changed_path_entries
                  WHERE scope_id = ?1 AND normalized_path = ?2 COLLATE BINARY
-                   AND source_mask = ?3 AND last_sequence <= ?4",
+                   AND source_mask = ?3
+                   AND (
+                       (?3 = ?5 AND provider_sequence IS NOT NULL
+                           AND provider_sequence <= ?4)
+                       OR (?3 != ?5 AND last_sequence <= ?4)
+                   )",
                 params![
                     scope_id,
                     path.as_str(),
                     owned.source.mask(),
                     sql_u64(through, "acknowledgement sequence")?,
+                    EvidenceSource::Observer.mask(),
                 ],
             )?;
         }
@@ -344,16 +403,21 @@ impl<'a> ChangedPathLedger<'a> {
             tx.execute(
                 "DELETE FROM changed_path_prefixes
                  WHERE scope_id = ?1 AND normalized_prefix = ?2 COLLATE BINARY
-                   AND source_mask = ?3 AND last_sequence <= ?4",
+                   AND source_mask = ?3
+                   AND (
+                       (?3 = ?5 AND provider_sequence IS NOT NULL
+                           AND provider_sequence <= ?4)
+                       OR (?3 != ?5 AND last_sequence <= ?4)
+                   )",
                 params![
                     scope_id,
                     prefix.path.as_str(),
                     owned.source.mask(),
                     sql_u64(through, "acknowledgement sequence")?,
+                    EvidenceSource::Observer.mask(),
                 ],
             )?;
         }
-        update_offsets(&tx, expected, cut.durable_offset)?;
         tx.commit()?;
         Ok(())
     }
@@ -364,26 +428,26 @@ impl<'a> ChangedPathLedger<'a> {
         target: &BaselineIdentity,
         cut: &EvidenceCut,
     ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        cas_guard(&tx, expected, true)?;
+        let scope = load_scope(&tx, expected)?;
+        validate_cut_boundaries(expected, &scope, cut)?;
         let encoded = EncodedExpected::new(expected)?;
-        let durable_offset = sql_u64(cut.durable_offset, "durable offset")?;
-        let changed = self.conn.execute(
+        let changed = tx.execute(
             "UPDATE changed_path_scopes
              SET ref_name = ?1, ref_generation = ?2, change_id = ?3,
-                 baseline_root_id = ?4,
-                 durable_offset = MAX(durable_offset, ?5),
-                 folded_offset = MAX(folded_offset, ?5), updated_at = ?6
-             WHERE scope_id = ?7 AND epoch = ?8 AND ref_name = ?9
-               AND ref_generation = ?10 AND baseline_root_id = ?11
-               AND policy_fingerprint = ?12
-               AND policy_dependency_generation = ?13
-               AND filesystem_identity = ?14 AND provider_identity = ?15
+                 baseline_root_id = ?4, updated_at = ?5
+             WHERE scope_id = ?6 AND epoch = ?7 AND ref_name = ?8
+               AND ref_generation = ?9 AND baseline_root_id = ?10
+               AND policy_fingerprint = ?11
+               AND policy_dependency_generation = ?12
+               AND filesystem_identity = ?13 AND provider_identity = ?14
                AND trust_state = 'trusted'",
             params![
                 target.ref_name,
                 sql_u64(target.ref_generation, "target ref generation")?,
                 target.change_id.0,
                 target.root_id.0,
-                durable_offset,
                 now_ts(),
                 encoded.scope_id,
                 encoded.epoch,
@@ -397,8 +461,9 @@ impl<'a> ChangedPathLedger<'a> {
             ],
         )?;
         if changed == 0 {
-            return Err(stale_cas_error(self.conn, expected));
+            return Err(stale_cas_error(&tx, expected));
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -410,16 +475,18 @@ impl<'a> ChangedPathLedger<'a> {
         source: EvidenceSource,
         sequence: u64,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        cas_guard(&tx, expected, false)?;
+        let mut tx = self.conn.unchecked_transaction()?;
+        let scope = evidence_write_guard(&tx, expected)?;
+        let mut savepoint = tx.savepoint()?;
         let now = now_ts();
         let sequence = sql_u64(sequence, "source sequence")?;
-        tx.execute(
+        let provider_sequence = (source == EvidenceSource::Observer).then_some(sequence);
+        savepoint.execute(
             "INSERT INTO changed_path_entries(
                  scope_id, normalized_path, event_flags, source_mask,
                  first_sequence, last_sequence, provider_id,
                  provider_sequence, intent_id, created_at, updated_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?5, ?6, ?5, NULL, ?7, ?7)
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, NULL, ?8, ?8)
              ON CONFLICT(scope_id, normalized_path) DO UPDATE SET
                  event_flags = changed_path_entries.event_flags | excluded.event_flags,
                  source_mask = changed_path_entries.source_mask | excluded.source_mask,
@@ -428,7 +495,13 @@ impl<'a> ChangedPathLedger<'a> {
                  provider_id = CASE
                      WHEN changed_path_entries.source_mask = excluded.source_mask
                      THEN excluded.provider_id ELSE NULL END,
-                 provider_sequence = MAX(changed_path_entries.provider_sequence, excluded.provider_sequence),
+                 provider_sequence = CASE
+                     WHEN excluded.provider_sequence IS NULL
+                     THEN changed_path_entries.provider_sequence
+                     WHEN changed_path_entries.provider_sequence IS NULL
+                     THEN excluded.provider_sequence
+                     ELSE MAX(changed_path_entries.provider_sequence, excluded.provider_sequence)
+                 END,
                  updated_at = excluded.updated_at",
             params![
                 expected.scope_id.to_text(),
@@ -437,10 +510,25 @@ impl<'a> ChangedPathLedger<'a> {
                 source.mask(),
                 sequence,
                 source.as_str(),
+                provider_sequence,
                 now,
             ],
         )?;
-        enforce_caps(&tx, expected)?;
+        let scope_id = expected.scope_id.to_text();
+        let overflowed = caps_exceeded(&savepoint, &scope, &scope_id)?;
+        if overflowed {
+            savepoint.rollback()?;
+        }
+        savepoint.commit()?;
+        if overflowed {
+            mark_scope_overflow(&tx, expected)?;
+            tx.commit()?;
+            return Err(reconcile_error(
+                expected,
+                TrustState::Overflow,
+                "persisted evidence cap exceeded",
+            ));
+        }
         tx.commit()?;
         Ok(())
     }
@@ -536,7 +624,7 @@ fn load_scope(conn: &Connection, expected: &ExpectedScope) -> Result<ScopeRow> {
     let encoded = EncodedExpected::new(expected)?;
     let row = conn
         .query_row(
-            "SELECT trust_state, trust_reason, durable_offset,
+            "SELECT trust_state, trust_reason, durable_offset, folded_offset,
                     max_candidate_rows, max_prefix_rows
              FROM changed_path_scopes
              WHERE scope_id = ?1 AND epoch = ?2 AND ref_name = ?3
@@ -561,30 +649,42 @@ fn load_scope(conn: &Connection, expected: &ExpectedScope) -> Result<ScopeRow> {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((state, reason, durable_offset, max_candidate_rows, max_prefix_rows)) = row else {
+    let Some((state, reason, durable_offset, folded_offset, max_candidate_rows, max_prefix_rows)) =
+        row
+    else {
         return Err(stale_cas_error(conn, expected));
     };
     Ok(ScopeRow {
         state: TrustState::parse(&state)?,
         reason,
         durable_offset: db_u64(durable_offset, "durable offset")?,
+        folded_offset: db_u64(folded_offset, "folded offset")?,
         max_candidate_rows: db_u64(max_candidate_rows, "candidate row cap")?,
         max_prefix_rows: db_u64(max_prefix_rows, "prefix row cap")?,
     })
 }
 
-fn enforce_caps(conn: &Connection, expected: &ExpectedScope) -> Result<()> {
+fn evidence_write_guard(conn: &Connection, expected: &ExpectedScope) -> Result<ScopeRow> {
+    cas_guard(conn, expected, false)?;
     let scope = load_scope(conn, expected)?;
-    let scope_id = expected.scope_id.to_text();
-    let candidates = row_count(conn, "changed_path_entries", &scope_id)?;
-    let prefixes = row_count(conn, "changed_path_prefixes", &scope_id)?;
-    if candidates <= scope.max_candidate_rows && prefixes <= scope.max_prefix_rows {
-        return Ok(());
+    if matches!(scope.state, TrustState::Overflow | TrustState::Corrupt) {
+        return Err(reconcile_error(expected, scope.state, &scope.reason));
     }
+    Ok(scope)
+}
+
+fn caps_exceeded(conn: &Connection, scope: &ScopeRow, scope_id: &str) -> Result<bool> {
+    let candidates = row_count(conn, "changed_path_entries", scope_id)?;
+    let prefixes = row_count(conn, "changed_path_prefixes", scope_id)?;
+    Ok(candidates > scope.max_candidate_rows || prefixes > scope.max_prefix_rows)
+}
+
+fn mark_scope_overflow(conn: &Connection, expected: &ExpectedScope) -> Result<()> {
     let encoded = EncodedExpected::new(expected)?;
     let changed = conn.execute(
         "UPDATE changed_path_scopes
@@ -613,33 +713,17 @@ fn enforce_caps(conn: &Connection, expected: &ExpectedScope) -> Result<()> {
     Ok(())
 }
 
-fn update_offsets(conn: &Connection, expected: &ExpectedScope, durable_offset: u64) -> Result<()> {
-    let encoded = EncodedExpected::new(expected)?;
-    let changed = conn.execute(
-        "UPDATE changed_path_scopes
-         SET durable_offset = MAX(durable_offset, ?1),
-             folded_offset = MAX(folded_offset, ?1), updated_at = ?2
-         WHERE scope_id = ?3 AND epoch = ?4 AND ref_name = ?5
-           AND ref_generation = ?6 AND baseline_root_id = ?7
-           AND policy_fingerprint = ?8 AND policy_dependency_generation = ?9
-           AND filesystem_identity = ?10 AND provider_identity = ?11
-           AND trust_state = 'trusted'",
-        params![
-            sql_u64(durable_offset, "durable offset")?,
-            now_ts(),
-            encoded.scope_id,
-            encoded.epoch,
-            expected.ref_name,
-            encoded.ref_generation,
-            expected.baseline_root.0,
-            encoded.policy_fingerprint,
-            encoded.policy_generation,
-            encoded.filesystem_identity,
-            encoded.provider_identity,
-        ],
-    )?;
-    if changed == 0 {
-        return Err(stale_cas_error(conn, expected));
+fn validate_cut_boundaries(
+    expected: &ExpectedScope,
+    scope: &ScopeRow,
+    cut: &EvidenceCut,
+) -> Result<()> {
+    if cut.durable_offset != scope.durable_offset || cut.folded_offset != scope.folded_offset {
+        return Err(reconcile_error(
+            expected,
+            TrustState::UntrustedGap,
+            "evidence cut does not match the persisted observer boundaries",
+        ));
     }
     Ok(())
 }
@@ -998,6 +1082,77 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rejects_an_unfolded_durable_tail() {
+        let conn = fixture(10, 10);
+        conn.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state = 'trusted', durable_offset = 8, folded_offset = 5",
+            [],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ChangedPathLedger::new(&conn).snapshot_candidates(&expected()),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_candidates_uses_one_read_snapshot_across_all_phases() {
+        let workspace = tempfile::tempdir().unwrap();
+        let database = workspace.path().join("ledger.db");
+        let reader = Connection::open(&database).unwrap();
+        reader.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        reader.execute_batch(FIXTURE_SCHEMA).unwrap();
+        ChangedPathLedger::new(&reader)
+            .begin_scope(
+                &scope_identity(),
+                &baseline(),
+                &policy(),
+                &filesystem(),
+                &provider(),
+            )
+            .unwrap();
+        let before = LedgerPath::parse("before").unwrap();
+        ChangedPathLedger::new(&reader)
+            .upsert_exact(
+                &expected(),
+                &before,
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                1,
+            )
+            .unwrap();
+        set_trust(&reader, TrustState::Trusted);
+        let writer = Connection::open(&database).unwrap();
+
+        let snapshot = ChangedPathLedger::new(&reader)
+            .snapshot_candidates_with_phase_hook(&expected(), || {
+                ChangedPathLedger::new(&writer)
+                    .upsert_exact(
+                        &expected(),
+                        &LedgerPath::parse("after").unwrap(),
+                        EvidenceFlags::CONTENT,
+                        EvidenceSource::Observer,
+                        2,
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.exact_paths, vec![before]);
+        assert_eq!(snapshot.cut.sequence, 1);
+        assert_eq!(
+            writer
+                .query_row("SELECT COUNT(*) FROM changed_path_entries", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn every_scope_mutation_rejects_a_stale_exact_cas_tuple() {
         let conn = fixture(10, 10);
         set_trust(&conn, TrustState::Trusted);
@@ -1049,6 +1204,7 @@ mod tests {
                         source: EvidenceSource::Observer,
                         sequence: 1,
                         durable_offset: 1,
+                        folded_offset: 1,
                     },
                     &OwnedEvidence {
                         source: EvidenceSource::Observer,
@@ -1069,6 +1225,7 @@ mod tests {
                         source: EvidenceSource::Observer,
                         sequence: 1,
                         durable_offset: 1,
+                        folded_offset: 1,
                     },
                 ),
             ];
@@ -1137,35 +1294,320 @@ mod tests {
     }
 
     #[test]
-    fn row_caps_atomically_mark_the_scope_overflowed() {
+    fn non_observer_sequences_do_not_inflate_the_observer_cut() {
+        let conn = fixture(10, 10);
+        let ledger = ChangedPathLedger::new(&conn);
+        let mixed = LedgerPath::parse("mixed").unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &mixed,
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                5,
+            )
+            .unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &mixed,
+                EvidenceFlags::MODE,
+                EvidenceSource::Intent,
+                500,
+            )
+            .unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &LedgerPath::parse("intent-only").unwrap(),
+                EvidenceFlags::CREATE,
+                EvidenceSource::Intent,
+                900,
+            )
+            .unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT provider_sequence FROM changed_path_entries
+                 WHERE normalized_path = 'intent-only'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+            None
+        );
+        set_trust(&conn, TrustState::Trusted);
+        assert_eq!(
+            ledger
+                .snapshot_candidates(&expected())
+                .unwrap()
+                .cut
+                .sequence,
+            5
+        );
+    }
+
+    #[test]
+    fn observer_acknowledgement_retains_mixed_and_later_observer_evidence() {
+        let conn = fixture(10, 10);
+        let ledger = ChangedPathLedger::new(&conn);
+        let mixed = LedgerPath::parse("mixed").unwrap();
+        let later = LedgerPath::parse("later").unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &mixed,
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                5,
+            )
+            .unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &mixed,
+                EvidenceFlags::MODE,
+                EvidenceSource::Intent,
+                500,
+            )
+            .unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &later,
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                6,
+            )
+            .unwrap();
+        set_trust(&conn, TrustState::Trusted);
+
+        ledger
+            .acknowledge(
+                &expected(),
+                &EvidenceCut {
+                    source: EvidenceSource::Observer,
+                    sequence: 5,
+                    durable_offset: 0,
+                    folded_offset: 0,
+                },
+                &OwnedEvidence {
+                    source: EvidenceSource::Observer,
+                    through_sequence: 5,
+                    exact_paths: vec![mixed, later],
+                    prefixes: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .all_exact(&expected())
+                .unwrap()
+                .into_iter()
+                .map(|evidence| evidence.path.0)
+                .collect::<Vec<_>>(),
+            vec!["later".to_string(), "mixed".to_string()]
+        );
+    }
+
+    #[test]
+    fn acknowledgement_rejects_scope_boundary_mismatch_before_deleting_evidence() {
+        let conn = fixture(10, 10);
+        let path = LedgerPath::parse("kept").unwrap();
+        let ledger = ChangedPathLedger::new(&conn);
+        ledger
+            .upsert_exact(
+                &expected(),
+                &path,
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                3,
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state = 'trusted', durable_offset = 10, folded_offset = 10",
+            [],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ledger.acknowledge(
+                &expected(),
+                &EvidenceCut {
+                    source: EvidenceSource::Observer,
+                    sequence: 3,
+                    durable_offset: 9,
+                    folded_offset: 9,
+                },
+                &OwnedEvidence {
+                    source: EvidenceSource::Observer,
+                    through_sequence: 3,
+                    exact_paths: vec![path],
+                    prefixes: Vec::new(),
+                },
+            ),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
+        assert_eq!(ledger.all_exact(&expected()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn baseline_advance_rejects_scope_boundary_mismatch() {
+        let conn = fixture(10, 10);
+        conn.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state = 'trusted', durable_offset = 10, folded_offset = 10",
+            [],
+        )
+        .unwrap();
+        let error = ChangedPathLedger::new(&conn)
+            .advance_baseline(
+                &expected(),
+                &BaselineIdentity {
+                    ref_name: "refs/branches/main".into(),
+                    ref_generation: 8,
+                    change_id: ChangeId("change-next".into()),
+                    root_id: ObjectId("root-next".into()),
+                },
+                &EvidenceCut {
+                    source: EvidenceSource::Observer,
+                    sequence: 3,
+                    durable_offset: 9,
+                    folded_offset: 9,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::ChangeLedgerReconcileRequired { .. }));
+        assert_eq!(
+            conn.query_row(
+                "SELECT ref_generation FROM changed_path_scopes",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn acknowledgement_and_baseline_advance_leave_observer_offsets_unchanged() {
+        let conn = fixture(10, 10);
+        conn.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state = 'trusted', durable_offset = 10, folded_offset = 10",
+            [],
+        )
+        .unwrap();
+        let ledger = ChangedPathLedger::new(&conn);
+        let cut = EvidenceCut {
+            source: EvidenceSource::Intent,
+            sequence: 500,
+            durable_offset: 10,
+            folded_offset: 10,
+        };
+        ledger
+            .acknowledge(
+                &expected(),
+                &cut,
+                &OwnedEvidence {
+                    source: EvidenceSource::Intent,
+                    through_sequence: 500,
+                    exact_paths: Vec::new(),
+                    prefixes: Vec::new(),
+                },
+            )
+            .unwrap();
+        ledger
+            .advance_baseline(
+                &expected(),
+                &BaselineIdentity {
+                    ref_name: "refs/branches/main".into(),
+                    ref_generation: 8,
+                    change_id: ChangeId("change-next".into()),
+                    root_id: ObjectId("root-next".into()),
+                },
+                &cut,
+            )
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT durable_offset, folded_offset FROM changed_path_scopes",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (10, 10)
+        );
+    }
+
+    #[test]
+    fn candidate_cap_rolls_back_the_over_cap_row_and_rejects_later_writes() {
         let conn = fixture(1, 1);
         let ledger = ChangedPathLedger::new(&conn);
-        for (path, sequence) in [("a", 1), ("b", 2)] {
-            ledger
-                .upsert_exact(
-                    &expected(),
-                    &LedgerPath::parse(path).unwrap(),
-                    EvidenceFlags::CONTENT,
-                    EvidenceSource::Observer,
-                    sequence,
-                )
-                .unwrap();
-        }
+        ledger
+            .upsert_exact(
+                &expected(),
+                &LedgerPath::parse("a").unwrap(),
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            ledger.upsert_exact(
+                &expected(),
+                &LedgerPath::parse("b").unwrap(),
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                2,
+            ),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
         assert_eq!(
             conn.query_row("SELECT trust_state FROM changed_path_scopes", [], |row| row
                 .get::<_, String>(0))
                 .unwrap(),
             "overflow"
         );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM changed_path_entries", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert!(matches!(
+            ledger.upsert_exact(
+                &expected(),
+                &LedgerPath::parse("c").unwrap(),
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                3,
+            ),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM changed_path_entries", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
 
+    #[test]
+    fn prefix_cap_rolls_back_the_over_cap_row_and_rejects_later_writes() {
         let prefix_conn = fixture(10, 1);
         let prefix_ledger = ChangedPathLedger::new(&prefix_conn);
         prefix_ledger
             .mark_prefix_dirty(&expected(), &prefix("a", 1))
             .unwrap();
-        prefix_ledger
-            .mark_prefix_dirty(&expected(), &prefix("b", 2))
-            .unwrap();
+        assert!(matches!(
+            prefix_ledger.mark_prefix_dirty(&expected(), &prefix("b", 2)),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
         assert_eq!(
             prefix_conn
                 .query_row("SELECT trust_state FROM changed_path_scopes", [], |row| row
@@ -1173,12 +1615,118 @@ mod tests {
                 .unwrap(),
             "overflow"
         );
+        assert_eq!(
+            prefix_conn
+                .query_row("SELECT COUNT(*) FROM changed_path_prefixes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            prefix_ledger.mark_prefix_dirty(&expected(), &prefix("c", 3)),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
+        assert_eq!(
+            prefix_conn
+                .query_row("SELECT COUNT(*) FROM changed_path_prefixes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn prefix_cap_rollback_restores_rows_deleted_during_coalescing() {
+        let conn = fixture(10, 2);
+        let ledger = ChangedPathLedger::new(&conn);
+        ledger
+            .mark_prefix_dirty(&expected(), &prefix("dir/a", 1))
+            .unwrap();
+        ledger
+            .mark_prefix_dirty(&expected(), &prefix("dir/b", 2))
+            .unwrap();
+        let rows = || {
+            conn.prepare(
+                "SELECT normalized_prefix, completeness_reason, source_mask,
+                        first_sequence, last_sequence, provider_id,
+                        provider_sequence, created_at, updated_at
+                 FROM changed_path_prefixes
+                 ORDER BY normalized_prefix COLLATE BINARY",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let before = rows();
+        conn.execute("UPDATE changed_path_scopes SET max_prefix_rows = 1", [])
+            .unwrap();
+
+        assert!(matches!(
+            ledger.mark_prefix_dirty(&expected(), &prefix("dir/a/sub", 3)),
+            Err(Error::ChangeLedgerReconcileRequired { .. })
+        ));
+        assert_eq!(rows(), before);
+    }
+
+    #[test]
+    fn overflow_and_corrupt_scopes_reject_all_evidence_writes() {
+        for state in [TrustState::Overflow, TrustState::Corrupt] {
+            let conn = fixture(10, 10);
+            set_trust(&conn, state);
+            let ledger = ChangedPathLedger::new(&conn);
+            assert!(matches!(
+                ledger.upsert_exact(
+                    &expected(),
+                    &LedgerPath::parse("blocked").unwrap(),
+                    EvidenceFlags::CONTENT,
+                    EvidenceSource::Observer,
+                    1,
+                ),
+                Err(Error::ChangeLedgerReconcileRequired { .. })
+            ));
+            assert!(matches!(
+                ledger.mark_prefix_dirty(&expected(), &prefix("blocked", 1)),
+                Err(Error::ChangeLedgerReconcileRequired { .. })
+            ));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM changed_path_entries),
+                         (SELECT COUNT(*) FROM changed_path_prefixes)",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+                (0, 0)
+            );
+        }
     }
 
     #[test]
     fn trusted_baseline_advance_updates_the_identity_and_fences_the_old_expected_scope() {
         let conn = fixture(10, 10);
-        set_trust(&conn, TrustState::Trusted);
+        conn.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state = 'trusted', durable_offset = 34, folded_offset = 34",
+            [],
+        )
+        .unwrap();
         let ledger = ChangedPathLedger::new(&conn);
         let target = BaselineIdentity {
             ref_name: "refs/branches/main".into(),
@@ -1194,6 +1742,7 @@ mod tests {
                     source: EvidenceSource::Observer,
                     sequence: 12,
                     durable_offset: 34,
+                    folded_offset: 34,
                 },
             )
             .unwrap();
@@ -1283,7 +1832,12 @@ mod tests {
             let source = EvidenceSource::from_index(acknowledged_source);
             ledger.acknowledge(
                 &expected(),
-                &EvidenceCut { source, sequence: cut_sequence, durable_offset: cut_sequence },
+                &EvidenceCut {
+                    source,
+                    sequence: cut_sequence,
+                    durable_offset: 0,
+                    folded_offset: 0,
+                },
                 &OwnedEvidence {
                     source,
                     through_sequence: cut_sequence,

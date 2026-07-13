@@ -238,6 +238,7 @@ pub(crate) struct EvidenceCut {
     pub(crate) source: EvidenceSource,
     pub(crate) sequence: u64,
     pub(crate) durable_offset: u64,
+    pub(crate) folded_offset: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
