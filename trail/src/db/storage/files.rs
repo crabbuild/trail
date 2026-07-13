@@ -17,17 +17,16 @@ impl Trail {
     {
         let mut mappings = BTreeMap::new();
         for path in paths {
-            let folded = case_insensitive_path_key(path);
-            if let Some(previous) = mappings.insert(folded, path.clone()) {
-                if previous != *path {
-                    return Err(Error::InvalidPath {
-                        path: path.clone(),
-                        reason: format!("case-insensitive path collision with `{previous}`"),
-                    });
-                }
-            }
+            insert_case_fold_mapping(&mut mappings, path)?;
         }
 
+        self.build_case_fold_map_tree_from_sorted_mappings(mappings)
+    }
+
+    fn build_case_fold_map_tree_from_sorted_mappings(
+        &self,
+        mappings: BTreeMap<String, String>,
+    ) -> Result<Tree> {
         let mut builder = SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
         for (folded, canonical) in mappings {
             builder.add(folded.into_bytes(), canonical.into_bytes())?;
@@ -58,10 +57,10 @@ impl Trail {
     ) -> Result<RootBuildResult> {
         let paths = normalize_root_build_paths(paths)?;
         validate_no_case_fold_collisions(paths.iter())?;
-        let case_fold_tree = self.build_case_fold_map_tree(paths.iter())?;
 
         let mut files = BTreeMap::new();
         let mut disk_manifest = BTreeMap::new();
+        let mut case_fold_mappings = BTreeMap::new();
         let mut path_builder =
             SortedBatchBuilder::new(self.store.clone(), root_map_prolly_config());
         let mut file_index_builder =
@@ -74,6 +73,7 @@ impl Trail {
         for chunk in paths.chunks(PATH_READ_BATCH) {
             let reads = read_path_file_batch(&self.workspace_root, chunk)?;
             for read in reads {
+                insert_case_fold_mapping(&mut case_fold_mappings, &read.path)?;
                 let built = self.build_file_entry(
                     &read.path,
                     read.bytes,
@@ -98,6 +98,8 @@ impl Trail {
             }
         }
 
+        let case_fold_tree =
+            self.build_case_fold_map_tree_from_sorted_mappings(case_fold_mappings)?;
         let path_tree = path_builder.build()?;
         let file_index_tree = file_index_builder.build()?;
         let root = WorktreeRoot {
@@ -733,6 +735,19 @@ impl Trail {
     }
 }
 
+fn insert_case_fold_mapping(mappings: &mut BTreeMap<String, String>, path: &str) -> Result<()> {
+    let folded = case_insensitive_path_key(path);
+    if let Some(previous) = mappings.insert(folded, path.to_string()) {
+        if previous != path {
+            return Err(Error::InvalidPath {
+                path: path.to_string(),
+                reason: format!("case-insensitive path collision with `{previous}`"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn normalize_root_build_paths(paths: &[String]) -> Result<Vec<String>> {
     let mut normalized = BTreeSet::new();
     for path in paths {
@@ -845,6 +860,15 @@ mod tests {
         );
     }
 
+    fn root_map_entries(db: &Trail, root_hex: Option<&str>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let tree = root_map_tree_from_root_hex(root_hex).unwrap();
+        db.root_prolly
+            .range(&tree, &[], None)
+            .unwrap()
+            .map(|item| item.unwrap())
+            .collect()
+    }
+
     #[test]
     fn legacy_worktree_root_deserialization_defaults_case_fold_index_to_none() {
         #[derive(Serialize)]
@@ -890,6 +914,49 @@ mod tests {
 
         assert_case_fold_mapping(&db, &built.root_id, "docs/readme.md", "docs/ReadMe.md");
         assert_case_fold_mapping(&db, &built.root_id, "src/kernel.rs", "src/Ｋernel.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_path_list_root_case_fold_domain_excludes_filtered_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        fs::create_dir_all(temp.path().join("docs")).unwrap();
+        fs::create_dir_all(temp.path().join("directory-only")).unwrap();
+        fs::write(temp.path().join("docs/ReadMe.md"), "readme\n").unwrap();
+        symlink_file("docs/ReadMe.md", temp.path().join("readme-link.md")).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let built = db
+            .build_root_from_worktree_paths(
+                &[
+                    "docs/ReadMe.md".to_string(),
+                    "directory-only".to_string(),
+                    "missing.md".to_string(),
+                    "readme-link.md".to_string(),
+                ],
+                &ChangeId("change_case_fold_filtered_paths".to_string()),
+            )
+            .unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &built.root_id).unwrap();
+
+        let path_entries = root_map_entries(&db, root.path_map_root.as_deref());
+        let case_fold_entries = root_map_entries(&db, root.case_fold_map_root.as_deref());
+        let path_domain = path_entries
+            .iter()
+            .map(|(path, _)| String::from_utf8(path.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let case_fold_domain = case_fold_entries
+            .iter()
+            .map(|(_, canonical)| String::from_utf8(canonical.clone()).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(path_domain, vec!["docs/ReadMe.md"]);
+        assert_eq!(case_fold_domain, path_domain);
+        assert_eq!(
+            case_fold_entries,
+            vec![(b"docs/readme.md".to_vec(), b"docs/ReadMe.md".to_vec())]
+        );
     }
 
     #[test]
