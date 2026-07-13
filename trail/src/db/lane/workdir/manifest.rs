@@ -417,6 +417,7 @@ impl Trail {
             .collect::<Vec<_>>();
         let observed =
             observed_exact_paths_for_candidates(dir, &candidate_paths, case_insensitive)?;
+        let observed_by_folded = index_observed_paths_by_folded(&observed);
 
         for (path, entry) in previous {
             let Some(cached) = manifest.files.get(path) else {
@@ -448,15 +449,15 @@ impl Trail {
             .collect::<BTreeSet<_>>();
         for path in target.keys().filter(|path| !previous.contains_key(*path)) {
             let folded = case_insensitive_path_key(path);
-            let observed_aliases = observed
-                .keys()
-                .filter(|observed_path| case_insensitive_path_key(observed_path) == folded)
-                .collect::<Vec<_>>();
-            let aliases_are_removed_previous = observed_aliases.iter().all(|observed_path| {
-                removed_paths.contains(*observed_path)
-                    && case_insensitive_path_key(observed_path) == folded
+            let observed_aliases = observed_by_folded.get(&folded);
+            let aliases_are_removed_previous = observed_aliases.is_none_or(|aliases| {
+                aliases
+                    .iter()
+                    .all(|observed_path| removed_paths.contains(*observed_path))
             });
-            if !observed_aliases.is_empty() && !aliases_are_removed_previous {
+            if observed_aliases.is_some_and(|aliases| !aliases.is_empty())
+                && !aliases_are_removed_previous
+            {
                 return Ok(false);
             }
         }
@@ -601,8 +602,22 @@ impl Trail {
         pinned_paths: &[String],
     ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
         let root = root.canonicalize()?;
-        let mut files = self.scan_workdir_file_stamps(&root)?;
         let case_insensitive = is_case_insensitive_filesystem(&root)?;
+        self.scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+            &root,
+            pinned_paths,
+            case_insensitive,
+        )
+    }
+
+    fn scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+        &self,
+        root: &Path,
+        pinned_paths: &[String],
+        case_insensitive: bool,
+    ) -> Result<BTreeMap<String, WorkdirFileStamp>> {
+        let root = root.canonicalize()?;
+        let mut files = self.scan_workdir_file_stamps(&root)?;
         let mut exact_paths = files.keys().cloned().collect::<BTreeSet<_>>();
         let observed = observed_exact_paths_for_candidates(&root, pinned_paths, case_insensitive)?;
         let actual_paths = observed.keys().cloned().collect::<BTreeSet<_>>();
@@ -610,6 +625,16 @@ impl Trail {
             .iter()
             .map(|path| case_insensitive_path_key(path))
             .collect::<BTreeSet<_>>();
+        for (path, kind) in &observed {
+            if *kind != ObservedPathKind::RegularFile {
+                continue;
+            }
+            let Some(stamp) = open_observed_exact_regular_file_stamp(&root, path)? else {
+                continue;
+            };
+            exact_paths.insert(path.clone());
+            files.insert(path.clone(), stamp);
+        }
         for path in pinned_paths {
             let path = normalize_relative_path(path)?;
             if !pinned_path_needs_probe(
@@ -641,6 +666,61 @@ impl Trail {
         }
         Ok(files)
     }
+}
+
+fn open_observed_exact_regular_file_stamp(
+    root: &Path,
+    path: &str,
+) -> Result<Option<WorkdirFileStamp>> {
+    let abs = safe_join(root, path)?;
+    #[cfg(not(unix))]
+    {
+        let metadata = match fs::symlink_metadata(&abs) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(None);
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = match options.open(&abs) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(not(unix))]
+    {
+        let final_metadata = fs::symlink_metadata(&abs)?;
+        if final_metadata.file_type().is_symlink() || !final_metadata.is_file() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(WorkdirFileStamp::from_metadata(&metadata)))
+}
+
+fn index_observed_paths_by_folded(
+    observed: &BTreeMap<String, ObservedPathKind>,
+) -> BTreeMap<String, Vec<&str>> {
+    let mut indexed = BTreeMap::<String, Vec<&str>>::new();
+    for path in observed.keys() {
+        indexed
+            .entry(case_insensitive_path_key(path))
+            .or_default()
+            .push(path);
+    }
+    indexed
 }
 
 fn pinned_path_needs_probe(
@@ -904,6 +984,38 @@ mod tests {
             &folded_paths,
             "README.md",
         ));
+
+        let stamps = db
+            .scan_workdir_file_stamps_with_pinned_paths_case_sensitivity(
+                workspace.path(),
+                &["README.md".to_string()],
+                true,
+            )
+            .unwrap();
+        assert!(stamps.contains_key("readme.md"));
+        assert!(!stamps.contains_key("README.md"));
+    }
+
+    #[test]
+    fn observed_fold_index_supports_ten_thousand_constant_domain_lookups() {
+        let observed = (0..10_000)
+            .map(|index| {
+                (
+                    format!("Dir-{index:05}/File.txt"),
+                    ObservedPathKind::RegularFile,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let folded = index_observed_paths_by_folded(&observed);
+
+        assert_eq!(folded.len(), 10_000);
+        for path in observed.keys() {
+            let aliases = folded
+                .get(&case_insensitive_path_key(path))
+                .expect("folded path is indexed once");
+            assert_eq!(aliases.as_slice(), &[path.as_str()]);
+        }
     }
 
     #[test]
