@@ -601,6 +601,7 @@ pub(crate) fn command_in_path(command: &str) -> bool {
     env::split_paths(&path).any(|dir| dir.join(command).is_file())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_acp_lifecycle_event(
     db: &mut Trail,
     lane: &str,
@@ -2704,7 +2705,7 @@ impl CaptureCoordinator {
         };
         let options_by_id = permission_options(params.get("options"));
         let mut approval_id = None;
-        if let Some(session) = self.resolve_session_state(acp_session_id).ok() {
+        if let Ok(session) = self.resolve_session_state(acp_session_id) {
             let active_turn_id = if let Some(mut active) = self.active_turns.remove(acp_session_id)
             {
                 let turn_id = active.turn_id.clone();

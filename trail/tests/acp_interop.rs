@@ -9,14 +9,12 @@ use std::process::Command;
 
 use trail::Trail;
 
-fn reference_peer() -> PathBuf {
-    std::env::var_os("TRAIL_ACP_REFERENCE_PEER")
-        .map(PathBuf::from)
-        .expect("TRAIL_ACP_REFERENCE_PEER must point to the official-type peer")
+fn reference_peer() -> Option<PathBuf> {
+    std::env::var_os("TRAIL_ACP_REFERENCE_PEER").map(PathBuf::from)
 }
 
-fn run_client(mode: &str, workspace: &Path, agent: &Path) -> std::process::Output {
-    Command::new(reference_peer())
+fn run_client(peer: &Path, mode: &str, workspace: &Path, agent: &Path) -> std::process::Output {
+    Command::new(peer)
         .arg(mode)
         .arg(workspace)
         .arg(acp_harness::trail_bin())
@@ -27,8 +25,12 @@ fn run_client(mode: &str, workspace: &Path, agent: &Path) -> std::process::Outpu
 
 #[test]
 fn official_v1_client_through_trail_to_official_v1_agent() {
+    let Some(peer) = reference_peer() else {
+        eprintln!("skipped: TRAIL_ACP_REFERENCE_PEER is unavailable");
+        return;
+    };
     let temp = acp_harness::workspace();
-    let output = run_client("client", temp.path(), &reference_peer());
+    let output = run_client(&peer, "client", temp.path(), &peer);
     assert!(
         output.status.success(),
         "official peer failed: stdout={} stderr={}",
@@ -60,6 +62,10 @@ fn official_v1_client_through_trail_to_official_v1_agent() {
 #[test]
 #[cfg(unix)]
 fn official_v1_client_through_trail_to_independent_fixture_agent() {
+    let Some(peer) = reference_peer() else {
+        eprintln!("skipped: TRAIL_ACP_REFERENCE_PEER is unavailable");
+        return;
+    };
     let temp = acp_harness::workspace();
     let agent = acp_harness::fixture_agent_command(
         temp.path(),
@@ -86,7 +92,7 @@ for line in sys.stdin:
 "#,
     );
     assert_eq!(agent.len(), 1, "interop fixture expects a direct launcher");
-    let output = run_client("client-basic", temp.path(), Path::new(&agent[0]));
+    let output = run_client(&peer, "client-basic", temp.path(), Path::new(&agent[0]));
     assert!(
         output.status.success(),
         "official client / fixture agent failed: stdout={} stderr={}",

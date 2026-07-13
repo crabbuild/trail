@@ -392,6 +392,7 @@ impl SpillStore {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_worker(
     rx: mpsc::Receiver<CaptureCommand>,
     workspace_root: &Path,

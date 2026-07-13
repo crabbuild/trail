@@ -166,9 +166,7 @@ where
     O: FrameObserver,
 {
     while let Some(mut frame) = read_frame(&mut reader, direction)? {
-        observer
-            .observe(&mut frame)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        observer.observe(&mut frame).map_err(io::Error::other)?;
         writer.write_all(frame.forward_bytes())?;
         writer.flush()?;
     }
@@ -253,7 +251,7 @@ fn terminate_child_tree(child: &mut Child) -> Result<()> {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
-        return Err(Error::Io(error));
+        Err(Error::Io(error))
     }
     #[cfg(not(unix))]
     {
