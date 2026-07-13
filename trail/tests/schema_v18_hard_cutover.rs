@@ -2,6 +2,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
+
 use rusqlite::Connection;
 use trail::{InitImportMode, Trail};
 
@@ -100,6 +105,17 @@ impl SchemaFixture {
         visit(&trail_dir, &trail_dir, &mut files);
         files
     }
+
+    fn use_slatedb_backend(&self) {
+        let config_path = self.root().join(".trail/config.toml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        let config = config.replace(
+            "prolly_backend = \"sqlite\"",
+            "prolly_backend = \"slatedb\"",
+        );
+        assert!(config.contains("prolly_backend = \"slatedb\""));
+        fs::write(config_path, config).unwrap();
+    }
 }
 
 fn open_error(root: &Path) -> trail::Error {
@@ -138,8 +154,91 @@ fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
     let before = fixture.snapshot_tree_bytes();
     let err = open_error(fixture.root());
     assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
-    assert!(err.to_string().contains("trail init --force"));
+    match &err {
+        trail::Error::SchemaReinitializeRequired { found, guidance } => {
+            assert_eq!(
+                found,
+                "database corrupt: found version 17; expected version 18"
+            );
+            assert_eq!(
+                guidance,
+                "back up this workspace, then run `trail init --force` to create schema v18"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        "workspace schema database corrupt: found version 17; expected version 18 cannot be opened; back up this workspace, then run `trail init --force` to create schema v18"
+    );
     assert_tree_unchanged(&fixture, &before);
+}
+
+#[test]
+fn missing_or_changed_prolly_schema_is_rejected_without_mutation() {
+    let fixtures = [
+        SchemaFixture::with_sql(|conn| {
+            conn.execute_batch("DROP TABLE prolly_hints;").unwrap();
+        }),
+        SchemaFixture::mutated_master_sql("prolly_nodes", "node BLOB NOT NULL", "node BLOB"),
+    ];
+
+    for fixture in fixtures {
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_tree_unchanged(&fixture, &before);
+    }
+}
+
+#[test]
+fn extra_views_and_triggers_are_rejected_without_mutation() {
+    let fixtures = [
+        SchemaFixture::with_sql(|conn| {
+            conn.execute_batch(
+                "CREATE VIEW changed_paths AS SELECT normalized_path FROM changed_path_entries;",
+            )
+            .unwrap();
+        }),
+        SchemaFixture::with_sql(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER trail_extra_trigger AFTER INSERT ON schema_meta
+                 BEGIN SELECT NEW.key; END;",
+            )
+            .unwrap();
+        }),
+    ];
+
+    for fixture in fixtures {
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_tree_unchanged(&fixture, &before);
+    }
+}
+
+#[test]
+fn slatedb_backend_runs_sql_schema_preflight_before_mutable_backend_open() {
+    let fixture = SchemaFixture::versioned(17);
+    fixture.use_slatedb_backend();
+    let err = open_error(fixture.root());
+    assert!(matches!(
+        err,
+        trail::Error::SchemaReinitializeRequired { .. }
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_schema_opens_from_a_non_utf8_workspace_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp
+        .path()
+        .join(OsString::from_vec(b"workspace-\xff".to_vec()));
+    fs::create_dir(&workspace).unwrap();
+    Trail::init(&workspace, "main", InitImportMode::Empty, false).unwrap();
+
+    Trail::open(&workspace).unwrap();
 }
 
 #[test]

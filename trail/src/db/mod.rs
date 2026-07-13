@@ -49,21 +49,54 @@ pub(crate) enum SchemaOpenMode {
     Existing,
 }
 
-pub(crate) fn preflight_existing_schema(db_path: &Path) -> Result<()> {
+pub(crate) fn preflight_existing_schema(db_path: &Path, prolly_backend: &str) -> Result<()> {
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
         | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+    let uri = immutable_sqlite_uri(db_path);
+    let conn =
+        rusqlite::Connection::open_with_flags(uri, flags).map_err(schema_reinitialize_error)?;
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(schema_reinitialize_error)?;
+    Trail::validate_schema_v18(&conn).map_err(schema_reinitialize_error)?;
+    match prolly_backend {
+        "sqlite" => {
+            storage::validate_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
+        }
+        "slatedb" => {
+            storage::validate_no_prolly_sqlite_schema_v18(&conn).map_err(schema_reinitialize_error)
+        }
+        other => Err(Error::InvalidInput(format!(
+            "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn immutable_sqlite_uri(db_path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut uri = String::from("file:");
+    for byte in db_path.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(char::from(*byte));
+            }
+            _ => uri.push_str(&format!("%{byte:02x}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
+#[cfg(not(unix))]
+fn immutable_sqlite_uri(db_path: &Path) -> String {
     let encoded_path = db_path
         .to_string_lossy()
         .replace('%', "%25")
         .replace('?', "%3f")
         .replace('#', "%23");
-    let uri = format!("file:{encoded_path}?immutable=1");
-    let conn =
-        rusqlite::Connection::open_with_flags(uri, flags).map_err(schema_reinitialize_error)?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .map_err(schema_reinitialize_error)?;
-    Trail::validate_schema_v18(&conn).map_err(schema_reinitialize_error)
+    format!("file:{encoded_path}?immutable=1")
 }
 
 fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
@@ -71,6 +104,23 @@ fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
         found: err.to_string(),
         guidance: "back up this workspace, then run `trail init --force` to create schema v18"
             .into(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod immutable_uri_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn immutable_uri_percent_encodes_non_utf8_path_bytes_losslessly() {
+        let path = Path::new(OsStr::from_bytes(b"/tmp/trail-\xff/%?#.sqlite"));
+
+        assert_eq!(
+            immutable_sqlite_uri(path),
+            "file:/tmp/trail-%ff/%25%3f%23.sqlite?immutable=1"
+        );
     }
 }
 
@@ -413,9 +463,16 @@ fn open_prolly_store(
     config: &TrailConfig,
     sqlite_path: &Path,
     metrics: Option<Arc<OperationMetricsState>>,
+    schema_mode: SchemaOpenMode,
 ) -> Result<TrailProllyStore> {
     let backend = match config.storage.prolly_backend.as_str() {
-        "sqlite" => TrailProllyStoreBackend::Sqlite(Arc::new(SqliteStore::open(sqlite_path)?)),
+        "sqlite" => {
+            let store = match schema_mode {
+                SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
+                SchemaOpenMode::Existing => SqliteStore::open_existing(sqlite_path)?,
+            };
+            TrailProllyStoreBackend::Sqlite(Arc::new(store))
+        }
         "slatedb" => open_slatedb_prolly_store(&config.storage)?,
         other => Err(Error::InvalidInput(format!(
             "storage.prolly_backend must be sqlite or slatedb, got `{other}`"

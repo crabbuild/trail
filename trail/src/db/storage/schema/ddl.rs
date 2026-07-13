@@ -1168,10 +1168,8 @@ pub(super) fn base_schema_v18_complete(conn: &Connection) -> Result<bool> {
 
 fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn.prepare(
-        "SELECT type, name, sql FROM sqlite_master
-         WHERE type IN ('table', 'index')
-           AND sql IS NOT NULL
-           AND name NOT LIKE 'sqlite_%'
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%'
            AND name NOT LIKE 'prolly_%'
            AND name NOT LIKE 'changed_path_%'
          ORDER BY type, name",
@@ -1191,4 +1189,46 @@ fn schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
 
 fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn master_objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        conn.prepare(
+            "SELECT type, name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn late_ledger_ddl_conflict_rolls_back_entire_fresh_creation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE changed_path_observer_owners (
+                sentinel TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let before = master_objects(&conn);
+        let before_user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(create_schema_v18(&conn).is_err());
+
+        assert_eq!(master_objects(&conn), before);
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            before_user_version
+        );
+    }
 }

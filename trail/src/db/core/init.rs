@@ -277,12 +277,19 @@ impl Trail {
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
         match schema_mode {
             SchemaOpenMode::FreshCreate => fs::create_dir_all(db_dir.join("index"))?,
-            SchemaOpenMode::Existing => preflight_existing_schema(&sqlite_path)?,
+            SchemaOpenMode::Existing => {
+                preflight_existing_schema(&sqlite_path, &config.storage.prolly_backend)?
+            }
         }
         register_sqlite_vec_extension()?;
         let operation_metrics =
             operation_metrics_are_enabled().then(|| Arc::new(OperationMetricsState::default()));
-        let store = open_prolly_store(&config, &sqlite_path, operation_metrics.clone())?;
+        let store = open_prolly_store(
+            &config,
+            &sqlite_path,
+            operation_metrics.clone(),
+            schema_mode,
+        )?;
         let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());

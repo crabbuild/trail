@@ -298,10 +298,8 @@ fn ledger_master_matches(conn: &Connection) -> Result<bool> {
 
 fn ledger_schema_objects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
     let mut statement = conn.prepare(
-        "SELECT type, name, sql FROM sqlite_master
-         WHERE type IN ('table', 'index')
-           AND sql IS NOT NULL
-           AND name LIKE 'changed_path_%'
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+         WHERE name LIKE 'changed_path_%'
          ORDER BY type, name",
     )?;
     let objects = statement

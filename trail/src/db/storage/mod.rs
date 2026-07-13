@@ -26,4 +26,5 @@ mod validation;
 mod worktree_index;
 mod worktree_scan;
 
+pub(crate) use schema::{validate_no_prolly_sqlite_schema_v18, validate_prolly_sqlite_schema_v18};
 pub(crate) use worktree_scan::{observed_exact_paths_for_candidates, ObservedPathKind};
