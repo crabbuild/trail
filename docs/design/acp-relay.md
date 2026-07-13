@@ -65,15 +65,16 @@ Implemented:
 - Workdir recording at prompt completion linked to the active prompt turn.
 - Conservative structured ACP `diff` content capture as Trail `write` patch
   edits for non-materialized sessions.
-- Guided setup and inspection commands: `trail acp install`, `trail acp list`,
-  `trail acp doctor`, `trail acp sessions`, `trail transcript`, and top-level
+- Guided setup and inspection commands: `trail agent acp setup`,
+  `trail agent acp status`, `trail agent acp doctor`, `trail agent acp sessions`,
+  `trail transcript`, and top-level
   `trail turn show`.
 - Bounded assistant/event capture with truncation events and relay EOF closeout
   for open turns.
 
 Not yet implemented:
 
-- Mutating editor config generation; `acp install` prints snippets only.
+- Exact editor adapters beyond Zed; generic and VS Code targets print entries.
 - Broad structured edit conversion beyond ACP `diff` content with `newText`.
 - Remote ACP transports while the HTTP transport remains draft.
 - Long-running assistant message checkpointing before prompt completion.
@@ -207,18 +208,18 @@ Useful flags:
 - `--provider` and `--model` annotate the lane, turns, and session mapping.
 - `--no-mcp` disables dynamic Trail MCP injection.
 
-Supporting setup commands are exposed through `trail acp`:
+Supporting setup commands are exposed through `trail agent acp`:
 
 ```sh
-trail acp list
-trail acp install --agent claude-code --print
-trail acp doctor --agent claude-code
-trail acp sessions
+trail agent acp status
+trail agent acp setup claude-code --editor generic --print
+trail agent acp doctor claude-code
+trail agent acp sessions
 trail transcript <lane-or-session>
 ```
 
-`acp install` prints editor-specific launch snippets only; it does not mutate
-editor configuration.
+`agent acp setup` previews editor-specific launch entries and applies exact
+supported adapters only with `--yes`.
 The relay itself must be usable directly from any ACP editor that can launch a
 local agent command.
 
@@ -722,7 +723,7 @@ Acceptance criteria:
 Deliverables:
 
 - `trail acp init <provider>` setup helpers.
-- `trail acp list` and `trail acp doctor`.
+- `trail agent acp status` and `trail agent acp doctor`.
 - Recommended editor config snippets.
 - Lane naming policy.
 - Parallel-session docs.

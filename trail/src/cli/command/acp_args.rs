@@ -4,14 +4,6 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 pub(super) enum AcpSubcommand {
-    /// Print guided setup for an ACP provider without mutating editor config.
-    Install(AcpInstallArgs),
-    /// Run ACP integration diagnostics.
-    Doctor(AcpDoctorArgs),
-    /// List supported ACP provider profiles.
-    List,
-    /// List captured ACP sessions.
-    Sessions(AcpSessionsArgs),
     /// Run a local ACP stdio relay in front of a real ACP coding agent.
     Relay(AcpRelayArgs),
 }
@@ -23,46 +15,10 @@ pub(super) struct AcpCommand {
 }
 
 #[derive(Args)]
-pub(super) struct AcpInstallArgs {
-    #[arg(
-        long,
-        default_value = "claude-code",
-        value_name = "AGENT",
-        help = "Built-in alias or ACP registry agent ID (run `trail acp list`)"
-    )]
-    pub(super) agent: String,
-    #[arg(long, default_value = "generic")]
-    pub(super) editor: String,
-    #[arg(long)]
-    pub(super) dry_run: bool,
-    #[arg(long = "print")]
-    pub(super) print_only: bool,
-}
-
-#[derive(Args)]
-pub(super) struct AcpDoctorArgs {
-    #[arg(
-        long,
-        default_value = "claude-code",
-        value_name = "AGENT",
-        help = "Built-in alias or ACP registry agent ID (run `trail acp list`)"
-    )]
-    pub(super) agent: String,
-    #[arg(long = "relay-command", num_args = 1.., allow_hyphen_values = true)]
-    pub(super) relay_command: Vec<String>,
-}
-
-#[derive(Args)]
-pub(super) struct AcpSessionsArgs {
-    #[arg(long)]
-    pub(super) lane: Option<String>,
-}
-
-#[derive(Args)]
 pub(super) struct AcpRelayArgs {
     #[arg(
         value_name = "AGENT",
-        help = "Built-in ACP alias or registry agent ID (run `trail acp list`)"
+        help = "Built-in ACP alias or registry agent ID (run `trail agent acp status`)"
     )]
     pub(super) agent: Option<String>,
     #[arg(long)]

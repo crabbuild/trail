@@ -21,11 +21,8 @@ pub(super) enum AgentSubcommand {
     Export(AgentTraceExportArgs),
     /// Link an exact Git commit to enumerated Trail session/change evidence.
     GitLink(AgentGitLinkCommand),
-    /// Print editor setup for the high-level agent task workflow.
-    Setup(AgentSetupArgs),
-    /// Run a stable ACP entrypoint that creates a fresh Trail lane per task.
-    #[command(hide = true)]
-    Acp(AgentAcpArgs),
+    /// Configure, diagnose, and run Agent Client Protocol integrations.
+    Acp(AgentAcpCommand),
     /// Create a fresh task lane and launch a terminal agent.
     Start(AgentStartArgs),
     /// Continue from an existing agent task checkpoint in a fresh task lane.
@@ -244,7 +241,7 @@ pub(super) struct AgentHooksCommand {
 #[derive(Subcommand)]
 pub(super) enum AgentHooksSubcommand {
     /// Install or update Trail-owned hooks for a provider.
-    Add(AgentHooksAddArgs),
+    Setup(AgentHooksSetupArgs),
     /// Remove only the entries or file owned by a Trail installation.
     Remove(AgentHooksRemoveArgs),
     /// List supported providers and their recorded installations.
@@ -270,21 +267,37 @@ pub(super) enum AgentHooksScopeArg {
 }
 
 #[derive(Args)]
-pub(super) struct AgentHooksAddArgs {
-    pub(super) provider: String,
+pub(super) struct AgentHooksSetupArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
     #[arg(long, value_enum, default_value = "project")]
     pub(super) scope: AgentHooksScopeArg,
     #[arg(long)]
     pub(super) lane: Option<String>,
+    #[arg(long = "print")]
+    pub(super) print_only: bool,
     #[arg(long)]
-    pub(super) dry_run: bool,
+    pub(super) yes: bool,
     #[arg(long)]
     pub(super) force: bool,
 }
 
 #[derive(Args)]
 pub(super) struct AgentHooksRemoveArgs {
-    pub(super) provider: String,
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
     #[arg(long, value_enum, default_value = "project")]
     pub(super) scope: AgentHooksScopeArg,
     #[arg(long)]
@@ -299,13 +312,23 @@ pub(super) struct AgentHooksListArgs {
 
 #[derive(Args)]
 pub(super) struct AgentHooksProviderArgs {
-    pub(super) provider: String,
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
 }
 
 #[derive(Args)]
 pub(super) struct AgentHooksDoctorArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with_all = ["provider_flag", "all"])]
     pub(super) provider: Option<String>,
-    #[arg(long, conflicts_with = "provider")]
+    #[arg(long = "provider", value_name = "PROVIDER", conflicts_with_all = ["provider", "all"])]
+    pub(super) provider_flag: Option<String>,
+    #[arg(long, conflicts_with_all = ["provider", "provider_flag"])]
     pub(super) all: bool,
     #[arg(long)]
     pub(super) probe: bool,
@@ -313,7 +336,14 @@ pub(super) struct AgentHooksDoctorArgs {
 
 #[derive(Args)]
 pub(super) struct AgentHooksEventsArgs {
-    pub(super) provider: String,
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
     #[arg(long, default_value_t = 20)]
     pub(super) last: usize,
     #[arg(long, default_value_t = 0)]
@@ -539,27 +569,54 @@ pub(super) struct AgentCommand {
 }
 
 #[derive(Args)]
-pub(super) struct AgentSetupArgs {
-    #[arg(
-        long,
-        default_value = "claude-code",
-        value_name = "PROVIDER",
-        help = "Provider profile: claude-code, codex, cursor, gemini, aider, opencode"
-    )]
-    pub(super) provider: String,
-    #[arg(long, default_value = "vscode")]
-    pub(super) editor: String,
+pub(super) struct AgentAcpCommand {
+    #[command(subcommand)]
+    pub(super) command: AgentAcpSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(super) enum AgentAcpSubcommand {
+    /// Configure an editor to launch an ACP-backed Trail task.
+    Setup(AgentAcpSetupArgs),
+    /// Run the editor-facing ACP task entrypoint.
+    #[command(hide = true)]
+    Run(AgentAcpRunArgs),
+    /// List available ACP providers and configured status.
+    Status(AgentAcpStatusArgs),
+    /// Run ACP integration diagnostics.
+    Doctor(AgentAcpDoctorArgs),
+    /// List captured ACP sessions.
+    Sessions(AgentAcpSessionsArgs),
 }
 
 #[derive(Args)]
-pub(super) struct AgentAcpArgs {
+pub(super) struct AgentAcpSetupArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
     #[arg(
-        long,
-        default_value = "claude-code",
+        long = "provider",
         value_name = "PROVIDER",
-        help = "Built-in or ACP registry provider (see `trail acp list`)"
+        conflicts_with = "provider"
     )]
-    pub(super) provider: String,
+    pub(super) provider_flag: Option<String>,
+    #[arg(long, default_value = "generic")]
+    pub(super) editor: String,
+    #[arg(long = "print")]
+    pub(super) print_only: bool,
+    #[arg(long)]
+    pub(super) yes: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AgentAcpRunArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
     #[arg(long)]
     pub(super) name: Option<String>,
     #[arg(long)]
@@ -571,14 +628,47 @@ pub(super) struct AgentAcpArgs {
 }
 
 #[derive(Args)]
-pub(super) struct AgentStartArgs {
+pub(super) struct AgentAcpStatusArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
     #[arg(
-        long,
-        default_value = "claude-code",
+        long = "provider",
         value_name = "PROVIDER",
-        help = "Terminal provider profile: claude-code, codex, cursor, gemini, aider, opencode"
+        conflicts_with = "provider"
     )]
-    pub(super) provider: String,
+    pub(super) provider_flag: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AgentAcpDoctorArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
+    #[arg(long = "relay-command", num_args = 1.., allow_hyphen_values = true)]
+    pub(super) relay_command: Vec<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AgentAcpSessionsArgs {
+    #[arg(long)]
+    pub(super) lane: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AgentStartArgs {
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
     #[arg(long)]
     pub(super) name: Option<String>,
     #[arg(
@@ -1081,6 +1171,12 @@ pub(super) struct AgentUndoArgs {
 
 #[derive(Args)]
 pub(super) struct AgentDoctorArgs {
-    #[arg(long, default_value = "claude-code")]
-    pub(super) provider: String,
+    #[arg(value_name = "PROVIDER", conflicts_with = "provider_flag")]
+    pub(super) provider: Option<String>,
+    #[arg(
+        long = "provider",
+        value_name = "PROVIDER",
+        conflicts_with = "provider"
+    )]
+    pub(super) provider_flag: Option<String>,
 }

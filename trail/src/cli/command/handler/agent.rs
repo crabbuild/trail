@@ -24,7 +24,6 @@ pub(super) fn handle_agent_command(ctx: &RuntimeContext, agent: AgentCommand) ->
         Some(AgentSubcommand::Learnings(args)) => handle_agent_learnings(ctx, args),
         Some(AgentSubcommand::Export(args)) => handle_agent_trace_export(ctx, args),
         Some(AgentSubcommand::GitLink(args)) => handle_agent_git_link(ctx, args),
-        Some(AgentSubcommand::Setup(args)) => handle_agent_setup(ctx, args),
         Some(AgentSubcommand::Acp(args)) => handle_agent_acp(ctx, args),
         Some(AgentSubcommand::Start(args)) => handle_agent_start(ctx, args),
         Some(AgentSubcommand::Continue(args)) => handle_agent_continue(ctx, args),
@@ -314,7 +313,7 @@ fn handle_agent_git_link(ctx: &RuntimeContext, args: AgentGitLinkCommand) -> Res
 
 fn handle_agent_hooks(ctx: &RuntimeContext, args: AgentHooksCommand) -> Result<()> {
     match args.command {
-        AgentHooksSubcommand::Add(args) => handle_agent_hooks_add(ctx, args),
+        AgentHooksSubcommand::Setup(args) => handle_agent_hooks_setup(ctx, args),
         AgentHooksSubcommand::Remove(args) => handle_agent_hooks_remove(ctx, args),
         AgentHooksSubcommand::List(args) => handle_agent_hooks_list(ctx, args),
         AgentHooksSubcommand::Status(args) => handle_agent_hooks_status(ctx, args),
@@ -342,23 +341,25 @@ fn handle_agent_hooks(ctx: &RuntimeContext, args: AgentHooksCommand) -> Result<(
     }
 }
 
-fn handle_agent_hooks_add(ctx: &RuntimeContext, args: AgentHooksAddArgs) -> Result<()> {
+fn handle_agent_hooks_setup(ctx: &RuntimeContext, args: AgentHooksSetupArgs) -> Result<()> {
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
     let registry = AgentProviderRegistry::built_in()?;
-    registry.resolve(&args.provider)?;
+    registry.resolve(&provider)?;
     let mut db = open_db(ctx)?;
     let scope = agent_hook_scope(args.scope);
     let home = agent_hooks_home_dir();
     let plan = build_agent_hook_install_plan(AgentHookInstallRequest {
         registry: &registry,
-        provider: &args.provider,
+        provider: &provider,
         workspace_id: &db.config().workspace.id.0,
         workspace_root: db.workspace_root(),
         home_dir: home.as_deref(),
         scope,
         force: args.force,
     })?;
-    let report = apply_agent_hook_install_plan(&plan, args.dry_run)?;
-    if !args.dry_run {
+    let dry_run = !args.yes || args.print_only;
+    let report = apply_agent_hook_install_plan(&plan, dry_run)?;
+    if !dry_run {
         if let Err(error) = db.record_agent_hook_installation(&plan, args.lane.as_deref()) {
             rollback_agent_hook_install_plan(&plan).map_err(|rollback| {
                 Error::Conflict(format!(
@@ -373,7 +374,7 @@ fn handle_agent_hooks_add(ctx: &RuntimeContext, args: AgentHooksAddArgs) -> Resu
         serde_json::to_value(&report)?,
         format!(
             "{} {} hooks at {} ({:?}){}",
-            if args.dry_run {
+            if dry_run {
                 "Would configure"
             } else {
                 "Configured"
@@ -381,14 +382,15 @@ fn handle_agent_hooks_add(ctx: &RuntimeContext, args: AgentHooksAddArgs) -> Resu
             report.provider,
             report.config_path.display(),
             report.action,
-            if args.dry_run { " [dry run]" } else { "" }
+            if dry_run { " [dry run]" } else { "" }
         ),
     )
 }
 
 fn handle_agent_hooks_remove(ctx: &RuntimeContext, args: AgentHooksRemoveArgs) -> Result<()> {
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
     let registry = AgentProviderRegistry::built_in()?;
-    let provider = registry.resolve(&args.provider)?.provider.clone();
+    let provider = registry.resolve(&provider)?.provider.clone();
     let mut db = open_db(ctx)?;
     let scope = agent_hook_scope(args.scope);
     let record = db
@@ -502,8 +504,9 @@ fn handle_agent_hooks_list(ctx: &RuntimeContext, args: AgentHooksListArgs) -> Re
 }
 
 fn handle_agent_hooks_status(ctx: &RuntimeContext, args: AgentHooksProviderArgs) -> Result<()> {
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
     let registry = AgentProviderRegistry::built_in()?;
-    let provider = registry.resolve(&args.provider)?.provider.clone();
+    let provider = registry.resolve(&provider)?.provider.clone();
     let db = open_db(ctx)?;
     let records = db.list_agent_hook_installations(Some(&provider))?;
     let home = agent_hooks_home_dir();
@@ -536,10 +539,15 @@ fn handle_agent_hooks_status(ctx: &RuntimeContext, args: AgentHooksProviderArgs)
 }
 
 fn handle_agent_hooks_doctor(ctx: &RuntimeContext, args: AgentHooksDoctorArgs) -> Result<()> {
-    let _all = args.all;
     let registry = AgentProviderRegistry::built_in()?;
-    let providers = if let Some(provider) = args.provider.as_deref() {
-        vec![registry.resolve(provider)?]
+    let requested = match (args.provider, args.provider_flag) {
+        (None, None) => None,
+        (positional, named) => Some(resolve_agent_provider_argument(positional, named, None)?),
+    };
+    let providers = if args.all {
+        registry.list()
+    } else if let Some(requested) = requested {
+        vec![registry.resolve(&requested)?]
     } else {
         registry.list()
     };
@@ -610,7 +618,7 @@ fn handle_agent_hooks_doctor(ctx: &RuntimeContext, args: AgentHooksDoctorArgs) -
                 "code": "HOOK_INSTALLATION_STATUS",
                 "status": if installations.is_empty() { "warning" } else { "ok" },
                 "message": if installations.is_empty() { "no recorded native hook installation" } else { "native hook ownership records found" },
-                "remediation": format!("trail agent hooks add {}", manifest.provider),
+                "remediation": format!("trail agent hooks setup {}", manifest.provider),
                 "details": installation_checks,
             }),
             serde_json::json!({
@@ -661,8 +669,9 @@ fn handle_agent_hooks_doctor(ctx: &RuntimeContext, args: AgentHooksDoctorArgs) -
 }
 
 fn handle_agent_hooks_events(ctx: &RuntimeContext, args: AgentHooksEventsArgs) -> Result<()> {
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
     let registry = AgentProviderRegistry::built_in()?;
-    let provider = registry.resolve(&args.provider)?.provider.clone();
+    let provider = registry.resolve(&provider)?.provider.clone();
     let db = open_db(ctx)?;
     let mut receipts =
         db.list_agent_hook_receipts_page(Some(&provider), None, args.offset, args.last)?;
@@ -1276,18 +1285,36 @@ fn handle_agent_home(ctx: &RuntimeContext) -> Result<()> {
     }
 }
 
-fn handle_agent_setup(ctx: &RuntimeContext, args: AgentSetupArgs) -> Result<()> {
-    let db = open_db(ctx)?;
-    let report = db.agent_setup_report(&args.provider, &args.editor)?;
-    render_agent_setup(&report, ctx.json, &ctx.render)
+fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpCommand) -> Result<()> {
+    match args.command {
+        AgentAcpSubcommand::Setup(args) => handle_agent_acp_setup(ctx, args),
+        AgentAcpSubcommand::Run(args) => handle_agent_acp_run(ctx, args),
+        AgentAcpSubcommand::Status(args) => super::acp::handle_acp_status(ctx, args),
+        AgentAcpSubcommand::Doctor(args) => super::acp::handle_acp_doctor(ctx, args),
+        AgentAcpSubcommand::Sessions(args) => super::acp::handle_acp_sessions(ctx, args),
+    }
 }
 
-fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
+fn handle_agent_acp_setup(ctx: &RuntimeContext, args: AgentAcpSetupArgs) -> Result<()> {
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
     let db = open_db(ctx)?;
-    let lane = db.fresh_agent_lane_name(&args.provider, args.name.as_deref());
+    let plan = trail::acp::build_acp_setup_plan(
+        db.workspace_root(),
+        db.db_dir(),
+        &provider,
+        &args.editor,
+    )?;
+    let report = trail::acp::apply_acp_setup_plan(plan, args.yes && !args.print_only)?;
+    render_acp_setup(&report, ctx.json, &ctx.render, args.print_only)
+}
+
+fn handle_agent_acp_run(ctx: &RuntimeContext, args: AgentAcpRunArgs) -> Result<()> {
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
+    let db = open_db(ctx)?;
+    let lane = db.fresh_agent_lane_name(&provider, args.name.as_deref());
     let launch = if args.command.is_empty() {
         Some(trail::acp::resolve_acp_provider(
-            &args.provider,
+            &provider,
             Some(db.db_dir()),
         )?)
     } else {
@@ -1296,7 +1323,7 @@ fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
     let provider = launch
         .as_ref()
         .map(|launch| launch.profile.agent.clone())
-        .unwrap_or_else(|| args.provider.clone());
+        .unwrap_or(provider);
     let upstream_command = launch
         .as_ref()
         .map(|launch| launch.upstream_command.clone())
@@ -1319,7 +1346,13 @@ fn handle_agent_acp(ctx: &RuntimeContext, args: AgentAcpArgs) -> Result<()> {
 
 fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> {
     let db = open_db(ctx)?;
-    let lane = db.fresh_agent_lane_name(&args.provider, args.name.as_deref());
+    let configured_provider = db.config().agent.default_provider.clone();
+    let provider = resolve_agent_provider_argument(
+        args.provider,
+        args.provider_flag,
+        configured_provider.as_deref(),
+    )?;
+    let lane = db.fresh_agent_lane_name(&provider, args.name.as_deref());
     let workdir_mode = db.resolve_lane_spawn_workdir_mode(
         args.from.as_deref(),
         Some(&args.workdir_mode),
@@ -1332,7 +1365,7 @@ fn handle_agent_start(ctx: &RuntimeContext, args: AgentStartArgs) -> Result<()> 
         ctx,
         db,
         lane,
-        args.provider,
+        provider,
         args.from,
         workdir_mode,
         args.command,
@@ -2757,49 +2790,62 @@ fn handle_agent_empty_action(
     }
 
     match action.id.as_str() {
-        "setup_vscode" => handle_agent_setup(
+        "acp_setup_vscode" => handle_agent_acp_setup(
             ctx,
-            AgentSetupArgs {
-                provider: "claude-code".to_string(),
+            AgentAcpSetupArgs {
+                provider: Some("claude-code".to_string()),
+                provider_flag: None,
                 editor: "vscode".to_string(),
+                print_only: false,
+                yes: false,
             },
         ),
-        "setup_codex_vscode" => handle_agent_setup(
+        "acp_setup_codex_vscode" => handle_agent_acp_setup(
             ctx,
-            AgentSetupArgs {
-                provider: "codex".to_string(),
+            AgentAcpSetupArgs {
+                provider: Some("codex".to_string()),
+                provider_flag: None,
                 editor: "vscode".to_string(),
+                print_only: false,
+                yes: false,
             },
         ),
-        "setup_cursor_vscode" => handle_agent_setup(
+        "acp_setup_cursor_vscode" => handle_agent_acp_setup(
             ctx,
-            AgentSetupArgs {
-                provider: "cursor".to_string(),
+            AgentAcpSetupArgs {
+                provider: Some("cursor".to_string()),
+                provider_flag: None,
                 editor: "vscode".to_string(),
+                print_only: false,
+                yes: false,
             },
         ),
         "doctor_claude_code" => handle_agent_doctor(
             ctx,
             AgentDoctorArgs {
-                provider: "claude-code".to_string(),
+                provider: Some("claude-code".to_string()),
+                provider_flag: None,
             },
         ),
         "doctor_codex" => handle_agent_doctor(
             ctx,
             AgentDoctorArgs {
-                provider: "codex".to_string(),
+                provider: Some("codex".to_string()),
+                provider_flag: None,
             },
         ),
         "doctor_cursor" => handle_agent_doctor(
             ctx,
             AgentDoctorArgs {
-                provider: "cursor".to_string(),
+                provider: Some("cursor".to_string()),
+                provider_flag: None,
             },
         ),
         "start_terminal_task" => handle_agent_start(
             ctx,
             AgentStartArgs {
-                provider: "claude-code".to_string(),
+                provider: Some("claude-code".to_string()),
+                provider_flag: None,
                 name: None,
                 from: None,
                 workdir_mode: "native-cow".to_string(),
@@ -2809,7 +2855,8 @@ fn handle_agent_empty_action(
         "start_gemini_task" => handle_agent_start(
             ctx,
             AgentStartArgs {
-                provider: "gemini".to_string(),
+                provider: Some("gemini".to_string()),
+                provider_flag: None,
                 name: None,
                 from: None,
                 workdir_mode: "native-cow".to_string(),
@@ -3381,6 +3428,8 @@ fn handle_agent_undo(ctx: &RuntimeContext, args: AgentUndoArgs) -> Result<()> {
 }
 
 fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()> {
+    let provider =
+        resolve_agent_provider_argument(args.provider, args.provider_flag, Some("claude-code"))?;
     let mut checks = Vec::new();
     let mut status = "ok";
     let mut workspace_ok = true;
@@ -3400,7 +3449,7 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
             }));
         }
     }
-    let profile = trail::acp::agent_provider_profile(&args.provider)?;
+    let profile = trail::acp::agent_provider_profile(&provider)?;
     checks.push(serde_json::json!({
         "name": "provider",
         "status": "ok",
@@ -3475,27 +3524,20 @@ fn handle_agent_doctor(ctx: &RuntimeContext, args: AgentDoctorArgs) -> Result<()
     if workspace_ok && !launch_ok {
         status = "failed";
     }
-    let setup_command = if profile.agent == "claude-code" {
-        "trail agent setup".to_string()
-    } else {
-        format!(
-            "trail agent setup --provider {} --editor vscode",
-            profile.agent
-        )
-    };
+    let setup_command = format!("trail agent acp setup {} --editor vscode", profile.agent);
     let mut suggestions = vec![serde_json::json!({
         "command": setup_command,
         "reason": "print the recommended Trail setup for this provider"
     })];
     if profile.supports_terminal {
         suggestions.push(serde_json::json!({
-            "command": format!("trail agent start --provider {}", profile.agent),
+            "command": format!("trail agent start {}", profile.agent),
             "reason": "launch a fresh materialized task lane from the terminal"
         }));
     }
     if profile.supports_acp {
         suggestions.push(serde_json::json!({
-            "command": format!("trail acp doctor --agent {}", profile.agent),
+            "command": format!("trail agent acp doctor {}", profile.agent),
             "reason": "check the lower-level ACP relay command"
         }));
     }

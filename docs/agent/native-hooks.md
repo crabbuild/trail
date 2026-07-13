@@ -11,8 +11,8 @@ Initialize Trail in the repository, preview the provider mutation, then apply
 it:
 
 ```sh
-trail agent hooks add codex --dry-run
-trail agent hooks add codex
+trail agent hooks setup codex --print
+trail agent hooks setup codex --yes
 trail agent hooks status codex
 trail agent hooks doctor codex
 ```
@@ -22,7 +22,7 @@ Replace `codex` with `claude-code`, `pi`, `opencode`, `cursor`, `gemini`,
 the provider's declared user location and records the same ownership manifest:
 
 ```sh
-trail agent hooks add claude-code --scope user
+trail agent hooks setup claude-code --scope user --yes
 ```
 
 Kiro's automatic target is the current versioned standalone hook contract

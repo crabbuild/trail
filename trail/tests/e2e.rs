@@ -79,6 +79,156 @@ fn cli_reports_package_version() {
     );
 }
 
+#[test]
+fn agent_default_provider_is_a_typed_workspace_config_value() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let set = run_trail_json(
+        temp.path(),
+        &["config", "set", "agent.default_provider", "codex"],
+    );
+    assert_eq!(set["key"], "agent.default_provider");
+    assert_eq!(set["new_value"], "codex");
+
+    let get = run_trail_json(temp.path(), &["config", "get", "agent.default_provider"]);
+    assert_eq!(get["value"], "codex");
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_agent_uses_configured_provider_when_argument_is_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    run_trail_json(
+        temp.path(),
+        &["config", "set", "agent.default_provider", "custom"],
+    );
+
+    let report = run_trail_json(temp.path(), &["agent", "start", "--", "/usr/bin/true"]);
+    assert_eq!(report["provider"], "custom");
+}
+
+#[test]
+fn agent_acp_setup_plan_uses_the_hidden_run_command() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let report = run_trail_json(
+        temp.path(),
+        &[
+            "agent", "acp", "setup", "codex", "--editor", "generic", "--print",
+        ],
+    );
+    assert_eq!(report["transport"], "acp");
+    assert_eq!(report["provider"], "codex");
+    assert_eq!(report["editor"], "generic");
+    assert_eq!(report["applied"], false);
+    assert_eq!(
+        report["command"],
+        serde_json::json!([
+            trail_bin().canonicalize().unwrap(),
+            "--workspace",
+            temp.path().canonicalize().unwrap(),
+            "agent",
+            "acp",
+            "run",
+            "codex"
+        ])
+    );
+}
+
+#[test]
+fn agent_acp_setup_falls_back_to_a_generic_entry_for_unknown_editors() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let report = run_trail_json(
+        temp.path(),
+        &[
+            "agent", "acp", "setup", "codex", "--editor", "neovim", "--print",
+        ],
+    );
+    assert_eq!(report["editor"], "neovim");
+    assert_eq!(report["action"], "print");
+    assert!(report["snippet"].as_str().unwrap().contains("ACP command:"));
+    assert!(report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("generic entry")));
+}
+
+#[test]
+fn agent_acp_setup_merges_the_owned_zed_entry() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(workspace.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    let settings = test_zed_settings_path(home.path());
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "{\"theme\":\"One Dark\"}\n").unwrap();
+
+    let output = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(workspace.path())
+        .arg("--json")
+        .args(["agent", "acp", "setup", "codex", "--editor", "zed", "--yes"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ACP setup failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["action"], "update");
+    let configured: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(configured["theme"], "One Dark");
+    assert_eq!(
+        configured["agent_servers"]["trail-codex"]["args"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "codex"
+    );
+
+    let repeated = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(workspace.path())
+        .arg("--json")
+        .args(["agent", "acp", "setup", "codex", "--editor", "zed", "--yes"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["action"], "noop");
+    assert_eq!(repeated["applied"], true);
+}
+
+fn test_zed_settings_path(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/Zed/settings.json")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".config/zed/settings.json")
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn terminal_agent_start_aligns_process_context_with_the_lane_workdir() {
@@ -144,7 +294,15 @@ fn terminal_agent_start_loads_project_hook_settings_in_the_isolated_provider() {
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
     let install = run_trail_json(
         temp.path(),
-        &["agent", "hooks", "add", "claude-code", "--scope", "project"],
+        &[
+            "agent",
+            "hooks",
+            "setup",
+            "claude-code",
+            "--scope",
+            "project",
+            "--yes",
+        ],
     );
     let settings = install["config_path"].as_str().unwrap().to_string();
 
@@ -593,20 +751,20 @@ fn native_hook_management_cli_installs_reports_and_removes_owned_config() {
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
-    let add = Command::new(trail_bin())
+    let setup = Command::new(trail_bin())
         .arg("--workspace")
         .arg(temp.path())
         .arg("--json")
-        .args(["agent", "hooks", "add", "codex"])
+        .args(["agent", "hooks", "setup", "codex", "--yes"])
         .output()
         .unwrap();
     assert!(
-        add.status.success(),
+        setup.status.success(),
         "hook install failed: {}",
-        String::from_utf8_lossy(&add.stderr)
+        String::from_utf8_lossy(&setup.stderr)
     );
-    let add: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
-    assert_eq!(add["provider"], "codex");
+    let setup: serde_json::Value = serde_json::from_slice(&setup.stdout).unwrap();
+    assert_eq!(setup["provider"], "codex");
     let hooks_path = temp.path().join(".codex/hooks.json");
     let hooks = fs::read_to_string(&hooks_path).unwrap();
     assert!(hooks.contains(" agent hook receive codex Stop --installation hook_"));
@@ -1350,13 +1508,13 @@ fn plain_redirected_and_quiet_output_follow_terminal_policy() {
 #[test]
 fn clap_diagnostics_keep_usage_on_separate_lines() {
     let output = Command::new(trail_bin())
-        .args(["agent", "hooks", "status"])
+        .args(["agent", "hook", "receive"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("the following required arguments were not provided:\n  <PROVIDER>"));
-    assert!(stderr.contains("\nUsage: trail agent hooks status <PROVIDER>\n"));
+    assert!(stderr.contains("\nUsage: trail agent hook receive <PROVIDER> <NATIVE_EVENT>\n"));
     assert!(!stderr.contains(r"\nUsage:"));
 }
 
@@ -1377,8 +1535,21 @@ fn agent_help_is_curated_and_hidden_commands_still_work() {
     assert!(stdout.contains("trail agent ask what should I do"));
     assert!(stdout.contains("  action"));
     assert!(stdout.contains("  changes"));
+    assert!(stdout.contains("  acp"));
+    assert!(stdout.contains("  hooks"));
+    assert!(!stdout.contains("  setup "));
     assert!(!stdout.contains("review-data"));
     assert!(!stdout.contains("turn-diff"));
+
+    let acp_help = Command::new(trail_bin())
+        .args(["agent", "acp", "--help"])
+        .output()
+        .unwrap();
+    assert!(acp_help.status.success());
+    let acp_stdout = String::from_utf8_lossy(&acp_help.stdout);
+    assert!(acp_stdout.contains("  setup"));
+    assert!(acp_stdout.contains("  status"));
+    assert!(!acp_stdout.contains("  run"));
 
     let hidden_help = Command::new(trail_bin())
         .args(["agent", "review-data", "--help"])
@@ -2679,12 +2850,12 @@ fn init_creates_lane_observability_indexes() {
 }
 
 #[test]
-fn acp_setup_commands_report_profiles_install_and_doctor() {
+fn agent_acp_commands_report_status_setup_and_doctor() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
 
-    let profiles = run_trail_json(temp.path(), &["acp", "list"]);
+    let profiles = run_trail_json(temp.path(), &["agent", "acp", "status"]);
     assert!(profiles
         .as_array()
         .unwrap()
@@ -2708,52 +2879,32 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .iter()
         .any(|profile| profile["agent"] == "fake"));
 
-    let install = run_trail_json(
+    let setup = run_trail_json(
         temp.path(),
         &[
+            "agent",
             "acp",
-            "install",
-            "--agent",
+            "setup",
             "claude-code",
             "--editor",
             "generic",
-            "--dry-run",
+            "--print",
         ],
     );
-    assert_eq!(install["agent"], "claude-code");
-    assert_eq!(
-        install["relay_command"],
-        serde_json::json!(["trail", "acp", "relay", "claude-code"])
-    );
-    assert!(install["snippet"]
+    assert_eq!(setup["transport"], "acp");
+    assert_eq!(setup["provider"], "claude-code");
+    assert_eq!(setup["editor"], "generic");
+    assert!(setup["snippet"]
         .as_str()
         .unwrap()
-        .contains("trail acp relay claude-code"));
-
-    let zed_install = run_trail_json(
-        temp.path(),
-        &[
-            "acp",
-            "install",
-            "--agent",
-            "claude-code",
-            "--editor",
-            "zed",
-            "--dry-run",
-        ],
-    );
-    let zed_snippet: serde_json::Value =
-        serde_json::from_str(zed_install["snippet"].as_str().unwrap()).unwrap();
-    let zed_agent = &zed_snippet["agent_servers"]["trail-claude-code"];
-    assert_eq!(zed_agent["type"], "custom");
-    assert_eq!(zed_agent["command"], "trail");
-    assert!(zed_agent["args"]
+        .contains("agent acp run claude-code"));
+    assert!(setup["command"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|part| part == "relay"));
+        .any(|part| part == "run"));
 
-    let doctor = run_trail_json(temp.path(), &["acp", "doctor", "--agent", "claude-code"]);
+    let doctor = run_trail_json(temp.path(), &["agent", "acp", "doctor", "claude-code"]);
     let checks = doctor["checks"].as_array().unwrap();
     assert!(checks
         .iter()
@@ -2767,9 +2918,9 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
     let custom_doctor = run_trail_json(
         temp.path(),
         &[
+            "agent",
             "acp",
             "doctor",
-            "--agent",
             "custom-acp",
             "--relay-command",
             "trail",
@@ -2786,47 +2937,30 @@ fn acp_setup_commands_report_profiles_install_and_doctor() {
         .iter()
         .any(|check| check["name"] == "relay" && check["status"] == "ok"));
 
-    let codex_install = run_trail_json(
-        temp.path(),
-        &[
-            "acp",
-            "install",
-            "--agent",
-            "codex",
-            "--editor",
-            "zed",
-            "--dry-run",
-        ],
-    );
-    assert_eq!(codex_install["agent"], "codex");
-    assert_eq!(
-        codex_install["relay_command"],
-        serde_json::json!(["trail", "acp", "relay", "codex"])
-    );
-    let codex_zed_snippet: serde_json::Value =
-        serde_json::from_str(codex_install["snippet"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        codex_zed_snippet["agent_servers"]["trail-codex"]["command"],
-        "trail"
-    );
+    let codex = run_trail_json(temp.path(), &["agent", "acp", "status", "codex"]);
+    assert_eq!(codex.as_array().unwrap().len(), 1);
+    assert_eq!(codex[0]["agent"], "codex");
+}
 
-    let cursor_install = run_trail_json(
+#[test]
+fn agent_hooks_setup_is_read_only_until_yes_is_passed() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let config_path = temp.path().join(".codex/hooks.json");
+    let preview = run_trail_json(
         temp.path(),
-        &[
-            "acp",
-            "install",
-            "--agent",
-            "cursor",
-            "--editor",
-            "generic",
-            "--dry-run",
-        ],
+        &["agent", "hooks", "setup", "codex", "--print"],
     );
-    assert_eq!(cursor_install["agent"], "cursor");
-    assert_eq!(
-        cursor_install["relay_command"],
-        serde_json::json!(["trail", "acp", "relay", "cursor"])
-    );
+    assert_eq!(preview["provider"], "codex");
+    assert_eq!(preview["dry_run"], true);
+    assert!(!config_path.exists());
+
+    let applied = run_trail_json(temp.path(), &["agent", "hooks", "setup", "codex", "--yes"]);
+    assert_eq!(applied["provider"], "codex");
+    assert_eq!(applied["dry_run"], false);
+    assert!(config_path.is_file());
 }
 
 #[cfg(unix)]
@@ -2852,150 +2986,37 @@ fn acp_relay_accepts_a_built_in_agent_shortcut() {
 
 #[cfg(unix)]
 #[test]
-fn agent_setup_and_stub_acp_use_fresh_lanes() {
+fn agent_acp_setup_and_hidden_runner_use_fresh_lanes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
-
-    let default_setup = run_trail_json(temp.path(), &["agent", "setup"]);
-    assert_eq!(default_setup["provider"], "claude-code");
-    assert_eq!(default_setup["editor"], "vscode");
-    assert_eq!(default_setup["mode"], "acp");
-    assert_eq!(default_setup["supports_acp"], true);
-    assert_eq!(default_setup["supports_terminal"], true);
-    assert!(default_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail Claude Code"));
-    assert!(default_setup["suggestions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|suggestion| suggestion["command"] == "trail agent"));
-    assert!(default_setup["suggestions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|suggestion| suggestion["command"]
-            .as_str()
-            .unwrap()
-            .contains("agent doctor")));
-
-    let generic_setup = run_trail_json(temp.path(), &["agent", "setup", "--editor", "generic"]);
-    assert_eq!(generic_setup["editor"], "generic");
-    assert!(generic_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("ACP command:"));
-    assert!(generic_setup["suggestions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|suggestion| suggestion["command"] == "trail agent action"));
-
-    let codex_setup = run_trail_json(
-        temp.path(),
-        &[
-            "agent",
-            "setup",
-            "--provider",
-            "codex",
-            "--editor",
-            "vscode",
-        ],
-    );
-    assert_eq!(codex_setup["provider"], "codex");
-    assert!(codex_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail Codex"));
-
-    let cursor_setup = run_trail_json(
-        temp.path(),
-        &[
-            "agent",
-            "setup",
-            "--provider",
-            "cursor",
-            "--editor",
-            "vscode",
-        ],
-    );
-    assert_eq!(cursor_setup["provider"], "cursor");
-    assert_eq!(cursor_setup["mode"], "acp");
-    assert!(cursor_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail Cursor"));
-
-    let gemini_setup = run_trail_json(
-        temp.path(),
-        &[
-            "agent",
-            "setup",
-            "--provider",
-            "gemini",
-            "--editor",
-            "generic",
-        ],
-    );
-    assert_eq!(gemini_setup["provider"], "gemini");
-    assert_eq!(gemini_setup["mode"], "terminal");
-    assert_eq!(gemini_setup["supports_acp"], false);
-    assert_eq!(gemini_setup["supports_mcp"], true);
-    assert!(gemini_setup["command"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "start"));
-    assert!(gemini_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Terminal command:"));
-    assert!(gemini_setup["snippet"]
-        .as_str()
-        .unwrap()
-        .contains("Trail MCP server command:"));
-    let gemini_doctor = run_trail_json(temp.path(), &["agent", "doctor", "--provider", "gemini"]);
-    assert_eq!(gemini_doctor["provider"], "gemini");
-    assert_eq!(gemini_doctor["capabilities"]["terminal"], true);
-    assert_eq!(gemini_doctor["capabilities"]["mcp"], true);
-    assert!(gemini_doctor["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|check| check["name"] == "acp" && check["status"] == "skipped"));
 
     let setup = run_trail_json(
         temp.path(),
         &[
             "agent",
+            "acp",
             "setup",
-            "--provider",
             "claude-code",
             "--editor",
             "vscode",
+            "--print",
         ],
     );
+    assert_eq!(setup["transport"], "acp");
     assert_eq!(setup["provider"], "claude-code");
-    let command = setup["command"].as_array().unwrap();
-    assert!(command.iter().any(|part| part == "agent"));
-    assert!(command.iter().any(|part| part == "acp"));
-    assert!(!command.iter().any(|part| part == "--lane"));
-    let snippet: serde_json::Value =
-        serde_json::from_str(setup["snippet"].as_str().unwrap()).unwrap();
-    let vscode_entry = &snippet["Trail Claude Code"];
-    assert_eq!(vscode_entry["command"], "trail");
-    assert!(vscode_entry["args"]
+    assert_eq!(setup["editor"], "vscode");
+    assert_eq!(setup["applied"], false);
+    assert!(setup["command"]
         .as_array()
         .unwrap()
-        .iter()
-        .any(|part| part == "agent"));
-    assert!(!vscode_entry["args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|part| part == "--lane"));
+        .windows(3)
+        .any(|parts| parts == ["acp", "run", "claude-code"]));
+
+    let gemini_doctor = run_trail_json(temp.path(), &["agent", "doctor", "gemini"]);
+    assert_eq!(gemini_doctor["provider"], "gemini");
+    assert_eq!(gemini_doctor["capabilities"]["terminal"], true);
+    assert_eq!(gemini_doctor["capabilities"]["mcp"], true);
 
     {
         let mut db = Trail::open(temp.path()).unwrap();
@@ -3008,34 +3029,41 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
     assert_eq!(empty_status["status"], "empty");
     let empty_next = run_trail_json(temp.path(), &["agent", "next"]);
     assert_eq!(empty_next["focus"], "setup");
-    assert_eq!(empty_next["primary"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_next["primary"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     let empty_actions = run_trail_json(temp.path(), &["agent", "action"]);
     assert_eq!(empty_actions["status"], "empty", "{empty_actions}");
     assert!(empty_actions["task"].is_null());
-    assert_eq!(empty_actions["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_actions["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_vscode" && action["command"] == "trail agent setup"));
+        .any(|action| action["id"] == "acp_setup_vscode"
+            && action["command"] == "trail agent acp setup claude-code --editor vscode"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_codex_vscode"
-            && action["command"] == "trail agent setup --provider codex"));
+        .any(|action| action["id"] == "acp_setup_codex_vscode"
+            && action["command"] == "trail agent acp setup codex --editor vscode"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
         .any(|action| action["id"] == "doctor_codex"
-            && action["command"] == "trail agent doctor --provider codex"));
+            && action["command"] == "trail agent doctor codex"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_cursor_vscode"
-            && action["command"] == "trail agent setup --provider cursor"));
+        .any(|action| action["id"] == "acp_setup_cursor_vscode"
+            && action["command"] == "trail agent acp setup cursor --editor vscode"));
     assert!(empty_actions["actions"]
         .as_array()
         .unwrap()
@@ -3047,7 +3075,7 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|action| action["id"] == "start_gemini_task"
-            && action["command"] == "trail agent start --provider gemini"));
+            && action["command"] == "trail agent start gemini"));
     let empty_ask_actions = run_trail_json(temp.path(), &["agent", "ask", "show", "actions"]);
     assert_eq!(empty_ask_actions["status"], "empty");
     assert!(empty_ask_actions["task"].is_null());
@@ -3055,8 +3083,8 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|action| action["id"] == "setup_vscode"));
-    let empty_setup_action = run_trail_json(temp.path(), &["agent", "action", "setup_vscode"]);
+        .any(|action| action["id"] == "acp_setup_vscode"));
+    let empty_setup_action = run_trail_json(temp.path(), &["agent", "action", "acp_setup_vscode"]);
     assert_eq!(empty_setup_action["provider"], "claude-code");
     assert_eq!(empty_setup_action["editor"], "vscode");
     assert!(empty_setup_action["command"]
@@ -3114,25 +3142,37 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
             .as_str()
             .unwrap()
             .contains("to changes"));
-        assert_eq!(empty_hint["next"]["command"], "trail agent setup");
+        assert_eq!(
+            empty_hint["next"]["command"],
+            "trail agent acp setup claude-code --editor vscode"
+        );
         assert!(empty_hint["actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|action| action["id"] == "setup_vscode"));
+            .any(|action| action["id"] == "acp_setup_vscode"));
     }
     let empty_dashboard = run_trail_json(temp.path(), &["agent", "dashboard"]);
     assert_eq!(empty_dashboard["status"], "empty");
     assert!(empty_dashboard["task"].is_null());
-    assert_eq!(empty_dashboard["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_dashboard["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     let empty_inbox = run_trail_json(temp.path(), &["agent", "inbox"]);
     assert_eq!(empty_inbox["total"], 0);
     assert_eq!(empty_inbox["attention_count"], 0);
     assert_eq!(empty_inbox["items"].as_array().unwrap().len(), 0);
-    assert_eq!(empty_inbox["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_inbox["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
     let empty_bare_agent = run_trail_json(temp.path(), &["agent"]);
     assert_eq!(empty_bare_agent["total"], 0);
-    assert_eq!(empty_bare_agent["next"]["command"], "trail agent setup");
+    assert_eq!(
+        empty_bare_agent["next"]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
 
     let doctor = run_trail_json(
         temp.path(),
@@ -3144,7 +3184,10 @@ fn agent_setup_and_stub_acp_use_fresh_lanes() {
         .unwrap()
         .iter()
         .any(|check| { check["name"] == "workspace" && check["status"] == "ok" }));
-    assert_eq!(doctor["suggestions"][0]["command"], "trail agent setup");
+    assert_eq!(
+        doctor["suggestions"][0]["command"],
+        "trail agent acp setup claude-code --editor vscode"
+    );
 
     let first_agent = write_stub_acp_agent(
         temp.path(),
@@ -4969,7 +5012,7 @@ fn run_agent_acp_stub_session(workspace: &Path, agent: &Path) {
         .arg(workspace)
         .arg("agent")
         .arg("acp")
-        .arg("--provider")
+        .arg("run")
         .arg("claude-code")
         .arg("--no-mcp")
         .arg("--")
@@ -5058,7 +5101,7 @@ fn agent_start_custom_command_applies_task_to_git_with_guided_flow() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|step| step["command"] == "trail agent setup"));
+        .any(|step| step["command"] == "trail agent acp setup claude-code --editor vscode"));
     let edit_script = temp.path().join("edit-readme.sh");
     fs::write(
         &edit_script,
@@ -5820,7 +5863,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .iter()
         .any(|path| path.path == "README.md"));
 
-    let acp_sessions = run_trail_json(temp.path(), &["acp", "sessions", "--lane", "acp-test"]);
+    let acp_sessions = run_trail_json(
+        temp.path(),
+        &["agent", "acp", "sessions", "--lane", "acp-test"],
+    );
     assert_eq!(acp_sessions["sessions"][0]["acp_session_id"], "sess_stub");
 
     let transcript = run_trail_json(temp.path(), &["transcript", "acp-test"]);

@@ -10,6 +10,21 @@ pub(crate) fn set_config_value(
         "workspace.id" => Err(Error::InvalidInput(
             "config key `workspace.id` is read-only".to_string(),
         )),
+        "agent.default_provider" => {
+            let provider = value.trim();
+            if provider.is_empty()
+                || !provider
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return Err(Error::InvalidInput(
+                    "agent.default_provider must use lowercase ASCII letters, digits, and hyphens"
+                        .to_string(),
+                ));
+            }
+            config.agent.default_provider = Some(provider.to_string());
+            Ok(())
+        }
         "workspace.default_branch" => {
             validate_ref_segment(value)?;
             if db.try_get_ref(&branch_ref(value))?.is_none() {

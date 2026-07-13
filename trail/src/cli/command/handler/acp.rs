@@ -5,10 +5,6 @@ use trail::model::{AcpDoctorCheck, AcpDoctorReport, AcpProviderProfile};
 
 pub(super) fn handle_acp_command(ctx: &RuntimeContext, acp: AcpCommand) -> Result<()> {
     match acp.command {
-        AcpSubcommand::Install(args) => handle_acp_install(ctx, args),
-        AcpSubcommand::Doctor(args) => handle_acp_doctor(ctx, args),
-        AcpSubcommand::List => handle_acp_list(ctx),
-        AcpSubcommand::Sessions(args) => handle_acp_sessions(ctx, args),
         AcpSubcommand::Relay(args) => handle_acp_relay(ctx, args),
     }
 }
@@ -29,31 +25,29 @@ pub(super) fn handle_top_turn_command(ctx: &RuntimeContext, turn: TopTurnCommand
     }
 }
 
-fn handle_acp_install(ctx: &RuntimeContext, args: AcpInstallArgs) -> Result<()> {
+pub(super) fn handle_acp_status(ctx: &RuntimeContext, args: AgentAcpStatusArgs) -> Result<()> {
     let db = open_db(ctx).ok();
-    let report = trail::acp::acp_install_report_with_registry(
-        &args.agent,
-        &args.editor,
-        args.dry_run,
-        db.as_ref().map(|db| db.db_dir()),
-    )?;
-    render_acp_install(&report, ctx.json, &ctx.render, args.print_only)
-}
-
-fn handle_acp_list(ctx: &RuntimeContext) -> Result<()> {
-    let db = open_db(ctx).ok();
-    let profiles =
+    let mut profiles =
         trail::acp::acp_provider_profiles_with_registry(db.as_ref().map(|db| db.db_dir()))?;
+    if args.provider.is_some() || args.provider_flag.is_some() {
+        let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
+        let canonical = trail::acp::acp_provider_profile_with_registry(
+            &provider,
+            db.as_ref().map(|db| db.db_dir()),
+        )?
+        .agent;
+        profiles.retain(|profile| profile.agent == canonical);
+    }
     render_acp_profiles(&profiles, ctx.json, &ctx.render)
 }
 
-fn handle_acp_sessions(ctx: &RuntimeContext, args: AcpSessionsArgs) -> Result<()> {
+pub(super) fn handle_acp_sessions(ctx: &RuntimeContext, args: AgentAcpSessionsArgs) -> Result<()> {
     let db = open_db(ctx)?;
     let report = db.list_lane_acp_sessions(args.lane.as_deref())?;
     render_acp_sessions(&report, ctx.json, &ctx.render)
 }
 
-fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
+pub(super) fn handle_acp_doctor(ctx: &RuntimeContext, args: AgentAcpDoctorArgs) -> Result<()> {
     let mut checks = Vec::new();
     let mut warnings = Vec::new();
     let mut status = "ok".to_string();
@@ -67,14 +61,15 @@ fn handle_acp_doctor(ctx: &RuntimeContext, args: AcpDoctorArgs) -> Result<()> {
         }
     }
 
+    let provider = resolve_agent_provider_argument(args.provider, args.provider_flag, None)?;
     let profile = match trail::acp::acp_provider_profile_with_registry(
-        &args.agent,
+        &provider,
         db_result.as_ref().ok().map(|db| db.db_dir()),
     ) {
         Ok(profile) => profile,
         Err(_) if !args.relay_command.is_empty() => AcpProviderProfile {
-            agent: args.agent.clone(),
-            display_name: args.agent.clone(),
+            agent: provider.clone(),
+            display_name: provider,
             available: true,
             relay_command: args.relay_command.clone(),
             notes: vec!["using caller-supplied ACP relay command".to_string()],

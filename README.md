@@ -484,9 +484,9 @@ For ACP coding-agent setup, keep installation simple and use the guided Trail
 commands after the binary is installed:
 
 ```sh
-trail agent doctor --provider claude-code
-trail agent doctor --provider codex
-trail agent setup
+trail agent doctor claude-code
+trail agent doctor codex
+trail agent acp setup claude-code --editor vscode
 ```
 
 For a project-local install directory, override `PREFIX`:
@@ -712,7 +712,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail merge <branch> --into <target> --dry-run` | Preview a branch merge and possible conflicts |
 | `trail ignore check <path>` | Check whether ignore policy records or skips a path |
 | `trail guardrails check --action <action>` | Preflight a risky action against workspace policy |
-| `trail agent setup` | Print editor config for fresh Trail agent tasks |
+| `trail agent acp setup claude-code --editor vscode` | Print editor config for fresh Trail agent tasks |
 | `trail agent continue latest` | Start a fresh follow-up task from the latest task checkpoint |
 | `trail agent` | Open the agent inbox home view with grouped tasks, review-first hints, and one next action |
 | `trail agent board` | Show a multi-agent board with low-noise columns and one next action |
@@ -802,7 +802,7 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail agent undo latest` | Undo the latest agent turn without copying checkpoint ids |
 | `trail agent undo-last latest` | Friendly alias for undoing the latest agent turn |
 | `trail lane spawn <name> --from <ref>` | Create an isolated lane branch |
-| `trail agent start --provider codex --workdir-mode nfs-cow` | Run a macOS terminal agent in a loopback NFS copy-on-write workdir |
+| `trail agent start codex --workdir-mode nfs-cow` | Run a macOS terminal agent in a loopback NFS copy-on-write workdir |
 | `trail lane apply-patch <name> --patch <file>` | Apply a structured patch to a lane branch |
 | `trail lane review <name>` | Produce a compact review packet for a lane branch |
 | `trail lane readiness <name>` | Report blockers before merging a lane branch |
@@ -811,11 +811,11 @@ install it with `make install` or replace `trail` with `target/debug/trail`.
 | `trail lane merge-queue run` | Run queued lane merges with readiness and conflict checks |
 | `trail daemon` | Start the loopback HTTP daemon for editor and automation integrations |
 | `trail mcp` | Start the MCP stdio server for agent hosts |
-| `trail acp list` | List built-in aliases and current official ACP registry agents |
-| `trail acp install --agent claude-code` | Print an ACP relay command and editor snippet |
-| `trail acp install --agent codex` | Print the Codex ACP relay command and editor snippet |
-| `trail acp doctor --agent claude-code` | Check ACP provider and relay readiness |
-| `trail acp sessions` | List captured ACP sessions |
+| `trail agent acp status` | List built-in aliases and current official ACP registry agents |
+| `trail agent acp setup claude-code --editor generic` | Print a generic Claude Code ACP entry |
+| `trail agent acp setup codex --editor zed` | Preview the Codex entry for Zed; add `--yes` to apply it |
+| `trail agent acp doctor claude-code` | Check ACP provider and relay readiness |
+| `trail agent acp sessions` | List captured ACP sessions |
 | `trail transcript <lane-or-session>` | Read captured prompts, assistant messages, tools, and checkpoints |
 | `trail doctor` | Run workspace and integration diagnostics |
 | `trail backup create <output>` | Create a Trail workspace backup |
@@ -868,13 +868,12 @@ exact directory where the agent edited files.
 Configure an ACP editor once:
 
 ```sh
-trail agent setup
+trail agent acp setup claude-code --editor vscode
 ```
 
-`agent setup` defaults to Claude Code plus VS Code, and Codex is also available
-with `trail agent setup --provider codex`. Use `--editor zed` or
-`--editor generic` when you want another snippet. It prints the editor snippet
-plus the next verification and review commands.
+ACP setup requires a provider. Use `--editor zed` for Trail's exact Zed
+adapter, or `--editor vscode`/`generic` for a copyable entry. Setup previews by
+default; pass `--yes` to apply an exact supported adapter.
 Paste the printed snippet into the editor's ACP custom-agent settings. After one
 prompt, ask Trail what needs attention:
 
@@ -1016,7 +1015,7 @@ For terminal-first work, create a fresh materialized lane and launch Claude Code
 inside it:
 
 ```sh
-trail agent start --provider claude-code --name docs-edit
+trail agent start claude-code --name docs-edit
 trail agent
 trail agent ask what should I do next
 trail agent todo

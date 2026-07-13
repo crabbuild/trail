@@ -15,6 +15,9 @@ use crate::model::*;
 use crate::{Error, PatchDocument, PatchEdit, Result, Trail};
 
 mod registry;
+mod setup;
+
+pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
 
 const ACP_CAPTURE_LOCK_WAIT: Duration = Duration::from_secs(30);
 const CLAUDE_ACP_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@latest";
@@ -204,7 +207,7 @@ pub fn agent_provider_profile(provider: &str) -> Result<AcpProviderProfile> {
             "runs OpenCode in a Trail materialized task lane",
         )),
         _ => Err(Error::InvalidInput(format!(
-            "unsupported agent provider `{provider}`; supported providers: {}. You can still pass an explicit command after `--` to `trail agent start` or `trail agent acp`.",
+            "unsupported agent provider `{provider}`; supported providers: {}. You can still pass an explicit command after `--` to `trail agent start` or `trail agent acp run`.",
             supported_agent_providers().join(", ")
         ))),
     }
@@ -225,41 +228,6 @@ pub fn terminal_agent_command(provider: &str) -> Result<Vec<String>> {
                 "provider `{provider}` does not define a default terminal command; pass one after `--`"
             ))
         })
-}
-
-pub fn acp_install_report(agent: &str, editor: &str, dry_run: bool) -> Result<AcpInstallReport> {
-    acp_install_report_with_registry(agent, editor, dry_run, None)
-}
-
-pub fn acp_install_report_with_registry(
-    agent: &str,
-    editor: &str,
-    dry_run: bool,
-    cache_dir: Option<&std::path::Path>,
-) -> Result<AcpInstallReport> {
-    let profile = acp_provider_profile_with_registry(agent, cache_dir)?;
-    let editor = match editor {
-        "generic" | "zed" => editor,
-        other => {
-            return Err(Error::InvalidInput(format!(
-                "unsupported ACP editor `{other}`; supported editors: generic, zed"
-            )))
-        }
-    };
-    let snippet = acp_editor_snippet(editor, &profile.agent, &profile.relay_command);
-    Ok(AcpInstallReport {
-        agent: profile.agent,
-        editor: editor.to_string(),
-        dry_run,
-        relay_command: profile.relay_command,
-        snippet,
-        detected: profile.available,
-        warnings: if profile.available {
-            Vec::new()
-        } else {
-            profile.notes
-        },
-    })
 }
 
 fn supported_acp_agents() -> Vec<&'static str> {
@@ -456,39 +424,6 @@ pub(crate) fn command_in_path(command: &str) -> bool {
         return false;
     };
     env::split_paths(&path).any(|dir| dir.join(command).is_file())
-}
-
-fn acp_editor_snippet(editor: &str, agent: &str, relay_command: &[String]) -> String {
-    let command = shell_join(relay_command);
-    match editor {
-        "zed" => serde_json::to_string_pretty(&serde_json::json!({
-            "agent_servers": {
-                (format!("trail-{agent}")): {
-                    "type": "custom",
-                    "command": relay_command.first().cloned().unwrap_or_default(),
-                    "args": relay_command.iter().skip(1).cloned().collect::<Vec<_>>()
-                }
-            }
-        }))
-        .unwrap_or_else(|_| "{}".to_string()),
-        _ => format!("ACP command:\n{command}"),
-    }
-}
-
-fn shell_join(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|part| {
-            if part.chars().all(|ch| {
-                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | '@' | ':')
-            }) {
-                part.clone()
-            } else {
-                format!("'{}'", part.replace('\'', "'\\''"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn record_acp_lifecycle_event(

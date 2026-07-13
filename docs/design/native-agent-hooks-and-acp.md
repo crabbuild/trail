@@ -154,7 +154,7 @@ The primary workflow is:
 $ trail init
 $ trail lane spawn feature-auth --workdir-mode native-cow
 $ cd "$(trail lane workdir feature-auth)"
-$ trail agent hooks add codex --lane feature-auth
+$ trail agent hooks setup codex --lane feature-auth --yes
 $ trail agent hooks doctor codex
 $ codex
 ```
@@ -164,19 +164,19 @@ The user interacts with Codex normally. The installed project hooks invoke Trail
 Equivalent setup should work for every supported provider:
 
 ```console
-$ trail agent hooks add claude-code
-$ trail agent hooks add pi
-$ trail agent hooks add opencode
-$ trail agent hooks add cursor
-$ trail agent hooks add gemini
-$ trail agent hooks add copilot
-$ trail agent hooks add grok
+$ trail agent hooks setup claude-code --yes
+$ trail agent hooks setup pi --yes
+$ trail agent hooks setup opencode --yes
+$ trail agent hooks setup cursor --yes
+$ trail agent hooks setup gemini --yes
+$ trail agent hooks setup copilot --yes
+$ trail agent hooks setup grok --yes
 ```
 
 Project scope is the default. User scope is explicit:
 
 ```console
-$ trail agent hooks add codex --scope user
+$ trail agent hooks setup codex --scope user --yes
 ```
 
 User-scoped hooks discover the nearest initialized Trail workspace at runtime. If no workspace exists, they exit successfully without recording.
@@ -1859,11 +1859,9 @@ Grok stores sessions under `~/.grok/sessions` and can export Markdown. Prefer th
 
 ```text
 trail agent hooks list [--installed] [--json]
-trail agent hooks add <provider> [--scope project|user] [--lane <lane>]
-                       [--context off|session|turn|compaction] [--dry-run] [--force]
-trail agent hooks add --manifest <file> [--allow-unsigned-manifest]
+trail agent hooks setup <provider> [--scope project|user] [--lane <lane>]
+                         [--print] [--yes] [--force]
 trail agent hooks remove <provider> [--scope project|user] [--dry-run]
-trail agent hooks remove --manifest <file> [--dry-run]
 trail agent hooks status <provider> [--json]
 trail agent hooks doctor [<provider>|--all] [--probe] [--json]
 trail agent hooks events <provider> [--last <n>] [--failed] [--json]

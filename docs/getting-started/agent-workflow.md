@@ -7,13 +7,13 @@ changes, and applies reviewed work to Git only after a safety preflight.
 
 ```sh
 make install
-trail agent doctor --provider codex
+trail agent doctor codex
 ```
 
-For an ACP editor, print and install its configuration snippet:
+For an ACP editor, print its configuration entry:
 
 ```sh
-trail agent setup --provider codex --editor vscode
+trail agent acp setup codex --editor vscode
 ```
 
 ## 2. Start a Task
@@ -21,7 +21,7 @@ trail agent setup --provider codex --editor vscode
 For terminal-first work:
 
 ```sh
-trail agent start --provider codex --name first-agent-task
+trail agent start codex --name first-agent-task
 ```
 
 Trail creates a fresh lane and launches the provider inside an isolated

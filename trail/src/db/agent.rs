@@ -267,85 +267,6 @@ impl Trail {
         )
     }
 
-    pub fn agent_setup_report(&self, provider: &str, editor: &str) -> Result<AgentSetupReport> {
-        let profile = crate::acp::agent_provider_profile(provider)?;
-        let editor = match editor {
-            "generic" | "vscode" | "zed" => editor,
-            other => {
-                return Err(Error::InvalidInput(format!(
-                    "unsupported agent editor `{other}`; supported editors: generic, vscode, zed"
-                )))
-            }
-        };
-        let mode = if profile.supports_acp {
-            "acp"
-        } else {
-            "terminal"
-        };
-        let mut command = vec![
-            "trail".to_string(),
-            "--workspace".to_string(),
-            self.workspace_root.to_string_lossy().to_string(),
-            "agent".to_string(),
-        ];
-        if profile.supports_acp {
-            command.push("acp".to_string());
-        } else {
-            command.push("start".to_string());
-        }
-        command.push("--provider".to_string());
-        command.push(profile.agent.clone());
-        let mcp_command = vec![
-            "trail".to_string(),
-            "--workspace".to_string(),
-            self.workspace_root.to_string_lossy().to_string(),
-            "mcp".to_string(),
-        ];
-        let snippet = if profile.supports_acp {
-            agent_editor_snippet(editor, &profile.agent, &command)
-        } else {
-            agent_terminal_setup_snippet(&profile, &command, &mcp_command)
-        };
-        let mut suggestions = vec![StatusSuggestion {
-            command: format!("trail agent doctor --provider {}", profile.agent),
-            reason: "verify the workspace and provider before the first agent session".to_string(),
-        }];
-        if profile.supports_terminal {
-            suggestions.push(StatusSuggestion {
-                command: format!("trail agent start --provider {}", profile.agent),
-                reason: "launch a fresh materialized task lane with this provider".to_string(),
-            });
-        }
-        suggestions.extend([
-            StatusSuggestion {
-                command: "trail agent".to_string(),
-                reason: "after one prompt, show the task inbox and next useful action".to_string(),
-            },
-            StatusSuggestion {
-                command: "trail agent action".to_string(),
-                reason: "show runnable setup, review, validation, apply, and recovery actions"
-                    .to_string(),
-            },
-        ]);
-        Ok(AgentSetupReport {
-            provider: profile.agent,
-            editor: editor.to_string(),
-            mode: mode.to_string(),
-            command,
-            snippet,
-            detected: profile.available,
-            supports_acp: profile.supports_acp,
-            supports_mcp: profile.supports_mcp,
-            supports_terminal: profile.supports_terminal,
-            warnings: if profile.available {
-                Vec::new()
-            } else {
-                profile.notes
-            },
-            suggestions,
-        })
-    }
-
     pub fn list_agent_tasks(&self) -> Result<AgentTaskListReport> {
         self.list_agent_tasks_with_options(false)
     }
@@ -449,7 +370,7 @@ impl Trail {
         if inbox.total == 0 {
             agent_push_suggestion(
                 &mut suggestions,
-                "trail agent start --provider claude-code".to_string(),
+                "trail agent start claude-code".to_string(),
                 "start a terminal agent task without configuring an editor",
             );
         }
@@ -475,7 +396,7 @@ impl Trail {
         let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentStackReport {
@@ -491,7 +412,7 @@ impl Trail {
                 suggestions: vec![
                     next.clone(),
                     StatusSuggestion {
-                        command: "trail agent start --provider claude-code".to_string(),
+                        command: "trail agent start claude-code".to_string(),
                         reason: "start a terminal agent task without configuring an editor"
                             .to_string(),
                     },
@@ -590,7 +511,7 @@ impl Trail {
         let tasks = self.list_agent_tasks_with_options(include_archived)?.tasks;
         if tasks.is_empty() {
             let next = StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             };
             return Ok(AgentInboxReport {
@@ -604,12 +525,12 @@ impl Trail {
                 suggestions: vec![
                     next.clone(),
                     StatusSuggestion {
-                        command: "trail agent doctor --provider claude-code".to_string(),
+                        command: "trail agent doctor claude-code".to_string(),
                         reason: "verify the provider and workspace before connecting an editor"
                             .to_string(),
                     },
                     StatusSuggestion {
-                        command: "trail agent start --provider claude-code".to_string(),
+                        command: "trail agent start claude-code".to_string(),
                         reason: "start a terminal agent task instead of using an editor"
                             .to_string(),
                     },
@@ -649,7 +570,7 @@ impl Trail {
             })
             .or_else(|| items.first().map(|item| item.next.clone()))
             .unwrap_or_else(|| StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             });
         let mut suggestions = vec![next.clone()];
@@ -694,7 +615,7 @@ impl Trail {
                 latest: None,
                 risk: None,
                 suggestions: vec![StatusSuggestion {
-                    command: "trail agent setup".to_string(),
+                    command: "trail agent acp setup claude-code --editor vscode".to_string(),
                     reason: "configure an editor once, then start an agent task".to_string(),
                 }],
             });
@@ -715,7 +636,7 @@ impl Trail {
     pub fn agent_next(&self, selector: &str) -> Result<AgentNextReport> {
         let Some(lane) = self.resolve_agent_selector(selector)? else {
             let primary = StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason:
                     "configure an editor once; Trail will create fresh task lanes automatically"
                         .to_string(),
@@ -728,12 +649,12 @@ impl Trail {
                 primary,
                 suggestions: vec![
                     StatusSuggestion {
-                        command: "trail agent doctor --provider claude-code".to_string(),
+                        command: "trail agent doctor claude-code".to_string(),
                         reason: "verify the provider and workspace before connecting an editor"
                             .to_string(),
                     },
                     StatusSuggestion {
-                        command: "trail agent start --provider claude-code".to_string(),
+                        command: "trail agent start claude-code".to_string(),
                         reason: "start a terminal agent task instead of using an editor"
                             .to_string(),
                     },
@@ -5239,7 +5160,7 @@ fn agent_empty_action_palette_value() -> serde_json::Value {
         "task": null,
         "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
         "next": {
-            "command": "trail agent setup",
+            "command": "trail agent acp setup claude-code --editor vscode",
             "reason": "print a stable editor config that creates fresh Trail tasks automatically"
         },
         "actions": agent_empty_action_palette_actions()
@@ -5249,10 +5170,10 @@ fn agent_empty_action_palette_value() -> serde_json::Value {
 fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
     vec![
         agent_static_action(
-            "setup_vscode",
+            "acp_setup_vscode",
             "Set up VS Code",
             "setup",
-            "trail agent setup",
+            "trail agent acp setup claude-code --editor vscode",
             "print a copyable ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -5261,16 +5182,16 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_claude_code",
             "Check Claude Code",
             "doctor",
-            "trail agent doctor --provider claude-code",
+            "trail agent doctor claude-code",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
         ),
         agent_static_action(
-            "setup_codex_vscode",
+            "acp_setup_codex_vscode",
             "Set up VS Code for Codex",
             "setup",
-            "trail agent setup --provider codex",
+            "trail agent acp setup codex --editor vscode",
             "print a copyable Codex ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -5279,16 +5200,16 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_codex",
             "Check Codex",
             "doctor",
-            "trail agent doctor --provider codex",
+            "trail agent doctor codex",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
         ),
         agent_static_action(
-            "setup_cursor_vscode",
+            "acp_setup_cursor_vscode",
             "Set up VS Code for Cursor",
             "setup",
-            "trail agent setup --provider cursor",
+            "trail agent acp setup cursor --editor vscode",
             "print a copyable Cursor ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -5297,7 +5218,7 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_cursor",
             "Check Cursor",
             "doctor",
-            "trail agent doctor --provider cursor",
+            "trail agent doctor cursor",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
@@ -5306,7 +5227,7 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "start_terminal_task",
             "Start terminal task",
             "start",
-            "trail agent start --provider claude-code",
+            "trail agent start claude-code",
             "launch a fresh materialized terminal task when you are not using an editor",
             "open_world",
             true,
@@ -5315,7 +5236,7 @@ fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "start_gemini_task",
             "Start Gemini task",
             "start",
-            "trail agent start --provider gemini",
+            "trail agent start gemini",
             "launch Gemini CLI in a fresh materialized Trail task lane",
             "open_world",
             true,
@@ -5615,7 +5536,7 @@ fn agent_inbox_next_for_task(task: &AgentTaskReport) -> StatusSuggestion {
     let lane = &task.lane;
     match &task.status {
         AgentTaskStatus::Empty => StatusSuggestion {
-            command: "trail agent setup".to_string(),
+            command: "trail agent acp setup claude-code --editor vscode".to_string(),
             reason: "configure an editor once, then start an agent task".to_string(),
         },
         AgentTaskStatus::Active => StatusSuggestion {
@@ -5913,19 +5834,19 @@ fn agent_guide_steps(
         return vec![
             agent_guide_step(
                 "Connect an editor",
-                "trail agent setup",
+                "trail agent acp setup claude-code --editor vscode",
                 "print a stable ACP editor config that creates fresh Trail tasks automatically",
                 "once per editor setup",
             ),
             agent_guide_step(
                 "Check the provider",
-                "trail agent doctor --provider claude-code",
+                "trail agent doctor claude-code",
                 "verify Trail and the provider before the first real session",
                 "before or after setup when something does not connect",
             ),
             agent_guide_step(
                 "Start in terminal",
-                "trail agent start --provider claude-code",
+                "trail agent start claude-code",
                 "launch a fresh materialized terminal task when you are not using an ACP editor",
                 "when you want to work from the shell",
             ),
@@ -11762,7 +11683,7 @@ fn agent_risk_summary(level: &AgentRiskLevel, score: u8, task: &AgentTaskReport)
 fn agent_task_suggestions(lane: &str, status: &AgentTaskStatus) -> Vec<StatusSuggestion> {
     match status {
         AgentTaskStatus::Empty => vec![StatusSuggestion {
-            command: "trail agent setup".to_string(),
+            command: "trail agent acp setup claude-code --editor vscode".to_string(),
             reason: "configure an editor once, then start an agent task".to_string(),
         }],
         AgentTaskStatus::Dirty => vec![StatusSuggestion {
@@ -11805,7 +11726,7 @@ fn agent_next_report_from_view(
             "setup",
             "No agent task is available.",
             StatusSuggestion {
-                command: "trail agent setup".to_string(),
+                command: "trail agent acp setup claude-code --editor vscode".to_string(),
                 reason: "configure an editor once, then start an agent task".to_string(),
             },
         ),
@@ -12053,66 +11974,6 @@ fn agent_brief_suggestions(lane: &str, next: &AgentNextReport) -> Vec<StatusSugg
         }
     }
     suggestions
-}
-
-fn agent_editor_snippet(editor: &str, provider: &str, command: &[String]) -> String {
-    match editor {
-        "vscode" => serde_json::to_string_pretty(&serde_json::json!({
-            (format!("Trail {}", provider_display_name(provider))): {
-                "command": command.first().cloned().unwrap_or_default(),
-                "args": command.iter().skip(1).cloned().collect::<Vec<_>>(),
-                "env": {}
-            }
-        }))
-        .unwrap_or_else(|_| "{}".to_string()),
-        "zed" => serde_json::to_string_pretty(&serde_json::json!({
-            "agent_servers": {
-                (format!("trail-{}", provider)): {
-                    "type": "custom",
-                    "command": command.first().cloned().unwrap_or_default(),
-                    "args": command.iter().skip(1).cloned().collect::<Vec<_>>()
-                }
-            }
-        }))
-        .unwrap_or_else(|_| "{}".to_string()),
-        _ => format!("ACP command:\n{}", shell_join(command)),
-    }
-}
-
-fn agent_terminal_setup_snippet(
-    profile: &AcpProviderProfile,
-    command: &[String],
-    mcp_command: &[String],
-) -> String {
-    let mut snippet = format!(
-        "Terminal command:\n{}\n\nTrail MCP server command:\n{}",
-        shell_join(command),
-        shell_join(mcp_command)
-    );
-    if profile.supports_mcp {
-        snippet.push_str(&format!(
-            "\n\nRegister the MCP command in {} if you want direct Trail context tools inside the agent.",
-            profile.display_name
-        ));
-    } else {
-        snippet.push_str(&format!(
-            "\n\n{} is configured here as a terminal agent; use the terminal command to run it in an isolated Trail task lane.",
-            profile.display_name
-        ));
-    }
-    snippet
-}
-
-fn provider_display_name(provider: &str) -> String {
-    match provider {
-        "claude-code" | "claude" => "Claude Code".to_string(),
-        "codex" | "codex-cli" | "openai-codex" => "Codex".to_string(),
-        "cursor" | "cursor-agent" => "Cursor".to_string(),
-        "gemini" | "gemini-cli" => "Gemini CLI".to_string(),
-        "aider" => "Aider".to_string(),
-        "opencode" | "open-code" => "OpenCode".to_string(),
-        other => other.to_string(),
-    }
 }
 
 fn sanitize_agent_ref_component(value: &str) -> String {

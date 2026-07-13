@@ -33,11 +33,12 @@ trail --json agent dashboard latest
 
 | Command | Purpose and important options |
 | --- | --- |
-| `setup` | Print editor setup. `--provider <NAME>` defaults to `claude-code`; `--editor <NAME>` defaults to `vscode`. |
-| `doctor` | Check provider and workspace readiness. `--provider <NAME>` defaults to `claude-code`. |
-| `start` | Create a fresh task lane and launch a terminal agent. Supports `--provider`, `--name`, `--from`, `--workdir-mode`, and a command after `--`. |
+| `acp setup <PROVIDER>` | Preview ACP editor setup. Accepts equivalent `--provider`, plus `--editor`, `--print`, and `--yes`. |
+| `hooks setup <PROVIDER>` | Preview native hook setup. Accepts equivalent `--provider`, plus `--scope`, `--print`, and `--yes`. |
+| `doctor [PROVIDER]` | Check terminal provider and workspace readiness. Accepts equivalent `--provider`. |
+| `start [PROVIDER]` | Create a fresh task lane and launch a terminal agent. Accepts equivalent `--provider`, a configured default, `--name`, `--from`, `--workdir-mode`, and a command after `--`. |
 | `continue [TASK]` | Create a follow-up task from an existing task checkpoint. Supports `--provider`, `--name`, `--workdir-mode`, and a command after `--`. Alias: `follow-up`. |
-| `acp` | Hidden stable ACP entry point used by editor integrations. Supports `--provider`, `--name`, `--from`, `--no-mcp`, and a command after `--`. |
+| `acp status/doctor/sessions` | Inspect ACP providers, readiness, and captured sessions. Editors use the hidden `acp run` entrypoint. |
 
 Built-in terminal profiles are `claude-code`, `codex`, `cursor`, `gemini`,
 `aider`, and `opencode`.
@@ -46,10 +47,10 @@ Valid terminal workdir modes are `auto`, `native-cow`, `portable-copy`,
 `fuse-cow`, `nfs-cow`, and `dokan-cow`; the default is `auto`.
 
 ```sh
-trail agent setup --provider codex --editor vscode
-trail agent doctor --provider codex
-trail agent start --provider codex --name docs-task
-trail agent start --provider codex --from main --workdir-mode native-cow
+trail agent acp setup codex --editor vscode
+trail agent doctor codex
+trail agent start codex --name docs-task
+trail agent start codex --from main --workdir-mode native-cow
 trail agent continue latest --provider claude-code
 ```
 

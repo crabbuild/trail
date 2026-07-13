@@ -9,6 +9,8 @@ pub const ANCHOR_KIND: &str = "Anchor";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrailConfig {
     pub workspace: WorkspaceConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     pub recording: RecordingConfig,
     pub text: TextConfig,
     pub lane: LaneConfig,
@@ -19,6 +21,12 @@ pub struct TrailConfig {
     pub guardrails: GuardrailsConfig,
     #[serde(default = "default_workspace_views_config")]
     pub workspace_views: WorkspaceViewsConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub default_provider: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -271,6 +279,7 @@ impl TrailConfig {
                 id: workspace_id,
                 default_branch: default_branch.into(),
             },
+            agent: AgentConfig::default(),
             recording: RecordingConfig {
                 mode: "save".to_string(),
                 debounce_ms: 500,

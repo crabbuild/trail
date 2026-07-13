@@ -20,7 +20,7 @@ VS Code Trail extension
     |
     | ACP JSON-RPC stdio
     v
-trail agent acp --provider <provider>
+trail agent acp run <provider>
     |
     | Trail ACP relay
     v
@@ -697,7 +697,7 @@ Required reads:
 
 Required mutations:
 
-- create/start task through `trail agent acp`
+- create/start task through `trail agent acp run`
 - cancel prompt through ACP
 - approval decision through ACP and Trail mirror
 - record/refresh lane workdir when explicitly requested
@@ -959,7 +959,7 @@ Acceptance:
 Deliver:
 
 - Provider registry with `claude-code` and custom command.
-- ACP stdio client over `trail agent acp`.
+- ACP stdio client over `trail agent acp run`.
 - Chat panel with text messages, plan, tool rows, usage meter, and cancel.
 - Basic permission prompt.
 

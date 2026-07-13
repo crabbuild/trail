@@ -417,6 +417,55 @@ mod tests {
     }
 
     #[test]
+    fn agent_cli_parses_new_positional_provider_commands() {
+        for command in [
+            vec!["trail", "agent", "start", "codex"],
+            vec!["trail", "agent", "acp", "setup", "codex", "--editor", "zed"],
+            vec!["trail", "agent", "acp", "run", "codex"],
+            vec!["trail", "agent", "acp", "doctor", "codex"],
+            vec!["trail", "agent", "hooks", "setup", "codex"],
+            vec!["trail", "agent", "hooks", "status", "codex"],
+        ] {
+            Cli::try_parse_from(command.clone()).unwrap_or_else(|error| {
+                panic!("new agent command {command:?} should parse: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn agent_cli_accepts_named_provider_and_rejects_both_forms() {
+        Cli::try_parse_from([
+            "trail",
+            "agent",
+            "acp",
+            "setup",
+            "--provider",
+            "codex",
+            "--editor",
+            "zed",
+        ])
+        .expect("named ACP provider should parse");
+        Cli::try_parse_from(["trail", "agent", "hooks", "setup", "--provider", "codex"])
+            .expect("named hook provider should parse");
+        assert!(Cli::try_parse_from([
+            "trail",
+            "agent",
+            "start",
+            "codex",
+            "--provider",
+            "claude-code",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn agent_cli_rejects_removed_setup_commands() {
+        assert!(Cli::try_parse_from(["trail", "agent", "setup"]).is_err());
+        assert!(Cli::try_parse_from(["trail", "acp", "install"]).is_err());
+        assert!(Cli::try_parse_from(["trail", "agent", "hooks", "add", "codex"]).is_err());
+    }
+
+    #[test]
     fn workdir_mode_cli_uses_the_hard_cutover_names() {
         for mode in [
             "auto",

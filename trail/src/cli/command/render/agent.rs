@@ -13,7 +13,6 @@ macro_rules! agent_renderer {
     };
 }
 
-agent_renderer!(render_agent_setup, AgentSetupReport, "Agent setup");
 agent_renderer!(render_agent_status, AgentStatusReport, "Agent status");
 agent_renderer!(render_agent_guide, AgentGuideReport, "Agent guide");
 agent_renderer!(
@@ -130,7 +129,7 @@ pub(crate) fn render_agent_empty_action_palette(json: bool, options: &RenderOpti
             "task": null,
             "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
             "next": {
-                "command": "trail agent setup",
+                "command": "trail agent acp setup claude-code --editor vscode",
                 "reason": "print a stable editor config that creates fresh Trail tasks automatically"
             },
             "actions": actions
@@ -141,7 +140,7 @@ pub(crate) fn render_agent_empty_action_palette(json: bool, options: &RenderOpti
             .context("Set up a provider or start a task to see review actions.")
             .block(UiBlock::Table(actions_table(&actions)))
             .next(
-                "trail agent setup",
+                "trail agent acp setup claude-code --editor vscode",
                 "print a copyable provider configuration",
             ),
         options,
@@ -160,7 +159,7 @@ pub(crate) fn render_agent_empty_task_hint(
             "task": null,
             "summary": "No agent task is recorded yet. Set up an editor, verify the provider, or start a terminal task.",
             "next": {
-                "command": "trail agent setup",
+                "command": "trail agent acp setup claude-code --editor vscode",
                 "reason": "print a stable editor config that creates fresh Trail tasks automatically"
             },
             "actions": agent_empty_action_palette_actions()
@@ -172,7 +171,7 @@ pub(crate) fn render_agent_empty_task_hint(
             UiTone::Neutral,
         )
         .next(
-            "trail agent start --provider claude-code",
+            "trail agent start claude-code",
             "start an isolated terminal task",
         ),
         options,
@@ -237,10 +236,10 @@ pub(crate) fn render_agent_diff(
 pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
     [
         (
-            "setup_vscode",
-            "Set up VS Code",
+            "acp_setup_vscode",
+            "Set up ACP in VS Code",
             "setup",
-            "trail agent setup",
+            "trail agent acp setup claude-code --editor vscode",
             "print a copyable ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -249,16 +248,16 @@ pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_claude_code",
             "Check Claude Code",
             "doctor",
-            "trail agent doctor --provider claude-code",
+            "trail agent doctor claude-code",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
         ),
         (
-            "setup_codex_vscode",
-            "Set up VS Code for Codex",
+            "acp_setup_codex_vscode",
+            "Set up Codex ACP in VS Code",
             "setup",
-            "trail agent setup --provider codex",
+            "trail agent acp setup codex --editor vscode",
             "print a copyable Codex ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -267,16 +266,16 @@ pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_codex",
             "Check Codex",
             "doctor",
-            "trail agent doctor --provider codex",
+            "trail agent doctor codex",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
         ),
         (
-            "setup_cursor_vscode",
-            "Set up VS Code for Cursor",
+            "acp_setup_cursor_vscode",
+            "Set up Cursor ACP in VS Code",
             "setup",
-            "trail agent setup --provider cursor",
+            "trail agent acp setup cursor --editor vscode",
             "print a copyable Cursor ACP editor config that creates fresh task lanes automatically",
             "read_only",
             false,
@@ -285,7 +284,7 @@ pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "doctor_cursor",
             "Check Cursor",
             "doctor",
-            "trail agent doctor --provider cursor",
+            "trail agent doctor cursor",
             "verify Trail workspace readiness and provider availability",
             "read_only",
             false,
@@ -294,7 +293,7 @@ pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "start_terminal_task",
             "Start terminal task",
             "start",
-            "trail agent start --provider claude-code",
+            "trail agent start claude-code",
             "launch a fresh materialized terminal task when you are not using an editor",
             "open_world",
             true,
@@ -303,7 +302,7 @@ pub(crate) fn agent_empty_action_palette_actions() -> Vec<AgentReviewAction> {
             "start_gemini_task",
             "Start Gemini task",
             "start",
-            "trail agent start --provider gemini",
+            "trail agent start gemini",
             "launch Gemini CLI in a fresh materialized Trail task lane",
             "open_world",
             true,

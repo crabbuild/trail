@@ -60,9 +60,9 @@ Custom workdirs must be empty or absent and cannot be symlinks.
 ## FUSE COW For Terminal Agents
 
 ```sh
-trail agent start --provider codex --workdir-mode fuse-cow
-trail agent start --provider custom --workdir-mode fuse-cow -- my-agent --flag
-trail agent start --provider codex --workdir-mode nfs-cow
+trail agent start codex --workdir-mode fuse-cow
+trail agent start custom --workdir-mode fuse-cow -- my-agent --flag
+trail agent start codex --workdir-mode nfs-cow
 ```
 
 `fuse-cow` lets a terminal agent see a normal filesystem tree without first

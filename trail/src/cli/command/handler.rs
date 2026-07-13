@@ -26,6 +26,24 @@ use errors::*;
 use parsing::*;
 use runtime::*;
 
+fn resolve_agent_provider_argument(
+    positional: Option<String>,
+    named: Option<String>,
+    fallback: Option<&str>,
+) -> Result<String> {
+    match (positional, named) {
+        (Some(_), Some(_)) => Err(Error::InvalidInput(
+            "provider may be supplied either positionally or with --provider, not both".to_string(),
+        )),
+        (Some(provider), None) | (None, Some(provider)) => Ok(provider),
+        (None, None) => fallback.map(ToString::to_string).ok_or_else(|| {
+            Error::InvalidInput(
+                "choose a provider positionally or with --provider <PROVIDER>".to_string(),
+            )
+        }),
+    }
+}
+
 pub(crate) fn run_cli() {
     let json_errors =
         args_request_json_errors(std::env::args_os().skip(1)) || env_requests_json_errors();

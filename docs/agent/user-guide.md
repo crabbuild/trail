@@ -21,7 +21,7 @@ Trail has terminal profiles for `claude-code`, `codex`, `cursor`, `gemini`,
 `aider`, and `opencode`.
 
 ```sh
-trail agent doctor --provider codex
+trail agent doctor codex
 ```
 
 The doctor checks provider and workspace readiness. Fix reported provider,
@@ -30,25 +30,26 @@ workspace, or workdir problems before starting a task.
 For an ACP-capable editor, print a configuration snippet:
 
 ```sh
-trail agent setup --provider codex --editor vscode
+trail agent acp setup codex --editor vscode
 ```
 
-`--editor` defaults to `vscode`; `zed` and `generic` are also supported setup
-targets. Paste the printed snippet into the editor's custom-agent settings.
+Use `zed` for Trail's exact writable adapter, or `vscode`/`generic` for a
+copyable entry. Setup previews by default; add `--yes` to apply a supported
+adapter.
 
 ## 2. Start an Isolated Terminal Task
 
 Create a named task and launch the provider inside its workdir:
 
 ```sh
-trail agent start --provider codex --name update-agent-docs
+trail agent start codex --name update-agent-docs
 ```
 
 Trail creates a fresh task lane from the current base. To start from another
 Trail ref, task, lane, or checkpoint, use `--from`:
 
 ```sh
-trail agent start --provider codex --from main --name update-agent-docs
+trail agent start codex --from main --name update-agent-docs
 ```
 
 Terminal tasks align the child process `PWD`, `OLDPWD`, and Git discovery
@@ -67,15 +68,15 @@ workdir checkpoint when the provider exits.
 Choose a workdir mode when the default full materialization is unsuitable:
 
 ```sh
-trail agent start --provider codex --workdir-mode fuse-cow
-trail agent start --provider codex --workdir-mode nfs-cow
+trail agent start codex --workdir-mode fuse-cow
+trail agent start codex --workdir-mode nfs-cow
 ```
 
 You can override a provider profile's executable by placing the command after
 `--`:
 
 ```sh
-trail agent start --provider codex -- codex --your-provider-flag
+trail agent start codex -- codex --your-provider-flag
 ```
 
 For editor-based ACP work, the configured editor entry point creates a fresh

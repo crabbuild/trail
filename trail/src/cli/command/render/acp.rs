@@ -54,8 +54,8 @@ pub(crate) fn render_acp_profiles(
     )
 }
 
-pub(crate) fn render_acp_install(
-    report: &AcpInstallReport,
+pub(crate) fn render_acp_setup(
+    report: &trail::acp::AcpSetupReport,
     json: bool,
     options: &RenderOptions,
     print_only: bool,
@@ -73,17 +73,18 @@ pub(crate) fn render_acp_install(
         );
     }
     let mut document = TerminalDocument::new(
-        format!("ACP install plan for {}", report.agent),
-        if report.dry_run {
-            UiTone::Attention
-        } else {
+        format!("ACP setup for {}", report.provider),
+        if report.applied {
             UiTone::Success
+        } else {
+            UiTone::Attention
         },
     )
     .block(UiBlock::Metadata(vec![
         ("Editor".to_string(), report.editor.clone()),
-        ("Detected".to_string(), report.detected.to_string()),
-        ("Relay".to_string(), shell_join(&report.relay_command)),
+        ("Action".to_string(), report.action.clone()),
+        ("Applied".to_string(), report.applied.to_string()),
+        ("Command".to_string(), shell_join(&report.command)),
     ]))
     .block(UiBlock::Patch {
         title: "Configuration snippet".to_string(),

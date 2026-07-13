@@ -51,17 +51,6 @@ pub struct AcpProviderProfile {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AcpInstallReport {
-    pub agent: String,
-    pub editor: String,
-    pub dry_run: bool,
-    pub relay_command: Vec<String>,
-    pub snippet: String,
-    pub detected: bool,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AcpDoctorCheck {
     pub name: String,
     pub status: String,
@@ -1203,21 +1192,6 @@ pub struct AgentFinishReport {
     pub apply: AgentApplyReport,
     pub archive: Option<AgentArchiveReport>,
     pub would_archive: bool,
-    pub suggestions: Vec<StatusSuggestion>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AgentSetupReport {
-    pub provider: String,
-    pub editor: String,
-    pub mode: String,
-    pub command: Vec<String>,
-    pub snippet: String,
-    pub detected: bool,
-    pub supports_acp: bool,
-    pub supports_mcp: bool,
-    pub supports_terminal: bool,
-    pub warnings: Vec<String>,
     pub suggestions: Vec<StatusSuggestion>,
 }
 
