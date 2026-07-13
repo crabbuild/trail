@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +15,10 @@ mod protocol;
 mod registry;
 mod schema;
 mod setup;
+mod transport;
+
+use protocol::{Direction, Frame};
+use transport::{FrameObserver, RelayFinishReason, StdioRelay};
 
 pub use setup::{apply_acp_setup_plan, build_acp_setup_plan, AcpSetupReport};
 
@@ -329,92 +330,46 @@ pub(crate) fn built_in_acp_relay_command(provider: &str) -> Vec<String> {
 }
 
 pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
-    if options.upstream_command.is_empty() {
-        return Err(Error::InvalidInput(
-            "ACP relay requires an upstream command after `--`".to_string(),
-        ));
-    }
+    let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options.clone())?));
+    let observer = Arc::new(CaptureObserver { coordinator });
+    StdioRelay::new(observer).run(&options)
+}
 
-    let mut child = Command::new(&options.upstream_command[0])
-        .args(&options.upstream_command[1..])
-        .envs(&options.upstream_env)
-        .current_dir(&options.workspace_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            Error::InvalidInput(format!(
-                "failed to launch upstream ACP agent `{}`: {err}",
-                options.upstream_command[0]
-            ))
-        })?;
+struct CaptureObserver {
+    coordinator: Arc<Mutex<CaptureCoordinator>>,
+}
 
-    let child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::InvalidInput("failed to open upstream ACP stdin pipe".to_string()))?;
-    let child_stdout = child.stdout.take().ok_or_else(|| {
-        Error::InvalidInput("failed to open upstream ACP stdout pipe".to_string())
-    })?;
-
-    if let Some(stderr) = child.stderr.take() {
-        thread::spawn(move || {
-            let _ = copy_upstream_stderr(stderr);
+impl FrameObserver for CaptureObserver {
+    fn observe(&self, frame: &mut Frame) -> Result<()> {
+        let original = frame.value().clone();
+        capture_step(&self.coordinator, |capture| match frame.direction() {
+            Direction::ClientToAgent => {
+                capture.before_client_message(frame.value_mut_for_transform())
+            }
+            Direction::AgentToClient => {
+                capture.before_agent_message(frame.value_mut_for_transform())
+            }
         });
+        if frame.value() != &original {
+            frame.commit_transform().map_err(Error::Io)?;
+        }
+        Ok(())
     }
 
-    let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options)?));
-    let (done_tx, done_rx) = mpsc::channel();
-
-    let editor_coordinator = Arc::clone(&coordinator);
-    let editor_done = done_tx.clone();
-    let editor_handle = thread::spawn(move || {
-        let result = pump_editor_to_agent(io::stdin().lock(), child_stdin, editor_coordinator);
-        let _ = editor_done.send(PumpDone::Editor(result));
-    });
-
-    let agent_coordinator = Arc::clone(&coordinator);
-    let agent_handle = thread::spawn(move || {
-        let result = pump_agent_to_editor(
-            BufReader::new(child_stdout),
-            io::stdout(),
-            agent_coordinator,
-        );
-        let _ = done_tx.send(PumpDone::Agent(result));
-    });
-
-    let first = done_rx.recv().map_err(|err| {
-        Error::InvalidInput(format!("ACP relay pump failed before startup: {err}"))
-    })?;
-    match first {
-        PumpDone::Editor(result) => {
-            result.map_err(Error::Io)?;
-            let status = child.wait().map_err(Error::Io)?;
-            if let Ok(PumpDone::Agent(result)) = done_rx.recv() {
-                result.map_err(Error::Io)?;
+    fn finish(&self, reason: RelayFinishReason) {
+        let (status, summary) = match reason {
+            RelayFinishReason::EditorEof => ("cancelled", "editor input closed".to_string()),
+            RelayFinishReason::EditorError(error) => {
+                ("failed", format!("editor sent malformed ACP: {error}"))
             }
-            let _ = agent_handle.join();
-            let _ = editor_handle.join();
-            if status.success() {
-                Ok(())
-            } else {
-                Err(Error::InvalidInput(format!(
-                    "upstream ACP agent exited with status {status}"
-                )))
+            RelayFinishReason::AgentEof => ("failed", "upstream output closed".to_string()),
+            RelayFinishReason::AgentError(error) => {
+                ("failed", format!("upstream sent malformed JSON: {error}"))
             }
-        }
-        PumpDone::Agent(result) => {
-            result.map_err(Error::Io)?;
-            let status = child.wait().map_err(Error::Io)?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(Error::InvalidInput(format!(
-                    "upstream ACP agent exited with status {status}"
-                )))
-            }
-        }
+        };
+        capture_step(&self.coordinator, |capture| {
+            capture.finish_open_turns(status, &summary)
+        });
     }
 }
 
@@ -513,73 +468,6 @@ fn record_acp_lifecycle_event(
     Ok(())
 }
 
-enum PumpDone {
-    Editor(io::Result<()>),
-    Agent(io::Result<()>),
-}
-
-fn pump_editor_to_agent<R, W>(
-    mut reader: R,
-    mut writer: W,
-    coordinator: Arc<Mutex<CaptureCoordinator>>,
-) -> io::Result<()>
-where
-    R: BufRead,
-    W: Write,
-{
-    loop {
-        let mut message = match read_json_line(&mut reader) {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
-            Err(err) => {
-                capture_step(&coordinator, |capture| {
-                    capture.finish_open_turns("failed", "editor sent malformed JSON")
-                });
-                return Err(err);
-            }
-        };
-        capture_step(&coordinator, |capture| {
-            capture.before_client_message(&mut message)
-        });
-        write_json_line(&mut writer, &message)?;
-    }
-    capture_step(&coordinator, |capture| {
-        capture.finish_open_turns("cancelled", "editor input closed")
-    });
-    writer.flush()
-}
-
-fn pump_agent_to_editor<R, W>(
-    mut reader: R,
-    mut writer: W,
-    coordinator: Arc<Mutex<CaptureCoordinator>>,
-) -> io::Result<()>
-where
-    R: BufRead,
-    W: Write,
-{
-    loop {
-        let mut message = match read_json_line(&mut reader) {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
-            Err(err) => {
-                capture_step(&coordinator, |capture| {
-                    capture.finish_open_turns("failed", "upstream sent malformed JSON")
-                });
-                return Err(err);
-            }
-        };
-        capture_step(&coordinator, |capture| {
-            capture.before_agent_message(&mut message)
-        });
-        write_json_line(&mut writer, &message)?;
-    }
-    capture_step(&coordinator, |capture| {
-        capture.finish_open_turns("failed", "upstream output closed")
-    });
-    writer.flush()
-}
-
 fn capture_step<F>(coordinator: &Arc<Mutex<CaptureCoordinator>>, f: F)
 where
     F: FnOnce(&mut CaptureCoordinator) -> Result<()>,
@@ -594,44 +482,6 @@ where
         Err(_) => {
             eprintln!("trail acp relay capture warning: capture coordinator lock poisoned");
         }
-    }
-}
-
-fn read_json_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
-    loop {
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            return Ok(None);
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str(line)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        return Ok(Some(value));
-    }
-}
-
-fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, value)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
-fn copy_upstream_stderr<R: Read>(reader: R) -> io::Result<()> {
-    let mut reader = BufReader::new(reader);
-    let mut buf = [0u8; 8192];
-    loop {
-        let bytes = reader.read(&mut buf)?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        let mut stderr = io::stderr().lock();
-        stderr.write_all(&buf[..bytes])?;
-        stderr.flush()?;
     }
 }
 
@@ -2485,15 +2335,13 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn json_line_round_trips_single_message() {
-        let mut input =
-            BufReader::new(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.as_slice());
-        let value = read_json_line(&mut input).unwrap().unwrap();
-        assert_eq!(value["method"], "initialize");
-
-        let mut out = Vec::new();
-        write_json_line(&mut out, &value).unwrap();
-        assert!(std::str::from_utf8(&out).unwrap().ends_with('\n'));
+    fn raw_json_frame_preserves_a_single_message() {
+        let raw = br#" {"jsonrpc":"2.0","id":1,"method":"initialize"}
+"#
+        .to_vec();
+        let frame = Frame::parse(Direction::ClientToAgent, raw.clone()).unwrap();
+        assert_eq!(frame.value()["method"], "initialize");
+        assert_eq!(frame.forward_bytes(), raw);
     }
 
     #[test]

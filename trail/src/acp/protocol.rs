@@ -80,6 +80,10 @@ impl Frame {
         self.kind
     }
 
+    pub(crate) fn direction(&self) -> Direction {
+        self.direction
+    }
+
     pub(crate) fn method(&self) -> Option<&str> {
         self.method.as_deref()
     }
