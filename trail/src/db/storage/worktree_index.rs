@@ -618,22 +618,17 @@ impl Trail {
         paths: &[String],
         manifests: &BTreeMap<String, DiskManifest>,
     ) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
+        if !paths.is_empty() {
+            self.clear_worktree_index_baseline()?;
         }
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result = (|| {
-            self.clear_worktree_index_baseline()?;
-            self.update_worktree_index_from_paths_and_manifest_in_transaction(paths, manifests)
-        })();
+        let result =
+            self.update_worktree_index_from_paths_and_manifest_in_transaction(paths, manifests);
         if result.is_ok() {
-            if let Err(err) = self.conn.execute_batch("COMMIT;") {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                return Err(Error::from(err));
-            }
-            return Ok(());
+            self.conn.execute_batch("COMMIT;")?;
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK;");
         }
-        let _ = self.conn.execute_batch("ROLLBACK;");
         result
     }
 
@@ -644,20 +639,23 @@ impl Trail {
     ) -> Result<()> {
         let scan_id = worktree_scan_id();
         let now = now_ts();
-        let mut delete = self.conn.prepare_cached(DELETE_WORKTREE_INDEX_PATH_SQL)?;
-        let mut upsert = self.conn.prepare_cached(UPSERT_WORKTREE_INDEX_PATH_SQL)?;
+        let mut upsert = self.conn.prepare_cached(
+            "INSERT OR REPLACE INTO worktree_file_index \
+             (path, size_bytes, modified_ns, changed_ns, device_id, inode, executable, kind, content_hash, last_seen_scan, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
         for path in paths {
             let abs = self.workspace_root.join(path_from_rel(path));
             let metadata = match fs::symlink_metadata(&abs) {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    delete.execute(params![path])?;
+                    self.delete_worktree_index_path(path)?;
                     continue;
                 }
                 Err(err) => return Err(Error::Io(err)),
             };
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                delete.execute(params![path])?;
+                self.delete_worktree_index_path(path)?;
                 continue;
             }
             let stamp = WorktreeFileStamp::from_metadata(&metadata);
