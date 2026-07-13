@@ -330,6 +330,7 @@ for scale in ${SCALES//,/ }; do
 
   WORK="$RUN_ROOT/$scale"
   REPO="$WORK/repo"
+  EMPTY_REPO="$WORK/empty-root-repo"
   GIT_REPO="$WORK/git-repo"
   GIT_UNMAPPED_REPO="$WORK/git-unmapped-repo"
   RESULTS="$WORK/results.tsv"
@@ -782,9 +783,73 @@ for i in range(max(1, min(50, files // 200))):
 json.dump({"base_change": base_change, "message": "scale patchbot", "edits": edits}, out.open("w"))
 PY
   run_timed "$scale" agent_apply_patch "$BIN" --workspace "$REPO" --json lane apply-patch patchbot --patch "$WORK/patchbot.json"
+  python3 scripts/extract-path-index-performance.py \
+    "$WORK/out/agent_apply_patch.stdout" patch "$WORK/path-index-patch.tsv"
   run_timed "$scale" agent_readiness "$BIN" --workspace "$REPO" --json lane readiness patchbot
   run_timed "$scale" merge_agent_dry_run "$BIN" --workspace "$REPO" --json lane merge patchbot --into main --direct --dry-run
   run_timed "$scale" merge_agent_apply "$BIN" --workspace "$REPO" --json lane merge patchbot --into main --direct
+
+  run_timed "$scale" path_index_rename_spawn "$BIN" --workspace "$REPO" --json lane spawn pathindexrename --from main --no-materialize
+  python3 - "$REPO" "$WORK/path-index-rename.json" "$WORK/out/path_index_rename_spawn.stdout" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+base_change = json.loads(pathlib.Path(sys.argv[3]).read_text())["base_change"]
+module = pathlib.Path("pkg_00000/module_000.rs")
+json.dump({
+    "base_change": base_change,
+    "message": "path-index delete/add and case rename",
+    "edits": [
+        {"op": "rename", "from": "README.md", "to": "readme.md"},
+        {"op": "delete", "path": str(module)},
+        {
+            "op": "write",
+            "path": str(module),
+            "content": (root / module).read_text() + "\n// delete then add\n",
+        },
+    ],
+}, out.open("w"))
+PY
+  run_timed "$scale" path_index_rename_patch "$BIN" --workspace "$REPO" --json lane apply-patch pathindexrename --patch "$WORK/path-index-rename.json"
+  python3 scripts/extract-path-index-performance.py \
+    "$WORK/out/path_index_rename_patch.stdout" rename_patch "$WORK/path-index-rename.tsv"
+
+  mkdir -p "$EMPTY_REPO"
+  run_timed "$scale" path_index_empty_init "$BIN" --workspace "$EMPTY_REPO" --json init
+  run_timed "$scale" path_index_empty_spawn "$BIN" --workspace "$EMPTY_REPO" --json lane spawn pathindexempty --from main --no-materialize
+  python3 - "$WORK/path-index-empty.json" "$WORK/out/path_index_empty_spawn.stdout" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+base_change = json.loads(pathlib.Path(sys.argv[2]).read_text())["base_change"]
+json.dump({
+    "base_change": base_change,
+    "message": "path-index first file",
+    "edits": [{"op": "write", "path": "FIRST.md", "content": "first file\n"}],
+}, out.open("w"))
+PY
+  run_timed "$scale" path_index_empty_patch "$BIN" --workspace "$EMPTY_REPO" --json lane apply-patch pathindexempty --patch "$WORK/path-index-empty.json"
+  python3 scripts/extract-path-index-performance.py \
+    "$WORK/out/path_index_empty_patch.stdout" empty_root_patch "$WORK/path-index-empty.tsv"
+
+  run_timed "$scale" path_index_record_spawn "$BIN" --workspace "$REPO" --json lane spawn pathindexrecord --from main --paths README.md
+  PATH_INDEX_RECORD_WORKDIR="$(python3 - "$WORK/out/path_index_record_spawn.stdout" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("workdir")
+print(value or "")
+PY
+)"
+  if [ -z "$PATH_INDEX_RECORD_WORKDIR" ]; then
+    printf 'bounded path-index record lane did not materialize a workdir\n' >&2
+    exit 1
+  fi
+  run_timed "$scale" path_index_record_mutate python3 - "$PATH_INDEX_RECORD_WORKDIR/README.md" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+path.write_text(path.read_text() + "\npath-index bounded record\n")
+PY
+  run_timed "$scale" path_index_record "$BIN" --workspace "$REPO" --json lane record pathindexrecord -m "path-index bounded record"
+  python3 scripts/extract-path-index-performance.py \
+    "$WORK/out/path_index_record.stdout" record "$WORK/path-index-record.tsv"
 
   run_timed "$scale" agent_spawn_queuebot "$BIN" --workspace "$REPO" --json lane spawn queuebot --from main --no-materialize
   python3 - "$REPO" "$WORK/queuebot.json" "$scale" "$WORK/out/agent_spawn_queuebot.stdout" <<'PY'
@@ -872,6 +937,7 @@ PY
     if [ -f "$WORK/agent-git-metrics.tsv" ]; then
       cat "$WORK/agent-git-metrics.tsv"
     fi
+    cat "$WORK/path-index-"*.tsv
     printf 'daemon_rss_bytes\t%s\n' "$DAEMON_RSS"
     du -sk "$REPO" "$REPO/.trail" 2>/dev/null | awk '{print "du_kb_" $2 "\t" $1}'
   } > "$WORK/metrics.tsv"

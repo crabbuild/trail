@@ -24,12 +24,20 @@ impl Trail {
             mode: metrics.mode.as_str().to_string(),
             lookup_count: metrics.lookup_count,
             full_root_path_load_count: metrics.full_root_path_load_count,
+            full_filesystem_path_scan_count: metrics.full_filesystem_path_scan_count,
         }
     }
 
     pub(crate) fn note_full_root_path_load(&self) {
         let mut metrics = self.case_fold_index_metrics.get();
         metrics.full_root_path_load_count = metrics.full_root_path_load_count.saturating_add(1);
+        self.case_fold_index_metrics.set(metrics);
+    }
+
+    pub(crate) fn note_full_filesystem_path_scan(&self) {
+        let mut metrics = self.case_fold_index_metrics.get();
+        metrics.full_filesystem_path_scan_count =
+            metrics.full_filesystem_path_scan_count.saturating_add(1);
         self.case_fold_index_metrics.set(metrics);
     }
 
@@ -2404,22 +2412,27 @@ mod tests {
         db.spawn_lane("metric-patch", Some("main"), false, None, None)
             .unwrap();
         db.reset_case_fold_index_metrics();
-        db.apply_lane_patch(
-            "metric-patch",
-            PatchDocument {
-                base_change: None,
-                allow_stale: true,
-                allow_ignored: false,
-                session_id: None,
-                message: None,
-                edits: vec![PatchEdit::Write {
-                    path: "notes.md".to_string(),
-                    content: "notes\n".to_string(),
-                    executable: false,
-                }],
-            },
-        )
-        .unwrap();
+        let patch_report = db
+            .apply_lane_patch(
+                "metric-patch",
+                PatchDocument {
+                    base_change: None,
+                    allow_stale: true,
+                    allow_ignored: false,
+                    session_id: None,
+                    message: None,
+                    edits: vec![PatchEdit::Write {
+                        path: "notes.md".to_string(),
+                        content: "notes\n".to_string(),
+                        executable: false,
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(patch_report.path_index.mode, "indexed");
+        assert_eq!(patch_report.path_index.lookup_count, 1);
+        assert_eq!(patch_report.path_index.full_root_path_load_count, 0);
+        assert_eq!(patch_report.path_index.full_filesystem_path_scan_count, 0);
         assert_indexed_case_fold_metrics(&db, 1);
 
         let spawned = db
@@ -2444,8 +2457,162 @@ mod tests {
         assert_eq!(count_rows("prolly_nodes"), prolly_before_preview);
 
         db.reset_case_fold_index_metrics();
-        db.record_lane_workdir("metric-record", None).unwrap();
+        let record_report = db.record_lane_workdir("metric-record", None).unwrap();
+        assert_eq!(record_report.path_index.mode, "indexed");
+        assert_eq!(record_report.path_index.lookup_count, 1);
+        assert_eq!(record_report.path_index.full_root_path_load_count, 0);
+        assert_eq!(record_report.path_index.full_filesystem_path_scan_count, 1);
         assert_indexed_case_fold_metrics(&db, 1);
+
+        let sparse = db
+            .spawn_lane_with_workdir_paths(
+                "metric-sparse-record",
+                Some("main"),
+                true,
+                None,
+                None,
+                None,
+                &["README.md".to_string()],
+            )
+            .unwrap();
+        let sparse_workdir = PathBuf::from(sparse.workdir.unwrap());
+        fs::write(sparse_workdir.join("README.md"), "sparse\n").unwrap();
+        let sparse_report = db
+            .record_lane_workdir("metric-sparse-record", None)
+            .unwrap();
+        assert_eq!(sparse_report.path_index.mode, "indexed");
+        assert_eq!(sparse_report.path_index.lookup_count, 1);
+        assert_eq!(sparse_report.path_index.full_root_path_load_count, 0);
+        assert_eq!(sparse_report.path_index.full_filesystem_path_scan_count, 0);
+    }
+
+    #[test]
+    fn operation_reports_reset_case_fold_metrics_after_error_retry_and_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let mut db = Trail::open(temp.path()).unwrap();
+        db.spawn_lane("metric-reset", Some("main"), false, None, None)
+            .unwrap();
+        let first = db
+            .apply_lane_patch(
+                "metric-reset",
+                PatchDocument {
+                    base_change: None,
+                    allow_stale: true,
+                    allow_ignored: false,
+                    session_id: None,
+                    message: None,
+                    edits: vec![
+                        PatchEdit::Write {
+                            path: "first.md".to_string(),
+                            content: "first\n".to_string(),
+                            executable: false,
+                        },
+                        PatchEdit::Write {
+                            path: "second.md".to_string(),
+                            content: "second\n".to_string(),
+                            executable: false,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(first.path_index.mode, "indexed");
+        assert_eq!(first.path_index.lookup_count, 2);
+
+        let held_lock = db.acquire_write_lock().unwrap();
+        let lock_err = db
+            .apply_lane_patch(
+                "metric-reset",
+                PatchDocument {
+                    base_change: None,
+                    allow_stale: true,
+                    allow_ignored: false,
+                    session_id: None,
+                    message: None,
+                    edits: vec![PatchEdit::Write {
+                        path: "locked.md".to_string(),
+                        content: "locked\n".to_string(),
+                        executable: false,
+                    }],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(lock_err, Error::WorkspaceLocked(_)));
+        drop(held_lock);
+        assert_eq!(
+            db.case_fold_index_metrics_report(),
+            CaseFoldIndexMetricsReport::default()
+        );
+
+        let err = db
+            .apply_lane_patch(
+                "metric-reset",
+                PatchDocument {
+                    base_change: None,
+                    allow_stale: true,
+                    allow_ignored: false,
+                    session_id: None,
+                    message: None,
+                    edits: vec![PatchEdit::Write {
+                        path: "../invalid.md".to_string(),
+                        content: "invalid\n".to_string(),
+                        executable: false,
+                    }],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidPath { .. }));
+        assert_eq!(
+            db.case_fold_index_metrics_report(),
+            CaseFoldIndexMetricsReport {
+                mode: "unknown".to_string(),
+                lookup_count: 0,
+                full_root_path_load_count: 0,
+                full_filesystem_path_scan_count: 0,
+            }
+        );
+
+        let retry = db
+            .apply_lane_patch(
+                "metric-reset",
+                PatchDocument {
+                    base_change: None,
+                    allow_stale: true,
+                    allow_ignored: false,
+                    session_id: None,
+                    message: None,
+                    edits: vec![PatchEdit::Write {
+                        path: "third.md".to_string(),
+                        content: "third\n".to_string(),
+                        executable: false,
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(retry.path_index.mode, "indexed");
+        assert_eq!(retry.path_index.lookup_count, 1);
+        assert_eq!(retry.path_index.full_root_path_load_count, 0);
+        assert_eq!(retry.path_index.full_filesystem_path_scan_count, 0);
+
+        let spawned = db
+            .spawn_lane("metric-noop", Some("main"), true, None, None)
+            .unwrap();
+        let workdir = PathBuf::from(spawned.workdir.unwrap());
+        fs::write(workdir.join("recorded.md"), "recorded\n").unwrap();
+        let recorded = db.record_lane_workdir("metric-noop", None).unwrap();
+        assert_eq!(recorded.path_index.mode, "indexed");
+        assert_eq!(recorded.path_index.lookup_count, 1);
+        assert_eq!(recorded.path_index.full_filesystem_path_scan_count, 1);
+
+        let noop = db.record_lane_workdir("metric-noop", None).unwrap();
+        assert!(noop.operation.is_none());
+        assert_eq!(noop.path_index.mode, "unknown");
+        assert_eq!(noop.path_index.lookup_count, 0);
+        assert_eq!(noop.path_index.full_root_path_load_count, 0);
+        assert_eq!(noop.path_index.full_filesystem_path_scan_count, 1);
     }
 
     #[test]

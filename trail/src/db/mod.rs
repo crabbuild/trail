@@ -861,6 +861,7 @@ pub(crate) struct CaseFoldIndexMetrics {
     mode: CaseFoldIndexMode,
     lookup_count: u64,
     full_root_path_load_count: u64,
+    full_filesystem_path_scan_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -880,13 +881,7 @@ impl CaseFoldIndexMode {
     }
 }
 
-#[allow(dead_code)] // Public inside the crate for Task 5's scale harness.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CaseFoldIndexMetricsReport {
-    pub(crate) mode: String,
-    pub(crate) lookup_count: u64,
-    pub(crate) full_root_path_load_count: u64,
-}
+pub(crate) type CaseFoldIndexMetricsReport = PathIndexMetricsReport;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum GitExportMode {

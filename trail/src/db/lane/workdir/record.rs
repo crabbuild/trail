@@ -98,6 +98,7 @@ impl Trail {
         lane: &str,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
+        self.reset_case_fold_index_metrics();
         let _lock = self.acquire_write_lock()?;
         self.record_lane_workdir_locked(lane, message, None)
     }
@@ -108,6 +109,7 @@ impl Trail {
         turn_id: &str,
         message: Option<String>,
     ) -> Result<LaneRecordReport> {
+        self.reset_case_fold_index_metrics();
         let _lock = self.acquire_write_lock()?;
         self.record_lane_workdir_locked(lane, message, Some(turn_id))
     }
@@ -118,6 +120,7 @@ impl Trail {
         message: Option<String>,
         existing_turn_id: Option<&str>,
     ) -> Result<LaneRecordReport> {
+        self.reset_case_fold_index_metrics();
         validate_ref_segment(lane)?;
         let branch = self.lane_branch(lane)?;
         ensure_lane_record_message_has_no_secrets(message.as_deref())?;
@@ -180,6 +183,13 @@ impl Trail {
                 candidate_paths: Some(candidate_paths),
             }
         } else {
+            // A full materialized workdir is repository-shaped: validating its
+            // manifest walks every materialized path (or falls back to a full
+            // scan when the manifest is missing). Sparse workdirs remain
+            // bounded by their explicit selection and are not counted here.
+            if !is_sparse {
+                self.note_full_filesystem_path_scan();
+            }
             self.lane_cached_workdir_manifest_status(
                 &workdir_path,
                 layered_manifest_path.as_deref(),
@@ -195,6 +205,7 @@ impl Trail {
                 operation: None,
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
+                path_index: self.case_fold_index_metrics_report(),
             });
         }
         if let Some(session_id) = &branch.session_id {
@@ -286,6 +297,7 @@ impl Trail {
                         operation: None,
                         root_id: head.root_id,
                         changed_paths: Vec::new(),
+                        path_index: self.case_fold_index_metrics_report(),
                     });
                 }
                 let selected_paths = summaries
@@ -375,6 +387,7 @@ impl Trail {
                             operation: None,
                             root_id: head.root_id,
                             changed_paths: Vec::new(),
+                            path_index: self.case_fold_index_metrics_report(),
                         });
                     }
                     let selected_paths = summaries
@@ -429,6 +442,7 @@ impl Trail {
                 operation: None,
                 root_id: head.root_id,
                 changed_paths: Vec::new(),
+                path_index: self.case_fold_index_metrics_report(),
             });
         }
         self.ensure_lane_record_policy(&branch, &diff.summaries)?;
@@ -532,6 +546,7 @@ impl Trail {
             operation: Some(change_id),
             root_id: built.root_id,
             changed_paths: diff.summaries,
+            path_index: self.case_fold_index_metrics_report(),
         })
     }
 

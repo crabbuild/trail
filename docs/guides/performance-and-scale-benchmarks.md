@@ -50,6 +50,23 @@ Optional toggles:
 - `TRAIL_SCALE_DAEMON=0|1`
 - `TRAIL_SCALE_GIT_IMPORT=0|1`
 
+Run the path-index structural matrix without the unrelated large artifacts:
+
+```sh
+TRAIL_BIN=target/release/trail \
+TRAIL_SCALE_FILES=1000,100000,1000000 \
+TRAIL_SCALE_MATERIALIZED=0 \
+TRAIL_SCALE_BACKUP=0 \
+TRAIL_SCALE_DAEMON=0 \
+TRAIL_SCALE_GIT_IMPORT=0 \
+scripts/cli-scale-bench.sh
+```
+
+This still runs an explicitly bounded sparse record case at every scale. It
+also covers a content-only patch, a case-only rename combined with delete/add,
+and a patch against an empty root. The scheduled workflow applies the same
+structural gates to 10k, 100k, and 1M files.
+
 ## Output
 
 Each scale writes:
@@ -65,6 +82,24 @@ Important storage signals:
 - `dbstat_repo_prolly_nodes`
 - `manifest_repo_clean_workdir_bytes`
 - `manifest_repo_sparse_workdir_bytes`
+
+Patch and record JSON reports include an operation-scoped `path_index` object:
+
+- `mode`: `indexed` once the operation uses bounded folded-path lookups.
+- `lookup_count`: number of folded-key index lookups. This must be no greater
+  than the unique folded old/new paths touched by the completed operation;
+  content-only writes to existing exact paths can require zero lookups.
+- `full_root_path_load_count`: eager loads of every path in a persisted root.
+- `full_filesystem_path_scan_count`: unbounded repository-shaped filesystem
+  traversals used for path validation. A full materialized workdir validation
+  counts as one, including a clean no-op. Walking an explicitly selected sparse
+  materialization does not count because its size is bounded by that selection.
+
+The counters reset at the public patch or record boundary, including failures,
+retries, and no-ops. This prevents a prior operation from making a later report
+look unbounded. The benchmark extractor independently folds changed paths with
+the same NFKC, per-codepoint lowercase, then NFC sequence as the Rust index and
+rejects malformed or internally inconsistent reports.
 
 Important hot-path rows:
 
@@ -116,6 +151,35 @@ fixture is initialized from the working tree and must return
 mapping table.
 
 ## Current Evidence
+
+The path-index structural matrix was freshly measured on July 13, 2026 with a
+release binary and headless optional toggles at
+`/tmp/trail-cli-scale-task5-struct-20260713`. All 60 structural and wall/storage
+gates passed (20 per scale):
+
+| Scale | Source files | Init | Content patch | Case rename patch | Empty-root patch | Sparse record |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k | 1,005 | 0.14s | 0.03s | 0.01s | 0.00s | 0.01s |
+| 100k | 100,029 | 9.62s | 0.29s | 0.02s | 0.01s | 0.01s |
+| 1M | 1,000,029 | 188.10s | 0.34s | 0.02s | 0.01s | 0.01s |
+
+At all three scales, all four operation reports used `mode=indexed`, loaded no
+full root path set, and performed no unbounded filesystem path scan. The
+content patch performed 0 lookups for 5 touched folded keys at 1k and 0 for 50
+at 100k/1M. The case fixture performed 1 lookup for 2 reported folded endpoints,
+while empty-root patch and sparse record each performed 1 lookup for 1 touched
+folded key. The 1M artifact was 1,584,734,208 SQLite bytes with 1,000,352
+objects; index rebuild took 3.28s. These results are structural evidence that
+patch and bounded record work scales with touched paths rather than repository
+path count.
+
+Keep legacy missing-index recovery as a separate correctness proof rather than
+mixing it into the performance rows:
+
+```sh
+cargo test -p trail --test e2e \
+  cli_path_index_required_human_json_rebuild_and_retry_lifecycle -- --exact
+```
 
 The latest local `/Volumes/Workspace` runs were measured on June 25, 2026 with the release binary:
 

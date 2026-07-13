@@ -103,15 +103,39 @@ pub(super) fn lane_schemas() -> Value {
                 { "$ref": "#/components/schemas/LaneRecordPreviewReport" }
             ]
         },
+        "PathIndexMetricsReport": {
+            "type": "object",
+            "required": ["mode", "lookup_count", "full_root_path_load_count", "full_filesystem_path_scan_count"],
+            "additionalProperties": false,
+            "properties": {
+                "mode": { "type": "string", "enum": ["unknown", "indexed"], "description": "Path resolution used by this operation." },
+                "lookup_count": { "type": "integer", "minimum": 0, "description": "Unique folded keys looked up in the persisted path index." },
+                "full_root_path_load_count": { "type": "integer", "minimum": 0, "description": "Eager loads of every path in a persisted root." },
+                "full_filesystem_path_scan_count": { "type": "integer", "minimum": 0, "description": "Unbounded repository-shaped filesystem validation walks; explicitly selected sparse materializations are excluded." }
+            }
+        },
+        "LanePatchReport": {
+            "type": "object",
+            "required": ["lane_id", "operation", "root_id", "changed_paths", "path_index"],
+            "additionalProperties": false,
+            "properties": {
+                "lane_id": { "type": "string" },
+                "operation": { "type": "string" },
+                "root_id": { "type": "string" },
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } },
+                "path_index": { "$ref": "#/components/schemas/PathIndexMetricsReport" }
+            }
+        },
         "LaneRecordReport": {
             "type": "object",
-            "required": ["lane_id", "operation", "root_id", "changed_paths"],
+            "required": ["lane_id", "operation", "root_id", "changed_paths", "path_index"],
             "additionalProperties": false,
             "properties": {
                 "lane_id": { "type": "string" },
                 "operation": { "type": ["string", "null"] },
                 "root_id": { "type": "string" },
-                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } }
+                "changed_paths": { "type": "array", "items": { "$ref": "#/components/schemas/FileDiffSummary" } },
+                "path_index": { "$ref": "#/components/schemas/PathIndexMetricsReport" }
             }
         },
         "LaneRecordPreviewReport": {

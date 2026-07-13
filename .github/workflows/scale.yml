@@ -151,14 +151,39 @@ jobs:
                 agent_git_plumbing_commands=5
               )
               git_metric_equalities=(
-                --metric-equals
                 agent_git_export_mode=mapped_delta
                 "agent_git_changed_paths=$changed_paths"
               )
             fi
+            patch_paths=$((scale / 200))
+            if [ "$patch_paths" -lt 1 ]; then patch_paths=1; fi
+            if [ "$patch_paths" -gt 50 ]; then patch_paths=50; fi
+            path_index_structural_thresholds=(
+              "patch_path_index_lookup_count=$patch_paths"
+              patch_path_index_full_root_path_load_count=0
+              patch_path_index_full_filesystem_path_scan_count=0
+              record_path_index_lookup_count=1
+              record_path_index_full_root_path_load_count=0
+              record_path_index_full_filesystem_path_scan_count=0
+              empty_root_patch_path_index_lookup_count=1
+              empty_root_patch_path_index_full_root_path_load_count=0
+              empty_root_patch_path_index_full_filesystem_path_scan_count=0
+              rename_patch_path_index_lookup_count=2
+              rename_patch_path_index_full_root_path_load_count=0
+              rename_patch_path_index_full_filesystem_path_scan_count=0
+            )
+            path_index_metric_equalities=(
+              patch_path_index_mode=indexed
+              record_path_index_mode=indexed
+              empty_root_patch_path_index_mode=indexed
+              rename_patch_path_index_mode=indexed
+            )
             python3 scripts/check-cli-scale-thresholds.py "$results" \
               "${daemon_thresholds[@]}" \
               agent_apply_patch=10 \
+              path_index_rename_patch=10 \
+              path_index_empty_patch=10 \
+              path_index_record=10 \
               agent_readiness=10 \
               merge_agent_dry_run=10 \
               merge_agent_apply=10 \
@@ -172,7 +197,10 @@ jobs:
               dbstat_repo_prolly_nodes=2500000000 \
               object_kind_repo_TextContent_bytes=1200000000 \
               object_count=2000000 \
+              "${path_index_structural_thresholds[@]}" \
               "${git_structural_thresholds[@]}" \
+              --metric-equals \
+              "${path_index_metric_equalities[@]}" \
               "${git_metric_equalities[@]}"
           done
       - name: Upload scale results

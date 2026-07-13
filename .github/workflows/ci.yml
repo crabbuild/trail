@@ -30,6 +30,7 @@ jobs:
           scripts/test_cli_scale_bench_source.py
           scripts/test_check_cli_scale_thresholds.py
           scripts/test_extract_agent_git_performance.py
+          scripts/test_extract_path_index_performance.py
       - name: Scale Benchmark Smoke
         run: make bench-cli-scale-smoke
         env:
@@ -61,6 +62,9 @@ jobs:
           daemon_cli_history=10
           daemon_cli_code_from=10
           agent_apply_patch=30
+          path_index_rename_patch=30
+          path_index_empty_patch=30
+          path_index_record=30
           agent_git_apply_dry_run=15
           agent_git_apply=20
           agent_git_apply_missing_mapping=5
@@ -82,9 +86,25 @@ jobs:
           agent_git_changed_paths=1
           agent_git_blob_writes=1
           agent_git_plumbing_commands=5
+          patch_path_index_lookup_count=5
+          patch_path_index_full_root_path_load_count=0
+          patch_path_index_full_filesystem_path_scan_count=0
+          record_path_index_lookup_count=1
+          record_path_index_full_root_path_load_count=0
+          record_path_index_full_filesystem_path_scan_count=0
+          empty_root_patch_path_index_lookup_count=1
+          empty_root_patch_path_index_full_root_path_load_count=0
+          empty_root_patch_path_index_full_filesystem_path_scan_count=0
+          rename_patch_path_index_lookup_count=2
+          rename_patch_path_index_full_root_path_load_count=0
+          rename_patch_path_index_full_filesystem_path_scan_count=0
           --metric-equals
           agent_git_export_mode=mapped_delta
           agent_git_changed_paths=1
+          patch_path_index_mode=indexed
+          record_path_index_mode=indexed
+          empty_root_patch_path_index_mode=indexed
+          rename_patch_path_index_mode=indexed
 
   prolly:
     name: Prolly core

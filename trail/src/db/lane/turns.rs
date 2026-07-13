@@ -6,6 +6,7 @@ impl Trail {
         turn_id: &str,
         patch: PatchDocument,
     ) -> Result<LanePatchReport> {
+        self.reset_case_fold_index_metrics();
         let _lock = self.acquire_write_lock()?;
         let turn = self.lane_turn(turn_id)?;
         if turn.ended_at.is_some() {

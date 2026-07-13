@@ -6,6 +6,7 @@ impl Trail {
         lane: &str,
         patch: PatchDocument,
     ) -> Result<LanePatchReport> {
+        self.reset_case_fold_index_metrics();
         let _lock = self.acquire_write_lock()?;
         self.apply_lane_patch_locked(lane, patch, None)
     }
@@ -16,6 +17,7 @@ impl Trail {
         patch: PatchDocument,
         api_turn: Option<&LaneTurn>,
     ) -> Result<LanePatchReport> {
+        self.reset_case_fold_index_metrics();
         validate_ref_segment(lane)?;
         let lane_row = self.lane_branch(lane)?;
         let ref_name = lane_row.ref_name.clone();
@@ -255,6 +257,7 @@ impl Trail {
             operation: change_id,
             root_id: built.root_id,
             changed_paths: changed_summaries,
+            path_index: self.case_fold_index_metrics_report(),
         })
     }
 
