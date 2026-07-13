@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1342,6 +1346,117 @@ fn agent_apply_batch_preserves_modes_deletions_and_safe_special_paths() {
         git_output_raw(temp.path(), &["show", &format!("HEAD:{special_path}")]),
         "echo special\n"
     );
+}
+
+#[test]
+fn agent_apply_batch_hashes_exact_trail_bytes_without_git_filters() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init"]);
+    run_git(temp.path(), &["config", "user.email", "trail@example.test"]);
+    run_git(temp.path(), &["config", "user.name", "Trail Test"]);
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.clean", "tr a-z A-Z"],
+    );
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.smudge", "cat"],
+    );
+    run_git(
+        temp.path(),
+        &["config", "filter.trail-uppercase.required", "true"],
+    );
+    fs::write(
+        temp.path().join(".gitattributes"),
+        "* filter=trail-uppercase\n.gitattributes -filter\n",
+    )
+    .unwrap();
+    run_git(temp.path(), &["add", ".gitattributes"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    Trail::init(temp.path(), "main", InitImportMode::GitTracked, false).unwrap();
+    let mut db = Trail::open(temp.path()).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "preserve exact bytes",
+        "edits": [{
+            "op": "write",
+            "path": "payload.txt",
+            "content": "Exact Trail bytes\n"
+        }]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(
+        git_output_raw(temp.path(), &["show", "HEAD:payload.txt"]),
+        "Exact Trail bytes\n"
+    );
+}
+
+#[test]
+fn agent_apply_batches_git_plumbing_with_external_db_dir() {
+    if !git_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    #[cfg(target_os = "linux")]
+    let external_db = temp
+        .path()
+        .join(OsString::from_vec(b"external-trail-db-\xff".to_vec()));
+    #[cfg(not(target_os = "linux"))]
+    let external_db = temp.path().join("external-trail-db");
+    fs::create_dir(&workspace).unwrap();
+    run_git(&workspace, &["init"]);
+    run_git(&workspace, &["config", "user.email", "trail@example.test"]);
+    run_git(&workspace, &["config", "user.name", "Trail Test"]);
+    fs::write(workspace.join("README.md"), "base\n").unwrap();
+    run_git(&workspace, &["add", "README.md"]);
+    run_git(&workspace, &["commit", "-m", "initial"]);
+    Trail::init(&workspace, "main", InitImportMode::GitTracked, false).unwrap();
+    fs::rename(workspace.join(".trail"), &external_db).unwrap();
+
+    let mut db = Trail::open_with_db_dir(&workspace, &external_db).unwrap();
+    db.spawn_lane("apply-bot", Some("main"), false, None, None)
+        .unwrap();
+    let patch: PatchDocument = serde_json::from_value(serde_json::json!({
+        "message": "apply with external database",
+        "edits": [{
+            "op": "write",
+            "path": "external-db.txt",
+            "content": "external database path\n"
+        }]
+    }))
+    .unwrap();
+    apply_lane_patch_at_head(&mut db, "apply-bot", patch).unwrap();
+    db.agent_mark_reviewed("apply-bot", None).unwrap();
+
+    let applied = db.agent_apply("apply-bot", false, None).unwrap();
+
+    assert_eq!(applied.performance.git_plumbing_command_count, 5);
+    assert_eq!(
+        git_output_raw(&workspace, &["show", "HEAD:external-db.txt"]),
+        "external database path\n"
+    );
+    let tmp = external_db.join("tmp");
+    if tmp.is_dir() {
+        assert!(!fs::read_dir(tmp).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-delta-")
+        }));
+    }
 }
 
 #[test]

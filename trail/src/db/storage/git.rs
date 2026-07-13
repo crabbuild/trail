@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 impl Trail {
     pub(crate) fn reset_git_handoff_metrics(&self) {
@@ -229,24 +231,8 @@ impl Trail {
                 if let Some(entry) = patch_right.get(path) {
                     let bytes = self.materialize_entry_bytes(entry)?;
                     let synthetic_name = format!("blob-{ordinal:020}");
-                    fs::write(blob_dir.join(&synthetic_name), bytes)?;
-                    let synthetic_path = blob_dir
-                        .join(&synthetic_name)
-                        .strip_prefix(&self.workspace_root)
-                        .map_err(|_| {
-                            Error::Git(format!(
-                                "Git blob batch directory `{}` is outside workspace `{}`",
-                                blob_dir.display(),
-                                self.workspace_root.display()
-                            ))
-                        })?
-                        .to_string_lossy()
-                        .into_owned();
-                    if synthetic_path.contains(['\n', '\r']) {
-                        return Err(Error::Git(
-                            "Git blob batch path contains a line separator".to_string(),
-                        ));
-                    }
+                    let synthetic_path = blob_dir.join(&synthetic_name);
+                    fs::write(&synthetic_path, bytes)?;
                     additions.push((
                         path.clone(),
                         if entry.executable { "100755" } else { "100644" },
@@ -260,12 +246,11 @@ impl Trail {
             } else {
                 let mut hash_input = Vec::new();
                 for (_, _, synthetic_path) in &additions {
-                    hash_input.extend_from_slice(synthetic_path.as_bytes());
-                    hash_input.push(b'\n');
+                    append_git_stdin_path(&mut hash_input, synthetic_path)?;
                 }
                 self.record_git_plumbing_command();
                 let output = self.git_output_bytes_with_input(
-                    &["hash-object", "-w", "--stdin-paths"],
+                    &["hash-object", "-w", "--no-filters", "--stdin-paths"],
                     &hash_input,
                     None,
                 )?;
@@ -459,24 +444,14 @@ impl Trail {
         if let Some(index_path) = index_path {
             command.env("GIT_INDEX_FILE", index_path);
         }
-        let mut child = command
-            .stdin(std::process::Stdio::piped())
+        let mut stdin = tempfile::tempfile()?;
+        stdin.write_all(input)?;
+        stdin.seek(SeekFrom::Start(0))?;
+        let output = command
+            .stdin(std::process::Stdio::from(stdin))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| Error::Git(err.to_string()))?;
-        let write_result = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::Git("failed to open git stdin".to_string()))?
-            .write_all(input);
-        if let Err(err) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Error::Io(err));
-        }
-        let output = child
-            .wait_with_output()
+            .output()
             .map_err(|err| Error::Git(err.to_string()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -506,6 +481,24 @@ impl Trail {
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+}
+
+fn append_git_stdin_path(input: &mut Vec<u8>, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| Error::Git("Git blob batch path is not valid UTF-8".to_string()))?
+        .as_bytes();
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err(Error::Git(
+            "Git blob batch path contains a line separator".to_string(),
+        ));
+    }
+    input.extend_from_slice(bytes);
+    input.push(b'\n');
+    Ok(())
 }
 
 fn parse_git_hash_object_oids(output: &[u8], expected_count: usize) -> Result<Vec<String>> {
@@ -545,6 +538,75 @@ fn parse_git_hash_object_oids(output: &[u8], expected_count: usize) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn git_stdin_path_preserves_non_utf8_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/trail-\xff/blob".to_vec()));
+        let mut input = Vec::new();
+
+        append_git_stdin_path(&mut input, &path).unwrap();
+
+        assert_eq!(input, b"/tmp/trail-\xff/blob\n");
+    }
+
+    #[test]
+    fn git_hash_batch_drains_output_larger_than_pipe_capacity() {
+        const CHILD_ENV: &str = "TRAIL_GIT_HASH_BATCH_DEADLOCK_CHILD";
+        const TEST_NAME: &str =
+            "db::storage::git::tests::git_hash_batch_drains_output_larger_than_pipe_capacity";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "bounded Git hash batch child failed");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("Git hash batch deadlocked while stdout exceeded pipe capacity");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .arg("init")
+            .output()
+            .unwrap();
+        fs::write(temp.path().join("batch-source"), b"batch bytes\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let mut input = Vec::with_capacity(1_300_000);
+        for _ in 0..100_000 {
+            input.extend_from_slice(b"batch-source\n");
+        }
+
+        let output = db
+            .git_output_bytes_with_input(&["hash-object", "-w", "--stdin-paths"], &input, None)
+            .unwrap();
+
+        assert!(output.len() > 4_000_000);
+        assert_eq!(
+            parse_git_hash_object_oids(&output, 100_000).unwrap().len(),
+            100_000
+        );
+    }
 
     #[test]
     fn git_hash_batch_output_preserves_order_and_validates_count() {
