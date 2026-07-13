@@ -24,9 +24,12 @@ Add an optional `case_fold_map_root` to `WorktreeRoot`. Its Prolly map stores:
 NFKC(lowercase(path)), NFC-normalized -> canonical path bytes
 ```
 
-The field is Serde-defaulted for old roots. New roots always carry the index.
-The index uses the same persistent store/configuration as the path and file-ID
-maps, so unchanged nodes are content-addressed and shared.
+The field is Serde-defaulted for old roots. New non-empty roots carry the index
+root. Because an empty Prolly tree has no root CID, `case_fold_map_root=None`
+is also a valid empty index exactly when `file_count=0`; no path scan is needed
+to establish that state. The index uses the same persistent store/configuration
+as the path and file-ID maps, so unchanged nodes are content-addressed and
+shared.
 
 ## Mutation contract
 
@@ -42,11 +45,13 @@ derive removals/additions from the same touched-path set used for the path map.
 
 ## Legacy roots and repair
 
-An old root without the index is not silently scanned on a hot mutation path.
-Hot callers return stable `PATH_INDEX_REQUIRED` with the recovery command
-`trail index rebuild`. The existing rebuild operation backfills the current
-root/index state. Compatibility read/materialization operations may still read
-old roots; only mutation safety requires the index.
+An old non-empty root without the index is not silently scanned on a hot
+mutation path. Hot callers return stable `PATH_INDEX_REQUIRED` with the
+recovery command `trail index rebuild`. A root with no index CID and
+`file_count=0` is already a valid empty index and may be mutated directly. The
+existing rebuild operation backfills the current root/index state.
+Compatibility read/materialization operations may still read old roots; only
+mutation safety requires the index.
 
 ## Structural evidence
 

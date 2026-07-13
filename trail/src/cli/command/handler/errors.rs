@@ -167,7 +167,7 @@ fn diagnostic_for_error(err: &Error) -> UiDiagnostic {
             });
             diagnostic
         }
-        Error::InvalidInput(_) | Error::InvalidPath { .. } => {
+        Error::InvalidInput(_) | Error::InvalidPath { .. } | Error::PathIndexRequired(_) => {
             let mut diagnostic =
                 UiDiagnostic::new(err.code(), "Trail cannot use the supplied input");
             diagnostic.recovery = Some(UiNextAction {

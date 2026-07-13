@@ -34,6 +34,90 @@ impl Trail {
         Ok(builder.build()?)
     }
 
+    // Task 3 integrates this primitive into the hot incremental root builders.
+    #[allow(dead_code)]
+    pub(crate) fn validate_and_update_case_fold_index(
+        &self,
+        previous_root: &WorktreeRoot,
+        removals: &[String],
+        additions: &[String],
+    ) -> Result<Tree> {
+        for path in removals.iter().chain(additions) {
+            let normalized = normalize_relative_path(path)?;
+            if normalized != *path {
+                return Err(Error::InvalidPath {
+                    path: path.clone(),
+                    reason: format!("path must be normalized as `{normalized}`"),
+                });
+            }
+        }
+        let previous_tree = match previous_root.case_fold_map_root.as_deref() {
+            Some(case_fold_root) => root_map_tree_from_root_hex(Some(case_fold_root))?,
+            None if previous_root.file_count == 0 => self.root_prolly.create(),
+            None => {
+                return Err(Error::PathIndexRequired(
+                    "legacy root has no case-fold index; run `trail index rebuild`".to_string(),
+                ));
+            }
+        };
+        let touched_keys = removals
+            .iter()
+            .chain(additions)
+            .map(|path| case_insensitive_path_key(path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let existing = self.root_prolly.get_many(&previous_tree, &touched_keys)?;
+        let mut before = BTreeMap::new();
+        for (folded, canonical) in touched_keys.into_iter().zip(existing) {
+            let canonical = canonical
+                .map(|value| validate_case_fold_index_value(&folded, value))
+                .transpose()?;
+            before.insert(folded, canonical);
+        }
+        let mut after = before.clone();
+
+        for path in removals {
+            let folded = case_insensitive_path_key(path);
+            if after.get(&folded).and_then(Option::as_deref) == Some(path.as_str()) {
+                after.insert(folded, None);
+            }
+        }
+        for path in additions {
+            let folded = case_insensitive_path_key(path);
+            if let Some(previous) = after.get(&folded).and_then(Option::as_deref) {
+                if previous != path {
+                    return Err(Error::InvalidPath {
+                        path: path.clone(),
+                        reason: format!("case-insensitive path collision with `{previous}`"),
+                    });
+                }
+            }
+            after.insert(folded, Some(path.clone()));
+        }
+
+        let mutations = after
+            .into_iter()
+            .filter_map(|(folded, canonical)| {
+                (before.get(&folded) != Some(&canonical)).then(|| {
+                    let key = folded.into_bytes();
+                    match canonical {
+                        Some(canonical) => prolly::Mutation::Upsert {
+                            key,
+                            val: canonical.into_bytes(),
+                        },
+                        None => prolly::Mutation::Delete { key },
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if mutations.is_empty() {
+            return Ok(previous_tree);
+        }
+
+        Ok(self.root_prolly.batch(&previous_tree, mutations)?)
+    }
+
     pub(crate) fn build_root_from_git_tracked_paths(
         &self,
         paths: &[String],
@@ -735,6 +819,31 @@ impl Trail {
     }
 }
 
+fn validate_case_fold_index_value(folded: &str, value: Vec<u8>) -> Result<String> {
+    let canonical = String::from_utf8(value).map_err(|err| {
+        Error::Corrupt(format!(
+            "case-fold index key {folded:?} stores non UTF-8 canonical path bytes: {err}"
+        ))
+    })?;
+    let normalized = normalize_relative_path(&canonical).map_err(|err| {
+        Error::Corrupt(format!(
+            "case-fold index key {folded:?} stores invalid canonical path {canonical:?}: {err}"
+        ))
+    })?;
+    if normalized != canonical {
+        return Err(Error::Corrupt(format!(
+            "case-fold index key {folded:?} stores noncanonical path {canonical:?}; canonical path must be normalized as {normalized:?}"
+        )));
+    }
+    let canonical_folded = case_insensitive_path_key(&canonical);
+    if canonical_folded != folded {
+        return Err(Error::Corrupt(format!(
+            "case-fold index key {folded:?} stores canonical path {canonical:?}, which folds to {canonical_folded:?}"
+        )));
+    }
+    Ok(canonical)
+}
+
 fn insert_case_fold_mapping(mappings: &mut BTreeMap<String, String>, path: &str) -> Result<()> {
     let folded = case_insensitive_path_key(path);
     if let Some(previous) = mappings.insert(folded, path.to_string()) {
@@ -869,6 +978,26 @@ mod tests {
             .collect()
     }
 
+    fn root_with_case_fold_value(
+        db: &Trail,
+        root: &WorktreeRoot,
+        folded: &str,
+        canonical: &str,
+    ) -> WorktreeRoot {
+        let tree = root_map_tree_from_root_hex(root.case_fold_map_root.as_deref()).unwrap();
+        let tree = db
+            .root_prolly
+            .put(
+                &tree,
+                folded.as_bytes().to_vec(),
+                canonical.as_bytes().to_vec(),
+            )
+            .unwrap();
+        let mut corrupt = root.clone();
+        corrupt.case_fold_map_root = tree_root_hex(&tree);
+        corrupt
+    }
+
     #[test]
     fn legacy_worktree_root_deserialization_defaults_case_fold_index_to_none() {
         #[derive(Serialize)]
@@ -893,6 +1022,438 @@ mod tests {
 
         let root: WorktreeRoot = from_cbor(&bytes).unwrap();
         assert_eq!(root.case_fold_map_root, None);
+    }
+
+    #[test]
+    fn indexed_case_fold_update_renames_a_path_and_preserves_untouched_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        fs::write(temp.path().join("LICENSE"), "license\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let mut root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        root.path_map_root = Some("path-tree-must-not-be-loaded".to_string());
+        root.file_index_map_root = Some("file-index-tree-must-not-be-loaded".to_string());
+
+        let next = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &["README.md".to_string()],
+                &["docs/Guide.md".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(db.root_prolly.get(&next, b"readme.md").unwrap(), None);
+        assert_eq!(
+            db.root_prolly.get(&next, b"docs/guide.md").unwrap(),
+            Some(b"docs/Guide.md".to_vec())
+        );
+        assert_eq!(
+            db.root_prolly.get(&next, b"license").unwrap(),
+            Some(b"LICENSE".to_vec())
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_applies_removal_before_case_only_addition() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+
+        let next = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &["README.md".to_string()],
+                &["readme.md".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.root_prolly.get(&next, b"readme.md").unwrap(),
+            Some(b"readme.md".to_vec())
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_adds_the_first_path_to_an_empty_root() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        assert_eq!(root.file_count, 0);
+        assert_eq!(root.case_fold_map_root, None);
+
+        let next = db
+            .validate_and_update_case_fold_index(&root, &[], &["docs/ReadMe.md".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            db.root_prolly.get(&next, b"docs/readme.md").unwrap(),
+            Some(b"docs/ReadMe.md".to_vec())
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_empty_root_collision_writes_no_nodes() {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        let prolly_nodes_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
+
+        let err = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &[],
+                &["README.md".to_string(), "readme.md".to_string()],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::InvalidPath { ref path, ref reason }
+                if path == "readme.md"
+                    && reason == "case-insensitive path collision with `README.md`"
+        ));
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_rejects_traversal_and_non_nfc_paths_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        let prolly_nodes_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
+
+        let traversal = db
+            .validate_and_update_case_fold_index(&root, &["../README.md".to_string()], &[])
+            .unwrap_err();
+        assert!(matches!(
+            traversal,
+            Error::InvalidPath { ref reason, .. } if reason.contains("inside the workspace")
+        ));
+
+        let non_nfc = db
+            .validate_and_update_case_fold_index(&root, &[], &["docs/cafe\u{0301}.md".to_string()])
+            .unwrap_err();
+        assert!(matches!(
+            non_nfc,
+            Error::InvalidPath { ref reason, .. } if reason.contains("Unicode NFC")
+        ));
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_rejects_ascii_and_unicode_within_batch_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("LICENSE"), "license\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+
+        let ascii = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &[],
+                &["README.md".to_string(), "readme.md".to_string()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            ascii,
+            Error::InvalidPath { ref path, ref reason }
+                if path == "readme.md"
+                    && reason == "case-insensitive path collision with `README.md`"
+        ));
+
+        let unicode = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &[],
+                &["src/Ｋernel.rs".to_string(), "src/kernel.rs".to_string()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            unicode,
+            Error::InvalidPath { ref path, ref reason }
+                if path == "src/kernel.rs"
+                    && reason == "case-insensitive path collision with `src/Ｋernel.rs`"
+        ));
+    }
+
+    #[test]
+    fn indexed_case_fold_update_rejects_collision_with_existing_root_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        let prolly_nodes_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
+
+        let err = db
+            .validate_and_update_case_fold_index(&root, &[], &["readme.md".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::InvalidPath { ref path, ref reason }
+                if path == "readme.md"
+                    && reason == "case-insensitive path collision with `README.md`"
+        ));
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_rejects_stored_key_value_mismatch_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        let corrupt = root_with_case_fold_value(&db, &root, "readme.md", "Other.md");
+        let objects_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        let prolly_nodes_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
+
+        let err = db
+            .validate_and_update_case_fold_index(&corrupt, &["README.md".to_string()], &[])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Corrupt(ref message)
+                if message.contains("readme.md")
+                    && message.contains("Other.md")
+                    && message.contains("other.md")
+        ));
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            objects_before
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_rejects_invalid_stored_canonical_paths_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+
+        for (stored, expected_reason) in [
+            ("../README.md", "inside the workspace"),
+            ("docs/./ReadMe.md", "must be normalized"),
+            ("docs/cafe\u{0301}.md", "Unicode NFC"),
+        ] {
+            let corrupt = root_with_case_fold_value(&db, &root, "readme.md", stored);
+            let objects_before: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+                .unwrap();
+            let prolly_nodes_before: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+                .unwrap();
+
+            let err = db
+                .validate_and_update_case_fold_index(&corrupt, &["README.md".to_string()], &[])
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                Error::Corrupt(ref message)
+                    if message.contains("readme.md")
+                        && message.contains(expected_reason)
+                        && message.contains("canonical path")
+            ));
+            assert_eq!(
+                db.conn
+                    .query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                objects_before,
+                "stored value {stored:?} wrote an object"
+            );
+            assert_eq!(
+                db.conn
+                    .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                prolly_nodes_before,
+                "stored value {stored:?} wrote a Prolly node"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_case_fold_update_duplicate_and_noop_inputs_reuse_previous_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        let previous_tree =
+            root_map_tree_from_root_hex(root.case_fold_map_root.as_deref()).unwrap();
+        let prolly_nodes_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
+
+        let duplicate = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &[],
+                &["README.md".to_string(), "README.md".to_string()],
+            )
+            .unwrap();
+        let wrong_case_removal = db
+            .validate_and_update_case_fold_index(&root, &["readme.md".to_string()], &[])
+            .unwrap();
+        let delete_then_add = db
+            .validate_and_update_case_fold_index(
+                &root,
+                &["README.md".to_string()],
+                &["README.md".to_string()],
+            )
+            .unwrap();
+        let empty = db
+            .validate_and_update_case_fold_index(&root, &[], &[])
+            .unwrap();
+
+        assert_eq!(tree_root_hex(&duplicate), tree_root_hex(&previous_tree));
+        assert_eq!(
+            tree_root_hex(&wrong_case_removal),
+            tree_root_hex(&previous_tree)
+        );
+        assert_eq!(
+            tree_root_hex(&delete_then_add),
+            tree_root_hex(&previous_tree)
+        );
+        assert_eq!(tree_root_hex(&empty), tree_root_hex(&previous_tree));
+        assert_eq!(
+            db.root_prolly
+                .get(&wrong_case_removal, b"readme.md")
+                .unwrap(),
+            Some(b"README.md".to_vec())
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
+        );
+    }
+
+    #[test]
+    fn indexed_case_fold_update_legacy_root_requires_rebuild_without_reads_or_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let head = db.get_ref("refs/branches/main").unwrap();
+        let mut root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        root.case_fold_map_root = None;
+        root.path_map_root = Some("invalid-path-tree-that-must-not-be-loaded".to_string());
+        let objects_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        let prolly_nodes_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row.get(0))
+            .unwrap();
+
+        let err = db
+            .validate_and_update_case_fold_index(&root, &[], &["new.md".to_string()])
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::PathIndexRequired(ref message)
+                if message.contains("trail index rebuild")
+        ));
+        assert_eq!(err.code(), "PATH_INDEX_REQUIRED");
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            objects_before
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM prolly_nodes", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            prolly_nodes_before
+        );
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub enum Error {
     WorkspaceExists(PathBuf),
     #[error("invalid path `{path}`: {reason}")]
     InvalidPath { path: String, reason: String },
+    #[error("path invariant index is required: {0}")]
+    PathIndexRequired(String),
     #[error("ignored path `{0}`")]
     IgnoredPath(String),
     #[error("ref not found: {0}")]
@@ -85,6 +87,7 @@ impl Error {
             Error::WorkspaceNotFound(_) => "WORKSPACE_NOT_FOUND",
             Error::WorkspaceExists(_) => "WORKSPACE_EXISTS",
             Error::InvalidPath { .. } => "INVALID_PATH",
+            Error::PathIndexRequired(_) => "PATH_INDEX_REQUIRED",
             Error::IgnoredPath(_) => "IGNORED_PATH",
             Error::RefNotFound(_) => "REF_NOT_FOUND",
             Error::OperationNotFound(_) => "OPERATION_NOT_FOUND",
@@ -127,7 +130,7 @@ impl Error {
             Error::Conflict(_) => 6,
             Error::PatchRejected(_) => 7,
             Error::StaleBranch(_) | Error::WorkspaceLocked(_) => 8,
-            Error::InvalidPath { .. } => 9,
+            Error::InvalidPath { .. } | Error::PathIndexRequired(_) => 9,
             Error::Git(_)
             | Error::GitMappingRequired(_)
             | Error::GitHeadChanged(_)
@@ -184,5 +187,15 @@ mod tests {
             assert_eq!(error.code(), code);
             assert_eq!(error.exit_code(), 10);
         }
+    }
+
+    #[test]
+    fn path_index_required_has_stable_code_and_exit_status() {
+        let error = Error::PathIndexRequired(
+            "legacy root has no case-fold index; run `trail index rebuild`".into(),
+        );
+
+        assert_eq!(error.code(), "PATH_INDEX_REQUIRED");
+        assert_eq!(error.exit_code(), 9);
     }
 }
