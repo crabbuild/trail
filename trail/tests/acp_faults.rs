@@ -103,7 +103,15 @@ fn transport_accepts_the_frame_limit_and_rejects_one_byte_above_it() {
     });
     let mut stdout = child.stdout.take().unwrap();
     let mut received = Vec::new();
-    stdout.read_to_end(&mut received).unwrap();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let bytes = stdout.read(&mut chunk).unwrap();
+        if bytes == 0 {
+            break;
+        }
+        received.extend_from_slice(&chunk[..bytes]);
+        thread::sleep(Duration::from_millis(2));
+    }
     writer.join().unwrap();
     let status = child.wait().unwrap();
     assert!(status.success());
