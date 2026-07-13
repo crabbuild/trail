@@ -71,6 +71,9 @@ dokan-sys = "0.3.1"
 widestring = "0.4.3"
 winapi = { version = "0.3", features = ["errhandlingapi", "fileapi", "handleapi", "jobapi2", "minwinbase", "ntdef", "ntstatus", "processthreadsapi", "sddl", "securitybaseapi", "synchapi", "userenv", "winbase", "winerror", "winnt"] }
 
+[dev-dependencies]
+proptest = "=1.8.0"
+
 [lints]
 workspace = true
 

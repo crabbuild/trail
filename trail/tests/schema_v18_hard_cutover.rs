@@ -329,6 +329,76 @@ fn fresh_init_creates_the_exact_v18_ledger_shape() {
         .unwrap();
     assert!(entry_sql.contains("normalized_path TEXT COLLATE BINARY NOT NULL"));
 
+    let scope_columns = conn
+        .prepare(
+            "SELECT name, type, [notnull], dflt_value FROM pragma_table_xinfo(\
+                'changed_path_scopes'\
+             ) WHERE name LIKE 'max_%' ORDER BY cid",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        scope_columns,
+        vec![
+            (
+                "max_candidate_rows".into(),
+                "INTEGER".into(),
+                1,
+                "250000".into()
+            ),
+            (
+                "max_prefix_rows".into(),
+                "INTEGER".into(),
+                1,
+                "16384".into()
+            ),
+            (
+                "max_observer_log_bytes".into(),
+                "INTEGER".into(),
+                1,
+                "268435456".into(),
+            ),
+            (
+                "max_segment_bytes".into(),
+                "INTEGER".into(),
+                1,
+                "16777216".into(),
+            ),
+            (
+                "max_unfolded_tail_records".into(),
+                "INTEGER".into(),
+                1,
+                "65536".into(),
+            ),
+        ]
+    );
+    let scope_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'changed_path_scopes'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for check in [
+        "CHECK(max_candidate_rows>0)",
+        "CHECK(max_prefix_rows>0)",
+        "CHECK(max_observer_log_bytes>0)",
+        "CHECK(max_segment_bytes>0 AND max_segment_bytes<=max_observer_log_bytes)",
+        "CHECK(max_unfolded_tail_records>0)",
+    ] {
+        assert!(scope_sql.contains(check), "missing {check}");
+    }
+
     let policy_sql: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE name = 'changed_path_policy_dependencies'",
@@ -401,6 +471,11 @@ fn malformed_v18_attributes_are_rejected_read_only() {
             "changed_path_scopes",
             "DEFAULT 'reconciling'",
             "DEFAULT 'trusted'",
+        ),
+        SchemaFixture::mutated_master_sql(
+            "changed_path_scopes",
+            "DEFAULT 250000 CHECK(max_candidate_rows>0)",
+            "DEFAULT 250000 CHECK(max_candidate_rows>=0)",
         ),
         SchemaFixture::mutated_master_sql(
             "changed_path_entries",
