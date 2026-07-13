@@ -2850,7 +2850,7 @@ fn init_creates_lane_observability_indexes() {
 }
 
 #[test]
-fn agent_acp_commands_report_status_setup_and_doctor() {
+fn agent_acp_doctor_reports_status_setup_and_verifiable_evidence() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
     Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
@@ -2911,9 +2911,76 @@ fn agent_acp_commands_report_status_setup_and_doctor() {
         .any(|check| check["name"] == "workspace" && check["status"] == "ok"));
     assert!(checks
         .iter()
-        .any(|check| check["name"] == "capture" && check["status"] == "skipped"));
+        .any(|check| { check["name"] == "capture_journal" && check["status"] == "ok" }));
+    assert!(checks
+        .iter()
+        .any(|check| check["name"] == "path_mapping" && check["status"] == "ok"));
+    assert_eq!(doctor["conformance"]["wire_version"], 1);
+    assert_eq!(
+        doctor["conformance"]["schema_commit"],
+        "64cbd71ae520b89aac54164d8c1d364333c8ee5f"
+    );
+    assert_eq!(
+        doctor["conformance"]["schema_sha256"],
+        "92c1dfcda10dd47e99127500a3763da2b471f9ac61e12b9bf0430c32cf953796"
+    );
+    assert_eq!(
+        doctor["conformance"]["meta_sha256"],
+        "e0bf36f8123b2544b499174197fdc371ec49a1b4572a35114513d56492741599"
+    );
+    assert_eq!(doctor["conformance"]["transport"], "stdio");
+    assert_eq!(doctor["conformance"]["method_count"], 23);
+    let source_revision = option_env!("TRAIL_SOURCE_REVISION")
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or("unverified");
+    let expected_evidence = if source_revision != "unverified"
+        && option_env!("TRAIL_ACP_V1_CONFORMANCE_VERIFIED") == Some(source_revision)
+    {
+        "verified"
+    } else {
+        "unverified"
+    };
+    assert_eq!(doctor["conformance"]["evidence_status"], expected_evidence);
+    assert!(doctor["conformance"]["build_identifier"]
+        .as_str()
+        .unwrap()
+        .starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")));
+    assert_eq!(
+        doctor["conformance"]["exclusions"],
+        serde_json::json!(["ACP v2", "draft remote HTTP transport"])
+    );
     assert!(doctor["lane"].is_null());
     assert!(doctor["session_id"].is_null());
+
+    let human = Command::new(trail_bin())
+        .current_dir(temp.path())
+        .args(["agent", "acp", "doctor", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    for expected in [
+        "Wire version",
+        "Schema commit",
+        "Schema SHA-256",
+        "Metadata SHA-256",
+        "Transport",
+        "Evidence",
+        "ACP v2",
+        "draft remote HTTP transport",
+        "capture_journal",
+        "path_mapping",
+    ] {
+        assert!(
+            human.contains(expected),
+            "missing `{expected}` in:\n{human}"
+        );
+    }
+    if expected_evidence == "unverified" {
+        assert!(!human.contains("ACP v1 conformant"));
+    } else {
+        assert!(human.contains("ACP v1 conformant"));
+    }
 
     let custom_doctor = run_trail_json(
         temp.path(),

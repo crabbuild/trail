@@ -121,15 +121,35 @@ pub(crate) fn render_acp_doctor(
             .iter()
             .map(|warning| UiCheck::new(UiCheckState::Warn, "Warning", warning)),
     );
+    let evidence = &report.conformance;
+    let title = if evidence.evidence_status == "verified" {
+        "ACP v1 conformant".to_string()
+    } else {
+        format!("ACP diagnostics: {}", report.status)
+    };
     render_document(
         &TerminalDocument::new(
-            format!("ACP diagnostics: {}", report.status),
+            title,
             if report.status == "ok" {
                 UiTone::Success
             } else {
                 UiTone::Attention
             },
         )
+        .block(UiBlock::Metadata(vec![
+            (
+                "Wire version".to_string(),
+                evidence.wire_version.to_string(),
+            ),
+            ("Schema commit".to_string(), evidence.schema_commit.clone()),
+            ("Schema SHA-256".to_string(), evidence.schema_sha256.clone()),
+            ("Metadata SHA-256".to_string(), evidence.meta_sha256.clone()),
+            ("Transport".to_string(), evidence.transport.clone()),
+            ("Methods".to_string(), evidence.method_count.to_string()),
+            ("Evidence".to_string(), evidence.evidence_status.clone()),
+            ("Build".to_string(), evidence.build_identifier.clone()),
+            ("Exclusions".to_string(), evidence.exclusions.join(", ")),
+        ]))
         .block(UiBlock::Checklist(checks)),
         options,
     )

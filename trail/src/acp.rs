@@ -37,6 +37,55 @@ const ACP_MAX_PENDING_EVENTS_PER_TURN: usize = 128;
 const ACP_MAX_ASSISTANT_MESSAGE_BYTES: usize = 256 * 1024;
 const ACP_MAX_ASSISTANT_TOTAL_BYTES: usize = 1024 * 1024;
 
+/// Returns the immutable contract identity and build attestation exposed by
+/// `trail agent acp doctor`.
+pub fn acp_v1_conformance_evidence() -> AcpConformanceEvidence {
+    let source_revision = option_env!("TRAIL_SOURCE_REVISION")
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or("unverified");
+    let verified = source_revision != "unverified"
+        && option_env!("TRAIL_ACP_V1_CONFORMANCE_VERIFIED") == Some(source_revision);
+    AcpConformanceEvidence {
+        wire_version: 1,
+        schema_commit: schema::ACP_V1_SCHEMA_COMMIT.to_string(),
+        schema_sha256: schema::ACP_V1_SCHEMA_SHA256.to_string(),
+        meta_sha256: schema::ACP_V1_META_SHA256.to_string(),
+        transport: "stdio".to_string(),
+        method_count: 23,
+        evidence_status: if verified { "verified" } else { "unverified" }.to_string(),
+        build_identifier: format!("{}+{source_revision}", env!("CARGO_PKG_VERSION")),
+        exclusions: vec![
+            "ACP v2".to_string(),
+            "draft remote HTTP transport".to_string(),
+        ],
+    }
+}
+
+/// Exercises the same workspace mapper used by the relay, including the rule
+/// that roots outside the Trail workspace are preserved rather than isolated.
+pub fn validate_acp_path_mapping(workspace_root: &std::path::Path) -> Result<()> {
+    let mapper = WorkspaceMapper::new(workspace_root.to_path_buf(), workspace_root.to_path_buf())?;
+    let workspace = mapper.map(workspace_root)?;
+    if !workspace.isolated {
+        return Err(Error::InvalidPath {
+            path: workspace_root.display().to_string(),
+            reason: "ACP workspace root was not recognized as isolated".to_string(),
+        });
+    }
+    if let Some(external_root) = workspace_root.parent() {
+        if external_root != workspace_root {
+            let external = mapper.map(external_root)?;
+            if external.isolated || external.effective != external.original {
+                return Err(Error::InvalidPath {
+                    path: external_root.display().to_string(),
+                    reason: "ACP external root was not preserved".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct AcpRelayOptions {
     pub workspace_root: PathBuf,

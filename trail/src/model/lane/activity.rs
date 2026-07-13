@@ -68,12 +68,26 @@ pub struct AcpDoctorCheck {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcpConformanceEvidence {
+    pub wire_version: u16,
+    pub schema_commit: String,
+    pub schema_sha256: String,
+    pub meta_sha256: String,
+    pub transport: String,
+    pub method_count: u16,
+    pub evidence_status: String,
+    pub build_identifier: String,
+    pub exclusions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AcpDoctorReport {
     pub status: String,
     pub provider: String,
     pub relay_command: Vec<String>,
     pub lane: Option<String>,
     pub session_id: Option<String>,
+    pub conformance: AcpConformanceEvidence,
     pub checks: Vec<AcpDoctorCheck>,
     pub warnings: Vec<String>,
 }
