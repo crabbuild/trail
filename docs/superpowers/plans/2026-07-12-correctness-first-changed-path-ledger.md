@@ -1,6 +1,11 @@
 # Changed-Path Ledger Implementation Plan
 
-Status: approved implementation plan
+Status: superseded by `docs/superpowers/plans/2026-07-13-activated-changed-path-ledger.md`
+
+The replacement plan implements the approved schema-v18 hard cutover, qualified
+Linux and macOS observers, automatic reconciliation, secure daemon startup, and
+one atomic activation gate. This earlier dormant/migration-oriented plan must
+not be executed.
 
 Design: `docs/superpowers/specs/2026-07-12-correctness-first-changed-path-ledger-design.md`
 
