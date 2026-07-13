@@ -1,292 +1,362 @@
 ---
 meta:
   contentType: Conceptual
-  title: How users set up Trail agents for editors and terminals
+  title: How do you set up Trail agents with ACP and native hooks?
 ---
 
-# How users set up Trail agents for editors and terminals
+# How do you set up Trail agents with ACP and native hooks?
 
-Trail will configure supported Agent Client Protocol (ACP) editors and prepare terminal agents through one guided `trail agent setup` flow. After setup, you choose an agent and a surface while Trail selects the integration mode and records both paths as ordinary Trail agent tasks.
+Trail separates Agent Client Protocol (ACP) setup from native hook setup. You choose the transport first, then configure its provider. Both transports record the same Trail tasks, lifecycle events, evidence, and checkpoints.
 
 ## Document plan
 
-- **Overview**: define one setup and daily-use contract for editor and terminal agents
-- **Goal**: let you configure Trail once, confirm one preview, and start an agent without managing ACP commands, lane names, or session identifiers
-- **Audience**: Trail contributors who implement or review agent setup, provider resolution, editor adapters, and task capture
-- **Content plan**: cover the product contract, command behavior, architecture, configuration safety, failures, and tests
+- **Overview**: define the ACP, hooks, and terminal command boundaries
+- **Goal**: explain how Trail configures each agent transport through one consistent setup contract
+- **Audience**: Trail contributors who implement or review agent setup, provider resolution, adapters, and capture
+- **Content plan**: cover commands, provider syntax, planning, configuration ownership, runtime capture, failures, and tests
 - **Open questions**: none; the product and safety decisions in this document are approved
 
-## Current behavior and problem
+## Why Trail separates ACP and hooks
 
-Trail already includes the ACP relay, built-in and registry providers, Model Context Protocol (MCP) injection, fresh task lanes, transcript capture, provider diagnostics, and a shared review and apply workflow. The current `trail agent setup` command prints one editor snippet but does not install it.
+Trail currently spreads agent setup across `trail agent setup`, `trail acp install`, `trail agent acp`, and `trail agent hooks add`. These commands use different provider catalogs, editor lists, mutation rules, and terminology.
 
-This leaves protocol-specific work with you. You must choose an editor target, copy settings, understand the relay command, and remember a provider flag for terminal tasks. Trail should retain those low-level controls without requiring them during standard setup or daily work.
+The new model exposes two sibling integration categories:
+
+- `trail agent acp` owns editor and ACP integration
+- `trail agent hooks` owns native provider hooks
+
+Terminal agents need no setup command. `trail agent start` launches an isolated task directly.
 
 ## Product goals
 
 The change must meet these goals:
 
-1. Configure supported editors and the terminal default through one command
-2. Preview every configuration write, provider download, and workspace initialization before mutation
-3. Require confirmation before interactive writes
-4. Preserve a copyable configuration path for unsupported editors
-5. Route editor and terminal sessions into the same high-level Trail task workflow
-6. Keep setup idempotent, transactional, and recoverable
-7. Hide ACP terminology from standard daily-use output
+1. Give ACP and native hooks distinct command boundaries
+2. Use the same provider syntax across setup, diagnostics, and terminal startup
+3. Use one planning and transaction contract for both setup categories
+4. Route ACP, native hooks, terminal tasks, and hybrid capture into the same task workflow
+5. Preserve unrelated editor and provider configuration
+6. Keep every setup idempotent, transactional, and recoverable
+7. Remove the old setup model without aliases or migration behavior
 
 ## Non-goals
 
 This change will not:
 
-- Remove `trail acp` or its diagnostics
+- Add a combined setup orchestrator
 - Add a graphical setup application
-- Claim that terminal capture has the same streaming detail as ACP capture
-- Modify unrelated editor settings
-- Install configuration for an editor without an exact adapter for its settings schema
-- Change Trail’s review, readiness, apply, or finish semantics
+- Make ACP and native hooks expose identical evidence
+- Require setup before a terminal task
+- Install configuration without an exact adapter for the target schema
+- Change task review, readiness, apply, or finish semantics
+- Preserve removed command syntax
 
-## User contract
+## Public command model
 
-Run one command from a repository:
-
-```sh
-trail agent setup
-```
-
-In an interactive terminal, Trail detects the workspace, available providers, supported editor installations, and existing Trail-owned entries. Trail asks you to choose only when detection cannot produce one unambiguous choice.
-
-Trail then prints one plan:
+The public command tree makes the transport boundary visible:
 
 ```text
-Trail agent setup
-
-Provider: Codex
-Editors:
-  ✓ Zed
-  ✓ VS Code
-
-Will add:
-  “Trail · Codex” → trail agent acp --provider codex
-
-No unrelated settings will change.
-Backups will be stored in Trail’s user state directory.
-
-Apply these changes? [y/N]
+trail agent
+├── acp
+│   ├── setup
+│   ├── status
+│   ├── doctor
+│   └── sessions
+├── hooks
+│   ├── setup
+│   ├── status
+│   ├── doctor
+│   ├── events
+│   ├── replay
+│   └── remove
+└── start
 ```
 
-After confirmation, Trail applies the plan, verifies the result, and prints the two daily entry points:
-
-```text
-Editor: select “Trail · Codex” and start a chat
-Terminal: trail agent start
-```
-
-Both paths create a fresh Trail agent task. Standard completion uses the existing commands:
+Configured editors invoke the hidden ACP runner. Provider hook files invoke the hidden singular hook receiver:
 
 ```sh
-trail agent next
-trail agent ready latest
-trail agent finish latest
+trail agent acp run codex
+trail agent hook receive codex Stop
 ```
 
-You do not need to know the relay command, lane name, or session identifier. The editor label names Trail and the selected agent, not ACP.
+`trail acp relay` remains the low-level surface for custom ACP hosts and relay diagnostics. It does not configure editors or replace `trail agent acp setup`.
 
-## Command behavior
+## Provider arguments
 
-The existing `trail agent setup` command becomes the guided setup surface. Low-level ACP commands remain available for diagnostics and custom integrations.
+Every provider-aware agent command accepts a provider as its preferred positional argument:
 
-| Invocation | Behavior |
-| --- | --- |
-| `trail agent setup` | Detect choices, preview the plan, request confirmation, apply, and verify in an interactive terminal |
-| `trail agent setup --provider codex` | Preselect Codex and detect supported editors |
-| `trail agent setup --editor zed` | Preselect Zed and resolve the provider by precedence |
-| `trail agent setup --print` | Print the plan and snippets without writing files or downloading providers |
-| `trail agent setup --yes` | Apply a fully resolved plan without prompting |
-| `trail --json agent setup` | Emit the resolved read-only plan as JSON |
-| `trail --json agent setup --yes` | Apply the resolved plan and emit a structured result |
-| `trail acp relay codex` | Retain direct access to the low-level relay |
+```sh
+trail agent start codex
+trail agent acp setup codex --editor zed
+trail agent hooks setup codex --scope project
+trail agent acp doctor codex
+trail agent hooks status codex
+```
 
-An interactive invocation may prompt for unresolved choices. A non-interactive invocation must never wait for input. Without `--yes`, a non-interactive invocation remains read-only and returns the same plan and snippets that existing automation expects.
+The explicit `--provider` form remains part of the new model for automation and callers that prefer named arguments:
 
-Provider selection uses this precedence:
+```sh
+trail agent start --provider codex
+trail agent acp setup --provider codex --editor zed
+trail agent hooks setup --provider codex --scope project
+```
 
-1. Explicit `--provider`
-2. The workspace’s saved agent provider
-3. The only detected ready provider
-4. An interactive choice when several providers are ready
-5. The current `claude-code` compatibility default in non-interactive output
+A command rejects input that supplies both forms. After resolution, Trail stores and reports the canonical provider name.
 
-Editor selection uses this precedence:
+`trail agent start` uses `agent.default_provider` only when neither form is present. You set that general terminal default explicitly:
 
-1. Explicit `--editor`
-2. Every detected editor with an exact Trail adapter
-3. Generic copyable output when no exact adapter exists
+```sh
+trail config set agent.default_provider codex
+trail agent start
+```
 
-`--editor` may be repeated to configure more than one supported editor. `generic` always selects read-only snippet output.
+ACP and hooks setup never change the terminal default.
 
-## Workspace and provider preparation
+Interactive setup may ask you to choose a provider when you omit it. Non-interactive setup requires the positional or named form.
 
-Setup starts with a read-only preflight. If the current Git repository has no Trail workspace, the plan may include `trail init --from-git`. Trail must show that initialization before confirmation and must not choose a baseline for a non-Git directory.
+## Shared setup contract
 
-The provider resolver reports whether the selected provider needs an executable, package runner, registry download, or cached binary. Setup includes any Trail-controlled download in the preview and performs it only after confirmation. Diagnostics must not expose environment values, authentication data, or provider output that may contain secrets.
+Both setup categories use the same operation sequence:
 
-Setup saves the chosen provider as `agent.default_provider` in `.trail/config.toml`. The new configuration section uses a Serde default so existing workspaces remain readable. `trail agent start` uses this value when `--provider` is absent, while an explicit flag always wins.
+```text
+resolve provider
+    -> inspect workspace and targets
+    -> build a read-only plan
+    -> preview and confirm
+    -> lock and apply
+    -> verify
+    -> commit metadata or roll back
+```
+
+An interactive invocation previews the plan and requests confirmation. `--print` and JSON output return the plan without writing files or downloading providers. `--yes` applies a fully resolved plan without prompting.
+
+A non-interactive invocation never waits for input. Without `--yes`, it remains read-only.
+
+## ACP setup ownership
+
+`trail agent acp setup` configures editor and ACP integration for one provider:
+
+```sh
+trail agent acp setup codex --editor zed
+trail agent acp setup codex --editor vscode --yes
+trail --json agent acp setup codex --editor generic
+```
+
+ACP setup may perform these actions:
+
+- Resolve a built-in or registry ACP provider
+- Report a package runner, download, or cached binary requirement
+- Detect supported editors when `--editor` is absent
+- Configure exact editor adapters
+- Generate a generic copyable entry for unsupported editors
+- Inject Trail Model Context Protocol (MCP) tools into the hidden runner
+- Record ACP integration ownership and source digests
+- Verify the provider, editor entry, workspace path, and launch command
+
+ACP setup must not install or remove native hooks. It must not change `agent.default_provider`.
+
+Each editor entry uses a stable Trail-owned identifier such as `trail-codex` and a label such as `Trail · Codex`. The generated entry uses absolute executable and workspace paths:
+
+```text
+/path/to/trail --workspace /path/to/repository agent acp run codex
+```
+
+The first exact adapter targets Zed external-agent settings. VS Code support requires an adapter for a known ACP client extension and its exact settings schema. Trail prints a generic entry when it cannot identify that schema.
+
+## Native hook setup ownership
+
+`trail agent hooks setup` installs or updates Trail-owned native hooks for one provider:
+
+```sh
+trail agent hooks setup codex
+trail agent hooks setup claude-code --scope user
+trail --json agent hooks setup gemini --scope project
+```
+
+Hooks setup may perform these actions:
+
+- Resolve a built-in native hook manifest
+- Probe provider compatibility when requested
+- Merge Trail-owned entries into shared JSON configuration
+- Create an owned plugin, extension, or hook file
+- Record ownership inventory and before/after digests
+- Verify the installed configuration and provider contract
+
+Hooks setup must not configure editors, acquire ACP registry providers, or change ACP integration metadata. It must not change `agent.default_provider`.
+
+Project scope is the default. User scope writes only to the provider’s declared user location. `trail agent hooks remove` removes exact Trail-owned entries or files after ownership verification.
+
+## Terminal task behavior
+
+`trail agent start` launches a provider without a setup phase:
+
+```sh
+trail agent start codex
+trail agent start custom -- my-agent --flag
+```
+
+The command creates a fresh task lane, materializes or mounts its workdir, starts a managed capture run, launches the provider, and records the final checkpoint. Installed native hooks may enrich the same task with prompts, tools, approvals, transcripts, and per-turn checkpoints.
+
+The terminal command resolves its provider from the positional argument, `--provider`, or `agent.default_provider`, in that order. It reports an error when all three are absent.
 
 ## Setup architecture
 
-Setup separates detection and planning from mutation:
+The implementation contains one shared setup framework and transport-specific adapters:
 
-```text
-trail agent setup
-        |
-        v
-Workspace, provider, and editor detection
-        |
-        v
-Read-only setup plan
-        |
-        v
-Preview and confirmation
-        |
-        v
-Transactional apply
-        |
-        v
-Provider and editor verification
-```
+- **Provider resolver**: returns one canonical identity and transport capabilities
+- **Detector**: locates the workspace, executable, provider dependencies, editor installations, and target files
+- **Planner**: converts detected state and arguments into a serializable plan without mutation
+- **ACP adapter**: owns editor detection, scoped merges, generated entries, and verification
+- **Hook adapter**: owns provider hook configuration, event contracts, and verification
+- **Applier**: locks targets, creates secure backups, writes atomically, and rolls back failures
+- **Verifier**: checks every result against the plan before metadata commit
 
-The implementation contains five bounded components:
+The planner is the only input to human previews, JSON output, and mutation. The applier rejects a plan when a source digest differs from the inspected value.
 
-- **Detector**: locates the workspace, Trail executable, provider launchers, editor installations, and relevant settings files
-- **Planner**: converts detected state and command arguments into a serializable setup plan without writing or downloading
-- **Editor adapter**: owns detection, scoped merge, snippet generation, and verification for one exact editor or extension schema
-- **Applier**: acquires configuration locks, creates secure backups, uses atomic per-file replacements, and rolls back the transaction on failure
-- **Verifier**: checks the saved default, provider readiness, configured editor entries, and generated launch commands
+## Setup plans and results
 
-The planner is the only source for human previews, JSON output, and mutation input. The applier must reject a plan when any source-file digest differs from the digest captured during planning.
+Every setup plan contains common fields:
 
-## Setup plan and result
-
-The structured setup plan contains:
-
+- Transport category
 - Workspace root and optional initialization action
 - Trail executable path
-- Selected provider and capability mode
-- Provider acquisition actions and network requirements
-- Previous and proposed workspace default provider
-- Editor adapter identifiers
-- Target configuration paths and source digests
-- Trail-owned keys to add, update, or remove
+- Canonical provider and capability summary
+- Acquisition actions and network requirements
+- Target paths and source digests
+- Trail-owned entries or files
 - Redacted scoped diffs
-- Generic fallback snippets
 - Verification checks
-- Whether confirmation is required
+- Confirmation requirement
 
-The apply result records each attempted action, its status, rollback status, and verification outcome. Human output summarizes those fields, while JSON preserves stable field names for automation.
+ACP plans also contain editor adapter identifiers and fallback entries. Hook plans also contain scope, manifest version, provider version range, and ownership inventory.
 
-## Editor adapters and configuration ownership
+The apply result records every attempted action, its status, rollback status, and verification outcome. Human output summarizes these fields. JSON keeps stable field names for automation.
 
-The first exact adapter targets Zed’s native external-agent settings. VS Code support requires an adapter for a known ACP client extension and its exact settings schema. When Trail cannot identify that extension, it prints the generic command and snippet instead of guessing a settings key.
+## Workspace and provider preparation
 
-Each configured entry uses a stable Trail-owned identifier such as `trail-codex` and a display label such as `Trail · Codex`. The generated command uses absolute paths for both the Trail executable and workspace:
+Setup begins with a read-only preflight. In an uninitialized Git repository, the plan may include `trail init --from-git`. Trail shows that action before confirmation. It does not choose a baseline for a non-Git directory.
 
-```text
-/your_trail_executable_path --workspace /your_repository_path agent acp --provider codex
-```
+Provider resolution reports every Trail-controlled download before mutation. Diagnostics redact environment values, authentication data, unrelated configuration values, and provider output that may contain secrets.
 
-Adapters may update only their Trail-owned entry. They must preserve unrelated keys, comments, ordering, and formatting when the target format supports them. Setup records installation ownership and digests in Trail’s local integration metadata so a later run can distinguish a Trail update from your entry.
+The ACP and hook resolvers use one provider capability manifest. A provider may support either transport, both transports, or terminal execution only. Each setup command rejects providers that do not support its transport.
 
-## Transaction and backup safety
+## Configuration ownership and transactions
 
-Before writing, the applier locks every target and verifies its planned digest. It stores user-readable-only backups in Trail’s operating-system application state directory. Backups must never enter the repository or `.trail` workspace data because editor settings may contain credentials.
+Before writing, the applier locks every target and compares its current digest with the plan. It stores user-readable-only backups in Trail’s operating-system application state directory. Editor and provider settings may contain credentials, so backups never enter the repository or `.trail` data.
 
-Trail retains the latest verified backup for each target and replaces it during the next successful setup. Failed setup attempts retain the snapshot needed for manual recovery until a later successful setup replaces it.
+Adapters update only their Trail-owned entry or file. Shared formats preserve unrelated keys and hooks. Owned files reject foreign content unless the operator has explicitly authorized replacement through that transport’s setup contract.
 
-The applier writes temporary files, parses each result with the target adapter, and then replaces the originals atomically. All supported-editor changes and the workspace default form one transaction. If any write or verification fails, Trail restores every changed target and reports the rollback result.
+Each setup invocation forms one transaction. Trail writes temporary files, parses each result with its adapter, and replaces targets atomically. A write or verification failure restores every changed target.
 
-If the plan initializes Trail, the new workspace joins the same transaction. Rollback removes it only when its digest still matches the state that setup created. Otherwise, Trail retains the workspace and reports the concurrent change.
+If the plan creates a Trail workspace, rollback removes it only while its digest matches the created state. A concurrent change preserves the workspace and becomes the primary reported conflict.
 
-Provider acquisition may populate Trail’s immutable cache before configuration commit. A later failure may leave an unreferenced cache artifact, but it must not leave partial editor or workspace configuration. Existing cache maintenance removes unreferenced artifacts.
+Provider acquisition may leave an unreferenced immutable cache artifact after a later failure. It must not leave partial workspace, editor, or hook configuration.
 
-Running the same setup twice must produce an empty configuration diff after readiness checks. A concurrent editor change causes a digest conflict and a new preview requirement rather than an overwrite.
+Repeated setup with the same arguments produces no configuration diff. A concurrent target change aborts the operation and requires a new plan.
 
-## Shared editor and terminal task flow
+## Runtime capture boundaries
 
-Editor configuration invokes the existing hidden `trail agent acp` entry point with an explicit provider. Terminal startup invokes `trail agent start` with the saved default provider. Both commands must call one shared task-creation boundary for lane naming, baseline selection, task metadata, workdir reporting, review status, and completion actions.
+The hidden `trail agent acp run` command creates a fresh task and starts the ACP relay with MCP injection. The hidden `trail agent hook receive` command journals one bounded, redacted native receipt and returns the provider’s success response.
 
-ACP sessions retain their richer streaming transcript, tool-event, permission, MCP injection, and checkpoint capture. Terminal sessions retain their universal isolated workdir and final checkpoint behavior. Both expose the same task-level selectors and review lifecycle even when their capture detail differs.
+ACP, native hooks, terminal wrappers, and hybrid capture use the same versioned lifecycle vocabulary and capture coordinator. Provider adapters translate native events. They do not own task creation, checkpoint policy, deduplication, or finalization.
 
-## Failure and fallback behavior
+When an exact native session identity matches an active ACP session, Trail records hybrid capture. ACP owns lifecycle progression while native hooks add receipts and transcript evidence. Ambiguous matches fail closed.
 
-Setup handles expected failures without discarding a usable path:
+## Hard cutover
 
-- **No Trail workspace**: include Git-based initialization in the confirmed plan
-- **No supported editor**: save the terminal default and print a generic ACP snippet
-- **Unsupported or unknown ACP extension**: leave editor settings untouched and print the launch command and snippet
-- **Malformed editor settings**: report the parse location, preserve the file, and print the fallback snippet
-- **Missing provider dependency**: report the required runner or download before mutation
-- **Stale Trail or repository path**: let `trail agent doctor` identify the stale entry and recommend setup again
-- **Concurrent settings change**: abort before writing and request a new preview
-- **Write or verification failure**: restore the complete transaction and report any rollback failure as the primary blocker
+The implementation removes the old setup model:
 
-Fallback output is a successful setup result when terminal use remains ready. Unsupported editor installation is not an error unless the caller explicitly requested that exact editor with `--editor`.
+- Remove `trail agent setup`
+- Remove `trail acp install`
+- Remove `trail agent hooks add`
+- Remove the old leaf form of `trail agent acp`
+- Remove old help text, examples, tests, and documentation
+
+The cutover adds no aliases, deprecation warnings, migration messages, or compatibility shims. Removed syntax receives the command parser’s standard unknown-command or missing-subcommand response.
+
+`trail acp relay` remains because it serves custom ACP integrations. The explicit `--provider` form also remains because it is part of the new positional-provider contract.
+
+## Failure behavior
+
+Each setup category reports failures within its boundary:
+
+- **Missing workspace**: include Git-based initialization in the confirmed plan
+- **Unsupported transport**: report the provider capability that is absent
+- **Unsupported editor**: print a generic ACP entry without changing editor settings
+- **Malformed target**: report the parse location and preserve the file
+- **Missing provider dependency**: show the required runner or acquisition action before mutation
+- **Concurrent target change**: abort and require a new preview
+- **Write or verification failure**: restore the full setup transaction
+- **Rollback failure**: report the unrecovered target as the primary blocker
+- **Native delivery failure**: spool the redacted receipt and preserve provider success behavior
+
+ACP failure never changes hook configuration. Hook failure never changes editor or ACP configuration.
 
 ## Diagnostics and terminology
 
-Standard setup and daily-use output uses “editor agent,” “terminal agent,” “provider,” and “Trail task.” It does not teach ACP, MCP, relay, lane, or session concepts.
+Public output names the selected category:
 
-`trail agent doctor` checks the high-level experience and may name the failed integration layer in diagnostic detail. `trail acp doctor` and `trail acp relay` remain the explicit protocol-level surfaces for contributors, support, and custom hosts.
+- `trail agent acp doctor` diagnoses editor, provider, relay, MCP, and capture readiness
+- `trail agent hooks doctor` diagnoses compatibility, ownership, drift, delivery, receipts, spool pressure, and transcript fidelity
+- `trail agent doctor` remains task-oriented and checks terminal launch plus workspace readiness
+
+Daily output uses provider, editor agent, terminal agent, native hooks, and Trail task. Protocol terms such as relay, lane, session mapping, and receipt appear only where they explain an ACP or hooks diagnostic.
 
 ## Test strategy
 
 Implementation follows test-driven development.
 
-### Detection and planning tests
+### Command contract tests
 
-- Resolve provider and editor precedence deterministically
+- Accept the positional provider and `--provider` forms
+- Reject input that supplies both provider forms
+- Resolve `agent.default_provider` only for terminal startup
+- Require a provider for non-interactive setup
+- Expose only the new command tree in help output
+- Reject removed command syntax through the standard parser path
+
+### Planning and adapter tests
+
 - Produce no writes or downloads while planning
-- Redact unrelated editor values from previews and JSON
-- Include workspace initialization only for an uninitialized Git repository
-- Reject unresolved non-interactive `--yes` plans
-
-### Editor adapter contract tests
-
-- Detect supported installation paths on each operating system
-- Add, update, and remove only the Trail-owned entry
-- Preserve unrelated settings, comments, ordering, and formatting
-- Generate valid generic snippets for unsupported clients
-- Reject malformed and concurrently modified configurations
-
-Every adapter must pass the same fixture-based contract suite before it becomes an automatic-install target.
+- Emit the same plan through human and JSON projections
+- Redact unrelated configuration values
+- Reject providers that lack the selected transport
+- Verify ACP editor adapter contracts on each operating system
+- Verify native hook adapter contracts for every built-in manifest
+- Preserve unrelated configuration and reject malformed targets
 
 ### Transaction tests
 
-- Create user-readable-only backups outside the workspace
-- Apply each target with atomic replacement and transaction rollback
-- Restore every target after an injected write or verification failure
+- Store secure backups outside the workspace
+- Detect source changes after planning
+- Apply every target through atomic replacement
+- Restore every changed target after an injected failure
 - Report rollback failures without claiming recovery
-- Produce an empty diff when setup runs twice
+- Produce no configuration diff after repeated setup
 
 ### Integration and end-to-end tests
 
-- Use temporary home, application-state, workspace, and editor directories
-- Exercise interactive confirmation, rejection, `--print`, `--yes`, and JSON modes
-- Verify that tests never read or modify real editor configuration
-- Launch a stub ACP editor session and a stub terminal provider session
-- Confirm that both sessions produce addressable Trail tasks with the same review and finish actions
-- Confirm that ACP capture remains richer without changing the common task contract
+- Exercise confirmation, rejection, `--print`, `--yes`, and JSON behavior
+- Keep test homes, workspaces, caches, and editor settings isolated
+- Launch a stub editor through hidden `trail agent acp run`
+- Deliver stub native events after `trail agent hooks setup`
+- Launch terminal tasks with positional, named, and configured providers
+- Confirm that every transport creates addressable tasks with the same review and finish actions
+- Confirm that hybrid capture deduplicates turns, messages, spans, and checkpoints
 
-Optional release checks may exercise real editor and provider installations. They must run in disposable profiles and must not gate unit tests on network access.
+Optional release checks may exercise real editors and providers in disposable profiles. Unit and integration tests do not require network access.
 
 ## Completion criteria
 
 The change is complete when:
 
-1. One interactive `trail agent setup` invocation previews, confirms, applies, and verifies all detected supported targets
-2. Unsupported editors receive a copyable, workspace-specific fallback without configuration writes
-3. `trail agent start` uses the saved provider when no explicit provider is given
-4. Editor and terminal sessions enter the same Trail task review and completion workflow
-5. Setup is idempotent and rolls back every changed target after an injected failure
-6. Non-interactive setup remains read-only unless `--yes` is present
-7. JSON plans and results expose stable automation fields without secrets
-8. Current CLI, ACP relay, agent workflow, and full Trail regression tests pass
+1. ACP setup configures and verifies supported editor integrations through `trail agent acp setup`
+2. Hook setup configures and verifies native provider hooks through `trail agent hooks setup`
+3. Both setup categories use the same plan, confirmation, transaction, and verification contract
+4. Terminal startup requires no setup and accepts a positional provider
+5. The explicit `--provider` form behaves identically to the positional form
+6. Generated editors launch the hidden `trail agent acp run`
+7. ACP, hooks, terminal, and hybrid capture retain one task and evidence model
+8. Removed commands, aliases, documentation, and tests no longer exist
+9. Repeated setup is idempotent and injected failures restore every changed target
+10. Human and JSON output expose stable, redacted plan and result fields
