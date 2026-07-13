@@ -458,23 +458,9 @@ PY
       run_timed "$scale" agent_git_ready "$BIN" --workspace "$GIT_REPO" --json agent ready latest
       run_timed "$scale" agent_git_apply_dry_run "$BIN" --workspace "$GIT_REPO" --json agent apply latest --dry-run
       run_timed "$scale" agent_git_apply "$BIN" --workspace "$GIT_REPO" --json agent apply latest
-      python3 - "$WORK/out/agent_git_apply.stdout" "$WORK/agent-git-metrics.tsv" <<'PY'
-import json, pathlib, sys
-payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
-export = payload.get("git_export")
-if not isinstance(export, dict) or not isinstance(export.get("performance"), dict):
-    raise SystemExit("agent Git apply JSON did not contain git_export.performance")
-performance = export["performance"]
-required = ["export_mode", "changed_path_count", "blob_write_count"]
-missing = [key for key in required if key not in performance]
-if missing:
-    raise SystemExit(f"agent Git apply JSON omitted performance metrics: {missing}")
-pathlib.Path(sys.argv[2]).write_text(
-    f"agent_git_export_mode\t{performance['export_mode']}\n"
-    f"agent_git_changed_paths\t{int(performance['changed_path_count'])}\n"
-    f"agent_git_blob_writes\t{int(performance['blob_write_count'])}\n"
-)
-PY
+      python3 scripts/extract-agent-git-performance.py \
+        "$WORK/out/agent_git_apply.stdout" \
+        "$WORK/agent-git-metrics.tsv"
       GIT_UNMAPPED_HEAD_BEFORE="$(git -C "$GIT_UNMAPPED_REPO" rev-parse HEAD)"
       GIT_UNMAPPED_INDEX_BEFORE="$(git hash-object "$GIT_UNMAPPED_REPO/.git/index")"
       run_timed "$scale" git_unmapped_init_working_tree "$BIN" --workspace "$GIT_UNMAPPED_REPO" --json init --working-tree

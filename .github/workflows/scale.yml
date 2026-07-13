@@ -32,6 +32,8 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run CLI scale benchmark
@@ -52,15 +54,36 @@ jobs:
       - name: Check large-agent hot path thresholds
         if: always()
         run: |
-          if [ "${{ github.event.inputs.run_daemon || '1' }}" != "1" ]; then
-            echo "skipping daemon hot-path thresholds because run_daemon is disabled"
-            exit 0
-          fi
           root="${{ runner.temp }}/trail-cli-scale-scale-${{ github.run_id }}"
           mapfile -t result_files < <(find "$root" -name results.tsv -print | sort)
           if [ "${#result_files[@]}" -eq 0 ]; then
             echo "no scale benchmark results found under $root" >&2
             exit 1
+          fi
+          daemon_thresholds=()
+          if [ "${{ github.event.inputs.run_daemon || '1' }}" = "1" ]; then
+            daemon_thresholds=(
+              daemon_wait_for_health=60
+              daemon_wait_for_hot_cache=120
+              daemon_status=5
+              daemon_persisted_snapshot_status=5
+              daemon_persisted_snapshot_record_clean=5
+              daemon_persisted_snapshot_diff_dirty=10
+              daemon_cli_status=5
+              daemon_cli_record_dirty=10
+              daemon_cli_agent_readiness=5
+              daemon_cli_agent_trace_summary=5
+              daemon_cli_merge_dry_run=10
+              daemon_cli_session_start=10
+              daemon_cli_approval_request=10
+              daemon_cli_lease_acquire=10
+              daemon_cli_timeline=10
+              daemon_cli_why=10
+              daemon_cli_history=10
+              daemon_cli_code_from=10
+            )
+          else
+            echo "omitting daemon hot-path thresholds because run_daemon is disabled"
           fi
           git_thresholds=()
           if [ "${{ github.event.inputs.run_git_import || '1' }}" = "1" ]; then
@@ -133,29 +156,12 @@ jobs:
               )
             fi
             python3 scripts/check-cli-scale-thresholds.py "$results" \
-              daemon_wait_for_health=60 \
-              daemon_wait_for_hot_cache=120 \
-              daemon_status=5 \
-              daemon_persisted_snapshot_status=5 \
-              daemon_persisted_snapshot_record_clean=5 \
-              daemon_persisted_snapshot_diff_dirty=10 \
-              daemon_cli_status=5 \
-              daemon_cli_record_dirty=10 \
-              daemon_cli_agent_readiness=5 \
-              daemon_cli_agent_trace_summary=5 \
-              daemon_cli_merge_dry_run=10 \
-              daemon_cli_session_start=10 \
-              daemon_cli_approval_request=10 \
-              daemon_cli_lease_acquire=10 \
-              daemon_cli_timeline=10 \
-              daemon_cli_why=10 \
-              daemon_cli_history=10 \
-              daemon_cli_code_from=10 \
+              "${daemon_thresholds[@]}" \
               agent_apply_patch=10 \
               agent_readiness=10 \
               merge_agent_dry_run=10 \
               merge_agent_apply=10 \
-              merge_queue_run=10 \
+              lane_merge_queue_run=10 \
               "${git_thresholds[@]}" \
               "${git_apply_thresholds[@]}" \
               "${materialized_thresholds[@]}" \

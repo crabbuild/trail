@@ -25,7 +25,10 @@ jobs:
       - name: Scale Benchmark Syntax
         run: bash -n scripts/cli-scale-bench.sh
       - name: Scale Threshold Checker Tests
-        run: python3 -m unittest scripts/test_check_cli_scale_thresholds.py
+        run: >-
+          python3 -m unittest
+          scripts/test_check_cli_scale_thresholds.py
+          scripts/test_extract_agent_git_performance.py
       - name: Scale Benchmark Smoke
         run: make bench-cli-scale-smoke
         env:
@@ -60,7 +63,7 @@ jobs:
           agent_git_apply_dry_run=15
           agent_git_apply=20
           agent_git_apply_missing_mapping=5
-          merge_queue_run=30
+          lane_merge_queue_run=30
           agent_spawn_sparse=15
           agent_read_sparse_hydrate_neighbors=15
           agent_sync_sparse_dir=15
