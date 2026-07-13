@@ -468,8 +468,17 @@ impl FrameObserver for CaptureObserver {
     }
 
     fn flush(&self, timeout: Duration) {
-        self.ingress
-            .flush(timeout.max(ACP_CALLBACK_CAPTURE_FLUSH_TIMEOUT));
+        let has_pending_client_callbacks = self
+            .coordinator
+            .lock()
+            .map(|coordinator| coordinator.has_pending_client_callbacks())
+            .unwrap_or(true);
+        let timeout = if has_pending_client_callbacks {
+            timeout.max(ACP_CALLBACK_CAPTURE_FLUSH_TIMEOUT)
+        } else {
+            timeout
+        };
+        self.ingress.flush(timeout);
         let reason = self
             .finish_reason
             .lock()
@@ -982,6 +991,12 @@ struct CaptureCoordinator {
 }
 
 impl CaptureCoordinator {
+    fn has_pending_client_callbacks(&self) -> bool {
+        self.pending_operations
+            .values()
+            .any(|operation| matches!(operation, PendingOperation::ClientCallback(_)))
+    }
+
     fn new(options: AcpRelayOptions) -> Result<Self> {
         let upstream_command_json =
             serde_json::to_string(&redact_command(&options.upstream_command)).ok();
