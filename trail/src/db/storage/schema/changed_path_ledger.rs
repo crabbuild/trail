@@ -203,6 +203,14 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
          );
          CREATE INDEX changed_path_reconciliation_rows_kind_idx
              ON changed_path_reconciliation_rows(attempt_id, row_kind, normalized_path COLLATE BINARY);
+         CREATE TABLE changed_path_reconciliation_guards (
+             attempt_id TEXT NOT NULL
+                 REFERENCES changed_path_reconciliations(attempt_id) ON UPDATE CASCADE ON DELETE CASCADE,
+             relative_path BLOB NOT NULL CHECK (length(relative_path) > 0),
+             directory_identity BLOB NOT NULL CHECK (length(directory_identity) > 0),
+             staged_at INTEGER NOT NULL,
+             PRIMARY KEY (attempt_id, relative_path)
+         ) WITHOUT ROWID;
          CREATE TABLE changed_path_observer_owners (
              scope_id TEXT NOT NULL PRIMARY KEY
                  REFERENCES changed_path_scopes(scope_id) ON UPDATE CASCADE ON DELETE CASCADE,
@@ -321,7 +329,7 @@ fn ledger_schema_objects(conn: &Connection) -> Result<Vec<(String, String, Strin
 
 fn schema_structure_complete(conn: &Connection) -> Result<bool> {
     type Column = (&'static str, &'static str, bool, Option<&'static str>, i64);
-    let tables: [(&str, &[Column]); 10] = [
+    let tables: [(&str, &[Column]); 11] = [
         (
             "changed_path_scopes",
             &[
@@ -499,6 +507,15 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             ],
         ),
         (
+            "changed_path_reconciliation_guards",
+            &[
+                ("attempt_id", "TEXT", true, None, 1),
+                ("relative_path", "BLOB", true, None, 2),
+                ("directory_identity", "BLOB", true, None, 0),
+                ("staged_at", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
             "changed_path_observer_segments",
             &[
                 ("scope_id", "TEXT", true, None, 1),
@@ -546,7 +563,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let table_fragments: [(&str, &[&str]); 10] = [
+    let table_fragments: [(&str, &[&str]); 11] = [
         (
             "changed_path_scopes",
             &[
@@ -648,6 +665,14 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             ],
         ),
         (
+            "changed_path_reconciliation_guards",
+            &[
+                "CHECK (length(relative_path) > 0)",
+                "CHECK (length(directory_identity) > 0)",
+                "WITHOUT ROWID",
+            ],
+        ),
+        (
             "changed_path_observer_segments",
             &[
                 "CHECK (length(segment_id) > 0)",
@@ -680,7 +705,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let primary_keys: [(&str, &[&str]); 10] = [
+    let primary_keys: [(&str, &[&str]); 11] = [
         ("changed_path_scopes", &["scope_id"]),
         ("changed_path_entries", &["scope_id", "normalized_path"]),
         ("changed_path_prefixes", &["scope_id", "normalized_prefix"]),
@@ -697,6 +722,10 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         (
             "changed_path_reconciliation_rows",
             &["attempt_id", "normalized_path"],
+        ),
+        (
+            "changed_path_reconciliation_guards",
+            &["attempt_id", "relative_path"],
         ),
         (
             "changed_path_observer_segments",
@@ -732,6 +761,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         "changed_path_intent_prefixes",
         "changed_path_reconciliations",
         "changed_path_reconciliation_rows",
+        "changed_path_reconciliation_guards",
     ] {
         if origin_index_count(conn, table, "u")? != 0 {
             return Ok(false);
@@ -806,7 +836,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 10] = [
+    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 11] = [
         ("changed_path_scopes", &[]),
         (
             "changed_path_entries",
@@ -888,6 +918,16 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         ),
         (
             "changed_path_reconciliation_rows",
+            &[(
+                "attempt_id",
+                "changed_path_reconciliations",
+                "attempt_id",
+                "CASCADE",
+                "CASCADE",
+            )],
+        ),
+        (
+            "changed_path_reconciliation_guards",
             &[(
                 "attempt_id",
                 "changed_path_reconciliations",

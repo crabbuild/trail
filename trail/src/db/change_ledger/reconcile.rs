@@ -1,3 +1,4 @@
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -17,6 +18,10 @@ use crate::Trail;
 
 const STAGING_BATCH_ROWS: usize = 256;
 const MAX_IDENTITY_RACE_RETRIES: u64 = 2;
+const MAX_OBSERVER_SPOOL_EVENTS: u64 = 1_000_000;
+const MAX_OBSERVER_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_OBSERVER_SPOOL_PATH_BYTES: usize = 1024 * 1024;
+const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,6 +36,87 @@ pub(crate) struct ObserverEvent {
     pub(crate) path: LedgerPath,
     pub(crate) flags: EvidenceFlags,
     pub(crate) sequence: u64,
+}
+
+struct ObserverEventSpool {
+    file: std::fs::File,
+    events: u64,
+    bytes: u64,
+}
+
+impl ObserverEventSpool {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile()?,
+            events: 0,
+            bytes: 0,
+        })
+    }
+
+    fn push(&mut self, event: ObserverEvent) -> Result<()> {
+        let path = event.path.as_str().as_bytes();
+        if path.len() > MAX_OBSERVER_SPOOL_PATH_BYTES {
+            return Err(Error::InvalidInput(
+                "observer event path exceeds reconciliation spool limit".into(),
+            ));
+        }
+        let next_events = self.events.saturating_add(1);
+        let record_bytes = OBSERVER_SPOOL_HEADER_BYTES
+            .checked_add(path.len())
+            .ok_or_else(|| Error::InvalidInput("observer spool record size overflow".into()))?;
+        let next_bytes = self
+            .bytes
+            .checked_add(record_bytes as u64)
+            .ok_or_else(|| Error::InvalidInput("observer spool size overflow".into()))?;
+        if next_events > MAX_OBSERVER_SPOOL_EVENTS || next_bytes > MAX_OBSERVER_SPOOL_BYTES {
+            return Err(Error::InvalidInput(
+                "observer evidence exceeds bounded reconciliation spool".into(),
+            ));
+        }
+        let path_len = u32::try_from(path.len())
+            .map_err(|_| Error::InvalidInput("observer path length overflow".into()))?;
+        self.file.write_all(&path_len.to_be_bytes())?;
+        self.file.write_all(&event.flags.0.to_be_bytes())?;
+        self.file.write_all(&event.sequence.to_be_bytes())?;
+        self.file.write_all(path)?;
+        self.events = next_events;
+        self.bytes = next_bytes;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.file.sync_all()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<ObserverEvent>> {
+        let mut header = [0_u8; OBSERVER_SPOOL_HEADER_BYTES];
+        let read = self.file.read(&mut header[..1])?;
+        if read == 0 {
+            return Ok(None);
+        }
+        self.file.read_exact(&mut header[1..])?;
+        let path_len = u32::from_be_bytes(header[..4].try_into().expect("four byte length"));
+        let path_len = usize::try_from(path_len)
+            .map_err(|_| Error::Corrupt("observer spool path length cannot fit memory".into()))?;
+        if path_len > MAX_OBSERVER_SPOOL_PATH_BYTES {
+            return Err(Error::Corrupt(
+                "observer spool path exceeds bounded record limit".into(),
+            ));
+        }
+        let flags = i64::from_be_bytes(header[4..12].try_into().expect("eight byte flags"));
+        let sequence = u64::from_be_bytes(header[12..20].try_into().expect("eight byte sequence"));
+        let mut path = vec![0_u8; path_len];
+        self.file.read_exact(&mut path)?;
+        let path = String::from_utf8(path)
+            .map_err(|_| Error::Corrupt("observer spool path is not UTF-8".into()))?;
+        Ok(Some(ObserverEvent {
+            path: LedgerPath::parse(&path)?,
+            flags: EvidenceFlags(flags),
+            sequence,
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -572,7 +658,7 @@ impl ReconciliationAttempt {
             );
         }
         let root_identity = trail.pinned_worktree_root_identity(&self.root);
-        let mut policy_event = false;
+        let mut spool = ObserverEventSpool::new()?;
         let qualification = observer.drain_through(
             &self.expected,
             &root_identity,
@@ -584,22 +670,22 @@ impl ReconciliationAttempt {
                         "observer returned evidence outside requested fence interval".into(),
                     ));
                 }
-                if raw_event_invalidates_policy(policy, std::path::Path::new(event.path.as_str())) {
-                    policy_event = true;
-                    return Ok(());
-                }
-                let current =
-                    trail.read_pinned_worktree_path(&self.root, policy, event.path.as_str())?;
-                let baseline =
-                    trail.root_file_entry(&self.expected.baseline_root, event.path.as_str())?;
-                writer.stage_observer_result(event, current, baseline)
+                spool.push(event)
             },
         )?;
-        if policy_event {
-            return self.fail(
-                ledger,
-                "recording policy changed during reconciliation interval",
-            );
+        spool.finish()?;
+        while let Some(event) = spool.next()? {
+            if raw_event_invalidates_policy(policy, std::path::Path::new(event.path.as_str())) {
+                return self.fail(
+                    ledger,
+                    "recording policy changed during reconciliation interval",
+                );
+            }
+            let current =
+                trail.read_pinned_worktree_path(&self.root, policy, event.path.as_str())?;
+            let baseline =
+                trail.root_file_entry(&self.expected.baseline_root, event.path.as_str())?;
+            writer.stage_observer_result(event, current, baseline)?;
         }
         writer.flush()?;
         let candidate_rows = ledger.conn.query_row(
@@ -640,18 +726,16 @@ impl ReconciliationAttempt {
         ledger: &ChangedPathLedger<'_>,
     ) -> Result<()> {
         let mut statement = ledger.conn.prepare(
-            "SELECT content_hash,after_identity
-             FROM changed_path_reconciliation_rows
-             WHERE attempt_id=?1 AND before_identity='directory_guard'
-             ORDER BY normalized_path COLLATE BINARY",
+            "SELECT relative_path,directory_identity
+             FROM changed_path_reconciliation_guards
+             WHERE attempt_id=?1
+             ORDER BY relative_path",
         )?;
         let mut rows = statement.query([&self.attempt_id])?;
         while let Some(row) = rows.next()? {
-            let path = row.get::<_, String>(0)?;
-            let identity = row
-                .get::<_, Option<String>>(1)?
-                .and_then(|value| hex::decode(value).ok())
-                .ok_or_else(|| Error::Corrupt("invalid staged directory guard".into()))?;
+            let path = String::from_utf8(row.get::<_, Vec<u8>>(0)?)
+                .map_err(|_| Error::Corrupt("invalid staged directory guard path".into()))?;
+            let identity = row.get::<_, Vec<u8>>(1)?;
             if !trail.verify_pinned_worktree_directory(&self.root, &path, &identity)? {
                 return Err(Error::InvalidInput(format!(
                     "directory identity changed during reconciliation: `{path}`"
@@ -1095,10 +1179,16 @@ struct StagedRow {
     source_sequence: Option<u64>,
 }
 
+struct StagedDirectoryGuard {
+    path: Vec<u8>,
+    identity: Vec<u8>,
+}
+
 struct StagingWriter<'a> {
     conn: &'a rusqlite::Connection,
     attempt_id: &'a str,
     pending: Vec<StagedRow>,
+    pending_guards: Vec<StagedDirectoryGuard>,
     observed_files: u64,
     staged_rows: u64,
     hashed_bytes: u64,
@@ -1112,6 +1202,7 @@ impl<'a> StagingWriter<'a> {
             conn,
             attempt_id,
             pending: Vec::with_capacity(STAGING_BATCH_ROWS),
+            pending_guards: Vec::with_capacity(STAGING_BATCH_ROWS),
             observed_files: 0,
             staged_rows: 0,
             hashed_bytes: 0,
@@ -1128,20 +1219,11 @@ impl<'a> StagingWriter<'a> {
     }
 
     fn stage_directory_guard(&mut self, directory: ReconciliationDirectory) -> Result<()> {
-        self.push(StagedRow {
-            path: format!(
-                "#directory-guard/{}",
-                hex::encode(directory.path.as_bytes())
-            ),
-            row_kind: "entry",
-            file_kind: Some("DirectoryGuard".into()),
-            content_hash: Some(directory.path),
-            executable: None,
-            size_bytes: None,
-            flags: EvidenceFlags::default(),
-            identity: Some(directory.identity),
-            source_sequence: None,
-        })
+        self.pending_guards.push(StagedDirectoryGuard {
+            path: directory.path.into_bytes(),
+            identity: directory.identity,
+        });
+        self.after_push()
     }
 
     fn compare_baseline(&mut self, path: String, baseline: FileEntry) -> Result<()> {
@@ -1276,15 +1358,20 @@ impl<'a> StagingWriter<'a> {
 
     fn push(&mut self, row: StagedRow) -> Result<()> {
         self.pending.push(row);
-        self.peak_batch_rows = self.peak_batch_rows.max(self.pending.len() as u64);
-        if self.pending.len() >= STAGING_BATCH_ROWS {
+        self.after_push()
+    }
+
+    fn after_push(&mut self) -> Result<()> {
+        let pending_rows = self.pending.len().saturating_add(self.pending_guards.len());
+        self.peak_batch_rows = self.peak_batch_rows.max(pending_rows as u64);
+        if pending_rows >= STAGING_BATCH_ROWS {
             self.flush()?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_guards.is_empty() {
             return Ok(());
         }
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
@@ -1309,15 +1396,23 @@ impl<'a> StagingWriter<'a> {
                     row.content_hash,
                     row.executable.map(i64::from),
                     row.size_bytes.map(sql_u64).transpose()?,
-                    if row.file_kind.as_deref() == Some("DirectoryGuard") {
-                        "directory_guard".to_string()
-                    } else {
-                        format!("flags:{}", row.flags.0)
-                    },
+                    format!("flags:{}", row.flags.0),
                     row.identity.map(hex::encode),
                     row.source_sequence.map(sql_u64).transpose()?,
                     now_ts(),
                 ],
+            )?;
+            self.staged_rows = self.staged_rows.saturating_add(1);
+        }
+        for guard in self.pending_guards.drain(..) {
+            tx.execute(
+                "INSERT INTO changed_path_reconciliation_guards(
+                     attempt_id,relative_path,directory_identity,staged_at
+                 ) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(attempt_id,relative_path) DO UPDATE SET
+                     directory_identity=excluded.directory_identity,
+                     staged_at=excluded.staged_at",
+                params![self.attempt_id, guard.path, guard.identity, now_ts()],
             )?;
             self.staged_rows = self.staged_rows.saturating_add(1);
         }
@@ -1793,6 +1888,7 @@ fn db_u64(value: i64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::cell::{Cell, RefCell};
     use std::fs;
     #[cfg(unix)]
@@ -1806,6 +1902,7 @@ mod tests {
 
     struct FakeQualifiedObserver {
         began: Cell<bool>,
+        drains: Cell<u64>,
         sequence: Cell<u64>,
         corrupt_proof: bool,
     }
@@ -1880,6 +1977,60 @@ mod tests {
 
     struct RetryOnceObserver {
         attempts: Cell<u64>,
+    }
+
+    struct PrimaryTransactionObserver<'a> {
+        conn: &'a rusqlite::Connection,
+        path: std::path::PathBuf,
+    }
+
+    impl QualifiedObserver for PrimaryTransactionObserver<'_> {
+        fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: 10,
+                durable_offset: 0,
+                nonce: b"spool-start".to_vec(),
+            })
+        }
+
+        fn end_fence(
+            &self,
+            _expected: &ExpectedScope,
+            _start: &ObserverFence,
+        ) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: 266,
+                durable_offset: 0,
+                nonce: b"spool-end".to_vec(),
+            })
+        }
+
+        fn drain_through(
+            &self,
+            expected: &ExpectedScope,
+            root_handle_identity: &[u8],
+            start: &ObserverFence,
+            end: &ObserverFence,
+            sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+        ) -> Result<ObserverQualification> {
+            let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+            fs::write(&self.path, b"during callback\n")?;
+            for sequence in 11..=266 {
+                sink(ObserverEvent {
+                    path: LedgerPath::parse("modify.txt")?,
+                    flags: EvidenceFlags::CONTENT,
+                    sequence,
+                })?;
+            }
+            fs::write(&self.path, b"after callback\n")?;
+            tx.commit()?;
+            Ok(ObserverQualification::seal_for_test(
+                expected,
+                root_handle_identity.to_vec(),
+                start.clone(),
+                end.clone(),
+            ))
+        }
     }
 
     impl QualifiedObserver for RetryOnceObserver {
@@ -1972,6 +2123,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 began: Cell::new(false),
+                drains: Cell::new(0),
                 sequence: Cell::new(10),
                 corrupt_proof: false,
             }
@@ -1980,6 +2132,7 @@ mod tests {
         fn with_corrupt_proof() -> Self {
             Self {
                 began: Cell::new(false),
+                drains: Cell::new(0),
                 sequence: Cell::new(10),
                 corrupt_proof: true,
             }
@@ -2017,6 +2170,7 @@ mod tests {
             end: &ObserverFence,
             _sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
         ) -> Result<ObserverQualification> {
+            self.drains.set(self.drains.get().saturating_add(1));
             let mut qualification = ObserverQualification::seal_for_test(
                 expected,
                 root_handle_identity.to_vec(),
@@ -3177,6 +3331,97 @@ mod tests {
     }
 
     #[test]
+    fn observer_callback_only_spools_then_replays_after_primary_transaction() {
+        let fixture = Fixture::new();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let observer = PrimaryTransactionObserver {
+            conn: &fixture.db.conn,
+            path: fixture.root().join("modify.txt"),
+        };
+        let mut attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::Full,
+            "callback_spool",
+        )
+        .unwrap();
+
+        attempt
+            .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+            .unwrap();
+
+        let staged_hash: String = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT content_hash FROM changed_path_reconciliation_rows
+                 WHERE attempt_id=?1 AND normalized_path='modify.txt'",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            staged_hash,
+            hex::encode(Sha256::digest(b"after callback\n"))
+        );
+        assert_eq!(fixture.latest_attempt_state(), "ready");
+    }
+
+    #[test]
+    fn directory_guards_cannot_collide_with_legitimate_user_paths() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root().join("a")).unwrap();
+        fs::create_dir(fixture.root().join("#directory-guard")).unwrap();
+        fs::write(
+            fixture.root().join("#directory-guard/61"),
+            b"legitimate user file\n",
+        )
+        .unwrap();
+        let observer = FakeQualifiedObserver::new();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let mut attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::Full,
+            "guard_collision",
+        )
+        .unwrap();
+        attempt
+            .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+            .unwrap();
+
+        let candidate_exists: bool = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM changed_path_reconciliation_rows
+                 WHERE attempt_id=?1 AND normalized_path='#directory-guard/61'
+                   AND before_identity LIKE 'flags:%')",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let guard_exists: bool = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM changed_path_reconciliation_guards
+                 WHERE attempt_id=?1 AND relative_path=?2)",
+                params![attempt.attempt_id, b"a".as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(candidate_exists);
+        assert!(guard_exists);
+    }
+
+    #[test]
     fn retryable_identity_race_restarts_and_reports_actual_retry() {
         let fixture = Fixture::new();
         let ledger = ChangedPathLedger::new(&fixture.db.conn);
@@ -3253,6 +3498,53 @@ mod tests {
         assert_eq!(count, 100_000);
         assert_eq!(writer.peak_batch_rows, STAGING_BATCH_ROWS as u64);
         assert!(writer.pending.capacity() <= STAGING_BATCH_ROWS);
+    }
+
+    #[test]
+    fn hundred_thousand_files_reconcile_end_to_end_with_bounded_streaming() {
+        let fixture = Fixture::new();
+        for directory in 0..100_u64 {
+            let path = fixture.root().join(format!("scale/{directory:03}"));
+            fs::create_dir_all(&path).unwrap();
+            for file in 0..1_000_u64 {
+                std::fs::File::create(path.join(format!("{file:04}.empty"))).unwrap();
+            }
+        }
+        fixture
+            .db
+            .conn
+            .execute("DELETE FROM worktree_file_index", [])
+            .unwrap();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let observer = FakeQualifiedObserver::new();
+
+        let report = reconcile_full(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            "hundred_thousand_end_to_end",
+        )
+        .unwrap();
+
+        let published: i64 = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observer.drains.get(), 1);
+        assert_eq!(report.observed_files, 100_004);
+        assert_eq!(report.observed_candidates, 100_000);
+        assert_eq!(report.candidate_rows, 100_000);
+        assert_eq!(published, 100_000);
+        assert!(report.hashed_bytes > 0);
+        assert!(report.peak_batch_rows <= STAGING_BATCH_ROWS as u64);
+        assert!(report.peak_buffer_bytes <= 2 * 64 * 1024 + 6);
     }
 
     #[test]
