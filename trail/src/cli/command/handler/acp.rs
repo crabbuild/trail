@@ -56,6 +56,21 @@ pub(super) fn handle_acp_doctor(ctx: &RuntimeContext, args: AgentAcpDoctorArgs) 
     match &db_result {
         Ok(db) => {
             checks.push(acp_check("workspace", "ok", "Trail workspace opened"));
+            match db.ensure_live_path_invariant_indexes() {
+                Ok(()) => checks.push(acp_check(
+                    "path_invariant_index",
+                    "ok",
+                    "all live branch and lane roots can accept safe mutations",
+                )),
+                Err(err) => {
+                    status = "failed".to_string();
+                    checks.push(acp_check(
+                        "path_invariant_index",
+                        "failed",
+                        &err.to_string(),
+                    ));
+                }
+            }
             let capture_journal = capture_journal_check(db);
             if capture_journal.status == "failed" {
                 status = "failed".to_string();
@@ -78,6 +93,11 @@ pub(super) fn handle_acp_doctor(ctx: &RuntimeContext, args: AgentAcpDoctorArgs) 
             checks.push(acp_check("workspace", "failed", &format!("{err}")));
             checks.push(acp_check(
                 "capture_journal",
+                "skipped",
+                "workspace unavailable",
+            ));
+            checks.push(acp_check(
+                "path_invariant_index",
                 "skipped",
                 "workspace unavailable",
             ));

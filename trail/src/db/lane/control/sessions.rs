@@ -183,11 +183,8 @@ impl Trail {
         for turn in details.turns {
             let turn_details = self.show_lane_turn(&turn.turn_id)?;
             let turn_envelope = turn_details.turn_envelope;
-            let checkpoint = if turn_envelope
-                .as_ref()
-                .is_some_and(|envelope| envelope.outcome.no_changes)
-            {
-                None
+            let checkpoint = if let Some(envelope) = turn_envelope.as_ref() {
+                envelope.outcome.checkpoint.clone()
             } else {
                 turn_details.turn.after_change.clone().or_else(|| {
                     turn_details

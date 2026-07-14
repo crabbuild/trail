@@ -1959,6 +1959,40 @@ fn cli_path_index_required_human_json_rebuild_and_retry_lifecycle() {
         .is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn acp_doctor_and_relay_preflight_report_legacy_path_index() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "base\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+    make_current_branch_root_legacy(temp.path());
+
+    let doctor = run_trail_json(temp.path(), &["agent", "acp", "doctor", "claude-code"]);
+    assert_eq!(doctor["status"], "failed");
+    assert!(doctor["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "path_invariant_index"
+            && check["status"] == "failed"
+            && check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("trail index rebuild"))
+    }));
+
+    let relay = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .arg("--json")
+        .args(["acp", "relay", "--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(relay.status.code(), Some(9));
+    assert!(relay.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&relay.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "PATH_INDEX_REQUIRED");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("trail index rebuild")));
+}
+
 #[test]
 fn cli_env_defaults_select_workspace_db_branch_and_format() {
     let temp = tempfile::tempdir().unwrap();
@@ -6555,7 +6589,20 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .operations
         .iter()
         .any(|operation| operation.kind == OperationKind::LaneRecord));
+    let envelope = turn
+        .turn_envelope
+        .as_ref()
+        .expect("ACP prompt must have a typed turn envelope");
+    assert_eq!(envelope.outcome.status.as_deref(), Some("completed"));
+    assert!(!envelope.outcome.no_changes);
+    assert!(envelope.outcome.checkpoint.is_some());
+    assert_eq!(envelope.outcome.checkpoint, turn.turn.after_change);
+    assert!(turn
+        .events
+        .iter()
+        .any(|event| event.event_type == "workdir_recorded"));
     let status = db.lane_status("acp-test").unwrap();
+    assert_eq!(status.workdir_state, Some(WorktreeState::Clean));
     assert!(status
         .changed_paths
         .iter()
@@ -6581,6 +6628,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
         .unwrap()
         .iter()
         .any(|summary| summary.as_str().unwrap().contains("write README")));
+    assert_eq!(
+        transcript["turns"][0]["checkpoint"],
+        transcript["turns"][0]["turn_envelope"]["outcome"]["checkpoint"]
+    );
 
     let turn_alias = run_trail_json(
         temp.path(),

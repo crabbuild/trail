@@ -396,6 +396,8 @@ pub fn run_stdio_relay(options: AcpRelayOptions) -> Result<()> {
 }
 
 fn capture_observer(options: &AcpRelayOptions) -> Result<Arc<CaptureObserver>> {
+    Trail::open_with_db_dir(&options.workspace_root, &options.db_dir)?
+        .ensure_live_path_invariant_indexes()?;
     let coordinator = Arc::new(Mutex::new(CaptureCoordinator::new(options.clone())?));
     let pipeline = TransformPipeline::new(
         Arc::new(AcpV1Contract::load()?),
@@ -837,6 +839,14 @@ struct ActiveTurn {
     redaction_applied: bool,
     assistant_buffer_bytes: usize,
     capture_truncated: bool,
+}
+
+#[derive(Debug)]
+struct TurnTerminalOutcome<'a> {
+    status: &'a str,
+    stop_reason: Option<String>,
+    error_summary: Option<String>,
+    checkpoint_failed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1960,28 +1970,41 @@ impl CaptureCoordinator {
             self.flush_turn_events(active_turn)?;
             self.flush_assistant_messages(active_turn, "prompt_completed")?;
         }
-        if pending.materialized {
-            let _ = db.record_lane_workdir_for_turn(
+        let checkpoint_error = if pending.materialized {
+            self.record_prompt_workdir_checkpoint(
+                &mut db,
                 &pending.lane_name,
                 &pending.turn_id,
-                Some("ACP prompt workdir checkpoint".to_string()),
-            );
-        }
+                "ACP prompt workdir checkpoint".to_string(),
+            )?
+        } else {
+            None
+        };
+        let checkpoint_failed = checkpoint_error.is_some();
+        let final_status = if checkpoint_failed { "failed" } else { status };
+        let final_error_summary = match (error_summary(message), checkpoint_error.clone()) {
+            (Some(upstream), Some(checkpoint)) => Some(format!("{upstream}; {checkpoint}")),
+            (Some(upstream), None) => Some(upstream),
+            (None, Some(checkpoint)) => Some(checkpoint),
+            (None, None) => None,
+        };
         db.add_lane_turn_event(
             &pending.turn_id,
             "acp_prompt_finished",
             Some(redact_json(serde_json::json!({
                 "protocol": "acp",
                 "acp_session_id": pending.acp_session_id,
-                "status": status,
+                "status": final_status,
+                "upstream_status": status,
                 "cancel_requested": cancel_requested,
                 "stop_reason": stop_reason(message),
-                "error": message.get("error").cloned()
+                "error": message.get("error").cloned(),
+                "checkpoint_error": checkpoint_error
             }))),
             None,
             None,
         )?;
-        let terminal_kind = match status {
+        let terminal_kind = match final_status {
             "failed" => AgentLifecycleEventKind::TurnFailed,
             "cancelled" | "interrupted" => AgentLifecycleEventKind::TurnCancelled,
             _ => AgentLifecycleEventKind::TurnCompleted,
@@ -1998,29 +2021,74 @@ impl CaptureCoordinator {
             self.options.provider.as_deref(),
             &pending.acp_session_id,
             terminal_kind,
-            serde_json::json!({"status": status, "stop_reason": stop_reason(message)}),
+            serde_json::json!({
+                "status": final_status,
+                "upstream_status": status,
+                "stop_reason": stop_reason(message),
+                "checkpoint_error": checkpoint_error
+            }),
         )?;
         if let Some(span_id) = pending.root_span_id {
             let _ = db.end_lane_trace_span(
                 &span_id,
-                status,
+                final_status,
                 Some(redact_json(serde_json::json!({
                     "stop_reason": stop_reason(message)
                 }))),
             );
         }
-        db.end_lane_turn(&pending.turn_id, status)?;
+        db.end_lane_turn(&pending.turn_id, final_status)?;
         db.create_turn_evidence_manifest(&pending.turn_id)?;
         db.classify_session_activity(&session_id, 10_000)?;
         self.finalize_turn_envelope(
             &mut db,
             &pending.turn_id,
-            status,
-            stop_reason(message).map(str::to_string),
-            error_summary(message),
+            TurnTerminalOutcome {
+                status: final_status,
+                stop_reason: stop_reason(message).map(str::to_string),
+                error_summary: final_error_summary,
+                checkpoint_failed,
+            },
             active.as_ref(),
         )?;
         Ok(())
+    }
+
+    fn record_prompt_workdir_checkpoint(
+        &self,
+        db: &mut Trail,
+        lane: &str,
+        turn_id: &str,
+        message: String,
+    ) -> Result<Option<String>> {
+        match db.record_lane_workdir_for_turn(lane, turn_id, Some(message)) {
+            Ok(_) => Ok(None),
+            Err(error) => {
+                let error_code = error.code();
+                let error_message = error.to_string();
+                let summary =
+                    format!("Trail ACP workdir checkpoint failed ({error_code}): {error_message}");
+                eprintln!("trail acp relay checkpoint error: {summary}");
+                db.add_lane_turn_event(
+                    turn_id,
+                    "acp_workdir_checkpoint_failed",
+                    Some(redact_json(serde_json::json!({
+                        "protocol": "acp",
+                        "lane": lane,
+                        "error_code": error_code,
+                        "error": error_message,
+                        "recovery": if error_code == "PATH_INDEX_REQUIRED" {
+                            Some("trail index rebuild")
+                        } else {
+                            None
+                        }
+                    }))),
+                    None,
+                    None,
+                )?;
+                Ok(Some(summary))
+            }
+        }
     }
 
     fn capture_session_update(&mut self, message: &Value) -> Result<()> {
@@ -3166,21 +3234,32 @@ impl CaptureCoordinator {
             );
             self.flush_turn_events(&mut active)?;
             let mut db = self.open_db()?;
-            if active.materialized {
-                let _ = db.record_lane_workdir_for_turn(
+            let checkpoint_error = if active.materialized {
+                self.record_prompt_workdir_checkpoint(
+                    &mut db,
                     &active.lane_name,
                     &active.turn_id,
-                    Some(format!("ACP prompt workdir checkpoint ({reason})")),
-                );
-            }
+                    format!("ACP prompt workdir checkpoint ({reason})"),
+                )?
+            } else {
+                None
+            };
+            let checkpoint_failed = checkpoint_error.is_some();
+            let final_status = if checkpoint_failed { "failed" } else { status };
+            let final_error_summary = checkpoint_error
+                .as_ref()
+                .map(|checkpoint| format!("{}; {checkpoint}", summarize_text(reason)))
+                .or_else(|| Some(summarize_text(reason)));
             db.add_lane_turn_event(
                 &active.turn_id,
                 "acp_prompt_finished",
                 Some(redact_json(serde_json::json!({
                     "protocol": "acp",
                     "acp_session_id": acp_session_id,
-                    "status": status,
-                    "reason": reason
+                    "status": final_status,
+                    "upstream_status": status,
+                    "reason": reason,
+                    "checkpoint_error": checkpoint_error
                 }))),
                 None,
                 None,
@@ -3188,21 +3267,24 @@ impl CaptureCoordinator {
             if let Some(span_id) = &active.root_span_id {
                 let _ = db.end_lane_trace_span(
                     span_id,
-                    status,
+                    final_status,
                     Some(redact_json(serde_json::json!({ "reason": reason }))),
                 );
             }
-            let _ = db.end_lane_turn(&active.turn_id, status);
-            let _ = db.create_turn_evidence_manifest(&active.turn_id);
-            let _ = self.finalize_turn_envelope(
+            db.end_lane_turn(&active.turn_id, final_status)?;
+            db.create_turn_evidence_manifest(&active.turn_id)?;
+            self.finalize_turn_envelope(
                 &mut db,
                 &active.turn_id,
-                status,
-                None,
-                Some(summarize_text(reason)),
+                TurnTerminalOutcome {
+                    status: final_status,
+                    stop_reason: None,
+                    error_summary: final_error_summary,
+                    checkpoint_failed,
+                },
                 Some(&active),
-            );
-            let _ = db.update_lane_acp_session_status(&acp_session_id, status);
+            )?;
+            db.update_lane_acp_session_status(&acp_session_id, final_status)?;
             self.pending_operations.retain(|_, operation| {
                 !matches!(
                     operation,
@@ -3293,9 +3375,7 @@ impl CaptureCoordinator {
         &self,
         db: &mut Trail,
         turn_id: &str,
-        status: &str,
-        stop_reason: Option<String>,
-        error_summary: Option<String>,
+        terminal: TurnTerminalOutcome<'_>,
         active: Option<&ActiveTurn>,
     ) -> Result<()> {
         let turn = db.lane_turn(turn_id)?;
@@ -3332,12 +3412,16 @@ impl CaptureCoordinator {
             envelope.capture.redaction_applied = true;
         }
         envelope.finalize_outcome(
-            status.to_string(),
-            stop_reason,
+            terminal.status.to_string(),
+            terminal.stop_reason,
             &turn.before_change,
             turn.after_change.as_ref(),
-            error_summary,
+            terminal.error_summary,
         );
+        if terminal.checkpoint_failed {
+            envelope.outcome.checkpoint = None;
+            envelope.outcome.no_changes = false;
+        }
         db.update_lane_turn_metadata(turn_id, &envelope.to_metadata_value())
     }
 }
@@ -4243,8 +4327,62 @@ fn redact_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InitImportMode;
+    use crate::{InitImportMode, ObjectId};
     use std::fs;
+
+    fn make_ref_root_legacy(db: &Trail, ref_name: &str) -> ObjectId {
+        let head = db.get_ref(ref_name).unwrap();
+        let mut root: WorktreeRoot = db.get_object(WORKTREE_ROOT_KIND, &head.root_id).unwrap();
+        assert!(root.file_count > 0);
+        assert!(root.case_fold_map_root.take().is_some());
+        let legacy_root = db
+            .put_object(WORKTREE_ROOT_KIND, root.version, &root)
+            .unwrap();
+        db.set_ref(
+            &head.name,
+            &head.change_id,
+            &legacy_root,
+            &head.operation_id,
+        )
+        .unwrap();
+        legacy_root
+    }
+
+    #[test]
+    fn acp_relay_preflight_rejects_legacy_live_root() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        make_ref_root_legacy(&db, "refs/branches/main");
+        drop(db);
+
+        let options = AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: Some("legacy-preflight".to_string()),
+            from_ref: None,
+            provider: Some("test".to_string()),
+            model: None,
+            materialize: true,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["agent".to_string()],
+            upstream_env: BTreeMap::new(),
+        };
+
+        match capture_observer(&options) {
+            Err(Error::PathIndexRequired(message)) => {
+                assert!(message.contains("refs/branches/main"));
+                assert!(message.contains("trail index rebuild"));
+            }
+            Err(other) => panic!("expected PATH_INDEX_REQUIRED, got {other}"),
+            Ok(observer) => {
+                drop(observer);
+                panic!("legacy live root unexpectedly passed ACP relay preflight");
+            }
+        }
+    }
 
     #[test]
     fn raw_json_frame_preserves_a_single_message() {
@@ -4707,5 +4845,114 @@ mod tests {
         assert!(envelope.outcome.no_changes);
         assert!(envelope.outcome.checkpoint.is_none());
         assert!(turn.checkpoint.is_none());
+    }
+
+    #[test]
+    fn acp_checkpoint_failure_is_durable_and_not_no_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let cwd = temp.path().to_string_lossy().to_string();
+        let lane = "agent-checkpoint-error";
+        let mut coordinator = CaptureCoordinator::new(AcpRelayOptions {
+            workspace_root: temp.path().to_path_buf(),
+            db_dir: temp.path().join(".trail"),
+            lane: Some(lane.to_string()),
+            from_ref: None,
+            provider: Some("codex".to_string()),
+            model: Some("gpt-test".to_string()),
+            materialize: true,
+            workdir: None,
+            inject_mcp: false,
+            upstream_command: vec!["codex".to_string()],
+            upstream_env: BTreeMap::new(),
+        })
+        .unwrap();
+
+        let mut session_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "sessionId": "client-session",
+                "cwd": cwd
+            }
+        });
+        coordinator
+            .before_client_message(&mut session_request)
+            .unwrap();
+        let mut session_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "sessionId": "upstream-session"
+            }
+        });
+        coordinator
+            .before_agent_message(&mut session_response)
+            .unwrap();
+
+        let mut prompt_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "upstream-session",
+                "prompt": [
+                    { "type": "text", "text": "Create RECOVERABLE.md" }
+                ]
+            }
+        });
+        coordinator
+            .before_client_message(&mut prompt_request)
+            .unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let workdir = PathBuf::from(db.lane_details(lane).unwrap().branch.workdir.unwrap());
+        fs::write(workdir.join("RECOVERABLE.md"), "preserve me\n").unwrap();
+        let branch = db.lane_branch(lane).unwrap();
+        make_ref_root_legacy(&db, &branch.ref_name);
+        drop(db);
+
+        let mut prompt_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "stopReason": "end_turn"
+            }
+        });
+        coordinator
+            .before_agent_message(&mut prompt_response)
+            .unwrap();
+
+        let db = Trail::open(temp.path()).unwrap();
+        let transcript = db.transcript(lane).unwrap();
+        assert_eq!(transcript.turns.len(), 1);
+        let turn = &transcript.turns[0];
+        let envelope = turn.turn_envelope.as_ref().unwrap();
+        assert_eq!(envelope.outcome.status.as_deref(), Some("failed"));
+        assert!(!envelope.outcome.no_changes);
+        assert!(envelope.outcome.checkpoint.is_none());
+        assert!(envelope
+            .outcome
+            .error_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("PATH_INDEX_REQUIRED")));
+        assert!(turn.checkpoint.is_none());
+        let failure_event = turn
+            .events
+            .iter()
+            .find(|event| event.event_type == "acp_workdir_checkpoint_failed")
+            .expect("checkpoint failure must be durable");
+        assert_eq!(
+            failure_event.payload.as_ref().unwrap()["error_code"],
+            "PATH_INDEX_REQUIRED"
+        );
+        let status = db.lane_status(lane).unwrap();
+        assert_eq!(status.workdir_state, Some(WorktreeState::DirtyUntracked));
+        assert!(status
+            .workdir_changed_paths
+            .iter()
+            .any(|path| path.path == "RECOVERABLE.md"));
     }
 }
