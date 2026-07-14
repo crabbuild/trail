@@ -50,6 +50,26 @@ pub mod test_support {
     pub fn changed_path_backup_restore_rotation() -> std::result::Result<(), String> {
         crate::db::run_backup_restore_rotation()
     }
+
+    pub fn changed_path_qualified_proof_revalidation() -> std::result::Result<(), String> {
+        crate::db::run_qualified_proof_revalidation()
+    }
+
+    pub fn changed_path_ambiguous_recovery_gate() -> std::result::Result<(), String> {
+        crate::db::run_ambiguous_recovery_gate()
+    }
+
+    pub fn changed_path_backup_overwrite_rollback() -> std::result::Result<(), String> {
+        crate::db::run_backup_overwrite_rollback()
+    }
+
+    pub fn changed_path_retirement_barrier() -> std::result::Result<(), String> {
+        crate::db::run_retirement_barrier()
+    }
+
+    pub fn changed_path_lane_deletion_retirement() -> std::result::Result<(), String> {
+        crate::db::run_lane_deletion_retirement()
+    }
 }
 
 /// Re-export the prolly crate as a Trail module namespace.

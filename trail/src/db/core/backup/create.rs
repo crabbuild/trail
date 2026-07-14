@@ -1,5 +1,8 @@
 use super::*;
 use crate::db::change_ledger::{mark_backup_scopes_untrusted, ChangedPathLedger};
+use crate::db::core::backup::publication::{
+    publish_staged_tree, remove_any, remove_retained_tree, sibling_stage,
+};
 
 impl Trail {
     pub fn create_backup(
@@ -15,22 +18,33 @@ impl Trail {
             ));
         }
         ChangedPathLedger::new(&self.conn).recover()?;
-        if output.exists() {
-            if !overwrite {
-                return Err(Error::WorkspaceExists(output));
-            }
-            if output.is_dir() {
-                fs::remove_dir_all(&output)?;
-            } else {
-                fs::remove_file(&output)?;
-            }
+        if output.exists() && !overwrite {
+            return Err(Error::WorkspaceExists(output));
         }
-
-        let result = self.create_backup_inner(&output);
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&output);
-        }
-        result
+        let parent = output
+            .parent()
+            .ok_or_else(|| Error::InvalidInput("backup output has no parent".into()))?;
+        fs::create_dir_all(parent)?;
+        let stage = sibling_stage(&output, "backup-stage")?;
+        let mut report = match self.create_backup_inner(&stage) {
+            Ok(report) => report,
+            Err(error) => {
+                let _ = remove_any(&stage);
+                return Err(error);
+            }
+        };
+        let retained = match publish_staged_tree(&stage, &output) {
+            Ok(retained) => retained,
+            Err(error) => {
+                let _ = remove_any(&stage);
+                return Err(error);
+            }
+        };
+        remove_retained_tree(retained, parent)?;
+        report.path = output.to_string_lossy().to_string();
+        report.manifest_path = backup_manifest_path(&output).to_string_lossy().to_string();
+        report.sqlite_path = backup_sqlite_path(&output).to_string_lossy().to_string();
+        Ok(report)
     }
 
     pub(crate) fn create_backup_inner(&self, output: &Path) -> Result<BackupCreateReport> {

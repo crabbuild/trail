@@ -1,6 +1,29 @@
 use super::*;
 use unicode_normalization::UnicodeNormalization;
 
+pub(crate) fn canonicalize_lossless(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        #[cfg(unix)]
+        Err(error) if path.to_str().is_none() && error.raw_os_error() == Some(libc::EILSEQ) => {
+            // macOS realpath(3) rejects existing names containing arbitrary
+            // filesystem bytes. Canonicalize the parent so symlinks above the
+            // opaque component are still resolved, then preserve that component
+            // byte-for-byte. Recursing also handles an opaque ancestor.
+            let name = path.file_name().ok_or_else(|| Error::Io(error))?;
+            let parent = path.parent().ok_or_else(|| Error::InvalidPath {
+                path: path.to_string_lossy().into_owned(),
+                reason: "path has no parent to canonicalize".into(),
+            })?;
+            let canonical_parent = canonicalize_lossless(parent)?;
+            let resolved = canonical_parent.join(name);
+            fs::metadata(&resolved)?;
+            Ok(resolved)
+        }
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 pub(crate) fn normalize_relative_path(path: &str) -> Result<String> {
     if path.as_bytes().contains(&0) {
         return Err(Error::InvalidPath {

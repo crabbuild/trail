@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::change_ledger::retire_deletion_scopes;
 
 impl Trail {
     pub fn lane_timeline(&self, lane: &str, limit: usize) -> Result<Vec<TimelineEntry>> {
@@ -50,6 +51,12 @@ impl Trail {
                 "lane `{lane}` has unmerged changes; pass --force to remove"
             )));
         }
+        let mut owners = vec![branch.lane_id.as_str(), lane];
+        if let Some(view) = &preserved_view {
+            owners.push(view.view_id.as_str());
+        }
+        let roots = branch.workdir.as_deref().into_iter().collect::<Vec<_>>();
+        retire_deletion_scopes(&self.conn, &owners, &roots)?;
         remove_ref_file(&self.db_dir, &branch.ref_name)?;
         self.conn
             .execute("DELETE FROM refs WHERE name = ?1", params![branch.ref_name])?;

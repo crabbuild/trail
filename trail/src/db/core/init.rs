@@ -50,7 +50,7 @@ impl Trail {
         text_policy: Option<&str>,
         prolly_backend: Option<&str>,
     ) -> Result<InitReport> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
         let db_dir = workspace_root.join(".trail");
         if db_dir.exists() {
             if !force {
@@ -208,7 +208,7 @@ impl Trail {
     }
 
     pub fn discover(start: impl AsRef<Path>) -> Result<Self> {
-        let mut current = start.as_ref().canonicalize()?;
+        let mut current = canonicalize_lossless(start.as_ref())?;
         loop {
             let db_dir = current.join(".trail");
             if db_dir.is_dir() {
@@ -222,7 +222,7 @@ impl Trail {
     }
 
     pub fn open(workspace_root: impl AsRef<Path>) -> Result<Self> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
         let db_dir = workspace_root.join(".trail");
         if !db_dir.is_dir() {
             return Err(Error::WorkspaceNotFound(workspace_root));
@@ -235,8 +235,8 @@ impl Trail {
         workspace_root: impl AsRef<Path>,
         db_dir: impl AsRef<Path>,
     ) -> Result<Self> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
-        let db_dir = db_dir.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        let db_dir = canonicalize_lossless(db_dir.as_ref())?;
         if !db_dir.is_dir() {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
@@ -259,8 +259,8 @@ impl Trail {
         workspace_root: impl AsRef<Path>,
         db_dir: impl AsRef<Path>,
     ) -> Result<Self> {
-        let workspace_root = workspace_root.as_ref().canonicalize()?;
-        let db_dir = db_dir.as_ref().canonicalize()?;
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        let db_dir = canonicalize_lossless(db_dir.as_ref())?;
         if !db_dir.is_dir() {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
