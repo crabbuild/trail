@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod log;
+mod policy;
 mod store;
 mod types;
 
@@ -10,6 +11,13 @@ mod types;
 pub(crate) use log::{
     recover_segments, DurableCut, ObserverRecord, PersistedLogLimits, RecoveredTail, RecoveryError,
     RecoveryScope, SegmentWriter,
+};
+#[allow(unused_imports)]
+pub(crate) use policy::{
+    compile_policy, raw_event_invalidates_policy, raw_path_may_invalidate_policy,
+    validate_policy_manifest, AdapterEquivalence, CompiledPolicy, PolicyCompileContext,
+    PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics, PolicyManifest,
+    PolicyManifestValidation, RecordingPolicySnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;

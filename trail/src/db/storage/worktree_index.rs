@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::change_ledger::raw_path_may_invalidate_policy;
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -1349,7 +1350,7 @@ fn handle_daemon_watch_event(
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
-    if daemon_event_touches_ignore_file(root, &event.paths) {
+    if daemon_event_touches_policy_dependency(root, &event.paths) {
         mark_daemon_cache_overflow(state, persist);
         return;
     }
@@ -1401,9 +1402,10 @@ fn daemon_event_paths_all_default_ignored(root: &Path, paths: &[PathBuf]) -> boo
         })
 }
 
-fn daemon_event_touches_ignore_file(root: &Path, paths: &[PathBuf]) -> bool {
+fn daemon_event_touches_policy_dependency(root: &Path, paths: &[PathBuf]) -> bool {
     paths.iter().any(|path| {
-        daemon_event_relative_path(root, path).is_some_and(|path| is_ignore_policy_path(&path))
+        daemon_event_relative_path(root, path)
+            .is_some_and(|path| raw_path_may_invalidate_policy(&path_from_rel(&path)))
     })
 }
 
@@ -2035,6 +2037,10 @@ mod tests {
             ".gitignore",
             "nested/.trailignore",
             "nested/.gitignore",
+            ".trail/config.toml",
+            ".git/info/exclude",
+            ".git/config",
+            ".git/config.worktree",
         ] {
             let state = Arc::new(Mutex::new(DaemonWorktreeCacheState {
                 initialized: true,
