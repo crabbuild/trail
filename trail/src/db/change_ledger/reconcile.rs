@@ -22,6 +22,9 @@ const MAX_OBSERVER_SPOOL_EVENTS: u64 = 1_000_000;
 const MAX_OBSERVER_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OBSERVER_SPOOL_PATH_BYTES: usize = 1024 * 1024;
 const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
+// Do not linearize against a lease that can expire in the same instant as the
+// final CAS and SQLite commit.
+const MIN_PUBLICATION_LEASE_HORIZON_SECS: i64 = 5;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -306,6 +309,8 @@ pub(crate) struct ReconciliationAttempt {
     encoded_identity: Vec<u8>,
     root: PinnedWorktreeRoot,
     report: ChangeLedgerReconcileReport,
+    #[cfg(test)]
+    final_publication_hook: Option<Box<dyn FnOnce(&rusqlite::Connection)>>,
 }
 
 pub(crate) fn persisted_proven_prefixes(
@@ -569,6 +574,8 @@ pub(crate) fn begin_reconciliation(
             trust_state: TrustState::Reconciling.as_str().to_string(),
             ..ChangeLedgerReconcileReport::default()
         },
+        #[cfg(test)]
+        final_publication_hook: None,
     })
 }
 
@@ -626,6 +633,21 @@ fn is_retryable_identity_race(error: &Error) -> bool {
 }
 
 impl ReconciliationAttempt {
+    #[cfg(test)]
+    fn set_final_publication_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce(&rusqlite::Connection) + 'static,
+    {
+        self.final_publication_hook = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_final_publication_hook(&mut self, conn: &rusqlite::Connection) {
+        if let Some(hook) = self.final_publication_hook.take() {
+            hook(conn);
+        }
+    }
+
     pub(crate) fn observe(
         &mut self,
         trail: &Trail,
@@ -778,7 +800,7 @@ impl ReconciliationAttempt {
                 "reconciliation attempt has not completed observation".into(),
             ));
         };
-        let Some(qualification) = self.qualification.as_ref() else {
+        let Some(qualification) = self.qualification.clone() else {
             return Err(reconcile_required(
                 &self.expected,
                 TrustState::Reconciling.as_str(),
@@ -825,7 +847,7 @@ impl ReconciliationAttempt {
             &tx,
             &self.expected,
             &self.stored_identity,
-            qualification,
+            &qualification,
             &end,
         )
         .is_err()
@@ -914,6 +936,23 @@ impl ReconciliationAttempt {
         if candidate_cap_exceeded(&tx, &scope_id)? {
             return self.fail_candidate_cap_transaction(tx);
         }
+        #[cfg(test)]
+        self.run_final_publication_hook(&tx);
+        if validate_observer_continuity_at(
+            &tx,
+            &self.expected,
+            &self.stored_identity,
+            &qualification,
+            &end,
+            publication_lease_deadline()?,
+        )
+        .is_err()
+        {
+            return self.fail_observer_continuity_candidate_transaction(
+                tx,
+                "observer lease or durable segment became unavailable at publication boundary",
+            );
+        }
         tx.execute_batch("RELEASE changed_path_reconciliation_candidates;")?;
         let merged_durable = current_durable.max(end.durable_offset);
         let merged_folded = current_folded.max(end.durable_offset);
@@ -995,13 +1034,13 @@ impl ReconciliationAttempt {
         }
         let qualification = self
             .qualification
-            .as_ref()
+            .clone()
             .expect("publication checked observer qualification");
         if validate_observer_continuity(
             &tx,
             &self.expected,
             &self.stored_identity,
-            qualification,
+            &qualification,
             end,
         )
         .is_err()
@@ -1128,6 +1167,23 @@ impl ReconciliationAttempt {
         if candidate_cap_exceeded(&tx, &scope_id)? {
             return self.fail_candidate_cap_transaction(tx);
         }
+        #[cfg(test)]
+        self.run_final_publication_hook(&tx);
+        if validate_observer_continuity_at(
+            &tx,
+            &self.expected,
+            &self.stored_identity,
+            &qualification,
+            end,
+            publication_lease_deadline()?,
+        )
+        .is_err()
+        {
+            return self.fail_observer_continuity_candidate_transaction(
+                tx,
+                "observer lease or durable segment became unavailable at prefix publication boundary",
+            );
+        }
         tx.execute_batch("RELEASE changed_path_reconciliation_candidates;")?;
         let terminalized = tx.execute(
             "UPDATE changed_path_reconciliations SET state='published', updated_at=?1
@@ -1187,6 +1243,26 @@ impl ReconciliationAttempt {
     }
 
     fn fail_observer_continuity_transaction(
+        &self,
+        tx: Transaction<'_>,
+        reason: &str,
+    ) -> Result<ChangeLedgerReconcileReport> {
+        self.commit_observer_continuity_failure(tx, reason)
+    }
+
+    fn fail_observer_continuity_candidate_transaction(
+        &self,
+        tx: Transaction<'_>,
+        reason: &str,
+    ) -> Result<ChangeLedgerReconcileReport> {
+        tx.execute_batch(
+            "ROLLBACK TO changed_path_reconciliation_candidates;
+             RELEASE changed_path_reconciliation_candidates;",
+        )?;
+        self.commit_observer_continuity_failure(tx, reason)
+    }
+
+    fn commit_observer_continuity_failure(
         &self,
         tx: Transaction<'_>,
         reason: &str,
@@ -1660,6 +1736,24 @@ fn validate_observer_continuity(
     qualification: &ObserverQualification,
     end: &ObserverFence,
 ) -> Result<()> {
+    validate_observer_continuity_at(
+        tx,
+        expected,
+        identity,
+        qualification,
+        end,
+        now_ts().saturating_add(1),
+    )
+}
+
+fn validate_observer_continuity_at(
+    tx: &Transaction<'_>,
+    expected: &ExpectedScope,
+    identity: &StoredAttemptIdentity,
+    qualification: &ObserverQualification,
+    end: &ObserverFence,
+    minimum_lease_expiry: i64,
+) -> Result<()> {
     if identity.observer_owner_token.as_deref() != Some(qualification.observer_owner_token.as_str())
     {
         return Err(reconcile_required(
@@ -1672,7 +1766,7 @@ fn validate_observer_continuity(
         "SELECT COUNT(*) FROM changed_path_observer_owners
          WHERE scope_id=?1 AND epoch=?2 AND owner_token=?3
            AND provider_id IS ?4 AND provider_identity IS ?5
-           AND fence_nonce IS ?6 AND lease_state='active' AND expires_at>?7",
+           AND fence_nonce IS ?6 AND lease_state='active' AND expires_at>=?7",
         params![
             identity.scope_id,
             sql_u64(identity.epoch)?,
@@ -1680,7 +1774,7 @@ fn validate_observer_continuity(
             identity.provider_id,
             identity.provider_identity,
             qualification.owner_fence_nonce,
-            now_ts(),
+            minimum_lease_expiry,
         ],
         |row| row.get::<_, i64>(0),
     )? == 1;
@@ -1711,6 +1805,12 @@ fn validate_observer_continuity(
         ));
     }
     Ok(())
+}
+
+fn publication_lease_deadline() -> Result<i64> {
+    now_ts()
+        .checked_add(MIN_PUBLICATION_LEASE_HORIZON_SECS)
+        .ok_or_else(|| Error::Corrupt("observer publication lease deadline overflowed".into()))
 }
 
 fn validate_ready_attempt(
@@ -2883,6 +2983,20 @@ mod tests {
                 .unwrap()
         }
 
+        fn ledger_prefixes(&self) -> Vec<String> {
+            self.db
+                .conn
+                .prepare(
+                    "SELECT normalized_prefix FROM changed_path_prefixes
+                     WHERE scope_id=?1 ORDER BY normalized_prefix COLLATE BINARY",
+                )
+                .unwrap()
+                .query_map([self.expected.scope_id.to_text()], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
         fn latest_attempt_state(&self) -> String {
             self.db
                 .conn
@@ -3180,6 +3294,163 @@ mod tests {
             );
             assert_eq!(fixture.latest_attempt_state(), "failed");
         }
+    }
+
+    #[test]
+    fn full_publication_expiry_at_final_boundary_rolls_back_candidates() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root().join("late.txt"), b"late\n").unwrap();
+        fixture
+            .db
+            .conn
+            .execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,
+                     source_mask,first_sequence,last_sequence,created_at,updated_at
+                 ) VALUES(?1,'old-prefix','reconciliation',0,?2,1,1,?3,?3)",
+                params![
+                    fixture.expected.scope_id.to_text(),
+                    super::super::EvidenceSource::Reconciliation.mask(),
+                    now_ts(),
+                ],
+            )
+            .unwrap();
+        let before_rows = fixture.ledger_rows();
+        let before_prefixes = fixture.ledger_prefixes();
+        let mut attempt = fixture.begin_observed();
+        let before_generation: i64 = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT continuity_generation FROM changed_path_scopes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        attempt.set_final_publication_hook(|conn| {
+            conn.execute(
+                "UPDATE changed_path_observer_owners SET expires_at=?1",
+                [now_ts()],
+            )
+            .unwrap();
+        });
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+
+        assert!(attempt
+            .publish(&fixture.db, &ledger, &fixture.policy)
+            .is_err());
+
+        assert_eq!(fixture.ledger_rows(), before_rows);
+        assert_eq!(fixture.ledger_prefixes(), before_prefixes);
+        let (state, generation): (String, i64) = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT trust_state,continuity_generation FROM changed_path_scopes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "untrusted_gap");
+        assert_eq!(generation, before_generation + 1);
+        assert_eq!(fixture.latest_attempt_state(), "failed");
+    }
+
+    #[test]
+    fn prefix_publication_insufficient_final_horizon_rolls_back_candidates() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.root().join("src")).unwrap();
+        fs::write(fixture.root().join("src/current.txt"), b"current\n").unwrap();
+        fixture.persist_live_provider_prefix("src");
+        fixture
+            .db
+            .conn
+            .execute(
+                "INSERT INTO changed_path_entries(
+                     scope_id,normalized_path,event_flags,source_mask,
+                     first_sequence,last_sequence,created_at,updated_at
+                 ) VALUES(?1,'src/stale.txt',?2,?3,1,1,?4,?4)",
+                params![
+                    fixture.expected.scope_id.to_text(),
+                    EvidenceFlags::CONTENT.0,
+                    super::super::EvidenceSource::Reconciliation.mask(),
+                    now_ts(),
+                ],
+            )
+            .unwrap();
+        fixture
+            .db
+            .conn
+            .execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,
+                     source_mask,first_sequence,last_sequence,created_at,updated_at
+                 ) VALUES(?1,'src/stale','reconciliation',0,?2,1,1,?3,?3)",
+                params![
+                    fixture.expected.scope_id.to_text(),
+                    super::super::EvidenceSource::Reconciliation.mask(),
+                    now_ts(),
+                ],
+            )
+            .unwrap();
+        let before_rows = fixture.ledger_rows();
+        let before_prefixes = fixture.ledger_prefixes();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let proof = persisted_proven_prefixes(
+            &ledger,
+            &fixture.expected,
+            &[LedgerPath::parse("src").unwrap()],
+        )
+        .unwrap();
+        let observer = FakeQualifiedObserver::new();
+        let mut attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::ProvenPrefixes(proof),
+            "final_lease_horizon",
+        )
+        .unwrap();
+        attempt
+            .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+            .unwrap();
+        let before_generation: i64 = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT continuity_generation FROM changed_path_scopes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        attempt.set_final_publication_hook(|conn| {
+            conn.execute(
+                "UPDATE changed_path_observer_owners SET expires_at=?1",
+                [now_ts() + 1],
+            )
+            .unwrap();
+        });
+
+        assert!(attempt
+            .publish(&fixture.db, &ledger, &fixture.policy)
+            .is_err());
+
+        assert_eq!(fixture.ledger_rows(), before_rows);
+        assert_eq!(fixture.ledger_prefixes(), before_prefixes);
+        let (state, generation): (String, i64) = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT trust_state,continuity_generation FROM changed_path_scopes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "untrusted_gap");
+        assert_eq!(generation, before_generation + 1);
+        assert_eq!(fixture.latest_attempt_state(), "failed");
     }
 
     #[test]
