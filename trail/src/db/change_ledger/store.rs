@@ -5,7 +5,7 @@ use crate::db::util::now_ts;
 use crate::error::{Error, Result};
 
 pub(crate) struct ChangedPathLedger<'a> {
-    conn: &'a Connection,
+    pub(super) conn: &'a Connection,
 }
 
 #[derive(Debug)]

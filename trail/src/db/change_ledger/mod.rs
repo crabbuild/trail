@@ -4,6 +4,7 @@
 
 mod log;
 mod policy;
+mod reconcile;
 mod store;
 mod types;
 
@@ -18,6 +19,12 @@ pub(crate) use policy::{
     validate_policy_manifest, AdapterEquivalence, CompiledPolicy, PolicyCompileContext,
     PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics, PolicyInvalidationIndex,
     PolicyManifest, PolicyManifestValidation, QualifiedPolicyObserverCut, RecordingPolicySnapshot,
+};
+#[allow(unused_imports)]
+pub(crate) use reconcile::{
+    begin_reconciliation, persisted_proven_prefixes, reconcile_full, ObserverEvent, ObserverFence,
+    ObserverQualification, ProvenPrefixSet, QualifiedObserver, ReconcileMode,
+    ReconciliationAttempt,
 };
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;

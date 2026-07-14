@@ -61,6 +61,28 @@ pub struct WorktreeIndexReport {
     pub duration_ms: u64,
 }
 
+/// Dormant diagnostics for the schema-v18 changed-path reconciler. Public
+/// commands do not emit this report until the ledger activation gate lands.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ChangeLedgerReconcileReport {
+    pub(crate) mode: String,
+    pub(crate) reason: String,
+    pub(crate) observed_files: u64,
+    pub(crate) staged_rows: u64,
+    pub(crate) observed_candidates: u64,
+    pub(crate) candidate_rows: u64,
+    pub(crate) hashed_bytes: u64,
+    pub(crate) peak_batch_rows: u64,
+    pub(crate) peak_buffer_bytes: u64,
+    pub(crate) start_sequence: u64,
+    pub(crate) end_sequence: u64,
+    pub(crate) start_durable_offset: u64,
+    pub(crate) end_durable_offset: u64,
+    pub(crate) published: bool,
+    pub(crate) trust_state: String,
+    pub(crate) retries: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExternalMutationAuditRecord {
     pub audit_id: String,

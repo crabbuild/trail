@@ -1,13 +1,17 @@
 use super::*;
-use crate::db::change_ledger::raw_path_may_invalidate_policy;
 #[cfg(test)]
 use crate::db::change_ledger::PolicyInvalidationIndex;
+use crate::db::change_ledger::{
+    raw_path_may_invalidate_policy, CompiledPolicy, PolicyDependencyKind,
+};
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use rayon::prelude::*;
 use rusqlite::{Params, Statement, StatementStatus};
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
 
 const DAEMON_STATUS_DIRTY_PATH_LIMIT: usize = 16_384;
 const WORKTREE_INDEX_STAMP_LOOKUP_CHUNK: usize = 512;
@@ -25,6 +29,25 @@ const UPSERT_WORKTREE_INDEX_PATH_SQL: &str =
     "INSERT OR REPLACE INTO worktree_file_index \
      (path, size_bytes, modified_ns, changed_ns, device_id, inode, executable, kind, content_hash, last_seen_scan, updated_at) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+
+const RECONCILE_READ_BUFFER_BYTES: usize = 64 * 1024;
+
+pub(crate) struct PinnedWorktreeRoot {
+    path: PathBuf,
+    descriptor: fs::File,
+    identity: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReconciliationFile {
+    pub(crate) path: String,
+    pub(crate) file_kind: String,
+    pub(crate) content_hash: String,
+    pub(crate) executable: bool,
+    pub(crate) size_bytes: u64,
+    pub(crate) identity: Vec<u8>,
+    pub(crate) peak_buffer_bytes: u64,
+}
 
 #[derive(Debug)]
 struct WorktreeIndexReadCandidate {
@@ -60,6 +83,94 @@ struct PersistedDaemonWorktreeSnapshot {
 }
 
 impl Trail {
+    pub(crate) fn open_pinned_worktree_root(
+        &self,
+        policy: &CompiledPolicy,
+    ) -> Result<PinnedWorktreeRoot> {
+        if policy.snapshot.workspace_root != self.workspace_root {
+            return Err(Error::InvalidInput(
+                "compiled recording policy belongs to a different workspace root".into(),
+            ));
+        }
+        let descriptor = open_absolute_directory_no_follow(&self.workspace_root)?;
+        let identity = root_descriptor_identity(&descriptor)?;
+        Ok(PinnedWorktreeRoot {
+            path: self.workspace_root.clone(),
+            descriptor,
+            identity,
+        })
+    }
+
+    pub(crate) fn pinned_worktree_root_identity(&self, root: &PinnedWorktreeRoot) -> Vec<u8> {
+        root.identity.clone()
+    }
+
+    pub(crate) fn verify_pinned_worktree_root(&self, root: &PinnedWorktreeRoot) -> Result<bool> {
+        let current = open_absolute_directory_no_follow(&root.path)?;
+        Ok(root_descriptor_identity(&current)? == root.identity
+            && root_descriptor_identity(&root.descriptor)? == root.identity)
+    }
+
+    pub(crate) fn visit_pinned_worktree_files<F>(
+        &self,
+        root: &PinnedWorktreeRoot,
+        policy: &CompiledPolicy,
+        prefixes: &[String],
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ReconciliationFile) -> Result<()>,
+    {
+        let matcher = pinned_policy_matcher(policy)?;
+        let mut walker = WalkDir::new(&root.path).follow_links(false).into_iter();
+        while let Some(item) = walker.next() {
+            let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
+            if entry.path() == root.path {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&root.path)
+                .map_err(|err| Error::InvalidInput(err.to_string()))?;
+            let relative = relative.to_str().ok_or_else(|| {
+                Error::InvalidInput("reconciliation does not support non-UTF-8 paths".into())
+            })?;
+            let relative = normalize_relative_path(relative)?;
+            let is_dir = entry.file_type().is_dir();
+            if !path_intersects_reconcile_scope(&relative, is_dir, prefixes)
+                || reconcile_path_ignored(&matcher, &relative, is_dir)
+            {
+                if is_dir {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Some(file) =
+                read_reconciliation_file_no_follow(&root.descriptor, &relative, &self.config.text)?
+            {
+                visitor(file)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_pinned_worktree_path(
+        &self,
+        root: &PinnedWorktreeRoot,
+        policy: &CompiledPolicy,
+        path: &str,
+    ) -> Result<Option<ReconciliationFile>> {
+        let path = normalize_relative_path(path)?;
+        let matcher = pinned_policy_matcher(policy)?;
+        if reconcile_path_ignored(&matcher, &path, false) {
+            return Ok(None);
+        }
+        read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text)
+    }
+
     /// Returns true only when a clean baseline identifies the same immutable
     /// visible file state as `target_root_id`. Path-invariant indexes and
     /// creator metadata are deliberately excluded because they do not change
@@ -995,6 +1106,300 @@ impl Trail {
         )?;
         Ok(())
     }
+}
+
+fn pinned_policy_matcher(policy: &CompiledPolicy) -> Result<ignore::gitignore::Gitignore> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(&policy.snapshot.workspace_root);
+    for source in &policy.snapshot.rule_sources {
+        if !matches!(
+            source.kind,
+            PolicyDependencyKind::Ignore
+                | PolicyDependencyKind::Trailignore
+                | PolicyDependencyKind::Gitignore
+                | PolicyDependencyKind::GitInfoExclude
+                | PolicyDependencyKind::GitExcludesFile
+        ) {
+            continue;
+        }
+        let rules = std::str::from_utf8(&source.bytes).map_err(|_| {
+            Error::InvalidInput(format!(
+                "recording policy rule source `{}` is not UTF-8",
+                source.path.display()
+            ))
+        })?;
+        for line in rules.lines() {
+            builder
+                .add_line(Some(source.path.clone()), line)
+                .map_err(|err| Error::InvalidInput(err.to_string()))?;
+        }
+    }
+    builder
+        .build()
+        .map_err(|err| Error::InvalidInput(err.to_string()))
+}
+
+fn reconcile_path_ignored(
+    matcher: &ignore::gitignore::Gitignore,
+    relative: &str,
+    is_dir: bool,
+) -> bool {
+    is_default_ignored(relative)
+        || matcher
+            .matched_path_or_any_parents(path_from_rel(relative), is_dir)
+            .is_ignore()
+}
+
+fn path_intersects_reconcile_scope(relative: &str, is_dir: bool, prefixes: &[String]) -> bool {
+    prefixes.is_empty()
+        || prefixes.iter().any(|prefix| {
+            relative == prefix
+                || relative.starts_with(&format!("{prefix}/"))
+                || (is_dir && prefix.starts_with(&format!("{relative}/")))
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_absolute_directory_no_follow(path: &Path) -> Result<fs::File> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    if !path.is_absolute() {
+        return Err(Error::InvalidInput(format!(
+            "reconciliation root `{}` is not absolute",
+            path.display()
+        )));
+    }
+    let mut descriptor = fs::File::from(
+        openat(
+            CWD,
+            Path::new("/"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|err| Error::Io(err.into()))?,
+    );
+    for component in path
+        .strip_prefix(Path::new("/"))
+        .map_err(|err| Error::InvalidInput(err.to_string()))?
+        .components()
+    {
+        let Component::Normal(name) = component else {
+            return Err(Error::InvalidInput(format!(
+                "reconciliation root `{}` is not normalized",
+                path.display()
+            )));
+        };
+        descriptor = fs::File::from(
+            openat(
+                &descriptor,
+                Path::new(name),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|err| Error::Io(err.into()))?,
+        );
+    }
+    Ok(descriptor)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_absolute_directory_no_follow(path: &Path) -> Result<fs::File> {
+    Err(Error::InvalidInput(format!(
+        "qualified changed-path reconciliation is unsupported for `{}` on this platform",
+        path.display()
+    )))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn root_descriptor_identity(file: &fs::File) -> Result<Vec<u8>> {
+    use rustix::fs::fstat;
+
+    let stat = fstat(file).map_err(|err| Error::Io(err.into()))?;
+    Ok(format!(
+        "root-v1:dev={};ino={};mode={};uid={};gid={}",
+        stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid
+    )
+    .into_bytes())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn root_descriptor_identity(_file: &fs::File) -> Result<Vec<u8>> {
+    Err(Error::InvalidInput(
+        "qualified changed-path reconciliation is unsupported on this platform".into(),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_reconciliation_file_no_follow(
+    root: &fs::File,
+    relative: &str,
+    text: &TextConfig,
+) -> Result<Option<ReconciliationFile>> {
+    use rustix::fs::{fstat, openat, statat, AtFlags, FileType, Mode, OFlags};
+
+    let path = path_from_rel(relative);
+    let components = path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(Error::InvalidInput(format!(
+            "reconciliation path `{relative}` is not normalized"
+        )));
+    }
+    for _ in 0..2 {
+        let mut directory = root.try_clone().map_err(Error::Io)?;
+        for component in &components[..components.len() - 1] {
+            let Component::Normal(name) = component else {
+                unreachable!();
+            };
+            directory = match openat(
+                &directory,
+                Path::new(name),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fs::File::from(fd),
+                Err(err) if err == rustix::io::Errno::NOENT => return Ok(None),
+                Err(err) => return Err(Error::Io(err.into())),
+            };
+        }
+        let Component::Normal(name) = components[components.len() - 1] else {
+            unreachable!();
+        };
+        let before_path = match statat(&directory, Path::new(name), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(err) if err == rustix::io::Errno::NOENT => return Ok(None),
+            Err(err) => return Err(Error::Io(err.into())),
+        };
+        if FileType::from_raw_mode(before_path.st_mode) != FileType::RegularFile {
+            return Ok(None);
+        }
+        let descriptor = match openat(
+            &directory,
+            Path::new(name),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(err) if err == rustix::io::Errno::NOENT => continue,
+            Err(err) => return Err(Error::Io(err.into())),
+        };
+        let mut file = fs::File::from(descriptor);
+        let before_open = fstat(&file).map_err(|err| Error::Io(err.into()))?;
+        if stat_identity(&before_path) != stat_identity(&before_open)
+            || FileType::from_raw_mode(before_open.st_mode) != FileType::RegularFile
+        {
+            continue;
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; RECONCILE_READ_BUFFER_BYTES];
+        let mut utf8_validation = Vec::with_capacity(RECONCILE_READ_BUFFER_BYTES + 3);
+        let mut utf8_tail = Vec::with_capacity(3);
+        let mut utf8_valid = true;
+        let mut binary = false;
+        let mut binary_bytes_seen = 0usize;
+        let mut current_line_bytes = 0u64;
+        let mut max_line_bytes = 0u64;
+        let mut size = 0u64;
+        loop {
+            let read = file.read(&mut buffer).map_err(Error::Io)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            size = size.saturating_add(read as u64);
+            if binary_bytes_seen < 8192 {
+                let inspected = read.min(8192 - binary_bytes_seen);
+                binary |= buffer[..inspected].contains(&0);
+                binary_bytes_seen += inspected;
+            }
+            for byte in &buffer[..read] {
+                if *byte == b'\n' {
+                    max_line_bytes = max_line_bytes.max(current_line_bytes);
+                    current_line_bytes = 0;
+                } else {
+                    current_line_bytes = current_line_bytes.saturating_add(1);
+                }
+            }
+            if utf8_valid {
+                utf8_validation.clear();
+                utf8_validation.extend_from_slice(&utf8_tail);
+                utf8_validation.extend_from_slice(&buffer[..read]);
+                utf8_tail.clear();
+                if let Err(err) = std::str::from_utf8(&utf8_validation) {
+                    if err.error_len().is_some() {
+                        utf8_valid = false;
+                    } else {
+                        utf8_tail.extend_from_slice(&utf8_validation[err.valid_up_to()..]);
+                    }
+                }
+            }
+        }
+        let after_open = fstat(&file).map_err(|err| Error::Io(err.into()))?;
+        let after_path = match statat(&directory, Path::new(name), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        if stat_identity(&before_open) != stat_identity(&after_open)
+            || stat_identity(&after_open) != stat_identity(&after_path)
+            || i64::try_from(size).ok() != Some(after_open.st_size)
+        {
+            continue;
+        }
+        max_line_bytes = max_line_bytes.max(current_line_bytes);
+        utf8_valid &= utf8_tail.is_empty();
+        let kind = if binary {
+            FileKind::Binary
+        } else if size > text.opaque_text_max_bytes
+            || !utf8_valid
+            || max_line_bytes > text.max_line_bytes
+        {
+            FileKind::OpaqueText
+        } else {
+            FileKind::Text
+        };
+        return Ok(Some(ReconciliationFile {
+            path: relative.to_string(),
+            file_kind: file_kind_index_label(&kind).to_string(),
+            content_hash: hex::encode(hasher.finalize()),
+            executable: before_open.st_mode & 0o111 != 0,
+            size_bytes: size,
+            identity: stat_identity(&after_open),
+            peak_buffer_bytes: (buffer.len() + utf8_validation.capacity() + utf8_tail.capacity())
+                as u64,
+        }));
+    }
+    Err(Error::InvalidInput(format!(
+        "reconciliation path `{relative}` changed while it was read"
+    )))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_reconciliation_file_no_follow(
+    _root: &fs::File,
+    relative: &str,
+    _text: &TextConfig,
+) -> Result<Option<ReconciliationFile>> {
+    Err(Error::InvalidInput(format!(
+        "qualified reconciliation of `{relative}` is unsupported on this platform"
+    )))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stat_identity(stat: &rustix::fs::Stat) -> Vec<u8> {
+    format!(
+        "file-v1:dev={};ino={};mode={};len={};mtime={};mtime_nsec={};ctime={};ctime_nsec={}",
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_mode,
+        stat.st_size,
+        stat.st_mtime,
+        stat.st_mtime_nsec,
+        stat.st_ctime,
+        stat.st_ctime_nsec
+    )
+    .into_bytes()
 }
 
 fn minimal_component_selections(selections: &[String]) -> Vec<String> {

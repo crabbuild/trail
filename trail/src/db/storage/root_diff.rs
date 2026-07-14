@@ -2,6 +2,42 @@ use super::diff::{RenameLookupProbes, RenameMatchIndex};
 use super::*;
 
 impl Trail {
+    pub(crate) fn visit_root_file_entries<F>(
+        &self,
+        root_id: &ObjectId,
+        prefixes: &[String],
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(String, FileEntry) -> Result<()>,
+    {
+        let root: WorktreeRoot = self.get_object(WORKTREE_ROOT_KIND, root_id)?;
+        let tree = root_map_tree_from_root_hex(root.path_map_root.as_deref())?;
+        if prefixes.is_empty() {
+            for item in self.root_prolly.range(&tree, &[], None)? {
+                let (key, value) = item?;
+                visitor(path_from_key(key)?, from_cbor::<FileEntry>(&value)?)?;
+            }
+            return Ok(());
+        }
+
+        for prefix in prefixes {
+            if let Some(value) = self.root_prolly.get(&tree, prefix.as_bytes())? {
+                visitor(prefix.clone(), from_cbor::<FileEntry>(&value)?)?;
+            }
+            let start = format!("{prefix}/");
+            let end = format!("{prefix}0");
+            for item in self
+                .root_prolly
+                .range(&tree, start.as_bytes(), Some(end.as_bytes()))?
+            {
+                let (key, value) = item?;
+                visitor(path_from_key(key)?, from_cbor::<FileEntry>(&value)?)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn diff_root_file_summaries(
         &self,
         left_root_id: &ObjectId,
