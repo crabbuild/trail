@@ -63,7 +63,7 @@ impl Trail {
             &roots,
             &[branch.ref_name.as_str()],
         )?;
-        remove_retired_segments(&retired_segments)?;
+        remove_retired_segments(&self.conn, &retired_segments)?;
         remove_ref_file(&self.db_dir, &branch.ref_name)?;
         self.conn
             .execute("DELETE FROM refs WHERE name = ?1", params![branch.ref_name])?;

@@ -219,10 +219,32 @@ pub(crate) fn rotate_restored_scopes(
 pub(crate) struct SegmentDeletionToken {
     scope_id: super::ScopeId,
     epoch: u64,
-    directory: Option<std::sync::Arc<super::secure_fs::SecureDirectory>>,
-    leaf: String,
+    segment_id: String,
+    directory: std::sync::Arc<super::secure_fs::SecureDirectory>,
+    quarantine_directory: std::sync::Arc<super::secure_fs::SecureDirectory>,
+    identity: PersistedSegmentDeletion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PersistedSegmentDeletion {
+    original_leaf: String,
+    quarantine_directory_leaf: String,
     quarantine_leaf: String,
-    authorized: Option<std::sync::Arc<std::fs::File>>,
+    scope_directory_identity: (u64, u64),
+    quarantine_directory_identity: (u64, u64),
+    segment_identity: (u64, u64),
+    file_length: u64,
+    file_hash: [u8; 32],
+    durable_end_offset: u64,
+    durable_hash: [u8; 32],
+    limits: super::PersistedLogLimits,
+    owner_token: [u8; 32],
+    first_sequence: u64,
+    last_sequence: Option<u64>,
+    previous_segment_id: Option<String>,
+    previous_segment_hash: [u8; 32],
+    source_state: String,
+    state: String,
 }
 
 impl std::fmt::Debug for SegmentDeletionToken {
@@ -231,10 +253,14 @@ impl std::fmt::Debug for SegmentDeletionToken {
             .debug_struct("SegmentDeletionToken")
             .field("scope_id", &self.scope_id.to_text())
             .field("epoch", &self.epoch)
-            .field("directory_retained", &self.directory.is_some())
-            .field("leaf", &self.leaf)
-            .field("quarantine_leaf", &self.quarantine_leaf)
-            .field("inode_authorized", &self.authorized.is_some())
+            .field("segment_id", &self.segment_id)
+            .field("leaf", &self.identity.original_leaf)
+            .field(
+                "quarantine_directory_leaf",
+                &self.identity.quarantine_directory_leaf,
+            )
+            .field("quarantine_leaf", &self.identity.quarantine_leaf)
+            .field("state", &self.identity.state)
             .finish()
     }
 }
@@ -264,6 +290,7 @@ enum DeletionSubstitutionPoint {
     Parent,
     Leaf,
     BeforeQuarantineMove,
+    AfterQuarantineVerify,
 }
 
 #[cfg(debug_assertions)]
@@ -373,25 +400,25 @@ fn retire_scope_identity(
             command: "trail status".into(),
         });
     };
-    let paths = tx
-        .prepare(
-            "SELECT segment_path FROM changed_path_observer_segments
-             WHERE scope_id=?1 AND epoch=?2 ORDER BY first_sequence",
-        )?
-        .query_map(
-            params![
-                expected.scope_id.to_text(),
-                sql_u64(expected.epoch, "scope epoch")?
-            ],
-            |row| row.get(0),
-        )?
-        .collect::<std::result::Result<Vec<String>, _>>()?;
-    validate_retired_segment_paths(&paths)?;
-    let tokens = segment_deletion_tokens(database_path, expected.scope_id, expected.epoch, &paths)?;
+    if expected.retired_at.is_none() {
+        prepare_segment_deletion_transactions(
+            &tx,
+            database_path,
+            expected.scope_id,
+            expected.epoch,
+        )?;
+    } else {
+        validate_segment_deletion_transaction_coverage(&tx, expected.scope_id, expected.epoch)?;
+    }
     if expected.retired_at.is_some() {
         tx.commit()?;
         durable_intent_barrier(conn)?;
-        return Ok(tokens);
+        return load_segment_deletion_tokens(
+            conn,
+            database_path,
+            expected.scope_id,
+            expected.epoch,
+        );
     }
     let revoked = tx.execute(
         "UPDATE changed_path_observer_owners SET lease_state='revoked',updated_at=?1
@@ -449,7 +476,7 @@ fn retire_scope_identity(
     )?;
     tx.commit()?;
     durable_intent_barrier(conn)?;
-    Ok(tokens)
+    load_segment_deletion_tokens(conn, database_path, expected.scope_id, expected.epoch)
 }
 
 fn load_retirement_identity(
@@ -585,109 +612,725 @@ fn validate_retired_segment_paths(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn segment_deletion_tokens(
+#[derive(Debug)]
+struct RetiredSegmentRow {
+    segment_id: String,
+    owner_token: [u8; 32],
+    first_sequence: u64,
+    last_sequence: Option<u64>,
+    durable_end_offset: u64,
+    previous_segment_id: Option<String>,
+    previous_segment_hash: [u8; 32],
+    stored_segment_hash: Option<[u8; 32]>,
+    segment_path: String,
+    state: String,
+}
+
+fn prepare_segment_deletion_transactions(
+    tx: &Transaction<'_>,
     database_path: &std::path::Path,
     scope_id: super::ScopeId,
     epoch: u64,
-    leaves: &[String],
-) -> Result<Vec<SegmentDeletionToken>> {
+) -> Result<()> {
+    let limit_values: (i64, i64, i64) = tx.query_row(
+        "SELECT max_observer_log_bytes,max_segment_bytes,max_unfolded_tail_records
+         FROM changed_path_scopes WHERE scope_id=?1 AND epoch=?2",
+        params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let limits = super::PersistedLogLimits {
+        max_log_bytes: db_u64(limit_values.0, "maximum observer log bytes")?,
+        max_segment_bytes: db_u64(limit_values.1, "maximum segment bytes")?,
+        max_unfolded_tail_records: usize::try_from(db_u64(
+            limit_values.2,
+            "maximum unfolded records",
+        )?)
+        .map_err(|_| Error::Corrupt("maximum unfolded records exceeds memory".into()))?,
+    };
+    let rows = tx
+        .prepare(
+            "SELECT segment_id,owner_token,first_sequence,last_sequence,durable_end_offset,
+                    previous_segment_id,previous_segment_hash,segment_hash,segment_path,state
+             FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2 ORDER BY first_sequence,segment_id",
+        )?
+        .query_map(
+            params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            Ok(RetiredSegmentRow {
+                segment_id: row.0,
+                owner_token: decode_hex_32(&row.1, "retired segment owner token")?,
+                first_sequence: db_u64(row.2, "retired segment first sequence")?,
+                last_sequence: row
+                    .3
+                    .map(|value| db_u64(value, "retired segment last sequence"))
+                    .transpose()?,
+                durable_end_offset: db_u64(row.4, "retired segment durable offset")?,
+                previous_segment_id: row.5,
+                previous_segment_hash: row
+                    .6
+                    .as_deref()
+                    .map(|value| decode_hex_32(value, "retired previous segment hash"))
+                    .transpose()?
+                    .unwrap_or([0; 32]),
+                stored_segment_hash: row
+                    .7
+                    .as_deref()
+                    .map(|value| decode_hex_32(value, "retired segment hash"))
+                    .transpose()?,
+                segment_path: row.8,
+                state: row.9,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_retired_segment_paths(
+        &rows
+            .iter()
+            .map(|row| row.segment_path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    if rows.is_empty() {
+        return Ok(());
+    }
     let trail_root = database_path
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or_else(|| Error::Corrupt("retirement database has no Trail root".into()))?;
-    let directory = trail_root
+    let directory_path = trail_root
         .join("observer-segments")
         .join(scope_id.to_text());
-    let directory = match super::secure_fs::SecureDirectory::open_absolute(&directory) {
-        Ok(directory) => Some(std::sync::Arc::new(directory)),
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    leaves
-        .iter()
-        .map(|leaf| {
-            let quarantine_leaf = deletion_quarantine_leaf(scope_id, epoch, leaf);
-            let authorized = match &directory {
-                Some(directory) => match directory.open_regular(&quarantine_leaf) {
-                    Ok(file) => Some(std::sync::Arc::new(file)),
-                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        match directory.open_regular(leaf) {
-                            Ok(file) => Some(std::sync::Arc::new(file)),
-                            Err(Error::Io(error))
-                                if error.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                None
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    Err(error) => return Err(error),
-                },
-                None => None,
-            };
+    let directory = super::secure_fs::SecureDirectory::open_absolute(&directory_path)?;
+    let scope_directory_identity = directory.identity()?;
+    let mut expected_previous_segment_id: Option<String> = None;
+    let mut expected_previous_segment_hash = [0; 32];
+    let mut expected_first_sequence = 1_u64;
+    let mut saw_open_segment = false;
+    for row in rows {
+        if saw_open_segment
+            || row.previous_segment_id != expected_previous_segment_id
+            || row.previous_segment_hash != expected_previous_segment_hash
+            || row.first_sequence != expected_first_sequence
+        {
+            return Err(Error::Corrupt(format!(
+                "retired observer segment metadata lineage is not exact at `{}`",
+                row.segment_id
+            )));
+        }
+        let existing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM changed_path_segment_deletions
+             WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3)",
+            params![
+                scope_id.to_text(),
+                sql_u64(epoch, "scope epoch")?,
+                row.segment_id
+            ],
+            |sql_row| sql_row.get(0),
+        )?;
+        if existing {
+            return Err(Error::Corrupt(format!(
+                "segment deletion transaction already exists before retirement: {}",
+                row.segment_id
+            )));
+        }
+        let quarantine_directory_leaf =
+            deletion_quarantine_directory_leaf(scope_id, epoch, &row.segment_id);
+        match directory.open_private_dir(&quarantine_directory_leaf) {
+            Ok(orphan) => {
+                if !orphan.entry_names()?.is_empty() {
+                    return Err(Error::InvalidInput(format!(
+                        "unowned quarantine namespace is not empty: `{quarantine_directory_leaf}`"
+                    )));
+                }
+                drop(orphan);
+                directory.remove_empty_dir(&quarantine_directory_leaf)?;
+                directory.sync()?;
+            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let quarantine_directory = directory.create_private_dir(&quarantine_directory_leaf)?;
+        let quarantine_directory_identity = quarantine_directory.identity()?;
+        let file = directory.open_regular(&row.segment_path)?;
+        let segment_identity = super::secure_fs::file_identity(&file)?;
+        let authenticated = super::log::authenticate_segment_for_deletion(
+            &file,
+            &super::log::DeletionSegmentExpectation {
+                scope_id,
+                epoch,
+                segment_id: row.segment_id.clone(),
+                owner_token: row.owner_token,
+                first_sequence: row.first_sequence,
+                last_sequence: row.last_sequence,
+                durable_end_offset: row.durable_end_offset,
+                previous_segment_hash: row.previous_segment_hash,
+                stored_segment_hash: row.stored_segment_hash,
+                state: row.state.clone(),
+                limits,
+            },
+        )
+        .map_err(|error| Error::Corrupt(error.to_string()))?;
+        expected_previous_segment_id = Some(row.segment_id.clone());
+        expected_previous_segment_hash = authenticated.durable_hash;
+        saw_open_segment = row.state == "open";
+        expected_first_sequence = row
+            .last_sequence
+            .unwrap_or(row.first_sequence.saturating_sub(1))
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("retired segment sequence overflow".into()))?;
+        let now = now_ts();
+        tx.execute(
+            "INSERT INTO changed_path_segment_deletions(
+                 scope_id,epoch,segment_id,original_leaf,quarantine_directory_leaf,
+                 quarantine_leaf,scope_directory_device,scope_directory_inode,
+                 quarantine_directory_device,quarantine_directory_inode,
+                 segment_device,segment_inode,file_length,file_hash,durable_end_offset,
+                 durable_hash,max_observer_log_bytes,max_segment_bytes,
+                 max_unfolded_tail_records,owner_token,first_sequence,last_sequence,
+                 previous_segment_id,previous_segment_hash,source_state,state,
+                 created_at,updated_at,completed_at)
+             VALUES(?1,?2,?3,?4,?5,'segment.cplq',?6,?7,?8,?9,?10,?11,?12,?13,
+                    ?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,'prepared',?25,?25,NULL)",
+            params![
+                scope_id.to_text(),
+                sql_u64(epoch, "scope epoch")?,
+                row.segment_id,
+                row.segment_path,
+                quarantine_directory_leaf,
+                encode_fs_identity_part(scope_directory_identity.0),
+                encode_fs_identity_part(scope_directory_identity.1),
+                encode_fs_identity_part(quarantine_directory_identity.0),
+                encode_fs_identity_part(quarantine_directory_identity.1),
+                encode_fs_identity_part(segment_identity.0),
+                encode_fs_identity_part(segment_identity.1),
+                sql_u64(authenticated.file_length, "segment file length")?,
+                hex::encode(authenticated.file_hash),
+                sql_u64(row.durable_end_offset, "segment durable offset")?,
+                hex::encode(authenticated.durable_hash),
+                sql_u64(limits.max_log_bytes, "maximum observer log bytes")?,
+                sql_u64(limits.max_segment_bytes, "maximum segment bytes")?,
+                sql_u64(
+                    u64::try_from(limits.max_unfolded_tail_records).map_err(|_| {
+                        Error::InvalidInput("maximum unfolded records exceeds SQLite".into())
+                    })?,
+                    "maximum unfolded records"
+                )?,
+                hex::encode(row.owner_token),
+                sql_u64(row.first_sequence, "segment first sequence")?,
+                row.last_sequence
+                    .map(|value| sql_u64(value, "segment last sequence"))
+                    .transpose()?,
+                row.previous_segment_id,
+                hex::encode(row.previous_segment_hash),
+                row.state,
+                now,
+            ],
+        )?;
+        quarantine_directory.sync()?;
+    }
+    directory.sync()?;
+    Ok(())
+}
+
+fn deletion_quarantine_directory_leaf(
+    scope_id: super::ScopeId,
+    epoch: u64,
+    segment_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"trail-segment-deletion-quarantine-v2\0");
+    hasher.update(scope_id.0);
+    hasher.update(epoch.to_le_bytes());
+    hasher.update(segment_id.as_bytes());
+    format!(".trail-delete-{}.d", hex::encode(hasher.finalize()))
+}
+
+fn validate_segment_deletion_transaction_coverage(
+    conn: &Connection,
+    scope_id: super::ScopeId,
+    epoch: u64,
+) -> Result<()> {
+    let (segments, deletions, missing): (i64, i64, i64) = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM changed_path_observer_segments
+              WHERE scope_id=?1 AND epoch=?2),
+             (SELECT COUNT(*) FROM changed_path_segment_deletions
+              WHERE scope_id=?1 AND epoch=?2),
+             (SELECT COUNT(*) FROM changed_path_observer_segments segment
+              WHERE segment.scope_id=?1 AND segment.epoch=?2
+                AND NOT EXISTS(
+                    SELECT 1 FROM changed_path_segment_deletions deletion
+                    WHERE deletion.scope_id=segment.scope_id AND deletion.epoch=segment.epoch
+                      AND deletion.segment_id=segment.segment_id))",
+        params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if segments != deletions || missing != 0 {
+        return Err(Error::Corrupt(format!(
+            "retired segment deletion transaction coverage mismatch: segments={segments} deletions={deletions} missing={missing}"
+        )));
+    }
+    Ok(())
+}
+
+fn load_segment_deletion_tokens(
+    conn: &Connection,
+    database_path: &std::path::Path,
+    scope_id: super::ScopeId,
+    epoch: u64,
+) -> Result<Vec<SegmentDeletionToken>> {
+    validate_segment_deletion_transaction_coverage(conn, scope_id, epoch)?;
+    let trail_root = database_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| Error::Corrupt("retirement database has no Trail root".into()))?;
+    let rows = load_persisted_segment_deletions(conn, scope_id, epoch)?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let directory = std::sync::Arc::new(super::secure_fs::SecureDirectory::open_absolute(
+        &trail_root
+            .join("observer-segments")
+            .join(scope_id.to_text()),
+    )?);
+    rows.into_iter()
+        .map(|(segment_id, identity)| {
+            directory.verify_identity(identity.scope_directory_identity)?;
+            let quarantine_directory = std::sync::Arc::new(
+                directory.open_private_dir(&identity.quarantine_directory_leaf)?,
+            );
+            quarantine_directory.verify_identity(identity.quarantine_directory_identity)?;
             Ok(SegmentDeletionToken {
                 scope_id,
                 epoch,
+                segment_id,
                 directory: directory.clone(),
-                leaf: leaf.clone(),
-                quarantine_leaf,
-                authorized,
+                quarantine_directory,
+                identity,
             })
         })
         .collect()
 }
 
-fn deletion_quarantine_leaf(scope_id: super::ScopeId, epoch: u64, leaf: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"trail-segment-deletion-quarantine-v1\0");
-    hasher.update(scope_id.0);
-    hasher.update(epoch.to_le_bytes());
-    hasher.update(leaf.as_bytes());
-    format!(".trail-delete-{}.cplq", hex::encode(hasher.finalize()))
-}
-
-pub(crate) fn remove_retired_segments(tokens: &[SegmentDeletionToken]) -> Result<()> {
+pub(crate) fn remove_retired_segments(
+    conn: &Connection,
+    tokens: &[SegmentDeletionToken],
+) -> Result<()> {
     for token in tokens {
-        validate_retired_segment_paths(std::slice::from_ref(&token.leaf))?;
-        let Some(directory) = &token.directory else {
-            continue;
-        };
-        let Some(authorized) = &token.authorized else {
-            continue;
-        };
+        let current = load_one_persisted_segment_deletion(
+            conn,
+            token.scope_id,
+            token.epoch,
+            &token.segment_id,
+        )?;
+        validate_deletion_token_identity(token, &current)?;
+        validate_retired_segment_paths(std::slice::from_ref(&current.original_leaf))?;
+        token
+            .directory
+            .verify_identity(current.scope_directory_identity)?;
+        token
+            .quarantine_directory
+            .verify_identity(current.quarantine_directory_identity)?;
         #[cfg(debug_assertions)]
         run_deletion_substitution_hook(DeletionSubstitutionPoint::Parent);
-        let quarantined = match directory.open_regular(&token.quarantine_leaf) {
-            Ok(file) => file,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+        let original = open_optional_regular(&token.directory, &current.original_leaf)?;
+        let quarantined =
+            open_optional_regular(&token.quarantine_directory, &current.quarantine_leaf)?;
+        if current.state == "complete" {
+            if original.is_some() || quarantined.is_some() {
+                return Err(Error::InvalidInput(
+                    "completed segment deletion has a reappeared filesystem name".into(),
+                ));
+            }
+            continue;
+        }
+        let quarantined = match (original, quarantined) {
+            (Some(original), None) if current.state == "prepared" => {
                 #[cfg(debug_assertions)]
                 run_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf);
-                match directory.verify_opened_regular(&token.leaf, authorized) {
-                    Ok(()) => {}
-                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
+                token
+                    .directory
+                    .verify_opened_regular(&current.original_leaf, &original)?;
+                authenticate_persisted_deletion_file(token, &current, &original)?;
                 #[cfg(debug_assertions)]
                 run_deletion_substitution_hook(DeletionSubstitutionPoint::BeforeQuarantineMove);
-                directory.rename_leaf_noreplace(&token.leaf, &token.quarantine_leaf)?;
+                token.directory.rename_leaf_to_noreplace(
+                    &current.original_leaf,
+                    &token.quarantine_directory,
+                    &current.quarantine_leaf,
+                )?;
                 crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_move");
-                directory.open_regular(&token.quarantine_leaf)?
+                let quarantined = token
+                    .quarantine_directory
+                    .open_regular(&current.quarantine_leaf)?;
+                authenticate_persisted_deletion_file(token, &current, &quarantined)?;
+                token.quarantine_directory.sync()?;
+                token.directory.sync()?;
+                update_segment_deletion_state(conn, token, &["prepared"], "quarantined", false)?;
+                quarantined
             }
-            Err(error) => return Err(error),
+            (None, Some(quarantined))
+                if matches!(current.state.as_str(), "prepared" | "quarantined") =>
+            {
+                authenticate_persisted_deletion_file(token, &current, &quarantined)?;
+                if current.state == "prepared" {
+                    token.quarantine_directory.sync()?;
+                    token.directory.sync()?;
+                    update_segment_deletion_state(
+                        conn,
+                        token,
+                        &["prepared"],
+                        "quarantined",
+                        false,
+                    )?;
+                }
+                quarantined
+            }
+            (None, None)
+                if matches!(
+                    current.state.as_str(),
+                    "prepared" | "quarantined" | "unlinked"
+                ) =>
+            {
+                finish_absent_segment_deletion(conn, token)?;
+                continue;
+            }
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "segment deletion filesystem state does not match persisted state `{}`",
+                    current.state
+                )));
+            }
         };
-        directory.verify_same_opened_regular(authorized, &quarantined)?;
+        authenticate_persisted_deletion_file(token, &current, &quarantined)?;
         crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_verify");
-        if directory.unlink_leaf(&token.quarantine_leaf)? {
-            crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_unlink");
-            directory.sync()?;
-            crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_fsync");
+        #[cfg(debug_assertions)]
+        run_deletion_substitution_hook(DeletionSubstitutionPoint::AfterQuarantineVerify);
+        if !token
+            .quarantine_directory
+            .unlink_verified_regular(&current.quarantine_leaf, &quarantined)?
+        {
+            return Err(Error::Corrupt(
+                "authenticated quarantine entry disappeared before unlink".into(),
+            ));
         }
+        crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_unlink");
+        update_segment_deletion_state(
+            conn,
+            token,
+            &["prepared", "quarantined"],
+            "unlinked",
+            false,
+        )?;
+        finish_absent_segment_deletion(conn, token)?;
     }
     Ok(())
+}
+
+fn load_persisted_segment_deletions(
+    conn: &Connection,
+    scope_id: super::ScopeId,
+    epoch: u64,
+) -> Result<Vec<(String, PersistedSegmentDeletion)>> {
+    conn.prepare(
+        "SELECT segment_id,original_leaf,quarantine_directory_leaf,quarantine_leaf,
+                scope_directory_device,scope_directory_inode,
+                quarantine_directory_device,quarantine_directory_inode,
+                segment_device,segment_inode,file_length,file_hash,durable_end_offset,
+                durable_hash,max_observer_log_bytes,max_segment_bytes,
+                max_unfolded_tail_records,owner_token,first_sequence,last_sequence,
+                previous_segment_id,previous_segment_hash,source_state,state
+         FROM changed_path_segment_deletions
+         WHERE scope_id=?1 AND epoch=?2 ORDER BY segment_id",
+    )?
+    .query_map(
+        params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
+        decode_persisted_segment_deletion,
+    )?
+    .collect::<std::result::Result<Vec<_>, _>>()?
+    .into_iter()
+    .map(decode_persisted_segment_deletion_values)
+    .collect()
+}
+
+type PersistedSegmentDeletionValues = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    i64,
+    Option<i64>,
+    Option<String>,
+    String,
+    String,
+    String,
+);
+
+fn decode_persisted_segment_deletion(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedSegmentDeletionValues> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
+        row.get(21)?,
+        row.get(22)?,
+        row.get(23)?,
+    ))
+}
+
+fn decode_persisted_segment_deletion_values(
+    row: PersistedSegmentDeletionValues,
+) -> Result<(String, PersistedSegmentDeletion)> {
+    Ok((
+        row.0,
+        PersistedSegmentDeletion {
+            original_leaf: row.1,
+            quarantine_directory_leaf: row.2,
+            quarantine_leaf: row.3,
+            scope_directory_identity: (
+                decode_fs_identity_part(&row.4, "scope directory device")?,
+                decode_fs_identity_part(&row.5, "scope directory inode")?,
+            ),
+            quarantine_directory_identity: (
+                decode_fs_identity_part(&row.6, "quarantine directory device")?,
+                decode_fs_identity_part(&row.7, "quarantine directory inode")?,
+            ),
+            segment_identity: (
+                decode_fs_identity_part(&row.8, "segment device")?,
+                decode_fs_identity_part(&row.9, "segment inode")?,
+            ),
+            file_length: db_u64(row.10, "deletion file length")?,
+            file_hash: decode_hex_32(&row.11, "deletion file hash")?,
+            durable_end_offset: db_u64(row.12, "deletion durable offset")?,
+            durable_hash: decode_hex_32(&row.13, "deletion durable hash")?,
+            limits: super::PersistedLogLimits {
+                max_log_bytes: db_u64(row.14, "deletion maximum log bytes")?,
+                max_segment_bytes: db_u64(row.15, "deletion maximum segment bytes")?,
+                max_unfolded_tail_records: usize::try_from(db_u64(
+                    row.16,
+                    "deletion maximum unfolded records",
+                )?)
+                .map_err(|_| Error::Corrupt("deletion record cap exceeds memory".into()))?,
+            },
+            owner_token: decode_hex_32(&row.17, "deletion owner token")?,
+            first_sequence: db_u64(row.18, "deletion first sequence")?,
+            last_sequence: row
+                .19
+                .map(|value| db_u64(value, "deletion last sequence"))
+                .transpose()?,
+            previous_segment_id: row.20,
+            previous_segment_hash: decode_hex_32(&row.21, "deletion previous hash")?,
+            source_state: row.22,
+            state: row.23,
+        },
+    ))
+}
+
+fn load_one_persisted_segment_deletion(
+    conn: &Connection,
+    scope_id: super::ScopeId,
+    epoch: u64,
+    segment_id: &str,
+) -> Result<PersistedSegmentDeletion> {
+    load_persisted_segment_deletions(conn, scope_id, epoch)?
+        .into_iter()
+        .find_map(|(observed_id, identity)| (observed_id == segment_id).then_some(identity))
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "persisted segment deletion disappeared: {}/{epoch}/{segment_id}",
+                scope_id.to_text()
+            ))
+        })
+}
+
+fn validate_deletion_token_identity(
+    token: &SegmentDeletionToken,
+    current: &PersistedSegmentDeletion,
+) -> Result<()> {
+    let mut expected = token.identity.clone();
+    expected.state.clone_from(&current.state);
+    if expected != *current {
+        return Err(Error::InvalidInput(
+            "persisted segment deletion identity changed after authority issuance".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn open_optional_regular(
+    directory: &super::secure_fs::SecureDirectory,
+    leaf: &str,
+) -> Result<Option<std::fs::File>> {
+    match directory.open_regular(leaf) {
+        Ok(file) => Ok(Some(file)),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn authenticate_persisted_deletion_file(
+    token: &SegmentDeletionToken,
+    identity: &PersistedSegmentDeletion,
+    file: &std::fs::File,
+) -> Result<()> {
+    if super::secure_fs::file_identity(file)? != identity.segment_identity {
+        return Err(Error::InvalidInput(
+            "segment deletion inode does not match persisted authority".into(),
+        ));
+    }
+    let authenticated = super::log::authenticate_segment_for_deletion(
+        file,
+        &super::log::DeletionSegmentExpectation {
+            scope_id: token.scope_id,
+            epoch: token.epoch,
+            segment_id: token.segment_id.clone(),
+            owner_token: identity.owner_token,
+            first_sequence: identity.first_sequence,
+            last_sequence: identity.last_sequence,
+            durable_end_offset: identity.durable_end_offset,
+            previous_segment_hash: identity.previous_segment_hash,
+            stored_segment_hash: (identity.source_state == "sealed")
+                .then_some(identity.durable_hash),
+            state: identity.source_state.clone(),
+            limits: identity.limits,
+        },
+    )
+    .map_err(|error| Error::Corrupt(error.to_string()))?;
+    if authenticated.file_length != identity.file_length
+        || authenticated.file_hash != identity.file_hash
+        || authenticated.durable_hash != identity.durable_hash
+    {
+        return Err(Error::InvalidInput(
+            "segment deletion bytes do not match persisted authority".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn update_segment_deletion_state(
+    conn: &Connection,
+    token: &SegmentDeletionToken,
+    expected_states: &[&str],
+    state: &str,
+    completed: bool,
+) -> Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let persisted =
+        load_one_persisted_segment_deletion(&tx, token.scope_id, token.epoch, &token.segment_id)?;
+    validate_deletion_token_identity(token, &persisted)?;
+    let current = persisted.state;
+    if current == state || (completed && current == "complete") {
+        tx.commit()?;
+        durable_intent_barrier(conn)?;
+        return Ok(());
+    }
+    if !expected_states.contains(&current.as_str()) {
+        return Err(Error::InvalidInput(format!(
+            "segment deletion state `{current}` cannot advance to `{state}`"
+        )));
+    }
+    let now = now_ts();
+    let changed = tx.execute(
+        "UPDATE changed_path_segment_deletions
+         SET state=?1,updated_at=?2,completed_at=?3
+         WHERE scope_id=?4 AND epoch=?5 AND segment_id=?6 AND state=?7",
+        params![
+            state,
+            now,
+            completed.then_some(now),
+            token.scope_id.to_text(),
+            sql_u64(token.epoch, "scope epoch")?,
+            token.segment_id,
+            current,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::Conflict(
+            "segment deletion state changed during durable transition".into(),
+        ));
+    }
+    tx.commit()?;
+    durable_intent_barrier(conn)
+}
+
+fn finish_absent_segment_deletion(conn: &Connection, token: &SegmentDeletionToken) -> Result<()> {
+    token.quarantine_directory.sync()?;
+    token.directory.sync()?;
+    crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_fsync");
+    update_segment_deletion_state(
+        conn,
+        token,
+        &["prepared", "quarantined", "unlinked"],
+        "complete",
+        true,
+    )
+}
+
+fn encode_fs_identity_part(value: u64) -> String {
+    format!("{value:016x}")
+}
+
+fn decode_fs_identity_part(value: &str, label: &str) -> Result<u64> {
+    u64::from_str_radix(value, 16).map_err(|_| Error::Corrupt(format!("invalid persisted {label}")))
+}
+
+fn decode_hex_32(value: &str, label: &str) -> Result<[u8; 32]> {
+    hex::decode(value)
+        .map_err(|_| Error::Corrupt(format!("invalid {label} encoding")))?
+        .try_into()
+        .map_err(|_| Error::Corrupt(format!("invalid {label} length")))
 }
 
 fn finish_publication(
@@ -1842,24 +2485,7 @@ mod harness {
             [retired.expected.scope_id.to_text()],
             |row| row.get(0),
         )?;
-        let now = now_ts();
-        retired.db.conn.execute(
-            "INSERT INTO changed_path_observer_owners(
-                 scope_id,epoch,owner_token,provider_id,provider_identity,lease_state,
-                 fence_nonce,acquired_at,heartbeat_at,expires_at,error_state,error_at,updated_at
-             ) VALUES(?1,1,'retire-owner','provider','identity','active',NULL,?2,?2,?3,NULL,NULL,?2)",
-            params![retired.expected.scope_id.to_text(), now, now + 60],
-        )?;
-        retired.db.conn.execute(
-            "INSERT INTO changed_path_observer_segments(
-                 scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
-                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
-                 previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
-                 created_at,sealed_at,updated_at
-             ) VALUES(?1,1,'retire-segment',1,'retire-owner','provider',1,NULL,0,0,
-                      NULL,NULL,NULL,'retire-segment.cpl','open',?2,NULL,?2)",
-            params![retired.expected.scope_id.to_text(), now],
-        )?;
+        let retired_leaf = create_real_retirement_segment(&retired, 0x67)?;
         let retired_paths =
             retire_scope(&retired.db.conn, &retired.db.sqlite_path, &retired.expected)?;
         let retirement_state = retired.db.conn.query_row(
@@ -1880,9 +2506,9 @@ mod harness {
         )?;
         if retired_paths
             .iter()
-            .map(|token| token.leaf.as_str())
+            .map(|token| token.identity.original_leaf.as_str())
             .collect::<Vec<_>>()
-            != vec!["retire-segment.cpl"]
+            != vec![retired_leaf.as_str()]
             || retirement_state.0 != retirement_before + 1
             || retirement_state.1.is_none()
             || retirement_state.2 != "revoked"
@@ -1968,20 +2594,7 @@ mod harness {
         }
 
         let reader_fixture = Fixture::new(0x6c)?;
-        reader_fixture.db.conn.execute(
-            "INSERT INTO changed_path_observer_segments(
-                 scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
-                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
-                 previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
-                 created_at,sealed_at,updated_at)
-             VALUES(?1,1,'reader-segment',1,'owner','provider',1,1,1,1,NULL,NULL,?2,
-                    'reader-segment.cpl','sealed',?3,?3,?3)",
-            params![
-                reader_fixture.expected.scope_id.to_text(),
-                hex::encode([2_u8; 32]),
-                now_ts()
-            ],
-        )?;
+        let reader_leaf = create_real_retirement_segment(&reader_fixture, 0x6c)?;
         let reader = Connection::open(reader_fixture.db.db_dir.join(crate::db::DB_RELATIVE_PATH))?;
         reader.execute_batch("BEGIN DEFERRED")?;
         let _: i64 = reader.query_row("SELECT COUNT(*) FROM changed_path_scopes", [], |row| {
@@ -2006,9 +2619,9 @@ mod harness {
         )?;
         if paths
             .iter()
-            .map(|token| token.leaf.as_str())
+            .map(|token| token.identity.original_leaf.as_str())
             .collect::<Vec<_>>()
-            != vec!["reader-segment.cpl"]
+            != vec![reader_leaf.as_str()]
         {
             return Err(Error::Corrupt(format!(
                 "retirement retry did not return confined paths: {paths:?}"
@@ -2019,55 +2632,79 @@ mod harness {
 
     fn retired_segment_fixture(
         tag: u8,
-        leaf: &str,
-    ) -> Result<(Fixture, Vec<SegmentDeletionToken>, std::path::PathBuf)> {
+    ) -> Result<(
+        Fixture,
+        Vec<SegmentDeletionToken>,
+        std::path::PathBuf,
+        String,
+    )> {
         let fixture = Fixture::new(tag)?;
-        fixture.db.conn.execute(
-            "INSERT INTO changed_path_observer_segments(
-                 scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
-                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
-                 previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
-                 created_at,sealed_at,updated_at)
-             VALUES(?1,1,'deletion-substitution',1,'owner','provider',1,1,1,1,
-                    NULL,NULL,?2,?3,'sealed',?4,?4,?4)",
-            params![
-                fixture.expected.scope_id.to_text(),
-                hex::encode([7_u8; 32]),
-                leaf,
-                now_ts()
-            ],
-        )?;
+        let leaf = create_real_retirement_segment(&fixture, tag)?;
         let directory = fixture
             .db
             .db_dir
             .join("observer-segments")
             .join(fixture.expected.scope_id.to_text());
-        std::fs::create_dir_all(&directory)?;
-        std::fs::write(directory.join(leaf), b"retired authority\n")?;
         let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
-        Ok((fixture, tokens, directory))
+        Ok((fixture, tokens, directory, leaf))
+    }
+
+    fn create_real_retirement_segment(fixture: &Fixture, tag: u8) -> Result<String> {
+        create_real_segment(
+            &fixture.db,
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+            tag,
+        )
+    }
+
+    fn create_real_segment(db: &Trail, scope_id: ScopeId, epoch: u64, tag: u8) -> Result<String> {
+        let directory = db.db_dir.join("observer-segments").join(scope_id.to_text());
+        let provider_id: String = db.conn.query_row(
+            "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
+            [scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        let writer = super::super::SegmentWriter::acquire(
+            &db.sqlite_path,
+            &directory,
+            scope_id,
+            epoch,
+            [tag.wrapping_add(0x41); 32],
+            &provider_id,
+            b"retirement-test-cursor".to_vec(),
+            Duration::from_secs(600),
+        )?;
+        let leaf: String = db.conn.query_row(
+            "SELECT segment_path FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2",
+            params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
+            |row| row.get(0),
+        )?;
+        drop(writer);
+        Ok(leaf)
     }
 
     pub(super) fn deletion_parent_substitution_uses_retained_authority() -> Result<()> {
-        let (_fixture, tokens, directory) =
-            retired_segment_fixture(0x87, "parent-substitution.cpl")?;
+        let (fixture, tokens, directory, leaf) = retired_segment_fixture(0x87)?;
         let retained = directory.with_extension("retained-directory");
-        let replacement_file = directory.join("parent-substitution.cpl");
-        let original_file = retained.join("parent-substitution.cpl");
+        let replacement_file = directory.join(&leaf);
+        let original_file = retained.join(&leaf);
         let hook_directory = directory.clone();
         let hook_retained = retained.clone();
+        let hook_leaf = leaf.clone();
         install_deletion_substitution_hook(DeletionSubstitutionPoint::Parent, move || {
             std::fs::rename(&hook_directory, &hook_retained).unwrap();
             std::fs::create_dir(&hook_directory).unwrap();
             std::fs::write(
-                hook_directory.join("parent-substitution.cpl"),
+                hook_directory.join(&hook_leaf),
                 b"replacement must survive\n",
             )
             .unwrap();
         });
 
-        remove_retired_segments(&tokens)?;
-        remove_retired_segments(&tokens)?;
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
         if original_file.exists() || !replacement_file.exists() {
             return Err(Error::Corrupt(
                 "retired deletion followed a substituted parent directory".into(),
@@ -2080,8 +2717,8 @@ mod harness {
     pub(super) fn deletion_leaf_substitution_fails_closed() -> Result<()> {
         use std::os::unix::fs::symlink;
 
-        let (fixture, tokens, directory) = retired_segment_fixture(0x88, "leaf-substitution.cpl")?;
-        let leaf = directory.join("leaf-substitution.cpl");
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x88)?;
+        let leaf = directory.join(segment_leaf);
         let retained_leaf = directory.join("leaf-substitution.retained.cpl");
         let outside = fixture._root.path().join("outside-segment.cpl");
         std::fs::write(&outside, b"outside must survive\n")?;
@@ -2093,7 +2730,7 @@ mod harness {
             symlink(&hook_outside, &hook_leaf).unwrap();
         });
 
-        if remove_retired_segments(&tokens).is_ok() {
+        if remove_retired_segments(&fixture.db.conn, &tokens).is_ok() {
             return Err(Error::Corrupt(
                 "retired deletion accepted a substituted leaf".into(),
             ));
@@ -2107,11 +2744,12 @@ mod harness {
     }
 
     pub(super) fn deletion_name_substitution_after_verification_fails_closed() -> Result<()> {
-        let (_fixture, tokens, directory) =
-            retired_segment_fixture(0x89, "post-verification-substitution.cpl")?;
-        let leaf = directory.join("post-verification-substitution.cpl");
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x89)?;
+        let leaf = directory.join(segment_leaf);
         let authorized = directory.join("post-verification-authorized.cpl");
-        let quarantine = directory.join(&tokens[0].quarantine_leaf);
+        let quarantine = directory
+            .join(&tokens[0].identity.quarantine_directory_leaf)
+            .join(&tokens[0].identity.quarantine_leaf);
         let hook_leaf = leaf.clone();
         let hook_authorized = authorized.clone();
         install_deletion_substitution_hook(
@@ -2122,7 +2760,7 @@ mod harness {
             },
         );
 
-        if remove_retired_segments(&tokens).is_ok() {
+        if remove_retired_segments(&fixture.db.conn, &tokens).is_ok() {
             return Err(Error::Corrupt(
                 "retired deletion accepted a name substituted after verification".into(),
             ));
@@ -2132,6 +2770,86 @@ mod harness {
                 "retired deletion did not preserve the authorized inode and quarantine the substitution"
                     .into(),
             ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn deletion_substitution_after_quarantine_verification_fails_closed() -> Result<()> {
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8c)?;
+        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
+        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
+        std::fs::rename(directory.join(segment_leaf), &quarantine)?;
+        let authorized = quarantine_directory.join("post-quarantine-authorized.cpl");
+        let hook_quarantine = quarantine.clone();
+        let hook_authorized = authorized.clone();
+        install_deletion_substitution_hook(
+            DeletionSubstitutionPoint::AfterQuarantineVerify,
+            move || {
+                std::fs::rename(&hook_quarantine, &hook_authorized).unwrap();
+                std::fs::write(&hook_quarantine, b"replacement must survive\n").unwrap();
+            },
+        );
+
+        let rejection = remove_retired_segments(&fixture.db.conn, &tokens)
+            .err()
+            .ok_or_else(|| {
+                Error::Corrupt(
+                    "retired deletion accepted substitution after quarantine verification".into(),
+                )
+            })?;
+        if !quarantine.exists() || !authorized.exists() {
+            return Err(Error::Corrupt(format!(
+                "retired deletion did not preserve post-verification files: quarantine={} authorized={} qdir={} rejection={rejection}",
+                quarantine.exists(),
+                authorized.exists(),
+                quarantine_directory.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn deletion_retry_rejects_hostile_quarantine_replacement() -> Result<()> {
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8d)?;
+        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
+        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
+        let retained = quarantine_directory.join("hostile-quarantine-retained.cpl");
+        std::fs::rename(directory.join(segment_leaf), &quarantine)?;
+        std::fs::rename(&quarantine, &retained)?;
+        std::fs::write(&quarantine, b"hostile replacement must survive\n")?;
+
+        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        if remove_retired_segments(&fixture.db.conn, &retry).is_ok() {
+            return Err(Error::Corrupt(
+                "retirement retry adopted a hostile quarantine replacement".into(),
+            ));
+        }
+        if !quarantine.exists() || !retained.exists() {
+            return Err(Error::Corrupt(
+                "retirement retry deleted a hostile or retained quarantine file".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn deletion_normal_retry_is_durably_idempotent() -> Result<()> {
+        let (fixture, tokens, _directory, _segment_leaf) = retired_segment_fixture(0x8e)?;
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
+        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        remove_retired_segments(&fixture.db.conn, &retry)?;
+        remove_retired_segments(&fixture.db.conn, &retry)?;
+        let completed: i64 = fixture.db.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_segment_deletions
+             WHERE scope_id=?1 AND epoch=?2 AND state='complete'",
+            params![
+                fixture.expected.scope_id.to_text(),
+                sql_u64(fixture.expected.epoch, "scope epoch")?
+            ],
+            |row| row.get(0),
+        )?;
+        if completed != 1 {
+            return Err(Error::Corrupt(format!(
+                "normal deletion retry did not retain one durable completion row: {completed}"
+            )));
         }
         Ok(())
     }
@@ -2292,13 +3010,13 @@ mod harness {
         let mut retired_expected = fixture.expected.clone();
         retired_expected.ref_generation = retired_expected.ref_generation.saturating_add(1);
         let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &retired_expected)?;
-        remove_retired_segments(&tokens)?;
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
         if tokens.is_empty()
             || tokens.iter().any(|token| {
                 token
                     .directory
-                    .as_ref()
-                    .is_some_and(|directory| directory.open_regular(&token.leaf).is_ok())
+                    .open_regular(&token.identity.original_leaf)
+                    .is_ok()
             })
         {
             return Err(Error::Corrupt(
@@ -2410,32 +3128,25 @@ mod harness {
             ));
         }
         db.conn.execute(
-            "UPDATE changed_path_observer_segments SET segment_path='lane-segment.cpl'
-             WHERE scope_id=?1",
+            "DELETE FROM changed_path_observer_segments WHERE scope_id=?1",
             [scope.scope_id.to_text()],
         )?;
+        db.conn.execute(
+            "DELETE FROM changed_path_observer_segments WHERE scope_id=?1",
+            [view_scope.scope_id.to_text()],
+        )?;
+        let lane_leaf = create_real_segment(&db, scope.scope_id, 1, 0x6d)?;
+        let view_leaf = create_real_segment(&db, view_scope.scope_id, 1, 0x6e)?;
         let segment_directory = db
             .db_dir
             .join("observer-segments")
             .join(scope.scope_id.to_text());
-        std::fs::create_dir_all(&segment_directory)?;
-        let segment_file = segment_directory.join("lane-segment.cpl");
-        std::fs::write(&segment_file, b"retired segment\n")?;
-        OpenOptions::new()
-            .read(true)
-            .open(&segment_file)?
-            .sync_all()?;
+        let segment_file = segment_directory.join(lane_leaf);
         let view_segment_directory = db
             .db_dir
             .join("observer-segments")
             .join(view_scope.scope_id.to_text());
-        std::fs::create_dir_all(&view_segment_directory)?;
-        let view_segment_file = view_segment_directory.join("view-segment.cpl");
-        std::fs::write(&view_segment_file, b"retired view segment\n")?;
-        OpenOptions::new()
-            .read(true)
-            .open(&view_segment_file)?
-            .sync_all()?;
+        let view_segment_file = view_segment_directory.join(view_leaf);
         let reader = Connection::open(db.db_dir.join(crate::db::DB_RELATIVE_PATH))?;
         reader.execute_batch("BEGIN DEFERRED")?;
         let _: i64 = reader.query_row("SELECT COUNT(*) FROM changed_path_scopes", [], |row| {
@@ -2495,9 +3206,9 @@ mod harness {
     #[test]
     fn subprocess_kill_and_retry_covers_quarantine_deletion_boundaries() {
         for (index, phase) in [
+            "changed_path_deletion_after_quarantine_unlink",
             "changed_path_deletion_after_quarantine_move",
             "changed_path_deletion_after_quarantine_verify",
-            "changed_path_deletion_after_quarantine_unlink",
             "changed_path_deletion_after_quarantine_fsync",
         ]
         .into_iter()
@@ -2552,30 +3263,39 @@ mod harness {
                     params![spawned.workdir, scope.scope_id.to_text()],
                 )
                 .unwrap();
-            let leaf = format!("quarantine-crash-{index}.cpl");
-            db.conn
-                .execute(
-                    "INSERT INTO changed_path_observer_segments(
-                         scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
-                         first_sequence,last_sequence,durable_end_offset,folded_end_offset,
-                         previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
-                         created_at,sealed_at,updated_at)
-                     VALUES(?1,1,?2,1,'owner','provider',1,1,1,1,NULL,NULL,?3,?4,'sealed',?5,?5,?5)",
-                    params![
-                        scope.scope_id.to_text(),
-                        format!("quarantine-crash-{index}"),
-                        hex::encode([0x93; 32]),
-                        leaf,
-                        now_ts(),
-                    ],
-                )
-                .unwrap();
             let segment_directory = db
                 .db_dir
                 .join("observer-segments")
                 .join(scope.scope_id.to_text());
-            std::fs::create_dir_all(&segment_directory).unwrap();
-            std::fs::write(segment_directory.join(&leaf), b"segment\n").unwrap();
+            let provider_id: String = db
+                .conn
+                .query_row(
+                    "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
+                    [scope.scope_id.to_text()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let writer = super::super::SegmentWriter::acquire(
+                &db.sqlite_path,
+                &segment_directory,
+                scope.scope_id,
+                1,
+                [0x93_u8.wrapping_add(index as u8); 32],
+                &provider_id,
+                b"crash-retirement-cursor".to_vec(),
+                Duration::from_secs(600),
+            )
+            .unwrap();
+            let leaf: String = db
+                .conn
+                .query_row(
+                    "SELECT segment_path FROM changed_path_observer_segments
+                     WHERE scope_id=?1 AND epoch=1",
+                    [scope.scope_id.to_text()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(writer);
             let workdir = std::path::PathBuf::from(spawned.workdir.unwrap());
             drop(db);
 
@@ -2599,6 +3319,35 @@ mod harness {
             child.kill().unwrap();
             let _ = child.wait().unwrap();
 
+            if phase == "changed_path_deletion_after_quarantine_unlink" {
+                let retry_ready = root.path().join("retry-after-unlink-fsync.ready");
+                let mut retry_child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "db::change_ledger::recovery::harness::deletion_subprocess_crash_helper",
+                        "--nocapture",
+                    ])
+                    .env("RUST_TEST_THREADS", "1")
+                    .env(
+                        "TRAIL_TEST_CRASH_AT",
+                        "changed_path_deletion_after_quarantine_fsync",
+                    )
+                    .env("TRAIL_TEST_CRASH_READY", &retry_ready)
+                    .env("TRAIL_TEST_DELETION_CRASH_WORKSPACE", root.path())
+                    .env("TRAIL_TEST_DELETION_CRASH_LANE", &lane)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                wait_for_crash_handshake(
+                    &mut retry_child,
+                    &retry_ready,
+                    "retry-after-unlink-directory-fsync",
+                );
+                retry_child.kill().unwrap();
+                let _ = retry_child.wait().unwrap();
+            }
+
             let mut reopened = Trail::open(root.path()).unwrap();
             reopened.remove_lane(&lane, true).unwrap();
             let retired: bool = reopened
@@ -2609,18 +3358,32 @@ mod harness {
                     |row| row.get(0),
                 )
                 .unwrap();
-            let remaining_segments = std::fs::read_dir(&segment_directory)
-                .unwrap()
-                .filter_map(std::result::Result::ok)
-                .filter(|entry| {
-                    let name = entry.file_name();
-                    name == std::ffi::OsStr::new(&leaf)
-                        || name.to_string_lossy().starts_with(".trail-delete-")
-                })
-                .count();
+            let remaining_segments = usize::from(segment_directory.join(&leaf).exists())
+                + std::fs::read_dir(&segment_directory)
+                    .unwrap()
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| {
+                        let name = entry.file_name();
+                        name.to_string_lossy().starts_with(".trail-delete-")
+                            && entry.path().join("segment.cplq").exists()
+                    })
+                    .count();
             assert!(retired, "scope did not remain retired after {phase}");
             assert_eq!(remaining_segments, 0, "segment remained after {phase}");
             assert!(!workdir.exists(), "workdir remained after {phase}");
+            let completed: i64 = reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM changed_path_segment_deletions
+                     WHERE scope_id=?1 AND epoch=1 AND state='complete'",
+                    [scope.scope_id.to_text()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                completed, 1,
+                "deletion was not durably complete after {phase}"
+            );
         }
     }
 
@@ -3466,6 +4229,25 @@ pub(crate) fn run_deletion_post_verification_substitution_rejection(
 ) -> std::result::Result<(), String> {
     harness::deletion_name_substitution_after_verification_fails_closed()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_post_quarantine_verification_substitution_rejection(
+) -> std::result::Result<(), String> {
+    harness::deletion_substitution_after_quarantine_verification_fails_closed()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_retry_hostile_quarantine_replacement_rejection(
+) -> std::result::Result<(), String> {
+    harness::deletion_retry_rejects_hostile_quarantine_replacement()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_normal_retry_idempotence() -> std::result::Result<(), String> {
+    harness::deletion_normal_retry_is_durably_idempotent().map_err(|error| error.to_string())
 }
 
 #[cfg(debug_assertions)]

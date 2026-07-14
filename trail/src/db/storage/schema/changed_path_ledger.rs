@@ -278,7 +278,52 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              CHECK (folded_end_offset <= durable_end_offset)
          );
          CREATE INDEX changed_path_observer_segments_state_idx
-             ON changed_path_observer_segments(scope_id, epoch, state, last_sequence);";
+             ON changed_path_observer_segments(scope_id, epoch, state, last_sequence);
+         CREATE TABLE changed_path_segment_deletions (
+             scope_id TEXT NOT NULL,
+             epoch INTEGER NOT NULL CHECK (epoch >= 1),
+             segment_id TEXT NOT NULL CHECK (length(segment_id) > 0),
+             original_leaf TEXT NOT NULL CHECK (length(original_leaf) > 0),
+             quarantine_directory_leaf TEXT NOT NULL
+                 CHECK (length(quarantine_directory_leaf) > 0),
+             quarantine_leaf TEXT NOT NULL CHECK (length(quarantine_leaf) > 0),
+             scope_directory_device TEXT NOT NULL CHECK (length(scope_directory_device) > 0),
+             scope_directory_inode TEXT NOT NULL CHECK (length(scope_directory_inode) > 0),
+             quarantine_directory_device TEXT NOT NULL
+                 CHECK (length(quarantine_directory_device) > 0),
+             quarantine_directory_inode TEXT NOT NULL
+                 CHECK (length(quarantine_directory_inode) > 0),
+             segment_device TEXT NOT NULL CHECK (length(segment_device) > 0),
+             segment_inode TEXT NOT NULL CHECK (length(segment_inode) > 0),
+             file_length INTEGER NOT NULL CHECK (file_length >= 0),
+             file_hash TEXT NOT NULL CHECK (length(file_hash) = 64),
+             durable_end_offset INTEGER NOT NULL CHECK (durable_end_offset >= 0),
+             durable_hash TEXT NOT NULL CHECK (length(durable_hash) = 64),
+             max_observer_log_bytes INTEGER NOT NULL CHECK (max_observer_log_bytes > 0),
+             max_segment_bytes INTEGER NOT NULL CHECK (max_segment_bytes > 0),
+             max_unfolded_tail_records INTEGER NOT NULL CHECK (max_unfolded_tail_records > 0),
+             owner_token TEXT NOT NULL CHECK (length(owner_token) = 64),
+             first_sequence INTEGER NOT NULL CHECK (first_sequence >= 1),
+             last_sequence INTEGER,
+             previous_segment_id TEXT,
+             previous_segment_hash TEXT NOT NULL CHECK (length(previous_segment_hash) = 64),
+             source_state TEXT NOT NULL CHECK (source_state IN ('open', 'sealed')),
+             state TEXT NOT NULL DEFAULT 'prepared'
+                 CHECK (state IN ('prepared', 'quarantined', 'unlinked', 'complete')),
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             completed_at INTEGER,
+             PRIMARY KEY (scope_id, epoch, segment_id),
+             UNIQUE (scope_id, epoch, original_leaf),
+             UNIQUE (scope_id, epoch, quarantine_directory_leaf),
+             FOREIGN KEY (scope_id, epoch, segment_id)
+                 REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
+                 ON UPDATE CASCADE ON DELETE CASCADE,
+             CHECK ((state = 'complete' AND completed_at IS NOT NULL)
+                    OR (state <> 'complete' AND completed_at IS NULL))
+         );
+         CREATE INDEX changed_path_segment_deletions_state_idx
+             ON changed_path_segment_deletions(scope_id, epoch, state);";
 
 pub(super) fn create_changed_path_ledger_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(CHANGED_PATH_LEDGER_SCHEMA_V18)

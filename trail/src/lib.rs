@@ -112,6 +112,20 @@ pub mod test_support {
         crate::db::run_deletion_post_verification_substitution_rejection()
     }
 
+    pub fn changed_path_deletion_post_quarantine_verification_substitution_rejection(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_deletion_post_quarantine_verification_substitution_rejection()
+    }
+
+    pub fn changed_path_deletion_retry_hostile_quarantine_replacement_rejection(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_deletion_retry_hostile_quarantine_replacement_rejection()
+    }
+
+    pub fn changed_path_deletion_normal_retry_idempotence() -> std::result::Result<(), String> {
+        crate::db::run_deletion_normal_retry_idempotence()
+    }
+
     pub fn changed_path_restored_nullable_provider_lane_deletion() -> std::result::Result<(), String>
     {
         crate::db::run_restored_nullable_provider_lane_deletion()

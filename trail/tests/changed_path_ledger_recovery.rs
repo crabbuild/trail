@@ -97,6 +97,24 @@ fn retired_segment_deletion_rejects_name_substitution_after_verification() {
 }
 
 #[test]
+fn retired_segment_deletion_rejects_substitution_after_quarantine_verification() {
+    trail::test_support::changed_path_deletion_post_quarantine_verification_substitution_rejection(
+    )
+    .unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_retry_rejects_hostile_quarantine_replacement() {
+    trail::test_support::changed_path_deletion_retry_hostile_quarantine_replacement_rejection()
+        .unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_normal_retry_is_durably_idempotent() {
+    trail::test_support::changed_path_deletion_normal_retry_idempotence().unwrap();
+}
+
+#[test]
 fn restored_nullable_provider_lane_and_view_scopes_can_be_deleted() {
     trail::test_support::changed_path_restored_nullable_provider_lane_deletion().unwrap();
 }

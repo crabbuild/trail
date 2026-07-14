@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use rusqlite::types::ValueRef;
@@ -684,6 +684,107 @@ pub(crate) fn recover_segments_from_directory(
     })?;
     validate_recovery_owner(&connection, expected, epoch)?;
     Ok(recovered)
+}
+
+pub(crate) fn authenticate_segment_for_deletion(
+    file: &File,
+    expected: &DeletionSegmentExpectation,
+) -> std::result::Result<AuthenticatedDeletionSegment, RecoveryError> {
+    let limits = expected.limits.validate()?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| RecoveryError::new(format!("read deletion segment metadata: {error}")))?;
+    if metadata.len() > limits.max_segment_bytes || metadata.len() > limits.max_log_bytes {
+        return Err(RecoveryError::new(
+            "deletion segment exceeds persisted byte limit",
+        ));
+    }
+    if expected.durable_end_offset > metadata.len() {
+        return Err(RecoveryError::new(
+            "deletion segment durable offset exceeds file length",
+        ));
+    }
+    let file_length = usize::try_from(metadata.len())
+        .map_err(|_| RecoveryError::new("deletion segment length cannot fit memory"))?;
+    let mut bytes = Vec::with_capacity(file_length);
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| RecoveryError::new(format!("clone deletion segment: {error}")))?;
+    reader
+        .rewind()
+        .map_err(|error| RecoveryError::new(format!("rewind deletion segment: {error}")))?;
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| RecoveryError::new(format!("read deletion segment: {error}")))?;
+    if bytes.len() != file_length {
+        return Err(RecoveryError::new(
+            "deletion segment changed length while authenticating",
+        ));
+    }
+    let durable_length = usize::try_from(expected.durable_end_offset)
+        .map_err(|_| RecoveryError::new("durable deletion length cannot fit memory"))?;
+    let durable_bytes = &bytes[..durable_length];
+    let (identity, _) = decode_header(durable_bytes)?;
+    let expected_scope = RecoveryScope {
+        scope_id: expected.scope_id,
+        epoch: expected.epoch,
+        owner_token: expected.owner_token,
+    };
+    if identity.recovery_scope() != expected_scope
+        || identity.previous_segment_hash != expected.previous_segment_hash
+    {
+        return Err(RecoveryError::new(
+            "deletion segment header lineage does not match persisted metadata",
+        ));
+    }
+    let derived_id = super::writer::segment_id(
+        expected.epoch,
+        expected.first_sequence,
+        expected.owner_token,
+    );
+    if expected.segment_id != derived_id {
+        return Err(RecoveryError::new(
+            "deletion segment id does not match exact derived identity",
+        ));
+    }
+    let recovered = recover_bytes(durable_bytes, &identity, limits)?;
+    if recovered.requires_reconciliation {
+        return Err(RecoveryError::new(
+            "deletion segment durable prefix is not record-complete",
+        ));
+    }
+    match (expected.last_sequence, recovered.records.first()) {
+        (Some(last), Some(first))
+            if first.sequence == expected.first_sequence && recovered.last_sequence == last => {}
+        (None, None) if recovered.last_sequence == 0 => {}
+        _ => {
+            return Err(RecoveryError::new(
+                "deletion segment sequence metadata does not match durable bytes",
+            ));
+        }
+    }
+    let durable_hash: [u8; 32] = Sha256::digest(durable_bytes).into();
+    match expected.state.as_str() {
+        "sealed"
+            if metadata.len() == expected.durable_end_offset
+                && expected.stored_segment_hash == Some(durable_hash) => {}
+        "open" if expected.stored_segment_hash.is_none() => {}
+        "sealed" => {
+            return Err(RecoveryError::new(
+                "sealed deletion segment hash or length does not match metadata",
+            ));
+        }
+        _ => {
+            return Err(RecoveryError::new(
+                "deletion segment source state is not authenticatable",
+            ));
+        }
+    }
+    Ok(AuthenticatedDeletionSegment {
+        file_length: metadata.len(),
+        file_hash: Sha256::digest(&bytes).into(),
+        durable_hash,
+    })
 }
 
 fn validate_recovery_owner(

@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 mod codec;
 mod writer;
 
+pub(crate) use codec::authenticate_segment_for_deletion;
 #[cfg(test)]
 pub(crate) use codec::recover_segments;
 pub(crate) use codec::recover_segments_from_directory;
@@ -101,6 +102,28 @@ pub(crate) struct AuthenticatedSegment {
     pub(crate) durable_end_offset: u64,
     pub(crate) folded_end_offset: u64,
     pub(crate) segment_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeletionSegmentExpectation {
+    pub(crate) scope_id: ScopeId,
+    pub(crate) epoch: u64,
+    pub(crate) segment_id: String,
+    pub(crate) owner_token: [u8; 32],
+    pub(crate) first_sequence: u64,
+    pub(crate) last_sequence: Option<u64>,
+    pub(crate) durable_end_offset: u64,
+    pub(crate) previous_segment_hash: [u8; 32],
+    pub(crate) stored_segment_hash: Option<[u8; 32]>,
+    pub(crate) state: String,
+    pub(crate) limits: PersistedLogLimits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedDeletionSegment {
+    pub(crate) file_length: u64,
+    pub(crate) file_hash: [u8; 32],
+    pub(crate) durable_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
