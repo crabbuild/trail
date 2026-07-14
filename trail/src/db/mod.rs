@@ -141,7 +141,20 @@ pub(crate) struct ValidatedSchemaGeneration {
 impl ValidatedSchemaGeneration {
     pub(crate) fn verify_unchanged(&self) -> Result<()> {
         let current = schema_generation(&self.db_path).map_err(schema_reinitialize_error)?;
-        if current != self.generation {
+        let concurrent_handoffs = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_handoffs
+            > 1;
+        if current != self.generation
+            && !schema_generation_is_only_volatile_shm_presence_transition(
+                &self.generation,
+                &current,
+                concurrent_handoffs,
+            )
+        {
             return Err(schema_reinitialize_error(
                 "schema main/WAL/SHM generation changed during mutable handoff",
             ));
@@ -195,6 +208,38 @@ impl ValidatedSchemaGeneration {
         }
         Ok(())
     }
+}
+
+fn schema_generation_is_only_volatile_shm_presence_transition(
+    expected: &SchemaGeneration,
+    current: &SchemaGeneration,
+    concurrent_handoffs: bool,
+) -> bool {
+    expected.0.len() == current.0.len()
+        && expected
+            .0
+            .iter()
+            .zip(&current.0)
+            .all(|(expected, current)| {
+                if expected.suffix != current.suffix {
+                    return false;
+                }
+                if expected.suffix == "-shm" {
+                    // SQLite creates, removes, and recreates SHM as its first and
+                    // last live connections cross the handoff. SHM is a rebuildable
+                    // lock/index file, not durable schema authority. Permit only a
+                    // presence transition or a same-device, same-length inode
+                    // rotation; in-place byte/length mutation remains a hard failure.
+                    return concurrent_handoffs
+                        || expected.present != current.present
+                        || (expected.present
+                            && current.present
+                            && expected.device == current.device
+                            && expected.inode != current.inode
+                            && expected.length == current.length);
+                }
+                expected == current
+            })
 }
 
 #[cfg(unix)]
