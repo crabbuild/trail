@@ -10,6 +10,31 @@ thread_local! {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static PRIVATE_DIR_CREATE_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn install_private_dir_create_open_hook(hook: impl FnOnce() + 'static) {
+    PRIVATE_DIR_CREATE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn clear_private_dir_create_open_hook() {
+    PRIVATE_DIR_CREATE_OPEN_HOOK.with(|slot| slot.borrow_mut().take());
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn run_private_dir_create_open_hook() {
+    PRIVATE_DIR_CREATE_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn install_verified_unlink_inner_window_hook(hook: impl FnOnce() + 'static) {
     VERIFIED_UNLINK_INNER_WINDOW_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
@@ -107,6 +132,8 @@ impl SecureDirectory {
         validate_leaf(name)?;
         mkdirat(&self.file, Path::new(name), Mode::from_raw_mode(0o700))
             .map_err(|error| Error::Io(error.into()))?;
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        run_private_dir_create_open_hook();
         let directory = self.open_dir(name)?;
         directory.verify_private()?;
         Ok(directory)

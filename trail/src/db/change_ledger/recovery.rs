@@ -221,17 +221,15 @@ pub(crate) struct SegmentDeletionToken {
     epoch: u64,
     segment_id: String,
     directory: std::sync::Arc<super::secure_fs::SecureDirectory>,
-    quarantine_directory: std::sync::Arc<super::secure_fs::SecureDirectory>,
     identity: PersistedSegmentDeletion,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PersistedSegmentDeletion {
     original_leaf: String,
-    quarantine_directory_leaf: String,
     quarantine_leaf: String,
     scope_directory_identity: (u64, u64),
-    quarantine_directory_identity: (u64, u64),
+    quarantine_identity: (u64, u64),
     segment_identity: (u64, u64),
     file_length: u64,
     file_hash: [u8; 32],
@@ -255,10 +253,6 @@ impl std::fmt::Debug for SegmentDeletionToken {
             .field("epoch", &self.epoch)
             .field("segment_id", &self.segment_id)
             .field("leaf", &self.identity.original_leaf)
-            .field(
-                "quarantine_directory_leaf",
-                &self.identity.quarantine_directory_leaf,
-            )
             .field("quarantine_leaf", &self.identity.quarantine_leaf)
             .field("state", &self.identity.state)
             .finish()
@@ -288,10 +282,8 @@ struct RetirementIdentity {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum DeletionSubstitutionPoint {
     Parent,
-    Leaf,
     BeforeQuarantineMove,
-    AfterQuarantineVerify,
-    OrphanQuarantineAfterVerify,
+    AfterDirectRenameBeforeVerify,
 }
 
 #[cfg(debug_assertions)]
@@ -638,18 +630,20 @@ struct RetiredSegmentRow {
     stored_segment_hash: Option<[u8; 32]>,
     segment_path: String,
     state: String,
+    source_identity: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
 struct QuarantineAllocation {
     attempt_nonce: String,
-    quarantine_directory_leaf: String,
+    quarantine_leaf: String,
     scope_directory_identity: (u64, u64),
-    quarantine_directory_identity: Option<(u64, u64)>,
+    source_identity: (u64, u64),
+    quarantine_identity: Option<(u64, u64)>,
     state: String,
 }
 
-fn allocation_quarantine_directory_leaf(
+fn allocation_quarantine_leaf(
     scope_id: super::ScopeId,
     epoch: u64,
     segment_id: &str,
@@ -658,12 +652,12 @@ fn allocation_quarantine_directory_leaf(
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-    hasher.update(b"trail-segment-quarantine-allocation-v1\0");
+    hasher.update(b"trail-segment-direct-quarantine-v1\0");
     hasher.update(scope_id.0);
     hasher.update(epoch.to_le_bytes());
     hasher.update(segment_id.as_bytes());
     hasher.update(attempt_nonce.as_bytes());
-    format!(".trail-delete-{}.d", hex::encode(hasher.finalize()))
+    format!(".trail-delete-{}.cplq", hex::encode(hasher.finalize()))
 }
 
 fn new_allocation_nonce() -> Result<String> {
@@ -680,63 +674,30 @@ fn insert_quarantine_allocation(
     epoch: u64,
     segment_id: &str,
     scope_directory_identity: (u64, u64),
+    source_identity: (u64, u64),
 ) -> Result<()> {
     let attempt_nonce = new_allocation_nonce()?;
-    let quarantine_directory_leaf =
-        allocation_quarantine_directory_leaf(scope_id, epoch, segment_id, &attempt_nonce);
+    let quarantine_leaf = allocation_quarantine_leaf(scope_id, epoch, segment_id, &attempt_nonce);
     let now = now_ts();
     tx.execute(
         "INSERT INTO changed_path_segment_quarantine_allocations(
-             attempt_nonce,scope_id,epoch,segment_id,quarantine_directory_leaf,
+             attempt_nonce,scope_id,epoch,segment_id,quarantine_leaf,
              scope_directory_device,scope_directory_inode,identity_policy,
-             quarantine_directory_device,quarantine_directory_inode,
+             source_segment_device,source_segment_inode,quarantine_device,quarantine_inode,
              observed_conflict_device,observed_conflict_inode,retained_reason,state,
              created_at,updated_at,allocated_at,bound_at,abandoned_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,'fresh_private_0700_same_euid',
-                NULL,NULL,NULL,NULL,NULL,'allocating',?8,?8,NULL,NULL,NULL)",
+         VALUES(?1,?2,?3,?4,?5,?6,?7,'direct_noreplace_same_directory_v1',
+                ?8,?9,NULL,NULL,NULL,NULL,NULL,'allocating',?10,?10,NULL,NULL,NULL)",
         params![
             attempt_nonce,
             scope_id.to_text(),
             sql_u64(epoch, "scope epoch")?,
             segment_id,
-            quarantine_directory_leaf,
+            quarantine_leaf,
             encode_fs_identity_part(scope_directory_identity.0),
             encode_fs_identity_part(scope_directory_identity.1),
-            now,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_abandoned_preexisting_allocation(
-    tx: &Transaction<'_>,
-    expected: &RetirementIdentity,
-    segment_id: &str,
-    quarantine_directory_leaf: &str,
-    scope_directory_identity: (u64, u64),
-    observed_identity: Option<(u64, u64)>,
-) -> Result<()> {
-    let now = now_ts();
-    tx.execute(
-        "INSERT INTO changed_path_segment_quarantine_allocations(
-             attempt_nonce,scope_id,epoch,segment_id,quarantine_directory_leaf,
-             scope_directory_device,scope_directory_inode,identity_policy,
-             quarantine_directory_device,quarantine_directory_inode,
-             observed_conflict_device,observed_conflict_inode,retained_reason,state,
-             created_at,updated_at,allocated_at,bound_at,abandoned_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,'fresh_private_0700_same_euid',
-                NULL,NULL,?8,?9,'preexisting_unjournaled_namespace','abandoned',
-                ?10,?10,NULL,NULL,?10)",
-        params![
-            new_allocation_nonce()?,
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?,
-            segment_id,
-            quarantine_directory_leaf,
-            encode_fs_identity_part(scope_directory_identity.0),
-            encode_fs_identity_part(scope_directory_identity.1),
-            observed_identity.map(|identity| encode_fs_identity_part(identity.0)),
-            observed_identity.map(|identity| encode_fs_identity_part(identity.1)),
+            encode_fs_identity_part(source_identity.0),
+            encode_fs_identity_part(source_identity.1),
             now,
         ],
     )?;
@@ -751,10 +712,10 @@ fn load_active_quarantine_allocation(
 ) -> Result<QuarantineAllocation> {
     let rows = conn
         .prepare(
-            "SELECT attempt_nonce,quarantine_directory_leaf,
+            "SELECT attempt_nonce,quarantine_leaf,
                     scope_directory_device,scope_directory_inode,
-                    quarantine_directory_device,quarantine_directory_inode,state,
-                    identity_policy
+                    source_segment_device,source_segment_inode,
+                    quarantine_device,quarantine_inode,state,identity_policy
              FROM changed_path_segment_quarantine_allocations
              WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3
                AND state IN ('allocating','allocated','bound')",
@@ -771,10 +732,12 @@ fn load_active_quarantine_allocation(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )?
@@ -787,30 +750,34 @@ fn load_active_quarantine_allocation(
         )));
     }
     let row = &rows[0];
-    if row.7 != "fresh_private_0700_same_euid" || row.4.is_some() != row.5.is_some() {
+    if row.9 != "direct_noreplace_same_directory_v1" || row.6.is_some() != row.7.is_some() {
         return Err(Error::Corrupt(
             "quarantine allocation identity policy or identity pair is invalid".into(),
         ));
     }
     Ok(QuarantineAllocation {
         attempt_nonce: row.0.clone(),
-        quarantine_directory_leaf: row.1.clone(),
+        quarantine_leaf: row.1.clone(),
         scope_directory_identity: (
             decode_fs_identity_part(&row.2, "allocation scope directory device")?,
             decode_fs_identity_part(&row.3, "allocation scope directory inode")?,
         ),
-        quarantine_directory_identity: row
-            .4
+        source_identity: (
+            decode_fs_identity_part(&row.4, "allocation source device")?,
+            decode_fs_identity_part(&row.5, "allocation source inode")?,
+        ),
+        quarantine_identity: row
+            .6
             .as_deref()
-            .zip(row.5.as_deref())
+            .zip(row.7.as_deref())
             .map(|(device, inode)| {
                 Ok::<(u64, u64), Error>((
-                    decode_fs_identity_part(device, "allocation directory device")?,
-                    decode_fs_identity_part(inode, "allocation directory inode")?,
+                    decode_fs_identity_part(device, "allocation quarantine device")?,
+                    decode_fs_identity_part(inode, "allocation quarantine inode")?,
                 ))
             })
             .transpose()?,
-        state: row.6.clone(),
+        state: row.8.clone(),
     })
 }
 
@@ -884,6 +851,7 @@ fn load_retired_segment_rows(
                     .transpose()?,
                 segment_path: row.8,
                 state: row.9,
+                source_identity: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -915,7 +883,7 @@ fn inspect_segments_before_allocation(
     scope_id: super::ScopeId,
     epoch: u64,
 ) -> Result<((u64, u64), Vec<RetiredSegmentRow>)> {
-    let (limits, rows) = load_retired_segment_rows(conn, scope_id, epoch)?;
+    let (limits, mut rows) = load_retired_segment_rows(conn, scope_id, epoch)?;
     if rows.is_empty() {
         return Ok(((0, 0), rows));
     }
@@ -927,7 +895,7 @@ fn inspect_segments_before_allocation(
     let mut expected_previous_segment_hash = [0; 32];
     let mut expected_first_sequence = 1_u64;
     let mut saw_open_segment = false;
-    for row in &rows {
+    for row in &mut rows {
         if saw_open_segment
             || row.previous_segment_id != expected_previous_segment_id
             || row.previous_segment_hash != expected_previous_segment_hash
@@ -938,7 +906,23 @@ fn inspect_segments_before_allocation(
                 row.segment_id
             )));
         }
-        let file = directory.open_regular(&row.segment_path)?;
+        let file = match directory.open_regular(&row.segment_path) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let allocation =
+                    load_active_quarantine_allocation(conn, scope_id, epoch, &row.segment_id)?;
+                let file = directory.open_regular(&allocation.quarantine_leaf)?;
+                let identity = super::secure_fs::file_identity(&file)?;
+                if identity != allocation.source_identity {
+                    return Err(Error::InvalidInput(
+                        "journaled quarantine does not match the authenticated source inode".into(),
+                    ));
+                }
+                file
+            }
+            Err(error) => return Err(error),
+        };
+        let source_identity = super::secure_fs::file_identity(&file)?;
         let authenticated = super::log::authenticate_segment_for_deletion(
             &file,
             &super::log::DeletionSegmentExpectation {
@@ -956,6 +940,7 @@ fn inspect_segments_before_allocation(
             },
         )
         .map_err(|error| Error::Corrupt(error.to_string()))?;
+        row.source_identity = Some(source_identity);
         expected_previous_segment_id = Some(row.segment_id.clone());
         expected_previous_segment_hash = authenticated.durable_hash;
         saw_open_segment = row.state == "open";
@@ -970,35 +955,12 @@ fn inspect_segments_before_allocation(
 
 fn journal_missing_quarantine_allocations(
     conn: &Connection,
-    database_path: &std::path::Path,
     expected: &RetirementIdentity,
     scope_directory_identity: (u64, u64),
     rows: &[RetiredSegmentRow],
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
-    }
-    let directory = super::secure_fs::SecureDirectory::open_absolute(
-        &scope_segment_directory_path(database_path, expected.scope_id)?,
-    )?;
-    directory.verify_identity(scope_directory_identity)?;
-    let mut preexisting = Vec::new();
-    for row in rows {
-        let leaf =
-            deletion_quarantine_directory_leaf(expected.scope_id, expected.epoch, &row.segment_id);
-        match directory.open_private_dir(&leaf) {
-            Ok(orphan) => {
-                orphan.identity()?;
-                #[cfg(debug_assertions)]
-                run_deletion_substitution_hook(
-                    DeletionSubstitutionPoint::OrphanQuarantineAfterVerify,
-                );
-                let observed = directory.open_private_dir(&leaf)?.identity()?;
-                preexisting.push((row.segment_id.clone(), leaf, Some(observed)));
-            }
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => preexisting.push((row.segment_id.clone(), leaf, None)),
-        }
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if load_retirement_identity(&tx, &expected.scope_id.to_text())?.as_ref() != Some(expected) {
@@ -1008,24 +970,6 @@ fn journal_missing_quarantine_allocations(
             reason: "scope identity changed before quarantine allocation journal".into(),
             command: "trail status".into(),
         });
-    }
-    for (segment_id, leaf, observed_identity) in preexisting {
-        let already_audited: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM changed_path_segment_quarantine_allocations
-             WHERE quarantine_directory_leaf=?1)",
-            [&leaf],
-            |row| row.get(0),
-        )?;
-        if !already_audited {
-            insert_abandoned_preexisting_allocation(
-                &tx,
-                expected,
-                &segment_id,
-                &leaf,
-                scope_directory_identity,
-                observed_identity,
-            )?;
-        }
     }
     for row in rows {
         let active: i64 = tx.query_row(
@@ -1046,6 +990,9 @@ fn journal_missing_quarantine_allocations(
                 expected.epoch,
                 &row.segment_id,
                 scope_directory_identity,
+                row.source_identity.ok_or_else(|| {
+                    Error::Corrupt("retirement source identity was not authenticated".into())
+                })?,
             )?,
             1 => {}
             count => {
@@ -1069,6 +1016,7 @@ fn abandon_quarantine_allocation_and_replace(
     allocation: &QuarantineAllocation,
     observed_identity: Option<(u64, u64)>,
     reason: &str,
+    replace: bool,
 ) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if load_retirement_identity(&tx, &expected.scope_id.to_text())?.as_ref() != Some(expected) {
@@ -1099,13 +1047,16 @@ fn abandon_quarantine_allocation_and_replace(
             "quarantine allocation changed while abandoning it".into(),
         ));
     }
-    insert_quarantine_allocation(
-        &tx,
-        expected.scope_id,
-        expected.epoch,
-        segment_id,
-        allocation.scope_directory_identity,
-    )?;
+    if replace {
+        insert_quarantine_allocation(
+            &tx,
+            expected.scope_id,
+            expected.epoch,
+            segment_id,
+            allocation.scope_directory_identity,
+            allocation.source_identity,
+        )?;
+    }
     tx.commit()?;
     durable_intent_barrier(conn)
 }
@@ -1119,10 +1070,10 @@ fn mark_quarantine_allocation_allocated(
     let now = now_ts();
     let changed = tx.execute(
         "UPDATE changed_path_segment_quarantine_allocations
-         SET state='allocated',quarantine_directory_device=?1,
-             quarantine_directory_inode=?2,updated_at=?3,allocated_at=?3
+         SET state='allocated',quarantine_device=?1,
+             quarantine_inode=?2,updated_at=?3,allocated_at=?3
          WHERE attempt_nonce=?4 AND state='allocating'
-           AND quarantine_directory_device IS NULL AND quarantine_directory_inode IS NULL",
+           AND quarantine_device IS NULL AND quarantine_inode IS NULL",
         params![
             encode_fs_identity_part(identity.0),
             encode_fs_identity_part(identity.1),
@@ -1141,6 +1092,33 @@ fn mark_quarantine_allocation_allocated(
     Ok(())
 }
 
+fn authenticate_direct_quarantine(
+    file: &std::fs::File,
+    row: &RetiredSegmentRow,
+    scope_id: super::ScopeId,
+    epoch: u64,
+    limits: super::PersistedLogLimits,
+) -> Result<()> {
+    super::log::authenticate_segment_for_deletion(
+        file,
+        &super::log::DeletionSegmentExpectation {
+            scope_id,
+            epoch,
+            segment_id: row.segment_id.clone(),
+            owner_token: row.owner_token,
+            first_sequence: row.first_sequence,
+            last_sequence: row.last_sequence,
+            durable_end_offset: row.durable_end_offset,
+            previous_segment_hash: row.previous_segment_hash,
+            stored_segment_hash: row.stored_segment_hash,
+            state: row.state.clone(),
+            limits,
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| Error::Corrupt(error.to_string()))
+}
+
 fn ensure_segment_quarantine_allocations(
     conn: &Connection,
     database_path: &std::path::Path,
@@ -1151,16 +1129,11 @@ fn ensure_segment_quarantine_allocations(
     if rows.is_empty() {
         return Ok(());
     }
-    journal_missing_quarantine_allocations(
-        conn,
-        database_path,
-        expected,
-        scope_directory_identity,
-        &rows,
-    )?;
+    journal_missing_quarantine_allocations(conn, expected, scope_directory_identity, &rows)?;
     let directory = super::secure_fs::SecureDirectory::open_absolute(
         &scope_segment_directory_path(database_path, expected.scope_id)?,
     )?;
+    let (limits, _) = load_retired_segment_rows(conn, expected.scope_id, expected.epoch)?;
     directory.verify_identity(scope_directory_identity)?;
     for (index, row) in rows.iter().enumerate() {
         let mut attempts = 0_usize;
@@ -1181,97 +1154,119 @@ fn ensure_segment_quarantine_allocations(
             directory.verify_identity(allocation.scope_directory_identity)?;
             match allocation.state.as_str() {
                 "allocated" => {
-                    match directory.open_private_dir(&allocation.quarantine_directory_leaf) {
-                        Ok(opened) => {
-                            let observed = opened.identity()?;
-                            if Some(observed) == allocation.quarantine_directory_identity {
-                                break;
-                            }
+                    let opened = directory.open_regular(&allocation.quarantine_leaf)?;
+                    let observed = super::secure_fs::file_identity(&opened)?;
+                    if Some(observed) != allocation.quarantine_identity
+                        || observed != allocation.source_identity
+                    {
+                        abandon_quarantine_allocation_and_replace(
+                            conn,
+                            expected,
+                            &row.segment_id,
+                            &allocation,
+                            Some(observed),
+                            "allocated_direct_quarantine_identity_mismatch",
+                            false,
+                        )?;
+                        return Err(Error::InvalidInput(
+                            "allocated direct quarantine identity changed".into(),
+                        ));
+                    }
+                    authenticate_direct_quarantine(
+                        &opened,
+                        row,
+                        expected.scope_id,
+                        expected.epoch,
+                        limits,
+                    )?;
+                    break;
+                }
+                "allocating" => match directory.open_regular(&allocation.quarantine_leaf) {
+                    Ok(opened) => {
+                        let observed = super::secure_fs::file_identity(&opened)?;
+                        if observed != allocation.source_identity {
+                            let source_still_present =
+                                open_optional_regular(&directory, &row.segment_path)?.is_some();
                             abandon_quarantine_allocation_and_replace(
                                 conn,
                                 expected,
                                 &row.segment_id,
                                 &allocation,
                                 Some(observed),
-                                "allocated_namespace_identity_mismatch",
+                                "direct_quarantine_target_identity_mismatch",
+                                source_still_present,
                             )?;
+                            if source_still_present {
+                                continue;
+                            }
+                            return Err(Error::InvalidInput(
+                                "direct quarantine target does not match journaled source".into(),
+                            ));
                         }
-                        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                            abandon_quarantine_allocation_and_replace(
-                                conn,
-                                expected,
-                                &row.segment_id,
-                                &allocation,
-                                None,
-                                "allocated_namespace_missing",
-                            )?;
-                        }
-                        Err(_) => {
-                            abandon_quarantine_allocation_and_replace(
-                                conn,
-                                expected,
-                                &row.segment_id,
-                                &allocation,
-                                None,
-                                "allocated_namespace_unopenable",
-                            )?;
-                        }
-                    }
-                }
-                "allocating" => match directory
-                    .open_private_dir(&allocation.quarantine_directory_leaf)
-                {
-                    Ok(opened) => {
-                        abandon_quarantine_allocation_and_replace(
-                            conn,
-                            expected,
-                            &row.segment_id,
-                            &allocation,
-                            Some(opened.identity()?),
-                            "allocating_namespace_present_without_persisted_identity",
+                        authenticate_direct_quarantine(
+                            &opened,
+                            row,
+                            expected.scope_id,
+                            expected.epoch,
+                            limits,
                         )?;
+                        crate::db::util::test_crash_point(
+                            "changed_path_deletion_after_direct_quarantine_verify",
+                        );
+                        opened.sync_all()?;
+                        directory.sync()?;
+                        crate::db::util::test_crash_point(
+                            "changed_path_deletion_after_direct_quarantine_fsync",
+                        );
+                        mark_quarantine_allocation_allocated(conn, &allocation, observed)?;
+                        break;
                     }
                     Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        match directory.create_private_dir(&allocation.quarantine_directory_leaf) {
-                            Ok(created) => {
+                        let source = directory.open_regular(&row.segment_path)?;
+                        if super::secure_fs::file_identity(&source)? != allocation.source_identity {
+                            return Err(Error::InvalidInput(
+                                "retirement source changed after allocation journal".into(),
+                            ));
+                        }
+                        #[cfg(debug_assertions)]
+                        run_deletion_substitution_hook(
+                            DeletionSubstitutionPoint::BeforeQuarantineMove,
+                        );
+                        match directory
+                            .rename_leaf_noreplace(&row.segment_path, &allocation.quarantine_leaf)
+                        {
+                            Ok(()) => {
                                 crate::db::util::test_crash_point(
-                                    "changed_path_deletion_after_allocation_mkdir",
+                                    "changed_path_deletion_after_direct_quarantine_rename",
                                 );
-                                let identity = created.identity()?;
-                                created.sync()?;
-                                directory.sync()?;
-                                mark_quarantine_allocation_allocated(conn, &allocation, identity)?;
-                                break;
+                                #[cfg(debug_assertions)]
+                                run_deletion_substitution_hook(
+                                    DeletionSubstitutionPoint::AfterDirectRenameBeforeVerify,
+                                );
                             }
                             Err(Error::Io(error))
                                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
                             {
                                 let observed = directory
-                                    .open_private_dir(&allocation.quarantine_directory_leaf)
+                                    .open_regular(&allocation.quarantine_leaf)
                                     .ok()
-                                    .and_then(|opened| opened.identity().ok());
+                                    .and_then(|opened| {
+                                        super::secure_fs::file_identity(&opened).ok()
+                                    });
                                 abandon_quarantine_allocation_and_replace(
                                     conn,
                                     expected,
                                     &row.segment_id,
                                     &allocation,
                                     observed,
-                                    "allocation_create_conflict",
+                                    "direct_quarantine_target_preexisting",
+                                    true,
                                 )?;
                             }
                             Err(error) => return Err(error),
                         }
                     }
-                    Err(_) => {
-                        abandon_quarantine_allocation_and_replace(
-                            conn,
-                            expected,
-                            &row.segment_id,
-                            &allocation,
-                            None,
-                            "allocating_namespace_unopenable",
-                        )?;
-                    }
+                    Err(error) => return Err(error),
                 },
                 state => {
                     return Err(Error::Corrupt(format!(
@@ -1351,14 +1346,19 @@ fn prepare_segment_deletion_transactions(
                 row.segment_id
             )));
         }
-        let quarantine_directory_identity = allocation
-            .quarantine_directory_identity
+        let quarantine_identity = allocation
+            .quarantine_identity
             .ok_or_else(|| Error::Corrupt("allocated quarantine identity is missing".into()))?;
-        let quarantine_directory =
-            directory.open_private_dir(&allocation.quarantine_directory_leaf)?;
-        quarantine_directory.verify_identity(quarantine_directory_identity)?;
-        let file = directory.open_regular(&row.segment_path)?;
-        let segment_identity = super::secure_fs::file_identity(&file)?;
+        let file = directory.open_regular(&allocation.quarantine_leaf)?;
+        let observed_identity = super::secure_fs::file_identity(&file)?;
+        if observed_identity != quarantine_identity
+            || observed_identity != allocation.source_identity
+        {
+            return Err(Error::InvalidInput(
+                "direct quarantine identity changed before retirement binding".into(),
+            ));
+        }
+        let segment_identity = allocation.source_identity;
         let authenticated = super::log::authenticate_segment_for_deletion(
             &file,
             &super::log::DeletionSegmentExpectation {
@@ -1387,27 +1387,26 @@ fn prepare_segment_deletion_transactions(
         let now = now_ts();
         tx.execute(
             "INSERT INTO changed_path_segment_deletions(
-                 scope_id,epoch,segment_id,original_leaf,quarantine_directory_leaf,
-                 quarantine_leaf,allocation_nonce,scope_directory_device,scope_directory_inode,
-                 quarantine_directory_device,quarantine_directory_inode,
+                 scope_id,epoch,segment_id,original_leaf,quarantine_leaf,allocation_nonce,
+                 scope_directory_device,scope_directory_inode,quarantine_device,quarantine_inode,
                  segment_device,segment_inode,file_length,file_hash,durable_end_offset,
                  durable_hash,max_observer_log_bytes,max_segment_bytes,
                  max_unfolded_tail_records,owner_token,first_sequence,last_sequence,
                  previous_segment_id,previous_segment_hash,source_state,state,
                  created_at,updated_at,completed_at)
-             VALUES(?1,?2,?3,?4,?5,'segment.cplq',?6,?7,?8,?9,?10,?11,?12,?13,?14,
-                    ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,'prepared',?26,?26,NULL)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                    ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,'quiesced',?26,?26,?26)",
             params![
                 scope_id.to_text(),
                 sql_u64(epoch, "scope epoch")?,
                 row.segment_id,
                 row.segment_path,
-                allocation.quarantine_directory_leaf,
+                allocation.quarantine_leaf,
                 allocation.attempt_nonce,
                 encode_fs_identity_part(scope_directory_identity.0),
                 encode_fs_identity_part(scope_directory_identity.1),
-                encode_fs_identity_part(quarantine_directory_identity.0),
-                encode_fs_identity_part(quarantine_directory_identity.1),
+                encode_fs_identity_part(quarantine_identity.0),
+                encode_fs_identity_part(quarantine_identity.1),
                 encode_fs_identity_part(segment_identity.0),
                 encode_fs_identity_part(segment_identity.1),
                 sql_u64(authenticated.file_length, "segment file length")?,
@@ -1445,25 +1444,9 @@ fn prepare_segment_deletion_transactions(
                 row.segment_id
             )));
         }
-        quarantine_directory.sync()?;
     }
     directory.sync()?;
     Ok(())
-}
-
-fn deletion_quarantine_directory_leaf(
-    scope_id: super::ScopeId,
-    epoch: u64,
-    segment_id: &str,
-) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"trail-segment-deletion-quarantine-v2\0");
-    hasher.update(scope_id.0);
-    hasher.update(epoch.to_le_bytes());
-    hasher.update(segment_id.as_bytes());
-    format!(".trail-delete-{}.d", hex::encode(hasher.finalize()))
 }
 
 fn validate_segment_deletion_transaction_coverage(
@@ -1492,16 +1475,15 @@ fn validate_segment_deletion_transaction_coverage(
                      OR allocation.scope_id<>deletion.scope_id
                      OR allocation.epoch<>deletion.epoch
                      OR allocation.segment_id<>deletion.segment_id
-                     OR allocation.quarantine_directory_leaf<>
-                        deletion.quarantine_directory_leaf
+                     OR allocation.quarantine_leaf<>deletion.quarantine_leaf
                      OR allocation.scope_directory_device<>
                         deletion.scope_directory_device
                      OR allocation.scope_directory_inode<>
                         deletion.scope_directory_inode
-                     OR allocation.quarantine_directory_device<>
-                        deletion.quarantine_directory_device
-                     OR allocation.quarantine_directory_inode<>
-                        deletion.quarantine_directory_inode))",
+                     OR allocation.source_segment_device<>deletion.segment_device
+                     OR allocation.source_segment_inode<>deletion.segment_inode
+                     OR allocation.quarantine_device<>deletion.quarantine_device
+                     OR allocation.quarantine_inode<>deletion.quarantine_inode))",
             params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
@@ -1536,16 +1518,17 @@ fn load_segment_deletion_tokens(
     rows.into_iter()
         .map(|(segment_id, identity)| {
             directory.verify_identity(identity.scope_directory_identity)?;
-            let quarantine_directory = std::sync::Arc::new(
-                directory.open_private_dir(&identity.quarantine_directory_leaf)?,
-            );
-            quarantine_directory.verify_identity(identity.quarantine_directory_identity)?;
+            let quarantined = directory.open_regular(&identity.quarantine_leaf)?;
+            if super::secure_fs::file_identity(&quarantined)? != identity.quarantine_identity {
+                return Err(Error::InvalidInput(
+                    "direct quarantine identity changed while loading deletion token".into(),
+                ));
+            }
             Ok(SegmentDeletionToken {
                 scope_id,
                 epoch,
                 segment_id,
                 directory: directory.clone(),
-                quarantine_directory,
                 identity,
             })
         })
@@ -1568,94 +1551,22 @@ pub(crate) fn remove_retired_segments(
         token
             .directory
             .verify_identity(current.scope_directory_identity)?;
-        token
-            .quarantine_directory
-            .verify_identity(current.quarantine_directory_identity)?;
         #[cfg(debug_assertions)]
         run_deletion_substitution_hook(DeletionSubstitutionPoint::Parent);
         let original = open_optional_regular(&token.directory, &current.original_leaf)?;
-        let quarantined =
-            open_optional_regular(&token.quarantine_directory, &current.quarantine_leaf)?;
-        if current.state == "quiesced" {
-            if original.is_some() || quarantined.is_none() {
-                return Err(Error::InvalidInput(
-                    "quiesced segment retirement has missing or reappeared filesystem evidence"
-                        .into(),
-                ));
-            }
-            authenticate_persisted_deletion_file(
-                token,
-                &current,
-                quarantined.as_ref().expect("checked quarantine presence"),
-            )?;
-            continue;
+        let quarantined = open_optional_regular(&token.directory, &current.quarantine_leaf)?;
+        if current.state != "quiesced" || original.is_some() || quarantined.is_none() {
+            return Err(Error::InvalidInput(
+                "quiesced direct segment retirement has missing or reappeared evidence".into(),
+            ));
         }
-        let quarantined = match (original, quarantined) {
-            (Some(original), None) if current.state == "prepared" => {
-                #[cfg(debug_assertions)]
-                run_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf);
-                token
-                    .directory
-                    .verify_opened_regular(&current.original_leaf, &original)?;
-                authenticate_persisted_deletion_file(token, &current, &original)?;
-                #[cfg(debug_assertions)]
-                run_deletion_substitution_hook(DeletionSubstitutionPoint::BeforeQuarantineMove);
-                token.directory.rename_leaf_to_noreplace(
-                    &current.original_leaf,
-                    &token.quarantine_directory,
-                    &current.quarantine_leaf,
-                )?;
-                crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_move");
-                let quarantined = token
-                    .quarantine_directory
-                    .open_regular(&current.quarantine_leaf)?;
-                authenticate_persisted_deletion_file(token, &current, &quarantined)?;
-                token.quarantine_directory.sync()?;
-                token.directory.sync()?;
-                update_segment_deletion_state(conn, token, &["prepared"], "quarantined", false)?;
-                quarantined
-            }
-            (None, Some(quarantined))
-                if matches!(current.state.as_str(), "prepared" | "quarantined") =>
-            {
-                authenticate_persisted_deletion_file(token, &current, &quarantined)?;
-                if current.state == "prepared" {
-                    token.quarantine_directory.sync()?;
-                    token.directory.sync()?;
-                    update_segment_deletion_state(
-                        conn,
-                        token,
-                        &["prepared"],
-                        "quarantined",
-                        false,
-                    )?;
-                }
-                quarantined
-            }
-            _ => {
-                return Err(Error::InvalidInput(format!(
-                    "segment deletion filesystem state does not match persisted state `{}`",
-                    current.state
-                )));
-            }
-        };
+        let quarantined = quarantined.expect("checked direct quarantine presence");
+        if super::secure_fs::file_identity(&quarantined)? != current.quarantine_identity {
+            return Err(Error::InvalidInput(
+                "quiesced direct quarantine inode changed".into(),
+            ));
+        }
         authenticate_persisted_deletion_file(token, &current, &quarantined)?;
-        crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_verify");
-        #[cfg(debug_assertions)]
-        run_deletion_substitution_hook(DeletionSubstitutionPoint::AfterQuarantineVerify);
-        let terminal_quarantine = token
-            .quarantine_directory
-            .open_regular(&current.quarantine_leaf)?;
-        token
-            .quarantine_directory
-            .verify_same_opened_regular(&quarantined, &terminal_quarantine)?;
-        authenticate_persisted_deletion_file(token, &current, &terminal_quarantine)?;
-        terminal_quarantine.sync_all()?;
-        token.quarantine_directory.sync()?;
-        token.directory.sync()?;
-        crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_fsync");
-        update_segment_deletion_state(conn, token, &["prepared", "quarantined"], "quiesced", true)?;
-        crate::db::util::test_crash_point("changed_path_deletion_after_quiesced_state");
     }
     Ok(())
 }
@@ -1666,9 +1577,8 @@ fn load_persisted_segment_deletions(
     epoch: u64,
 ) -> Result<Vec<(String, PersistedSegmentDeletion)>> {
     conn.prepare(
-        "SELECT segment_id,original_leaf,quarantine_directory_leaf,quarantine_leaf,
-                scope_directory_device,scope_directory_inode,
-                quarantine_directory_device,quarantine_directory_inode,
+        "SELECT segment_id,original_leaf,quarantine_leaf,
+                scope_directory_device,scope_directory_inode,quarantine_device,quarantine_inode,
                 segment_device,segment_inode,file_length,file_hash,durable_end_offset,
                 durable_hash,max_observer_log_bytes,max_segment_bytes,
                 max_unfolded_tail_records,owner_token,first_sequence,last_sequence,
@@ -1687,7 +1597,6 @@ fn load_persisted_segment_deletions(
 }
 
 type PersistedSegmentDeletionValues = (
-    String,
     String,
     String,
     String,
@@ -1740,7 +1649,6 @@ fn decode_persisted_segment_deletion(
         row.get(20)?,
         row.get(21)?,
         row.get(22)?,
-        row.get(23)?,
     ))
 }
 
@@ -1751,43 +1659,42 @@ fn decode_persisted_segment_deletion_values(
         row.0,
         PersistedSegmentDeletion {
             original_leaf: row.1,
-            quarantine_directory_leaf: row.2,
-            quarantine_leaf: row.3,
+            quarantine_leaf: row.2,
             scope_directory_identity: (
-                decode_fs_identity_part(&row.4, "scope directory device")?,
-                decode_fs_identity_part(&row.5, "scope directory inode")?,
+                decode_fs_identity_part(&row.3, "scope directory device")?,
+                decode_fs_identity_part(&row.4, "scope directory inode")?,
             ),
-            quarantine_directory_identity: (
-                decode_fs_identity_part(&row.6, "quarantine directory device")?,
-                decode_fs_identity_part(&row.7, "quarantine directory inode")?,
+            quarantine_identity: (
+                decode_fs_identity_part(&row.5, "quarantine device")?,
+                decode_fs_identity_part(&row.6, "quarantine inode")?,
             ),
             segment_identity: (
-                decode_fs_identity_part(&row.8, "segment device")?,
-                decode_fs_identity_part(&row.9, "segment inode")?,
+                decode_fs_identity_part(&row.7, "segment device")?,
+                decode_fs_identity_part(&row.8, "segment inode")?,
             ),
-            file_length: db_u64(row.10, "deletion file length")?,
-            file_hash: decode_hex_32(&row.11, "deletion file hash")?,
-            durable_end_offset: db_u64(row.12, "deletion durable offset")?,
-            durable_hash: decode_hex_32(&row.13, "deletion durable hash")?,
+            file_length: db_u64(row.9, "deletion file length")?,
+            file_hash: decode_hex_32(&row.10, "deletion file hash")?,
+            durable_end_offset: db_u64(row.11, "deletion durable offset")?,
+            durable_hash: decode_hex_32(&row.12, "deletion durable hash")?,
             limits: super::PersistedLogLimits {
-                max_log_bytes: db_u64(row.14, "deletion maximum log bytes")?,
-                max_segment_bytes: db_u64(row.15, "deletion maximum segment bytes")?,
+                max_log_bytes: db_u64(row.13, "deletion maximum log bytes")?,
+                max_segment_bytes: db_u64(row.14, "deletion maximum segment bytes")?,
                 max_unfolded_tail_records: usize::try_from(db_u64(
-                    row.16,
+                    row.15,
                     "deletion maximum unfolded records",
                 )?)
                 .map_err(|_| Error::Corrupt("deletion record cap exceeds memory".into()))?,
             },
-            owner_token: decode_hex_32(&row.17, "deletion owner token")?,
-            first_sequence: db_u64(row.18, "deletion first sequence")?,
+            owner_token: decode_hex_32(&row.16, "deletion owner token")?,
+            first_sequence: db_u64(row.17, "deletion first sequence")?,
             last_sequence: row
-                .19
+                .18
                 .map(|value| db_u64(value, "deletion last sequence"))
                 .transpose()?,
-            previous_segment_id: row.20,
-            previous_segment_hash: decode_hex_32(&row.21, "deletion previous hash")?,
-            source_state: row.22,
-            state: row.23,
+            previous_segment_id: row.19,
+            previous_segment_hash: decode_hex_32(&row.20, "deletion previous hash")?,
+            source_state: row.21,
+            state: row.22,
         },
     ))
 }
@@ -3251,18 +3158,28 @@ mod harness {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn orphan_quarantine_fixture(
-        tag: u8,
-    ) -> Result<(Fixture, std::path::PathBuf, String, (u64, u64))> {
+    fn direct_target_collision_is_retained(tag: u8) -> Result<()> {
         let fixture = Fixture::new(tag)?;
         create_real_retirement_segment(&fixture, tag)?;
-        let segment_id: String = fixture.db.conn.query_row(
-            "SELECT segment_id FROM changed_path_observer_segments
-             WHERE scope_id=?1 AND epoch=?2",
-            params![
-                fixture.expected.scope_id.to_text(),
-                sql_u64(fixture.expected.epoch, "scope epoch")?
-            ],
+        let (scope_identity, rows) = inspect_segments_before_allocation(
+            &fixture.db.conn,
+            &fixture.db.sqlite_path,
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+        )?;
+        let retirement =
+            load_retirement_identity(&fixture.db.conn, &fixture.expected.scope_id.to_text())?
+                .ok_or_else(|| Error::Corrupt("missing collision retirement identity".into()))?;
+        journal_missing_quarantine_allocations(
+            &fixture.db.conn,
+            &retirement,
+            scope_identity,
+            &rows,
+        )?;
+        let quarantine_leaf: String = fixture.db.conn.query_row(
+            "SELECT quarantine_leaf FROM changed_path_segment_quarantine_allocations
+             WHERE scope_id=?1 AND state='allocating'",
+            [fixture.expected.scope_id.to_text()],
             |row| row.get(0),
         )?;
         let directory = fixture
@@ -3270,132 +3187,41 @@ mod harness {
             .db_dir
             .join("observer-segments")
             .join(fixture.expected.scope_id.to_text());
-        let quarantine_leaf = deletion_quarantine_directory_leaf(
-            fixture.expected.scope_id,
-            fixture.expected.epoch,
-            &segment_id,
-        );
-        let parent = super::super::secure_fs::SecureDirectory::open_absolute(&directory)?;
-        let orphan = parent.create_private_dir(&quarantine_leaf)?;
-        let orphan_identity = orphan.identity()?;
-        orphan.sync()?;
-        parent.sync()?;
-        Ok((fixture, directory, quarantine_leaf, orphan_identity))
+        let quarantine = directory.join(&quarantine_leaf);
+        std::fs::write(&quarantine, b"foreign direct quarantine\n")?;
+        let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        let (deletion_rows, audited): (i64, i64) = fixture.db.conn.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM changed_path_segment_deletions WHERE scope_id=?1),
+                 (SELECT COUNT(*) FROM changed_path_segment_quarantine_allocations
+                  WHERE scope_id=?1 AND quarantine_leaf=?2
+                    AND state='abandoned'
+                    AND retained_reason='direct_quarantine_target_identity_mismatch')",
+            params![fixture.expected.scope_id.to_text(), quarantine_leaf],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if std::fs::read(&quarantine)? != b"foreign direct quarantine\n"
+            || tokens.len() != 1
+            || tokens[0].identity.quarantine_leaf == quarantine_leaf
+            || deletion_rows != 1
+            || audited != 1
+        {
+            return Err(Error::Corrupt(
+                "direct target collision was removed or adopted".into(),
+            ));
+        }
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn orphan_quarantine_substitution_fails_closed() -> Result<()> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let (fixture, directory, quarantine_leaf, orphan_identity) =
-            orphan_quarantine_fixture(0x95)?;
-        let quarantine = directory.join(&quarantine_leaf);
-        let retained = directory.join(format!("{quarantine_leaf}.verified-retained"));
-        let hook_ran = std::sync::Arc::new(AtomicBool::new(false));
-        let replacement_identity = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let hook_quarantine = quarantine.clone();
-        let hook_retained = retained.clone();
-        let hook_ran_capture = hook_ran.clone();
-        let replacement_identity_capture = replacement_identity.clone();
-        install_deletion_substitution_hook(
-            DeletionSubstitutionPoint::OrphanQuarantineAfterVerify,
-            move || {
-                std::fs::rename(&hook_quarantine, &hook_retained).unwrap();
-                std::fs::create_dir(&hook_quarantine).unwrap();
-                std::fs::set_permissions(&hook_quarantine, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
-                let metadata = std::fs::metadata(&hook_quarantine).unwrap();
-                *replacement_identity_capture.lock().unwrap() =
-                    Some((metadata.dev(), metadata.ino()));
-                hook_ran_capture.store(true, Ordering::SeqCst);
-            },
-        );
-
-        let result = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected);
-        clear_deletion_substitution_hook();
-        let parent = super::super::secure_fs::SecureDirectory::open_absolute(&directory)?;
-        let current_identity = parent.open_private_dir(&quarantine_leaf)?.identity()?;
-        let tokens = result?;
-        let replacement_identity = replacement_identity
-            .lock()
-            .unwrap()
-            .ok_or_else(|| Error::Corrupt("orphan substitution hook did not run".into()))?;
-        let retained_leaf = retained
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .ok_or_else(|| Error::Corrupt("retained orphan leaf is not UTF-8".into()))?;
-        let retained_identity = parent.open_private_dir(retained_leaf)?.identity()?;
-        let (deletion_rows, audited): (i64, i64) = fixture.db.conn.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM changed_path_segment_deletions WHERE scope_id=?1),
-                 (SELECT COUNT(*) FROM changed_path_segment_quarantine_allocations
-                  WHERE scope_id=?1 AND quarantine_directory_leaf=?2
-                    AND state='abandoned'
-                    AND retained_reason='preexisting_unjournaled_namespace'
-                    AND observed_conflict_device=?3 AND observed_conflict_inode=?4)",
-            params![
-                fixture.expected.scope_id.to_text(),
-                quarantine_leaf,
-                encode_fs_identity_part(replacement_identity.0),
-                encode_fs_identity_part(replacement_identity.1),
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let retired: bool = fixture.db.conn.query_row(
-            "SELECT retired_at IS NOT NULL FROM changed_path_scopes WHERE scope_id=?1",
-            [fixture.expected.scope_id.to_text()],
-            |row| row.get(0),
-        )?;
-        if !hook_ran.load(Ordering::SeqCst)
-            || current_identity != replacement_identity
-            || retained_identity != orphan_identity
-            || tokens.len() != 1
-            || tokens[0].identity.quarantine_directory_leaf == quarantine_leaf
-            || tokens[0].identity.quarantine_directory_identity == current_identity
-            || tokens[0].identity.quarantine_directory_identity == retained_identity
-            || deletion_rows != 1
-            || audited != 1
-            || !retired
-        {
-            return Err(Error::Corrupt(
-                "orphan retirement did not retain, audit, and bypass substituted authority".into(),
-            ));
-        }
-        remove_retired_segments(&fixture.db.conn, &tokens)?;
-        Ok(())
+        direct_target_collision_is_retained(0x95)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn empty_orphan_quarantine_is_retained_and_rejected() -> Result<()> {
-        let (fixture, directory, quarantine_leaf, orphan_identity) =
-            orphan_quarantine_fixture(0x96)?;
-        let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
-        let parent = super::super::secure_fs::SecureDirectory::open_absolute(&directory)?;
-        let retained_identity = parent.open_private_dir(&quarantine_leaf)?.identity()?;
-        let (deletion_rows, audited): (i64, i64) = fixture.db.conn.query_row(
-            "SELECT
-                 (SELECT COUNT(*) FROM changed_path_segment_deletions WHERE scope_id=?1),
-                 (SELECT COUNT(*) FROM changed_path_segment_quarantine_allocations
-                  WHERE scope_id=?1 AND quarantine_directory_leaf=?2
-                    AND state='abandoned'
-                    AND retained_reason='preexisting_unjournaled_namespace')",
-            params![fixture.expected.scope_id.to_text(), quarantine_leaf],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if retained_identity != orphan_identity
-            || tokens.len() != 1
-            || tokens[0].identity.quarantine_directory_leaf == quarantine_leaf
-            || tokens[0].identity.quarantine_directory_identity == orphan_identity
-            || deletion_rows != 1
-            || audited != 1
-        {
-            return Err(Error::Corrupt(
-                "empty orphan quarantine was not retained, audited, and bypassed".into(),
-            ));
-        }
-        remove_retired_segments(&fixture.db.conn, &tokens)?;
-        Ok(())
+        direct_target_collision_is_retained(0x96)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3403,14 +3229,19 @@ mod harness {
         let fixture = Fixture::new(0x97)?;
         create_real_retirement_segment(&fixture, 0x97)?;
         let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
-        if tokens.len() != 1 || tokens[0].identity.state != "prepared" {
+        if tokens.len() != 1 || tokens[0].identity.state != "quiesced" {
             return Err(Error::Corrupt(
                 "normal retirement did not mint exactly one fresh prepared authority".into(),
             ));
         }
-        tokens[0]
-            .quarantine_directory
-            .verify_identity(tokens[0].identity.quarantine_directory_identity)?;
+        let quarantined = tokens[0]
+            .directory
+            .open_regular(&tokens[0].identity.quarantine_leaf)?;
+        if super::super::secure_fs::file_identity(&quarantined)?
+            != tokens[0].identity.quarantine_identity
+        {
+            return Err(Error::Corrupt("direct quarantine identity changed".into()));
+        }
         remove_retired_segments(&fixture.db.conn, &tokens)?;
         let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
         remove_retired_segments(&fixture.db.conn, &retry)?;
@@ -3487,23 +3318,16 @@ mod harness {
 
         let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x88)?;
         let leaf = directory.join(segment_leaf);
-        let retained_leaf = directory.join("leaf-substitution.retained.cpl");
         let outside = fixture._root.path().join("outside-segment.cpl");
         std::fs::write(&outside, b"outside must survive\n")?;
-        let hook_leaf = leaf.clone();
-        let hook_retained = retained_leaf.clone();
-        let hook_outside = outside.clone();
-        install_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf, move || {
-            std::fs::rename(&hook_leaf, &hook_retained).unwrap();
-            symlink(&hook_outside, &hook_leaf).unwrap();
-        });
+        symlink(&outside, &leaf)?;
 
         if remove_retired_segments(&fixture.db.conn, &tokens).is_ok() {
             return Err(Error::Corrupt(
                 "retired deletion accepted a substituted leaf".into(),
             ));
         }
-        if !outside.exists() || !retained_leaf.exists() {
+        if !outside.exists() || std::fs::symlink_metadata(&leaf).is_err() {
             return Err(Error::Corrupt(
                 "retired deletion escaped its descriptor-relative leaf".into(),
             ));
@@ -3515,25 +3339,15 @@ mod harness {
         let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x89)?;
         let leaf = directory.join(segment_leaf);
         let authorized = directory.join("post-verification-authorized.cpl");
-        let quarantine = directory
-            .join(&tokens[0].identity.quarantine_directory_leaf)
-            .join(&tokens[0].identity.quarantine_leaf);
-        let hook_leaf = leaf.clone();
-        let hook_authorized = authorized.clone();
-        install_deletion_substitution_hook(
-            DeletionSubstitutionPoint::BeforeQuarantineMove,
-            move || {
-                std::fs::rename(&hook_leaf, &hook_authorized).unwrap();
-                std::fs::write(&hook_leaf, b"replacement must survive\n").unwrap();
-            },
-        );
+        let quarantine = directory.join(&tokens[0].identity.quarantine_leaf);
+        std::fs::write(&leaf, b"replacement must survive\n")?;
 
         if remove_retired_segments(&fixture.db.conn, &tokens).is_ok() {
             return Err(Error::Corrupt(
                 "retired deletion accepted a name substituted after verification".into(),
             ));
         }
-        if leaf.exists() || !authorized.exists() || !quarantine.exists() {
+        if !leaf.exists() || authorized.exists() || !quarantine.exists() {
             return Err(Error::Corrupt(
                 "retired deletion did not preserve the authorized inode and quarantine the substitution"
                     .into(),
@@ -3543,20 +3357,11 @@ mod harness {
     }
 
     pub(super) fn deletion_substitution_after_quarantine_verification_fails_closed() -> Result<()> {
-        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8c)?;
-        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
-        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
-        std::fs::rename(directory.join(segment_leaf), &quarantine)?;
-        let authorized = quarantine_directory.join("post-quarantine-authorized.cpl");
-        let hook_quarantine = quarantine.clone();
-        let hook_authorized = authorized.clone();
-        install_deletion_substitution_hook(
-            DeletionSubstitutionPoint::AfterQuarantineVerify,
-            move || {
-                std::fs::rename(&hook_quarantine, &hook_authorized).unwrap();
-                std::fs::write(&hook_quarantine, b"replacement must survive\n").unwrap();
-            },
-        );
+        let (fixture, tokens, directory, _segment_leaf) = retired_segment_fixture(0x8c)?;
+        let quarantine = directory.join(&tokens[0].identity.quarantine_leaf);
+        let authorized = directory.join("post-quarantine-authorized.cpl");
+        std::fs::rename(&quarantine, &authorized)?;
+        std::fs::write(&quarantine, b"replacement must survive\n")?;
 
         let rejection = remove_retired_segments(&fixture.db.conn, &tokens)
             .err()
@@ -3567,26 +3372,23 @@ mod harness {
             })?;
         if !quarantine.exists() || !authorized.exists() {
             return Err(Error::Corrupt(format!(
-                "retired deletion did not preserve post-verification files: quarantine={} authorized={} qdir={} rejection={rejection}",
+                "retired deletion did not preserve post-verification files: quarantine={} authorized={} directory={} rejection={rejection}",
                 quarantine.exists(),
                 authorized.exists(),
-                quarantine_directory.display()
+                directory.display()
             )));
         }
         Ok(())
     }
 
     pub(super) fn deletion_retry_rejects_hostile_quarantine_replacement() -> Result<()> {
-        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8d)?;
-        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
-        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
-        let retained = quarantine_directory.join("hostile-quarantine-retained.cpl");
-        std::fs::rename(directory.join(segment_leaf), &quarantine)?;
+        let (fixture, tokens, directory, _segment_leaf) = retired_segment_fixture(0x8d)?;
+        let quarantine = directory.join(&tokens[0].identity.quarantine_leaf);
+        let retained = directory.join("hostile-quarantine-retained.cpl");
         std::fs::rename(&quarantine, &retained)?;
         std::fs::write(&quarantine, b"hostile replacement must survive\n")?;
 
-        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
-        if remove_retired_segments(&fixture.db.conn, &retry).is_ok() {
+        if retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected).is_ok() {
             return Err(Error::Corrupt(
                 "retirement retry adopted a hostile quarantine replacement".into(),
             ));
@@ -3602,9 +3404,8 @@ mod harness {
     pub(super) fn deletion_normal_retry_is_durably_idempotent() -> Result<()> {
         let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8e)?;
         let original = directory.join(&segment_leaf);
-        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
-        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
-        let expected_bytes = std::fs::read(&original)?;
+        let quarantine = directory.join(&tokens[0].identity.quarantine_leaf);
+        let expected_bytes = std::fs::read(&quarantine)?;
         let expected_identity = tokens[0].identity.segment_identity;
         remove_retired_segments(&fixture.db.conn, &tokens)?;
         if original.exists() || !quarantine.exists() {
@@ -3648,14 +3449,12 @@ mod harness {
     pub(super) fn deletion_quiesced_retry_rejects_missing_quarantine() -> Result<()> {
         let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8f)?;
         let original = directory.join(segment_leaf);
-        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
-        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
-        let retained = quarantine_directory.join("missing-quarantine-retained.cpl");
+        let quarantine = directory.join(&tokens[0].identity.quarantine_leaf);
+        let retained = directory.join("missing-quarantine-retained.cpl");
         remove_retired_segments(&fixture.db.conn, &tokens)?;
         std::fs::rename(&quarantine, &retained)?;
 
-        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
-        if remove_retired_segments(&fixture.db.conn, &retry).is_ok() {
+        if retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected).is_ok() {
             return Err(Error::Corrupt(
                 "quiesced retirement retry accepted a missing quarantine entry".into(),
             ));
@@ -3671,8 +3470,7 @@ mod harness {
     pub(super) fn deletion_quiesced_retry_rejects_reappeared_original() -> Result<()> {
         let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x94)?;
         let original = directory.join(segment_leaf);
-        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
-        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
+        let quarantine = directory.join(&tokens[0].identity.quarantine_leaf);
         remove_retired_segments(&fixture.db.conn, &tokens)?;
         std::fs::write(&original, b"reappeared original-name replacement\n")?;
 
@@ -4039,21 +3837,167 @@ mod harness {
         panic!("deletion crash helper passed its requested crash point");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn retirement_never_uses_separable_mkdir_open_authority() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fixture = Fixture::new(0xa4).unwrap();
+        create_real_retirement_segment(&fixture, 0xa4).unwrap();
+        let directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        let hook_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let hook_ran_capture = hook_ran.clone();
+        let hook_directory = directory.clone();
+        super::super::secure_fs::install_private_dir_create_open_hook(move || {
+            let allocated = std::fs::read_dir(&hook_directory)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".trail-delete-")
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "d")
+                })
+                .unwrap();
+            let retained = allocated.path().with_extension("old-retained");
+            std::fs::rename(allocated.path(), retained).unwrap();
+            std::fs::create_dir(allocated.path()).unwrap();
+            std::fs::set_permissions(allocated.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            hook_ran_capture.store(true, Ordering::SeqCst);
+        });
+
+        let result = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected);
+        super::super::secure_fs::clear_private_dir_create_open_hook();
+
+        result.unwrap();
+        assert!(
+            !hook_ran.load(Ordering::SeqCst),
+            "retirement crossed the separable mkdirat/openat substitution window"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn direct_quarantine_rejects_source_substitution_before_atomic_rename() {
+        let fixture = Fixture::new(0xa5).unwrap();
+        let source_leaf = create_real_retirement_segment(&fixture, 0xa5).unwrap();
+        let directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        let source = directory.join(&source_leaf);
+        let retained = directory.join("authenticated-source-retained.cpl");
+        let hook_source = source.clone();
+        let hook_retained = retained.clone();
+        install_deletion_substitution_hook(
+            DeletionSubstitutionPoint::BeforeQuarantineMove,
+            move || {
+                std::fs::rename(&hook_source, &hook_retained).unwrap();
+                std::fs::write(&hook_source, b"hostile source replacement\n").unwrap();
+            },
+        );
+
+        let result = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected);
+        clear_deletion_substitution_hook();
+        assert!(result.is_err(), "substituted source was accepted");
+        assert!(retained.is_file(), "authenticated source was not retained");
+        let targets = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".trail-delete-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            std::fs::read(targets[0].path()).unwrap(),
+            b"hostile source replacement\n"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn direct_quarantine_rejects_target_substitution_after_rename_before_verify() {
+        let fixture = Fixture::new(0xa6).unwrap();
+        create_real_retirement_segment(&fixture, 0xa6).unwrap();
+        let directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        let retained = directory.join("renamed-target-retained.cpl");
+        let hook_directory = directory.clone();
+        let hook_retained = retained.clone();
+        install_deletion_substitution_hook(
+            DeletionSubstitutionPoint::AfterDirectRenameBeforeVerify,
+            move || {
+                let target = std::fs::read_dir(&hook_directory)
+                    .unwrap()
+                    .filter_map(std::result::Result::ok)
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".trail-delete-")
+                    })
+                    .unwrap()
+                    .path();
+                std::fs::rename(&target, &hook_retained).unwrap();
+                std::fs::write(&target, b"hostile target replacement\n").unwrap();
+            },
+        );
+
+        let result = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected);
+        clear_deletion_substitution_hook();
+        assert!(result.is_err(), "substituted direct target was accepted");
+        assert!(
+            retained.is_file(),
+            "atomically moved source was not retained"
+        );
+        let hostile = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".trail-delete-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read(hostile).unwrap(),
+            b"hostile target replacement\n"
+        );
+    }
+
     #[test]
     fn subprocess_kill_and_retry_covers_quarantine_deletion_boundaries() {
         for (index, phase) in [
             "changed_path_deletion_after_allocation_journal_barrier",
-            "changed_path_deletion_after_allocation_mkdir",
+            "changed_path_deletion_after_direct_quarantine_rename",
+            "changed_path_deletion_after_direct_quarantine_verify",
+            "changed_path_deletion_after_direct_quarantine_fsync",
             "changed_path_deletion_after_allocation_identity_barrier",
             "changed_path_deletion_between_allocation_segments",
             "changed_path_deletion_after_allocation_setup",
             "changed_path_deletion_before_retirement_commit",
             "changed_path_deletion_after_retirement_commit",
             "changed_path_deletion_after_retirement_wal_barrier",
-            "changed_path_deletion_after_quarantine_move",
-            "changed_path_deletion_after_quarantine_verify",
-            "changed_path_deletion_after_quarantine_fsync",
-            "changed_path_deletion_after_quiesced_state",
         ]
         .into_iter()
         .enumerate()
@@ -4188,7 +4132,7 @@ mod harness {
                 let crash_conn = Connection::open(&sqlite_path).unwrap();
                 let allocation_leaves = crash_conn
                     .prepare(
-                        "SELECT quarantine_directory_leaf
+                        "SELECT quarantine_leaf
                          FROM changed_path_segment_quarantine_allocations
                          WHERE scope_id=?1 AND state='allocating' ORDER BY segment_id",
                     )
@@ -4198,14 +4142,11 @@ mod harness {
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .unwrap();
                 drop(crash_conn);
-                let parent =
-                    super::super::secure_fs::SecureDirectory::open_absolute(&segment_directory)
-                        .unwrap();
                 for leaf in allocation_leaves {
-                    parent.create_private_dir(&leaf).unwrap().sync().unwrap();
-                    injected_conflicts.push(segment_directory.join(leaf));
+                    let path = segment_directory.join(leaf);
+                    std::fs::write(&path, b"foreign direct crash target\n").unwrap();
+                    injected_conflicts.push(path);
                 }
-                parent.sync().unwrap();
             }
 
             let mut reopened = Trail::open(root.path()).unwrap();
@@ -4218,15 +4159,16 @@ mod harness {
                     |row| row.get(0),
                 )
                 .unwrap();
-            let retained_quarantines = std::fs::read_dir(&segment_directory)
+            let retained_quarantines = reopened
+                .conn
+                .prepare(
+                    "SELECT quarantine_leaf FROM changed_path_segment_deletions
+                     WHERE scope_id=?1 AND epoch=1 ORDER BY segment_id",
+                )
                 .unwrap()
-                .filter_map(std::result::Result::ok)
-                .filter(|entry| {
-                    let name = entry.file_name();
-                    name.to_string_lossy().starts_with(".trail-delete-")
-                        && entry.path().join("segment.cplq").exists()
-                })
-                .map(|entry| entry.path().join("segment.cplq"))
+                .query_map([scope.scope_id.to_text()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|leaf| segment_directory.join(leaf.unwrap()))
                 .collect::<Vec<_>>();
             assert!(retired, "scope did not remain retired after {phase}");
             for leaf in &leaves {
@@ -4248,7 +4190,7 @@ mod harness {
             assert_eq!(retained_bytes, expected_segment_bytes);
             for conflict in &injected_conflicts {
                 assert!(
-                    conflict.is_dir(),
+                    conflict.is_file(),
                     "foreign namespace was removed after {phase}"
                 );
             }
@@ -4280,8 +4222,6 @@ mod harness {
             assert_eq!(bound, 2, "allocations were not exactly bound after {phase}");
             if phase == "changed_path_deletion_after_allocation_journal_barrier" {
                 assert_eq!(abandoned, 2, "foreign allocations were not audited");
-            } else if phase == "changed_path_deletion_after_allocation_mkdir" {
-                assert_eq!(abandoned, 1, "ambiguous mkdir allocation was not audited");
             }
         }
     }

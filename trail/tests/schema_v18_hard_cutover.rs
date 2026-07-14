@@ -148,6 +148,92 @@ fn assert_tree_unchanged(fixture: &SchemaFixture, before: &BTreeMap<PathBuf, Vec
     assert!(changes.is_empty(), "workspace bytes changed: {changes:?}");
 }
 
+fn insert_malformed_retirement_graph(conn: &Connection, kind: &str) {
+    conn.execute_batch(
+        "INSERT INTO changed_path_scopes(
+             scope_id,scope_kind,owner_id,scope_root,scope_root_identity,
+             filesystem_identity,filesystem_kind,case_sensitive,ref_name,ref_generation,
+             change_id,baseline_root_id,policy_fingerprint,policy_dependency_generation,
+             trust_state,trust_reason,retired_at,created_at,updated_at)
+         VALUES('scope-a','workspace','owner-a','','root-id','fs-id','native',1,
+                'refs/heads/main',1,'change-a','root-a','policy-a',1,
+                'untrusted_gap','scope_retired',1,1,1);
+         INSERT INTO changed_path_observer_segments(
+             scope_id,epoch,segment_id,owner_token,provider_id,first_sequence,
+             durable_end_offset,folded_end_offset,segment_path,state,created_at,updated_at)
+         VALUES
+             ('scope-a',1,'segment-a',
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              'provider',1,0,0,'segment-a.cpl','retired',1,1),
+             ('scope-a',1,'segment-b',
+              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+              'provider',2,0,0,'segment-b.cpl','retired',1,1);",
+    )
+    .unwrap();
+    let allocation_state = if kind == "state_invalid" {
+        "allocated"
+    } else {
+        "bound"
+    };
+    let bound_at = if allocation_state == "bound" {
+        "1"
+    } else {
+        "NULL"
+    };
+    conn.execute_batch(&format!(
+        "INSERT INTO changed_path_segment_quarantine_allocations(
+             attempt_nonce,scope_id,epoch,segment_id,quarantine_leaf,
+             scope_directory_device,scope_directory_inode,identity_policy,
+             source_segment_device,source_segment_inode,quarantine_device,quarantine_inode,state,
+             created_at,updated_at,allocated_at,bound_at)
+         VALUES(
+             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+             'scope-a',1,'segment-a','.trail-delete-a.cplq','1','2',
+             'direct_noreplace_same_directory_v1','7','8','7','8','{allocation_state}',1,1,1,{bound_at});"
+    ))
+    .unwrap();
+    if kind == "cross_wired" {
+        conn.execute_batch(
+            "INSERT INTO changed_path_segment_quarantine_allocations(
+                 attempt_nonce,scope_id,epoch,segment_id,quarantine_leaf,
+                 scope_directory_device,scope_directory_inode,identity_policy,
+                 source_segment_device,source_segment_inode,quarantine_device,quarantine_inode,state,
+                 created_at,updated_at,allocated_at,bound_at)
+             VALUES(
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 'scope-a',1,'segment-b','.trail-delete-b.cplq','1','2',
+                 'direct_noreplace_same_directory_v1','9','10','9','10','bound',1,1,1,1);",
+        )
+        .unwrap();
+    }
+    if kind != "orphan" {
+        let allocation_nonce = if kind == "cross_wired" {
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        } else {
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        };
+        conn.execute_batch(&format!(
+            "INSERT INTO changed_path_segment_deletions(
+                 scope_id,epoch,segment_id,original_leaf,quarantine_leaf,allocation_nonce,
+                 scope_directory_device,scope_directory_inode,quarantine_device,quarantine_inode,
+                 segment_device,segment_inode,file_length,file_hash,durable_end_offset,
+                 durable_hash,max_observer_log_bytes,max_segment_bytes,max_unfolded_tail_records,
+                 owner_token,first_sequence,last_sequence,previous_segment_id,
+                 previous_segment_hash,source_state,state,created_at,updated_at,completed_at)
+             VALUES('scope-a',1,'segment-a','segment-a.cpl','.trail-delete-a.cplq',
+                    '{allocation_nonce}','1','2','7','8','7','8',0,
+                    '0000000000000000000000000000000000000000000000000000000000000000',0,
+                    '0000000000000000000000000000000000000000000000000000000000000000',
+                    1024,512,16,
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    1,NULL,NULL,
+                    '0000000000000000000000000000000000000000000000000000000000000000',
+                    'open','quiesced',1,1,1);"
+        ))
+        .unwrap();
+    }
+}
+
 #[test]
 fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
     let fixture = SchemaFixture::versioned(17);
@@ -485,12 +571,14 @@ fn fresh_init_creates_the_exact_v18_ledger_shape() {
             "scope_id",
             "epoch",
             "segment_id",
-            "quarantine_directory_leaf",
+            "quarantine_leaf",
             "scope_directory_device",
             "scope_directory_inode",
             "identity_policy",
-            "quarantine_directory_device",
-            "quarantine_directory_inode",
+            "source_segment_device",
+            "source_segment_inode",
+            "quarantine_device",
+            "quarantine_inode",
             "observed_conflict_device",
             "observed_conflict_inode",
             "retained_reason",
@@ -584,6 +672,19 @@ fn malformed_v18_attributes_are_rejected_read_only() {
         let before = fixture.snapshot_tree_bytes();
         let err = open_error(fixture.root());
         assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_tree_unchanged(&fixture, &before);
+    }
+}
+
+#[test]
+fn malformed_retirement_graph_is_rejected_read_only() {
+    for kind in ["orphan", "cross_wired", "state_invalid"] {
+        let fixture = SchemaFixture::with_sql(|conn| {
+            insert_malformed_retirement_graph(conn, kind);
+        });
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED", "kind={kind}");
         assert_tree_unchanged(&fixture, &before);
     }
 }

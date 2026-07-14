@@ -284,14 +284,15 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              scope_id TEXT NOT NULL,
              epoch INTEGER NOT NULL CHECK (epoch >= 1),
              segment_id TEXT NOT NULL CHECK (length(segment_id) > 0),
-             quarantine_directory_leaf TEXT NOT NULL UNIQUE
-                 CHECK (length(quarantine_directory_leaf) > 0),
+             quarantine_leaf TEXT NOT NULL UNIQUE CHECK (length(quarantine_leaf) > 0),
              scope_directory_device TEXT NOT NULL CHECK (length(scope_directory_device) > 0),
              scope_directory_inode TEXT NOT NULL CHECK (length(scope_directory_inode) > 0),
              identity_policy TEXT NOT NULL
-                 CHECK (identity_policy = 'fresh_private_0700_same_euid'),
-             quarantine_directory_device TEXT,
-             quarantine_directory_inode TEXT,
+                 CHECK (identity_policy = 'direct_noreplace_same_directory_v1'),
+             source_segment_device TEXT NOT NULL CHECK (length(source_segment_device) > 0),
+             source_segment_inode TEXT NOT NULL CHECK (length(source_segment_inode) > 0),
+             quarantine_device TEXT,
+             quarantine_inode TEXT,
              observed_conflict_device TEXT,
              observed_conflict_inode TEXT,
              retained_reason TEXT,
@@ -305,12 +306,11 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              FOREIGN KEY (scope_id, epoch, segment_id)
                  REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
                  ON UPDATE CASCADE ON DELETE CASCADE,
-             CHECK ((quarantine_directory_device IS NULL) =
-                    (quarantine_directory_inode IS NULL)),
+             CHECK ((quarantine_device IS NULL) = (quarantine_inode IS NULL)),
              CHECK ((observed_conflict_device IS NULL) =
                     (observed_conflict_inode IS NULL)),
              CHECK (state NOT IN ('allocated', 'bound') OR
-                    (quarantine_directory_device IS NOT NULL AND allocated_at IS NOT NULL)),
+                    (quarantine_device IS NOT NULL AND allocated_at IS NOT NULL)),
              CHECK ((state = 'bound' AND bound_at IS NOT NULL) OR
                     (state <> 'bound' AND bound_at IS NULL)),
              CHECK ((state = 'abandoned' AND retained_reason IS NOT NULL
@@ -328,16 +328,12 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              epoch INTEGER NOT NULL CHECK (epoch >= 1),
              segment_id TEXT NOT NULL CHECK (length(segment_id) > 0),
              original_leaf TEXT NOT NULL CHECK (length(original_leaf) > 0),
-             quarantine_directory_leaf TEXT NOT NULL
-                 CHECK (length(quarantine_directory_leaf) > 0),
              quarantine_leaf TEXT NOT NULL CHECK (length(quarantine_leaf) > 0),
              allocation_nonce TEXT NOT NULL UNIQUE CHECK (length(allocation_nonce) = 64),
              scope_directory_device TEXT NOT NULL CHECK (length(scope_directory_device) > 0),
              scope_directory_inode TEXT NOT NULL CHECK (length(scope_directory_inode) > 0),
-             quarantine_directory_device TEXT NOT NULL
-                 CHECK (length(quarantine_directory_device) > 0),
-             quarantine_directory_inode TEXT NOT NULL
-                 CHECK (length(quarantine_directory_inode) > 0),
+             quarantine_device TEXT NOT NULL CHECK (length(quarantine_device) > 0),
+             quarantine_inode TEXT NOT NULL CHECK (length(quarantine_inode) > 0),
              segment_device TEXT NOT NULL CHECK (length(segment_device) > 0),
              segment_inode TEXT NOT NULL CHECK (length(segment_inode) > 0),
              file_length INTEGER NOT NULL CHECK (file_length >= 0),
@@ -353,22 +349,20 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              previous_segment_id TEXT,
              previous_segment_hash TEXT NOT NULL CHECK (length(previous_segment_hash) = 64),
              source_state TEXT NOT NULL CHECK (source_state IN ('open', 'sealed')),
-             state TEXT NOT NULL DEFAULT 'prepared'
-                 CHECK (state IN ('prepared', 'quarantined', 'quiesced')),
+             state TEXT NOT NULL DEFAULT 'quiesced' CHECK (state = 'quiesced'),
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              completed_at INTEGER,
              PRIMARY KEY (scope_id, epoch, segment_id),
              UNIQUE (scope_id, epoch, original_leaf),
-             UNIQUE (scope_id, epoch, quarantine_directory_leaf),
+             UNIQUE (scope_id, epoch, quarantine_leaf),
              FOREIGN KEY (scope_id, epoch, segment_id)
                  REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
                  ON UPDATE CASCADE ON DELETE CASCADE,
              FOREIGN KEY (allocation_nonce)
                  REFERENCES changed_path_segment_quarantine_allocations(attempt_nonce)
                  ON UPDATE CASCADE ON DELETE CASCADE,
-             CHECK ((state = 'quiesced' AND completed_at IS NOT NULL)
-                    OR (state <> 'quiesced' AND completed_at IS NULL))
+             CHECK (completed_at IS NOT NULL)
          );
          CREATE INDEX changed_path_segment_deletions_state_idx
              ON changed_path_segment_deletions(scope_id, epoch, state);";
@@ -441,7 +435,7 @@ fn ledger_schema_objects(conn: &Connection) -> Result<Vec<(String, String, Strin
 
 fn schema_structure_complete(conn: &Connection) -> Result<bool> {
     type Column = (&'static str, &'static str, bool, Option<&'static str>, i64);
-    let tables: [(&str, &[Column]); 11] = [
+    let tables: [(&str, &[Column]); 13] = [
         (
             "changed_path_scopes",
             &[
@@ -669,6 +663,66 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 ("updated_at", "INTEGER", true, None, 0),
             ],
         ),
+        (
+            "changed_path_segment_quarantine_allocations",
+            &[
+                ("attempt_nonce", "TEXT", false, None, 1),
+                ("scope_id", "TEXT", true, None, 0),
+                ("epoch", "INTEGER", true, None, 0),
+                ("segment_id", "TEXT", true, None, 0),
+                ("quarantine_leaf", "TEXT", true, None, 0),
+                ("scope_directory_device", "TEXT", true, None, 0),
+                ("scope_directory_inode", "TEXT", true, None, 0),
+                ("identity_policy", "TEXT", true, None, 0),
+                ("source_segment_device", "TEXT", true, None, 0),
+                ("source_segment_inode", "TEXT", true, None, 0),
+                ("quarantine_device", "TEXT", false, None, 0),
+                ("quarantine_inode", "TEXT", false, None, 0),
+                ("observed_conflict_device", "TEXT", false, None, 0),
+                ("observed_conflict_inode", "TEXT", false, None, 0),
+                ("retained_reason", "TEXT", false, None, 0),
+                ("state", "TEXT", true, Some("'allocating'"), 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("updated_at", "INTEGER", true, None, 0),
+                ("allocated_at", "INTEGER", false, None, 0),
+                ("bound_at", "INTEGER", false, None, 0),
+                ("abandoned_at", "INTEGER", false, None, 0),
+            ],
+        ),
+        (
+            "changed_path_segment_deletions",
+            &[
+                ("scope_id", "TEXT", true, None, 1),
+                ("epoch", "INTEGER", true, None, 2),
+                ("segment_id", "TEXT", true, None, 3),
+                ("original_leaf", "TEXT", true, None, 0),
+                ("quarantine_leaf", "TEXT", true, None, 0),
+                ("allocation_nonce", "TEXT", true, None, 0),
+                ("scope_directory_device", "TEXT", true, None, 0),
+                ("scope_directory_inode", "TEXT", true, None, 0),
+                ("quarantine_device", "TEXT", true, None, 0),
+                ("quarantine_inode", "TEXT", true, None, 0),
+                ("segment_device", "TEXT", true, None, 0),
+                ("segment_inode", "TEXT", true, None, 0),
+                ("file_length", "INTEGER", true, None, 0),
+                ("file_hash", "TEXT", true, None, 0),
+                ("durable_end_offset", "INTEGER", true, None, 0),
+                ("durable_hash", "TEXT", true, None, 0),
+                ("max_observer_log_bytes", "INTEGER", true, None, 0),
+                ("max_segment_bytes", "INTEGER", true, None, 0),
+                ("max_unfolded_tail_records", "INTEGER", true, None, 0),
+                ("owner_token", "TEXT", true, None, 0),
+                ("first_sequence", "INTEGER", true, None, 0),
+                ("last_sequence", "INTEGER", false, None, 0),
+                ("previous_segment_id", "TEXT", false, None, 0),
+                ("previous_segment_hash", "TEXT", true, None, 0),
+                ("source_state", "TEXT", true, None, 0),
+                ("state", "TEXT", true, Some("'quiesced'"), 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("updated_at", "INTEGER", true, None, 0),
+                ("completed_at", "INTEGER", false, None, 0),
+            ],
+        ),
     ];
     for (table, expected) in tables {
         if !table_columns_match(conn, table, expected)? {
@@ -676,7 +730,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let table_fragments: [(&str, &[&str]); 11] = [
+    let table_fragments: [(&str, &[&str]); 13] = [
         (
             "changed_path_scopes",
             &[
@@ -812,6 +866,25 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "owner_token TEXT NOT NULL UNIQUE",
             ],
         ),
+        (
+            "changed_path_segment_quarantine_allocations",
+            &[
+                "CHECK (length(attempt_nonce) = 64)",
+                "CHECK (epoch >= 1)",
+                "CHECK (identity_policy = 'direct_noreplace_same_directory_v1')",
+                "CHECK (state IN ('allocating', 'allocated', 'bound', 'abandoned'))",
+            ],
+        ),
+        (
+            "changed_path_segment_deletions",
+            &[
+                "CHECK (epoch >= 1)",
+                "CHECK (length(allocation_nonce) = 64)",
+                "CHECK (state = 'quiesced')",
+                "UNIQUE (scope_id, epoch, original_leaf)",
+                "UNIQUE (scope_id, epoch, quarantine_leaf)",
+            ],
+        ),
     ];
     for (table, fragments) in table_fragments {
         if !table_sql_contains(conn, table, fragments)? {
@@ -819,7 +892,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let primary_keys: [(&str, &[&str]); 11] = [
+    let primary_keys: [(&str, &[&str]); 13] = [
         ("changed_path_scopes", &["scope_id"]),
         ("changed_path_entries", &["scope_id", "normalized_path"]),
         ("changed_path_prefixes", &["scope_id", "normalized_prefix"]),
@@ -846,6 +919,14 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             &["scope_id", "epoch", "segment_id"],
         ),
         ("changed_path_observer_owners", &["scope_id"]),
+        (
+            "changed_path_segment_quarantine_allocations",
+            &["attempt_nonce"],
+        ),
+        (
+            "changed_path_segment_deletions",
+            &["scope_id", "epoch", "segment_id"],
+        ),
     ];
     for (table, columns) in primary_keys {
         if !origin_index_matches(conn, table, "pk", columns)? {
@@ -867,6 +948,23 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             return Ok(false);
         }
     }
+    if !origin_indexes_match(
+        conn,
+        "changed_path_segment_quarantine_allocations",
+        "u",
+        &[&["quarantine_leaf"]],
+    )? || !origin_indexes_match(
+        conn,
+        "changed_path_segment_deletions",
+        "u",
+        &[
+            &["allocation_nonce"],
+            &["scope_id", "epoch", "original_leaf"],
+            &["scope_id", "epoch", "quarantine_leaf"],
+        ],
+    )? {
+        return Ok(false);
+    }
     for table in [
         "changed_path_entries",
         "changed_path_prefixes",
@@ -882,7 +980,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let named_indexes: [(&str, &str, &[&str]); 12] = [
+    let named_indexes: [(&str, &str, &[&str]); 14] = [
         (
             "changed_path_intents",
             "changed_path_intents_scope_state_idx",
@@ -943,14 +1041,32 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             "changed_path_observer_segments_state_idx",
             &["scope_id", "epoch", "state", "last_sequence"],
         ),
+        (
+            "changed_path_segment_quarantine_allocations",
+            "changed_path_segment_quarantine_allocations_state_idx",
+            &["scope_id", "epoch", "segment_id", "state"],
+        ),
+        (
+            "changed_path_segment_deletions",
+            "changed_path_segment_deletions_state_idx",
+            &["scope_id", "epoch", "state"],
+        ),
     ];
     for (table, index, columns) in named_indexes {
         if !named_index_matches(conn, table, index, columns)? {
             return Ok(false);
         }
     }
+    if !named_unique_partial_index_matches(
+        conn,
+        "changed_path_segment_quarantine_allocations",
+        "changed_path_segment_quarantine_allocations_active_idx",
+        &["scope_id", "epoch", "segment_id"],
+    )? {
+        return Ok(false);
+    }
 
-    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 11] = [
+    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 13] = [
         ("changed_path_scopes", &[]),
         (
             "changed_path_entries",
@@ -1070,6 +1186,65 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CASCADE",
             )],
         ),
+        (
+            "changed_path_segment_quarantine_allocations",
+            &[
+                (
+                    "scope_id",
+                    "changed_path_observer_segments",
+                    "scope_id",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+                (
+                    "epoch",
+                    "changed_path_observer_segments",
+                    "epoch",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+                (
+                    "segment_id",
+                    "changed_path_observer_segments",
+                    "segment_id",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+            ],
+        ),
+        (
+            "changed_path_segment_deletions",
+            &[
+                (
+                    "scope_id",
+                    "changed_path_observer_segments",
+                    "scope_id",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+                (
+                    "epoch",
+                    "changed_path_observer_segments",
+                    "epoch",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+                (
+                    "segment_id",
+                    "changed_path_observer_segments",
+                    "segment_id",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+                (
+                    "allocation_nonce",
+                    "changed_path_segment_quarantine_allocations",
+                    "attempt_nonce",
+                    "CASCADE",
+                    "CASCADE",
+                ),
+            ],
+        ),
     ];
     for (table, expected) in expected_foreign_keys {
         if !foreign_keys_match(conn, table, expected)? {
@@ -1083,6 +1258,45 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         if rows.next()?.is_some() {
             return Ok(false);
         }
+    }
+    let invalid_retirement_graph: bool = conn.query_row(
+        "WITH invalid AS (
+             SELECT allocation.attempt_nonce
+             FROM changed_path_segment_quarantine_allocations allocation
+             LEFT JOIN changed_path_segment_deletions deletion
+               ON deletion.allocation_nonce=allocation.attempt_nonce
+             GROUP BY allocation.attempt_nonce
+             HAVING COUNT(deletion.allocation_nonce)<>CASE WHEN allocation.state='bound' THEN 1 ELSE 0 END
+                OR (allocation.state='bound' AND (
+                    MIN(deletion.state)<>'quiesced' OR MIN(deletion.completed_at) IS NULL
+                    OR MIN(deletion.scope_id)<>allocation.scope_id
+                    OR MIN(deletion.epoch)<>allocation.epoch
+                    OR MIN(deletion.segment_id)<>allocation.segment_id
+                    OR MIN(deletion.quarantine_leaf)<>allocation.quarantine_leaf
+                    OR MIN(deletion.scope_directory_device)<>allocation.scope_directory_device
+                    OR MIN(deletion.scope_directory_inode)<>allocation.scope_directory_inode
+                    OR MIN(deletion.segment_device)<>allocation.source_segment_device
+                    OR MIN(deletion.segment_inode)<>allocation.source_segment_inode
+                    OR MIN(deletion.quarantine_device)<>allocation.quarantine_device
+                    OR MIN(deletion.quarantine_inode)<>allocation.quarantine_inode))
+             UNION ALL
+             SELECT deletion.allocation_nonce
+             FROM changed_path_segment_deletions deletion
+             LEFT JOIN changed_path_segment_quarantine_allocations allocation
+               ON allocation.attempt_nonce=deletion.allocation_nonce
+             WHERE allocation.attempt_nonce IS NULL OR allocation.state<>'bound'
+                OR deletion.state<>'quiesced' OR deletion.completed_at IS NULL
+             UNION ALL
+             SELECT segment_id
+             FROM changed_path_segment_quarantine_allocations
+             WHERE state IN ('allocating','allocated','bound')
+             GROUP BY scope_id,epoch,segment_id HAVING COUNT(*)<>1
+         ) SELECT EXISTS(SELECT 1 FROM invalid)",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_retirement_graph {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -1197,6 +1411,43 @@ fn origin_index_count(conn: &Connection, table: &str, origin: &str) -> Result<i6
     .map_err(Error::from)
 }
 
+fn origin_indexes_match(
+    conn: &Connection,
+    table: &str,
+    origin: &str,
+    expected: &[&[&str]],
+) -> Result<bool> {
+    let mut statement = conn.prepare(
+        "SELECT name FROM pragma_index_list(?1)
+         WHERE origin=?2 AND [unique]=1 AND partial=0",
+    )?;
+    let names = statement
+        .query_map(params![table, origin], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut actual = names
+        .iter()
+        .map(|name| {
+            Ok(index_key_columns(conn, name)?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(column, _)| column)
+                .collect::<Vec<_>>())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    actual.sort();
+    let mut expected = expected
+        .iter()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    Ok(actual == expected)
+}
+
 fn named_index_matches(
     conn: &Connection,
     table: &str,
@@ -1217,6 +1468,38 @@ fn named_index_matches(
         )
         .optional()?;
     if metadata != Some((false, "c".to_string(), false)) {
+        return Ok(false);
+    }
+    let Some(columns) = index_key_columns(conn, index)? else {
+        return Ok(false);
+    };
+    Ok(columns.len() == expected_columns.len()
+        && columns
+            .iter()
+            .zip(expected_columns)
+            .all(|((actual, collation), expected)| actual == expected && collation == "BINARY"))
+}
+
+fn named_unique_partial_index_matches(
+    conn: &Connection,
+    table: &str,
+    index: &str,
+    expected_columns: &[&str],
+) -> Result<bool> {
+    let metadata = conn
+        .query_row(
+            "SELECT [unique],origin,partial FROM pragma_index_list(?1) WHERE name=?2",
+            params![table, index],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if metadata != Some((true, "c".into(), true)) {
         return Ok(false);
     }
     let Some(columns) = index_key_columns(conn, index)? else {
