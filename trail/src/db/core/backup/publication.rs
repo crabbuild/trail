@@ -43,6 +43,14 @@ pub(super) fn sync_tree_bottom_up(root: &Path) -> Result<()> {
 }
 
 pub(super) fn publish_staged_tree(stage: &Path, target: &Path) -> Result<Option<PathBuf>> {
+    publish_staged_tree_with_exchange(stage, target, atomic_exchange)
+}
+
+fn publish_staged_tree_with_exchange(
+    stage: &Path,
+    target: &Path,
+    exchange: impl FnOnce(&Path, &Path) -> Result<bool>,
+) -> Result<Option<PathBuf>> {
     let parent = target
         .parent()
         .ok_or_else(|| Error::InvalidInput("publication target has no parent".into()))?;
@@ -57,23 +65,37 @@ pub(super) fn publish_staged_tree(stage: &Path, target: &Path) -> Result<Option<
         return Ok(None);
     }
 
-    if atomic_exchange(stage, target)? {
+    if exchange(stage, target)? {
         sync_directory_strict(parent)?;
         test_crash_point("backup_restore_after_atomic_exchange");
         return Ok(Some(stage.to_path_buf()));
     }
 
-    let previous = sibling_path(target, "previous")?;
-    fs::rename(target, &previous)?;
-    sync_directory_strict(parent)?;
-    if let Err(error) = fs::rename(stage, target) {
-        let _ = fs::rename(&previous, target);
-        let _ = sync_directory_strict(parent);
-        return Err(error.into());
+    Err(Error::Conflict(
+        "atomic directory exchange is unsupported; live tree was not moved".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_exchange_refuses_before_moving_the_live_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("live");
+        let stage = root.path().join("stage");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&stage).unwrap();
+        fs::write(target.join("marker"), b"old").unwrap();
+        fs::write(stage.join("marker"), b"new").unwrap();
+
+        let result = publish_staged_tree_with_exchange(&stage, &target, |_, _| Ok(false));
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(target.join("marker")).unwrap(), b"old");
+        assert_eq!(fs::read(stage.join("marker")).unwrap(), b"new");
     }
-    sync_directory_strict(parent)?;
-    test_crash_point("backup_restore_after_fallback_publish");
-    Ok(Some(previous))
 }
 
 pub(super) fn remove_retained_tree(path: Option<PathBuf>, parent: &Path) -> Result<()> {
@@ -101,18 +123,9 @@ pub(super) fn rollback_published_tree(target: &Path, retained: Option<PathBuf>) 
         sync_directory_strict(parent)?;
         return Ok(());
     }
-    let failed = sibling_path(target, "failed")?;
-    fs::rename(target, &failed)?;
-    sync_directory_strict(parent)?;
-    if let Err(error) = fs::rename(&retained, target) {
-        let _ = fs::rename(&failed, target);
-        let _ = sync_directory_strict(parent);
-        return Err(error.into());
-    }
-    sync_directory_strict(parent)?;
-    remove_any(&failed)?;
-    sync_directory_strict(parent)?;
-    Ok(())
+    Err(Error::Conflict(
+        "atomic rollback exchange is unsupported; both trees were retained".into(),
+    ))
 }
 
 pub(super) fn remove_any(path: &Path) -> Result<()> {
@@ -149,25 +162,6 @@ pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
-}
-
-fn sibling_path(target: &Path, label: &str) -> Result<PathBuf> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| Error::InvalidInput("publication target has no parent".into()))?;
-    let leaf = target
-        .file_name()
-        .ok_or_else(|| Error::InvalidInput("publication target has no file name".into()))?
-        .to_string_lossy();
-    for _ in 0..32 {
-        let candidate = parent.join(format!(".{leaf}.{label}-{}", now_nanos()));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(Error::Conflict(
-        "could not allocate retained publication path".into(),
-    ))
 }
 
 #[cfg(target_os = "macos")]

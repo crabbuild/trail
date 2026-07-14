@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use getrandom::getrandom;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -102,6 +104,7 @@ pub(crate) struct QualifiedFilesystemProof {
     pub(crate) owner_fence_nonce: Option<Vec<u8>>,
     pub(crate) durable_segment_id: String,
     pub(crate) durable_segment_hash: [u8; 32],
+    pub(crate) segment_directory: String,
     pub(crate) segment_path: String,
     pub(crate) start_cursor: Option<Vec<u8>>,
     pub(crate) end_cursor: Vec<u8>,
@@ -410,6 +413,7 @@ pub(super) fn validate_qualified_filesystem_proof(
         || proof.observer_owner_token.is_empty()
         || proof.provider_id.is_empty()
         || proof.durable_segment_id.is_empty()
+        || proof.segment_directory.is_empty()
         || proof.segment_path.is_empty()
         || !proof.complete_root_interval
         || !proof.complete_policy_interval
@@ -480,9 +484,8 @@ pub(super) fn validate_qualified_filesystem_proof(
             .and_then(|identity| hex::decode(identity).ok())
             .as_deref()
             != Some(proof.provider_identity.as_slice())
-        || provider_cursor.as_deref() != Some(proof.end_cursor.as_slice())
-        || db_u64(durable_offset, "scope durable offset")? != proof.end_cut.durable_offset
-        || db_u64(folded_offset, "scope folded offset")? != proof.end_cut.folded_offset
+        || db_u64(durable_offset, "scope durable offset")? < proof.end_cut.durable_offset
+        || db_u64(folded_offset, "scope folded offset")? < proof.end_cut.folded_offset
     {
         return Err(invalid(
             "filesystem proof no longer matches the trusted scope boundary",
@@ -529,6 +532,101 @@ pub(super) fn validate_qualified_filesystem_proof(
     if !owner_matches || !segment_matches {
         return Err(invalid(
             "filesystem proof owner, fence, or sealed segment changed",
+        ));
+    }
+
+    let database_path = conn
+        .path()
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("filesystem proof database path is unavailable"))?;
+    let expected_directory = format!("observer-segments/{}", expected.scope_id.to_text());
+    if proof.segment_directory != expected_directory {
+        return Err(invalid(
+            "filesystem proof segment directory is not the confined scope directory",
+        ));
+    }
+    let database_root = database_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("filesystem proof database has no Trail root"))?;
+    let mut segment_directory = database_root.to_path_buf();
+    for component in Path::new(&proof.segment_directory).components() {
+        let Component::Normal(component) = component else {
+            return Err(invalid(
+                "filesystem proof segment directory escapes Trail root",
+            ));
+        };
+        segment_directory.push(component);
+        let metadata = fs::symlink_metadata(&segment_directory)
+            .map_err(|_| invalid("filesystem proof segment directory is missing"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid(
+                "filesystem proof segment directory is not a real directory",
+            ));
+        }
+    }
+    let owner_token: [u8; 32] = hex::decode(&proof.observer_owner_token)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| invalid("filesystem proof owner token is not canonical"))?;
+    let raw_limits: (i64, i64, i64) = conn.query_row(
+        "SELECT max_observer_log_bytes,max_segment_bytes,max_unfolded_tail_records
+         FROM changed_path_scopes WHERE scope_id=?1 AND epoch=?2",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let limits = super::PersistedLogLimits {
+        max_log_bytes: db_u64(raw_limits.0, "observer log byte limit")?,
+        max_segment_bytes: db_u64(raw_limits.1, "segment byte limit")?,
+        max_unfolded_tail_records: usize::try_from(db_u64(
+            raw_limits.2,
+            "unfolded observer record limit",
+        )?)
+        .map_err(|_| Error::Corrupt("unfolded observer record limit exceeds usize".into()))?,
+    };
+    let recovered = super::recover_segments(
+        &database_path,
+        &segment_directory,
+        &super::RecoveryScope {
+            scope_id: expected.scope_id,
+            epoch: expected.epoch,
+            owner_token,
+        },
+        limits,
+    )
+    .map_err(|error| invalid(&format!("observer sidecar verification failed: {error}")))?;
+    if recovered.requires_reconciliation {
+        return Err(invalid(
+            "observer sidecar chain is incomplete or contains unpublished entries",
+        ));
+    }
+    let authenticated = recovered
+        .segments
+        .iter()
+        .find(|segment| segment.segment_id == proof.durable_segment_id)
+        .ok_or_else(|| invalid("filesystem proof segment is absent from verified chain"))?;
+    if authenticated.state != "sealed"
+        || authenticated.segment_path != proof.segment_path
+        || authenticated.start_cursor != proof.start_cursor.clone().unwrap_or_default()
+        || authenticated.end_cursor != proof.end_cursor
+        || authenticated.first_sequence != proof.start_sequence
+        || authenticated.last_sequence != proof.end_cut.sequence
+        || authenticated.durable_end_offset != proof.segment_durable_offset
+        || authenticated.folded_end_offset < proof.segment_folded_offset
+        || authenticated.segment_hash != proof.durable_segment_hash
+        || proof.end_cut.durable_offset != proof.segment_durable_offset
+        || proof.end_cut.folded_offset != proof.segment_folded_offset
+        || recovered.last_sequence < proof.end_cut.sequence
+        || recovered
+            .segments
+            .last()
+            .is_none_or(|segment| provider_cursor.as_deref() != Some(segment.end_cursor.as_slice()))
+    {
+        return Err(invalid(
+            "filesystem proof is not an authenticated prefix of the observer chain",
         ));
     }
 

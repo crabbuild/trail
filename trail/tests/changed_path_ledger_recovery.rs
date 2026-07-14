@@ -42,3 +42,13 @@ fn retirement_validates_paths_and_waits_for_preexisting_readers() {
 fn lane_deletion_retires_changed_path_scope_before_filesystem_removal() {
     trail::test_support::changed_path_lane_deletion_retirement().unwrap();
 }
+
+#[test]
+fn metadata_only_intent_proof_without_a_real_sidecar_is_rejected() {
+    trail::test_support::changed_path_missing_sidecar_rejection().unwrap();
+}
+
+#[test]
+fn authenticated_intent_cut_remains_a_prefix_after_later_observer_advance() {
+    trail::test_support::changed_path_advanced_prefix_recovery().unwrap();
+}

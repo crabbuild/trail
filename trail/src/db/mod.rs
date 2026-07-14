@@ -1161,9 +1161,10 @@ mod agent;
 mod change_ledger;
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::{
-    run_acknowledgement_race, run_ambiguous_recovery_gate, run_backup_overwrite_rollback,
-    run_backup_restore_rotation, run_callback_spool, run_crash_matrix, run_gc_root_lifecycle,
-    run_lane_deletion_retirement, run_oracle, run_qualified_proof_revalidation, run_races,
+    run_acknowledgement_race, run_advanced_prefix_recovery, run_ambiguous_recovery_gate,
+    run_backup_overwrite_rollback, run_backup_restore_rotation, run_callback_spool,
+    run_crash_matrix, run_gc_root_lifecycle, run_lane_deletion_retirement,
+    run_missing_sidecar_rejection, run_oracle, run_qualified_proof_revalidation, run_races,
     run_retirement_barrier,
 };
 mod core;

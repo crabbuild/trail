@@ -70,6 +70,14 @@ pub mod test_support {
     pub fn changed_path_lane_deletion_retirement() -> std::result::Result<(), String> {
         crate::db::run_lane_deletion_retirement()
     }
+
+    pub fn changed_path_missing_sidecar_rejection() -> std::result::Result<(), String> {
+        crate::db::run_missing_sidecar_rejection()
+    }
+
+    pub fn changed_path_advanced_prefix_recovery() -> std::result::Result<(), String> {
+        crate::db::run_advanced_prefix_recovery()
+    }
 }
 
 /// Re-export the prolly crate as a Trail module namespace.

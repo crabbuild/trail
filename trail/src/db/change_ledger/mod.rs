@@ -18,8 +18,8 @@ pub(crate) use intent::{
 
 #[allow(unused_imports)]
 pub(crate) use log::{
-    recover_segments, DurableCut, ObserverRecord, PersistedLogLimits, RecoveredTail, RecoveryError,
-    RecoveryScope, SegmentWriter,
+    recover_segments, AuthenticatedSegment, DurableCut, ObserverRecord, PersistedLogLimits,
+    RecoveredTail, RecoveryError, RecoveryScope, SegmentWriter,
 };
 #[allow(unused_imports)]
 pub(crate) use policy::{
@@ -37,14 +37,16 @@ pub(crate) use reconcile::{
 pub(crate) use reconcile::{run_callback_spool, run_oracle, run_races};
 #[allow(unused_imports)]
 pub(crate) use recovery::{
-    ledger_gc_roots, mark_backup_scopes_untrusted, recover_scope, retire_deletion_scopes,
-    retire_scope, rotate_restored_scopes, IntentGcRoot, RecoveryDecision,
+    ledger_gc_roots, mark_backup_scopes_untrusted, recover_scope, remove_retired_segments,
+    retire_deletion_scopes, retire_scope, rotate_restored_scopes, IntentGcRoot, RecoveryDecision,
+    SegmentDeletionToken,
 };
 #[cfg(debug_assertions)]
 pub(crate) use recovery::{
-    run_acknowledgement_race, run_ambiguous_recovery_gate, run_backup_overwrite_rollback,
-    run_backup_restore_rotation, run_crash_matrix, run_gc_root_lifecycle,
-    run_lane_deletion_retirement, run_qualified_proof_revalidation, run_retirement_barrier,
+    run_acknowledgement_race, run_advanced_prefix_recovery, run_ambiguous_recovery_gate,
+    run_backup_overwrite_rollback, run_backup_restore_rotation, run_crash_matrix,
+    run_gc_root_lifecycle, run_lane_deletion_retirement, run_missing_sidecar_rejection,
+    run_qualified_proof_revalidation, run_retirement_barrier,
 };
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;

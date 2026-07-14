@@ -2,7 +2,7 @@ use super::*;
 use crate::db::change_ledger::rotate_restored_scopes;
 use crate::db::core::backup::publication::{
     publish_staged_tree, remove_any, remove_retained_tree, rollback_published_tree, sibling_stage,
-    sync_directory_strict,
+    sync_directory_strict, sync_tree_bottom_up,
 };
 
 impl Trail {
@@ -41,7 +41,7 @@ impl Trail {
         };
         let temp_dir = sibling_stage(&db_dir, "restore-stage")?;
 
-        let restore_result = (|| -> Result<()> {
+        let restore_result = (|| -> Result<(u64, crate::model::FsckReport)> {
             fs::create_dir_all(temp_dir.join("index"))?;
             fs::create_dir_all(temp_dir.join("refs/branches"))?;
             fs::create_dir_all(temp_dir.join("refs/lanes"))?;
@@ -51,6 +51,7 @@ impl Trail {
                 backup_sqlite_path(&backup_path),
                 temp_dir.join(DB_RELATIVE_PATH),
             )?;
+            copy_dir_recursive(&backup_path.join("worktrees"), &temp_dir.join("worktrees"))?;
             let restored_conn = Connection::open(temp_dir.join(DB_RELATIVE_PATH))?;
             let filesystem_identity = fresh_restored_filesystem_identity(&workspace_root)?;
             let scope_root = restored_scope_root(&workspace_root);
@@ -61,26 +62,47 @@ impl Trail {
                 previous_epoch,
                 previous_continuity,
             )?;
+            drop(restored_conn);
+            test_crash_point("restore_after_ledger_rotation");
+
+            let mut db = Trail::open_without_recovering_derived_paths(&workspace_root, &temp_dir)?;
+            let rewritten_workdirs = {
+                let _lock = db.acquire_write_lock()?;
+                let rewritten = db.rewrite_restored_lane_workdir_paths()?;
+                db.drain_pending_path_index_derived_repairs_from_restore_stage(&db_dir)?;
+                rewritten
+            };
+            test_crash_point("restore_after_staged_workdir_rewrite");
+            db.recover_after_open()?;
+            test_crash_point("restore_after_staged_recovery");
+            let fsck = db.fsck()?;
+            if !fsck.errors.is_empty() {
+                return Err(Error::Corrupt(format!(
+                    "restored backup failed fsck: {}",
+                    fsck.errors.join("; ")
+                )));
+            }
             let checkpoint_busy: i64 =
-                restored_conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+                db.conn
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
             if checkpoint_busy != 0 {
                 return Err(Error::Conflict(
                     "restored SQLite checkpoint remained busy".into(),
                 ));
             }
-            drop(restored_conn);
-            OpenOptions::new()
-                .read(true)
-                .open(temp_dir.join(DB_RELATIVE_PATH))?
-                .sync_all()?;
-            copy_dir_recursive(&backup_path.join("worktrees"), &temp_dir.join("worktrees"))?;
-            test_crash_point("restore_after_ledger_rotation");
-            Ok(())
+            drop(db);
+            test_crash_point("restore_after_staged_checkpoint");
+            sync_tree_bottom_up(&temp_dir)?;
+            test_crash_point("restore_after_staged_sync");
+            Ok((rewritten_workdirs, fsck))
         })();
-        if let Err(err) = restore_result {
-            let _ = remove_any(&temp_dir);
-            return Err(err);
-        }
+        let (rewritten_workdirs, fsck) = match restore_result {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let _ = remove_any(&temp_dir);
+                return Err(err);
+            }
+        };
         let retained = match publish_staged_tree(&temp_dir, &db_dir) {
             Ok(retained) => retained,
             Err(error) => {
@@ -89,22 +111,6 @@ impl Trail {
             }
         };
         let post_publish = (|| -> Result<BackupRestoreReport> {
-            let mut db = Trail::open_without_recovering_derived_paths(&workspace_root, &db_dir)?;
-            let rewritten_workdirs = {
-                let _lock = db.acquire_write_lock()?;
-                let rewritten = db.rewrite_restored_lane_workdir_paths()?;
-                db.drain_pending_path_index_derived_repairs()?;
-                rewritten
-            };
-            db.recover_after_open()?;
-            let fsck = db.fsck()?;
-            if !fsck.errors.is_empty() {
-                return Err(Error::Corrupt(format!(
-                    "restored backup failed fsck: {}",
-                    fsck.errors.join("; ")
-                )));
-            }
-
             let backup_trailignore = backup_path.join(".trailignore");
             let workspace_trailignore = workspace_root.join(".trailignore");
             let restored_trailignore =
@@ -146,7 +152,9 @@ impl Trail {
                 let parent = db_dir
                     .parent()
                     .ok_or_else(|| Error::InvalidInput("restore target has no parent".into()))?;
+                test_crash_point("restore_before_retained_cleanup");
                 remove_retained_tree(retained, parent)?;
+                test_crash_point("restore_after_retained_cleanup");
                 Ok(report)
             }
             Err(error) => {

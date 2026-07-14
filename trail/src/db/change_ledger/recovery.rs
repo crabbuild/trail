@@ -212,7 +212,18 @@ pub(crate) fn rotate_restored_scopes(
     Ok(())
 }
 
-pub(crate) fn retire_scope(conn: &Connection, expected: &ExpectedScope) -> Result<Vec<String>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentDeletionToken {
+    pub(crate) scope_id: super::ScopeId,
+    pub(crate) epoch: u64,
+    pub(crate) directory: std::path::PathBuf,
+    pub(crate) leaf: String,
+}
+
+pub(crate) fn retire_scope(
+    conn: &Connection,
+    expected: &ExpectedScope,
+) -> Result<Vec<SegmentDeletionToken>> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let now = now_ts();
     let scope_state = tx
@@ -254,10 +265,11 @@ pub(crate) fn retire_scope(conn: &Connection, expected: &ExpectedScope) -> Resul
         )?
         .collect::<std::result::Result<Vec<String>, _>>()?;
     validate_retired_segment_paths(&paths)?;
+    let tokens = segment_deletion_tokens(conn, expected, &paths)?;
     if retired_at.is_some() {
         tx.commit()?;
         durable_intent_barrier(conn)?;
-        return Ok(paths);
+        return Ok(tokens);
     }
     let revoked = tx.execute(
         "UPDATE changed_path_observer_owners SET lease_state='revoked',updated_at=?1
@@ -306,14 +318,14 @@ pub(crate) fn retire_scope(conn: &Connection, expected: &ExpectedScope) -> Resul
     )?;
     tx.commit()?;
     durable_intent_barrier(conn)?;
-    Ok(paths)
+    Ok(tokens)
 }
 
 pub(crate) fn retire_deletion_scopes(
     conn: &Connection,
     owner_ids: &[&str],
     scope_roots: &[&str],
-) -> Result<Vec<String>> {
+) -> Result<Vec<SegmentDeletionToken>> {
     let rows = {
         let mut statement = conn.prepare(
             "SELECT scope_id,epoch,ref_name,ref_generation,baseline_root_id,
@@ -401,6 +413,91 @@ fn validate_retired_segment_paths(paths: &[String]) -> Result<()> {
                 "observer segment retirement path is not confined: `{path}`"
             )));
         }
+    }
+    Ok(())
+}
+
+fn segment_deletion_tokens(
+    conn: &Connection,
+    expected: &ExpectedScope,
+    leaves: &[String],
+) -> Result<Vec<SegmentDeletionToken>> {
+    let database_path = conn
+        .path()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| Error::Corrupt("retirement database path is unavailable".into()))?;
+    let trail_root = database_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| Error::Corrupt("retirement database has no Trail root".into()))?;
+    let directory = trail_root
+        .join("observer-segments")
+        .join(expected.scope_id.to_text());
+    Ok(leaves
+        .iter()
+        .map(|leaf| SegmentDeletionToken {
+            scope_id: expected.scope_id,
+            epoch: expected.epoch,
+            directory: directory.clone(),
+            leaf: leaf.clone(),
+        })
+        .collect())
+}
+
+pub(crate) fn remove_retired_segments(tokens: &[SegmentDeletionToken]) -> Result<()> {
+    let mut synced = std::collections::BTreeSet::new();
+    for token in tokens {
+        validate_retired_segment_paths(std::slice::from_ref(&token.leaf))?;
+        let metadata = match std::fs::symlink_metadata(&token.directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::Corrupt(format!(
+                "retired segment directory is not a real directory for scope {} epoch {}",
+                token.scope_id.to_text(),
+                token.epoch
+            )));
+        }
+        let path = token.directory.join(&token.leaf);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                std::fs::remove_file(&path)?;
+                synced.insert(token.directory.clone());
+            }
+            Ok(_) => {
+                return Err(Error::Corrupt(format!(
+                    "retired segment token does not name a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    for directory in synced {
+        sync_retired_segment_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn sync_retired_segment_directory(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)?
+            .sync_all()?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0200_0000)
+            .open(path)?
+            .sync_all()?;
     }
     Ok(())
 }
@@ -696,89 +793,128 @@ mod harness {
         }
 
         fn qualified_proof(&self, sequence: u64, path: &str) -> Result<QualifiedFilesystemProof> {
+            let (proof, writer) = self.qualified_proof_with_writer(sequence, path)?;
+            drop(writer);
+            Ok(proof)
+        }
+
+        fn qualified_proof_with_writer(
+            &self,
+            sequence: u64,
+            path: &str,
+        ) -> Result<(QualifiedFilesystemProof, super::super::SegmentWriter)> {
             let provider_id: String = self.db.conn.query_row(
                 "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
                 [self.expected.scope_id.to_text()],
                 |row| row.get(0),
             )?;
-            let owner_token = format!("qualified-owner-{}", self.expected.scope_id.to_text());
+            let owner_token_bytes = [self.expected.scope_id.0[0].wrapping_add(0x31); 32];
+            let owner_token = hex::encode(owner_token_bytes);
             let fence_nonce = b"qualified-fence".to_vec();
-            let segment_id = format!("qualified-segment-{}", self.expected.scope_id.to_text());
-            let segment_path = format!("{segment_id}.cpl");
-            let segment_hash = [self.expected.scope_id.0[0]; 32];
-            let end_cursor = format!("cursor-{sequence}").into_bytes();
-            let now = now_ts();
+            let relative_directory =
+                format!("observer-segments/{}", self.expected.scope_id.to_text());
+            let segment_directory = self.db.db_dir.join(&relative_directory);
+            let mut writer = super::super::SegmentWriter::acquire(
+                &self.db.db_dir.join(crate::db::DB_RELATIVE_PATH),
+                &segment_directory,
+                self.expected.scope_id,
+                self.expected.epoch,
+                owner_token_bytes,
+                &provider_id,
+                b"cursor-1".to_vec(),
+                Duration::from_secs(600),
+            )?;
+            let records = (1..=sequence)
+                .map(|record_sequence| {
+                    Ok(super::super::ObserverRecord {
+                        sequence: record_sequence,
+                        source: EvidenceSource::Observer,
+                        path: LedgerPath::parse(path)?,
+                        flags: EvidenceFlags::CONTENT,
+                        provider_cursor: format!("cursor-{}", record_sequence + 1).into_bytes(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            writer.append(&records)?;
+            let durable = writer.flush_durable()?;
+            writer.rotate()?;
+            let end_cursor = durable.provider_cursor.clone();
             self.insert_observer_event(path, sequence)?;
             self.db.conn.execute(
-                "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=100,
-                     folded_offset=100 WHERE scope_id=?2",
-                params![end_cursor, self.expected.scope_id.to_text()],
+                "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,
+                     folded_offset=?2 WHERE scope_id=?3",
+                params![
+                    end_cursor,
+                    sql_u64(durable.durable_end_offset, "fixture durable offset")?,
+                    self.expected.scope_id.to_text()
+                ],
             )?;
             self.db.conn.execute(
-                "INSERT INTO changed_path_observer_owners(
-                     scope_id,epoch,owner_token,provider_id,provider_identity,lease_state,
-                     fence_nonce,acquired_at,heartbeat_at,expires_at,error_state,error_at,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,'active',?6,?7,?7,?8,NULL,NULL,?7)",
+                "UPDATE changed_path_observer_owners
+                 SET provider_identity=?1,fence_nonce=?2 WHERE scope_id=?3",
                 params![
-                    self.expected.scope_id.to_text(),
-                    sql_u64(self.expected.epoch, "fixture epoch")?,
-                    owner_token,
-                    provider_id,
                     hex::encode(&self.expected.provider_identity),
                     fence_nonce,
-                    now,
-                    now + 600,
+                    self.expected.scope_id.to_text(),
                 ],
             )?;
             self.db.conn.execute(
-                "INSERT INTO changed_path_observer_segments(
-                     scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
-                     first_sequence,last_sequence,durable_end_offset,folded_end_offset,
-                     previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
-                     created_at,sealed_at,updated_at)
-                 VALUES(?1,?2,?3,1,?4,?5,1,?6,100,100,NULL,NULL,?7,?8,'sealed',?9,?9,?9)",
-                params![
-                    self.expected.scope_id.to_text(),
-                    sql_u64(self.expected.epoch, "fixture epoch")?,
-                    segment_id,
-                    owner_token,
-                    provider_id,
-                    sql_u64(sequence, "fixture sequence")?,
-                    hex::encode(segment_hash),
-                    segment_path,
-                    now,
-                ],
+                "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+                 WHERE scope_id=?1 AND segment_id=?2",
+                params![self.expected.scope_id.to_text(), durable.segment_id],
             )?;
-            Ok(QualifiedFilesystemProof {
-                scope_id: self.expected.scope_id,
-                epoch: self.expected.epoch,
-                expected_root_id: self.expected.baseline_root.clone(),
-                scope_root_identity: self.expected.filesystem_identity.clone(),
-                filesystem_identity: self.expected.filesystem_identity.clone(),
-                provider_id,
-                provider_identity: self.expected.provider_identity.clone(),
-                observer_owner_token: owner_token,
-                owner_fence_nonce: Some(fence_nonce),
-                durable_segment_id: segment_id,
-                durable_segment_hash: segment_hash,
-                segment_path,
-                start_cursor: Some(b"cursor-1".to_vec()),
-                end_cursor,
-                start_sequence: 1,
-                end_cut: EvidenceCut {
-                    source: EvidenceSource::Observer,
-                    sequence,
-                    durable_offset: 100,
-                    folded_offset: 100,
+            let segment = self.db.conn.query_row(
+                "SELECT segment_hash,segment_path,durable_end_offset,folded_end_offset
+                 FROM changed_path_observer_segments
+                 WHERE scope_id=?1 AND segment_id=?2 AND state='sealed'",
+                params![self.expected.scope_id.to_text(), durable.segment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
                 },
-                segment_durable_offset: 100,
-                segment_folded_offset: 100,
-                verified_paths: 1,
-                verified_prefixes: 0,
-                complete_root_interval: true,
-                complete_policy_interval: true,
-                persisted_evidence_through_end: true,
-            })
+            )?;
+            let segment_hash: [u8; 32] = hex::decode(segment.0)
+                .map_err(|error| Error::Corrupt(error.to_string()))?
+                .try_into()
+                .map_err(|_| Error::Corrupt("invalid fixture segment hash".into()))?;
+            Ok((
+                QualifiedFilesystemProof {
+                    scope_id: self.expected.scope_id,
+                    epoch: self.expected.epoch,
+                    expected_root_id: self.expected.baseline_root.clone(),
+                    scope_root_identity: self.expected.filesystem_identity.clone(),
+                    filesystem_identity: self.expected.filesystem_identity.clone(),
+                    provider_id,
+                    provider_identity: self.expected.provider_identity.clone(),
+                    observer_owner_token: owner_token,
+                    owner_fence_nonce: Some(fence_nonce),
+                    durable_segment_id: durable.segment_id,
+                    durable_segment_hash: segment_hash,
+                    segment_directory: relative_directory,
+                    segment_path: segment.1,
+                    start_cursor: Some(b"cursor-1".to_vec()),
+                    end_cursor,
+                    start_sequence: 1,
+                    end_cut: EvidenceCut {
+                        source: EvidenceSource::Observer,
+                        sequence,
+                        durable_offset: durable.durable_end_offset,
+                        folded_offset: durable.durable_end_offset,
+                    },
+                    segment_durable_offset: db_u64(segment.2, "fixture segment durable")?,
+                    segment_folded_offset: db_u64(segment.3, "fixture segment folded")?,
+                    verified_paths: 1,
+                    verified_prefixes: 0,
+                    complete_root_interval: true,
+                    complete_policy_interval: true,
+                    persisted_evidence_through_end: true,
+                },
+                writer,
+            ))
         }
 
         fn advance_ref_to(&self, target: &IntentTarget) -> Result<()> {
@@ -856,6 +992,69 @@ mod harness {
             return Err(Error::Corrupt(format!(
                 "concurrent observer evidence was cleared: {row:?}"
             )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn authenticated_prefix_survives_later_observer_advance() -> Result<()> {
+        let fixture = Fixture::new(0x81)?;
+        let target = fixture.target("advanced-prefix", fixture.expected.baseline_root.clone());
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("advanced-prefix.rs"),
+        )?;
+        let (proof, mut writer) = fixture.qualified_proof_with_writer(1, "advanced-prefix.rs")?;
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 2,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse("advanced-prefix.rs")?,
+            flags: EvidenceFlags::CONTENT,
+            provider_cursor: b"cursor-3".to_vec(),
+        }])?;
+        let advanced = writer.flush_durable()?;
+        writer.rotate()?;
+        drop(writer);
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1 AND segment_id=?2",
+            params![fixture.expected.scope_id.to_text(), advanced.segment_id],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                advanced.provider_cursor,
+                sql_u64(advanced.durable_end_offset, "advanced durable offset")?,
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        fixture.insert_observer_event("advanced-prefix.rs", 2)?;
+        durable_intent_barrier(&fixture.db.conn)?;
+        fixture.advance_ref_to(&target)?;
+        publish_intent(&ledger, &fixture.expected, &intent)?;
+
+        let decisions = recover_scope(&ledger, &fixture.expected)?;
+        if decisions != vec![(intent.clone(), RecoveryDecision::FinishPublication)] {
+            return Err(Error::Corrupt(format!(
+                "authenticated prefix was not accepted after later observer advance: {decisions:?}"
+            )));
+        }
+        let later_sequence: i64 = fixture.db.conn.query_row(
+            "SELECT provider_sequence FROM changed_path_entries
+             WHERE scope_id=?1 AND normalized_path='advanced-prefix.rs'",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        if later_sequence != 2 {
+            return Err(Error::Corrupt(
+                "later observer evidence was cleared with the intent prefix".into(),
+            ));
         }
         Ok(())
     }
@@ -1030,7 +1229,11 @@ mod harness {
                 ))
             },
         )?;
-        if retired_paths != vec!["retire-segment.cpl"]
+        if retired_paths
+            .iter()
+            .map(|token| token.leaf.as_str())
+            .collect::<Vec<_>>()
+            != vec!["retire-segment.cpl"]
             || retirement_state.0 != retirement_before + 1
             || retirement_state.1.is_none()
             || retirement_state.2 != "revoked"
@@ -1136,7 +1339,12 @@ mod harness {
         }
         reader.execute_batch("COMMIT")?;
         let paths = retire_scope(&reader_fixture.db.conn, &reader_fixture.expected)?;
-        if paths != vec!["reader-segment.cpl"] {
+        if paths
+            .iter()
+            .map(|token| token.leaf.as_str())
+            .collect::<Vec<_>>()
+            != vec!["reader-segment.cpl"]
+        {
             return Err(Error::Corrupt(format!(
                 "retirement retry did not return confined paths: {paths:?}"
             )));
@@ -1222,6 +1430,17 @@ mod harness {
              WHERE scope_id=?1",
             [scope.scope_id.to_text()],
         )?;
+        let segment_directory = db
+            .db_dir
+            .join("observer-segments")
+            .join(scope.scope_id.to_text());
+        std::fs::create_dir_all(&segment_directory)?;
+        let segment_file = segment_directory.join("lane-segment.cpl");
+        std::fs::write(&segment_file, b"retired segment\n")?;
+        OpenOptions::new()
+            .read(true)
+            .open(&segment_file)?
+            .sync_all()?;
         let reader = Connection::open(db.db_dir.join(crate::db::DB_RELATIVE_PATH))?;
         reader.execute_batch("BEGIN DEFERRED")?;
         let _: i64 = reader.query_row("SELECT COUNT(*) FROM changed_path_scopes", [], |row| {
@@ -1249,9 +1468,9 @@ mod harness {
             [scope.scope_id.to_text()],
             |row| row.get(0),
         )?;
-        if !retired || workdir.exists() {
+        if !retired || workdir.exists() || segment_file.exists() {
             return Err(Error::Corrupt(
-                "lane scope was not retired before workdir deletion".into(),
+                "lane scope/segment was not retired before workdir deletion".into(),
             ));
         }
         Ok(())
@@ -1268,21 +1487,26 @@ mod harness {
 
     #[test]
     fn subprocess_kill_and_reopen_covers_intent_durability_boundaries() {
-        for (index, phase) in [
-            "changed_path_after_object_graph",
-            "changed_path_after_intent_prepare",
-            "changed_path_after_filesystem_write",
-            "changed_path_after_observer_durable",
-            "changed_path_after_filesystem_applied",
-            "changed_path_after_ref_publish",
-            "changed_path_after_intent_publish",
-            "changed_path_after_recovery_commit",
+        for (index, (phase, tamper)) in [
+            ("changed_path_after_object_graph", None),
+            ("changed_path_after_intent_prepare", None),
+            ("changed_path_after_filesystem_write", None),
+            ("changed_path_after_observer_durable", None),
+            ("changed_path_after_filesystem_applied", None),
+            ("changed_path_after_ref_publish", None),
+            ("changed_path_after_ref_publish", Some("missing")),
+            ("changed_path_after_ref_publish", Some("truncated")),
+            ("changed_path_after_ref_publish", Some("replaced")),
+            ("changed_path_after_ref_publish", Some("corrupt")),
+            ("changed_path_after_intent_publish", None),
+            ("changed_path_after_recovery_commit", None),
         ]
         .into_iter()
         .enumerate()
         {
             let fixture = Fixture::new(0x70 + u8::try_from(index).unwrap()).unwrap();
-            let ready = fixture.db.db_dir.join("tmp").join(format!("{phase}.ready"));
+            let label = tamper.map_or_else(|| phase.to_string(), |kind| format!("{phase}-{kind}"));
+            let ready = fixture.db.db_dir.join("tmp").join(format!("{label}.ready"));
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1304,6 +1528,50 @@ mod harness {
             child.kill().unwrap();
             let _ = child.wait().unwrap();
 
+            if let Some(tamper) = tamper {
+                let segment_path: String = fixture
+                    .db
+                    .conn
+                    .query_row(
+                        "SELECT segment_path FROM changed_path_observer_segments
+                         WHERE scope_id=?1 AND state='sealed' ORDER BY first_sequence LIMIT 1",
+                        [fixture.expected.scope_id.to_text()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let path = fixture
+                    .db
+                    .db_dir
+                    .join("observer-segments")
+                    .join(fixture.expected.scope_id.to_text())
+                    .join(segment_path);
+                match tamper {
+                    "missing" => std::fs::remove_file(path).unwrap(),
+                    "truncated" => {
+                        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                        let len = file.metadata().unwrap().len();
+                        file.set_len(len.saturating_sub(1)).unwrap();
+                        file.sync_all().unwrap();
+                    }
+                    "replaced" => {
+                        std::fs::remove_file(&path).unwrap();
+                        std::fs::write(path, b"replacement segment").unwrap();
+                    }
+                    "corrupt" => {
+                        use std::io::{Seek, Write};
+                        let mut file = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(path)
+                            .unwrap();
+                        file.seek(std::io::SeekFrom::End(-1)).unwrap();
+                        file.write_all(&[0xff]).unwrap();
+                        file.sync_all().unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
             let reopened = Trail::open(&fixture.db.workspace_root).unwrap();
             let ledger = ChangedPathLedger::new(&reopened.conn);
             let _ = recover_scope(&ledger, &fixture.expected);
@@ -1322,10 +1590,19 @@ mod harness {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            if index == 0 {
+            if tamper.is_some() {
+                assert_eq!(state.0, "untrusted_gap", "tampered proof stayed clean");
+                assert_eq!(state.2, fixture.expected.baseline_root.0);
+            } else if phase == "changed_path_after_object_graph" {
                 assert_eq!(state.0, "trusted", "object-only boundary changed trust");
                 assert_eq!(state.2, fixture.expected.baseline_root.0);
-            } else if index < 5 {
+            } else if matches!(
+                phase,
+                "changed_path_after_intent_prepare"
+                    | "changed_path_after_filesystem_write"
+                    | "changed_path_after_observer_durable"
+                    | "changed_path_after_filesystem_applied"
+            ) {
                 assert_eq!(state.0, "untrusted_gap", "false clean after {phase}");
                 assert_eq!(state.2, fixture.expected.baseline_root.0);
             } else {
@@ -1403,10 +1680,20 @@ mod harness {
 
         for phase in [
             "restore_after_ledger_rotation",
+            "restore_after_staged_workdir_rewrite",
+            "restore_after_staged_recovery",
+            "restore_after_staged_checkpoint",
+            "restore_after_staged_sync",
             "backup_restore_after_staging_sync",
             "backup_restore_after_atomic_exchange",
+            "restore_before_retained_cleanup",
+            "restore_after_retained_cleanup",
         ] {
-            let fixture = Fixture::new(0x7b).unwrap();
+            let mut fixture = Fixture::new(0x7b).unwrap();
+            fixture
+                .db
+                .spawn_lane("restore-crash-lane", Some("main"), true, None, None)
+                .unwrap();
             fixture.db.create_backup(&fixture.backup, false).unwrap();
             let destination = fixture._root.path().join(format!("restore-{phase}"));
             std::fs::write(destination.join("live.txt"), b"old live workspace\n").unwrap_or_else(
@@ -1432,6 +1719,33 @@ mod harness {
                 old_is_intact || new_is_intact,
                 "neither old nor restored tree survived {phase}"
             );
+            if !old_is_intact {
+                let restored = Trail::open(&destination).unwrap();
+                let lane = restored.lane_details("restore-crash-lane").unwrap();
+                let workdir = lane.branch.workdir.unwrap();
+                let canonical_destination = destination.canonicalize().unwrap();
+                assert!(
+                    workdir.starts_with(
+                        &canonical_destination
+                            .join(".trail")
+                            .to_string_lossy()
+                            .to_string()
+                    ),
+                    "restored workdir was not rewritten after {phase}: {workdir}"
+                );
+                assert!(std::path::Path::new(&workdir).is_dir());
+                let identity: (String, String) = restored
+                    .conn
+                    .query_row(
+                        "SELECT trust_state,filesystem_identity FROM changed_path_scopes
+                         WHERE retired_at IS NULL LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(identity.0, "untrusted_gap");
+                assert!(!identity.1.is_empty());
+            }
         }
     }
 
@@ -1587,7 +1901,10 @@ mod harness {
             |row| row.get(0),
         )?;
         let owner_token = [0x71_u8; 32];
-        let segment_dir = db.db_dir.join("observer-crash-segments");
+        let segment_dir = db
+            .db_dir
+            .join("observer-segments")
+            .join(expected.scope_id.to_text());
         let mut writer = super::super::SegmentWriter::acquire(
             &db.db_dir.join(crate::db::DB_RELATIVE_PATH),
             &segment_dir,
@@ -1671,6 +1988,7 @@ mod harness {
             owner_fence_nonce: Some(b"crash-fence".to_vec()),
             durable_segment_id: segment.0,
             durable_segment_hash: hash,
+            segment_directory: format!("observer-segments/{}", expected.scope_id.to_text()),
             segment_path: segment.2,
             start_cursor: Some(b"cursor-1".to_vec()),
             end_cursor: b"cursor-end".to_vec(),
@@ -1801,6 +2119,34 @@ mod harness {
             return Err(Error::Corrupt(format!(
                 "unqualified proof did not fail closed: {state}"
             )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn rejects_metadata_only_proof_without_sidecar() -> Result<()> {
+        let fixture = Fixture::new(0x80)?;
+        let target = fixture.target("missing-sidecar", fixture.expected.baseline_root.clone());
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("missing-sidecar.rs"),
+        )?;
+        let proof = fixture.qualified_proof(1, "missing-sidecar.rs")?;
+        std::fs::remove_file(
+            fixture
+                .db
+                .db_dir
+                .join(&proof.segment_directory)
+                .join(&proof.segment_path),
+        )?;
+
+        if mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof).is_ok() {
+            return Err(Error::Corrupt(
+                "metadata-only intent proof was accepted without a segment sidecar".into(),
+            ));
         }
         Ok(())
     }
@@ -1959,4 +2305,15 @@ pub(crate) fn run_retirement_barrier() -> std::result::Result<(), String> {
 #[cfg(debug_assertions)]
 pub(crate) fn run_lane_deletion_retirement() -> std::result::Result<(), String> {
     harness::lane_deletion_retires_scope_first().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_missing_sidecar_rejection() -> std::result::Result<(), String> {
+    harness::rejects_metadata_only_proof_without_sidecar().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_advanced_prefix_recovery() -> std::result::Result<(), String> {
+    harness::authenticated_prefix_survives_later_observer_advance()
+        .map_err(|error| error.to_string())
 }

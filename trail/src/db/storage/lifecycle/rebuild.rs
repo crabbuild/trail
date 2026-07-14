@@ -601,6 +601,20 @@ impl Trail {
     }
 
     pub(crate) fn drain_pending_path_index_derived_repairs(&self) -> Result<()> {
+        self.drain_pending_path_index_derived_repairs_with_db_mapping(None)
+    }
+
+    pub(crate) fn drain_pending_path_index_derived_repairs_from_restore_stage(
+        &self,
+        published_db_dir: &Path,
+    ) -> Result<()> {
+        self.drain_pending_path_index_derived_repairs_with_db_mapping(Some(published_db_dir))
+    }
+
+    fn drain_pending_path_index_derived_repairs_with_db_mapping(
+        &self,
+        published_db_dir: Option<&Path>,
+    ) -> Result<()> {
         let pending = {
             let mut stmt = self.conn.prepare(
                 "SELECT ref_name, repair_kind, old_root, new_root, new_change \
@@ -622,7 +636,7 @@ impl Trail {
         };
 
         for repair in pending {
-            if !self.repair_pending_path_index_derived_mirror(&repair)? {
+            if !self.repair_pending_path_index_derived_mirror(&repair, published_db_dir)? {
                 continue;
             }
             self.conn.execute(
@@ -644,6 +658,7 @@ impl Trail {
     fn repair_pending_path_index_derived_mirror(
         &self,
         repair: &PendingPathIndexDerivedRepair,
+        published_db_dir: Option<&Path>,
     ) -> Result<bool> {
         let Some(reference) = self.try_get_ref(&repair.ref_name)? else {
             return Ok(true);
@@ -684,6 +699,9 @@ impl Trail {
                             .join(".trail")
                             .join("workdir-manifest.json")
                     });
+                let path = published_db_dir
+                    .and_then(|published| path.strip_prefix(published).ok())
+                    .map_or(path.clone(), |relative| self.db_dir.join(relative));
                 Ok(self.repair_clean_workdir_manifest_root_mirror(
                     &path,
                     &repair.old_root,

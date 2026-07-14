@@ -84,6 +84,21 @@ pub(crate) struct RecoveredTail {
     pub(crate) last_sequence: u64,
     pub(crate) last_hash: [u8; 32],
     pub(crate) requires_reconciliation: bool,
+    pub(crate) segments: Vec<AuthenticatedSegment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedSegment {
+    pub(crate) segment_id: String,
+    pub(crate) segment_path: String,
+    pub(crate) state: String,
+    pub(crate) start_cursor: Vec<u8>,
+    pub(crate) end_cursor: Vec<u8>,
+    pub(crate) first_sequence: u64,
+    pub(crate) last_sequence: u64,
+    pub(crate) durable_end_offset: u64,
+    pub(crate) folded_end_offset: u64,
+    pub(crate) segment_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

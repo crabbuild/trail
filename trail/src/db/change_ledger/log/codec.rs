@@ -281,6 +281,7 @@ pub(super) fn recover_bytes(
                 last_sequence,
                 last_hash: previous_hash,
                 requires_reconciliation: true,
+                segments: Vec::new(),
             });
         }
         let body_len = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
@@ -301,6 +302,7 @@ pub(super) fn recover_bytes(
                 last_sequence,
                 last_hash: previous_hash,
                 requires_reconciliation: true,
+                segments: Vec::new(),
             });
         }
         if records.len() == limits.max_unfolded_tail_records {
@@ -329,6 +331,7 @@ pub(super) fn recover_bytes(
         last_sequence,
         last_hash: previous_hash,
         requires_reconciliation: false,
+        segments: Vec::new(),
     })
 }
 
@@ -410,13 +413,14 @@ pub(crate) fn recover_segments(
             last_sequence: 0,
             last_hash: [0; 32],
             requires_reconciliation: true,
+            segments: Vec::new(),
         });
     }
     let mut statement = connection
         .prepare(
             "SELECT segment_id, owner_token, first_sequence, last_sequence,
-                    durable_end_offset, previous_segment_id, previous_segment_hash,
-                    segment_hash, segment_path, state
+                    durable_end_offset, folded_end_offset, previous_segment_id,
+                    previous_segment_hash, segment_hash, segment_path, state
              FROM changed_path_observer_segments
              WHERE scope_id = ?1 AND epoch = ?2
              ORDER BY first_sequence, segment_id",
@@ -434,6 +438,7 @@ pub(crate) fn recover_segments(
     let mut previous_segment_id: Option<String> = None;
     let mut previous_segment_hash = [0; 32];
     let mut requires_reconciliation = false;
+    let mut authenticated_segments = Vec::with_capacity(segment_count);
     let mut index = 0_usize;
     while let Some(sql_row) = rows
         .next()
@@ -588,6 +593,23 @@ pub(crate) fn recover_segments(
                 "observer segment metadata is not recoverable",
             ));
         }
+        let end_cursor = recovered
+            .records
+            .last()
+            .map(|record| record.provider_cursor.clone())
+            .unwrap_or_else(|| identity.provider_cursor.clone());
+        authenticated_segments.push(super::AuthenticatedSegment {
+            segment_id: row.segment_id.clone(),
+            segment_path: row.segment_path.clone(),
+            state: row.state.clone(),
+            start_cursor: identity.provider_cursor.clone(),
+            end_cursor,
+            first_sequence,
+            last_sequence: recovered.last_sequence,
+            durable_end_offset: durable,
+            folded_end_offset: db_u64(row.folded_end_offset, "folded observer offset")?,
+            segment_hash,
+        });
         records.extend(recovered.records);
         durable_end = durable_end
             .checked_add(recovered.durable_end)
@@ -636,6 +658,7 @@ pub(crate) fn recover_segments(
         last_sequence,
         last_hash,
         requires_reconciliation,
+        segments: authenticated_segments,
     };
     drop(rows);
     drop(statement);
@@ -825,6 +848,7 @@ struct SegmentMetadata {
     first_sequence: i64,
     last_sequence: Option<i64>,
     durable_end_offset: i64,
+    folded_end_offset: i64,
     previous_segment_id: Option<String>,
     previous_segment_hash: Option<String>,
     segment_hash: Option<String>,
@@ -845,16 +869,19 @@ fn decode_segment_metadata(row: &Row<'_>) -> std::result::Result<SegmentMetadata
         durable_end_offset: row
             .get(4)
             .map_err(|error| RecoveryError::new(format!("decode durable offset: {error}")))?,
+        folded_end_offset: row
+            .get(5)
+            .map_err(|error| RecoveryError::new(format!("decode folded offset: {error}")))?,
         previous_segment_id: bounded_optional_text(
             row,
-            5,
+            6,
             "previous segment id",
             MAX_SEGMENT_FILENAME_BYTES,
         )?,
-        previous_segment_hash: bounded_optional_text(row, 6, "previous segment hash", 64)?,
-        segment_hash: bounded_optional_text(row, 7, "segment hash", 64)?,
-        segment_path: bounded_text(row, 8, "segment path", MAX_SEGMENT_FILENAME_BYTES)?,
-        state: bounded_text(row, 9, "segment state", 16)?,
+        previous_segment_hash: bounded_optional_text(row, 7, "previous segment hash", 64)?,
+        segment_hash: bounded_optional_text(row, 8, "segment hash", 64)?,
+        segment_path: bounded_text(row, 9, "segment path", MAX_SEGMENT_FILENAME_BYTES)?,
+        state: bounded_text(row, 10, "segment state", 16)?,
     })
 }
 
