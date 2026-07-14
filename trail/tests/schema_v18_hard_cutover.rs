@@ -289,6 +289,62 @@ fn insert_malformed_retirement_graph(conn: &Connection, kind: &str) {
     }
 }
 
+fn insert_source_quarantine_cross_wire(conn: &Connection) {
+    insert_malformed_retirement_graph(conn, "valid");
+    conn.execute(
+        "DELETE FROM changed_path_observer_segments
+         WHERE scope_id='scope-a' AND segment_id='segment-b'",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints=ON;
+         UPDATE changed_path_segment_quarantine_allocations
+         SET quarantine_device='17',quarantine_inode='18'
+         WHERE scope_id='scope-a' AND segment_id='segment-a';
+         UPDATE changed_path_segment_deletions
+         SET quarantine_device='17',quarantine_inode='18'
+         WHERE scope_id='scope-a' AND segment_id='segment-a';
+         PRAGMA ignore_check_constraints=OFF;",
+    )
+    .unwrap();
+}
+
+fn insert_policy_scope(conn: &Connection) {
+    conn.execute_batch(
+        "INSERT INTO changed_path_scopes(
+             scope_id,scope_kind,owner_id,scope_root,scope_root_identity,
+             filesystem_identity,filesystem_kind,case_sensitive,ref_name,ref_generation,
+             change_id,baseline_root_id,policy_fingerprint,policy_dependency_generation,
+             trust_state,trust_reason,created_at,updated_at)
+         VALUES('policy-scope','workspace','policy-owner','','root-id','fs-id','native',1,
+                'refs/heads/main',1,'change-a','root-a','policy-a',1,
+                'stale_baseline','policy_fixture',1,1);",
+    )
+    .unwrap();
+}
+
+fn insert_policy_dependency(
+    conn: &Connection,
+    identity: &str,
+    kind: &str,
+    content_identity: &[u8],
+    generation: i64,
+) {
+    conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO changed_path_policy_dependencies(
+             scope_id,dependency_identity,dependency_kind,content_identity,
+             metadata_identity,observable,generation,last_source_sequence,created_at,updated_at)
+         VALUES('policy-scope',?1,?2,?3,X'73796e7468657469632d7631',1,?4,0,1,1)",
+        (identity, kind, content_identity, generation),
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+        .unwrap();
+}
+
 #[test]
 fn existing_v17_is_rejected_without_mutating_any_trail_byte() {
     let fixture = SchemaFixture::versioned(17);
@@ -745,6 +801,72 @@ fn malformed_retirement_graph_is_rejected_read_only() {
 }
 
 #[test]
+fn source_segment_and_quarantine_identity_cross_wire_is_rejected_read_only() {
+    let fixture = SchemaFixture::with_sql(insert_source_quarantine_cross_wire);
+    let before = fixture.snapshot_tree_bytes();
+    let err = open_error(fixture.root());
+    assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+    assert_tree_unchanged(&fixture, &before);
+}
+
+#[test]
+fn malformed_policy_dependency_rows_are_rejected_read_only() {
+    let content_identity = [7_u8; 32];
+    let fixtures = [
+        SchemaFixture::with_sql(|conn| {
+            insert_policy_scope(conn);
+            insert_policy_dependency(conn, "builtin:recording-policy", "builtin", &[7], 1);
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_policy_scope(conn);
+            insert_policy_dependency(
+                conn,
+                "builtin:recording-policy",
+                "builtin",
+                &content_identity,
+                2,
+            );
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_policy_scope(conn);
+            insert_policy_dependency(
+                conn,
+                "synthetic:not-a-path",
+                "gitignore",
+                &content_identity,
+                1,
+            );
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_policy_scope(conn);
+            insert_policy_dependency(
+                conn,
+                "path:2f746d702f612f2e2e2f62",
+                "gitignore",
+                &content_identity,
+                1,
+            );
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_policy_scope(conn);
+            insert_policy_dependency(
+                conn,
+                "path:2f746d702f706f6c696379",
+                "builtin",
+                &content_identity,
+                1,
+            );
+        }),
+    ];
+    for fixture in fixtures {
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_tree_unchanged(&fixture, &before);
+    }
+}
+
+#[test]
 fn malformed_scope_segment_allocation_deletion_graph_is_rejected_read_only() {
     let fixtures = [
         SchemaFixture::with_sql(|conn| {
@@ -813,6 +935,33 @@ fn persistent_wal_malformed_retirement_graph_is_rejected_byte_invariantly() {
 }
 
 #[test]
+fn persistent_wal_cross_wired_retirement_identity_is_rejected_byte_invariantly() {
+    let fixture = SchemaFixture::with_persistent_wal(insert_source_quarantine_cross_wire);
+    assert_persistent_wal_rejected_byte_invariantly(&fixture);
+}
+
+#[test]
+fn persistent_wal_malformed_policy_dependencies_are_rejected_byte_invariantly() {
+    let malformed_generation = SchemaFixture::with_persistent_wal(|conn| {
+        insert_policy_scope(conn);
+        insert_policy_dependency(conn, "builtin:recording-policy", "builtin", &[7_u8; 32], 2);
+    });
+    assert_persistent_wal_rejected_byte_invariantly(&malformed_generation);
+
+    let malformed_path = SchemaFixture::with_persistent_wal(|conn| {
+        insert_policy_scope(conn);
+        insert_policy_dependency(
+            conn,
+            "path:2f746d702f612f2e2e2f62",
+            "gitignore",
+            &[7_u8; 32],
+            1,
+        );
+    });
+    assert_persistent_wal_rejected_byte_invariantly(&malformed_path);
+}
+
+#[test]
 fn persistent_wal_schema_fk_and_partial_generations_are_rejected_byte_invariantly() {
     let malformed_schema = SchemaFixture::with_persistent_wal(|conn| {
         conn.execute_batch("PRAGMA writable_schema=ON;").unwrap();
@@ -838,7 +987,7 @@ fn persistent_wal_schema_fk_and_partial_generations_are_rejected_byte_invariantl
             "INSERT INTO changed_path_policy_dependencies(
                  scope_id,dependency_identity,dependency_kind,content_identity,
                  metadata_identity,observable,generation,last_source_sequence,created_at,updated_at)
-             VALUES('missing-scope','dependency','builtin',X'01',X'02',1,1,0,1,1)",
+             VALUES('missing-scope','builtin:recording-policy','builtin',zeroblob(32),X'02',1,1,0,1,1)",
             [],
         )
         .unwrap();

@@ -132,7 +132,8 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              dependency_identity TEXT COLLATE BINARY NOT NULL CHECK(length(dependency_identity)>0),
              dependency_kind TEXT NOT NULL
                  CHECK(dependency_kind IN ('builtin','trail_config','ignore','trailignore','gitignore','git_info_exclude','git_excludes_file','git_config','normalization','mode','case_policy')),
-             content_identity BLOB NOT NULL,
+             content_identity BLOB NOT NULL
+                 CHECK(typeof(content_identity)='blob' AND length(content_identity)=32),
              metadata_identity BLOB NOT NULL,
              observable INTEGER NOT NULL CHECK(observable IN (0,1)),
              generation INTEGER NOT NULL CHECK(generation>=0),
@@ -320,6 +321,9 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
                  REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
                  ON UPDATE CASCADE ON DELETE CASCADE,
              CHECK ((quarantine_device IS NULL) = (quarantine_inode IS NULL)),
+             CHECK (quarantine_device IS NULL OR
+                    (quarantine_device=source_segment_device AND
+                     quarantine_inode=source_segment_inode)),
              CHECK ((observed_conflict_device IS NULL) =
                     (observed_conflict_inode IS NULL)),
              CHECK (state NOT IN ('allocated', 'bound') OR
@@ -380,6 +384,7 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              FOREIGN KEY (allocation_nonce)
                  REFERENCES changed_path_segment_quarantine_allocations(attempt_nonce)
                  ON UPDATE CASCADE ON DELETE CASCADE,
+             CHECK (quarantine_device=segment_device AND quarantine_inode=segment_inode),
              CHECK (completed_at IS NOT NULL)
          );
          CREATE INDEX changed_path_segment_deletions_state_idx
@@ -834,6 +839,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             &[
                 "dependency_identity TEXT COLLATE BINARY NOT NULL",
                 "CHECK(dependency_kind IN ('builtin','trail_config','ignore','trailignore','gitignore','git_info_exclude','git_excludes_file','git_config','normalization','mode','case_policy'))",
+                "CHECK(typeof(content_identity)='blob' AND length(content_identity)=32)",
                 "CHECK(observable IN (0,1))",
                 "PRIMARY KEY(scope_id,dependency_identity,dependency_kind)",
                 "WITHOUT ROWID",
@@ -928,6 +934,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CHECK (epoch >= 1)",
                 "CHECK (identity_policy = 'direct_noreplace_same_directory_v1')",
                 "CHECK (state IN ('allocating', 'allocated', 'bound', 'abandoned'))",
+                "CHECK (quarantine_device IS NULL OR (quarantine_device=source_segment_device AND quarantine_inode=source_segment_inode))",
             ],
         ),
         (
@@ -940,6 +947,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CHECK (retirement_continuity_generation>=1)",
                 "CHECK (length(retirement_fence_nonce)=32)",
                 "CHECK (state = 'quiesced')",
+                "CHECK (quarantine_device=segment_device AND quarantine_inode=segment_inode)",
                 "UNIQUE (scope_id, epoch, original_leaf)",
                 "UNIQUE (scope_id, epoch, quarantine_leaf)",
             ],
@@ -1370,6 +1378,16 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
              WHERE state IN ('allocating','allocated','bound')
              GROUP BY scope_id,epoch,segment_id HAVING COUNT(*)<>1
              UNION ALL
+             SELECT attempt_nonce
+             FROM changed_path_segment_quarantine_allocations
+             WHERE quarantine_device IS NOT NULL
+               AND (quarantine_device<>source_segment_device
+                    OR quarantine_inode<>source_segment_inode)
+             UNION ALL
+             SELECT segment_id
+             FROM changed_path_segment_deletions
+             WHERE quarantine_device<>segment_device OR quarantine_inode<>segment_inode
+             UNION ALL
              SELECT scope.scope_id
              FROM changed_path_scopes scope
              WHERE scope.retired_at IS NULL
@@ -1486,7 +1504,128 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
     if invalid_retirement_graph {
         return Ok(false);
     }
+    policy_dependencies_canonical(conn)
+}
+
+fn policy_dependencies_canonical(conn: &Connection) -> Result<bool> {
+    let invalid_row: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM changed_path_policy_dependencies dependency
+             JOIN changed_path_scopes scope ON scope.scope_id=dependency.scope_id
+             WHERE typeof(dependency.content_identity)<>'blob'
+                OR length(dependency.content_identity)<>32
+                OR dependency.generation<>scope.policy_dependency_generation
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_row {
+        return Ok(false);
+    }
+
+    let mut statement = conn.prepare(
+        "SELECT dependency_identity,dependency_kind
+         FROM changed_path_policy_dependencies
+         ORDER BY scope_id,dependency_kind COLLATE BINARY,dependency_identity COLLATE BINARY",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let identity = row.get::<_, String>(0)?;
+        let kind = row.get::<_, String>(1)?;
+        if !policy_dependency_identity_is_canonical(&identity, &kind) {
+            return Ok(false);
+        }
+    }
     Ok(true)
+}
+
+fn policy_dependency_identity_is_canonical(identity: &str, kind: &str) -> bool {
+    if let Some(encoded_path) = identity.strip_prefix("path:") {
+        if !matches!(
+            kind,
+            "trail_config"
+                | "ignore"
+                | "trailignore"
+                | "gitignore"
+                | "git_info_exclude"
+                | "git_excludes_file"
+                | "git_config"
+        ) || encoded_path.is_empty()
+            || encoded_path.len() % 2 != 0
+            || !encoded_path
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return false;
+        }
+        let Ok(path_bytes) = hex::decode(encoded_path) else {
+            return false;
+        };
+        let path = policy_path_from_bytes(path_bytes);
+        return path.is_absolute()
+            && lexical_normalize_policy_path(&path) == path
+            && policy_path_identity(&path) == identity;
+    }
+
+    match kind {
+        "builtin" => identity == "builtin:recording-policy",
+        "trail_config" => identity == "trail-config:recording",
+        "normalization" => identity == "normalization:path",
+        "mode" => identity == "mode:filesystem-entry",
+        "case_policy" => identity == "case-policy:scope",
+        "git_config" => identity
+            .strip_prefix("git-env:")
+            .is_some_and(canonical_nonempty_hex),
+        "ignore" | "trailignore" | "gitignore" | "git_info_exclude" | "git_excludes_file" => false,
+        _ => false,
+    }
+}
+
+fn canonical_nonempty_hex(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() % 2 == 0
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(unix)]
+fn policy_path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+fn policy_path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(unix)]
+fn policy_path_identity(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    format!("path:{}", hex::encode(path.as_os_str().as_bytes()))
+}
+
+#[cfg(not(unix))]
+fn policy_path_identity(path: &Path) -> String {
+    format!("path:{}", hex::encode(path.to_string_lossy().as_bytes()))
+}
+
+fn lexical_normalize_policy_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn table_columns_match(
