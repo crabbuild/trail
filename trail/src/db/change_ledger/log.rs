@@ -9,12 +9,14 @@ mod writer;
 pub(crate) use codec::recover_segments;
 pub(crate) use writer::SegmentWriter;
 
+#[cfg(all(test, target_os = "linux"))]
+use codec::open_segment_no_follow;
 #[cfg(test)]
 use codec::{
     decode_header, encode_header, encode_record, encoded_segment, header_end, recover_bytes,
 };
 #[cfg(test)]
-use writer::{FaultPoint, FaultScript};
+use writer::{sync_directory, FaultPoint, FaultScript};
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +27,7 @@ const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
 const RECORD_FIXED_BYTES: usize = 8 + 1 + 32 + 32;
 const LENGTH_PREFIX_BYTES: usize = 4;
+const MAX_SEGMENT_FILENAME_BYTES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObserverRecord {

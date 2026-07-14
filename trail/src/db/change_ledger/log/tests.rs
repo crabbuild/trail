@@ -6,8 +6,10 @@ use crate::db::change_ledger::{
 };
 use crate::{ChangeId, InitImportMode, ObjectId, Trail};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,17 +89,65 @@ impl Fixture {
     }
 
     fn acquire(&self, token: [u8; 32]) -> SegmentWriter {
+        self.acquire_epoch(3, token).unwrap()
+    }
+
+    fn acquire_epoch(&self, epoch: u64, token: [u8; 32]) -> Result<SegmentWriter> {
         SegmentWriter::acquire(
             &self.database,
             &self.segments,
             self.scope,
-            3,
+            epoch,
             token,
             "test-provider",
             b"cursor-0".to_vec(),
             Duration::from_secs(60),
         )
-        .unwrap()
+    }
+
+    fn full_v18() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let scope = ScopeId([0x44; 32]);
+        ChangedPathLedger::new(&db.conn)
+            .begin_scope(
+                &ScopeIdentity {
+                    scope_id: scope,
+                    kind: ScopeKind::Workspace,
+                    owner_id: "observer-review-fixture".into(),
+                },
+                &BaselineIdentity {
+                    ref_name: "refs/branches/main".into(),
+                    ref_generation: 1,
+                    change_id: ChangeId("observer-review-change".into()),
+                    root_id: ObjectId("observer-review-root".into()),
+                },
+                &PolicyIdentity {
+                    fingerprint: [0x45; 32],
+                    generation: 1,
+                },
+                &FilesystemIdentity(vec![0x46]),
+                &ProviderIdentity {
+                    identity: vec![0x47],
+                    capabilities: ProviderCapabilities {
+                        durable_cursor: false,
+                        linearizable_fence: false,
+                        rename_pairing: true,
+                        overflow_scope: true,
+                        filesystem_supported: true,
+                        clean_proof_allowed: false,
+                        power_loss_durability: false,
+                    },
+                },
+            )
+            .unwrap();
+        Self {
+            database: db.db_dir.join(crate::db::DB_RELATIVE_PATH),
+            segments: db.db_dir.join("observer-review"),
+            scope,
+            _temp: temp,
+        }
     }
 
     fn durable_offset(&self) -> u64 {
@@ -111,6 +161,51 @@ impl Fixture {
             )
             .unwrap() as u64
     }
+}
+
+fn database_snapshot(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
+    let connection = Connection::open(&fixture.database).unwrap();
+    let mut owners = connection
+        .prepare(
+            "SELECT printf('%s|%d|%s|%s|%d|%d', scope_id, epoch, owner_token,
+                    lease_state, expires_at, updated_at)
+             FROM changed_path_observer_owners ORDER BY scope_id",
+        )
+        .unwrap();
+    let owners = owners
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<String>, _>>()
+        .unwrap();
+    let mut segments = connection
+        .prepare(
+            "SELECT printf('%s|%d|%s|%d|%s|%s|%s', scope_id, epoch, segment_id,
+                    first_sequence, owner_token, segment_path, state)
+             FROM changed_path_observer_segments
+             ORDER BY epoch, first_sequence, segment_id",
+        )
+        .unwrap();
+    let segments = segments
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<String>, _>>()
+        .unwrap();
+    (owners, segments)
+}
+
+fn file_snapshot(fixture: &Fixture) -> Vec<(String, Vec<u8>)> {
+    let mut files = fs::read_dir(&fixture.segments)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }
 
 fn event(sequence: u64) -> ObserverRecord {
@@ -173,14 +268,14 @@ fn recovery_rejects_wrong_identity_non_monotonic_sequences_and_count_caps() {
 }
 
 #[test]
-fn live_lease_is_exclusive_and_replaced_owner_fails_before_append() {
-    let fixture = Fixture::new();
-    let mut first = fixture.acquire([1; 32]);
+fn global_epoch_fences_same_epoch_replacement_without_any_mutation() {
+    let fixture = Fixture::full_v18();
+    let mut first = fixture.acquire_epoch(1, [1; 32]).unwrap();
     assert!(SegmentWriter::acquire(
         &fixture.database,
         &fixture.segments,
         fixture.scope,
-        3,
+        1,
         [2; 32],
         "test-provider",
         Vec::new(),
@@ -189,16 +284,57 @@ fn live_lease_is_exclusive_and_replaced_owner_fails_before_append() {
     .is_err());
 
     let connection = Connection::open(&fixture.database).unwrap();
+    for (state, error_state, error_at) in [
+        ("revoked", None, None),
+        ("expired", None, None),
+        ("error", Some("injected-terminal-state"), Some(1_i64)),
+    ] {
+        connection
+            .execute(
+                "UPDATE changed_path_observer_owners
+                 SET lease_state=?1, error_state=?2, error_at=?3 WHERE scope_id=?4",
+                params![state, error_state, error_at, fixture.scope.to_text()],
+            )
+            .unwrap();
+        let database_before = database_snapshot(&fixture);
+        let files_before = file_snapshot(&fixture);
+
+        let error = fixture.acquire_epoch(1, [2; 32]).err().unwrap();
+
+        assert!(
+            error.to_string().contains("reconciliation"),
+            "state {state}"
+        );
+        assert_eq!(
+            database_snapshot(&fixture),
+            database_before,
+            "state {state}"
+        );
+        assert_eq!(file_snapshot(&fixture), files_before, "state {state}");
+    }
+    assert!(first.append(&[event(1)]).is_err());
+
     connection
         .execute(
-            "UPDATE changed_path_observer_owners
-                 SET lease_state = 'revoked', expires_at = 0 WHERE scope_id = ?1",
+            "UPDATE changed_path_scopes SET epoch=2 WHERE scope_id=?1",
             [fixture.scope.to_text()],
         )
         .unwrap();
-    let _replacement = fixture.acquire([2; 32]);
+    let replacement = fixture.acquire_epoch(2, [2; 32]).unwrap();
+    drop(replacement);
+    let epochs: Vec<(i64, i64)> = Connection::open(&fixture.database)
+        .unwrap()
+        .prepare(
+            "SELECT epoch, first_sequence FROM changed_path_observer_segments
+             ORDER BY epoch, first_sequence",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(epochs, vec![(1, 1), (2, 1)]);
 
-    assert!(first.append(&[event(1)]).is_err());
     assert!(!first.is_authorized());
 }
 
@@ -221,14 +357,7 @@ fn append_failure_revokes_writer_and_flush_never_publishes_ahead_of_sync() {
     assert!(append_writer.append(&[event(1)]).is_err());
     assert!(!append_writer.is_authorized());
 
-    let connection = Connection::open(&fixture.database).unwrap();
-    connection
-        .execute(
-            "UPDATE changed_path_observer_owners
-                 SET lease_state = 'revoked', expires_at = 0 WHERE scope_id = ?1",
-            [fixture.scope.to_text()],
-        )
-        .unwrap();
+    let fixture = Fixture::new();
     let sync_fault = Arc::new(FaultScript::new([FaultPoint::FileSync]));
     let mut sync_writer = SegmentWriter::acquire_with_faults(
         &fixture.database,
@@ -286,13 +415,13 @@ fn every_rotation_publication_fault_retires_the_writer() {
         FaultPoint::SecondDirectorySync,
         FaultPoint::NextMetadataPublication,
     ] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::full_v18();
         let faults = Arc::new(FaultScript::new([point]));
         let mut writer = SegmentWriter::acquire_with_faults(
             &fixture.database,
             &fixture.segments,
             fixture.scope,
-            3,
+            1,
             [point as u8 + 10; 32],
             "test-provider",
             Vec::new(),
@@ -308,7 +437,60 @@ fn every_rotation_publication_fault_retires_the_writer() {
             "fault {point:?} did not retire writer"
         );
         assert!(writer.append(&[event(2)]).is_err());
+        let recovered = recover_segments(
+            &fixture.database,
+            &fixture.segments,
+            &RecoveryScope {
+                scope_id: fixture.scope,
+                epoch: 1,
+                owner_token: [point as u8 + 10; 32],
+            },
+            PersistedLogLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            recovered.requires_reconciliation,
+            "fault {point:?} recovered as trusted"
+        );
     }
+}
+
+#[test]
+fn acquisition_and_rotation_count_headers_against_both_byte_caps() {
+    let fixture = Fixture::new();
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE changed_path_scopes SET max_observer_log_bytes=16, max_segment_bytes=16",
+            [],
+        )
+        .unwrap();
+    assert!(fixture.acquire_epoch(3, [0x31; 32]).is_err());
+    assert!(database_snapshot(&fixture).0.is_empty());
+    assert!(!fixture.segments.exists());
+
+    let fixture = Fixture::new();
+    let token = [0x32; 32];
+    let first_identity = SegmentIdentity::test(fixture.scope, 3, token);
+    let first_header = encode_header(&first_identity).unwrap().len() as u64;
+    let (record, _) = encode_record(&event(1), [0; 32]).unwrap();
+    let mut next_identity = first_identity;
+    next_identity.provider_cursor = event(1).provider_cursor;
+    next_identity.previous_segment_hash = [1; 32];
+    let next_header = encode_header(&next_identity).unwrap().len() as u64;
+    let cap = first_header + record.len() as u64 + next_header - 1;
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE changed_path_scopes SET max_observer_log_bytes=?1, max_segment_bytes=?1",
+            [cap as i64],
+        )
+        .unwrap();
+    let mut writer = fixture.acquire(token);
+    writer.append(&[event(1)]).unwrap();
+    let before = database_snapshot(&fixture).1;
+    assert!(writer.rotate().is_err());
+    assert_eq!(database_snapshot(&fixture).1, before);
 }
 
 #[test]
@@ -341,7 +523,7 @@ fn version_one_header_is_canonical_and_identity_is_lossless() {
 }
 
 #[test]
-fn version_one_record_has_only_the_specified_six_fields() {
+fn independently_parsed_version_one_record_has_exactly_six_fields_and_checksum() {
     let identity = SegmentIdentity::test(ScopeId([7; 32]), 3, [9; 32]);
     let bytes = encoded_segment(&identity, &[event(1)]).unwrap();
     let record_start = header_end(&bytes).unwrap();
@@ -350,7 +532,270 @@ fn version_one_record_has_only_the_specified_six_fields() {
 
     assert_eq!(body_len + 4, bytes.len() - record_start);
     assert_eq!(bytes[record_start + 4 + 8], 1);
-    assert_eq!(bytes[record_start + 4 + 8 + 1], 0x83);
+    let body = &bytes[record_start + 4..];
+    let sequence = u64::from_be_bytes(body[..8].try_into().unwrap());
+    let source = body[8];
+    let payload_end = body.len() - 64;
+    let payload = &body[9..payload_end];
+    let previous_hash: [u8; 32] = body[payload_end..payload_end + 32].try_into().unwrap();
+    let checksum: [u8; 32] = body[payload_end + 32..].try_into().unwrap();
+    let independently_calculated: [u8; 32] = Sha256::digest(&body[..payload_end + 32]).into();
+    assert_eq!(sequence, 1);
+    assert_eq!(source, 1);
+    assert_eq!(payload[0], 0x83);
+    assert_eq!(previous_hash, [0; 32]);
+    assert_eq!(checksum, independently_calculated);
+    assert_eq!(
+        4 + 8 + 1 + payload.len() + 32 + 32,
+        bytes.len() - record_start
+    );
+}
+
+#[test]
+fn independently_crafted_noncanonical_cbor_is_rejected() {
+    let identity = SegmentIdentity::test(ScopeId([7; 32]), 3, [9; 32]);
+    let canonical = encode_header(&identity).unwrap();
+    let payload_start = 14;
+    let epoch_offset = payload_start + 1 + 2 + 32;
+    assert_eq!(canonical[epoch_offset], 3);
+    let mut noncanonical = canonical;
+    let canonical_length = u32::from_be_bytes(noncanonical[10..14].try_into().unwrap());
+    noncanonical[10..14].copy_from_slice(&(canonical_length + 1).to_be_bytes());
+    noncanonical[epoch_offset] = 0x18;
+    noncanonical.insert(epoch_offset + 1, 3);
+    assert!(decode_header(&noncanonical).is_err());
+}
+
+#[test]
+fn metadata_paths_are_derived_relative_bounded_and_never_followed() {
+    let fixture = Fixture::new();
+    let token = [0x71; 32];
+    let writer = fixture.acquire(token);
+    let filename = writer
+        .path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let stored: String = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT segment_path FROM changed_path_observer_segments",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, filename);
+
+    let connection = Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE changed_path_observer_segments SET segment_path='../escape.cpl'",
+            [],
+        )
+        .unwrap();
+    assert!(recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: token,
+        },
+        PersistedLogLimits::default(),
+    )
+    .is_err());
+
+    connection
+        .execute(
+            "UPDATE changed_path_observer_segments SET segment_path=?1",
+            ["x".repeat(MAX_SEGMENT_FILENAME_BYTES + 1)],
+        )
+        .unwrap();
+    let error = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: token,
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("path") || error.message.contains("filename"));
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_symlink_segment_final_component_with_no_follow() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let writer = fixture.acquire([0x72; 32]);
+    let path = writer.path.clone();
+    let target = fixture._temp.path().join("outside.cpl");
+    fs::copy(&path, &target).unwrap();
+    drop(writer);
+    fs::remove_file(&path).unwrap();
+    symlink(&target, &path).unwrap();
+    let error = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: [0x72; 32],
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("symlink") || error.message.contains("segment"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_recovery_open_is_compiled_with_no_follow() {
+    let fixture = Fixture::new();
+    let writer = fixture.acquire([0x73; 32]);
+    assert!(open_segment_no_follow(&writer.path).is_ok());
+}
+
+#[test]
+fn recovery_open_is_read_only_and_does_not_create_a_missing_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing.sqlite");
+    assert!(recover_segments(
+        &missing,
+        temp.path(),
+        &RecoveryScope {
+            scope_id: ScopeId([1; 32]),
+            epoch: 1,
+            owner_token: [2; 32],
+        },
+        PersistedLogLimits::default(),
+    )
+    .is_err());
+    assert!(!missing.exists());
+}
+
+#[test]
+fn read_only_recovery_does_not_create_wal_or_shm_sidecars_to_inspect() {
+    let fixture = Fixture::new();
+    let writer = fixture.acquire([0x7a; 32]);
+    let expected = RecoveryScope {
+        scope_id: fixture.scope,
+        epoch: 3,
+        owner_token: [0x7a; 32],
+    };
+    drop(writer);
+    let wal = PathBuf::from(format!("{}-wal", fixture.database.display()));
+    let shm = PathBuf::from(format!("{}-shm", fixture.database.display()));
+    if wal.exists() {
+        fs::remove_file(&wal).unwrap();
+    }
+    if shm.exists() {
+        fs::remove_file(&shm).unwrap();
+    }
+
+    recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &expected,
+        PersistedLogLimits::default(),
+    )
+    .unwrap();
+
+    assert!(!wal.exists());
+    assert!(!shm.exists());
+}
+
+#[test]
+fn recovery_rejects_segment_count_before_streaming_row_strings_or_records() {
+    let fixture = Fixture::new();
+    let mut writer = fixture.acquire([0x7b; 32]);
+    writer.append(&[event(1)]).unwrap();
+    writer.rotate().unwrap();
+    drop(writer);
+    let error = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: [0x7b; 32],
+        },
+        PersistedLogLimits {
+            max_unfolded_tail_records: 1,
+            ..PersistedLogLimits::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.message.contains("segment count"));
+}
+
+#[test]
+fn writer_applies_required_sqlite_runtime_pragmas() {
+    let fixture = Fixture::new();
+    let writer = fixture.acquire([0x74; 32]);
+    assert_eq!(writer.runtime_pragmas(), ("wal".into(), 1, 1, 2));
+}
+
+#[test]
+fn append_post_write_expiry_retires_without_publishing_memory_or_durability() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(FaultScript::new([FaultPoint::AppendPostWriteLeaseExpiry]));
+    let mut writer = SegmentWriter::acquire_with_faults(
+        &fixture.database,
+        &fixture.segments,
+        fixture.scope,
+        3,
+        [0x75; 32],
+        "test-provider",
+        Vec::new(),
+        Duration::from_secs(60),
+        faults,
+    )
+    .unwrap();
+    let offset = fixture.durable_offset();
+    assert!(writer.append(&[event(1)]).is_err());
+    assert_eq!(fixture.durable_offset(), offset);
+    let recovered = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: [0x75; 32],
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap();
+    assert!(recovered.requires_reconciliation);
+}
+
+#[test]
+fn flush_rejects_a_synchronized_file_length_different_from_claimed_offset() {
+    let fixture = Fixture::new();
+    let mut writer = fixture.acquire([0x76; 32]);
+    writer.append(&[event(1)]).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&writer.path)
+        .unwrap()
+        .write_all(b"unclaimed")
+        .unwrap();
+    let durable = fixture.durable_offset();
+    assert!(writer.flush_durable().is_err());
+    assert_eq!(fixture.durable_offset(), durable);
+}
+
+#[test]
+fn directory_sync_runs_on_the_current_host() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("entry"), b"durable-name").unwrap();
+    sync_directory(temp.path()).unwrap();
 }
 
 #[test]
@@ -445,7 +890,7 @@ fn trailing_bytes_in_a_sealed_middle_segment_fail_closed() {
         .unwrap();
     OpenOptions::new()
         .append(true)
-        .open(sealed_path)
+        .open(fixture.segments.join(sealed_path))
         .unwrap()
         .write_all(b"corrupt-middle")
         .unwrap();

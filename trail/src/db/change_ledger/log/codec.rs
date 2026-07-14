@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection, OpenFlags, Row};
 use serde_cbor::Value;
 use sha2::{Digest, Sha256};
 
@@ -359,8 +360,49 @@ pub(crate) fn recover_segments(
     limits: PersistedLogLimits,
 ) -> std::result::Result<RecoveredTail, RecoveryError> {
     let limits = limits.validate()?;
-    let connection = Connection::open(database_path)
-        .map_err(|error| RecoveryError::new(format!("open observer control database: {error}")))?;
+    let (connection, immutable_snapshot) = open_recovery_database(database_path)?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| RecoveryError::new(format!("enable observer foreign keys: {error}")))?;
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|error| RecoveryError::new(format!("read observer journal mode: {error}")))?;
+    let foreign_keys: i64 = connection
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|error| RecoveryError::new(format!("read observer foreign keys: {error}")))?;
+    let wal_runtime = journal_mode.eq_ignore_ascii_case("wal")
+        || (immutable_snapshot && database_header_uses_wal(database_path)?);
+    if !wal_runtime || foreign_keys != 1 {
+        return Err(RecoveryError::new(
+            "observer recovery requires WAL journal mode and foreign keys",
+        ));
+    }
+    let epoch = sql_i64(expected.epoch, "observer epoch")
+        .map_err(|error| RecoveryError::new(error.to_string()))?;
+    let segment_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2",
+            params![expected.scope_id.to_text(), epoch],
+            |row| row.get(0),
+        )
+        .map_err(|error| RecoveryError::new(format!("count observer metadata: {error}")))?;
+    let segment_count = usize::try_from(segment_count)
+        .map_err(|_| RecoveryError::new("negative observer segment count"))?;
+    if segment_count > limits.max_unfolded_tail_records {
+        return Err(RecoveryError::new(
+            "observer segment count exceeds unfolded-tail limit",
+        ));
+    }
+    if segment_count == 0 {
+        return Ok(RecoveredTail {
+            records: Vec::new(),
+            durable_end: 0,
+            last_sequence: 0,
+            last_hash: [0; 32],
+            requires_reconciliation: true,
+        });
+    }
     let mut statement = connection
         .prepare(
             "SELECT segment_id, owner_token, first_sequence, last_sequence,
@@ -371,45 +413,46 @@ pub(crate) fn recover_segments(
              ORDER BY first_sequence, segment_id",
         )
         .map_err(|error| RecoveryError::new(format!("read observer metadata: {error}")))?;
-    let epoch = sql_i64(expected.epoch, "observer epoch")
-        .map_err(|error| RecoveryError::new(error.to_string()))?;
-    let rows = statement
-        .query_map(params![expected.scope_id.to_text(), epoch], |row| {
-            Ok(SegmentMetadata {
-                segment_id: row.get(0)?,
-                owner_token: row.get(1)?,
-                first_sequence: row.get(2)?,
-                last_sequence: row.get(3)?,
-                durable_end_offset: row.get(4)?,
-                previous_segment_id: row.get(5)?,
-                previous_segment_hash: row.get(6)?,
-                segment_hash: row.get(7)?,
-                segment_path: PathBuf::from(row.get::<_, String>(8)?),
-                state: row.get(9)?,
-            })
-        })
-        .map_err(|error| RecoveryError::new(format!("query observer metadata: {error}")))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| RecoveryError::new(format!("decode observer metadata: {error}")))?;
-    if rows.is_empty() {
-        return Ok(RecoveredTail {
-            records: Vec::new(),
-            durable_end: 0,
-            last_sequence: 0,
-            last_hash: [0; 32],
-            requires_reconciliation: true,
-        });
-    }
-
+    let mut rows = statement
+        .query(params![expected.scope_id.to_text(), epoch])
+        .map_err(|error| RecoveryError::new(format!("query observer metadata: {error}")))?;
     let expected_owner = hex::encode(expected.owner_token);
-    let mut published_paths = HashSet::new();
+    let mut published_paths = HashSet::with_capacity(segment_count);
     let mut total_bytes = 0_u64;
-    for row in &rows {
+    let mut records = Vec::new();
+    let mut durable_end = 0_u64;
+    let mut last_sequence = 0_u64;
+    let mut last_hash = [0; 32];
+    let mut previous_segment_id: Option<String> = None;
+    let mut previous_segment_hash = [0; 32];
+    let mut requires_reconciliation = false;
+    let mut index = 0_usize;
+    while let Some(sql_row) = rows
+        .next()
+        .map_err(|error| RecoveryError::new(format!("stream observer metadata: {error}")))?
+    {
+        let row = decode_segment_metadata(sql_row)?;
+        index = index
+            .checked_add(1)
+            .ok_or_else(|| RecoveryError::new("observer segment count overflow"))?;
+        if index > segment_count {
+            return Err(RecoveryError::new(
+                "observer segment count changed during recovery",
+            ));
+        }
         if row.owner_token != expected_owner {
             return Err(RecoveryError::new(
                 "observer segment metadata has wrong owner",
             ));
         }
+        let expected_filename = super::writer::segment_filename(&row.segment_id)
+            .map_err(|error| RecoveryError::new(error.to_string()))?;
+        if row.segment_path != expected_filename {
+            return Err(RecoveryError::new(
+                "observer segment path is not the exact derived relative filename",
+            ));
+        }
+        published_paths.insert(expected_filename.clone());
         let durable = db_u64(row.durable_end_offset, "durable observer offset")?;
         if durable > limits.max_segment_bytes {
             return Err(RecoveryError::new(
@@ -424,24 +467,14 @@ pub(crate) fn recover_segments(
                 "observer log exceeds persisted byte limit",
             ));
         }
-        published_paths.insert(row.segment_path.clone());
-    }
-
-    let mut records = Vec::new();
-    let mut durable_end = 0_u64;
-    let mut last_sequence = 0_u64;
-    let mut last_hash = [0; 32];
-    let mut previous_segment_id: Option<String> = None;
-    let mut previous_segment_hash = [0; 32];
-    let mut requires_reconciliation = false;
-    for (index, row) in rows.iter().enumerate() {
-        if row.state == "open" && index + 1 != rows.len() {
+        if row.state == "open" && index != segment_count {
             return Err(RecoveryError::new(
                 "open observer segment appears before the recovered tail",
             ));
         }
-        let durable = db_u64(row.durable_end_offset, "durable observer offset")?;
-        let metadata = fs::metadata(&row.segment_path).map_err(|error| {
+        let path = segment_directory.join(&expected_filename);
+        let file = open_segment_no_follow(&path)?;
+        let metadata = file.metadata().map_err(|error| {
             RecoveryError::new(format!("read observer segment metadata: {error}"))
         })?;
         if metadata.len() > limits.max_segment_bytes || metadata.len() > limits.max_log_bytes {
@@ -465,8 +498,8 @@ pub(crate) fn recover_segments(
         let durable_usize = usize::try_from(durable)
             .map_err(|_| RecoveryError::new("durable observer offset cannot fit memory"))?;
         let mut bytes = Vec::with_capacity(durable_usize);
-        File::open(&row.segment_path)
-            .and_then(|file| file.take(durable).read_to_end(&mut bytes))
+        file.take(durable)
+            .read_to_end(&mut bytes)
             .map_err(|error| RecoveryError::new(format!("read observer segment: {error}")))?;
         if bytes.len() != durable_usize {
             return Err(RecoveryError::new(
@@ -492,7 +525,7 @@ pub(crate) fn recover_segments(
             return Err(RecoveryError::new("broken observer segment metadata hash"));
         }
         let recovered = recover_bytes(&bytes, &identity, limits)?;
-        if recovered.requires_reconciliation && index + 1 != rows.len() {
+        if recovered.requires_reconciliation && index != segment_count {
             return Err(RecoveryError::new(
                 "partial observer record before final segment",
             ));
@@ -506,8 +539,11 @@ pub(crate) fn recover_segments(
                 "observer sequence is not monotonic across segments",
             ));
         }
-        if records.len().saturating_add(recovered.records.len()) > limits.max_unfolded_tail_records
-        {
+        let next_record_count = records
+            .len()
+            .checked_add(recovered.records.len())
+            .ok_or_else(|| RecoveryError::new("observer tail record count overflow"))?;
+        if next_record_count > limits.max_unfolded_tail_records {
             return Err(RecoveryError::new(
                 "observer tail record count exceeds persisted limit",
             ));
@@ -544,19 +580,27 @@ pub(crate) fn recover_segments(
         last_sequence = recovered.last_sequence.max(last_sequence);
         last_hash = recovered.last_hash;
         requires_reconciliation |= recovered.requires_reconciliation;
-        previous_segment_id = Some(row.segment_id.clone());
+        previous_segment_id = Some(row.segment_id);
         previous_segment_hash = segment_hash;
+    }
+    if index != segment_count {
+        return Err(RecoveryError::new(
+            "observer segment count changed during recovery",
+        ));
     }
 
     if segment_directory.exists() {
         for entry in fs::read_dir(segment_directory).map_err(|error| {
             RecoveryError::new(format!("list observer segment directory: {error}"))
         })? {
-            let path = entry
-                .map_err(|error| RecoveryError::new(format!("list observer segment: {error}")))?
-                .path();
+            let entry = entry
+                .map_err(|error| RecoveryError::new(format!("list observer segment: {error}")))?;
+            let filename = entry.file_name();
+            let path = entry.path();
             if path.extension().is_some_and(|extension| extension == "cpl")
-                && !published_paths.contains(&path)
+                && filename
+                    .to_str()
+                    .map_or(true, |filename| !published_paths.contains(filename))
             {
                 requires_reconciliation = true;
             }
@@ -581,8 +625,110 @@ struct SegmentMetadata {
     previous_segment_id: Option<String>,
     previous_segment_hash: Option<String>,
     segment_hash: Option<String>,
-    segment_path: PathBuf,
+    segment_path: String,
     state: String,
+}
+
+fn decode_segment_metadata(row: &Row<'_>) -> std::result::Result<SegmentMetadata, RecoveryError> {
+    Ok(SegmentMetadata {
+        segment_id: bounded_text(row, 0, "segment id", MAX_SEGMENT_FILENAME_BYTES)?,
+        owner_token: bounded_text(row, 1, "owner token", 64)?,
+        first_sequence: row
+            .get(2)
+            .map_err(|error| RecoveryError::new(format!("decode first sequence: {error}")))?,
+        last_sequence: row
+            .get(3)
+            .map_err(|error| RecoveryError::new(format!("decode last sequence: {error}")))?,
+        durable_end_offset: row
+            .get(4)
+            .map_err(|error| RecoveryError::new(format!("decode durable offset: {error}")))?,
+        previous_segment_id: bounded_optional_text(
+            row,
+            5,
+            "previous segment id",
+            MAX_SEGMENT_FILENAME_BYTES,
+        )?,
+        previous_segment_hash: bounded_optional_text(row, 6, "previous segment hash", 64)?,
+        segment_hash: bounded_optional_text(row, 7, "segment hash", 64)?,
+        segment_path: bounded_text(row, 8, "segment path", MAX_SEGMENT_FILENAME_BYTES)?,
+        state: bounded_text(row, 9, "segment state", 16)?,
+    })
+}
+
+fn bounded_text(
+    row: &Row<'_>,
+    index: usize,
+    label: &str,
+    max: usize,
+) -> std::result::Result<String, RecoveryError> {
+    match row
+        .get_ref(index)
+        .map_err(|error| RecoveryError::new(format!("decode {label}: {error}")))?
+    {
+        ValueRef::Text(bytes) if bytes.len() <= max => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| RecoveryError::new(format!("invalid {label} text"))),
+        ValueRef::Text(_) => Err(RecoveryError::new(format!(
+            "{label} exceeds bounded length"
+        ))),
+        _ => Err(RecoveryError::new(format!("invalid {label} type"))),
+    }
+}
+
+fn bounded_optional_text(
+    row: &Row<'_>,
+    index: usize,
+    label: &str,
+    max: usize,
+) -> std::result::Result<Option<String>, RecoveryError> {
+    if matches!(
+        row.get_ref(index)
+            .map_err(|error| RecoveryError::new(format!("decode {label}: {error}")))?,
+        ValueRef::Null
+    ) {
+        Ok(None)
+    } else {
+        bounded_text(row, index, label, max).map(Some)
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn open_segment_no_follow(path: &Path) -> std::result::Result<File, RecoveryError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|error| {
+        RecoveryError::new(format!("open observer segment without symlinks: {error}"))
+    })?;
+    if !file
+        .metadata()
+        .map_err(|error| RecoveryError::new(format!("inspect observer segment: {error}")))?
+        .is_file()
+    {
+        return Err(RecoveryError::new("observer segment is not a regular file"));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub(super) fn open_segment_no_follow(path: &Path) -> std::result::Result<File, RecoveryError> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|error| RecoveryError::new(format!("inspect observer segment: {error}")))?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(RecoveryError::new(
+            "observer segment symlink metadata is rejected",
+        ));
+    }
+    let file = File::open(path)
+        .map_err(|error| RecoveryError::new(format!("open observer segment: {error}")))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| RecoveryError::new(format!("reinspect observer segment: {error}")))?;
+    if after.file_type().is_symlink() || !after.is_file() {
+        return Err(RecoveryError::new("observer segment changed to a symlink"));
+    }
+    Ok(file)
 }
 
 fn decode_optional_hash(value: Option<&str>) -> std::result::Result<[u8; 32], RecoveryError> {
@@ -610,4 +756,68 @@ fn db_u64(value: i64, label: &str) -> std::result::Result<u64, RecoveryError> {
     value
         .try_into()
         .map_err(|_| RecoveryError::new(format!("negative {label}")))
+}
+
+fn open_recovery_database(path: &Path) -> std::result::Result<(Connection, bool), RecoveryError> {
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal = std::path::PathBuf::from(wal_name);
+    let mut shm_name = path.as_os_str().to_os_string();
+    shm_name.push("-shm");
+    let shm = std::path::PathBuf::from(shm_name);
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let (connection, immutable) = match (wal.exists(), shm.exists()) {
+        (true, true) => (Connection::open_with_flags(path, flags), false),
+        (false, false) => (
+            Connection::open_with_flags(
+                immutable_sqlite_uri(path),
+                flags | OpenFlags::SQLITE_OPEN_URI,
+            ),
+            true,
+        ),
+        _ => {
+            return Err(RecoveryError::new(
+                "observer database has incomplete WAL sidecar state",
+            ));
+        }
+    };
+    connection
+        .map(|connection| (connection, immutable))
+        .map_err(|error| RecoveryError::new(format!("open observer control database: {error}")))
+}
+
+fn database_header_uses_wal(path: &Path) -> std::result::Result<bool, RecoveryError> {
+    let mut file = File::open(path)
+        .map_err(|error| RecoveryError::new(format!("open observer database header: {error}")))?;
+    let mut header = [0_u8; 20];
+    std::io::Read::read_exact(&mut file, &mut header)
+        .map_err(|error| RecoveryError::new(format!("read observer database header: {error}")))?;
+    Ok(&header[..16] == b"SQLite format 3\0" && header[18] == 2 && header[19] == 2)
+}
+
+#[cfg(unix)]
+fn immutable_sqlite_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(char::from(*byte));
+            }
+            _ => uri.push_str(&format!("%{byte:02x}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
+#[cfg(not(unix))]
+fn immutable_sqlite_uri(path: &Path) -> String {
+    let encoded = path
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('?', "%3f")
+        .replace('#', "%23");
+    format!("file:{encoded}?immutable=1")
 }

@@ -10,12 +10,13 @@ use sha2::{Digest, Sha256};
 
 use super::codec::{encode_header, encode_record};
 use super::*;
-use crate::db::util::now_ts;
+use crate::db::util::{apply_sqlite_pragmas, now_ts};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(super) enum FaultPoint {
     AppendWrite,
+    AppendPostWriteLeaseExpiry,
     FileSync,
     RotationOldSync,
     SealPublication,
@@ -42,18 +43,25 @@ impl FaultScript {
     }
 
     fn check(&self, point: FaultPoint) -> std::io::Result<()> {
-        let mut points = self
-            .points
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if points.front() == Some(&point) {
-            points.pop_front();
+        if self.take(point) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 format!("injected observer I/O fault at {point:?}"),
             ));
         }
         Ok(())
+    }
+
+    fn take(&self, point: FaultPoint) -> bool {
+        let mut points = self
+            .points
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if points.front() == Some(&point) {
+            points.pop_front();
+            return true;
+        }
+        false
     }
 }
 
@@ -145,90 +153,79 @@ impl SegmentWriter {
             ));
         }
         let mut control = Connection::open(database_path)?;
+        apply_sqlite_pragmas(&control)?;
         control.busy_timeout(Duration::from_secs(5))?;
         let now = now_ts();
         let expires_at = lease_expiry(now, lease_duration)?;
         let scope_text = scope_id.to_text();
         let epoch_sql = sql_i64(epoch, "observer epoch")?;
         let owner_text = hex::encode(owner_token);
-        let limits;
-        {
-            let transaction = control.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            limits = transaction
-                .query_row(
-                    "SELECT max_observer_log_bytes, max_segment_bytes,
+        let transaction = control.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let limits = transaction
+            .query_row(
+                "SELECT max_observer_log_bytes, max_segment_bytes,
                             max_unfolded_tail_records
                      FROM changed_path_scopes WHERE scope_id = ?1 AND epoch = ?2",
-                    params![scope_text, epoch_sql],
-                    |row| {
-                        Ok(PersistedLogLimits {
-                            max_log_bytes: row.get::<_, i64>(0)?.try_into().map_err(|_| {
+                params![scope_text, epoch_sql],
+                |row| {
+                    Ok(PersistedLogLimits {
+                        max_log_bytes: row.get::<_, i64>(0)?.try_into().map_err(|_| {
+                            rusqlite::Error::IntegralValueOutOfRange(0, row.get(0).unwrap_or(-1))
+                        })?,
+                        max_segment_bytes: row.get::<_, i64>(1)?.try_into().map_err(|_| {
+                            rusqlite::Error::IntegralValueOutOfRange(1, row.get(1).unwrap_or(-1))
+                        })?,
+                        max_unfolded_tail_records: row.get::<_, i64>(2)?.try_into().map_err(
+                            |_| {
                                 rusqlite::Error::IntegralValueOutOfRange(
-                                    0,
-                                    row.get(0).unwrap_or(-1),
+                                    2,
+                                    row.get(2).unwrap_or(-1),
                                 )
-                            })?,
-                            max_segment_bytes: row.get::<_, i64>(1)?.try_into().map_err(|_| {
-                                rusqlite::Error::IntegralValueOutOfRange(
-                                    1,
-                                    row.get(1).unwrap_or(-1),
-                                )
-                            })?,
-                            max_unfolded_tail_records: row.get::<_, i64>(2)?.try_into().map_err(
-                                |_| {
-                                    rusqlite::Error::IntegralValueOutOfRange(
-                                        2,
-                                        row.get(2).unwrap_or(-1),
-                                    )
-                                },
-                            )?,
-                        })
-                    },
-                )
-                .optional()?
-                .ok_or_else(|| Error::InvalidInput("observer scope/epoch is stale".into()))?;
-            limits
-                .validate()
-                .map_err(|error| Error::Corrupt(error.to_string()))?;
-            let live = transaction
-                .query_row(
-                    "SELECT owner_token FROM changed_path_observer_owners
-                     WHERE scope_id = ?1 AND lease_state = 'active' AND expires_at > ?2",
-                    params![scope_text, now],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if live.is_some() {
+                            },
+                        )?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::InvalidInput("observer scope/epoch is stale".into()))?;
+        limits
+            .validate()
+            .map_err(|error| Error::Corrupt(error.to_string()))?;
+        let existing_owner = transaction
+            .query_row(
+                "SELECT epoch, owner_token, lease_state, expires_at
+                 FROM changed_path_observer_owners WHERE scope_id=?1",
+                params![scope_text],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((owner_epoch, _token, state, owner_expiry)) = existing_owner {
+            let owner_epoch = u64::try_from(owner_epoch)
+                .map_err(|_| Error::Corrupt("negative observer owner epoch".into()))?;
+            if owner_epoch == epoch {
+                if state == "active" && owner_expiry > now {
+                    return Err(Error::WorkspaceLocked(
+                        "changed-path observer lease is already active".into(),
+                    ));
+                }
                 return Err(Error::WorkspaceLocked(
-                    "changed-path observer lease is already active".into(),
+                    "same-epoch observer owner replacement requires reconciliation and an authoritative epoch advance".into(),
                 ));
             }
-            transaction.execute(
-                "INSERT INTO changed_path_observer_owners(
-                     scope_id, epoch, owner_token, provider_id, provider_identity,
-                     lease_state, fence_nonce, acquired_at, heartbeat_at, expires_at,
-                     error_state, error_at, updated_at
-                 ) VALUES(?1, ?2, ?3, ?4, '', 'active', NULL, ?5, ?5, ?6, NULL, NULL, ?5)
-                 ON CONFLICT(scope_id) DO UPDATE SET
-                     epoch=excluded.epoch, owner_token=excluded.owner_token,
-                     provider_id=excluded.provider_id, provider_identity=excluded.provider_identity,
-                     lease_state='active', fence_nonce=NULL, acquired_at=excluded.acquired_at,
-                     heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at,
-                     error_state=NULL, error_at=NULL, updated_at=excluded.updated_at",
-                params![
-                    scope_text,
-                    epoch_sql,
-                    owner_text,
-                    provider_id,
-                    now,
-                    expires_at
-                ],
-            )?;
-            transaction.commit()?;
+            if owner_epoch > epoch {
+                return Err(Error::WorkspaceLocked(
+                    "observer owner epoch is ahead of the requested epoch; reconciliation required"
+                        .into(),
+                ));
+            }
         }
-
-        fs::create_dir_all(segment_directory)?;
-        sync_directory(segment_directory)?;
         let identity = SegmentIdentity {
             scope_id,
             epoch,
@@ -236,35 +233,54 @@ impl SegmentWriter {
             provider_cursor: provider_cursor.clone(),
             previous_segment_hash: [0; 32],
         };
+        let header = encode_header(&identity).map_err(|error| Error::Corrupt(error.to_string()))?;
+        let header_len = header.len() as u64;
+        if header_len > limits.max_segment_bytes || header_len > limits.max_log_bytes {
+            return Err(Error::InvalidInput(
+                "observer segment header exceeds persisted byte cap".into(),
+            ));
+        }
         let segment_id = segment_id(1, owner_token);
-        let path = segment_directory.join(format!("{segment_id}.cpl"));
-        let result = (|| -> Result<(File, u64)> {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&path)?;
-            let header =
-                encode_header(&identity).map_err(|error| Error::Corrupt(error.to_string()))?;
-            file.write_all(&header)?;
-            file.sync_all()?;
-            sync_directory(segment_directory)?;
-            Ok((file, header.len() as u64))
-        })();
-        let (file, current_offset) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                revoke_owner(
-                    &control,
-                    &scope_text,
-                    epoch,
-                    &owner_text,
-                    "segment_create_failed",
-                );
-                return Err(error);
-            }
-        };
-        let inserted = control.execute(
+        let filename = segment_filename(&segment_id)?;
+        let path = segment_directory.join(&filename);
+        fs::create_dir_all(segment_directory)?;
+        sync_directory(segment_directory)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.write_all(&header)?;
+        file.sync_all()?;
+        sync_directory(segment_directory)?;
+        let publish_now = now_ts();
+        if publish_now >= expires_at {
+            return Err(Error::WorkspaceLocked(
+                "observer lease expired before initial publication".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO changed_path_observer_owners(
+                 scope_id, epoch, owner_token, provider_id, provider_identity,
+                 lease_state, fence_nonce, acquired_at, heartbeat_at, expires_at,
+                 error_state, error_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, '', 'active', NULL, ?5, ?5, ?6, NULL, NULL, ?5)
+             ON CONFLICT(scope_id) DO UPDATE SET
+                 epoch=excluded.epoch, owner_token=excluded.owner_token,
+                 provider_id=excluded.provider_id, provider_identity=excluded.provider_identity,
+                 lease_state='active', fence_nonce=NULL, acquired_at=excluded.acquired_at,
+                 heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at,
+                 error_state=NULL, error_at=NULL, updated_at=excluded.updated_at",
+            params![
+                scope_text,
+                epoch_sql,
+                owner_text,
+                provider_id,
+                now,
+                expires_at
+            ],
+        )?;
+        let inserted = transaction.execute(
             "INSERT INTO changed_path_observer_segments(
                  scope_id, epoch, segment_id, log_format_version, owner_token,
                  provider_id, first_sequence, last_sequence, durable_end_offset,
@@ -283,23 +299,18 @@ impl SegmentWriter {
                 segment_id,
                 owner_text,
                 provider_id,
-                sql_i64(current_offset, "durable observer header offset")?,
-                path.to_string_lossy(),
-                now_ts()
+                sql_i64(header_len, "durable observer header offset")?,
+                filename,
+                publish_now
             ],
         )?;
         if inserted != 1 {
-            revoke_owner(
-                &control,
-                &scope_text,
-                epoch,
-                &owner_text,
-                "segment_publish_failed",
-            );
             return Err(Error::WorkspaceLocked(
                 "observer lease changed before publication".into(),
             ));
         }
+        transaction.commit()?;
+        let current_offset = header_len;
         Ok(Self {
             control,
             segment_directory: segment_directory.to_path_buf(),
@@ -381,8 +392,22 @@ impl SegmentWriter {
         if total_bytes > self.limits.max_log_bytes {
             return Err(Error::InvalidInput("observer log byte cap exceeded".into()));
         }
+        validate_lease_on(&transaction, &self.identity)?;
         self.faults.check(FaultPoint::AppendWrite)?;
         self.file.write_all(&batch)?;
+        if self.faults.take(FaultPoint::AppendPostWriteLeaseExpiry) {
+            transaction.execute(
+                "UPDATE changed_path_observer_owners
+                 SET expires_at=heartbeat_at
+                 WHERE scope_id=?1 AND epoch=?2 AND owner_token=?3",
+                params![
+                    self.identity.scope_id.to_text(),
+                    sql_i64(self.identity.epoch, "observer epoch")?,
+                    hex::encode(self.identity.owner_token)
+                ],
+            )?;
+        }
+        validate_lease_on(&transaction, &self.identity)?;
         transaction.commit()?;
         self.current_offset = next_offset;
         self.last_sequence = sequence;
@@ -407,6 +432,11 @@ impl SegmentWriter {
         validate_lease_on(&transaction, &self.identity)?;
         self.faults.check(FaultPoint::FileSync)?;
         self.file.sync_data()?;
+        if self.file.metadata()?.len() != self.current_offset {
+            return Err(Error::Corrupt(
+                "observer segment length differs from the claimed durable offset".into(),
+            ));
+        }
         validate_lease_on(&transaction, &self.identity)?;
         let changed = transaction.execute(
             "UPDATE changed_path_observer_segments
@@ -490,7 +520,11 @@ impl SegmentWriter {
     }
 
     fn rotate_inner(&mut self) -> Result<()> {
-        self.validate_lease()?;
+        self.ensure_authorized()?;
+        let transaction = self
+            .control
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_lease_on(&transaction, &self.identity)?;
         self.faults.check(FaultPoint::RotationOldSync)?;
         self.file.sync_data()?;
         let bytes = fs::read(&self.path)?;
@@ -500,9 +534,66 @@ impl SegmentWriter {
             ));
         }
         let old_segment_hash: [u8; 32] = Sha256::digest(&bytes).into();
-        self.faults.check(FaultPoint::SealPublication)?;
+        self.faults.check(FaultPoint::FirstDirectorySync)?;
+        sync_directory(&self.segment_directory)?;
+
+        let first_sequence = self.last_sequence.saturating_add(1).max(1);
+        let next_segment_id = segment_id(first_sequence, self.identity.owner_token);
+        let next_path = self
+            .segment_directory
+            .join(segment_filename(&next_segment_id)?);
+        let next_identity = SegmentIdentity {
+            scope_id: self.identity.scope_id,
+            epoch: self.identity.epoch,
+            owner_token: self.identity.owner_token,
+            provider_cursor: self.last_cursor.clone(),
+            previous_segment_hash: old_segment_hash,
+        };
+        let header =
+            encode_header(&next_identity).map_err(|error| Error::Corrupt(error.to_string()))?;
+        let header_len = header.len() as u64;
+        if header_len > self.limits.max_segment_bytes {
+            return Err(Error::InvalidInput(
+                "observer rotation header exceeds segment byte cap".into(),
+            ));
+        }
+        let other_durable = transaction.query_row(
+            "SELECT COALESCE(SUM(durable_end_offset), 0)
+             FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2 AND segment_id<>?3",
+            params![
+                self.identity.scope_id.to_text(),
+                sql_i64(self.identity.epoch, "observer epoch")?,
+                self.segment_id,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let total_after_rotation = u64::try_from(other_durable)
+            .map_err(|_| Error::Corrupt("negative observer log byte total".into()))?
+            .checked_add(self.current_offset)
+            .and_then(|total| total.checked_add(header_len))
+            .ok_or_else(|| Error::InvalidInput("observer log byte total overflow".into()))?;
+        if total_after_rotation > self.limits.max_log_bytes {
+            return Err(Error::InvalidInput(
+                "observer rotation header exceeds total log byte cap".into(),
+            ));
+        }
+        self.faults.check(FaultPoint::NextHeaderCreate)?;
+        let mut next_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&next_path)?;
+        self.faults.check(FaultPoint::NextHeaderWrite)?;
+        next_file.write_all(&header)?;
+        self.faults.check(FaultPoint::NextHeaderSync)?;
+        next_file.sync_all()?;
+        self.faults.check(FaultPoint::SecondDirectorySync)?;
+        sync_directory(&self.segment_directory)?;
+        validate_lease_on(&transaction, &self.identity)?;
         let now = now_ts();
-        let sealed = self.control.execute(
+        self.faults.check(FaultPoint::SealPublication)?;
+        let sealed = transaction.execute(
             "UPDATE changed_path_observer_segments
              SET state='sealed', last_sequence=?1, durable_end_offset=?2,
                  segment_hash=?3, sealed_at=?4, updated_at=?4
@@ -533,38 +624,9 @@ impl SegmentWriter {
                 "observer lease changed before sealing".into(),
             ));
         }
-        self.faults.check(FaultPoint::FirstDirectorySync)?;
-        sync_directory(&self.segment_directory)?;
-
-        let first_sequence = self.last_sequence.saturating_add(1).max(1);
-        let next_segment_id = segment_id(first_sequence, self.identity.owner_token);
-        let next_path = self
-            .segment_directory
-            .join(format!("{next_segment_id}.cpl"));
-        let next_identity = SegmentIdentity {
-            scope_id: self.identity.scope_id,
-            epoch: self.identity.epoch,
-            owner_token: self.identity.owner_token,
-            provider_cursor: self.last_cursor.clone(),
-            previous_segment_hash: old_segment_hash,
-        };
-        let header =
-            encode_header(&next_identity).map_err(|error| Error::Corrupt(error.to_string()))?;
-        self.faults.check(FaultPoint::NextHeaderCreate)?;
-        let mut next_file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&next_path)?;
-        self.faults.check(FaultPoint::NextHeaderWrite)?;
-        next_file.write_all(&header)?;
-        self.faults.check(FaultPoint::NextHeaderSync)?;
-        next_file.sync_all()?;
-        self.faults.check(FaultPoint::SecondDirectorySync)?;
-        sync_directory(&self.segment_directory)?;
-        self.validate_lease()?;
         self.faults.check(FaultPoint::NextMetadataPublication)?;
-        let published = self.control.execute(
+        let next_filename = segment_filename(&next_segment_id)?;
+        let published = transaction.execute(
             "INSERT INTO changed_path_observer_segments(
                  scope_id, epoch, segment_id, log_format_version, owner_token,
                  provider_id, first_sequence, last_sequence, durable_end_offset,
@@ -584,11 +646,11 @@ impl SegmentWriter {
                 hex::encode(self.identity.owner_token),
                 self.provider_id,
                 sql_i64(first_sequence, "observer sequence")?,
-                sql_i64(header.len() as u64, "durable observer header offset")?,
+                sql_i64(header_len, "durable observer header offset")?,
                 self.segment_id,
                 hex::encode(old_segment_hash),
-                next_path.to_string_lossy(),
-                now_ts(),
+                next_filename,
+                now,
             ],
         )?;
         if published != 1 {
@@ -596,12 +658,13 @@ impl SegmentWriter {
                 "observer lease changed before rotation publication".into(),
             ));
         }
+        transaction.commit()?;
         self.file = next_file;
         self.path = next_path;
         self.previous_segment_id = Some(self.segment_id.clone());
         self.segment_id = next_segment_id;
         self.identity = next_identity;
-        self.current_offset = header.len() as u64;
+        self.current_offset = header_len;
         self.last_hash = [0; 32];
         Ok(())
     }
@@ -634,6 +697,24 @@ impl SegmentWriter {
     #[cfg(test)]
     pub(super) fn is_authorized(&self) -> bool {
         self.authorized
+    }
+
+    #[cfg(test)]
+    pub(super) fn runtime_pragmas(&self) -> (String, i64, i64, i64) {
+        (
+            self.control
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap(),
+            self.control
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap(),
+            self.control
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap(),
+            self.control
+                .query_row("PRAGMA temp_store", [], |row| row.get(0))
+                .unwrap(),
+        )
     }
 }
 
@@ -673,7 +754,27 @@ fn segment_id(first_sequence: u64, owner_token: [u8; 32]) -> String {
     format!("{first_sequence:020}-{}", &hex::encode(owner_token)[..16])
 }
 
-fn sync_directory(path: &Path) -> std::io::Result<()> {
+pub(super) fn segment_filename(segment_id: &str) -> Result<String> {
+    let bytes = segment_id.as_bytes();
+    let valid = bytes.len() == 37
+        && bytes[..20].iter().all(u8::is_ascii_digit)
+        && bytes[20] == b'-'
+        && bytes[21..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+    if !valid {
+        return Err(Error::Corrupt("invalid observer segment id".into()));
+    }
+    let filename = format!("{segment_id}.cpl");
+    if filename.len() > MAX_SEGMENT_FILENAME_BYTES {
+        return Err(Error::Corrupt(
+            "observer segment filename exceeds bound".into(),
+        ));
+    }
+    Ok(filename)
+}
+
+pub(super) fn sync_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
