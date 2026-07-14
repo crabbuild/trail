@@ -335,7 +335,194 @@ fn global_epoch_fences_same_epoch_replacement_without_any_mutation() {
         .unwrap();
     assert_eq!(epochs, vec![(1, 1), (2, 1)]);
 
+    let recovered = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 2,
+            owner_token: [2; 32],
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap();
+    assert!(recovered.records.is_empty());
+    assert!(!recovered.requires_reconciliation);
+
     assert!(!first.is_authorized());
+}
+
+#[test]
+fn segment_id_is_exactly_derived_from_epoch_sequence_and_full_owner_token() {
+    let mut token_b = [0x11; 32];
+    token_b[31] = 0x12;
+    let first = segment_id(1, 1, [0x11; 32]);
+    let different_epoch = segment_id(2, 1, [0x11; 32]);
+    let different_token_tail = segment_id(1, 1, token_b);
+
+    assert_eq!(
+        first,
+        format!("{:020}-{:020}-{}", 1, 1, hex::encode([0x11; 32]))
+    );
+    assert_ne!(first, different_epoch);
+    assert_ne!(first, different_token_tail);
+    assert_eq!(segment_filename(&first).unwrap(), format!("{first}.cpl"));
+    assert!(segment_filename(&format!("{:020}-{:020}-{}", 0, 1, hex::encode([0x11; 32]))).is_err());
+    assert!(segment_filename(&segment_id(1, 1, [0xab; 32]).to_ascii_uppercase()).is_err());
+}
+
+#[test]
+fn epoch_advance_makes_filesystem_name_unique_even_with_the_same_full_token() {
+    let fixture = Fixture::full_v18();
+    let token = [0x12; 32];
+    drop(fixture.acquire_epoch(1, token).unwrap());
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE changed_path_scopes SET epoch=2 WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+        )
+        .unwrap();
+    drop(fixture.acquire_epoch(2, token).unwrap());
+
+    let files = file_snapshot(&fixture);
+    assert_eq!(files.len(), 2);
+    assert_ne!(files[0].0, files[1].0);
+    assert!(files
+        .iter()
+        .any(|file| file.0.starts_with("00000000000000000001-")));
+    assert!(files
+        .iter()
+        .any(|file| file.0.starts_with("00000000000000000002-")));
+}
+
+#[test]
+fn invalid_other_epoch_filename_metadata_cannot_suppress_an_orphan() {
+    let fixture = Fixture::new();
+    let token = [0x16; 32];
+    let writer = fixture.acquire(token);
+    let other_token = [0x17; 32];
+    let other_id = segment_id(2, 1, other_token);
+    let orphan_filename = segment_filename(&other_id).unwrap();
+    fs::write(fixture.segments.join(&orphan_filename), b"orphan").unwrap();
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "INSERT INTO changed_path_observer_segments(
+                 scope_id, epoch, segment_id, log_format_version, owner_token,
+                 provider_id, first_sequence, last_sequence, durable_end_offset,
+                 folded_end_offset, previous_segment_id, previous_segment_hash,
+                 segment_hash, segment_path, state, created_at, sealed_at, updated_at)
+             SELECT scope_id, 2, ?1, log_format_version, ?2,
+                    provider_id, first_sequence, last_sequence, durable_end_offset,
+                    folded_end_offset, previous_segment_id, previous_segment_hash,
+                    segment_hash, ?3, state, created_at, sealed_at, updated_at
+             FROM changed_path_observer_segments WHERE epoch=3",
+            params![other_id, hex::encode(other_token), orphan_filename],
+        )
+        .unwrap();
+
+    let recovered = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: token,
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap();
+    assert!(recovered.requires_reconciliation);
+    drop(writer);
+}
+
+#[test]
+fn coordinated_segment_id_path_and_file_rename_cannot_defeat_derivation() {
+    let fixture = Fixture::new();
+    let token = [0x13; 32];
+    let writer = fixture.acquire(token);
+    let forged_id = segment_id(3, 1, [0x14; 32]);
+    let forged_filename = segment_filename(&forged_id).unwrap();
+    fs::rename(&writer.path, fixture.segments.join(&forged_filename)).unwrap();
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE changed_path_observer_segments SET segment_id=?1, segment_path=?2",
+            params![forged_id, forged_filename],
+        )
+        .unwrap();
+
+    let error = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &RecoveryScope {
+            scope_id: fixture.scope,
+            epoch: 3,
+            owner_token: token,
+        },
+        PersistedLogLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("derived"));
+}
+
+#[test]
+fn recovery_fails_closed_for_every_invalid_current_owner_state() {
+    let fixture = Fixture::new();
+    let token = [0x15; 32];
+    let writer = fixture.acquire(token);
+    drop(writer);
+    let connection = Connection::open(&fixture.database).unwrap();
+    let original_expiry: i64 = connection
+        .query_row(
+            "SELECT expires_at FROM changed_path_observer_owners",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected = RecoveryScope {
+        scope_id: fixture.scope,
+        epoch: 3,
+        owner_token: token,
+    };
+    for mutation in [
+        "UPDATE changed_path_observer_owners SET owner_token=lower(hex(zeroblob(32)))",
+        "UPDATE changed_path_observer_owners SET epoch=2",
+        "UPDATE changed_path_observer_owners SET lease_state='revoked'",
+        "UPDATE changed_path_observer_owners SET lease_state='expired'",
+        "UPDATE changed_path_observer_owners SET expires_at=heartbeat_at",
+        "UPDATE changed_path_observer_owners SET error_state='owner-error', error_at=1",
+    ] {
+        connection.execute_batch(mutation).unwrap();
+        let error = recover_segments(
+            &fixture.database,
+            &fixture.segments,
+            &expected,
+            PersistedLogLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("owner"), "mutation: {mutation}");
+        connection
+            .execute(
+                "UPDATE changed_path_observer_owners
+                 SET epoch=3, owner_token=?1, lease_state='active', expires_at=?2,
+                     error_state=NULL, error_at=NULL",
+                params![hex::encode(token), original_expiry],
+            )
+            .unwrap();
+    }
+    connection
+        .execute("DELETE FROM changed_path_observer_owners", [])
+        .unwrap();
+    let error = recover_segments(
+        &fixture.database,
+        &fixture.segments,
+        &expected,
+        PersistedLogLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("owner"));
 }
 
 #[test]
@@ -430,6 +617,9 @@ fn every_rotation_publication_fault_retires_the_writer() {
         )
         .unwrap();
         writer.append(&[event(1)]).unwrap();
+        writer.flush_durable().unwrap();
+        let durable_before = fixture.durable_offset();
+        let metadata_before = database_snapshot(&fixture).1;
 
         assert!(writer.rotate().is_err(), "fault {point:?} did not fail");
         assert!(
@@ -437,7 +627,13 @@ fn every_rotation_publication_fault_retires_the_writer() {
             "fault {point:?} did not retire writer"
         );
         assert!(writer.append(&[event(2)]).is_err());
-        let recovered = recover_segments(
+        assert_eq!(fixture.durable_offset(), durable_before, "fault {point:?}");
+        assert_eq!(
+            database_snapshot(&fixture).1,
+            metadata_before,
+            "fault {point:?}"
+        );
+        let error = recover_segments(
             &fixture.database,
             &fixture.segments,
             &RecoveryScope {
@@ -447,12 +643,47 @@ fn every_rotation_publication_fault_retires_the_writer() {
             },
             PersistedLogLimits::default(),
         )
-        .unwrap();
+        .unwrap_err();
         assert!(
-            recovered.requires_reconciliation,
-            "fault {point:?} recovered as trusted"
+            error.requires_reconciliation && error.message.contains("owner"),
+            "fault {point:?} did not fail for retired owner: {error:?}"
         );
     }
+}
+
+#[test]
+fn append_batch_capacity_never_exceeds_persisted_remaining_bytes() {
+    let fixture = Fixture::new();
+    let token = [0x33; 32];
+    let identity = SegmentIdentity::test(fixture.scope, 3, token);
+    let header = encode_header(&identity).unwrap().len() as u64;
+    let (first, _) = encode_record(&event(1), [0; 32]).unwrap();
+    let remaining = first.len() as u64 + 8;
+    let cap = header + remaining;
+    Connection::open(&fixture.database)
+        .unwrap()
+        .execute(
+            "UPDATE changed_path_scopes SET max_observer_log_bytes=?1, max_segment_bytes=?1",
+            [cap as i64],
+        )
+        .unwrap();
+    let faults = Arc::new(FaultScript::default());
+    let mut writer = SegmentWriter::acquire_with_faults(
+        &fixture.database,
+        &fixture.segments,
+        fixture.scope,
+        3,
+        token,
+        "test-provider",
+        Vec::new(),
+        Duration::from_secs(60),
+        Arc::clone(&faults),
+    )
+    .unwrap();
+
+    assert!(writer.append(&[event(1), event(2)]).is_err());
+    assert!(faults.max_batch_capacity() > 0);
+    assert!(faults.max_batch_capacity() as u64 <= remaining);
 }
 
 #[test]
@@ -761,7 +992,7 @@ fn append_post_write_expiry_retires_without_publishing_memory_or_durability() {
     let offset = fixture.durable_offset();
     assert!(writer.append(&[event(1)]).is_err());
     assert_eq!(fixture.durable_offset(), offset);
-    let recovered = recover_segments(
+    let error = recover_segments(
         &fixture.database,
         &fixture.segments,
         &RecoveryScope {
@@ -771,8 +1002,9 @@ fn append_post_write_expiry_retires_without_publishing_memory_or_durability() {
         },
         PersistedLogLimits::default(),
     )
-    .unwrap();
-    assert!(recovered.requires_reconciliation);
+    .unwrap_err();
+    assert!(error.requires_reconciliation);
+    assert!(error.message.contains("owner"));
 }
 
 #[test]

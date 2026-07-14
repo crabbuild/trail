@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
@@ -377,8 +376,14 @@ pub(crate) fn recover_segments(
             "observer recovery requires WAL journal mode and foreign keys",
         ));
     }
+    connection
+        .execute_batch("BEGIN DEFERRED")
+        .map_err(|error| {
+            RecoveryError::new(format!("begin observer recovery snapshot: {error}"))
+        })?;
     let epoch = sql_i64(expected.epoch, "observer epoch")
         .map_err(|error| RecoveryError::new(error.to_string()))?;
+    validate_recovery_owner(&connection, expected, epoch)?;
     let segment_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM changed_path_observer_segments
@@ -395,6 +400,10 @@ pub(crate) fn recover_segments(
         ));
     }
     if segment_count == 0 {
+        connection.execute_batch("COMMIT").map_err(|error| {
+            RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
+        })?;
+        validate_recovery_owner(&connection, expected, epoch)?;
         return Ok(RecoveredTail {
             records: Vec::new(),
             durable_end: 0,
@@ -417,7 +426,6 @@ pub(crate) fn recover_segments(
         .query(params![expected.scope_id.to_text(), epoch])
         .map_err(|error| RecoveryError::new(format!("query observer metadata: {error}")))?;
     let expected_owner = hex::encode(expected.owner_token);
-    let mut published_paths = HashSet::with_capacity(segment_count);
     let mut total_bytes = 0_u64;
     let mut records = Vec::new();
     let mut durable_end = 0_u64;
@@ -445,14 +453,21 @@ pub(crate) fn recover_segments(
                 "observer segment metadata has wrong owner",
             ));
         }
-        let expected_filename = super::writer::segment_filename(&row.segment_id)
+        let first_sequence = db_u64(row.first_sequence, "first observer sequence")?;
+        let metadata_token = decode_owner_token(&row.owner_token)?;
+        let expected_id = super::writer::segment_id(expected.epoch, first_sequence, metadata_token);
+        if row.segment_id != expected_id {
+            return Err(RecoveryError::new(
+                "observer segment id does not match its exact derived identity",
+            ));
+        }
+        let expected_filename = super::writer::segment_filename(&expected_id)
             .map_err(|error| RecoveryError::new(error.to_string()))?;
         if row.segment_path != expected_filename {
             return Err(RecoveryError::new(
                 "observer segment path is not the exact derived relative filename",
             ));
         }
-        published_paths.insert(expected_filename.clone());
         let durable = db_u64(row.durable_end_offset, "durable observer offset")?;
         if durable > limits.max_segment_bytes {
             return Err(RecoveryError::new(
@@ -549,7 +564,7 @@ pub(crate) fn recover_segments(
             ));
         }
         if let Some(first) = recovered.records.first() {
-            if db_u64(row.first_sequence, "first observer sequence")? != first.sequence {
+            if first_sequence != first.sequence {
                 return Err(RecoveryError::new(
                     "observer segment first sequence metadata mismatch",
                 ));
@@ -597,22 +612,210 @@ pub(crate) fn recover_segments(
                 .map_err(|error| RecoveryError::new(format!("list observer segment: {error}")))?;
             let filename = entry.file_name();
             let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "cpl")
-                && filename
-                    .to_str()
-                    .map_or(true, |filename| !published_paths.contains(filename))
-            {
+            if path.extension().is_some_and(|extension| extension == "cpl") {
+                let published = filename.to_str().is_some_and(|filename| {
+                    filename.len() <= MAX_SEGMENT_FILENAME_BYTES
+                        && is_strictly_published_filename(
+                            &connection,
+                            &expected.scope_id,
+                            filename,
+                            &path,
+                        )
+                        .unwrap_or(false)
+                });
+                if published {
+                    continue;
+                }
                 requires_reconciliation = true;
             }
         }
     }
-    Ok(RecoveredTail {
+    let recovered = RecoveredTail {
         records,
         durable_end,
         last_sequence,
         last_hash,
         requires_reconciliation,
-    })
+    };
+    drop(rows);
+    drop(statement);
+    connection.execute_batch("COMMIT").map_err(|error| {
+        RecoveryError::new(format!("commit observer recovery snapshot: {error}"))
+    })?;
+    validate_recovery_owner(&connection, expected, epoch)?;
+    Ok(recovered)
+}
+
+fn validate_recovery_owner(
+    connection: &Connection,
+    expected: &RecoveryScope,
+    expected_epoch_sql: i64,
+) -> std::result::Result<(), RecoveryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT owner.epoch, owner.owner_token, owner.lease_state, owner.expires_at,
+                    owner.error_state, owner.error_at, scope.epoch
+             FROM changed_path_observer_owners owner
+             JOIN changed_path_scopes scope ON scope.scope_id=owner.scope_id
+             WHERE owner.scope_id=?1",
+        )
+        .map_err(|error| RecoveryError::new(format!("read observer owner: {error}")))?;
+    let mut rows = statement
+        .query([expected.scope_id.to_text()])
+        .map_err(|error| RecoveryError::new(format!("query observer owner: {error}")))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|error| RecoveryError::new(format!("stream observer owner: {error}")))?
+    else {
+        return Err(RecoveryError::new("current observer owner row is missing"));
+    };
+    let owner_epoch: i64 = row
+        .get(0)
+        .map_err(|error| RecoveryError::new(format!("decode observer owner epoch: {error}")))?;
+    let owner_token = bounded_text(row, 1, "observer owner token", 64)?;
+    let lease_state = bounded_text(row, 2, "observer owner lease state", 16)?;
+    let expires_at: i64 = row
+        .get(3)
+        .map_err(|error| RecoveryError::new(format!("decode observer owner expiry: {error}")))?;
+    let error_state = bounded_optional_text(row, 4, "observer owner error", 128)?;
+    let error_at: Option<i64> = row.get(5).map_err(|error| {
+        RecoveryError::new(format!("decode observer owner error time: {error}"))
+    })?;
+    let scope_epoch: i64 = row
+        .get(6)
+        .map_err(|error| RecoveryError::new(format!("decode observer scope epoch: {error}")))?;
+    if rows
+        .next()
+        .map_err(|error| RecoveryError::new(format!("stream observer owner: {error}")))?
+        .is_some()
+    {
+        return Err(RecoveryError::new("multiple current observer owner rows"));
+    }
+    if owner_epoch != expected_epoch_sql || scope_epoch != expected_epoch_sql {
+        return Err(RecoveryError::new("current observer owner epoch mismatch"));
+    }
+    if owner_token != hex::encode(expected.owner_token) {
+        return Err(RecoveryError::new("current observer owner token mismatch"));
+    }
+    decode_owner_token(&owner_token)?;
+    if lease_state != "active" {
+        return Err(RecoveryError::new(format!(
+            "current observer owner is {lease_state}"
+        )));
+    }
+    if error_state.is_some() || error_at.is_some() {
+        return Err(RecoveryError::new(
+            "current observer owner has an error state",
+        ));
+    }
+    if expires_at <= crate::db::util::now_ts() {
+        return Err(RecoveryError::new(
+            "current observer owner lease is expired",
+        ));
+    }
+    Ok(())
+}
+
+fn is_strictly_published_filename(
+    connection: &Connection,
+    scope_id: &ScopeId,
+    filename: &str,
+    path: &Path,
+) -> std::result::Result<bool, RecoveryError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT epoch, segment_id, first_sequence, owner_token, segment_path
+             FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND segment_path=?2",
+        )
+        .map_err(|error| RecoveryError::new(format!("read published segment names: {error}")))?;
+    let mut rows = statement
+        .query(params![scope_id.to_text(), filename])
+        .map_err(|error| RecoveryError::new(format!("query published segment names: {error}")))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| RecoveryError::new(format!("stream published segment names: {error}")))?
+    {
+        let epoch = match row
+            .get::<_, i64>(0)
+            .ok()
+            .and_then(|value| value.try_into().ok())
+        {
+            Some(epoch) => epoch,
+            None => continue,
+        };
+        let segment_id =
+            match bounded_text(row, 1, "published segment id", MAX_SEGMENT_FILENAME_BYTES) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+        let first_sequence = match row
+            .get::<_, i64>(2)
+            .ok()
+            .and_then(|value| value.try_into().ok())
+        {
+            Some(sequence) => sequence,
+            None => continue,
+        };
+        let owner = match bounded_text(row, 3, "published owner token", 64)
+            .and_then(|owner| decode_owner_token(&owner).map(|token| (owner, token)))
+        {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let segment_path =
+            match bounded_text(row, 4, "published segment path", MAX_SEGMENT_FILENAME_BYTES) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+        let derived_id = super::writer::segment_id(epoch, first_sequence, owner.1);
+        let Ok(derived_filename) = super::writer::segment_filename(&derived_id) else {
+            continue;
+        };
+        if owner.0 == hex::encode(owner.1)
+            && segment_id == derived_id
+            && segment_path == derived_filename
+            && filename == derived_filename
+            && published_header_matches(
+                path,
+                &RecoveryScope {
+                    scope_id: *scope_id,
+                    epoch,
+                    owner_token: owner.1,
+                },
+            )?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn published_header_matches(
+    path: &Path,
+    expected: &RecoveryScope,
+) -> std::result::Result<bool, RecoveryError> {
+    const PREFIX_BYTES: usize = 8 + 2 + 4;
+    let mut file = open_segment_no_follow(path)?;
+    let mut prefix = [0_u8; PREFIX_BYTES];
+    file.read_exact(&mut prefix)
+        .map_err(|error| RecoveryError::new(format!("read published segment header: {error}")))?;
+    let payload_length = u32::from_be_bytes(prefix[10..14].try_into().unwrap()) as usize;
+    if payload_length > MAX_HEADER_BYTES {
+        return Err(RecoveryError::new(
+            "published observer segment header exceeds limit",
+        ));
+    }
+    let total = PREFIX_BYTES
+        .checked_add(payload_length)
+        .ok_or_else(|| RecoveryError::new("published observer header length overflow"))?;
+    let mut bytes = Vec::with_capacity(total);
+    bytes.extend_from_slice(&prefix);
+    bytes.resize(total, 0);
+    file.read_exact(&mut bytes[PREFIX_BYTES..])
+        .map_err(|error| RecoveryError::new(format!("read published segment header: {error}")))?;
+    let (identity, consumed) = decode_header(&bytes)?;
+    Ok(consumed == total && identity.recovery_scope() == *expected)
 }
 
 #[derive(Debug)]
@@ -736,6 +939,17 @@ fn decode_optional_hash(value: Option<&str>) -> std::result::Result<[u8; 32], Re
         Some(value) => decode_required_hash(Some(value), "segment hash"),
         None => Ok([0; 32]),
     }
+}
+
+fn decode_owner_token(value: &str) -> std::result::Result<[u8; 32], RecoveryError> {
+    if value.len() != 64 || value != value.to_ascii_lowercase() {
+        return Err(RecoveryError::new("non-canonical observer owner token"));
+    }
+    let bytes = hex::decode(value)
+        .map_err(|_| RecoveryError::new("invalid observer owner token encoding"))?;
+    bytes
+        .try_into()
+        .map_err(|_| RecoveryError::new("invalid observer owner token length"))
 }
 
 fn decode_required_hash(

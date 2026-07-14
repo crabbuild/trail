@@ -16,7 +16,7 @@ use codec::{
     decode_header, encode_header, encode_record, encoded_segment, header_end, recover_bytes,
 };
 #[cfg(test)]
-use writer::{sync_directory, FaultPoint, FaultScript};
+use writer::{segment_filename, segment_id, sync_directory, FaultPoint, FaultScript};
 
 #[cfg(test)]
 mod tests;
@@ -27,7 +27,7 @@ const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
 const RECORD_FIXED_BYTES: usize = 8 + 1 + 32 + 32;
 const LENGTH_PREFIX_BYTES: usize = 4;
-const MAX_SEGMENT_FILENAME_BYTES: usize = 64;
+const MAX_SEGMENT_FILENAME_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObserverRecord {

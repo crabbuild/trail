@@ -342,3 +342,90 @@ cargo fmt --all -- --check
 git diff --check
   clean
 ```
+
+### Re-review fixes
+
+Findings 11–14 are fixed. Finding 15 remains a Task 7 activation acceptance item: the current macOS
+host has a real no-follow symlink rejection run, while Linux coverage in Task 3 is compile-only.
+Task 7 must execute the real Linux symlink rejection test before activation; this report does not
+claim Linux qualification.
+
+The second RED wave first failed to compile because the old ID API had no epoch input and the append
+fault seam had no aggregate-capacity evidence:
+
+```text
+error[E0425]: cannot find function `segment_id` in this scope
+error[E0599]: no method named `max_batch_capacity` found for Arc<FaultScript>
+```
+
+After the initial GREEN implementation, the stronger coordinated prior-epoch case established an
+additional behavioral RED: a perfectly derived other-epoch ID/path row suppressed a file containing
+invalid header bytes, causing `requires_reconciliation` to be false. Published prior-epoch filenames
+now count as legitimate only when the metadata ID/path is exactly derived and a bounded, no-follow
+file open confirms the header scope/epoch/full owner identity.
+
+Final focused result:
+
+```text
+running 33 tests
+test result: ok. 33 passed; 0 failed; 0 ignored; 454 filtered out
+```
+
+The re-review coverage proves:
+
+- segment IDs use the strict ASCII form
+  `<epoch:020>-<first_sequence:020>-<full-lowercase-owner-token-hex>`; both numeric fields are
+  positive canonical `u64` values, and filenames are exactly `<segment-id>.cpl`;
+- the same full token at sequence 1 produces distinct real filesystem names after an authoritative
+  epoch advance;
+- current recovery streams only current-epoch records, while directory orphan checks validate
+  published filenames for the same scope across all epochs without importing prior-epoch records;
+- coordinated invalid other-epoch metadata and invalid file/header identity cannot suppress an
+  orphan; current metadata, derived identity/path, header identity, and opened file must agree;
+- recovery uses one read snapshot for the exact current owner and metadata, then revalidates the
+  owner after the snapshot. Missing owner, token/epoch mismatch, non-active/error/revoked/expired
+  state, error fields, or an expired lease fails with reconciliation required;
+- every rotation fault starts from an appended and `flush_durable`-published record. Tests snapshot
+  the fully durable offset and segment metadata, inject each boundary, prove SQL rollback preserves
+  that snapshot, confirm token-guarded owner error retirement, and require owner-aware recovery to
+  fail closed on the actual v18 database/filesystem state;
+- append computes persisted remaining segment and cumulative-log capacity before encoding the batch.
+  Each record is encoded alone under the 1 MiB protocol cap, checked with overflow-safe arithmetic
+  before `try_reserve_exact`/aggregate extension, and observed aggregate capacity never exceeds the
+  persisted remaining cap.
+
+Exact second-wave verification:
+
+```text
+cargo test -p trail --lib db::change_ledger::log::tests -- --nocapture
+  33 passed; 0 failed
+
+cargo test -p trail --lib db::change_ledger::store::tests -- --nocapture
+  22 passed; 0 failed
+
+cargo test -p trail --test schema_v18_hard_cutover -- --nocapture
+  8 passed; 0 failed
+
+CARGO_NET_OFFLINE=true CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= \
+  cargo test -p trail --lib --quiet -- \
+  --skip cargo_adapter_builds_once_and_reuses_one_immutable_target_seed \
+  --skip automatic_detection_rejects_ambiguous_polyglot_roots
+  484 passed; 0 failed; 1 ignored; 2 filtered out
+
+env PATH="$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  CARGO_NET_OFFLINE=true CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= \
+  cargo test -p trail --lib cargo_adapter_builds_once_and_reuses_one_immutable_target_seed
+  1 passed; 0 failed
+
+env PATH="$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  CARGO_NET_OFFLINE=true CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= \
+  cargo test -p trail --lib automatic_detection_rejects_ambiguous_polyglot_roots
+  1 passed; 0 failed
+
+cargo clippy -p trail --lib --no-deps
+  exit 0; repository-wide pre-existing warning families only
+
+cargo fmt --all -- --check
+git diff --check
+  clean
+```

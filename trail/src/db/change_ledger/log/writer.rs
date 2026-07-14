@@ -32,6 +32,7 @@ pub(super) enum FaultPoint {
 #[derive(Debug, Default)]
 pub(super) struct FaultScript {
     points: Mutex<VecDeque<FaultPoint>>,
+    max_batch_capacity: Mutex<usize>,
 }
 
 impl FaultScript {
@@ -39,6 +40,7 @@ impl FaultScript {
     pub(super) fn new(points: impl IntoIterator<Item = FaultPoint>) -> Self {
         Self {
             points: Mutex::new(points.into_iter().collect()),
+            max_batch_capacity: Mutex::new(0),
         }
     }
 
@@ -62,6 +64,22 @@ impl FaultScript {
             return true;
         }
         false
+    }
+
+    fn observe_batch_capacity(&self, capacity: usize) {
+        let mut maximum = self
+            .max_batch_capacity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *maximum = (*maximum).max(capacity);
+    }
+
+    #[cfg(test)]
+    pub(super) fn max_batch_capacity(&self) -> usize {
+        *self
+            .max_batch_capacity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -240,7 +258,7 @@ impl SegmentWriter {
                 "observer segment header exceeds persisted byte cap".into(),
             ));
         }
-        let segment_id = segment_id(1, owner_token);
+        let segment_id = segment_id(epoch, 1, owner_token);
         let filename = segment_filename(&segment_id)?;
         let path = segment_directory.join(&filename);
         fs::create_dir_all(segment_directory)?;
@@ -349,30 +367,6 @@ impl SegmentWriter {
             transaction.commit()?;
             return Ok(());
         }
-        let mut batch = Vec::new();
-        let mut sequence = self.last_sequence;
-        let mut hash = self.last_hash;
-        for record in records {
-            if record.sequence != sequence.saturating_add(1) {
-                return Err(Error::InvalidInput(
-                    "observer append sequence is not exactly monotonic".into(),
-                ));
-            }
-            let (encoded, next_hash) = encode_record(record, hash)
-                .map_err(|error| Error::InvalidInput(error.to_string()))?;
-            batch.extend_from_slice(&encoded);
-            sequence = record.sequence;
-            hash = next_hash;
-        }
-        let next_offset = self
-            .current_offset
-            .checked_add(batch.len() as u64)
-            .ok_or_else(|| Error::InvalidInput("observer segment offset overflow".into()))?;
-        if next_offset > self.limits.max_segment_bytes {
-            return Err(Error::InvalidInput(
-                "observer segment byte cap exceeded".into(),
-            ));
-        }
         let other_durable = transaction.query_row(
             "SELECT COALESCE(SUM(durable_end_offset), 0)
              FROM changed_path_observer_segments
@@ -386,12 +380,60 @@ impl SegmentWriter {
         )?;
         let other_durable = u64::try_from(other_durable)
             .map_err(|_| Error::Corrupt("negative observer log byte total".into()))?;
-        let total_bytes = other_durable
-            .checked_add(next_offset)
+        let segment_remaining = self
+            .limits
+            .max_segment_bytes
+            .checked_sub(self.current_offset)
+            .ok_or_else(|| Error::Corrupt("observer segment already exceeds byte cap".into()))?;
+        let current_total = other_durable
+            .checked_add(self.current_offset)
             .ok_or_else(|| Error::InvalidInput("observer log byte total overflow".into()))?;
-        if total_bytes > self.limits.max_log_bytes {
-            return Err(Error::InvalidInput("observer log byte cap exceeded".into()));
+        let log_remaining = self
+            .limits
+            .max_log_bytes
+            .checked_sub(current_total)
+            .ok_or_else(|| Error::Corrupt("observer log already exceeds byte cap".into()))?;
+        let remaining = segment_remaining.min(log_remaining);
+        let remaining_usize = usize::try_from(remaining).map_err(|_| {
+            Error::InvalidInput("observer append capacity cannot fit memory".into())
+        })?;
+        let mut batch = Vec::new();
+        let mut sequence = self.last_sequence;
+        let mut hash = self.last_hash;
+        for record in records {
+            if record.sequence != sequence.saturating_add(1) {
+                return Err(Error::InvalidInput(
+                    "observer append sequence is not exactly monotonic".into(),
+                ));
+            }
+            let (encoded, next_hash) = encode_record(record, hash)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            let next_batch_len = batch
+                .len()
+                .checked_add(encoded.len())
+                .ok_or_else(|| Error::InvalidInput("observer append batch overflow".into()))?;
+            if next_batch_len > remaining_usize {
+                return Err(Error::InvalidInput(
+                    "observer append batch exceeds persisted remaining byte cap".into(),
+                ));
+            }
+            batch.try_reserve_exact(encoded.len()).map_err(|_| {
+                Error::InvalidInput("observer append batch allocation failed".into())
+            })?;
+            if batch.capacity() > remaining_usize {
+                return Err(Error::InvalidInput(
+                    "observer append batch allocation exceeds persisted remaining byte cap".into(),
+                ));
+            }
+            batch.extend_from_slice(&encoded);
+            self.faults.observe_batch_capacity(batch.capacity());
+            sequence = record.sequence;
+            hash = next_hash;
         }
+        let next_offset = self
+            .current_offset
+            .checked_add(batch.len() as u64)
+            .ok_or_else(|| Error::InvalidInput("observer segment offset overflow".into()))?;
         validate_lease_on(&transaction, &self.identity)?;
         self.faults.check(FaultPoint::AppendWrite)?;
         self.file.write_all(&batch)?;
@@ -538,7 +580,11 @@ impl SegmentWriter {
         sync_directory(&self.segment_directory)?;
 
         let first_sequence = self.last_sequence.saturating_add(1).max(1);
-        let next_segment_id = segment_id(first_sequence, self.identity.owner_token);
+        let next_segment_id = segment_id(
+            self.identity.epoch,
+            first_sequence,
+            self.identity.owner_token,
+        );
         let next_path = self
             .segment_directory
             .join(segment_filename(&next_segment_id)?);
@@ -750,18 +796,33 @@ fn lease_expiry(now: i64, duration: Duration) -> Result<i64> {
         .ok_or_else(|| Error::InvalidInput("observer lease expiry overflow".into()))
 }
 
-fn segment_id(first_sequence: u64, owner_token: [u8; 32]) -> String {
-    format!("{first_sequence:020}-{}", &hex::encode(owner_token)[..16])
+pub(super) fn segment_id(epoch: u64, first_sequence: u64, owner_token: [u8; 32]) -> String {
+    format!(
+        "{epoch:020}-{first_sequence:020}-{}",
+        hex::encode(owner_token)
+    )
 }
 
 pub(super) fn segment_filename(segment_id: &str) -> Result<String> {
     let bytes = segment_id.as_bytes();
-    let valid = bytes.len() == 37
+    let epoch = std::str::from_utf8(bytes.get(..20).unwrap_or_default())
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let first_sequence = std::str::from_utf8(bytes.get(21..41).unwrap_or_default())
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let valid = bytes.len() == 106
         && bytes[..20].iter().all(u8::is_ascii_digit)
         && bytes[20] == b'-'
-        && bytes[21..]
+        && bytes[21..41].iter().all(u8::is_ascii_digit)
+        && bytes[41] == b'-'
+        && bytes[42..]
             .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        && epoch.is_some_and(|epoch| epoch > 0 && format!("{epoch:020}") == segment_id[..20])
+        && first_sequence.is_some_and(|sequence| {
+            sequence > 0 && format!("{sequence:020}") == segment_id[21..41]
+        });
     if !valid {
         return Err(Error::Corrupt("invalid observer segment id".into()));
     }
