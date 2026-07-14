@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::change_ledger::{mark_backup_scopes_untrusted, ChangedPathLedger};
 
 impl Trail {
     pub fn create_backup(
@@ -13,6 +14,7 @@ impl Trail {
                 "backup output cannot be inside .trail".to_string(),
             ));
         }
+        ChangedPathLedger::new(&self.conn).recover()?;
         if output.exists() {
             if !overwrite {
                 return Err(Error::WorkspaceExists(output));
@@ -47,6 +49,20 @@ impl Trail {
         let sqlite_path_text = sqlite_path.to_string_lossy().to_string();
         self.conn
             .execute("VACUUM main INTO ?1", params![sqlite_path_text])?;
+        let backup_conn = Connection::open(&sqlite_path)?;
+        mark_backup_scopes_untrusted(&backup_conn)?;
+        let checkpoint_busy: i64 =
+            backup_conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if checkpoint_busy != 0 {
+            return Err(Error::Conflict(
+                "backup SQLite checkpoint remained busy".into(),
+            ));
+        }
+        drop(backup_conn);
+        OpenOptions::new()
+            .read(true)
+            .open(&sqlite_path)?
+            .sync_all()?;
         let (sqlite_bytes, sqlite_sha256) = file_digest(&sqlite_path)?;
 
         let worktree_bytes =
@@ -77,6 +93,10 @@ impl Trail {
         };
         let manifest_path = backup_manifest_path(output);
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        OpenOptions::new()
+            .read(true)
+            .open(&manifest_path)?
+            .sync_all()?;
 
         Ok(BackupCreateReport {
             path: output.to_string_lossy().to_string(),

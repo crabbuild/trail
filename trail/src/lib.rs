@@ -34,6 +34,22 @@ pub mod test_support {
     pub fn changed_path_reconciliation_callback_spool() -> std::result::Result<(), String> {
         crate::db::run_callback_spool()
     }
+
+    pub fn changed_path_intent_acknowledgement_race() -> std::result::Result<(), String> {
+        crate::db::run_acknowledgement_race()
+    }
+
+    pub fn changed_path_intent_gc_root_lifecycle() -> std::result::Result<(), String> {
+        crate::db::run_gc_root_lifecycle()
+    }
+
+    pub fn changed_path_intent_crash_matrix() -> std::result::Result<(), String> {
+        crate::db::run_crash_matrix()
+    }
+
+    pub fn changed_path_backup_restore_rotation() -> std::result::Result<(), String> {
+        crate::db::run_backup_restore_rotation()
+    }
 }
 
 /// Re-export the prolly crate as a Trail module namespace.

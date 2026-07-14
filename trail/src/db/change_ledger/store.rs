@@ -102,6 +102,7 @@ impl<'a> ChangedPathLedger<'a> {
                 "dirty prefix first sequence exceeds last sequence".into(),
             ));
         }
+        self.recover_scope(expected)?;
 
         let mut tx = self.conn.unchecked_transaction()?;
         let scope = evidence_write_guard(&tx, expected)?;
@@ -207,6 +208,7 @@ impl<'a> ChangedPathLedger<'a> {
                 "mark_untrusted cannot promote a scope to trusted".into(),
             ));
         }
+        self.recover_scope(expected)?;
         let encoded = EncodedExpected::new(expected)?;
         let changed = self.conn.execute(
             "UPDATE changed_path_scopes
@@ -242,6 +244,7 @@ impl<'a> ChangedPathLedger<'a> {
         &self,
         expected: &ExpectedScope,
     ) -> Result<CandidateSnapshot> {
+        self.recover_scope(expected)?;
         self.snapshot_candidates_in_transaction(expected, || {})
     }
 
@@ -375,6 +378,7 @@ impl<'a> ChangedPathLedger<'a> {
                 "incomplete prefixes cannot be acknowledged as authoritative".into(),
             ));
         }
+        self.recover_scope(expected)?;
         let through = cut.sequence.min(owned.through_sequence);
         let tx = self.conn.unchecked_transaction()?;
         cas_guard(&tx, expected, true)?;
@@ -429,6 +433,7 @@ impl<'a> ChangedPathLedger<'a> {
         target: &BaselineIdentity,
         cut: &EvidenceCut,
     ) -> Result<()> {
+        self.recover_scope(expected)?;
         let tx = self.conn.unchecked_transaction()?;
         cas_guard(&tx, expected, true)?;
         let scope = load_scope(&tx, expected)?;
@@ -476,6 +481,7 @@ impl<'a> ChangedPathLedger<'a> {
         source: EvidenceSource,
         sequence: u64,
     ) -> Result<()> {
+        self.recover_scope(expected)?;
         let mut tx = self.conn.unchecked_transaction()?;
         let scope = evidence_write_guard(&tx, expected)?;
         let mut savepoint = tx.savepoint()?;
@@ -845,6 +851,39 @@ mod tests {
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             UNIQUE(scope_kind, owner_id)
+        );
+        CREATE TABLE changed_path_intents (
+            intent_id TEXT NOT NULL PRIMARY KEY,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            scope_id TEXT NOT NULL REFERENCES changed_path_scopes(scope_id) ON DELETE CASCADE,
+            producer TEXT NOT NULL,
+            expected_scope_epoch INTEGER NOT NULL,
+            expected_ref_name TEXT NOT NULL,
+            expected_ref_generation INTEGER NOT NULL,
+            expected_change_id TEXT NOT NULL,
+            expected_root_id TEXT NOT NULL,
+            target_change_id TEXT NOT NULL,
+            target_root_id TEXT NOT NULL,
+            target_operation_id TEXT,
+            start_cursor BLOB,
+            lifecycle_state TEXT NOT NULL DEFAULT 'prepared',
+            verified_cut BLOB,
+            failure_reason TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE changed_path_intent_paths (
+            intent_id TEXT NOT NULL REFERENCES changed_path_intents(intent_id) ON DELETE CASCADE,
+            normalized_path TEXT NOT NULL,
+            event_flags INTEGER NOT NULL,
+            PRIMARY KEY(intent_id, normalized_path)
+        );
+        CREATE TABLE changed_path_intent_prefixes (
+            intent_id TEXT NOT NULL REFERENCES changed_path_intents(intent_id) ON DELETE CASCADE,
+            normalized_prefix TEXT NOT NULL,
+            completeness_reason TEXT NOT NULL,
+            event_flags INTEGER NOT NULL,
+            PRIMARY KEY(intent_id, normalized_prefix)
         );
         CREATE TABLE changed_path_entries (
             scope_id TEXT NOT NULL REFERENCES changed_path_scopes(scope_id) ON DELETE CASCADE,

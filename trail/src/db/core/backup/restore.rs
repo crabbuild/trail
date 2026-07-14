@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::change_ledger::rotate_restored_scopes;
 
 impl Trail {
     pub fn restore_backup(
@@ -45,6 +46,31 @@ impl Trail {
                 backup_sqlite_path(&backup_path),
                 temp_dir.join(DB_RELATIVE_PATH),
             )?;
+            let restored_conn = Connection::open(temp_dir.join(DB_RELATIVE_PATH))?;
+            let mut filesystem_identity = b"trail-restored-filesystem-v1\0".to_vec();
+            filesystem_identity.extend_from_slice(workspace_root.as_os_str().as_encoded_bytes());
+            let scope_root = workspace_root
+                .to_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "os-bytes:{}",
+                        hex::encode(workspace_root.as_os_str().as_encoded_bytes())
+                    )
+                });
+            rotate_restored_scopes(&restored_conn, &filesystem_identity, &scope_root)?;
+            let checkpoint_busy: i64 =
+                restored_conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            if checkpoint_busy != 0 {
+                return Err(Error::Conflict(
+                    "restored SQLite checkpoint remained busy".into(),
+                ));
+            }
+            drop(restored_conn);
+            OpenOptions::new()
+                .read(true)
+                .open(temp_dir.join(DB_RELATIVE_PATH))?
+                .sync_all()?;
             copy_dir_recursive(&backup_path.join("worktrees"), &temp_dir.join("worktrees"))?;
             Ok(())
         })();

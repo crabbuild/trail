@@ -2,11 +2,19 @@
 // authoritative readers and native producers to it.
 #![allow(dead_code)]
 
+mod intent;
 mod log;
 mod policy;
 mod reconcile;
+mod recovery;
 mod store;
 mod types;
+
+#[allow(unused_imports)]
+pub(crate) use intent::{
+    mark_filesystem_applied, prepare_intent, publish_intent, IntentEvidence, IntentId,
+    IntentProducer, IntentState, IntentTarget, VerifiedFilesystemCut,
+};
 
 #[allow(unused_imports)]
 pub(crate) use log::{
@@ -27,6 +35,15 @@ pub(crate) use reconcile::{
 };
 #[cfg(debug_assertions)]
 pub(crate) use reconcile::{run_callback_spool, run_oracle, run_races};
+#[allow(unused_imports)]
+pub(crate) use recovery::{
+    ledger_gc_roots, mark_backup_scopes_untrusted, recover_scope, retire_scope,
+    rotate_restored_scopes, RecoveryDecision,
+};
+#[cfg(debug_assertions)]
+pub(crate) use recovery::{
+    run_acknowledgement_race, run_backup_restore_rotation, run_crash_matrix, run_gc_root_lifecycle,
+};
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;
 #[allow(unused_imports)]

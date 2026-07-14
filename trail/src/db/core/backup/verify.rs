@@ -88,6 +88,23 @@ impl Trail {
                         errors.extend(fsck.errors);
                         workspace_id.get_or_insert_with(|| db.config.workspace.id.clone());
                         branch.get_or_insert(db.current_branch()?);
+                        let trusted_scopes: i64 = db.conn.query_row(
+                            "SELECT COUNT(*) FROM changed_path_scopes
+                             WHERE retired_at IS NULL AND trust_state='trusted'",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        let live_observers: i64 = db.conn.query_row(
+                            "SELECT (SELECT COUNT(*) FROM changed_path_observer_owners)
+                                  + (SELECT COUNT(*) FROM changed_path_observer_segments)",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if trusted_scopes != 0 || live_observers != 0 {
+                            errors.push(
+                                "changed-path backup is not fenced or marked untrusted".to_string(),
+                            );
+                        }
                     }
                     Err(err) => errors.push(format!("fsck failed: {err}")),
                 },

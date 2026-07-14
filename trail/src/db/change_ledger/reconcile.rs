@@ -495,6 +495,7 @@ pub(crate) fn begin_reconciliation(
             "compiled recording policy has no authenticated reconciliation authorization",
         ));
     }
+    ledger.recover_scope(expected)?;
     // The observation cut is deliberately acquired before the root is opened
     // and before any enumeration can begin.
     let start_fence = observer.begin_observation(expected)?;

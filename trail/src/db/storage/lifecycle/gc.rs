@@ -1,9 +1,18 @@
 use super::*;
+use crate::db::change_ledger::{ledger_gc_roots, ChangedPathLedger};
 
 impl Trail {
     pub fn gc(&mut self, dry_run: bool) -> Result<GcReport> {
         let _lock = self.acquire_write_lock()?;
-        let reachable = self.reachable_object_ids()?;
+        // Capture roots before recovery terminalizes an intent. This makes the
+        // recovery boundary itself conservative: the next GC, not this one,
+        // may collect a target that recovery proved terminal.
+        let intent_roots = ledger_gc_roots(&self.conn)?;
+        if !dry_run {
+            ChangedPathLedger::new(&self.conn).recover()?;
+        }
+        let mut reachable = self.reachable_object_ids()?;
+        reachable.extend(intent_roots);
         let known_kinds = known_gc_object_kinds();
         let mut stmt = self
             .conn

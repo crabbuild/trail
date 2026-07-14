@@ -233,7 +233,7 @@ impl BitOrAssign for EvidenceFlags {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct EvidenceCut {
     pub(crate) source: EvidenceSource,
     pub(crate) sequence: u64,
