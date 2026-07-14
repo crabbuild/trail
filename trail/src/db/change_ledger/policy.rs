@@ -371,6 +371,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_ascii_padded_git_config_count_keep_indexed_includes() {
+        let mut fixture = Fixture::new();
+        let target = fixture.root().join("indexed/missing.gitconfig");
+        fixture.git_env.extend([
+            ("GIT_CONFIG_COUNT".into(), "  1\t".into()),
+            ("GIT_CONFIG_KEY_0".into(), "include.path".into()),
+            ("GIT_CONFIG_VALUE_0".into(), target.as_os_str().to_owned()),
+        ]);
+
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+        assert!(policy.dependencies.iter().any(|dependency| {
+            dependency.identity == dependency_path_identity_with_case(&target, true)
+        }));
+
+        fixture.git_env.retain(|(key, _)| {
+            !matches!(
+                key.to_str(),
+                Some("GIT_CONFIG_KEY_0" | "GIT_CONFIG_VALUE_0")
+            )
+        });
+        fixture.git_env.iter_mut().for_each(|(key, value)| {
+            if key == OsStr::new("GIT_CONFIG_COUNT") {
+                *value = OsString::new();
+            }
+        });
+        assert!(discover_git_dependencies(1, &fixture.context()).is_ok());
+    }
+
+    #[test]
     fn git_selector_paths_follow_git_cwd_and_empty_semantics() {
         let mut fixture = Fixture::new();
         let home = fixture.root().join("home");
@@ -406,6 +435,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_home_uses_root_based_global_and_xdg_candidates() {
+        let mut fixture = Fixture::new();
+        fixture.git_env.extend([
+            ("HOME".into(), OsString::new()),
+            ("XDG_CONFIG_HOME".into(), OsString::new()),
+        ]);
+
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+        for target in [
+            PathBuf::from("/.gitconfig"),
+            PathBuf::from("/.config/git/config"),
+            PathBuf::from("/.config/git/ignore"),
+        ] {
+            assert!(policy.dependencies.iter().any(|dependency| {
+                dependency.identity == dependency_path_identity_with_case(&target, true)
+            }));
+        }
+    }
+
+    #[test]
     fn relative_xdg_and_global_paths_resolve_from_git_cwd() {
         let mut fixture = Fixture::new();
         fixture.git_env = vec![
@@ -423,6 +472,52 @@ mod tests {
                 dependency.identity == dependency_path_identity_with_case(&target, true)
             }));
         }
+    }
+
+    #[test]
+    fn git_subprocess_environment_drops_every_ambient_repository_selector() {
+        let mut fixture = Fixture::new();
+        fixture.git_env.extend([
+            ("HOME".into(), fixture.root().join("home").into_os_string()),
+            (
+                "GIT_DIR".into(),
+                fixture.root().join(".git").into_os_string(),
+            ),
+        ]);
+        let ambient = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("GIT_CONFIG".into(), "/tmp/hostile-config".into()),
+            ("GIT_COMMON_DIR".into(), "/tmp/hostile-common".into()),
+            ("GIT_WORK_TREE".into(), "/tmp/hostile-worktree".into()),
+            ("GIT_OBJECT_DIRECTORY".into(), "/tmp/hostile-objects".into()),
+            ("HOME".into(), "/tmp/hostile-home".into()),
+            ("XDG_CONFIG_HOME".into(), "/tmp/hostile-xdg".into()),
+            ("UNRELATED_AMBIENT".into(), "not-needed".into()),
+        ];
+
+        let environment = git_command_environment(&fixture.context(), ambient);
+        let keys = environment
+            .iter()
+            .map(|(key, _)| key.as_os_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                OsStr::new("PATH"),
+                OsStr::new("HOME"),
+                OsStr::new("GIT_DIR"),
+                OsStr::new("GIT_CONFIG_NOSYSTEM"),
+            ])
+        );
+        let expected_home = fixture.root().join("home").into_os_string();
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(key, _)| key == OsStr::new("HOME"))
+                .map(|(_, value)| value),
+            Some(&expected_home)
+        );
     }
 
     #[test]
@@ -562,6 +657,46 @@ mod tests {
     }
 
     #[test]
+    fn git_decodes_include_values_and_resolves_them_from_the_origin_file() {
+        let mut fixture = Fixture::new();
+        let config_root = fixture.root().parent().unwrap().join("git-config-grammar");
+        fs::create_dir_all(&config_root).unwrap();
+        let global = config_root.join("global.gitconfig");
+        fs::write(
+            &global,
+            concat!(
+                "[include]\n",
+                "\tpath = \"quoted dir/missing include.conf\" # trailing comment\n",
+                "[include]\n",
+                "\tpath = continued-\\\n",
+                "target.conf\n",
+                "[includeIf \"gitdir:/**\"]\n",
+                "\tpath = \"tab\\tmissing.conf\"\n",
+            ),
+        )
+        .unwrap();
+        fixture
+            .git_env
+            .push(("GIT_CONFIG_GLOBAL".into(), global.into_os_string()));
+
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+
+        for target in [
+            config_root.join("quoted dir/missing include.conf"),
+            config_root.join("continued-target.conf"),
+            config_root.join("tab\tmissing.conf"),
+        ] {
+            assert!(
+                policy.dependencies.iter().any(|dependency| {
+                    dependency.identity == dependency_path_identity_with_case(&target, true)
+                }),
+                "Git-decoded missing include was not persisted: {}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
     fn missing_external_global_config_is_persisted_and_creation_is_detected() {
         let mut fixture = Fixture::new();
         let global = fixture
@@ -620,6 +755,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_ancestor_never_pins_external_policy_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let external = fixture.root().parent().unwrap().join("external-config-dir");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(
+            external.join("policy.gitconfig"),
+            b"[include]\npath = should-never-be-decoded\n",
+        )
+        .unwrap();
+        let linked_dir = fixture.root().join("linked-config-dir");
+        symlink(&external, &linked_dir).unwrap();
+        let linked_policy = linked_dir.join("policy.gitconfig");
+
+        let (dependency, bytes) = read_file_dependency(
+            &linked_policy,
+            PolicyDependencyKind::GitConfig,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+
+        assert!(bytes.is_empty());
+        assert_eq!(dependency.content_identity, digest(b""));
+        assert!(!dependency.observable);
+    }
+
     #[test]
     fn builtins_normalization_mode_and_case_policy_are_authoritative_identities() {
         let fixture = Fixture::new();
@@ -674,10 +839,10 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::fs;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -1310,18 +1475,14 @@ fn discover_git_dependencies(
         return Ok(Vec::new());
     }
     let mut paths = BTreeMap::<(PolicyDependencyKind, String), PathBuf>::new();
-    let mut insert = |path: PathBuf, kind: PolicyDependencyKind| {
-        let path = lexical_normalize(&path);
-        paths.insert(
-            (kind, normalized_path_key(&path, context.case_sensitive)),
-            path,
-        );
-    };
     let cwd = lexical_normalize(context.workspace_root);
-    let home = git_environment_value(context, "HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|path| resolve_git_cwd_path(&cwd, path));
+    let home = git_environment_value(context, "HOME").map(|value| {
+        if value.is_empty() {
+            PathBuf::from("/")
+        } else {
+            resolve_git_cwd_path(&cwd, PathBuf::from(value))
+        }
+    });
     let xdg = git_environment_value(context, "XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -1329,17 +1490,29 @@ fn discover_git_dependencies(
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
     if let Some(global) = git_environment_value(context, "GIT_CONFIG_GLOBAL") {
         if !global.is_empty() {
-            insert(
+            insert_git_dependency_path(
+                &mut paths,
+                context.case_sensitive,
                 resolve_git_cwd_path(&cwd, PathBuf::from(global)),
                 PolicyDependencyKind::GitConfig,
             );
         }
     } else {
         if let Some(home) = &home {
-            insert(home.join(".gitconfig"), PolicyDependencyKind::GitConfig);
+            insert_git_dependency_path(
+                &mut paths,
+                context.case_sensitive,
+                home.join(".gitconfig"),
+                PolicyDependencyKind::GitConfig,
+            );
         }
         if let Some(xdg) = &xdg {
-            insert(xdg.join("git/config"), PolicyDependencyKind::GitConfig);
+            insert_git_dependency_path(
+                &mut paths,
+                context.case_sensitive,
+                xdg.join("git/config"),
+                PolicyDependencyKind::GitConfig,
+            );
         }
     }
     if !git_environment_value(context, "GIT_CONFIG_NOSYSTEM").is_some_and(|v| git_truthy(&v)) {
@@ -1347,63 +1520,22 @@ fn discover_git_dependencies(
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"));
         if !system.as_os_str().is_empty() {
-            insert(
+            insert_git_dependency_path(
+                &mut paths,
+                context.case_sensitive,
                 resolve_git_cwd_path(&cwd, system),
                 PolicyDependencyKind::GitConfig,
             );
         }
     }
     if let Some(xdg) = &xdg {
-        insert(
+        insert_git_dependency_path(
+            &mut paths,
+            context.case_sensitive,
             xdg.join("git/ignore"),
             PolicyDependencyKind::GitExcludesFile,
         );
     }
-    for (key, value) in injected_git_config(context)? {
-        let key = key.to_string_lossy().to_ascii_lowercase();
-        let kind =
-            if key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path")) {
-                Some(PolicyDependencyKind::GitConfig)
-            } else if key == "core.excludesfile" {
-                Some(PolicyDependencyKind::GitExcludesFile)
-            } else {
-                None
-            };
-        if let Some(kind) = kind {
-            if let Some(path) = resolve_git_config_path(&value, &cwd, home.as_deref()) {
-                insert(path, kind);
-            }
-        }
-    }
-    let origins = run_git(
-        context,
-        &[
-            "config",
-            "--includes",
-            "--show-origin",
-            "--show-scope",
-            "--null",
-            "--list",
-        ],
-        true,
-    )?;
-    let fields = origins
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    for triple in fields.chunks_exact(3) {
-        if let Some(raw_path) = triple[1].strip_prefix(b"file:") {
-            let path = os_string_from_bytes(raw_path);
-            let path = PathBuf::from(path);
-            let path = if path.is_absolute() {
-                lexical_normalize(&path)
-            } else {
-                lexical_normalize(&context.workspace_root.join(path))
-            };
-            insert(path, PolicyDependencyKind::GitConfig);
-        }
-    }
-
     let git_dirs = run_git(
         context,
         &[
@@ -1420,46 +1552,53 @@ fn discover_git_dependencies(
         .filter(|line| !line.is_empty())
         .map(|line| PathBuf::from(os_string_from_bytes(line)));
     if let Some(git_dir) = &git_dir {
-        insert(git_dir.join("config"), PolicyDependencyKind::GitConfig);
-        insert(
+        insert_git_dependency_path(
+            &mut paths,
+            context.case_sensitive,
+            git_dir.join("config"),
+            PolicyDependencyKind::GitConfig,
+        );
+        insert_git_dependency_path(
+            &mut paths,
+            context.case_sensitive,
             git_dir.join("config.worktree"),
             PolicyDependencyKind::GitConfig,
         );
     }
     if let Some(common) = lines.next().filter(|line| !line.is_empty()) {
-        insert(
+        insert_git_dependency_path(
+            &mut paths,
+            context.case_sensitive,
             PathBuf::from(os_string_from_bytes(common)).join("info/exclude"),
             PolicyDependencyKind::GitInfoExclude,
         );
     }
 
-    let excludes = run_git(
-        context,
-        &[
-            "config",
-            "--includes",
-            "--path",
-            "--get",
-            "core.excludesFile",
-        ],
-        false,
-    )?;
-    let excludes = trim_ascii_line_end(&excludes);
-    if !excludes.is_empty() {
-        let path = PathBuf::from(os_string_from_bytes(excludes));
-        insert(
-            if path.is_absolute() {
-                lexical_normalize(&path)
-            } else {
-                lexical_normalize(&context.workspace_root.join(path))
-            },
-            PolicyDependencyKind::GitExcludesFile,
-        );
+    for entry in injected_git_config_entries(context)? {
+        if git_config_key_is_include(&entry.key) {
+            if let Some(path) = resolve_git_include_path(&entry.value, &cwd, home.as_deref()) {
+                insert_git_dependency_path(
+                    &mut paths,
+                    context.case_sensitive,
+                    path,
+                    PolicyDependencyKind::GitConfig,
+                );
+            }
+        } else if entry.key.eq_ignore_ascii_case(b"core.excludesfile") {
+            if let Some(path) = resolve_git_config_path(&entry.value, &cwd, home.as_deref()) {
+                insert_git_dependency_path(
+                    &mut paths,
+                    context.case_sensitive,
+                    path,
+                    PolicyDependencyKind::GitExcludesFile,
+                );
+            }
+        }
     }
 
-    // Git's origin output omits missing include targets. Parse every known
-    // config recursively so creation of an include/includeIf target changes
-    // the manifest even when the target did not exist at discovery time.
+    // Ask Git to decode each safely pinned config independently. Keeping
+    // includes disabled makes missing and inactive include/includeIf targets
+    // visible without allowing Git to reopen or recursively follow paths.
     let mut pending = paths
         .iter()
         .filter(|((kind, _), _)| *kind == PolicyDependencyKind::GitConfig)
@@ -1471,15 +1610,34 @@ fn discover_git_dependencies(
         if !parsed.insert(key) {
             continue;
         }
-        let bytes = read_path_bytes_no_follow(&config)?.unwrap_or_default();
-        for included in parse_git_include_paths(&bytes, &config, home.as_deref()) {
-            let included_key = (
-                PolicyDependencyKind::GitConfig,
-                normalized_path_key(&included, context.case_sensitive),
-            );
-            if !paths.contains_key(&included_key) {
-                paths.insert(included_key, included.clone());
-                pending.push(included);
+        let Some(bytes) = read_path_bytes_no_follow(&config)? else {
+            continue;
+        };
+        for entry in git_config_entries_from_bytes(context, &bytes)? {
+            if git_config_key_is_include(&entry.key) {
+                if let Some(included) = resolve_git_include_path(
+                    &entry.value,
+                    config.parent().unwrap_or(Path::new("/")),
+                    home.as_deref(),
+                ) {
+                    let included_key = (
+                        PolicyDependencyKind::GitConfig,
+                        normalized_path_key(&included, context.case_sensitive),
+                    );
+                    if !paths.contains_key(&included_key) {
+                        paths.insert(included_key, included.clone());
+                        pending.push(included);
+                    }
+                }
+            } else if entry.key.eq_ignore_ascii_case(b"core.excludesfile") {
+                if let Some(path) = resolve_git_config_path(&entry.value, &cwd, home.as_deref()) {
+                    insert_git_dependency_path(
+                        &mut paths,
+                        context.case_sensitive,
+                        path,
+                        PolicyDependencyKind::GitExcludesFile,
+                    );
+                }
             }
         }
     }
@@ -1490,111 +1648,102 @@ fn discover_git_dependencies(
         .collect()
 }
 
-fn injected_git_config(context: &PolicyCompileContext<'_>) -> Result<Vec<(OsString, OsString)>> {
-    let mut entries = Vec::new();
-    if let Some(count) = git_environment_value(context, "GIT_CONFIG_COUNT") {
-        let count = count.to_string_lossy().parse::<usize>().map_err(|_| {
-            Error::InvalidInput("GIT_CONFIG_COUNT is not a non-negative integer".into())
-        })?;
-        for index in 0..count {
-            let key = git_environment_value(context, &format!("GIT_CONFIG_KEY_{index}"))
-                .ok_or_else(|| Error::InvalidInput(format!("GIT_CONFIG_KEY_{index} is missing")))?;
-            let value = git_environment_value(context, &format!("GIT_CONFIG_VALUE_{index}"))
-                .ok_or_else(|| {
-                    Error::InvalidInput(format!("GIT_CONFIG_VALUE_{index} is missing"))
-                })?;
-            entries.push((key, value));
-        }
+fn insert_git_dependency_path(
+    paths: &mut BTreeMap<(PolicyDependencyKind, String), PathBuf>,
+    case_sensitive: bool,
+    path: PathBuf,
+    kind: PolicyDependencyKind,
+) {
+    let path = lexical_normalize(&path);
+    paths.insert((kind, normalized_path_key(&path, case_sensitive)), path);
+}
+
+#[derive(Debug)]
+struct GitConfigEntry {
+    key: Vec<u8>,
+    value: OsString,
+}
+
+const GIT_POLICY_KEY_PATTERN: &str = r"^(include\.path|include[Ii]f\..*\.path|core\.excludesfile)$";
+
+fn git_config_entries_from_bytes(
+    context: &PolicyCompileContext<'_>,
+    bytes: &[u8],
+) -> Result<Vec<GitConfigEntry>> {
+    let output = run_git_with_stdin(
+        context,
+        &[
+            "config",
+            "--file",
+            "-",
+            "--no-includes",
+            "--show-origin",
+            "--null",
+            "--get-regexp",
+            GIT_POLICY_KEY_PATTERN,
+        ],
+        false,
+        bytes,
+    )?;
+    parse_git_config_entries(&output, false)
+}
+
+fn injected_git_config_entries(context: &PolicyCompileContext<'_>) -> Result<Vec<GitConfigEntry>> {
+    let output = run_injected_git_config(context)?;
+    parse_git_config_entries(&output, true)
+}
+
+fn parse_git_config_entries(output: &[u8], with_scope: bool) -> Result<Vec<GitConfigEntry>> {
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let width = if with_scope { 3 } else { 2 };
+    if fields.len() % width != 0 {
+        return Err(Error::InvalidInput(
+            "git config returned malformed origin output".into(),
+        ));
     }
-    if let Some(parameters) = git_environment_value(context, "GIT_CONFIG_PARAMETERS") {
-        for parameter in split_git_config_parameters(&parameters)? {
-            let bytes = os_str_bytes(&parameter);
-            let Some(separator) = bytes.iter().position(|byte| *byte == b'=') else {
-                return Err(Error::InvalidInput(
-                    "GIT_CONFIG_PARAMETERS entry has no `=` separator".into(),
-                ));
-            };
-            entries.push((
-                os_string_from_bytes(&bytes[..separator]),
-                os_string_from_bytes(&bytes[separator + 1..]),
-            ));
+    let mut entries = Vec::new();
+    for record in fields.chunks_exact(width) {
+        if with_scope && record[0] != b"command" {
+            continue;
         }
+        let key_value = record[width - 1];
+        let Some(separator) = key_value.iter().position(|byte| *byte == b'\n') else {
+            return Err(Error::InvalidInput(
+                "git config returned an entry without a key/value separator".into(),
+            ));
+        };
+        entries.push(GitConfigEntry {
+            key: key_value[..separator].to_vec(),
+            value: os_string_from_bytes(&key_value[separator + 1..]),
+        });
     }
     Ok(entries)
 }
 
-fn split_git_config_parameters(parameters: &OsStr) -> Result<Vec<OsString>> {
-    let input = os_str_bytes(parameters);
-    let mut index = 0;
-    let mut result = Vec::new();
-    while index < input.len() {
-        while input.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index += 1;
-        }
-        if index == input.len() {
-            break;
-        }
-        let mut token = Vec::new();
-        let mut quote = None;
-        while index < input.len() {
-            let byte = input[index];
-            match quote {
-                Some(b'\'') if byte == b'\'' => {
-                    quote = None;
-                    index += 1;
-                }
-                Some(b'\'') => {
-                    token.push(byte);
-                    index += 1;
-                }
-                Some(b'"') if byte == b'"' => {
-                    quote = None;
-                    index += 1;
-                }
-                Some(b'"') if byte == b'\\' => {
-                    index += 1;
-                    let Some(escaped) = input.get(index) else {
-                        return Err(Error::InvalidInput(
-                            "GIT_CONFIG_PARAMETERS has a trailing escape".into(),
-                        ));
-                    };
-                    token.push(*escaped);
-                    index += 1;
-                }
-                Some(b'"') => {
-                    token.push(byte);
-                    index += 1;
-                }
-                Some(_) => unreachable!(),
-                None if byte == b'\'' || byte == b'"' => {
-                    quote = Some(byte);
-                    index += 1;
-                }
-                None if byte == b'\\' => {
-                    index += 1;
-                    let Some(escaped) = input.get(index) else {
-                        return Err(Error::InvalidInput(
-                            "GIT_CONFIG_PARAMETERS has a trailing escape".into(),
-                        ));
-                    };
-                    token.push(*escaped);
-                    index += 1;
-                }
-                None if byte.is_ascii_whitespace() => break,
-                None => {
-                    token.push(byte);
-                    index += 1;
-                }
-            }
-        }
-        if quote.is_some() {
-            return Err(Error::InvalidInput(
-                "GIT_CONFIG_PARAMETERS has an unterminated quote".into(),
-            ));
-        }
-        result.push(os_string_from_bytes(&token));
+fn git_config_key_is_include(key: &[u8]) -> bool {
+    let key = String::from_utf8_lossy(key).to_ascii_lowercase();
+    key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
+}
+
+fn normalize_git_config_count(value: &OsStr) -> OsString {
+    let bytes = os_str_bytes(value);
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    if start == end {
+        OsString::from("0")
+    } else {
+        os_string_from_bytes(&bytes[start..end])
     }
-    Ok(result)
 }
 
 fn resolve_git_cwd_path(cwd: &Path, path: PathBuf) -> PathBuf {
@@ -1603,6 +1752,10 @@ fn resolve_git_cwd_path(cwd: &Path, path: PathBuf) -> PathBuf {
     } else {
         lexical_normalize(&cwd.join(path))
     }
+}
+
+fn resolve_git_include_path(value: &OsStr, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    resolve_git_config_path(value, base, home)
 }
 
 fn resolve_git_config_path(value: &OsStr, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
@@ -1626,45 +1779,6 @@ fn git_truthy(value: &OsStr) -> bool {
     )
 }
 
-fn parse_git_include_paths(bytes: &[u8], source: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-    let mut include_section = false;
-    let mut paths = Vec::new();
-    for line in String::from_utf8_lossy(bytes).lines() {
-        let line = line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            let section = line[1..line.len() - 1].trim().to_ascii_lowercase();
-            include_section = section == "include" || section.starts_with("includeif ");
-            continue;
-        }
-        if !include_section || line.starts_with(['#', ';']) {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if !key.trim().eq_ignore_ascii_case("path") {
-            continue;
-        }
-        let value = value.trim().trim_matches('"');
-        let path = if value == "~" {
-            home.map(Path::to_path_buf)
-        } else if let Some(suffix) = value.strip_prefix("~/") {
-            home.map(|home| home.join(suffix))
-        } else {
-            let path = PathBuf::from(value);
-            Some(if path.is_absolute() {
-                path
-            } else {
-                source.parent().unwrap_or(Path::new(".")).join(path)
-            })
-        };
-        if let Some(path) = path {
-            paths.push(lexical_normalize(&path));
-        }
-    }
-    paths
-}
-
 fn git_environment_value(context: &PolicyCompileContext<'_>, key: &str) -> Option<OsString> {
     git_environment_value_os(context, OsStr::new(key))
 }
@@ -1678,19 +1792,109 @@ fn git_environment_value_os(context: &PolicyCompileContext<'_>, key: &OsStr) -> 
         .map(|(_, value)| value.clone())
 }
 
-fn run_git(context: &PolicyCompileContext<'_>, args: &[&str], required: bool) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
-    command.args(args).current_dir(context.workspace_root);
-    command.env_remove("HOME").env_remove("XDG_CONFIG_HOME");
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_CONFIG_") {
-            command.env_remove(key);
+fn git_command_environment(
+    context: &PolicyCompileContext<'_>,
+    ambient: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = BTreeMap::new();
+    for (key, value) in ambient {
+        if key == OsStr::new("PATH") {
+            environment.insert(key, value);
         }
     }
     for (key, value) in context.git_environment {
-        command.env(key, value);
+        environment.insert(
+            key.clone(),
+            if key == OsStr::new("GIT_CONFIG_COUNT") {
+                normalize_git_config_count(value)
+            } else {
+                value.clone()
+            },
+        );
     }
+    environment.into_iter().collect()
+}
+
+fn run_git(context: &PolicyCompileContext<'_>, args: &[&str], required: bool) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(context.workspace_root);
+    command
+        .env_clear()
+        .envs(git_command_environment(context, std::env::vars_os()));
     let output = command.output().map_err(Error::Io)?;
+    git_output(args, required, output)
+}
+
+fn run_git_with_stdin(
+    context: &PolicyCompileContext<'_>,
+    args: &[&str],
+    required: bool,
+    stdin: &[u8],
+) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(context.workspace_root)
+        .env_clear()
+        .envs(git_command_environment(context, std::env::vars_os()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(Error::Io)?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::InvalidInput("git config stdin was unavailable".into()))?
+        .write_all(stdin)
+        .map_err(Error::Io)?;
+    let output = child.wait_with_output().map_err(Error::Io)?;
+    git_output(args, required, output)
+}
+
+fn run_injected_git_config(context: &PolicyCompileContext<'_>) -> Result<Vec<u8>> {
+    let args = [
+        "config",
+        "--no-includes",
+        "--show-origin",
+        "--show-scope",
+        "--null",
+        "--get-regexp",
+        GIT_POLICY_KEY_PATTERN,
+    ];
+    let ambient = git_command_environment(context, std::env::vars_os());
+    let mut environment = BTreeMap::new();
+    for (key, value) in ambient {
+        if key == OsStr::new("PATH")
+            || key == OsStr::new("GIT_CONFIG_PARAMETERS")
+            || key == OsStr::new("GIT_CONFIG_COUNT")
+            || key.to_string_lossy().starts_with("GIT_CONFIG_KEY_")
+            || key.to_string_lossy().starts_with("GIT_CONFIG_VALUE_")
+        {
+            environment.insert(key, value);
+        }
+    }
+    environment.insert(OsString::from("HOME"), OsString::from("/"));
+    environment.insert(
+        OsString::from("XDG_CONFIG_HOME"),
+        OsString::from("/dev/null"),
+    );
+    environment.insert(
+        OsString::from("GIT_CONFIG_GLOBAL"),
+        OsString::from("/dev/null"),
+    );
+    environment.insert(OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1"));
+
+    let output = Command::new("git")
+        .args(args)
+        .current_dir("/")
+        .env_clear()
+        .envs(environment)
+        .output()
+        .map_err(Error::Io)?;
+    git_output(&args, false, output)
+}
+
+fn git_output(args: &[&str], required: bool, output: std::process::Output) -> Result<Vec<u8>> {
     if output.status.success() {
         return Ok(output.stdout);
     }
@@ -1717,7 +1921,7 @@ fn read_file_dependency(
     path: &Path,
     kind: PolicyDependencyKind,
     generation: u64,
-    context: &PolicyCompileContext<'_>,
+    _context: &PolicyCompileContext<'_>,
 ) -> Result<(PolicyDependency, Vec<u8>)> {
     let path = lexical_normalize(path);
     let (metadata, bytes) = read_file_state_no_follow(&path)?;
@@ -1726,7 +1930,6 @@ fn read_file_dependency(
     // dependencies remain explicitly uncovered until a later task wires a
     // qualified discovery cut into this compiler.
     let observable = false;
-    let _has_symlink_ancestor = has_symlink_ancestor(context.workspace_root, &path)?;
     let dependency = PolicyDependency {
         identity: dependency_path_identity(&path),
         kind,
@@ -1747,76 +1950,90 @@ fn read_path_bytes_no_follow(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn read_file_state_no_follow(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        return read_file_state_openat(path);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        Ok((None, Vec::new()))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    let path = lexical_normalize(path);
+    if !path.is_absolute() {
+        return Ok((None, Vec::new()));
+    }
+    let components = path
+        .strip_prefix(Path::new("/"))
+        .ok()
+        .map(|relative| relative.components().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Ok((None, Vec::new()));
+    }
+
     for _ in 0..2 {
-        let before = match fs::symlink_metadata(path) {
-            Ok(metadata) => Some(metadata),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(Error::Io(err)),
+        let mut directory = match openat(
+            CWD,
+            Path::new("/"),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(_) => return Ok((None, Vec::new())),
         };
-        let Some(before_metadata) = before else {
-            if matches!(fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
-            {
+        for component in &components[..components.len() - 1] {
+            let Component::Normal(name) = component else {
                 return Ok((None, Vec::new()));
-            }
-            continue;
-        };
-        if before_metadata.file_type().is_symlink() || !before_metadata.is_file() {
-            let after = fs::symlink_metadata(path).map_err(Error::Io)?;
-            if metadata_identity(Some(&before_metadata), path)?
-                == metadata_identity(Some(&after), path)?
-            {
-                return Ok((Some(before_metadata), Vec::new()));
-            }
-            continue;
+            };
+            directory = match openat(
+                &directory,
+                Path::new(name),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(directory) => directory,
+                Err(_) => return Ok((None, Vec::new())),
+            };
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = match options.open(path) {
-            Ok(file) => file,
-            Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => continue,
-            Err(err) => return Err(Error::Io(err)),
+        let Component::Normal(file_name) = components[components.len() - 1] else {
+            return Ok((None, Vec::new()));
         };
-        let opened = file.metadata().map_err(Error::Io)?;
+        let descriptor = match openat(
+            &directory,
+            Path::new(file_name),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(_) => return Ok((None, Vec::new())),
+        };
+        let mut file = fs::File::from(descriptor);
+        let before = file.metadata().map_err(Error::Io)?;
+        if !before.is_file() {
+            return Ok((Some(before), Vec::new()));
+        }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(Error::Io)?;
-        let after = fs::symlink_metadata(path).map_err(Error::Io)?;
-        let opened_identity = metadata_identity(Some(&opened), path)?;
-        if opened_identity == metadata_identity(Some(&before_metadata), path)?
-            && opened_identity == metadata_identity(Some(&after), path)?
-        {
-            return Ok((Some(opened), bytes));
+        let after = file.metadata().map_err(Error::Io)?;
+        if metadata_identity(Some(&before), &path)? == metadata_identity(Some(&after), &path)? {
+            return Ok((Some(after), bytes));
         }
     }
     Err(Error::InvalidInput(format!(
         "policy dependency `{}` changed while it was read",
         path.display()
     )))
-}
-
-fn has_symlink_ancestor(workspace_root: &Path, path: &Path) -> Result<bool> {
-    let root = lexical_normalize(workspace_root);
-    let Ok(relative) = path.strip_prefix(&root) else {
-        return Ok(false);
-    };
-    let mut current = root;
-    for component in relative.components() {
-        current.push(component);
-        if current == path {
-            break;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
-            Err(err) => return Err(Error::Io(err)),
-        }
-    }
-    Ok(false)
 }
 
 fn metadata_identity(metadata: Option<&fs::Metadata>, path: &Path) -> Result<Vec<u8>> {
@@ -2121,16 +2338,6 @@ fn os_string_from_bytes(value: &[u8]) -> OsString {
 #[cfg(not(unix))]
 fn os_string_from_bytes(value: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(value).into_owned())
-}
-
-fn trim_ascii_line_end(mut value: &[u8]) -> &[u8] {
-    while value
-        .last()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
