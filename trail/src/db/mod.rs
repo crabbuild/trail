@@ -106,12 +106,52 @@ static NEXT_SCHEMA_VALIDATION_SERVER_ID: AtomicU64 = AtomicU64::new(1);
 static SCHEMA_VALIDATION_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
+static NEXT_SCHEMA_VALIDATION_SERVER_DELAYS: OnceLock<Mutex<HashMap<PathBuf, (u64, u64)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
 fn fail_next_schema_validation(db_path: &Path) {
     SCHEMA_VALIDATION_FAILURES
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(db_path.to_path_buf());
+}
+
+#[cfg(test)]
+fn delay_next_schema_validation_server_start_for_test(db_path: &Path, delay: Duration) {
+    NEXT_SCHEMA_VALIDATION_SERVER_DELAYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(db_path.to_path_buf())
+        .or_default()
+        .0 = delay.as_millis() as u64;
+}
+
+#[cfg(test)]
+fn delay_next_schema_validation_server_shutdown_for_test(db_path: &Path, delay: Duration) {
+    NEXT_SCHEMA_VALIDATION_SERVER_DELAYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(db_path.to_path_buf())
+        .or_default()
+        .1 = delay.as_millis() as u64;
+}
+
+#[cfg(test)]
+fn take_schema_validation_server_delays_for_test(db_path: &Path) -> (Duration, Duration) {
+    let (start, shutdown) = NEXT_SCHEMA_VALIDATION_SERVER_DELAYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(db_path)
+        .unwrap_or_default();
+    (
+        Duration::from_millis(start),
+        Duration::from_millis(shutdown),
+    )
 }
 
 #[cfg(test)]
@@ -522,6 +562,28 @@ impl Drop for SchemaValidationRuntimeEntry {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cleanup_stale_schema_validation_runtime_entries(runtime_dir: &Path, namespace: &str) {
+    let prefix = format!("{}-", &namespace[..24]);
+    for path in fs::read_dir(runtime_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with(&prefix)
+                && (name.ends_with(".socket") || name.ends_with(".announce")))
+            .then(|| entry.path())
+        })
+    {
+        if let Ok(entry) = SchemaValidationRuntimeEntry::capture(&path) {
+            drop(entry);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn schema_validation_peer_identity(
     stream: &std::os::unix::net::UnixStream,
 ) -> std::io::Result<(u32, u32)> {
@@ -744,117 +806,24 @@ struct SchemaValidationServer {
     _leader_exclusion: File,
     _socket_cleanup: SchemaValidationRuntimeEntry,
     _announcement_cleanup: SchemaValidationRuntimeEntry,
-    _failure_cache_cleanup: Option<SchemaValidationRuntimeEntry>,
     #[cfg(test)]
     panic_on_serve: bool,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn schema_validation_failure_cache_path(runtime_dir: &Path, namespace: &str) -> PathBuf {
-    runtime_dir.join(format!("{}-failure", &namespace[..24]))
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn remove_schema_validation_failure_cache(path: &Path) {
-    if let Ok(entry) = SchemaValidationRuntimeEntry::capture(path) {
-        drop(entry);
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_schema_validation_failure_cache(
-    path: &Path,
-    namespace: &str,
-    generation: &str,
-    backend: &str,
-) -> Option<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut identity = SchemaValidationRuntimeEntry::capture(path).ok()?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file()
-        || metadata.dev() != identity.device
-        || metadata.ino() != identity.inode
-        || metadata.uid() != rustix::process::getuid().as_raw()
-        || metadata.mode() & 0o077 != 0
-    {
-        drop(identity);
-        return None;
-    }
-    let mut text = String::new();
-    file.take(64 * 1024).read_to_string(&mut text).ok()?;
-    let mut lines = text.lines();
-    let expires_at = lines
-        .next()
-        .filter(|line| *line == "trail-schema-validation-failure-v1")
-        .and_then(|_| lines.next())
-        .filter(|line| *line == namespace)
-        .and_then(|_| lines.next())
-        .filter(|line| *line == generation)
-        .and_then(|_| lines.next())
-        .filter(|line| *line == hex::encode(backend.as_bytes()))
-        .and_then(|_| lines.next())
-        .and_then(|line| line.parse::<u128>().ok());
-    let message = lines
-        .next()
-        .and_then(|line| hex::decode(line).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    if expires_at.is_none_or(|expires_at| expires_at <= now)
-        || message.is_none()
-        || lines.next().is_some()
-    {
-        drop(identity);
-        return None;
-    }
-    identity.path.clear();
-    message
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish_schema_validation_failure_cache(
-    path: &Path,
-    namespace: &str,
-    generation: &str,
-    backend: &str,
-    message: &str,
-) -> Option<SchemaValidationRuntimeEntry> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    remove_schema_validation_failure_cache(path);
-    let expires_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .saturating_add(Duration::from_secs(2))
-        .as_nanos();
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
-    writeln!(
-        file,
-        "trail-schema-validation-failure-v1\n{namespace}\n{generation}\n{}\n{expires_at}\n{}",
-        hex::encode(backend.as_bytes()),
-        hex::encode(message.as_bytes())
-    )
-    .ok()?;
-    file.sync_all().ok()?;
-    SchemaValidationRuntimeEntry::capture(path).ok()
+    #[cfg(test)]
+    start_delay: Duration,
+    #[cfg(test)]
+    shutdown_delay: Duration,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl SchemaValidationServer {
+    #[cfg(test)]
+    fn delay_start_for_test(&self) {
+        std::thread::sleep(self.start_delay);
+    }
+
+    #[cfg(not(test))]
+    fn delay_start_for_test(&self) {}
+
     fn serve(self, shutdown: &SchemaValidationServerShutdown) {
         #[cfg(test)]
         if self.panic_on_serve {
@@ -868,6 +837,8 @@ impl SchemaValidationServer {
             &self.outcome,
             shutdown,
         );
+        #[cfg(test)]
+        std::thread::sleep(self.shutdown_delay);
     }
 }
 
@@ -887,45 +858,12 @@ fn spawn_schema_validation_server(
 struct ActiveSchemaValidationServer {
     id: u64,
     shutdown: Arc<SchemaValidationServerShutdown>,
-    completion: Arc<SchemaValidationServerCompletion>,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Default)]
-struct SchemaValidationServerCompletion {
-    completed: AtomicBool,
-    mutex: Mutex<()>,
-    changed: Condvar,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl SchemaValidationServerCompletion {
-    fn complete(&self) {
-        self.completed.store(true, Ordering::Release);
-        self.changed.notify_all();
-    }
-
-    fn wait(&self) {
-        if self.completed.load(Ordering::Acquire) {
-            return;
-        }
-        let guard = self
-            .mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        drop(
-            self.changed
-                .wait_while(guard, |_| !self.completed.load(Ordering::Acquire))
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SchemaValidationServerRegistration {
     db_path: PathBuf,
     id: u64,
-    completion: Arc<SchemaValidationServerCompletion>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -941,13 +879,11 @@ impl Drop for SchemaValidationServerRegistration {
         {
             servers.remove(&self.db_path);
         }
-        drop(servers);
-        self.completion.complete();
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn stop_schema_validation_server(db_path: &Path) {
+fn stop_schema_validation_server(db_path: &Path) -> bool {
     let active = SCHEMA_VALIDATION_SERVERS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -956,47 +892,44 @@ fn stop_schema_validation_server(db_path: &Path) {
         .cloned();
     if let Some(active) = active {
         active.shutdown.stop();
-        active.completion.wait();
+        true
+    } else {
+        false
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn start_schema_validation_server(db_path: &Path, server: SchemaValidationServer) {
-    stop_schema_validation_server(db_path);
     let id = NEXT_SCHEMA_VALIDATION_SERVER_ID.fetch_add(1, Ordering::Relaxed);
     let shutdown = Arc::new(SchemaValidationServerShutdown::default());
-    let completion = Arc::new(SchemaValidationServerCompletion::default());
-    let (start, wait_for_registration) = std::sync::mpsc::sync_channel(0);
     let registration = SchemaValidationServerRegistration {
         db_path: db_path.to_path_buf(),
         id,
-        completion: completion.clone(),
     };
+    let servers = SCHEMA_VALIDATION_SERVERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut servers = servers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(active) = servers.get(db_path) {
+        active.shutdown.stop();
+        return;
+    }
+    servers.insert(
+        db_path.to_path_buf(),
+        ActiveSchemaValidationServer {
+            id,
+            shutdown: shutdown.clone(),
+        },
+    );
+    drop(servers);
     let thread_shutdown = shutdown.clone();
-    let Ok(_thread) = std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("trail-schema-validation".to_owned())
         .spawn(move || {
             let _registration = registration;
-            if wait_for_registration.recv().is_ok() {
-                server.serve(&thread_shutdown);
-            }
-        })
-    else {
-        return;
-    };
-    SCHEMA_VALIDATION_SERVERS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
-            db_path.to_path_buf(),
-            ActiveSchemaValidationServer {
-                id,
-                shutdown,
-                completion,
-            },
-        );
-    let _ = start.send(());
+            server.delay_start_for_test();
+            server.serve(&thread_shutdown);
+        });
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1080,10 +1013,17 @@ fn coordinate_schema_snapshot_validation(
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixListener;
 
-    // POSIX record locks are process-associated: overlapping server FDs in one
-    // process can replace or release each other's lock authority. Retire and
-    // join the prior per-workspace server before beginning a new round.
-    stop_schema_validation_server(db_path);
+    // POSIX record locks are process-associated, so never overlap a replacement
+    // FD with an existing process-local server. Revoke the old server without
+    // waiting and conservatively perform this rare replacement validation
+    // locally; later rounds may elect a fresh cross-process authority after the
+    // old thread has released its FD.
+    if stop_schema_validation_server(db_path) {
+        return (
+            validate_schema_snapshot_generation(db_path, backend, generation),
+            None,
+        );
+    }
 
     let Some((runtime_dir, namespace)) =
         schema_validation_runtime_namespace(db_path).ok().flatten()
@@ -1105,22 +1045,14 @@ fn coordinate_schema_snapshot_validation(
         };
         match rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {
+                // Exclusive leader authority proves no live cross-process server
+                // owns an entry in this workspace namespace. Remove artifacts
+                // left by a process that exited without running Rust destructors.
+                cleanup_stale_schema_validation_runtime_entries(&runtime_dir, &namespace);
                 *generation = match schema_generation(db_path).map_err(schema_reinitialize_error) {
                     Ok(current) => current,
                     Err(error) => return (Err(error), Some(file)),
                 };
-                let generation_key = schema_generation_key(generation);
-                let failure_cache_path =
-                    schema_validation_failure_cache_path(&runtime_dir, &namespace);
-                if let Some(message) = read_schema_validation_failure_cache(
-                    &failure_cache_path,
-                    &namespace,
-                    &generation_key,
-                    backend,
-                ) {
-                    return (Err(schema_reinitialize_error(message)), Some(file));
-                }
-                remove_schema_validation_failure_cache(&failure_cache_path);
                 let mut nonce = [0_u8; 32];
                 if getrandom::getrandom(&mut nonce).is_err() {
                     return (
@@ -1229,18 +1161,9 @@ fn coordinate_schema_snapshot_validation(
                         CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(error))
                     }
                 };
-                let failure_cache_cleanup = match &outcome {
-                    CrossProcessSchemaValidationOutcome::Success => None,
-                    CrossProcessSchemaValidationOutcome::Failure(message) => {
-                        publish_schema_validation_failure_cache(
-                            &failure_cache_path,
-                            &namespace,
-                            &generation_key,
-                            backend,
-                            message,
-                        )
-                    }
-                };
+                #[cfg(test)]
+                let (start_delay, shutdown_delay) =
+                    take_schema_validation_server_delays_for_test(db_path);
                 let server = SchemaValidationServer {
                     listener,
                     nonce,
@@ -1250,9 +1173,12 @@ fn coordinate_schema_snapshot_validation(
                     _leader_exclusion: file,
                     _socket_cleanup: socket_cleanup,
                     _announcement_cleanup: announcement_cleanup,
-                    _failure_cache_cleanup: failure_cache_cleanup,
                     #[cfg(test)]
                     panic_on_serve: false,
+                    #[cfg(test)]
+                    start_delay,
+                    #[cfg(test)]
+                    shutdown_delay,
                 };
                 start_schema_validation_server(db_path, server);
                 return (validation, None);

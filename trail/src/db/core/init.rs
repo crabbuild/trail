@@ -706,6 +706,11 @@ mod schema_handoff_tests {
                     .env("TRAIL_TEST_SCHEMA_GO", go)
                     .env("TRAIL_TEST_SCHEMA_READY", &ready)
                     .env("TRAIL_TEST_SCHEMA_VALIDATION_COUNTER", counter)
+                    // These waves prove exact-one fanout while the authenticated
+                    // leader remains live for the server's bounded grace period.
+                    // A process that exits earlier may conservatively trigger a
+                    // second read-only validation.
+                    .env("TRAIL_TEST_SCHEMA_CHILD_LINGER_MS", "400")
                     .stdout(Stdio::null())
                     .stderr(Stdio::inherit());
                 configure(&mut command);
@@ -778,8 +783,9 @@ mod schema_handoff_tests {
                 _leader_exclusion: leader_exclusion,
                 _socket_cleanup: socket_cleanup,
                 _announcement_cleanup: announcement_cleanup,
-                _failure_cache_cleanup: None,
                 panic_on_serve: false,
+                start_delay: Duration::ZERO,
+                shutdown_delay: Duration::ZERO,
             },
             socket_path,
             lock_path,
@@ -799,6 +805,14 @@ mod schema_handoff_tests {
     }
 
     fn run_schema_child() -> bool {
+        fn linger_after_open() {
+            if let Some(delay) = std::env::var_os("TRAIL_TEST_SCHEMA_CHILD_LINGER_MS") {
+                std::thread::sleep(Duration::from_millis(
+                    delay.to_string_lossy().parse::<u64>().unwrap(),
+                ));
+            }
+        }
+
         let Ok(mode) = std::env::var("TRAIL_TEST_SCHEMA_CHILD") else {
             return false;
         };
@@ -816,6 +830,7 @@ mod schema_handoff_tests {
                 };
                 assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
                 assert!(error.to_string().contains("cross-process injected failure"));
+                linger_after_open();
                 return true;
             }
             "schema-failure" => {
@@ -823,10 +838,12 @@ mod schema_handoff_tests {
                     result,
                     Err(Error::SchemaReinitializeRequired { .. })
                 ));
+                linger_after_open();
                 return true;
             }
             other => panic!("unknown schema child mode {other}"),
         };
+        linger_after_open();
         true
     }
 
@@ -978,6 +995,26 @@ mod schema_handoff_tests {
         );
         release_and_wait(children, &later_go);
         assert_eq!(validation_count(&later_counter), 1);
+
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let (runtime_dir, namespace) = schema_validation_runtime_namespace(&db_path)
+            .unwrap()
+            .unwrap();
+        let prefix = format!("{}-", &namespace[..24]);
+        let leftovers = fs::read_dir(runtime_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with(&prefix)
+                    && (name.ends_with(".socket") || name.ends_with(".announce"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "schema validation runtime artifacts survived bounded cleanup: {leftovers:?}"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1310,6 +1347,7 @@ mod schema_handoff_tests {
         let db_path =
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
         fail_next_schema_validation(&db_path);
+        delay_next_schema_validation_server_shutdown_for_test(&db_path, Duration::from_millis(300));
         let barrier = Arc::new(Barrier::new(16));
         let started = Instant::now();
         let handles = (0..16)
@@ -1333,8 +1371,67 @@ mod schema_handoff_tests {
             "invalid-schema peers paid the detached IPC fanout lifetime: {:?}",
             started.elapsed()
         );
+        let retry_started = Instant::now();
         Trail::open(root.path()).unwrap();
+        assert!(
+            retry_started.elapsed() < Duration::from_millis(250),
+            "retry waited for the failed result server to retire: {:?}",
+            retry_started.elapsed()
+        );
         assert_eq!(schema_validation_count(&db_path), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn production_server_start_does_not_rendezvous_with_the_spawned_thread() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        delay_next_schema_validation_server_start_for_test(&db_path, Duration::from_millis(300));
+
+        let started = Instant::now();
+        Trail::open(root.path()).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "production start rendezvoused with the delayed server thread: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn generation_replacement_does_not_wait_for_the_old_server() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let canonical_db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        delay_next_schema_validation_server_shutdown_for_test(
+            &canonical_db_path,
+            Duration::from_millis(300),
+        );
+        Trail::open(root.path()).unwrap();
+
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='replacement-latency' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        Trail::open(root.path()).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "replacement waited for the old result server: {:?}",
+            started.elapsed()
+        );
+        drop(writer);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
