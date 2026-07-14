@@ -1159,6 +1159,8 @@ impl Drop for WriteLockWaitGuard {
 
 mod agent;
 mod change_ledger;
+#[cfg(debug_assertions)]
+pub(crate) use change_ledger::{run_callback_spool, run_oracle, run_races};
 mod core;
 mod lane;
 mod merge;

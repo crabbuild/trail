@@ -129,13 +129,18 @@ pub(crate) struct ObserverQualification {
     policy_generation: u64,
     start_fence: ObserverFence,
     end_fence: ObserverFence,
+    observer_owner_token: String,
+    owner_fence_nonce: Option<Vec<u8>>,
+    durable_segment_id: String,
+    segment_durable_offset: u64,
+    segment_folded_offset: u64,
     complete_root_interval: bool,
     complete_policy_interval: bool,
     persisted_evidence_through_end: bool,
 }
 
 impl ObserverQualification {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn seal_for_test(
         expected: &ExpectedScope,
         root_handle_identity: Vec<u8>,
@@ -151,6 +156,11 @@ impl ObserverQualification {
             policy_generation: expected.policy_generation,
             start_fence,
             end_fence,
+            observer_owner_token: "full-test-owner".into(),
+            owner_fence_nonce: Some(b"full-test-fence".to_vec()),
+            durable_segment_id: "full-test-segment".into(),
+            segment_durable_offset: 100,
+            segment_folded_offset: 100,
             complete_root_interval: true,
             complete_policy_interval: true,
             persisted_evidence_through_end: true,
@@ -172,6 +182,9 @@ impl ObserverQualification {
             && self.policy_generation == expected.policy_generation
             && self.start_fence == *start
             && self.end_fence == *end
+            && !self.observer_owner_token.is_empty()
+            && !self.durable_segment_id.is_empty()
+            && self.segment_folded_offset <= self.segment_durable_offset
             && end.sequence >= start.sequence
             && end.durable_offset >= start.durable_offset
             && self.complete_root_interval
@@ -199,6 +212,7 @@ pub(crate) trait QualifiedObserver {
 pub(crate) struct ProvenPrefixSet {
     prefixes: Vec<LedgerPath>,
     epoch: u64,
+    continuity_generation: u64,
     owner_token: String,
     owner_fence_nonce: Option<Vec<u8>>,
     provider_id: String,
@@ -268,6 +282,8 @@ struct StoredAttemptIdentity {
     baseline_root_id: String,
     policy_fingerprint: String,
     policy_generation: u64,
+    trust_state: String,
+    continuity_generation: u64,
     filesystem_identity: String,
     provider_id: Option<String>,
     provider_identity: Option<String>,
@@ -313,6 +329,7 @@ pub(crate) fn persisted_proven_prefixes(
         provider_fence,
         durable_offset,
         folded_offset,
+        continuity_generation,
     ): (
         String,
         String,
@@ -322,9 +339,11 @@ pub(crate) fn persisted_proven_prefixes(
         Option<Vec<u8>>,
         i64,
         i64,
+        i64,
     ) = ledger.conn.query_row(
         "SELECT trust_state,trust_reason,provider_id,provider_identity,
-                provider_cursor,provider_fence,durable_offset,folded_offset
+                provider_cursor,provider_fence,durable_offset,folded_offset,
+                continuity_generation
          FROM changed_path_scopes WHERE scope_id=?1",
         [&scope_id],
         |row| {
@@ -337,6 +356,7 @@ pub(crate) fn persisted_proven_prefixes(
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
             ))
         },
     )?;
@@ -432,6 +452,7 @@ pub(crate) fn persisted_proven_prefixes(
     }
     let durable_offset = db_u64(durable_offset)?;
     let folded_offset = db_u64(folded_offset)?;
+    let continuity_generation = db_u64(continuity_generation)?;
     if folded_offset > durable_offset {
         return Err(Error::Corrupt(
             "prefix proof folded cut exceeds durable cut".into(),
@@ -440,6 +461,7 @@ pub(crate) fn persisted_proven_prefixes(
     Ok(ProvenPrefixSet {
         prefixes,
         epoch: expected.epoch,
+        continuity_generation,
         owner_token,
         owner_fence_nonce,
         provider_id,
@@ -481,6 +503,9 @@ pub(crate) fn begin_reconciliation(
     let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
     exact_scope_guard(&tx, expected)?;
     validate_mode_start(&tx, expected, &mode)?;
+    if matches!(mode, ReconcileMode::Full) {
+        exact_scope_update_state(&tx, expected, TrustState::Reconciling, reason)?;
+    }
     let stored_identity =
         capture_attempt_identity(&tx, expected, start_fence.clone(), root_handle_identity)?;
     let encoded_identity = serde_json::to_vec(&stored_identity)?;
@@ -523,9 +548,6 @@ pub(crate) fn begin_reconciliation(
             now_ts(),
         ],
     )?;
-    if matches!(mode, ReconcileMode::Full) {
-        exact_scope_update_state(&tx, expected, TrustState::Reconciling, reason)?;
-    }
     tx.commit()?;
 
     Ok(ReconciliationAttempt {
@@ -799,6 +821,20 @@ impl ReconciliationAttempt {
                 "scope evidence cuts regressed during reconciliation publication",
             );
         }
+        if validate_observer_continuity(
+            &tx,
+            &self.expected,
+            &self.stored_identity,
+            qualification,
+            &end,
+        )
+        .is_err()
+        {
+            return self.fail_observer_continuity_transaction(
+                tx,
+                "observer owner or durable segment changed before publication",
+            );
+        }
         if !matches!(trail.verify_pinned_worktree_root(&self.root), Ok(true)) {
             return self.fail_publication_transaction(
                 tx,
@@ -892,7 +928,8 @@ impl ReconciliationAttempt {
                AND policy_fingerprint=?13 AND policy_dependency_generation=?14
                AND filesystem_identity=?15 AND provider_id IS ?16
                AND provider_identity IS ?17 AND observer_owner_token IS ?18
-               AND durable_offset=?19 AND folded_offset=?20",
+               AND durable_offset=?19 AND folded_offset=?20
+               AND trust_state='reconciling' AND continuity_generation=?21",
             params![
                 sql_u64(merged_durable)?,
                 sql_u64(merged_folded)?,
@@ -914,6 +951,7 @@ impl ReconciliationAttempt {
                 self.stored_identity.observer_owner_token,
                 sql_u64(current_durable)?,
                 sql_u64(current_folded)?,
+                sql_u64(self.stored_identity.continuity_generation)?,
             ],
         )?;
         if changed != 1 {
@@ -953,6 +991,24 @@ impl ReconciliationAttempt {
             return self.fail_publication_transaction(
                 tx,
                 "scope changed during prefix reconciliation publication",
+            );
+        }
+        let qualification = self
+            .qualification
+            .as_ref()
+            .expect("publication checked observer qualification");
+        if validate_observer_continuity(
+            &tx,
+            &self.expected,
+            &self.stored_identity,
+            qualification,
+            end,
+        )
+        .is_err()
+        {
+            return self.fail_observer_continuity_transaction(
+                tx,
+                "observer owner or durable segment changed before prefix publication",
             );
         }
         if validate_prefix_proof(&tx, &self.expected, &proof).is_err() {
@@ -1111,7 +1167,8 @@ impl ReconciliationAttempt {
         let reason = "reconciliation candidate row cap exceeded";
         tx.execute(
             "UPDATE changed_path_scopes
-             SET trust_state='overflow',trust_reason=?1,updated_at=?2
+             SET trust_state='overflow',trust_reason=?1,
+                 continuity_generation=continuity_generation+1,updated_at=?2
              WHERE scope_id=?3",
             params![reason, now_ts(), self.stored_identity.scope_id],
         )?;
@@ -1125,6 +1182,39 @@ impl ReconciliationAttempt {
         Err(reconcile_required(
             &self.expected,
             TrustState::Overflow.as_str(),
+            reason,
+        ))
+    }
+
+    fn fail_observer_continuity_transaction(
+        &self,
+        tx: Transaction<'_>,
+        reason: &str,
+    ) -> Result<ChangeLedgerReconcileReport> {
+        let now = now_ts();
+        tx.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state='untrusted_gap',trust_reason=?1,
+                 continuity_generation=continuity_generation+1,updated_at=?2
+             WHERE scope_id=?3 AND continuity_generation=?4
+               AND trust_state IN ('trusted','reconciling')",
+            params![
+                reason,
+                now,
+                self.stored_identity.scope_id,
+                sql_u64(self.stored_identity.continuity_generation)?,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE changed_path_reconciliations
+             SET state='failed',reason=?1,updated_at=?2
+             WHERE attempt_id=?3 AND state!='published'",
+            params![reason, now, self.attempt_id],
+        )?;
+        tx.commit()?;
+        Err(reconcile_required(
+            &self.expected,
+            TrustState::UntrustedGap.as_str(),
             reason,
         ))
     }
@@ -1446,7 +1536,7 @@ fn validate_mode_start(
 ) -> Result<()> {
     if let ReconcileMode::ProvenPrefixes(proof) = mode {
         let state = current_trust_state(tx, expected)?;
-        if matches!(state.as_str(), "overflow" | "untrusted_gap" | "corrupt") {
+        if !matches!(state.as_str(), "trusted" | "reconciling") {
             return Err(reconcile_required(
                 expected,
                 &state,
@@ -1473,7 +1563,9 @@ fn validate_prefix_proof(
         "SELECT COUNT(*) FROM changed_path_scopes
          WHERE scope_id=?1 AND epoch=?2 AND provider_id=?3
            AND provider_identity=?4 AND provider_cursor IS ?5
-           AND provider_fence IS ?6 AND durable_offset=?7 AND folded_offset=?8",
+           AND provider_fence IS ?6 AND durable_offset=?7 AND folded_offset=?8
+           AND trust_state IN ('trusted','reconciling')
+           AND continuity_generation=?9",
         params![
             scope_id,
             sql_u64(proof.epoch)?,
@@ -1483,6 +1575,7 @@ fn validate_prefix_proof(
             proof.provider_fence,
             sql_u64(proof.durable_offset)?,
             sql_u64(proof.folded_offset)?,
+            sql_u64(proof.continuity_generation)?,
         ],
         |row| row.get::<_, i64>(0),
     )? == 1;
@@ -1560,6 +1653,66 @@ fn validate_scope_capabilities(tx: &Transaction<'_>, expected: &ExpectedScope) -
     Ok(())
 }
 
+fn validate_observer_continuity(
+    tx: &Transaction<'_>,
+    expected: &ExpectedScope,
+    identity: &StoredAttemptIdentity,
+    qualification: &ObserverQualification,
+    end: &ObserverFence,
+) -> Result<()> {
+    if identity.observer_owner_token.as_deref() != Some(qualification.observer_owner_token.as_str())
+    {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "sealed observer owner does not match the reconciliation scope",
+        ));
+    }
+    let owner_matches = tx.query_row(
+        "SELECT COUNT(*) FROM changed_path_observer_owners
+         WHERE scope_id=?1 AND epoch=?2 AND owner_token=?3
+           AND provider_id IS ?4 AND provider_identity IS ?5
+           AND fence_nonce IS ?6 AND lease_state='active' AND expires_at>?7",
+        params![
+            identity.scope_id,
+            sql_u64(identity.epoch)?,
+            qualification.observer_owner_token,
+            identity.provider_id,
+            identity.provider_identity,
+            qualification.owner_fence_nonce,
+            now_ts(),
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    let segment_matches = tx.query_row(
+        "SELECT COUNT(*) FROM changed_path_observer_segments
+         WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3
+           AND owner_token=?4 AND provider_id IS ?5
+           AND state IN ('open','sealed') AND last_sequence IS NOT NULL
+           AND last_sequence>=?6 AND durable_end_offset>=?7
+           AND folded_end_offset>=?8",
+        params![
+            identity.scope_id,
+            sql_u64(identity.epoch)?,
+            qualification.durable_segment_id,
+            qualification.observer_owner_token,
+            identity.provider_id,
+            sql_u64(end.sequence)?,
+            sql_u64(qualification.segment_durable_offset)?,
+            sql_u64(qualification.segment_folded_offset)?,
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    if !owner_matches || !segment_matches {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "sealed observer owner or durable segment continuity is unavailable",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_ready_attempt(
     tx: &Transaction<'_>,
     attempt: &ReconciliationAttempt,
@@ -1619,16 +1772,18 @@ fn capture_attempt_identity(
         "SELECT scope_id,scope_root,scope_root_identity,case_sensitive,epoch,
                 ref_name,ref_generation,change_id,baseline_root_id,
                 policy_fingerprint,policy_dependency_generation,
-                filesystem_identity,provider_id,provider_identity,
-                observer_owner_token,durable_offset,folded_offset
+                trust_state,continuity_generation,filesystem_identity,
+                provider_id,provider_identity,observer_owner_token,
+                durable_offset,folded_offset
          FROM changed_path_scopes WHERE scope_id=?1",
         [expected.scope_id.to_text()],
         |row| {
             let epoch = row.get::<_, i64>(4)?;
             let ref_generation = row.get::<_, i64>(6)?;
             let policy_generation = row.get::<_, i64>(10)?;
-            let durable_offset = row.get::<_, i64>(15)?;
-            let folded_offset = row.get::<_, i64>(16)?;
+            let continuity_generation = row.get::<_, i64>(12)?;
+            let durable_offset = row.get::<_, i64>(17)?;
+            let folded_offset = row.get::<_, i64>(18)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1642,9 +1797,11 @@ fn capture_attempt_identity(
                 row.get::<_, String>(9)?,
                 policy_generation,
                 row.get::<_, String>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, Option<String>>(13)?,
+                continuity_generation,
+                row.get::<_, String>(13)?,
                 row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
                 durable_offset,
                 folded_offset,
             ))
@@ -1662,6 +1819,8 @@ fn capture_attempt_identity(
         baseline_root_id,
         policy_fingerprint,
         policy_generation,
+        trust_state,
+        continuity_generation,
         filesystem_identity,
         provider_id,
         provider_identity,
@@ -1681,6 +1840,8 @@ fn capture_attempt_identity(
         baseline_root_id,
         policy_fingerprint,
         policy_generation: db_u64(policy_generation)?,
+        trust_state,
+        continuity_generation: db_u64(continuity_generation)?,
         filesystem_identity,
         provider_id,
         provider_identity,
@@ -1698,6 +1859,8 @@ fn capture_attempt_identity(
         || identity.baseline_root_id != expected.baseline_root.0
         || identity.policy_fingerprint != hex::encode(expected.policy_fingerprint)
         || identity.policy_generation != expected.policy_generation
+        || !matches!(identity.trust_state.as_str(), "trusted" | "reconciling")
+        || identity.continuity_generation == 0
         || identity.filesystem_identity != hex::encode(&expected.filesystem_identity)
         || identity.provider_identity.as_deref()
             != Some(hex::encode(&expected.provider_identity).as_str())
@@ -1724,7 +1887,8 @@ fn validate_stored_scope(
                AND ref_generation=?7 AND change_id=?8 AND baseline_root_id=?9
                AND policy_fingerprint=?10 AND policy_dependency_generation=?11
                AND filesystem_identity=?12 AND provider_id IS ?13
-               AND provider_identity IS ?14 AND observer_owner_token IS ?15",
+               AND provider_identity IS ?14 AND observer_owner_token IS ?15
+               AND trust_state=?16 AND continuity_generation=?17",
             params![
                 identity.scope_id,
                 identity.scope_root,
@@ -1741,6 +1905,8 @@ fn validate_stored_scope(
                 identity.provider_id,
                 identity.provider_identity,
                 identity.observer_owner_token,
+                identity.trust_state,
+                sql_u64(identity.continuity_generation)?,
             ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
@@ -1799,7 +1965,8 @@ fn exact_scope_update_state(
     reason: &str,
 ) -> Result<()> {
     let changed = conn.execute(
-        "UPDATE changed_path_scopes SET trust_state=?1, trust_reason=?2, updated_at=?3
+        "UPDATE changed_path_scopes SET trust_state=?1, trust_reason=?2,
+             continuity_generation=continuity_generation+1, updated_at=?3
          WHERE scope_id=?4 AND epoch=?5 AND ref_name=?6 AND ref_generation=?7
            AND baseline_root_id=?8 AND policy_fingerprint=?9
            AND policy_dependency_generation=?10 AND filesystem_identity=?11
@@ -1884,6 +2051,366 @@ fn sql_u64(value: u64) -> Result<i64> {
 fn db_u64(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::Corrupt("negative reconciliation count".into()))
 }
+
+#[cfg(debug_assertions)]
+mod compiled_harness {
+    use super::*;
+    use crate::db::change_ledger::{
+        BaselineIdentity, FilesystemIdentity, PolicyIdentity, ProviderCapabilities,
+        ProviderIdentity, RecordingPolicySnapshot, ScopeIdentity, ScopeKind,
+    };
+    use crate::InitImportMode;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+
+    struct HarnessObserver {
+        end_sequence: u64,
+    }
+
+    impl QualifiedObserver for HarnessObserver {
+        fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: 10,
+                durable_offset: 0,
+                nonce: b"compiled-harness-start".to_vec(),
+            })
+        }
+
+        fn end_fence(
+            &self,
+            _expected: &ExpectedScope,
+            _start: &ObserverFence,
+        ) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: self.end_sequence,
+                durable_offset: 0,
+                nonce: b"compiled-harness-end".to_vec(),
+            })
+        }
+
+        fn drain_through(
+            &self,
+            expected: &ExpectedScope,
+            root_handle_identity: &[u8],
+            start: &ObserverFence,
+            end: &ObserverFence,
+            _sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+        ) -> Result<ObserverQualification> {
+            Ok(ObserverQualification::seal_for_test(
+                expected,
+                root_handle_identity.to_vec(),
+                start.clone(),
+                end.clone(),
+            ))
+        }
+    }
+
+    struct CallbackObserver<'a> {
+        conn: &'a rusqlite::Connection,
+        path: std::path::PathBuf,
+    }
+
+    impl QualifiedObserver for CallbackObserver<'_> {
+        fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: 10,
+                durable_offset: 0,
+                nonce: b"compiled-callback-start".to_vec(),
+            })
+        }
+
+        fn end_fence(
+            &self,
+            _expected: &ExpectedScope,
+            _start: &ObserverFence,
+        ) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: 266,
+                durable_offset: 0,
+                nonce: b"compiled-callback-end".to_vec(),
+            })
+        }
+
+        fn drain_through(
+            &self,
+            expected: &ExpectedScope,
+            root_handle_identity: &[u8],
+            start: &ObserverFence,
+            end: &ObserverFence,
+            sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+        ) -> Result<ObserverQualification> {
+            let transaction =
+                Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+            fs::write(&self.path, b"during callback\n")?;
+            for sequence in 11..=266 {
+                sink(ObserverEvent {
+                    path: LedgerPath::parse("modify.txt")?,
+                    flags: EvidenceFlags::CONTENT,
+                    sequence,
+                })?;
+            }
+            fs::write(&self.path, b"after callback\n")?;
+            transaction.commit()?;
+            Ok(ObserverQualification::seal_for_test(
+                expected,
+                root_handle_identity.to_vec(),
+                start.clone(),
+                end.clone(),
+            ))
+        }
+    }
+
+    struct HarnessFixture {
+        _temp: tempfile::TempDir,
+        db: Trail,
+        expected: ExpectedScope,
+        policy: CompiledPolicy,
+    }
+
+    impl HarnessFixture {
+        fn new() -> Result<Self> {
+            let temp = tempfile::tempdir()?;
+            fs::write(temp.path().join("modify.txt"), b"before\n")?;
+            fs::write(temp.path().join("delete.txt"), b"delete\n")?;
+            Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false)?;
+            let db = Trail::open(temp.path())?;
+            let branch = db.current_branch()?;
+            let head = db.resolve_branch_ref(&branch)?;
+            let scope = ScopeIdentity {
+                scope_id: ScopeId([0x6b; 32]),
+                kind: ScopeKind::Workspace,
+                owner_id: "compiled-reconciliation-harness".into(),
+            };
+            let fingerprint = [0x6c; 32];
+            let baseline = BaselineIdentity {
+                ref_name: head.name.clone(),
+                ref_generation: u64::try_from(head.generation)
+                    .map_err(|_| Error::Corrupt("negative harness ref generation".into()))?,
+                change_id: head.change_id,
+                root_id: head.root_id.clone(),
+            };
+            let filesystem = FilesystemIdentity(vec![0x6d]);
+            let provider = ProviderIdentity {
+                identity: vec![0x6e],
+                capabilities: ProviderCapabilities {
+                    durable_cursor: true,
+                    linearizable_fence: true,
+                    rename_pairing: true,
+                    overflow_scope: true,
+                    filesystem_supported: true,
+                    clean_proof_allowed: true,
+                    power_loss_durability: false,
+                },
+            };
+            ChangedPathLedger::new(&db.conn).begin_scope(
+                &scope,
+                &baseline,
+                &PolicyIdentity {
+                    fingerprint,
+                    generation: 1,
+                },
+                &filesystem,
+                &provider,
+            )?;
+            let expected = ExpectedScope {
+                scope_id: scope.scope_id,
+                epoch: 1,
+                ref_name: baseline.ref_name,
+                ref_generation: baseline.ref_generation,
+                baseline_root: baseline.root_id,
+                policy_fingerprint: fingerprint,
+                policy_generation: 1,
+                filesystem_identity: filesystem.0,
+                provider_identity: provider.identity,
+            };
+            install_continuity(&db.conn, &expected)?;
+            let policy = CompiledPolicy::for_reconciliation_test(
+                RecordingPolicySnapshot {
+                    workspace_root: db.workspace_root.clone(),
+                    ignore_gitignored: true,
+                    dependency_files: Vec::new(),
+                    case_sensitive: true,
+                    rule_sources: Vec::new(),
+                },
+                fingerprint,
+                &expected,
+            );
+            Ok(Self {
+                _temp: temp,
+                db,
+                expected,
+                policy,
+            })
+        }
+
+        fn begin_observed(
+            &self,
+            observer: &dyn QualifiedObserver,
+        ) -> Result<ReconciliationAttempt> {
+            let ledger = ChangedPathLedger::new(&self.db.conn);
+            let mut attempt = begin_reconciliation(
+                &self.db,
+                &ledger,
+                observer,
+                &self.expected,
+                &self.policy,
+                ReconcileMode::Full,
+                "compiled_harness",
+            )?;
+            attempt.observe(&self.db, &ledger, observer, &self.policy)?;
+            Ok(attempt)
+        }
+    }
+
+    fn install_continuity(conn: &rusqlite::Connection, expected: &ExpectedScope) -> Result<()> {
+        let scope_id = expected.scope_id.to_text();
+        let provider_id = hex::encode(&expected.provider_identity);
+        let now = now_ts();
+        conn.execute(
+            "UPDATE changed_path_scopes SET observer_owner_token='full-test-owner'
+             WHERE scope_id=?1",
+            [&scope_id],
+        )?;
+        conn.execute(
+            "INSERT INTO changed_path_observer_owners(
+                 scope_id,epoch,owner_token,provider_id,provider_identity,
+                 lease_state,fence_nonce,acquired_at,heartbeat_at,expires_at,updated_at
+             ) VALUES(?1,?2,'full-test-owner',?3,?4,'active',?5,?6,?6,?7,?6)",
+            params![
+                scope_id,
+                sql_u64(expected.epoch)?,
+                provider_id,
+                hex::encode(&expected.provider_identity),
+                b"full-test-fence".as_slice(),
+                now,
+                now + 3_600,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO changed_path_observer_segments(
+                 scope_id,epoch,segment_id,owner_token,provider_id,
+                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
+                 segment_path,state,created_at,updated_at
+             ) VALUES(?1,?2,'full-test-segment','full-test-owner',?3,
+                      1,1000,100,100,'full-test-segment.cpl','open',?4,?4)",
+            params![scope_id, sql_u64(expected.epoch)?, provider_id, now],
+        )?;
+        Ok(())
+    }
+
+    fn require(condition: bool, message: &str) -> Result<()> {
+        if condition {
+            Ok(())
+        } else {
+            Err(Error::Corrupt(message.into()))
+        }
+    }
+
+    fn oracle() -> Result<()> {
+        let fixture = HarnessFixture::new()?;
+        fs::write(fixture.db.workspace_root.join("modify.txt"), b"after\n")?;
+        fs::remove_file(fixture.db.workspace_root.join("delete.txt"))?;
+        fs::write(fixture.db.workspace_root.join("add.txt"), b"added\n")?;
+        let observer = HarnessObserver { end_sequence: 10 };
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let report = reconcile_full(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            "compiled_oracle",
+        )?;
+        let rows = fixture
+            .db
+            .conn
+            .prepare(
+                "SELECT normalized_path,event_flags FROM changed_path_entries
+                 WHERE scope_id=?1 ORDER BY normalized_path COLLATE BINARY",
+            )?
+            .query_map([fixture.expected.scope_id.to_text()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        require(report.published, "compiled oracle did not publish")?;
+        require(
+            rows == vec![
+                ("add.txt".into(), EvidenceFlags::CREATE.0),
+                ("delete.txt".into(), EvidenceFlags::DELETE.0),
+                ("modify.txt".into(), EvidenceFlags::CONTENT.0),
+            ],
+            "compiled reconciliation oracle mismatch",
+        )
+    }
+
+    fn races() -> Result<()> {
+        let fixture = HarnessFixture::new()?;
+        fs::write(fixture.db.workspace_root.join("add.txt"), b"added\n")?;
+        let observer = HarnessObserver { end_sequence: 10 };
+        let attempt = fixture.begin_observed(&observer)?;
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        ledger.mark_untrusted(
+            &fixture.expected,
+            TrustState::StaleBaseline,
+            "compiled concurrent invalidation",
+        )?;
+        require(
+            attempt
+                .publish(&fixture.db, &ledger, &fixture.policy)
+                .is_err(),
+            "compiled fail-closed state race promoted trust",
+        )?;
+
+        let fixture = HarnessFixture::new()?;
+        let attempt = fixture.begin_observed(&observer)?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_owners SET lease_state='revoked'
+             WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+        )?;
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        require(
+            attempt
+                .publish(&fixture.db, &ledger, &fixture.policy)
+                .is_err(),
+            "compiled owner-loss race promoted trust",
+        )
+    }
+
+    fn callback_spool() -> Result<()> {
+        let fixture = HarnessFixture::new()?;
+        let observer = CallbackObserver {
+            conn: &fixture.db.conn,
+            path: fixture.db.workspace_root.join("modify.txt"),
+        };
+        let attempt = fixture.begin_observed(&observer)?;
+        let staged_hash: String = fixture.db.conn.query_row(
+            "SELECT content_hash FROM changed_path_reconciliation_rows
+             WHERE attempt_id=?1 AND normalized_path='modify.txt'",
+            [&attempt.attempt_id],
+            |row| row.get(0),
+        )?;
+        require(
+            staged_hash == hex::encode(Sha256::digest(b"after callback\n")),
+            "compiled callback harness replayed before drain returned",
+        )
+    }
+
+    pub(crate) fn run_oracle() -> std::result::Result<(), String> {
+        oracle().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn run_races() -> std::result::Result<(), String> {
+        races().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn run_callback_spool() -> std::result::Result<(), String> {
+        callback_spool().map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) use compiled_harness::{run_callback_spool, run_oracle, run_races};
 
 #[cfg(test)]
 mod tests {
@@ -2191,6 +2718,44 @@ mod tests {
         policy: CompiledPolicy,
     }
 
+    fn install_test_observer_continuity(conn: &rusqlite::Connection, expected: &ExpectedScope) {
+        let scope_id = expected.scope_id.to_text();
+        let provider_id = hex::encode(&expected.provider_identity);
+        let now = now_ts();
+        conn.execute(
+            "UPDATE changed_path_scopes SET observer_owner_token='full-test-owner'
+             WHERE scope_id=?1",
+            [&scope_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changed_path_observer_owners(
+                 scope_id,epoch,owner_token,provider_id,provider_identity,
+                 lease_state,fence_nonce,acquired_at,heartbeat_at,expires_at,updated_at
+             ) VALUES(?1,?2,'full-test-owner',?3,?4,'active',?5,?6,?6,?7,?6)",
+            params![
+                scope_id,
+                sql_u64(expected.epoch).unwrap(),
+                provider_id,
+                hex::encode(&expected.provider_identity),
+                b"full-test-fence".as_slice(),
+                now,
+                now + 3_600,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changed_path_observer_segments(
+                 scope_id,epoch,segment_id,owner_token,provider_id,
+                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
+                 segment_path,state,created_at,updated_at
+             ) VALUES(?1,?2,'full-test-segment','full-test-owner',?3,
+                      1,1000,100,100,'full-test-segment.cpl','open',?4,?4)",
+            params![scope_id, sql_u64(expected.epoch).unwrap(), provider_id, now,],
+        )
+        .unwrap();
+    }
+
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
@@ -2258,12 +2823,14 @@ mod tests {
                 fingerprint,
                 &expected,
             );
-            Self {
+            let fixture = Self {
                 _temp: temp,
                 db,
                 expected,
                 policy,
-            }
+            };
+            fixture.install_full_observer_continuity();
+            fixture
         }
 
         fn root(&self) -> &std::path::Path {
@@ -2347,6 +2914,10 @@ mod tests {
             attempt
         }
 
+        fn install_full_observer_continuity(&self) {
+            install_test_observer_continuity(&self.db.conn, &self.expected);
+        }
+
         fn persist_live_provider_prefix(&self, prefix: &str) {
             let scope_id = self.expected.scope_id.to_text();
             let provider_id = hex::encode(&self.expected.provider_identity);
@@ -2357,24 +2928,6 @@ mod tests {
                      SET trust_state='reconciling', trust_reason='provider_prefix'
                      WHERE scope_id=?1",
                     [&scope_id],
-                )
-                .unwrap();
-            self.db
-                .conn
-                .execute(
-                    "INSERT INTO changed_path_observer_owners(
-                     scope_id,epoch,owner_token,provider_id,provider_identity,
-                     lease_state,acquired_at,heartbeat_at,expires_at,updated_at
-                 ) VALUES(?1,?2,?3,?4,?5,'active',?6,?6,?7,?6)",
-                    params![
-                        scope_id,
-                        sql_u64(self.expected.epoch).unwrap(),
-                        format!("owner-{prefix}"),
-                        provider_id,
-                        hex::encode(&self.expected.provider_identity),
-                        now_ts(),
-                        now_ts() + 3_600,
-                    ],
                 )
                 .unwrap();
             self.db
@@ -2536,6 +3089,96 @@ mod tests {
             assert_eq!(attempt_state, "failed", "column {column}");
             assert_ne!(trust, "trusted", "column {column}");
             assert_eq!(candidates, 0, "column {column}");
+        }
+    }
+
+    #[test]
+    fn fail_closed_transition_after_ready_never_promotes_full_trust() {
+        for state in [
+            TrustState::Overflow,
+            TrustState::Corrupt,
+            TrustState::UntrustedGap,
+            TrustState::StaleBaseline,
+        ] {
+            let fixture = Fixture::new();
+            fs::write(fixture.root().join("add.txt"), b"added\n").unwrap();
+            let attempt = fixture.begin_observed();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            ledger
+                .mark_untrusted(&fixture.expected, state, "concurrent invalidation")
+                .unwrap();
+
+            assert!(attempt
+                .publish(&fixture.db, &ledger, &fixture.policy)
+                .is_err());
+            let (scope_state, attempt_state): (String, String) = fixture
+                .db
+                .conn
+                .query_row(
+                    "SELECT s.trust_state,r.state
+                     FROM changed_path_scopes s
+                     JOIN changed_path_reconciliations r ON r.scope_id=s.scope_id
+                     ORDER BY r.created_at DESC,r.attempt_id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(scope_state, state.as_str());
+            assert_eq!(attempt_state, "failed");
+        }
+    }
+
+    #[test]
+    fn observer_owner_loss_after_drain_forces_full_reconciliation() {
+        for mutation in [
+            "UPDATE changed_path_observer_owners SET lease_state='revoked'",
+            "UPDATE changed_path_observer_owners SET lease_state='expired'",
+            "UPDATE changed_path_observer_owners SET expires_at=heartbeat_at",
+            "UPDATE changed_path_observer_owners SET fence_nonce=x'00'",
+        ] {
+            let fixture = Fixture::new();
+            let attempt = fixture.begin_observed();
+            fixture.db.conn.execute(mutation, []).unwrap();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+
+            assert!(
+                attempt
+                    .publish(&fixture.db, &ledger, &fixture.policy)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            let state: String = fixture
+                .db
+                .conn
+                .query_row("SELECT trust_state FROM changed_path_scopes", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(state, "untrusted_gap", "mutation {mutation}");
+            assert_eq!(fixture.latest_attempt_state(), "failed");
+        }
+    }
+
+    #[test]
+    fn durable_segment_loss_or_cut_regression_forces_full_reconciliation() {
+        for mutation in [
+            "DELETE FROM changed_path_observer_segments",
+            "UPDATE changed_path_observer_segments SET durable_end_offset=99,folded_end_offset=99",
+            "UPDATE changed_path_observer_segments SET folded_end_offset=99",
+            "UPDATE changed_path_observer_segments SET last_sequence=9",
+        ] {
+            let fixture = Fixture::new();
+            let attempt = fixture.begin_observed();
+            fixture.db.conn.execute(mutation, []).unwrap();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+
+            assert!(
+                attempt
+                    .publish(&fixture.db, &ledger, &fixture.policy)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            assert_eq!(fixture.latest_attempt_state(), "failed");
         }
     }
 
@@ -2908,6 +3551,7 @@ mod tests {
             "UPDATE changed_path_observer_owners SET owner_token='replacement-owner'",
             "UPDATE changed_path_prefixes SET provider_sequence=provider_sequence+1",
             "UPDATE changed_path_scopes SET durable_offset=1, folded_offset=1",
+            "UPDATE changed_path_scopes SET continuity_generation=continuity_generation+1",
         ] {
             let fixture = Fixture::new();
             fixture.persist_live_provider_prefix("src");
@@ -2932,6 +3576,83 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn stale_baseline_rejects_previously_sealed_prefix_proof_at_start() {
+        let fixture = Fixture::new();
+        fixture.persist_live_provider_prefix("src");
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let proof = persisted_proven_prefixes(
+            &ledger,
+            &fixture.expected,
+            &[LedgerPath::parse("src").unwrap()],
+        )
+        .unwrap();
+        fixture
+            .db
+            .conn
+            .execute(
+                "UPDATE changed_path_scopes
+                 SET trust_state='stale_baseline',trust_reason='policy changed'
+                 WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+            )
+            .unwrap();
+        let observer = FakeQualifiedObserver::new();
+
+        assert!(begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::ProvenPrefixes(proof),
+            "stale_prefix_start",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_baseline_after_ready_rejects_prefix_publication() {
+        let fixture = Fixture::new();
+        fixture.persist_live_provider_prefix("src");
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let proof = persisted_proven_prefixes(
+            &ledger,
+            &fixture.expected,
+            &[LedgerPath::parse("src").unwrap()],
+        )
+        .unwrap();
+        let observer = FakeQualifiedObserver::new();
+        let mut attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::ProvenPrefixes(proof),
+            "stale_prefix_publish",
+        )
+        .unwrap();
+        attempt
+            .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+            .unwrap();
+        fixture
+            .db
+            .conn
+            .execute(
+                "UPDATE changed_path_scopes
+                 SET trust_state='stale_baseline',trust_reason='policy changed'
+                 WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+            )
+            .unwrap();
+
+        assert!(attempt
+            .publish(&fixture.db, &ledger, &fixture.policy)
+            .is_err());
+        assert_eq!(fixture.latest_attempt_state(), "failed");
     }
 
     #[test]
@@ -3622,6 +4343,7 @@ mod tests {
             fingerprint,
             &expected,
         );
+        install_test_observer_continuity(&db.conn, &expected);
         for index in 0..128_u64 {
             let directory = index / 16;
             let file = index % 16;

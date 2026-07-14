@@ -23,6 +23,7 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              trust_state TEXT NOT NULL DEFAULT 'reconciling'
                  CHECK (trust_state IN ('trusted', 'reconciling', 'overflow', 'untrusted_gap', 'stale_baseline', 'corrupt')),
              trust_reason TEXT NOT NULL DEFAULT 'fresh_create',
+             continuity_generation INTEGER NOT NULL DEFAULT 1 CHECK (continuity_generation >= 1),
              epoch INTEGER NOT NULL DEFAULT 1 CHECK (epoch >= 1),
              max_candidate_rows INTEGER NOT NULL DEFAULT 250000 CHECK(max_candidate_rows>0),
              max_prefix_rows INTEGER NOT NULL DEFAULT 16384 CHECK(max_prefix_rows>0),
@@ -231,6 +232,24 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              CHECK ((error_state IS NULL AND error_at IS NULL)
                     OR (error_state IS NOT NULL AND error_at IS NOT NULL))
          );
+         CREATE TRIGGER changed_path_observer_owner_fail_closed
+         AFTER UPDATE OF lease_state ON changed_path_observer_owners
+         WHEN OLD.lease_state = 'active' AND NEW.lease_state <> 'active'
+         BEGIN
+             UPDATE changed_path_scopes
+             SET trust_state = CASE
+                     WHEN trust_state IN ('trusted', 'reconciling') THEN 'untrusted_gap'
+                     ELSE trust_state
+                 END,
+                 trust_reason = CASE
+                     WHEN trust_state IN ('trusted', 'reconciling')
+                         THEN 'observer_owner_' || NEW.lease_state
+                     ELSE trust_reason
+                 END,
+                 continuity_generation = continuity_generation + 1,
+                 updated_at = NEW.updated_at
+             WHERE scope_id = NEW.scope_id AND epoch = NEW.epoch;
+         END;
          CREATE INDEX changed_path_observer_owners_state_idx
              ON changed_path_observer_owners(lease_state, expires_at);
          CREATE TABLE changed_path_observer_segments (
@@ -350,6 +369,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 ("policy_dependency_generation", "INTEGER", true, None, 0),
                 ("trust_state", "TEXT", true, Some("'reconciling'"), 0),
                 ("trust_reason", "TEXT", true, Some("'fresh_create'"), 0),
+                ("continuity_generation", "INTEGER", true, Some("1"), 0),
                 ("epoch", "INTEGER", true, Some("1"), 0),
                 ("max_candidate_rows", "INTEGER", true, Some("250000"), 0),
                 ("max_prefix_rows", "INTEGER", true, Some("16384"), 0),
@@ -575,6 +595,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CHECK (ref_generation >= 0)",
                 "CHECK (policy_dependency_generation >= 0)",
                 "CHECK (trust_state IN ('trusted', 'reconciling', 'overflow', 'untrusted_gap', 'stale_baseline', 'corrupt'))",
+                "CHECK (continuity_generation >= 1)",
                 "CHECK (epoch >= 1)",
                 "CHECK(max_candidate_rows>0)",
                 "CHECK(max_prefix_rows>0)",

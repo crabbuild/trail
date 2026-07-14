@@ -20,6 +20,22 @@ pub use error::{Error, Result};
 pub use ids::{AnchorId, ChangeId, FileId, LineId, MessageId, ObjectId, WorkspaceId};
 pub use model::*;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod test_support {
+    pub fn changed_path_reconciliation_oracle() -> std::result::Result<(), String> {
+        crate::db::run_oracle()
+    }
+
+    pub fn changed_path_reconciliation_races() -> std::result::Result<(), String> {
+        crate::db::run_races()
+    }
+
+    pub fn changed_path_reconciliation_callback_spool() -> std::result::Result<(), String> {
+        crate::db::run_callback_spool()
+    }
+}
+
 /// Re-export the prolly crate as a Trail module namespace.
 pub use ::prolly;
 

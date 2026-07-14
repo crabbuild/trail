@@ -329,6 +329,25 @@ fn fresh_init_creates_the_exact_v18_ledger_shape() {
         .unwrap();
     assert!(entry_sql.contains("normalized_path TEXT COLLATE BINARY NOT NULL"));
 
+    let continuity_column: (String, String, i64, String) = conn
+        .query_row(
+            "SELECT name,type,\"notnull\",dflt_value
+             FROM pragma_table_info('changed_path_scopes')
+             WHERE name='continuity_generation'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        continuity_column,
+        (
+            "continuity_generation".into(),
+            "INTEGER".into(),
+            1,
+            "1".into()
+        )
+    );
+
     let scope_columns = conn
         .prepare(
             "SELECT name, type, [notnull], dflt_value FROM pragma_table_xinfo(\

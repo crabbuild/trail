@@ -208,16 +208,18 @@ mod tests {
             AdapterEquivalence::Conservative
         );
         assert!(compiled.stale_baseline);
-        let trust_state: String = fixture
+        let (trust_state, continuity_generation): (String, i64) = fixture
             .db
             .conn
             .query_row(
-                "SELECT trust_state FROM changed_path_scopes WHERE scope_id=?1",
+                "SELECT trust_state,continuity_generation
+                 FROM changed_path_scopes WHERE scope_id=?1",
                 [fixture.expected.scope_id.to_text()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(trust_state, "stale_baseline");
+        assert!(continuity_generation > 1);
     }
 
     #[test]
@@ -1427,7 +1429,7 @@ impl CompiledPolicy {
                 .is_some_and(|authorization| authorization.expected == *expected)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn authorize_reconciliation_for_test(&mut self, expected: &ExpectedScope) {
         self.adapter_equivalence = AdapterEquivalence::Equivalent;
         self.stale_baseline = false;
@@ -1450,7 +1452,7 @@ impl CompiledPolicy {
         }];
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn for_reconciliation_test(
         snapshot: RecordingPolicySnapshot,
         fingerprint: [u8; 32],
@@ -2849,7 +2851,8 @@ fn mark_policy_stale_guarded(
 ) -> Result<()> {
     let changed = conn.execute(
         "UPDATE changed_path_scopes
-         SET trust_state='stale_baseline', trust_reason=?1, updated_at=?2
+         SET trust_state='stale_baseline', trust_reason=?1,
+             continuity_generation=continuity_generation+1, updated_at=?2
          WHERE scope_id=?3 AND epoch=?4 AND ref_name=?5 AND ref_generation=?6
            AND baseline_root_id=?7 AND policy_fingerprint=?8
            AND policy_dependency_generation=?9

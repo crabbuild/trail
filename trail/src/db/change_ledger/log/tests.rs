@@ -18,6 +18,9 @@ const TEST_SCHEMA: &str = "
         CREATE TABLE changed_path_scopes (
             scope_id TEXT PRIMARY KEY,
             epoch INTEGER NOT NULL,
+            trust_state TEXT NOT NULL DEFAULT 'untrusted_gap',
+            trust_reason TEXT NOT NULL DEFAULT 'observer fixture',
+            continuity_generation INTEGER NOT NULL DEFAULT 1,
             max_observer_log_bytes INTEGER NOT NULL,
             max_segment_bytes INTEGER NOT NULL,
             max_unfolded_tail_records INTEGER NOT NULL
@@ -76,7 +79,10 @@ impl Fixture {
         connection.execute_batch(TEST_SCHEMA).unwrap();
         connection
             .execute(
-                "INSERT INTO changed_path_scopes VALUES(?1, 3, ?2, ?3, ?4)",
+                "INSERT INTO changed_path_scopes(
+                     scope_id,epoch,max_observer_log_bytes,max_segment_bytes,
+                     max_unfolded_tail_records
+                 ) VALUES(?1,3,?2,?3,?4)",
                 params![scope.to_text(), 268_435_456_i64, 16_777_216_i64, 65_536_i64],
             )
             .unwrap();
@@ -652,6 +658,86 @@ fn every_rotation_publication_fault_retires_the_writer() {
 }
 
 #[test]
+fn writer_retirement_advances_scope_continuity_generation() {
+    let fixture = Fixture::full_v18();
+    let faults = Arc::new(FaultScript::new([FaultPoint::FileSync]));
+    let mut writer = SegmentWriter::acquire_with_faults(
+        &fixture.database,
+        &fixture.segments,
+        fixture.scope,
+        1,
+        [0x5a; 32],
+        "test-provider",
+        Vec::new(),
+        Duration::from_secs(60),
+        faults,
+    )
+    .unwrap();
+    writer.append(&[event(1)]).unwrap();
+    let connection = Connection::open(&fixture.database).unwrap();
+    let before: i64 = connection
+        .query_row(
+            "SELECT continuity_generation FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(writer.flush_durable().is_err());
+
+    let after: (String, i64, String) = connection
+        .query_row(
+            "SELECT s.trust_state,s.continuity_generation,o.lease_state
+             FROM changed_path_scopes s
+             JOIN changed_path_observer_owners o ON o.scope_id=s.scope_id
+             WHERE s.scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, ("untrusted_gap".into(), before + 1, "error".into()));
+}
+
+#[test]
+fn owner_terminal_transition_preserves_existing_stronger_fail_closed_state() {
+    let fixture = Fixture::full_v18();
+    let _writer = fixture.acquire_epoch(1, [0x5b; 32]).unwrap();
+    let connection = Connection::open(&fixture.database).unwrap();
+    connection
+        .execute(
+            "UPDATE changed_path_scopes SET trust_state='corrupt',trust_reason='corrupt log'
+             WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+        )
+        .unwrap();
+    let before: i64 = connection
+        .query_row(
+            "SELECT continuity_generation FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    connection
+        .execute(
+            "UPDATE changed_path_observer_owners SET lease_state='revoked',updated_at=?1
+             WHERE scope_id=?2",
+            params![crate::db::util::now_ts(), fixture.scope.to_text()],
+        )
+        .unwrap();
+
+    let after: (String, String, i64) = connection
+        .query_row(
+            "SELECT trust_state,trust_reason,continuity_generation
+             FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.scope.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after, ("corrupt".into(), "corrupt log".into(), before + 1));
+}
+
+#[test]
 fn append_batch_capacity_never_exceeds_persisted_remaining_bytes() {
     let fixture = Fixture::new();
     let token = [0x33; 32];
@@ -992,6 +1078,15 @@ fn append_post_write_expiry_retires_without_publishing_memory_or_durability() {
     let offset = fixture.durable_offset();
     assert!(writer.append(&[event(1)]).is_err());
     assert_eq!(fixture.durable_offset(), offset);
+    let owner_state: (String, Option<String>) = Connection::open(&fixture.database)
+        .unwrap()
+        .query_row(
+            "SELECT lease_state,error_state FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(owner_state, ("error".into(), Some("append_failed".into())));
     let error = recover_segments(
         &fixture.database,
         &fixture.segments,

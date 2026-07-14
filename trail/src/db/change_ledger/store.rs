@@ -210,7 +210,8 @@ impl<'a> ChangedPathLedger<'a> {
         let encoded = EncodedExpected::new(expected)?;
         let changed = self.conn.execute(
             "UPDATE changed_path_scopes
-             SET trust_state = ?1, trust_reason = ?2, updated_at = ?3
+             SET trust_state = ?1, trust_reason = ?2,
+                 continuity_generation = continuity_generation + 1, updated_at = ?3
              WHERE scope_id = ?4 AND epoch = ?5 AND ref_name = ?6
                AND ref_generation = ?7 AND baseline_root_id = ?8
                AND policy_fingerprint = ?9
@@ -689,7 +690,7 @@ fn mark_scope_overflow(conn: &Connection, expected: &ExpectedScope) -> Result<()
     let changed = conn.execute(
         "UPDATE changed_path_scopes
          SET trust_state = 'overflow', trust_reason = 'persisted evidence cap exceeded',
-             updated_at = ?1
+             continuity_generation = continuity_generation + 1, updated_at = ?1
          WHERE scope_id = ?2 AND epoch = ?3 AND ref_name = ?4
            AND ref_generation = ?5 AND baseline_root_id = ?6
            AND policy_fingerprint = ?7 AND policy_dependency_generation = ?8
@@ -823,6 +824,7 @@ mod tests {
             policy_dependency_generation INTEGER NOT NULL,
             trust_state TEXT NOT NULL,
             trust_reason TEXT NOT NULL,
+            continuity_generation INTEGER NOT NULL DEFAULT 1,
             epoch INTEGER NOT NULL,
             provider_id TEXT,
             provider_identity TEXT,
@@ -1242,6 +1244,32 @@ mod tests {
             .mark_untrusted(&expected(), TrustState::Trusted, "not allowed")
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn mark_untrusted_advances_continuity_generation_atomically() {
+        let conn = fixture(10, 10);
+        let ledger = ChangedPathLedger::new(&conn);
+        let before: i64 = conn
+            .query_row(
+                "SELECT continuity_generation FROM changed_path_scopes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        ledger
+            .mark_untrusted(&expected(), TrustState::StaleBaseline, "policy invalidated")
+            .unwrap();
+
+        let after: (String, i64) = conn
+            .query_row(
+                "SELECT trust_state,continuity_generation FROM changed_path_scopes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, ("stale_baseline".into(), before + 1));
     }
 
     #[test]

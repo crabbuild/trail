@@ -25,6 +25,8 @@ pub(crate) use reconcile::{
     begin_reconciliation, persisted_proven_prefixes, reconcile_full, ObserverEvent, ObserverFence,
     ProvenPrefixSet, QualifiedObserver, ReconcileMode, ReconciliationAttempt,
 };
+#[cfg(debug_assertions)]
+pub(crate) use reconcile::{run_callback_spool, run_oracle, run_races};
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;
 #[allow(unused_imports)]

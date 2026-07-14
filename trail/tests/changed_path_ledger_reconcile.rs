@@ -40,8 +40,16 @@ fn reconciliation_staging_has_separate_binary_guard_namespace() {
 }
 
 #[test]
-fn production_cannot_forge_observer_qualification() {
-    let source = include_str!("../src/db/change_ledger/reconcile.rs");
-    assert!(source.contains("#[cfg(test)]\n    fn seal_for_test("));
-    assert!(!source.contains("pub(crate) fn seal_for_test("));
+fn compiled_harness_exercises_reconciliation_oracle() {
+    trail::test_support::changed_path_reconciliation_oracle().unwrap();
+}
+
+#[test]
+fn compiled_harness_exercises_fail_closed_publication_races() {
+    trail::test_support::changed_path_reconciliation_races().unwrap();
+}
+
+#[test]
+fn compiled_harness_exercises_callback_spooling() {
+    trail::test_support::changed_path_reconciliation_callback_spool().unwrap();
 }
