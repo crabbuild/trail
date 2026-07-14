@@ -18,7 +18,9 @@ use prolly::{
     BatchBuilder, BatchOp, Cid, Config, Diff, Encoding, Prolly, SortedBatchBuilder, Store, Tree,
 };
 use prolly_store_slatedb::SlateDbStore;
-use prolly_store_sqlite::SqliteStore;
+#[cfg(unix)]
+use prolly_store_sqlite::sqlite_main_file_identity;
+use prolly_store_sqlite::{SqliteMainFileIdentity, SqliteStore};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -66,6 +68,13 @@ struct SchemaFileGeneration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SchemaGeneration(Vec<SchemaFileGeneration>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+enum CrossProcessSchemaValidationOutcome {
+    Success,
+    Failure(String),
+}
 
 #[derive(Default)]
 struct SchemaValidationState {
@@ -123,6 +132,8 @@ pub(crate) struct ValidatedSchemaGeneration {
     db_path: PathBuf,
     generation: SchemaGeneration,
     entry: Arc<SchemaValidationEntry>,
+    _parent_authority: File,
+    main_authority: File,
     _shared_exclusion: SchemaSharedExclusion,
     _leader_exclusion: Option<File>,
 }
@@ -137,6 +148,112 @@ impl ValidatedSchemaGeneration {
         }
         Ok(())
     }
+
+    pub(crate) fn verify_connection(&self, conn: &Connection) -> Result<()> {
+        #[cfg(unix)]
+        let identity = sqlite_main_file_identity(conn).map_err(schema_reinitialize_error)?;
+        #[cfg(not(unix))]
+        let identity = SqliteMainFileIdentity {
+            device: 0,
+            inode: 0,
+            length: 0,
+        };
+        self.verify_main_identity(identity)
+    }
+
+    pub(crate) fn verify_main_identity(&self, identity: SqliteMainFileIdentity) -> Result<()> {
+        let expected = self
+            .generation
+            .0
+            .iter()
+            .find(|file| file.suffix.is_empty() && file.present)
+            .ok_or_else(|| schema_reinitialize_error("validated schema has no main database"))?;
+        #[cfg(unix)]
+        {
+            let retained = self
+                .main_authority
+                .metadata()
+                .map_err(schema_reinitialize_error)?;
+            if identity.device != expected.device
+                || identity.inode != expected.inode
+                || identity.length != expected.length
+                || retained.dev() != expected.device
+                || retained.ino() != expected.inode
+                || retained.len() != expected.length
+            {
+                return Err(schema_reinitialize_error(
+                    "SQLite main-file handle does not match validated schema authority",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = identity;
+            return Err(schema_reinitialize_error(
+                "verified SQLite main-file handles are unsupported on this platform",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_schema_main_authority(
+    db_path: &Path,
+    generation: &SchemaGeneration,
+) -> Result<(File, File)> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+
+    let expected = generation
+        .0
+        .iter()
+        .find(|file| file.suffix.is_empty() && file.present)
+        .ok_or_else(|| schema_reinitialize_error("schema main database is missing"))?;
+    let parent_path = db_path
+        .parent()
+        .ok_or_else(|| schema_reinitialize_error("schema database has no parent directory"))?;
+    let leaf = db_path
+        .file_name()
+        .ok_or_else(|| schema_reinitialize_error("schema database has no main-file leaf"))?;
+    let parent = File::from(
+        openat(
+            CWD,
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(schema_reinitialize_error)?,
+    );
+    let file = File::from(
+        openat(
+            &parent,
+            Path::new(leaf),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(schema_reinitialize_error)?,
+    );
+    let metadata = file.metadata().map_err(schema_reinitialize_error)?;
+    if !metadata.is_file()
+        || metadata.dev() != expected.device
+        || metadata.ino() != expected.inode
+        || metadata.len() != expected.length
+    {
+        return Err(schema_reinitialize_error(
+            "schema main-file authority changed after validation",
+        ));
+    }
+    Ok((parent, file))
+}
+
+#[cfg(not(unix))]
+fn open_schema_main_authority(
+    _db_path: &Path,
+    _generation: &SchemaGeneration,
+) -> Result<(File, File)> {
+    Err(schema_reinitialize_error(
+        "verified SQLite main-file handles are unsupported on this platform",
+    ))
 }
 
 impl Drop for ValidatedSchemaGeneration {
@@ -187,12 +304,16 @@ pub(crate) fn preflight_existing_schema(
                 validated == &generation && validated_backend == &backend
             })
         {
+            let (parent_authority, main_authority) =
+                open_schema_main_authority(db_path, &generation)?;
             state.active_handoffs = state.active_handoffs.saturating_add(1);
             drop(state);
             return Ok(ValidatedSchemaGeneration {
                 db_path: db_path.to_path_buf(),
                 generation,
                 entry,
+                _parent_authority: parent_authority,
+                main_authority,
                 _shared_exclusion: shared_exclusion,
                 _leader_exclusion: None,
             });
@@ -232,29 +353,8 @@ pub(crate) fn preflight_existing_schema(
         let round = state.round;
         drop(state);
 
-        let leader_exclusion = acquire_schema_validation_leader(db_path);
-        let validation = match &leader_exclusion {
-            Ok(_) => schema_generation(db_path)
-                .map_err(schema_reinitialize_error)
-                .and_then(|current| {
-                    // Another process can complete its validated mutable handoff while this
-                    // process waits for the cross-process leader lock. Start this validation
-                    // round from the generation protected by the leader lock, not the stale
-                    // generation observed before waiting.
-                    generation = current;
-                    validate_schema_snapshot(db_path, prolly_backend)
-                })
-                .and_then(|()| {
-                    let after = schema_generation(db_path).map_err(schema_reinitialize_error)?;
-                    if after != generation {
-                        return Err(schema_reinitialize_error(
-                            "schema main/WAL/SHM generation changed during snapshot validation",
-                        ));
-                    }
-                    Ok(())
-                }),
-            Err(error) => Err(schema_reinitialize_error(schema_failure_message(error))),
-        };
+        let (validation, leader_exclusion) =
+            coordinate_schema_snapshot_validation(db_path, prolly_backend, &mut generation);
 
         let mut state = entry
             .state
@@ -277,16 +377,540 @@ pub(crate) fn preflight_existing_schema(
                 return Err(schema_reinitialize_error(message.clone()));
             }
         }
+        let (parent_authority, main_authority) = open_schema_main_authority(db_path, &generation)?;
         state.active_handoffs = state.active_handoffs.saturating_add(1);
         drop(state);
         return Ok(ValidatedSchemaGeneration {
             db_path: db_path.to_path_buf(),
             generation,
             entry,
+            _parent_authority: parent_authority,
+            main_authority,
             _shared_exclusion: shared_exclusion,
-            _leader_exclusion: leader_exclusion.ok(),
+            _leader_exclusion: leader_exclusion,
         });
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn schema_generation_key(generation: &SchemaGeneration) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"trail-schema-generation-v1\0");
+    for file in &generation.0 {
+        digest.update((file.suffix.len() as u64).to_le_bytes());
+        digest.update(file.suffix.as_bytes());
+        digest.update([u8::from(file.present)]);
+        digest.update(file.device.to_le_bytes());
+        digest.update(file.inode.to_le_bytes());
+        digest.update(file.length.to_le_bytes());
+        digest.update(file.modified_seconds.to_le_bytes());
+        digest.update(file.modified_nanoseconds.to_le_bytes());
+        digest.update(file.changed_seconds.to_le_bytes());
+        digest.update(file.changed_nanoseconds.to_le_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn schema_validation_runtime_namespace(db_path: &Path) -> Result<Option<(PathBuf, String)>> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+
+    let uid = rustix::process::getuid().as_raw();
+    let runtime_dir = PathBuf::from(format!("/tmp/trail-sv-{uid}"));
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    if let Err(error) = builder.create(&runtime_dir) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Ok(None);
+        }
+    }
+    let metadata = match fs::symlink_metadata(&runtime_dir) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Ok(None);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"trail-schema-validation-path-v1\0");
+    digest.update(db_path.as_os_str().as_bytes());
+    Ok(Some((runtime_dir, hex::encode(digest.finalize()))))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SchemaValidationRuntimeEntry {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl SchemaValidationRuntimeEntry {
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for SchemaValidationRuntimeEntry {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn schema_validation_peer_identity(
+    stream: &std::os::unix::net::UnixStream,
+) -> std::io::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let credentials = unsafe { credentials.assume_init() };
+        return Ok((credentials.pid as u32, credentials.uid));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid = 0_i32;
+        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut i32).cast(),
+                &mut length,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut uid = 0_u32;
+        let mut gid = 0_u32;
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok((pid as u32, uid));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn schema_validation_wire_result(
+    nonce: &str,
+    generation: &str,
+    backend: &str,
+    outcome: &CrossProcessSchemaValidationOutcome,
+) -> String {
+    let (kind, payload) = match outcome {
+        CrossProcessSchemaValidationOutcome::Success => ("success", String::new()),
+        CrossProcessSchemaValidationOutcome::Failure(message) => {
+            ("failure", hex::encode(message.as_bytes()))
+        }
+    };
+    format!(
+        "trail-schema-validation-ipc-v1\n{nonce}\n{generation}\n{}\n{kind}\n{payload}\n",
+        hex::encode(backend.as_bytes()),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_schema_validation_wire_result(
+    text: &str,
+    nonce: &str,
+    generation: &str,
+    backend: &str,
+) -> Option<CrossProcessSchemaValidationOutcome> {
+    let mut lines = text.lines();
+    if lines.next()? != "trail-schema-validation-ipc-v1"
+        || lines.next()? != nonce
+        || lines.next()? != generation
+        || lines.next()? != hex::encode(backend.as_bytes())
+    {
+        return None;
+    }
+    let kind = lines.next()?;
+    let payload = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    match kind {
+        "success" if payload.is_empty() => Some(CrossProcessSchemaValidationOutcome::Success),
+        "failure" => String::from_utf8(hex::decode(payload).ok()?)
+            .ok()
+            .map(CrossProcessSchemaValidationOutcome::Failure),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn serve_schema_validation_result(
+    listener: &std::os::unix::net::UnixListener,
+    nonce: &str,
+    generation: &str,
+    backend: &str,
+    outcome: &CrossProcessSchemaValidationOutcome,
+) {
+    use std::net::Shutdown;
+
+    let response = schema_validation_wire_result(nonce, generation, backend, outcome);
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut request = String::new();
+                if schema_validation_peer_identity(&stream)
+                    .is_ok_and(|(_, uid)| uid == rustix::process::getuid().as_raw())
+                    && (&mut stream)
+                        .take(8192)
+                        .read_to_string(&mut request)
+                        .is_ok()
+                    && request
+                        == format!(
+                            "trail-schema-validation-request-v1\n{nonce}\n{generation}\n{}\n",
+                            hex::encode(backend.as_bytes())
+                        )
+                {
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn request_schema_validation_result(
+    socket_path: &Path,
+    nonce: &str,
+    generation: &str,
+    backend: &str,
+    leader_pid: u32,
+) -> Option<CrossProcessSchemaValidationOutcome> {
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    let (peer_pid, peer_uid) = schema_validation_peer_identity(&stream).ok()?;
+    if peer_pid != leader_pid || peer_uid != rustix::process::getuid().as_raw() {
+        return None;
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let request = format!(
+        "trail-schema-validation-request-v1\n{nonce}\n{generation}\n{}\n",
+        hex::encode(backend.as_bytes())
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    stream.shutdown(Shutdown::Write).ok()?;
+    let mut response = String::new();
+    stream
+        .take(1024 * 1024)
+        .read_to_string(&mut response)
+        .ok()?;
+    parse_schema_validation_wire_result(&response, nonce, generation, backend)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_schema_validation_announcement(
+    path: &Path,
+    leader_pid: u32,
+    expected_namespace: &str,
+) -> Option<(String, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::getuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(8192).read_to_string(&mut text).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "trail-schema-validation-announce-v1"
+        || lines.next()?.parse::<u32>().ok()? != leader_pid
+        || lines.next()? != expected_namespace
+    {
+        return None;
+    }
+    let nonce = lines.next()?.to_owned();
+    use std::os::unix::ffi::OsStringExt;
+    let socket = PathBuf::from(std::ffi::OsString::from_vec(
+        hex::decode(lines.next()?).ok()?,
+    ));
+    if nonce.len() != 64 || lines.next().is_some() {
+        return None;
+    }
+    Some((nonce, socket))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn coordinate_schema_snapshot_validation(
+    db_path: &Path,
+    backend: &str,
+    generation: &mut SchemaGeneration,
+) -> (Result<()>, Option<File>) {
+    use rustix::process::{Flock, FlockType, Pid};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let Some((runtime_dir, namespace)) =
+        schema_validation_runtime_namespace(db_path).ok().flatten()
+    else {
+        return (
+            validate_schema_snapshot_generation(db_path, backend, generation),
+            None,
+        );
+    };
+    loop {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(schema_validation_leader_path(db_path))
+        {
+            Ok(file) => file,
+            Err(error) => return (Err(schema_reinitialize_error(error)), None),
+        };
+        match rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                let mut nonce = [0_u8; 32];
+                if getrandom::getrandom(&mut nonce).is_err() {
+                    return (
+                        validate_schema_snapshot_generation(db_path, backend, generation),
+                        Some(file),
+                    );
+                }
+                let nonce = hex::encode(nonce);
+                let leaf = format!("{}-{}", &namespace[..24], &nonce[..24]);
+                let socket_path = runtime_dir.join(format!("{leaf}.socket"));
+                let announcement_path = runtime_dir.join(format!("{leaf}.announce"));
+                if socket_path.as_os_str().as_encoded_bytes().len() >= 100 {
+                    return (
+                        validate_schema_snapshot_generation(db_path, backend, generation),
+                        Some(file),
+                    );
+                }
+                let listener = match UnixListener::bind(&socket_path) {
+                    Ok(listener) => listener,
+                    Err(_) => {
+                        return (
+                            validate_schema_snapshot_generation(db_path, backend, generation),
+                            Some(file),
+                        )
+                    }
+                };
+                let _socket_cleanup = match SchemaValidationRuntimeEntry::capture(&socket_path) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        return (
+                            validate_schema_snapshot_generation(db_path, backend, generation),
+                            Some(file),
+                        )
+                    }
+                };
+                if rustix::fs::chmodat(
+                    rustix::fs::CWD,
+                    &socket_path,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .is_err()
+                    || fs::symlink_metadata(&socket_path).is_ok_and(|metadata| {
+                        metadata.dev() != _socket_cleanup.device
+                            || metadata.ino() != _socket_cleanup.inode
+                            || metadata.mode() & 0o077 != 0
+                    })
+                {
+                    return (
+                        validate_schema_snapshot_generation(db_path, backend, generation),
+                        Some(file),
+                    );
+                }
+                let _ = listener.set_nonblocking(true);
+                let announcement = format!(
+                    "trail-schema-validation-announce-v1\n{}\n{}\n{}\n{}\n",
+                    std::process::id(),
+                    namespace,
+                    nonce,
+                    hex::encode(socket_path.as_os_str().as_encoded_bytes()),
+                );
+                let mut announcement_file = match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&announcement_path)
+                {
+                    Ok(file) => file,
+                    Err(_) => {
+                        return (
+                            validate_schema_snapshot_generation(db_path, backend, generation),
+                            Some(file),
+                        )
+                    }
+                };
+                let _announcement_cleanup =
+                    match SchemaValidationRuntimeEntry::capture(&announcement_path) {
+                        Ok(identity) => identity,
+                        Err(_) => {
+                            return (
+                                validate_schema_snapshot_generation(db_path, backend, generation),
+                                Some(file),
+                            )
+                        }
+                    };
+                if announcement_file
+                    .write_all(announcement.as_bytes())
+                    .is_err()
+                    || announcement_file.sync_all().is_err()
+                {
+                    return (
+                        validate_schema_snapshot_generation(db_path, backend, generation),
+                        Some(file),
+                    );
+                }
+                *generation = match schema_generation(db_path).map_err(schema_reinitialize_error) {
+                    Ok(current) => current,
+                    Err(error) => return (Err(error), Some(file)),
+                };
+                let generation_key = schema_generation_key(generation);
+                let validation = validate_schema_snapshot_generation(db_path, backend, generation);
+                let outcome = match &validation {
+                    Ok(()) => CrossProcessSchemaValidationOutcome::Success,
+                    Err(error) => {
+                        CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(error))
+                    }
+                };
+                serve_schema_validation_result(
+                    &listener,
+                    &nonce,
+                    &generation_key,
+                    backend,
+                    &outcome,
+                );
+                return (validation, Some(file));
+            }
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                let requested = Flock::from(FlockType::WriteLock);
+                let leader_pid = rustix::process::fcntl_getlk(&file, &requested)
+                    .ok()
+                    .flatten()
+                    .map(|lock| Pid::as_raw(lock.pid) as u32);
+                if let Some(leader_pid) = leader_pid {
+                    let generation_key = schema_generation_key(generation);
+                    let prefix = format!("{}-", &namespace[..24]);
+                    let announcements = fs::read_dir(&runtime_dir)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            name.starts_with(&prefix) && name.ends_with(".announce")
+                        });
+                    for announcement in announcements {
+                        if let Some((nonce, announced_socket)) = read_schema_validation_announcement(
+                            &announcement.path(),
+                            leader_pid,
+                            &namespace,
+                        ) {
+                            let expected_socket = runtime_dir.join(format!(
+                                "{}-{}.socket",
+                                &namespace[..24],
+                                &nonce[..24]
+                            ));
+                            if announced_socket != expected_socket {
+                                continue;
+                            }
+                            if let Some(outcome) = request_schema_validation_result(
+                                &announced_socket,
+                                &nonce,
+                                &generation_key,
+                                backend,
+                                leader_pid,
+                            ) {
+                                return (
+                                    match outcome {
+                                        CrossProcessSchemaValidationOutcome::Success => Ok(()),
+                                        CrossProcessSchemaValidationOutcome::Failure(message) => {
+                                            Err(schema_reinitialize_error(message))
+                                        }
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return (Err(Error::Io(error.into())), None),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn coordinate_schema_snapshot_validation(
+    db_path: &Path,
+    backend: &str,
+    generation: &mut SchemaGeneration,
+) -> (Result<()>, Option<File>) {
+    (
+        validate_schema_snapshot_generation(db_path, backend, generation),
+        None,
+    )
+}
+
+fn validate_schema_snapshot_generation(
+    db_path: &Path,
+    prolly_backend: &str,
+    generation: &SchemaGeneration,
+) -> Result<()> {
+    validate_schema_snapshot(db_path, prolly_backend)?;
+    let after = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+    if &after != generation {
+        return Err(schema_reinitialize_error(
+            "schema main/WAL/SHM generation changed during snapshot validation",
+        ));
+    }
+    Ok(())
 }
 
 fn schema_failure_message(error: &Error) -> String {
@@ -297,6 +921,8 @@ fn schema_failure_message(error: &Error) -> String {
 }
 
 fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> {
+    #[cfg(test)]
+    schema_validation_process_test_probe()?;
     #[cfg(test)]
     if SCHEMA_VALIDATION_FAILURES
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -343,6 +969,53 @@ fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> 
             "storage.prolly_backend must be sqlite or slatedb, got `{other}`"
         ))),
     }
+}
+
+#[cfg(test)]
+fn schema_validation_process_test_probe() -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(counter_path) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_COUNTER") {
+        let mut counter = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(counter_path)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        rustix::fs::flock(&counter, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|error| Error::Io(error.into()))?;
+        writeln!(counter, "{}", std::process::id())?;
+        counter.sync_all()?;
+    }
+    if let Some(started_path) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_STARTED") {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(started_path);
+    }
+    if let Some(crash_path) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_CRASH_ONCE") {
+        if let Ok(mut crash) = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(crash_path)
+        {
+            writeln!(crash, "{}", std::process::id())?;
+            crash.sync_all()?;
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+    if let Some(delay) = std::env::var_os("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS") {
+        let delay = delay
+            .to_string_lossy()
+            .parse::<u64>()
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        std::thread::sleep(Duration::from_millis(delay));
+    }
+    if let Ok(message) = std::env::var("TRAIL_TEST_SCHEMA_VALIDATION_FAIL") {
+        return Err(schema_reinitialize_error(message));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -405,18 +1078,6 @@ fn schema_validation_leader_path(db_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(SCHEMA_VALIDATION_LEADER_FILE)
-}
-
-fn acquire_schema_validation_leader(db_path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(schema_validation_leader_path(db_path))
-        .map_err(schema_reinitialize_error)?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|error| Error::Io(error.into()))?;
-    Ok(file)
 }
 
 fn schema_db_dir(db_path: &Path) -> Result<&Path> {
@@ -872,12 +1533,27 @@ fn open_prolly_store(
     sqlite_path: &Path,
     metrics: Option<Arc<OperationMetricsState>>,
     schema_mode: SchemaOpenMode,
+    validated_schema: Option<&ValidatedSchemaGeneration>,
 ) -> Result<TrailProllyStore> {
     let backend = match config.storage.prolly_backend.as_str() {
         "sqlite" => {
             let store = match schema_mode {
                 SchemaOpenMode::FreshCreate => SqliteStore::open(sqlite_path)?,
-                SchemaOpenMode::Existing => SqliteStore::open_existing(sqlite_path)?,
+                SchemaOpenMode::Existing => {
+                    if let Some(validated) = validated_schema {
+                        SqliteStore::open_existing_verified(sqlite_path, |identity| {
+                            validated.verify_main_identity(identity).map_err(|error| {
+                                prolly_store_sqlite::SqliteStoreError::new(error.to_string())
+                            })
+                        })
+                        .map_err(schema_reinitialize_error)?
+                    } else {
+                        // The only unverified existing-open path is an internal clone made
+                        // while the caller already owns the workspace writer exclusion and
+                        // a fully validated Trail handle.
+                        SqliteStore::open_existing(sqlite_path)?
+                    }
+                }
             };
             TrailProllyStoreBackend::Sqlite(Arc::new(store))
         }

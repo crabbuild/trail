@@ -3764,9 +3764,11 @@ dependencies = [
 name = "prolly-store-sqlite"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "prolly-map",
  "prolly-store-test",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

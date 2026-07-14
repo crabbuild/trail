@@ -8,6 +8,38 @@ const DETAILED_INIT_CHANGES_FILE_THRESHOLD: usize = 10_000;
 thread_local! {
     static SCHEMA_HANDOFF_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
         const { std::cell::RefCell::new(None) };
+    static SCHEMA_PRIMARY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+    static SCHEMA_PROLLY_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_schema_primary_open_hook(hook: impl FnOnce(&Path) + 'static) {
+    SCHEMA_PRIMARY_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_schema_primary_open_hook(db_dir: &Path) {
+    SCHEMA_PRIMARY_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
+}
+
+#[cfg(test)]
+fn install_schema_prolly_open_hook(hook: impl FnOnce(&Path) + 'static) {
+    SCHEMA_PROLLY_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_schema_prolly_open_hook(db_dir: &Path) {
+    SCHEMA_PROLLY_OPEN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -352,16 +384,35 @@ impl Trail {
         register_sqlite_vec_extension()?;
         let operation_metrics =
             operation_metrics_are_enabled().then(|| Arc::new(OperationMetricsState::default()));
-        let conn = Connection::open(&sqlite_path)?;
+        #[cfg(test)]
+        if validated_schema.is_some() {
+            run_schema_primary_open_hook(&db_dir);
+        }
+        let conn = match schema_mode {
+            SchemaOpenMode::FreshCreate => Connection::open(&sqlite_path)?,
+            SchemaOpenMode::Existing => Connection::open_with_flags(
+                &sqlite_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?,
+        };
+        if let Some(validated) = &validated_schema {
+            validated.verify_connection(&conn)?;
+        }
         conn.set_db_config(
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             true,
         )?;
+        #[cfg(test)]
+        if validated_schema.is_some() {
+            run_schema_prolly_open_hook(&db_dir);
+        }
         let store = open_prolly_store(
             &config,
             &sqlite_path,
             operation_metrics.clone(),
             schema_mode,
+            validated_schema.as_ref(),
         )?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());
@@ -562,10 +613,520 @@ fn worktree_path_scan_is_large(scan: &WorktreePathScan) -> bool {
 mod schema_handoff_tests {
     use super::*;
     use std::io::Write;
+    use std::process::{Child, Stdio};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Barrier,
     };
+
+    #[cfg(unix)]
+    fn assert_open_replacement_is_rejected_before_mutation(
+        install: impl FnOnce(Box<dyn FnOnce(&Path)>),
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let original_bytes = fs::read(&db_path).unwrap();
+        let replacement = db_path.with_extension("replacement.sqlite");
+        fs::copy(&db_path, &replacement).unwrap();
+        let replacement_bytes = fs::read(&replacement).unwrap();
+        let retained = db_path.with_extension("validated.sqlite");
+        let hook_db = db_path.clone();
+        let hook_replacement = replacement.clone();
+        let hook_retained = retained.clone();
+        install(Box::new(move |_| {
+            fs::rename(&hook_db, &hook_retained).unwrap();
+            fs::rename(&hook_replacement, &hook_db).unwrap();
+        }));
+        let error = Trail::open(root.path()).err();
+        assert!(
+            matches!(error, Some(Error::SchemaReinitializeRequired { .. })),
+            "replacement rejection returned {error:?}"
+        );
+        assert_eq!(fs::read(retained).unwrap(), original_bytes);
+        assert_eq!(fs::read(db_path).unwrap(), replacement_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_sqlite_open_binds_the_validated_inode_before_any_statement() {
+        assert_open_replacement_is_rejected_before_mutation(|hook| {
+            install_schema_primary_open_hook(hook)
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prolly_sqlite_open_binds_the_validated_inode_before_any_pragma() {
+        assert_open_replacement_is_rejected_before_mutation(|hook| {
+            install_schema_prolly_open_hook(hook)
+        });
+    }
+
+    const CROSS_PROCESS_TEST: &str =
+        "db::core::init::schema_handoff_tests::cross_process_schema_validation_fanout";
+
+    fn wait_for_path(path: &Path, deadline: Duration) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(
+                started.elapsed() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn validation_count(path: &Path) -> usize {
+        fs::read_to_string(path).unwrap_or_default().lines().count()
+    }
+
+    fn spawn_schema_children(
+        root: &Path,
+        counter: &Path,
+        go: &Path,
+        count: usize,
+        mode: &str,
+        configure: impl Fn(&mut Command),
+    ) -> Vec<Child> {
+        let ready_dir = go.with_extension("ready");
+        fs::create_dir(&ready_dir).unwrap();
+        let children = (0..count)
+            .map(|index| {
+                let ready = ready_dir.join(format!("{index}.ready"));
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", CROSS_PROCESS_TEST, "--nocapture"])
+                    .env("RUST_TEST_THREADS", "1")
+                    .env("TRAIL_TEST_SCHEMA_CHILD", mode)
+                    .env("TRAIL_TEST_SCHEMA_WORKSPACE", root)
+                    .env("TRAIL_TEST_SCHEMA_GO", go)
+                    .env("TRAIL_TEST_SCHEMA_READY", &ready)
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_COUNTER", counter)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit());
+                configure(&mut command);
+                command.spawn().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        while fs::read_dir(&ready_dir).unwrap().count() != count {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        children
+    }
+
+    fn release_and_wait(mut children: Vec<Child>, go: &Path) {
+        fs::write(go, []).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "schema validation child {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("schema validation child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn run_schema_child() -> bool {
+        let Ok(mode) = std::env::var("TRAIL_TEST_SCHEMA_CHILD") else {
+            return false;
+        };
+        let root = PathBuf::from(std::env::var_os("TRAIL_TEST_SCHEMA_WORKSPACE").unwrap());
+        let go = PathBuf::from(std::env::var_os("TRAIL_TEST_SCHEMA_GO").unwrap());
+        fs::write(std::env::var_os("TRAIL_TEST_SCHEMA_READY").unwrap(), []).unwrap();
+        wait_for_path(&go, Duration::from_secs(10));
+        let result = Trail::open(root);
+        match mode.as_str() {
+            "success" | "crash" => result.unwrap(),
+            "failure" => {
+                let error = match result {
+                    Ok(_) => panic!("injected schema failure opened"),
+                    Err(error) => error,
+                };
+                assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+                assert!(error.to_string().contains("cross-process injected failure"));
+                return true;
+            }
+            "schema-failure" => {
+                assert!(matches!(
+                    result,
+                    Err(Error::SchemaReinitializeRequired { .. })
+                ));
+                return true;
+            }
+            other => panic!("unknown schema child mode {other}"),
+        };
+        true
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cross_process_schema_validation_fanout() {
+        if run_schema_child() {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let writer = Connection::open(root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='success-wave' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let counter = root.path().join("success-count");
+        let go = root.path().join("success-go");
+        let started_marker = root.path().join("success-started");
+        let started = Instant::now();
+        let children =
+            spawn_schema_children(root.path(), &counter, &go, 16, "success", |command| {
+                command
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "1000")
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_STARTED", &started_marker);
+            });
+        fs::write(&go, []).unwrap();
+        wait_for_path(&started_marker, Duration::from_secs(5));
+        let exclusion =
+            File::open(root.path().join(".trail/index").join(SCHEMA_EXCLUSION_FILE)).unwrap();
+        assert_eq!(
+            rustix::fs::flock(
+                &exclusion,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            )
+            .unwrap_err(),
+            rustix::io::Errno::AGAIN,
+            "external schema writer was not excluded during validation"
+        );
+        release_and_wait(children, &go);
+        assert_eq!(validation_count(&counter), 1);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='failure-wave' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let failure_counter = root.path().join("failure-count");
+        let failure_go = root.path().join("failure-go");
+        let children = spawn_schema_children(
+            root.path(),
+            &failure_counter,
+            &failure_go,
+            16,
+            "failure",
+            |command| {
+                command
+                    .env(
+                        "TRAIL_TEST_SCHEMA_VALIDATION_FAIL",
+                        "cross-process injected failure",
+                    )
+                    .env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "500");
+            },
+        );
+        release_and_wait(children, &failure_go);
+        assert_eq!(validation_count(&failure_counter), 1);
+
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='crash-wave' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let crash_counter = root.path().join("crash-count");
+        let crash_go = root.path().join("crash-go");
+        let crash_once = root.path().join("crash-once");
+        let mut children = spawn_schema_children(
+            root.path(),
+            &crash_counter,
+            &crash_go,
+            16,
+            "crash",
+            |command| {
+                command.env("TRAIL_TEST_SCHEMA_VALIDATION_CRASH_ONCE", &crash_once);
+            },
+        );
+        fs::write(&crash_go, []).unwrap();
+        wait_for_path(&crash_once, Duration::from_secs(5));
+        let leader_pid = fs::read_to_string(&crash_once)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let leader = children
+            .iter_mut()
+            .find(|child| child.id() == leader_pid)
+            .unwrap();
+        leader.kill().unwrap();
+        let _ = leader.wait().unwrap();
+        children.retain(|child| child.id() != leader_pid);
+        release_and_wait(children, &crash_go);
+        assert_eq!(
+            validation_count(&crash_counter),
+            2,
+            "crash validation leaders: {}",
+            fs::read_to_string(&crash_counter).unwrap_or_default()
+        );
+
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='later-generation' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let later_counter = root.path().join("later-count");
+        let later_go = root.path().join("later-go");
+        let children = spawn_schema_children(
+            root.path(),
+            &later_counter,
+            &later_go,
+            16,
+            "success",
+            |command| {
+                command.env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "500");
+            },
+        );
+        release_and_wait(children, &later_go);
+        assert_eq!(validation_count(&later_counter), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ipc_result_is_bound_to_exact_main_wal_shm_generation_and_backend() {
+        let mut generation = SchemaGeneration(
+            ["", "-wal", "-shm", "-journal"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, suffix)| SchemaFileGeneration {
+                    suffix,
+                    present: true,
+                    device: 10,
+                    inode: 20 + index as u64,
+                    length: 30 + index as u64,
+                    modified_seconds: 40,
+                    modified_nanoseconds: 50,
+                    changed_seconds: 60,
+                    changed_nanoseconds: 70,
+                })
+                .collect(),
+        );
+        let original_key = schema_generation_key(&generation);
+        let response = schema_validation_wire_result(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &original_key,
+            "sqlite",
+            &CrossProcessSchemaValidationOutcome::Success,
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let index = generation
+                .0
+                .iter()
+                .position(|file| file.suffix == suffix)
+                .unwrap();
+            generation.0[index].inode += 1;
+            let changed_key = schema_generation_key(&generation);
+            assert!(parse_schema_validation_wire_result(
+                &response,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &changed_key,
+                "sqlite",
+            )
+            .is_none());
+            generation.0[index].inode -= 1;
+        }
+        assert!(parse_schema_validation_wire_result(
+            &response,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &original_key,
+            "slatedb",
+        )
+        .is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ipc_rejects_spoofed_announcement_and_nonleader_peer() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let announcement = root.path().join("spoof.announce");
+        fs::write(
+            &announcement,
+            format!(
+                "trail-schema-validation-announce-v1\n{}\nwrong-namespace\n{}\n{}\n",
+                std::process::id(),
+                "a".repeat(64),
+                hex::encode(
+                    root.path()
+                        .join("spoof.socket")
+                        .as_os_str()
+                        .as_encoded_bytes()
+                ),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&announcement, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_schema_validation_announcement(
+            &announcement,
+            std::process::id(),
+            "expected-namespace",
+        )
+        .is_none());
+
+        let socket = root.path().join("peer.socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap());
+        assert!(request_schema_validation_result(
+            &socket,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "sqlite",
+            std::process::id().wrapping_add(1),
+        )
+        .is_none());
+        drop(accept.join().unwrap());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_main_wal_and_shm_changes_each_start_one_fresh_multiprocess_validation() {
+        fn open_stable_writer(db_path: &Path, label: &str) -> Connection {
+            let writer = Connection::open(db_path).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE schema_meta SET value=?1 WHERE key='app.version'",
+                    [label],
+                )
+                .unwrap();
+            writer
+        }
+
+        for (index, suffix) in ["", "-wal", "-shm"].into_iter().enumerate() {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_dir = root.path().join(".trail");
+            let db_path = db_dir.join(DB_RELATIVE_PATH);
+            let writer = open_stable_writer(&db_path, &format!("before-{index}"));
+            let before = schema_generation(&db_path).unwrap();
+            assert!(before
+                .0
+                .iter()
+                .find(|file| file.suffix == suffix)
+                .is_some_and(|file| file.present));
+
+            let counter = root.path().join(format!("{index}-count"));
+            let initial_go = root.path().join(format!("{index}-initial-go"));
+            let children = spawn_schema_children(
+                root.path(),
+                &counter,
+                &initial_go,
+                16,
+                "success",
+                |command| {
+                    command.env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "100");
+                },
+            );
+            release_and_wait(children, &initial_go);
+            assert_eq!(validation_count(&counter), 1);
+            drop(writer);
+
+            let lock = acquire_workspace_lock(&db_dir).unwrap();
+            if suffix.is_empty() {
+                let replacement = db_path.with_extension("validation-replacement");
+                fs::copy(&db_path, &replacement).unwrap();
+                fs::rename(&replacement, &db_path).unwrap();
+            } else {
+                let mut sidecar = db_path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                match fs::remove_file(PathBuf::from(sidecar)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("failed to rotate {suffix}: {error}"),
+                }
+            }
+            let writer = open_stable_writer(&db_path, &format!("after-{index}"));
+            if suffix == "-shm" {
+                let mut shm = db_path.as_os_str().to_os_string();
+                shm.push("-shm");
+                assert!(PathBuf::from(shm).exists());
+            }
+            let after = schema_generation(&db_path).unwrap();
+            let before_file = before.0.iter().find(|file| file.suffix == suffix).unwrap();
+            let after_file = after.0.iter().find(|file| file.suffix == suffix).unwrap();
+            assert_ne!(
+                before_file, after_file,
+                "{suffix} generation did not change"
+            );
+            drop(lock);
+
+            let fresh_go = root.path().join(format!("{index}-fresh-go"));
+            let children =
+                spawn_schema_children(root.path(), &counter, &fresh_go, 16, "success", |command| {
+                    command.env("TRAIL_TEST_SCHEMA_VALIDATION_DELAY_MS", "100");
+                });
+            release_and_wait(children, &fresh_go);
+            assert_eq!(
+                validation_count(&counter),
+                2,
+                "{suffix} change did not start exactly one fresh validation"
+            );
+            drop(writer);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_dir = root.path().join(".trail");
+        let db_path = db_dir.join(DB_RELATIVE_PATH);
+        let writer = open_stable_writer(&db_path, "backend-before");
+        let counter = root.path().join("backend-count");
+        let sqlite_go = root.path().join("backend-sqlite-go");
+        let children =
+            spawn_schema_children(root.path(), &counter, &sqlite_go, 16, "success", |_| {});
+        release_and_wait(children, &sqlite_go);
+        assert_eq!(validation_count(&counter), 1);
+        drop(writer);
+        let lock = acquire_workspace_lock(&db_dir).unwrap();
+        let config_path = db_dir.join(CONFIG_FILE);
+        let config = fs::read_to_string(&config_path).unwrap().replace(
+            "prolly_backend = \"sqlite\"",
+            "prolly_backend = \"slatedb\"",
+        );
+        fs::write(&config_path, config).unwrap();
+        drop(lock);
+        let slatedb_go = root.path().join("backend-slatedb-go");
+        let children = spawn_schema_children(
+            root.path(),
+            &counter,
+            &slatedb_go,
+            16,
+            "schema-failure",
+            |_| {},
+        );
+        release_and_wait(children, &slatedb_go);
+        assert_eq!(
+            validation_count(&counter),
+            2,
+            "backend change reused the sqlite validation result"
+        );
+    }
 
     #[test]
     fn schema_snapshot_exclusion_is_retained_through_mutable_handoff() {
