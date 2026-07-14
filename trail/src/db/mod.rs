@@ -623,10 +623,12 @@ fn serve_schema_validation_result(
     use std::net::Shutdown;
 
     let response = schema_validation_wire_result(nonce, generation, backend, outcome);
-    let deadline = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < deadline {
+    let hard_deadline = Instant::now() + Duration::from_millis(300);
+    let mut idle_deadline = Instant::now() + Duration::from_millis(10);
+    while Instant::now() < hard_deadline && Instant::now() < idle_deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                idle_deadline = Instant::now() + Duration::from_millis(10);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let mut request = String::new();
                 if schema_validation_peer_identity(&stream)
@@ -646,7 +648,7 @@ fn serve_schema_validation_result(
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(_) => break,
         }

@@ -1254,4 +1254,29 @@ mod schema_handoff_tests {
         Trail::open(root.path()).unwrap();
         assert_eq!(schema_validation_count(&db_path), 2);
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn uncontended_schema_validation_does_not_wait_for_an_ipc_audience() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(root.path().join("schema.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let started = Instant::now();
+        serve_schema_validation_result(
+            &listener,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            "sqlite",
+            &CrossProcessSchemaValidationOutcome::Success,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "uncontended IPC service waited for a nonexistent audience: {:?}",
+            started.elapsed()
+        );
+    }
 }
