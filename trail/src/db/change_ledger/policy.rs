@@ -697,6 +697,181 @@ mod tests {
     }
 
     #[test]
+    fn git_expands_policy_paths_before_origin_or_cwd_resolution() {
+        let mut fixture = Fixture::new();
+        let home = fixture.root().parent().unwrap().join("path-expansion-home");
+        let config_root = fixture
+            .root()
+            .parent()
+            .unwrap()
+            .join("path-expansion-config");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config_root).unwrap();
+        let global = config_root.join("global.gitconfig");
+        fs::write(
+            &global,
+            concat!(
+                "[include]\n",
+                "\tpath = \"%(prefix)/share/trail approval/include.conf\"\n",
+                "[includeIf \"gitdir:/**\"]\n",
+                "\tpath = \"~/quoted dir/conditional.conf\"\n",
+                "[core]\n",
+                "\texcludesFile = \"~/excluded-\\\n",
+                "rules\"\n",
+            ),
+        )
+        .unwrap();
+        fixture.git_env.extend([
+            ("HOME".into(), home.into_os_string()),
+            ("GIT_CONFIG_GLOBAL".into(), global.as_os_str().to_owned()),
+        ]);
+
+        let git_path = |key: &str| {
+            let output = Command::new("git")
+                .args(["config", "--file"])
+                .arg(&global)
+                .args(["--path", "--get-all", key])
+                .current_dir(fixture.root())
+                .env_clear()
+                .envs(git_command_environment(
+                    &fixture.context(),
+                    std::env::vars_os(),
+                ))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            PathBuf::from(os_string_from_bytes(
+                output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout),
+            ))
+        };
+        let expected = [
+            git_path("include.path"),
+            git_path("includeIf.gitdir:/**.path"),
+            git_path("core.excludesFile"),
+        ];
+
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+
+        for target in expected {
+            let target = if target.is_absolute() {
+                target
+            } else {
+                config_root.join(target)
+            };
+            assert!(
+                policy.dependencies.iter().any(|dependency| {
+                    dependency.identity == dependency_path_identity_with_case(&target, true)
+                }),
+                "missing Git-expanded path {}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_git_config_file_and_its_policy_keys_are_dependencies() {
+        let mut fixture = Fixture::new();
+        let config_dir = fixture.root().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let legacy = config_dir.join("legacy.gitconfig");
+        let included = config_dir.join("included.gitconfig");
+        fs::write(
+            &legacy,
+            "[include]\n\tpath = included.gitconfig\n[core]\n\texcludesFile = legacy.ignore\n",
+        )
+        .unwrap();
+        fs::write(&included, "[core]\n\texcludesFile = included.ignore\n").unwrap();
+        fixture
+            .git_env
+            .push(("GIT_CONFIG".into(), "config/legacy.gitconfig".into()));
+
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+
+        for target in [
+            legacy,
+            included,
+            fixture.root().join("legacy.ignore"),
+            fixture.root().join("included.ignore"),
+        ] {
+            assert!(
+                policy.dependencies.iter().any(|dependency| {
+                    dependency.identity == dependency_path_identity_with_case(&target, true)
+                }),
+                "missing legacy GIT_CONFIG dependency {}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_and_empty_legacy_git_config_selectors_are_persisted() {
+        for (value, target) in [
+            (
+                OsString::from("config/missing-legacy.gitconfig"),
+                PathBuf::from("config/missing-legacy.gitconfig"),
+            ),
+            (OsString::new(), PathBuf::new()),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.git_env.push(("GIT_CONFIG".into(), value));
+
+            let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+            let target = lexical_normalize(&fixture.root().join(target));
+
+            assert!(
+                policy.dependencies.iter().any(|dependency| {
+                    dependency.kind == PolicyDependencyKind::GitConfig
+                        && dependency.identity == dependency_path_identity_with_case(&target, true)
+                }),
+                "missing selected config dependency {}",
+                target.display()
+            );
+        }
+    }
+
+    #[test]
+    fn every_forwarded_repository_selector_invalidates_direct_reuse() {
+        for key in ["GIT_CONFIG", "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
+            let mut fixture = Fixture::new();
+            let first = fixture.compile(&mut PolicyDependencyMetrics::default());
+            fixture.git_env.push((
+                key.into(),
+                fixture
+                    .root()
+                    .join(format!("changed-{key}"))
+                    .into_os_string(),
+            ));
+
+            assert_eq!(
+                validate_policy_manifest(&fixture.context(), &first.manifest()).unwrap(),
+                PolicyManifestValidation::Changed,
+                "selector {key} did not invalidate reuse",
+            );
+        }
+    }
+
+    #[test]
+    fn repository_selector_change_forces_full_policy_discovery() {
+        let mut fixture = Fixture::new();
+        let mut metrics = PolicyDependencyMetrics::default();
+        let first = fixture.compile(&mut metrics);
+        fixture.git_env.push((
+            "GIT_DIR".into(),
+            fixture.root().join(".git").into_os_string(),
+        ));
+
+        let second = fixture.compile(&mut metrics);
+
+        assert_eq!(metrics.policy_dependency_full_discovery, 2);
+        assert!(!second.reused_manifest);
+        assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
     fn missing_external_global_config_is_persisted_and_creation_is_detected() {
         let mut fixture = Fixture::new();
         let global = fixture
@@ -757,6 +932,71 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn final_symlink_retarget_and_removal_change_identity_without_target_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let first_target = fixture.root().parent().unwrap().join("first-secret-ignore");
+        let second_target = fixture
+            .root()
+            .parent()
+            .unwrap()
+            .join("second-secret-ignore");
+        fs::write(&first_target, b"first secret bytes\n").unwrap();
+        fs::write(&second_target, b"second secret bytes\n").unwrap();
+        let dependency_path = fixture.root().join("final-symlink-ignore");
+        symlink(&first_target, &dependency_path).unwrap();
+        let (dependency, bytes) = read_file_dependency(
+            &dependency_path,
+            PolicyDependencyKind::GitExcludesFile,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(dependency.content_identity, digest(b""));
+        assert_ne!(dependency.content_identity, digest(b"first secret bytes\n"));
+        let mut manifest_dependencies = synthetic_dependencies(1, &fixture.context()).unwrap();
+        manifest_dependencies.push(dependency.clone());
+        manifest_dependencies.sort_by(|left, right| {
+            (left.kind, left.identity.as_str()).cmp(&(right.kind, right.identity.as_str()))
+        });
+        let manifest = PolicyManifest {
+            dependencies: manifest_dependencies,
+            generation: 1,
+            rule_sources: Vec::new(),
+        };
+        let (_, sources) = validate_policy_manifest_and_pin(&fixture.context(), &manifest).unwrap();
+        let source = sources
+            .iter()
+            .find(|source| source.path == dependency_path)
+            .expect("final symlink remains a semantic rule source without target bytes");
+        assert!(source.bytes.is_empty());
+        fs::remove_file(&dependency_path).unwrap();
+        symlink(&second_target, &dependency_path).unwrap();
+        let (retargeted, retargeted_bytes) = read_file_dependency(
+            &dependency_path,
+            PolicyDependencyKind::GitExcludesFile,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert!(retargeted_bytes.is_empty());
+        assert_ne!(retargeted.metadata_identity, dependency.metadata_identity);
+        fs::remove_file(&dependency_path).unwrap();
+        let (removed, removed_bytes) = read_file_dependency(
+            &dependency_path,
+            PolicyDependencyKind::GitExcludesFile,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert!(removed_bytes.is_empty());
+        assert_ne!(removed.metadata_identity, dependency.metadata_identity);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn symlinked_directory_ancestor_never_pins_external_policy_bytes() {
         use std::os::unix::fs::symlink;
 
@@ -783,6 +1023,84 @@ mod tests {
         assert!(bytes.is_empty());
         assert_eq!(dependency.content_identity, digest(b""));
         assert!(!dependency.observable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlink_retarget_and_removal_change_identity_and_invalidate_raw_events() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let first = fixture
+            .root()
+            .parent()
+            .unwrap()
+            .join("first-secret-config-dir");
+        let second = fixture
+            .root()
+            .parent()
+            .unwrap()
+            .join("second-secret-config-dir");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("policy.gitconfig"), b"first ancestor secret\n").unwrap();
+        fs::write(second.join("policy.gitconfig"), b"second ancestor secret\n").unwrap();
+        let ancestor = fixture.root().join("linked-policy-dir");
+        let dependency_path = ancestor.join("policy.gitconfig");
+        symlink(&first, &ancestor).unwrap();
+        let (dependency, bytes) = read_file_dependency(
+            &dependency_path,
+            PolicyDependencyKind::GitConfig,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        let index = PolicyInvalidationIndex::from_dependencies(
+            fixture.root(),
+            true,
+            std::slice::from_ref(&dependency),
+        )
+        .unwrap();
+
+        assert!(bytes.is_empty());
+        assert_eq!(dependency.content_identity, digest(b""));
+        assert_ne!(
+            dependency.content_identity,
+            digest(b"first ancestor secret\n")
+        );
+        assert!(index.matches(fixture.root(), &ancestor));
+        let policy = finish_compiled_policy(
+            &fixture.context(),
+            PolicyManifest {
+                dependencies: vec![dependency.clone()],
+                generation: 1,
+                rule_sources: Vec::new(),
+            },
+            false,
+        )
+        .unwrap();
+        assert!(raw_event_invalidates_policy(&policy, &ancestor));
+        fs::remove_file(&ancestor).unwrap();
+        symlink(&second, &ancestor).unwrap();
+        let (retargeted, retargeted_bytes) = read_file_dependency(
+            &dependency_path,
+            PolicyDependencyKind::GitConfig,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert!(retargeted_bytes.is_empty());
+        assert_ne!(retargeted.metadata_identity, dependency.metadata_identity);
+        fs::remove_file(&ancestor).unwrap();
+        let (removed, removed_bytes) = read_file_dependency(
+            &dependency_path,
+            PolicyDependencyKind::GitConfig,
+            1,
+            &fixture.context(),
+        )
+        .unwrap();
+        assert!(removed_bytes.is_empty());
+        assert_ne!(removed.metadata_identity, dependency.metadata_identity);
     }
 
     #[test]
@@ -1021,6 +1339,11 @@ impl PolicyInvalidationIndex {
                 root.join(path)
             };
             exact_paths.insert(normalized_path_key(&path, case_sensitive));
+            if let Some(unsafe_component) =
+                unsafe_component_path_from_metadata_identity(&dependency.metadata_identity)
+            {
+                exact_paths.insert(normalized_path_key(&unsafe_component, case_sensitive));
+            }
         }
         Ok(Self {
             case_sensitive,
@@ -1423,6 +1746,10 @@ fn synthetic_dependencies(
     let mut selector_keys = [
         OsString::from("HOME"),
         OsString::from("XDG_CONFIG_HOME"),
+        OsString::from("GIT_CONFIG"),
+        OsString::from("GIT_DIR"),
+        OsString::from("GIT_COMMON_DIR"),
+        OsString::from("GIT_WORK_TREE"),
         OsString::from("GIT_CONFIG_GLOBAL"),
         OsString::from("GIT_CONFIG_SYSTEM"),
         OsString::from("GIT_CONFIG_NOSYSTEM"),
@@ -1434,7 +1761,7 @@ fn synthetic_dependencies(
             .git_environment
             .iter()
             .map(|(key, _)| key.clone())
-            .filter(|key| key.to_string_lossy().starts_with("GIT_CONFIG_")),
+            .filter(|key| key.to_string_lossy().starts_with("GIT_")),
     );
     for key in selector_keys {
         let value = git_environment_value_os(context, &key)
@@ -1488,6 +1815,14 @@ fn discover_git_dependencies(
         .map(PathBuf::from)
         .map(|path| resolve_git_cwd_path(&cwd, path))
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    if let Some(selected) = git_environment_value(context, "GIT_CONFIG") {
+        insert_git_dependency_path(
+            &mut paths,
+            context.case_sensitive,
+            resolve_git_cwd_path(&cwd, PathBuf::from(selected)),
+            PolicyDependencyKind::GitConfig,
+        );
+    }
     if let Some(global) = git_environment_value(context, "GIT_CONFIG_GLOBAL") {
         if !global.is_empty() {
             insert_git_dependency_path(
@@ -1685,12 +2020,27 @@ fn git_config_entries_from_bytes(
         false,
         bytes,
     )?;
-    parse_git_config_entries(&output, false)
+    expand_git_config_entry_paths(context, parse_git_config_entries(&output, false)?)
 }
 
 fn injected_git_config_entries(context: &PolicyCompileContext<'_>) -> Result<Vec<GitConfigEntry>> {
     let output = run_injected_git_config(context)?;
-    parse_git_config_entries(&output, true)
+    expand_git_config_entry_paths(context, parse_git_config_entries(&output, true)?)
+}
+
+fn expand_git_config_entry_paths(
+    context: &PolicyCompileContext<'_>,
+    entries: Vec<GitConfigEntry>,
+) -> Result<Vec<GitConfigEntry>> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            Ok(GitConfigEntry {
+                key: entry.key,
+                value: git_expand_path_value(context, &entry.value)?,
+            })
+        })
+        .collect()
 }
 
 fn parse_git_config_entries(output: &[u8], with_scope: bool) -> Result<Vec<GitConfigEntry>> {
@@ -1754,19 +2104,12 @@ fn resolve_git_cwd_path(cwd: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-fn resolve_git_include_path(value: &OsStr, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    resolve_git_config_path(value, base, home)
+fn resolve_git_include_path(value: &OsStr, base: &Path, _home: Option<&Path>) -> Option<PathBuf> {
+    resolve_git_config_path(value, base, None)
 }
 
-fn resolve_git_config_path(value: &OsStr, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    if value == OsStr::new("~") {
-        return home.map(Path::to_path_buf);
-    }
-    let bytes = os_str_bytes(value);
-    if bytes.starts_with(b"~/") {
-        return home.map(|home| lexical_normalize(&home.join(os_string_from_bytes(&bytes[2..]))));
-    }
-    if bytes.is_empty() {
+fn resolve_git_config_path(value: &OsStr, cwd: &Path, _home: Option<&Path>) -> Option<PathBuf> {
+    if value.is_empty() {
         return None;
     }
     Some(resolve_git_cwd_path(cwd, PathBuf::from(value)))
@@ -1813,6 +2156,44 @@ fn git_command_environment(
         );
     }
     environment.into_iter().collect()
+}
+
+fn git_expand_path_value(context: &PolicyCompileContext<'_>, value: &OsStr) -> Result<OsString> {
+    let mut assignment = OsString::from("trail.policyPath=");
+    assignment.push(value);
+    let ambient = git_command_environment(context, std::env::vars_os());
+    let mut environment = BTreeMap::new();
+    for (key, value) in ambient {
+        if key == OsStr::new("PATH") || key == OsStr::new("HOME") {
+            environment.insert(key, value);
+        }
+    }
+    environment.insert(
+        OsString::from("XDG_CONFIG_HOME"),
+        OsString::from("/dev/null"),
+    );
+    environment.insert(
+        OsString::from("GIT_CONFIG_GLOBAL"),
+        OsString::from("/dev/null"),
+    );
+    environment.insert(OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1"));
+    let output = Command::new("git")
+        .arg("-c")
+        .arg(assignment)
+        .args(["config", "--path", "--get", "trail.policyPath"])
+        .current_dir(context.workspace_root)
+        .env_clear()
+        .envs(environment)
+        .output()
+        .map_err(Error::Io)?;
+    let output = git_output(
+        &["-c", "trail.policyPath=<value>", "config", "--path"],
+        true,
+        output,
+    )?;
+    Ok(os_string_from_bytes(
+        output.strip_suffix(b"\n").unwrap_or(&output),
+    ))
 }
 
 fn run_git(context: &PolicyCompileContext<'_>, args: &[&str], required: bool) -> Result<Vec<u8>> {
@@ -1924,7 +2305,7 @@ fn read_file_dependency(
     _context: &PolicyCompileContext<'_>,
 ) -> Result<(PolicyDependency, Vec<u8>)> {
     let path = lexical_normalize(path);
-    let (metadata, bytes) = read_file_state_no_follow(&path)?;
+    let state = read_file_state_no_follow(&path)?;
     // Task 4 has no native-observer handoff yet. Direct filesystem checks can
     // validate reuse, but they cannot establish observer continuity, so file
     // dependencies remain explicitly uncovered until a later task wires a
@@ -1933,23 +2314,51 @@ fn read_file_dependency(
     let dependency = PolicyDependency {
         identity: dependency_path_identity(&path),
         kind,
-        content_identity: digest(&bytes),
-        metadata_identity: metadata_identity(metadata.as_ref(), &path)?,
+        content_identity: digest(&state.bytes),
+        metadata_identity: match state.unsafe_metadata_identity {
+            Some(identity) => identity,
+            None => metadata_identity(state.metadata.as_ref(), &path)?,
+        },
         observable,
         generation,
         last_source_sequence: 0,
     };
-    Ok((dependency, bytes))
+    Ok((dependency, state.bytes))
 }
 
 fn read_path_bytes_no_follow(path: &Path) -> Result<Option<Vec<u8>>> {
-    let (metadata, bytes) = read_file_state_no_follow(path)?;
-    Ok(metadata
+    let state = read_file_state_no_follow(path)?;
+    Ok(state
+        .metadata
         .filter(|metadata| metadata.is_file())
-        .map(|_| bytes))
+        .map(|_| state.bytes))
 }
 
-fn read_file_state_no_follow(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)> {
+struct NoFollowFileState {
+    metadata: Option<fs::Metadata>,
+    bytes: Vec<u8>,
+    unsafe_metadata_identity: Option<Vec<u8>>,
+}
+
+impl NoFollowFileState {
+    fn missing() -> Self {
+        Self {
+            metadata: None,
+            bytes: Vec::new(),
+            unsafe_metadata_identity: None,
+        }
+    }
+
+    fn unsafe_component(metadata_identity: Vec<u8>) -> Self {
+        Self {
+            metadata: None,
+            bytes: Vec::new(),
+            unsafe_metadata_identity: Some(metadata_identity),
+        }
+    }
+}
+
+fn read_file_state_no_follow(path: &Path) -> Result<NoFollowFileState> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         return read_file_state_openat(path);
@@ -1957,17 +2366,20 @@ fn read_file_state_no_follow(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
-        Ok((None, Vec::new()))
+        Ok(NoFollowFileState::missing())
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)> {
+fn read_file_state_openat(path: &Path) -> Result<NoFollowFileState> {
     use rustix::fs::{openat, Mode, OFlags, CWD};
 
     let path = lexical_normalize(path);
     if !path.is_absolute() {
-        return Ok((None, Vec::new()));
+        return Err(Error::InvalidInput(format!(
+            "policy dependency `{}` is not absolute",
+            path.display()
+        )));
     }
     let components = path
         .strip_prefix(Path::new("/"))
@@ -1979,7 +2391,10 @@ fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)
             .iter()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Ok((None, Vec::new()));
+        return Err(Error::InvalidInput(format!(
+            "policy dependency `{}` cannot be traversed safely",
+            path.display()
+        )));
     }
 
     for _ in 0..2 {
@@ -1990,12 +2405,17 @@ fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)
             Mode::empty(),
         ) {
             Ok(directory) => directory,
-            Err(_) => return Ok((None, Vec::new())),
+            Err(err) => return Err(Error::Io(err.into())),
         };
+        let mut traversed = PathBuf::from("/");
         for component in &components[..components.len() - 1] {
             let Component::Normal(name) = component else {
-                return Ok((None, Vec::new()));
+                return Err(Error::InvalidInput(format!(
+                    "policy dependency `{}` cannot be traversed safely",
+                    path.display()
+                )));
             };
+            traversed.push(name);
             directory = match openat(
                 &directory,
                 Path::new(name),
@@ -2003,11 +2423,21 @@ fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)
                 Mode::empty(),
             ) {
                 Ok(directory) => directory,
-                Err(_) => return Ok((None, Vec::new())),
+                Err(open_error) => {
+                    return unsafe_open_failure_state(
+                        &directory,
+                        Path::new(name),
+                        &traversed,
+                        open_error,
+                    )
+                }
             };
         }
         let Component::Normal(file_name) = components[components.len() - 1] else {
-            return Ok((None, Vec::new()));
+            return Err(Error::InvalidInput(format!(
+                "policy dependency `{}` cannot be traversed safely",
+                path.display()
+            )));
         };
         let descriptor = match openat(
             &directory,
@@ -2016,18 +2446,33 @@ fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)
             Mode::empty(),
         ) {
             Ok(descriptor) => descriptor,
-            Err(_) => return Ok((None, Vec::new())),
+            Err(open_error) => {
+                return unsafe_open_failure_state(
+                    &directory,
+                    Path::new(file_name),
+                    &path,
+                    open_error,
+                )
+            }
         };
         let mut file = fs::File::from(descriptor);
         let before = file.metadata().map_err(Error::Io)?;
         if !before.is_file() {
-            return Ok((Some(before), Vec::new()));
+            return Ok(NoFollowFileState {
+                metadata: Some(before),
+                bytes: Vec::new(),
+                unsafe_metadata_identity: None,
+            });
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(Error::Io)?;
         let after = file.metadata().map_err(Error::Io)?;
         if metadata_identity(Some(&before), &path)? == metadata_identity(Some(&after), &path)? {
-            return Ok((Some(after), bytes));
+            return Ok(NoFollowFileState {
+                metadata: Some(after),
+                bytes,
+                unsafe_metadata_identity: None,
+            });
         }
     }
     Err(Error::InvalidInput(format!(
@@ -2036,7 +2481,66 @@ fn read_file_state_openat(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)
     )))
 }
 
-fn metadata_identity(metadata: Option<&fs::Metadata>, path: &Path) -> Result<Vec<u8>> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unsafe_open_failure_state<Fd: std::os::fd::AsFd>(
+    directory: Fd,
+    name: &Path,
+    component_path: &Path,
+    open_error: rustix::io::Errno,
+) -> Result<NoFollowFileState> {
+    use rustix::fs::{readlinkat, statat, AtFlags, FileType};
+
+    let stat = match statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(err) if err == rustix::io::Errno::NOENT => {
+            if open_error == rustix::io::Errno::NOENT {
+                return Ok(NoFollowFileState::missing());
+            }
+            return Err(Error::Io(open_error.into()));
+        }
+        Err(err) => return Err(Error::Io(err.into())),
+    };
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    let mut identity = format!(
+        "unsafe-component-v1:path={};kind={file_type:?};mode={};dev={};ino={};len={};uid={};gid={};",
+        hex::encode(os_str_bytes(component_path.as_os_str())),
+        stat.st_mode,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_uid,
+        stat.st_gid,
+    )
+    .into_bytes();
+    identity.extend_from_slice(
+        format!(
+            "mtime={};mtime_nsec={};ctime={};ctime_nsec={};",
+            stat.st_mtime, stat.st_mtime_nsec, stat.st_ctime, stat.st_ctime_nsec,
+        )
+        .as_bytes(),
+    );
+    if file_type == FileType::Symlink {
+        let target = readlinkat(&directory, name, Vec::new()).map_err(|err| {
+            Error::InvalidInput(format!(
+                "policy dependency component `{}` changed while its symlink identity was read: {err}",
+                component_path.display()
+            ))
+        })?;
+        identity.extend_from_slice(b"target=");
+        identity.extend_from_slice(hex::encode(target.as_bytes()).as_bytes());
+        identity.push(b';');
+    }
+    Ok(NoFollowFileState::unsafe_component(identity))
+}
+
+fn unsafe_component_path_from_metadata_identity(identity: &[u8]) -> Option<PathBuf> {
+    let encoded = identity.strip_prefix(b"unsafe-component-v1:path=")?;
+    let encoded = encoded.split(|byte| *byte == b';').next()?;
+    let bytes = hex::decode(encoded).ok()?;
+    Some(PathBuf::from(os_string_from_bytes(&bytes)))
+}
+
+fn metadata_identity(metadata: Option<&fs::Metadata>, _path: &Path) -> Result<Vec<u8>> {
     let Some(metadata) = metadata else {
         return Ok(b"missing-v1".to_vec());
     };
@@ -2066,15 +2570,6 @@ fn metadata_identity(metadata: Option<&fs::Metadata>, path: &Path) -> Result<Vec
             )
             .as_bytes(),
         );
-    }
-    if metadata.file_type().is_symlink() {
-        match fs::read_link(path) {
-            Ok(target) => identity.extend_from_slice(dependency_path_identity(&target).as_bytes()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                identity.extend_from_slice(b"missing-target")
-            }
-            Err(err) => return Err(Error::Io(err)),
-        }
     }
     Ok(identity)
 }
