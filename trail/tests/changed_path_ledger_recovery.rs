@@ -114,6 +114,24 @@ fn retired_segment_deletion_normal_retry_is_durably_idempotent() {
     trail::test_support::changed_path_deletion_normal_retry_idempotence().unwrap();
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn orphan_quarantine_substitution_after_verification_is_rejected() {
+    trail::test_support::changed_path_orphan_quarantine_substitution_rejection().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn empty_orphan_quarantine_is_retained_and_rejected() {
+    trail::test_support::changed_path_empty_orphan_quarantine_rejection().unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn normal_retirement_allocates_fresh_quarantine_without_orphan() {
+    trail::test_support::changed_path_no_orphan_quarantine_allocation().unwrap();
+}
+
 #[test]
 fn retired_segment_deletion_quiesced_retry_rejects_missing_quarantine() {
     trail::test_support::changed_path_deletion_quiesced_missing_quarantine_rejection().unwrap();

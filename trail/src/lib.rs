@@ -126,6 +126,22 @@ pub mod test_support {
         crate::db::run_deletion_normal_retry_idempotence()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn changed_path_orphan_quarantine_substitution_rejection() -> std::result::Result<(), String>
+    {
+        crate::db::run_orphan_quarantine_substitution_rejection()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn changed_path_empty_orphan_quarantine_rejection() -> std::result::Result<(), String> {
+        crate::db::run_empty_orphan_quarantine_rejection()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn changed_path_no_orphan_quarantine_allocation() -> std::result::Result<(), String> {
+        crate::db::run_no_orphan_quarantine_allocation()
+    }
+
     pub fn changed_path_deletion_quiesced_missing_quarantine_rejection(
     ) -> std::result::Result<(), String> {
         crate::db::run_deletion_quiesced_missing_quarantine_rejection()

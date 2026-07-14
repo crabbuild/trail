@@ -336,26 +336,6 @@ impl SecureDirectory {
         ))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn remove_empty_dir(&self, name: &str) -> Result<bool> {
-        use rustix::fs::{unlinkat, AtFlags};
-
-        validate_leaf(name)?;
-        match unlinkat(&self.file, Path::new(name), AtFlags::REMOVEDIR) {
-            Ok(()) => Ok(true),
-            Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
-            Err(error) => Err(Error::Io(error.into())),
-        }
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn remove_empty_dir(&self, name: &str) -> Result<bool> {
-        let _ = (self, name);
-        Err(Error::InvalidInput(
-            "secure descriptor-relative directory removal is unsupported".into(),
-        ))
-    }
-
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn unlink_verified_regular(&self, name: &str, opened: &File) -> Result<bool> {
         self.verify_opened_regular(name, opened)?;

@@ -1183,6 +1183,11 @@ pub(crate) use change_ledger::{
     run_deletion_leaf_substitution_rejection, run_mark_ancestor_substitution_rejection,
     run_recovery_ancestor_substitution_rejection,
 };
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use change_ledger::{
+    run_empty_orphan_quarantine_rejection, run_no_orphan_quarantine_allocation,
+    run_orphan_quarantine_substitution_rejection,
+};
 mod core;
 mod lane;
 mod merge;

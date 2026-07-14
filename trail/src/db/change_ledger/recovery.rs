@@ -291,6 +291,7 @@ enum DeletionSubstitutionPoint {
     Leaf,
     BeforeQuarantineMove,
     AfterQuarantineVerify,
+    OrphanQuarantineAfterVerify,
 }
 
 #[cfg(debug_assertions)]
@@ -322,6 +323,13 @@ fn run_deletion_substitution_hook(point: DeletionSubstitutionPoint) {
                 hook();
             }
         }
+    });
+}
+
+#[cfg(debug_assertions)]
+fn clear_deletion_substitution_hook() {
+    DELETION_SUBSTITUTION_HOOK.with(|slot| {
+        slot.borrow_mut().take();
     });
 }
 
@@ -754,14 +762,14 @@ fn prepare_segment_deletion_transactions(
             deletion_quarantine_directory_leaf(scope_id, epoch, &row.segment_id);
         match directory.open_private_dir(&quarantine_directory_leaf) {
             Ok(orphan) => {
-                if !orphan.entry_names()?.is_empty() {
-                    return Err(Error::InvalidInput(format!(
-                        "unowned quarantine namespace is not empty: `{quarantine_directory_leaf}`"
-                    )));
-                }
-                drop(orphan);
-                directory.remove_empty_dir(&quarantine_directory_leaf)?;
-                directory.sync()?;
+                let entry_count = orphan.entry_names()?.len();
+                #[cfg(debug_assertions)]
+                run_deletion_substitution_hook(
+                    DeletionSubstitutionPoint::OrphanQuarantineAfterVerify,
+                );
+                return Err(Error::InvalidInput(format!(
+                    "pre-existing quarantine namespace is not owned by this retirement transaction and was retained: `{quarantine_directory_leaf}` entries={entry_count}"
+                )));
             }
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -2629,6 +2637,163 @@ mod harness {
         Ok((fixture, tokens, directory, leaf))
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn orphan_quarantine_fixture(
+        tag: u8,
+    ) -> Result<(Fixture, std::path::PathBuf, String, (u64, u64))> {
+        let fixture = Fixture::new(tag)?;
+        create_real_retirement_segment(&fixture, tag)?;
+        let segment_id: String = fixture.db.conn.query_row(
+            "SELECT segment_id FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2",
+            params![
+                fixture.expected.scope_id.to_text(),
+                sql_u64(fixture.expected.epoch, "scope epoch")?
+            ],
+            |row| row.get(0),
+        )?;
+        let directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        let quarantine_leaf = deletion_quarantine_directory_leaf(
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+            &segment_id,
+        );
+        let parent = super::super::secure_fs::SecureDirectory::open_absolute(&directory)?;
+        let orphan = parent.create_private_dir(&quarantine_leaf)?;
+        let orphan_identity = orphan.identity()?;
+        orphan.sync()?;
+        parent.sync()?;
+        Ok((fixture, directory, quarantine_leaf, orphan_identity))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn orphan_quarantine_substitution_fails_closed() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (fixture, directory, quarantine_leaf, orphan_identity) =
+            orphan_quarantine_fixture(0x95)?;
+        let quarantine = directory.join(&quarantine_leaf);
+        let retained = directory.join(format!("{quarantine_leaf}.verified-retained"));
+        let hook_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let replacement_identity = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let hook_quarantine = quarantine.clone();
+        let hook_retained = retained.clone();
+        let hook_ran_capture = hook_ran.clone();
+        let replacement_identity_capture = replacement_identity.clone();
+        install_deletion_substitution_hook(
+            DeletionSubstitutionPoint::OrphanQuarantineAfterVerify,
+            move || {
+                std::fs::rename(&hook_quarantine, &hook_retained).unwrap();
+                std::fs::create_dir(&hook_quarantine).unwrap();
+                std::fs::set_permissions(&hook_quarantine, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let metadata = std::fs::metadata(&hook_quarantine).unwrap();
+                *replacement_identity_capture.lock().unwrap() =
+                    Some((metadata.dev(), metadata.ino()));
+                hook_ran_capture.store(true, Ordering::SeqCst);
+            },
+        );
+
+        let result = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected);
+        clear_deletion_substitution_hook();
+        let parent = super::super::secure_fs::SecureDirectory::open_absolute(&directory)?;
+        let current_identity = parent.open_private_dir(&quarantine_leaf)?.identity()?;
+        if result.is_ok() {
+            if hook_ran.load(Ordering::SeqCst)
+                && replacement_identity
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|identity| current_identity != identity)
+            {
+                return Err(Error::Corrupt(
+                    "orphan cleanup removed the directory substituted after verification".into(),
+                ));
+            }
+            return Err(Error::Corrupt(
+                "retirement accepted a pre-existing orphan quarantine namespace".into(),
+            ));
+        }
+        let replacement_identity = replacement_identity
+            .lock()
+            .unwrap()
+            .ok_or_else(|| Error::Corrupt("orphan substitution hook did not run".into()))?;
+        let retained_leaf = retained
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| Error::Corrupt("retained orphan leaf is not UTF-8".into()))?;
+        let retained_identity = parent.open_private_dir(retained_leaf)?.identity()?;
+        let deletion_rows: i64 = fixture.db.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_segment_deletions WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        let retired: bool = fixture.db.conn.query_row(
+            "SELECT retired_at IS NOT NULL FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        if !hook_ran.load(Ordering::SeqCst)
+            || current_identity != replacement_identity
+            || retained_identity != orphan_identity
+            || deletion_rows != 0
+            || retired
+        {
+            return Err(Error::Corrupt(
+                "failed orphan retirement removed or adopted substituted quarantine authority"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn empty_orphan_quarantine_is_retained_and_rejected() -> Result<()> {
+        let (fixture, directory, quarantine_leaf, orphan_identity) =
+            orphan_quarantine_fixture(0x96)?;
+        if retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected).is_ok() {
+            return Err(Error::Corrupt(
+                "retirement silently reused an empty orphan quarantine namespace".into(),
+            ));
+        }
+        let parent = super::super::secure_fs::SecureDirectory::open_absolute(&directory)?;
+        let retained_identity = parent.open_private_dir(&quarantine_leaf)?.identity()?;
+        let deletion_rows: i64 = fixture.db.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_segment_deletions WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        if retained_identity != orphan_identity || deletion_rows != 0 {
+            return Err(Error::Corrupt(
+                "empty orphan quarantine was replaced or adopted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn no_orphan_allocates_fresh_quarantine_authority() -> Result<()> {
+        let fixture = Fixture::new(0x97)?;
+        create_real_retirement_segment(&fixture, 0x97)?;
+        let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        if tokens.len() != 1 || tokens[0].identity.state != "prepared" {
+            return Err(Error::Corrupt(
+                "normal retirement did not mint exactly one fresh prepared authority".into(),
+            ));
+        }
+        tokens[0]
+            .quarantine_directory
+            .verify_identity(tokens[0].identity.quarantine_directory_identity)?;
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
+        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        remove_retired_segments(&fixture.db.conn, &retry)?;
+        Ok(())
+    }
+
     fn create_real_retirement_segment(fixture: &Fixture, tag: u8) -> Result<String> {
         create_real_segment(
             &fixture.db,
@@ -4282,6 +4447,21 @@ pub(crate) fn run_deletion_retry_hostile_quarantine_replacement_rejection(
 #[cfg(debug_assertions)]
 pub(crate) fn run_deletion_normal_retry_idempotence() -> std::result::Result<(), String> {
     harness::deletion_normal_retry_is_durably_idempotent().map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn run_orphan_quarantine_substitution_rejection() -> std::result::Result<(), String> {
+    harness::orphan_quarantine_substitution_fails_closed().map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn run_empty_orphan_quarantine_rejection() -> std::result::Result<(), String> {
+    harness::empty_orphan_quarantine_is_retained_and_rejected().map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn run_no_orphan_quarantine_allocation() -> std::result::Result<(), String> {
+    harness::no_orphan_allocates_fresh_quarantine_authority().map_err(|error| error.to_string())
 }
 
 #[cfg(debug_assertions)]
