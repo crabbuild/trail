@@ -148,6 +148,64 @@ impl SecureDirectory {
         verify_entry_identity(&self.file, name, opened, false)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn verify_same_opened_regular(
+        &self,
+        expected: &File,
+        observed: &File,
+    ) -> Result<()> {
+        use rustix::fs::{fstat, FileType};
+
+        let expected = fstat(expected).map_err(|error| Error::Io(error.into()))?;
+        let observed = fstat(observed).map_err(|error| Error::Io(error.into()))?;
+        if FileType::from_raw_mode(expected.st_mode) != FileType::RegularFile
+            || FileType::from_raw_mode(observed.st_mode) != FileType::RegularFile
+            || expected.st_dev != observed.st_dev
+            || expected.st_ino != observed.st_ino
+        {
+            return Err(Error::InvalidInput(
+                "secure filesystem quarantine inode does not match deletion authority".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn verify_same_opened_regular(
+        &self,
+        expected: &File,
+        observed: &File,
+    ) -> Result<()> {
+        let _ = (self, expected, observed);
+        Err(Error::InvalidInput(
+            "secure descriptor-relative inode comparison is unsupported".into(),
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn rename_leaf_noreplace(&self, source: &str, destination: &str) -> Result<()> {
+        use rustix::fs::{renameat_with, RenameFlags};
+
+        validate_leaf(source)?;
+        validate_leaf(destination)?;
+        renameat_with(
+            &self.file,
+            Path::new(source),
+            &self.file,
+            Path::new(destination),
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| Error::Io(error.into()))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn rename_leaf_noreplace(&self, source: &str, destination: &str) -> Result<()> {
+        let _ = (self, source, destination);
+        Err(Error::InvalidInput(
+            "secure descriptor-relative quarantine rename is unsupported".into(),
+        ))
+    }
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn verify_opened_regular(&self, name: &str, opened: &File) -> Result<()> {
         let _ = (self, name, opened);

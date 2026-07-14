@@ -165,6 +165,7 @@ pub(crate) struct RootDirectoryChild {
 pub struct Trail {
     workspace_root: PathBuf,
     db_dir: PathBuf,
+    sqlite_path: PathBuf,
     conn: Connection,
     store: TrailProllyStore,
     prolly: Prolly<TrailProllyStore>,
@@ -1159,14 +1160,17 @@ impl Drop for WriteLockWaitGuard {
 
 mod agent;
 mod change_ledger;
+#[cfg(all(debug_assertions, unix))]
+pub(crate) use change_ledger::run_non_utf_database_path_mark_recover_and_retire;
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::{
     run_acknowledgement_race, run_advanced_prefix_recovery, run_ambiguous_recovery_gate,
     run_backup_overwrite_rollback, run_backup_restore_rotation, run_callback_spool,
     run_crash_matrix, run_deletion_parent_substitution_rejection,
-    run_exact_interval_bridge_rejection, run_gc_root_lifecycle, run_lane_deletion_retirement,
-    run_missing_sidecar_rejection, run_oracle, run_prefix_interval_bridge_rejection,
-    run_qualified_proof_revalidation, run_races, run_retirement_barrier,
+    run_deletion_post_verification_substitution_rejection, run_exact_interval_bridge_rejection,
+    run_gc_root_lifecycle, run_lane_deletion_retirement, run_missing_sidecar_rejection, run_oracle,
+    run_prefix_interval_bridge_rejection, run_qualified_proof_revalidation, run_races,
+    run_restored_nullable_provider_lane_deletion, run_retirement_barrier,
     run_valid_prefix_interval_recovery,
 };
 #[cfg(all(debug_assertions, unix))]

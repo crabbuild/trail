@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::change_ledger::{mark_backup_scopes_untrusted, ChangedPathLedger};
+use crate::db::change_ledger::mark_backup_scopes_untrusted;
 use crate::db::core::backup::publication::{
     publish_staged_tree, remove_any, remove_retained_tree, sibling_stage,
 };
@@ -17,7 +17,7 @@ impl Trail {
                 "backup output cannot be inside .trail".to_string(),
             ));
         }
-        ChangedPathLedger::new(&self.conn).recover()?;
+        self.changed_path_ledger().recover()?;
         if output.exists() && !overwrite {
             return Err(Error::WorkspaceExists(output));
         }

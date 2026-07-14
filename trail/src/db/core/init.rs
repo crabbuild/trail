@@ -301,6 +301,7 @@ impl Trail {
         let db = Self {
             workspace_root,
             db_dir,
+            sqlite_path,
             conn,
             store,
             prolly,
@@ -338,6 +339,10 @@ impl Trail {
 
     pub fn db_dir(&self) -> &Path {
         &self.db_dir
+    }
+
+    pub(crate) fn changed_path_ledger(&self) -> super::change_ledger::ChangedPathLedger<'_> {
+        super::change_ledger::ChangedPathLedger::new_at(&self.conn, &self.sqlite_path)
     }
 
     pub fn config(&self) -> &TrailConfig {

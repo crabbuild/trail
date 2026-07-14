@@ -41,7 +41,10 @@ pub(crate) fn recover_scope(
             && current_change_matches(&tx, &intent)?;
         let target_published = authoritative_ref_matches_target(&tx, &intent)?;
         let qualified_proof = intent.verified_cut.as_ref().is_some_and(|proof| {
-            validate_qualified_filesystem_proof(&tx, expected, &intent, proof).is_ok()
+            ledger.database_path().is_ok_and(|database_path| {
+                validate_qualified_filesystem_proof(&tx, database_path, expected, &intent, proof)
+                    .is_ok()
+            })
         });
         let decision = if exact_scope
             && target_published
@@ -218,6 +221,8 @@ pub(crate) struct SegmentDeletionToken {
     epoch: u64,
     directory: Option<std::sync::Arc<super::secure_fs::SecureDirectory>>,
     leaf: String,
+    quarantine_leaf: String,
+    authorized: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl std::fmt::Debug for SegmentDeletionToken {
@@ -228,8 +233,29 @@ impl std::fmt::Debug for SegmentDeletionToken {
             .field("epoch", &self.epoch)
             .field("directory_retained", &self.directory.is_some())
             .field("leaf", &self.leaf)
+            .field("quarantine_leaf", &self.quarantine_leaf)
+            .field("inode_authorized", &self.authorized.is_some())
             .finish()
     }
+}
+
+#[derive(Clone, Debug)]
+struct RetirementIdentity {
+    scope_id: super::ScopeId,
+    epoch: u64,
+    scope_kind: String,
+    owner_id: String,
+    scope_root: String,
+    ref_name: String,
+    ref_generation: u64,
+    change_id: String,
+    baseline_root_id: ObjectId,
+    policy_fingerprint: String,
+    policy_generation: u64,
+    filesystem_identity: String,
+    continuity_generation: u64,
+    provider_identity: Option<String>,
+    retired_at: Option<i64>,
 }
 
 #[cfg(debug_assertions)]
@@ -237,6 +263,7 @@ impl std::fmt::Debug for SegmentDeletionToken {
 enum DeletionSubstitutionPoint {
     Parent,
     Leaf,
+    BeforeQuarantineMove,
 }
 
 #[cfg(debug_assertions)]
@@ -273,32 +300,76 @@ fn run_deletion_substitution_hook(point: DeletionSubstitutionPoint) {
 
 pub(crate) fn retire_scope(
     conn: &Connection,
+    database_path: &std::path::Path,
     expected: &ExpectedScope,
 ) -> Result<Vec<SegmentDeletionToken>> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let now = now_ts();
-    let scope_state = tx
-        .query_row(
-            "SELECT retired_at FROM changed_path_scopes
-             WHERE scope_id=?1 AND epoch=?2 AND ref_name=?3 AND ref_generation=?4
-               AND baseline_root_id=?5 AND filesystem_identity=?6 AND provider_identity=?7",
-            params![
-                expected.scope_id.to_text(),
-                sql_u64(expected.epoch, "scope epoch")?,
-                expected.ref_name,
-                sql_u64(expected.ref_generation, "ref generation")?,
-                expected.baseline_root.0,
-                hex::encode(&expected.filesystem_identity),
-                hex::encode(&expected.provider_identity),
-            ],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()?;
-    let Some(retired_at) = scope_state else {
+    let identity =
+        load_retirement_identity(conn, &expected.scope_id.to_text())?.ok_or_else(|| {
+            Error::ChangeLedgerReconcileRequired {
+                scope: expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "scope retirement lookup failed".into(),
+                command: "trail status".into(),
+            }
+        })?;
+    let expected_provider_identity = hex::encode(&expected.provider_identity);
+    if identity.epoch != expected.epoch
+        || identity.ref_name != expected.ref_name
+        || identity.ref_generation != expected.ref_generation
+        || identity.baseline_root_id != expected.baseline_root
+        || identity.policy_fingerprint != hex::encode(expected.policy_fingerprint)
+        || identity.policy_generation != expected.policy_generation
+        || identity.filesystem_identity != hex::encode(&expected.filesystem_identity)
+        || identity.provider_identity.as_deref() != Some(expected_provider_identity.as_str())
+    {
         return Err(Error::ChangeLedgerReconcileRequired {
             scope: expected.scope_id.to_text(),
             state: "untrusted_gap".into(),
-            reason: "scope retirement CAS failed".into(),
+            reason: "scope retirement expected identity changed".into(),
+            command: "trail status".into(),
+        });
+    }
+    retire_scope_identity(conn, database_path, &identity)
+}
+
+fn retire_scope_identity(
+    conn: &Connection,
+    database_path: &std::path::Path,
+    expected: &RetirementIdentity,
+) -> Result<Vec<SegmentDeletionToken>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let now = now_ts();
+    let current_matches: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM changed_path_scopes
+         WHERE scope_id=?1 AND epoch=?2 AND scope_kind=?3 AND owner_id=?4 AND scope_root=?5
+           AND ref_name=?6 AND ref_generation=?7 AND change_id=?8 AND baseline_root_id=?9
+           AND policy_fingerprint=?10 AND policy_dependency_generation=?11
+           AND filesystem_identity=?12 AND continuity_generation=?13
+           AND provider_identity IS ?14 AND retired_at IS ?15)",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?,
+            expected.scope_kind,
+            expected.owner_id,
+            expected.scope_root,
+            expected.ref_name,
+            sql_u64(expected.ref_generation, "ref generation")?,
+            expected.change_id,
+            expected.baseline_root_id.0,
+            expected.policy_fingerprint,
+            sql_u64(expected.policy_generation, "policy generation")?,
+            expected.filesystem_identity,
+            sql_u64(expected.continuity_generation, "continuity generation")?,
+            expected.provider_identity,
+            expected.retired_at,
+        ],
+        |row| row.get(0),
+    )?;
+    if !current_matches {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "scope retirement exact row changed".into(),
             command: "trail status".into(),
         });
     };
@@ -316,8 +387,8 @@ pub(crate) fn retire_scope(
         )?
         .collect::<std::result::Result<Vec<String>, _>>()?;
     validate_retired_segment_paths(&paths)?;
-    let tokens = segment_deletion_tokens(conn, expected, &paths)?;
-    if retired_at.is_some() {
+    let tokens = segment_deletion_tokens(database_path, expected.scope_id, expected.epoch, &paths)?;
+    if expected.retired_at.is_some() {
         tx.commit()?;
         durable_intent_barrier(conn)?;
         return Ok(tokens);
@@ -331,30 +402,39 @@ pub(crate) fn retire_scope(
             sql_u64(expected.epoch, "scope epoch")?
         ],
     )?;
+    let post_revocation_continuity = expected
+        .continuity_generation
+        .checked_add(u64::from(revoked != 0))
+        .ok_or_else(|| Error::Corrupt("retirement continuity generation overflow".into()))?;
     let changed = tx.execute(
         "UPDATE changed_path_scopes SET retired_at=?1,trust_state='untrusted_gap',
-             trust_reason='scope_retired',continuity_generation=continuity_generation+?9,
+             trust_reason='scope_retired',continuity_generation=continuity_generation+?5,
              observer_owner_token=NULL,observer_heartbeat_at=NULL,updated_at=?1
-         WHERE scope_id=?2 AND epoch=?3 AND ref_name=?4 AND ref_generation=?5
-           AND baseline_root_id=?6 AND filesystem_identity=?7 AND provider_identity=?8
-           AND retired_at IS NULL",
+         WHERE scope_id=?2 AND epoch=?3 AND continuity_generation=?4
+           AND provider_identity IS ?6 AND retired_at IS NULL",
         params![
             now,
             expected.scope_id.to_text(),
             sql_u64(expected.epoch, "scope epoch")?,
-            expected.ref_name,
-            sql_u64(expected.ref_generation, "ref generation")?,
-            expected.baseline_root.0,
-            hex::encode(&expected.filesystem_identity),
-            hex::encode(&expected.provider_identity),
-            i64::from(revoked == 0)
+            sql_u64(post_revocation_continuity, "continuity generation")?,
+            i64::from(revoked == 0),
+            expected.provider_identity,
         ],
     )?;
     if changed != 1 {
+        let observed: (i64, i64, Option<String>, Option<i64>) = tx.query_row(
+            "SELECT epoch,continuity_generation,provider_identity,retired_at
+             FROM changed_path_scopes WHERE scope_id=?1",
+            [expected.scope_id.to_text()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
         return Err(Error::ChangeLedgerReconcileRequired {
             scope: expected.scope_id.to_text(),
             state: "untrusted_gap".into(),
-            reason: "scope retirement CAS failed".into(),
+            reason: format!(
+                "scope retirement update CAS failed: expected epoch={} continuity={} provider={:?}; observed={observed:?}",
+                expected.epoch, expected.continuity_generation, expected.provider_identity
+            ),
             command: "trail status".into(),
         });
     }
@@ -372,16 +452,75 @@ pub(crate) fn retire_scope(
     Ok(tokens)
 }
 
+fn load_retirement_identity(
+    conn: &Connection,
+    scope_id: &str,
+) -> Result<Option<RetirementIdentity>> {
+    let row = conn
+        .query_row(
+            "SELECT scope_id,epoch,scope_kind,owner_id,scope_root,ref_name,ref_generation,
+                    change_id,baseline_root_id,policy_fingerprint,policy_dependency_generation,
+                    filesystem_identity,continuity_generation,provider_identity,retired_at
+             FROM changed_path_scopes WHERE scope_id=?1",
+            [scope_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let scope_bytes = hex::decode(&row.0).map_err(|error| Error::Corrupt(error.to_string()))?;
+    Ok(Some(RetirementIdentity {
+        scope_id: super::ScopeId(
+            scope_bytes
+                .try_into()
+                .map_err(|_| Error::Corrupt("invalid retirement scope id".into()))?,
+        ),
+        epoch: db_u64(row.1, "retirement scope epoch")?,
+        scope_kind: row.2,
+        owner_id: row.3,
+        scope_root: row.4,
+        ref_name: row.5,
+        ref_generation: db_u64(row.6, "retirement ref generation")?,
+        change_id: row.7,
+        baseline_root_id: ObjectId(row.8),
+        policy_fingerprint: row.9,
+        policy_generation: db_u64(row.10, "retirement policy generation")?,
+        filesystem_identity: row.11,
+        continuity_generation: db_u64(row.12, "retirement continuity generation")?,
+        provider_identity: row.13,
+        retired_at: row.14,
+    }))
+}
+
 pub(crate) fn retire_deletion_scopes(
     conn: &Connection,
+    database_path: &std::path::Path,
     owner_ids: &[&str],
     scope_roots: &[&str],
+    ref_names: &[&str],
 ) -> Result<Vec<SegmentDeletionToken>> {
-    let rows = {
+    let scope_ids = {
         let mut statement = conn.prepare(
-            "SELECT scope_id,epoch,ref_name,ref_generation,baseline_root_id,
-                    policy_fingerprint,policy_dependency_generation,filesystem_identity,
-                    provider_identity,owner_id,scope_root
+            "SELECT scope_id,owner_id,scope_root,ref_name
              FROM changed_path_scopes
              WHERE scope_kind IN ('materialized_lane','workspace_view')
              ORDER BY scope_id",
@@ -390,55 +529,33 @@ pub(crate) fn retire_deletion_scopes(
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(scope_id, owner_id, scope_root, ref_name)| {
+                (owner_ids.contains(&owner_id.as_str())
+                    || scope_roots.contains(&scope_root.as_str())
+                    || ref_names.contains(&ref_name.as_str()))
+                .then_some(scope_id)
+            })
+            .collect::<Vec<_>>();
         rows
     };
     let mut retired_paths = Vec::new();
-    for row in rows {
-        if !owner_ids.contains(&row.9.as_str()) && !scope_roots.contains(&row.10.as_str()) {
-            continue;
-        }
-        let provider_identity = row.8.ok_or_else(|| Error::ChangeLedgerReconcileRequired {
-            scope: row.0.clone(),
-            state: "untrusted_gap".into(),
-            reason: "deletion scope has no qualified provider identity".into(),
-            command: "trail status".into(),
+    for scope_id in scope_ids {
+        let identity = load_retirement_identity(conn, &scope_id)?.ok_or_else(|| {
+            Error::ChangeLedgerReconcileRequired {
+                scope: scope_id.clone(),
+                state: "untrusted_gap".into(),
+                reason: "deletion scope disappeared before retirement".into(),
+                command: "trail status".into(),
+            }
         })?;
-        let scope_bytes = hex::decode(&row.0).map_err(|error| Error::Corrupt(error.to_string()))?;
-        let policy_bytes =
-            hex::decode(&row.5).map_err(|error| Error::Corrupt(error.to_string()))?;
-        let expected = ExpectedScope {
-            scope_id: super::ScopeId(
-                scope_bytes
-                    .try_into()
-                    .map_err(|_| Error::Corrupt("invalid deletion scope id".into()))?,
-            ),
-            epoch: db_u64(row.1, "deletion scope epoch")?,
-            ref_name: row.2,
-            ref_generation: db_u64(row.3, "deletion ref generation")?,
-            baseline_root: ObjectId(row.4),
-            policy_fingerprint: policy_bytes
-                .try_into()
-                .map_err(|_| Error::Corrupt("invalid deletion policy fingerprint".into()))?,
-            policy_generation: db_u64(row.6, "deletion policy generation")?,
-            filesystem_identity: hex::decode(row.7)
-                .map_err(|error| Error::Corrupt(error.to_string()))?,
-            provider_identity: hex::decode(provider_identity)
-                .map_err(|error| Error::Corrupt(error.to_string()))?,
-        };
-        retired_paths.extend(retire_scope(conn, &expected)?);
+        retired_paths.extend(retire_scope_identity(conn, database_path, &identity)?);
     }
     Ok(retired_paths)
 }
@@ -469,35 +586,66 @@ fn validate_retired_segment_paths(paths: &[String]) -> Result<()> {
 }
 
 fn segment_deletion_tokens(
-    conn: &Connection,
-    expected: &ExpectedScope,
+    database_path: &std::path::Path,
+    scope_id: super::ScopeId,
+    epoch: u64,
     leaves: &[String],
 ) -> Result<Vec<SegmentDeletionToken>> {
-    let database_path = conn
-        .path()
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| Error::Corrupt("retirement database path is unavailable".into()))?;
     let trail_root = database_path
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or_else(|| Error::Corrupt("retirement database has no Trail root".into()))?;
     let directory = trail_root
         .join("observer-segments")
-        .join(expected.scope_id.to_text());
+        .join(scope_id.to_text());
     let directory = match super::secure_fs::SecureDirectory::open_absolute(&directory) {
         Ok(directory) => Some(std::sync::Arc::new(directory)),
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    Ok(leaves
+    leaves
         .iter()
-        .map(|leaf| SegmentDeletionToken {
-            scope_id: expected.scope_id,
-            epoch: expected.epoch,
-            directory: directory.clone(),
-            leaf: leaf.clone(),
+        .map(|leaf| {
+            let quarantine_leaf = deletion_quarantine_leaf(scope_id, epoch, leaf);
+            let authorized = match &directory {
+                Some(directory) => match directory.open_regular(&quarantine_leaf) {
+                    Ok(file) => Some(std::sync::Arc::new(file)),
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match directory.open_regular(leaf) {
+                            Ok(file) => Some(std::sync::Arc::new(file)),
+                            Err(Error::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
+            Ok(SegmentDeletionToken {
+                scope_id,
+                epoch,
+                directory: directory.clone(),
+                leaf: leaf.clone(),
+                quarantine_leaf,
+                authorized,
+            })
         })
-        .collect())
+        .collect()
+}
+
+fn deletion_quarantine_leaf(scope_id: super::ScopeId, epoch: u64, leaf: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"trail-segment-deletion-quarantine-v1\0");
+    hasher.update(scope_id.0);
+    hasher.update(epoch.to_le_bytes());
+    hasher.update(leaf.as_bytes());
+    format!(".trail-delete-{}.cplq", hex::encode(hasher.finalize()))
 }
 
 pub(crate) fn remove_retired_segments(tokens: &[SegmentDeletionToken]) -> Result<()> {
@@ -506,18 +654,37 @@ pub(crate) fn remove_retired_segments(tokens: &[SegmentDeletionToken]) -> Result
         let Some(directory) = &token.directory else {
             continue;
         };
-        #[cfg(debug_assertions)]
-        run_deletion_substitution_hook(DeletionSubstitutionPoint::Parent);
-        let opened = match directory.open_regular(&token.leaf) {
-            Ok(file) => file,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+        let Some(authorized) = &token.authorized else {
+            continue;
         };
         #[cfg(debug_assertions)]
-        run_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf);
-        directory.verify_opened_regular(&token.leaf, &opened)?;
-        if directory.unlink_leaf(&token.leaf)? {
+        run_deletion_substitution_hook(DeletionSubstitutionPoint::Parent);
+        let quarantined = match directory.open_regular(&token.quarantine_leaf) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(debug_assertions)]
+                run_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf);
+                match directory.verify_opened_regular(&token.leaf, authorized) {
+                    Ok(()) => {}
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                #[cfg(debug_assertions)]
+                run_deletion_substitution_hook(DeletionSubstitutionPoint::BeforeQuarantineMove);
+                directory.rename_leaf_noreplace(&token.leaf, &token.quarantine_leaf)?;
+                crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_move");
+                directory.open_regular(&token.quarantine_leaf)?
+            }
+            Err(error) => return Err(error),
+        };
+        directory.verify_same_opened_regular(authorized, &quarantined)?;
+        crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_verify");
+        if directory.unlink_leaf(&token.quarantine_leaf)? {
+            crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_unlink");
             directory.sync()?;
+            crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_fsync");
         }
     }
     Ok(())
@@ -765,7 +932,7 @@ mod harness {
                     power_loss_durability: true,
                 },
             };
-            ChangedPathLedger::new(&db.conn).begin_scope(
+            db.changed_path_ledger().begin_scope(
                 &scope,
                 &baseline,
                 &policy,
@@ -1069,7 +1236,7 @@ mod harness {
     pub(super) fn acknowledgement_race() -> Result<()> {
         let fixture = Fixture::new(0x61)?;
         let target = fixture.target("ack", fixture.expected.baseline_root.clone());
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -1115,7 +1282,7 @@ mod harness {
     pub(super) fn authenticated_prefix_survives_later_observer_advance() -> Result<()> {
         let fixture = Fixture::new(0x81)?;
         let target = fixture.target("advanced-prefix", fixture.expected.baseline_root.clone());
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -1247,7 +1414,7 @@ mod harness {
         } else {
             Fixture::evidence(bridge_path)
         };
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -1345,7 +1512,7 @@ mod harness {
                 last_sequence: 1,
             }],
         };
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -1488,7 +1655,7 @@ mod harness {
             "mark-directory-swap",
             fixture.expected.baseline_root.clone(),
         );
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -1514,7 +1681,7 @@ mod harness {
             "recovery-directory-swap",
             fixture.expected.baseline_root.clone(),
         );
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -1590,7 +1757,7 @@ mod harness {
             operation_id: Some(target_ref.operation_id),
         };
         prepare_intent(
-            &ChangedPathLedger::new(&fixture.db.conn),
+            &fixture.db.changed_path_ledger(),
             &fixture.expected,
             IntentProducer::Checkout,
             &target,
@@ -1628,7 +1795,7 @@ mod harness {
         let prepared = Fixture::new(0x63)?;
         let target = prepared.target("prepared", prepared.expected.baseline_root.clone());
         let intent = prepare_intent(
-            &ChangedPathLedger::new(&prepared.db.conn),
+            &prepared.db.changed_path_ledger(),
             &prepared.expected,
             IntentProducer::LaneSync,
             &target,
@@ -1640,14 +1807,8 @@ mod harness {
             [prepared.expected.scope_id.to_text()],
             |row| row.get(0),
         )?;
-        recover_scope(
-            &ChangedPathLedger::new(&prepared.db.conn),
-            &prepared.expected,
-        )?;
-        recover_scope(
-            &ChangedPathLedger::new(&prepared.db.conn),
-            &prepared.expected,
-        )?;
+        recover_scope(&prepared.db.changed_path_ledger(), &prepared.expected)?;
+        recover_scope(&prepared.db.changed_path_ledger(), &prepared.expected)?;
         let state = prepared.db.conn.query_row(
             "SELECT lifecycle_state,trust_state,continuity_generation,s.ref_generation,
                     s.change_id,i.expected_change_id FROM changed_path_intents i
@@ -1699,7 +1860,8 @@ mod harness {
                       NULL,NULL,NULL,'retire-segment.cpl','open',?2,NULL,?2)",
             params![retired.expected.scope_id.to_text(), now],
         )?;
-        let retired_paths = retire_scope(&retired.db.conn, &retired.expected)?;
+        let retired_paths =
+            retire_scope(&retired.db.conn, &retired.db.sqlite_path, &retired.expected)?;
         let retirement_state = retired.db.conn.query_row(
             "SELECT s.continuity_generation,s.retired_at,o.lease_state,g.state
              FROM changed_path_scopes s
@@ -1734,7 +1896,7 @@ mod harness {
         for (tag, publish_before_recovery) in [(0x64, false), (0x65, true)] {
             let fixture = Fixture::new(tag)?;
             let target = fixture.target("published", fixture.expected.baseline_root.clone());
-            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            let ledger = fixture.db.changed_path_ledger();
             let intent = prepare_intent(
                 &ledger,
                 &fixture.expected,
@@ -1783,7 +1945,13 @@ mod harness {
                 now_ts()
             ],
         )?;
-        if retire_scope(&malicious.db.conn, &malicious.expected).is_ok() {
+        if retire_scope(
+            &malicious.db.conn,
+            &malicious.db.sqlite_path,
+            &malicious.expected,
+        )
+        .is_ok()
+        {
             return Err(Error::Corrupt(
                 "scope retirement returned an escaping observer segment path".into(),
             ));
@@ -1819,13 +1987,23 @@ mod harness {
         let _: i64 = reader.query_row("SELECT COUNT(*) FROM changed_path_scopes", [], |row| {
             row.get(0)
         })?;
-        if retire_scope(&reader_fixture.db.conn, &reader_fixture.expected).is_ok() {
+        if retire_scope(
+            &reader_fixture.db.conn,
+            &reader_fixture.db.sqlite_path,
+            &reader_fixture.expected,
+        )
+        .is_ok()
+        {
             return Err(Error::Corrupt(
                 "retirement returned deletion authority while an older reader was active".into(),
             ));
         }
         reader.execute_batch("COMMIT")?;
-        let paths = retire_scope(&reader_fixture.db.conn, &reader_fixture.expected)?;
+        let paths = retire_scope(
+            &reader_fixture.db.conn,
+            &reader_fixture.db.sqlite_path,
+            &reader_fixture.expected,
+        )?;
         if paths
             .iter()
             .map(|token| token.leaf.as_str())
@@ -1866,7 +2044,7 @@ mod harness {
             .join(fixture.expected.scope_id.to_text());
         std::fs::create_dir_all(&directory)?;
         std::fs::write(directory.join(leaf), b"retired authority\n")?;
-        let tokens = retire_scope(&fixture.db.conn, &fixture.expected)?;
+        let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
         Ok((fixture, tokens, directory))
     }
 
@@ -1928,6 +2106,208 @@ mod harness {
         Ok(())
     }
 
+    pub(super) fn deletion_name_substitution_after_verification_fails_closed() -> Result<()> {
+        let (_fixture, tokens, directory) =
+            retired_segment_fixture(0x89, "post-verification-substitution.cpl")?;
+        let leaf = directory.join("post-verification-substitution.cpl");
+        let authorized = directory.join("post-verification-authorized.cpl");
+        let quarantine = directory.join(&tokens[0].quarantine_leaf);
+        let hook_leaf = leaf.clone();
+        let hook_authorized = authorized.clone();
+        install_deletion_substitution_hook(
+            DeletionSubstitutionPoint::BeforeQuarantineMove,
+            move || {
+                std::fs::rename(&hook_leaf, &hook_authorized).unwrap();
+                std::fs::write(&hook_leaf, b"replacement must survive\n").unwrap();
+            },
+        );
+
+        if remove_retired_segments(&tokens).is_ok() {
+            return Err(Error::Corrupt(
+                "retired deletion accepted a name substituted after verification".into(),
+            ));
+        }
+        if leaf.exists() || !authorized.exists() || !quarantine.exists() {
+            return Err(Error::Corrupt(
+                "retired deletion did not preserve the authorized inode and quarantine the substitution"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn restored_nullable_provider_lane_deletion() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("lane.txt"), b"lane\n")?;
+        Trail::init(root.path(), "main", InitImportMode::WorkingTree, false)?;
+        let mut db = Trail::open(root.path())?;
+        let spawned = db.spawn_lane("restored-retire", Some("main"), true, None, None)?;
+        let branch = db.lane_branch("restored-retire")?;
+        let head = db.get_ref(&branch.ref_name)?;
+        let view = db.create_workspace_view(
+            &branch.lane_id,
+            &head.change_id,
+            &head.root_id,
+            "fuse-cow",
+            &root.path().join("restored-retire-view"),
+        )?;
+        let baseline = BaselineIdentity {
+            ref_name: head.name.clone(),
+            ref_generation: u64::try_from(head.generation)
+                .map_err(|_| Error::Corrupt("negative lane ref generation".into()))?,
+            change_id: head.change_id.clone(),
+            root_id: head.root_id.clone(),
+        };
+        let policy = PolicyIdentity {
+            fingerprint: [0x8a; 32],
+            generation: 1,
+        };
+        let filesystem = FilesystemIdentity(vec![0x8a]);
+        let provider = ProviderIdentity {
+            identity: vec![0x8b],
+            capabilities: ProviderCapabilities {
+                durable_cursor: true,
+                linearizable_fence: true,
+                rename_pairing: true,
+                overflow_scope: true,
+                filesystem_supported: true,
+                clean_proof_allowed: true,
+                power_loss_durability: true,
+            },
+        };
+        for identity in [
+            ScopeIdentity {
+                scope_id: ScopeId([0x8a; 32]),
+                kind: ScopeKind::MaterializedLane,
+                owner_id: branch.lane_id.clone(),
+            },
+            ScopeIdentity {
+                scope_id: ScopeId([0x8b; 32]),
+                kind: ScopeKind::WorkspaceView,
+                owner_id: view.view_id.clone(),
+            },
+        ] {
+            db.changed_path_ledger().begin_scope(
+                &identity,
+                &baseline,
+                &policy,
+                &filesystem,
+                &provider,
+            )?;
+        }
+        db.conn.execute(
+            "UPDATE changed_path_scopes SET scope_root=?1 WHERE scope_id=?2",
+            params![spawned.workdir, ScopeId([0x8a; 32]).to_text()],
+        )?;
+        let backup = root.path().join("restored-retire-backup");
+        db.create_backup(&backup, false)?;
+        let destination = root.path().join("restored-retire-destination");
+        Trail::restore_backup(&destination, &backup, false)?;
+        let mut restored = Trail::open(&destination)?;
+        let nullable: i64 = restored.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_scopes
+             WHERE scope_kind IN ('materialized_lane','workspace_view')
+               AND provider_identity IS NULL AND retired_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if nullable != 2 {
+            return Err(Error::Corrupt(format!(
+                "restore did not produce two nullable-provider deletion scopes: {nullable}"
+            )));
+        }
+        restored.remove_lane("restored-retire", true)?;
+        let retired: i64 = restored.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_scopes
+             WHERE scope_kind IN ('materialized_lane','workspace_view') AND retired_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if retired != 2 {
+            return Err(Error::Corrupt(format!(
+                "restored nullable-provider lane/view scopes were not retired: {retired}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn non_utf_database_path_mark_recover_and_retire() -> Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let fixture = Fixture::new(0x8c)?;
+        let Fixture {
+            _root,
+            db,
+            expected,
+            backup,
+            restore,
+        } = fixture;
+        let old_workspace = db.workspace_root.clone();
+        drop(db);
+        let new_workspace = _root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"workspace-\xff".to_vec()));
+        if let Err(error) = std::fs::rename(&old_workspace, &new_workspace) {
+            if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EILSEQ) {
+                let conn = Connection::open_in_memory()?;
+                let database_path = new_workspace.join(".trail/index/trail.sqlite");
+                let ledger = ChangedPathLedger::new_at(&conn, &database_path);
+                if ledger.database_path()?.as_os_str().as_bytes()
+                    != database_path.as_os_str().as_bytes()
+                {
+                    return Err(Error::Corrupt(
+                        "macOS lossless database path plumbing changed raw bytes".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        let db = Trail::open(&new_workspace)?;
+        let fixture = Fixture {
+            _root,
+            db,
+            expected,
+            backup,
+            restore,
+        };
+        let target = fixture.target(
+            "non-utf-database-path",
+            fixture.expected.baseline_root.clone(),
+        );
+        let ledger = fixture.db.changed_path_ledger();
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Materialize,
+            &target,
+            &Fixture::evidence("non-utf.txt"),
+        )?;
+        let proof = fixture.qualified_proof(1, "non-utf.txt")?;
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+        fixture.advance_ref_to(&target)?;
+        recover_scope(&ledger, &fixture.expected)?;
+
+        let mut retired_expected = fixture.expected.clone();
+        retired_expected.ref_generation = retired_expected.ref_generation.saturating_add(1);
+        let tokens = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &retired_expected)?;
+        remove_retired_segments(&tokens)?;
+        if tokens.is_empty()
+            || tokens.iter().any(|token| {
+                token
+                    .directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.open_regular(&token.leaf).is_ok())
+            })
+        {
+            return Err(Error::Corrupt(
+                "non-UTF database path did not retain proof/recovery/retirement authority".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn lane_deletion_retires_scope_first() -> Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("lane.txt"), b"lane\n")?;
@@ -1972,19 +2352,14 @@ mod harness {
                 power_loss_durability: true,
             },
         };
-        ChangedPathLedger::new(&db.conn).begin_scope(
-            &scope,
-            &baseline,
-            &policy,
-            &filesystem,
-            &provider,
-        )?;
+        db.changed_path_ledger()
+            .begin_scope(&scope, &baseline, &policy, &filesystem, &provider)?;
         let view_scope = ScopeIdentity {
             scope_id: ScopeId([0x6e; 32]),
             kind: ScopeKind::WorkspaceView,
             owner_id: view.view_id.clone(),
         };
-        ChangedPathLedger::new(&db.conn).begin_scope(
+        db.changed_path_ledger().begin_scope(
             &view_scope,
             &baseline,
             &policy,
@@ -2107,6 +2482,149 @@ mod harness {
     }
 
     #[test]
+    fn deletion_subprocess_crash_helper() {
+        let Some(workspace) = std::env::var_os("TRAIL_TEST_DELETION_CRASH_WORKSPACE") else {
+            return;
+        };
+        let lane = std::env::var("TRAIL_TEST_DELETION_CRASH_LANE").unwrap();
+        let mut db = Trail::open(std::path::Path::new(&workspace)).unwrap();
+        db.remove_lane(&lane, true).unwrap();
+        panic!("deletion crash helper passed its requested crash point");
+    }
+
+    #[test]
+    fn subprocess_kill_and_retry_covers_quarantine_deletion_boundaries() {
+        for (index, phase) in [
+            "changed_path_deletion_after_quarantine_move",
+            "changed_path_deletion_after_quarantine_verify",
+            "changed_path_deletion_after_quarantine_unlink",
+            "changed_path_deletion_after_quarantine_fsync",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("lane.txt"), b"lane\n").unwrap();
+            Trail::init(root.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+            let mut db = Trail::open(root.path()).unwrap();
+            let lane = format!("quarantine-crash-{index}");
+            let spawned = db
+                .spawn_lane(&lane, Some("main"), true, None, None)
+                .unwrap();
+            let branch = db.lane_branch(&lane).unwrap();
+            let head = db.get_ref(&branch.ref_name).unwrap();
+            let scope = ScopeIdentity {
+                scope_id: ScopeId([0x90_u8.wrapping_add(index as u8); 32]),
+                kind: ScopeKind::MaterializedLane,
+                owner_id: branch.lane_id.clone(),
+            };
+            db.changed_path_ledger()
+                .begin_scope(
+                    &scope,
+                    &BaselineIdentity {
+                        ref_name: head.name,
+                        ref_generation: u64::try_from(head.generation).unwrap(),
+                        change_id: head.change_id,
+                        root_id: head.root_id,
+                    },
+                    &PolicyIdentity {
+                        fingerprint: [0x90; 32],
+                        generation: 1,
+                    },
+                    &FilesystemIdentity(vec![0x91]),
+                    &ProviderIdentity {
+                        identity: vec![0x92],
+                        capabilities: ProviderCapabilities {
+                            durable_cursor: true,
+                            linearizable_fence: true,
+                            rename_pairing: true,
+                            overflow_scope: true,
+                            filesystem_supported: true,
+                            clean_proof_allowed: true,
+                            power_loss_durability: true,
+                        },
+                    },
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE changed_path_scopes SET scope_root=?1 WHERE scope_id=?2",
+                    params![spawned.workdir, scope.scope_id.to_text()],
+                )
+                .unwrap();
+            let leaf = format!("quarantine-crash-{index}.cpl");
+            db.conn
+                .execute(
+                    "INSERT INTO changed_path_observer_segments(
+                         scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
+                         first_sequence,last_sequence,durable_end_offset,folded_end_offset,
+                         previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
+                         created_at,sealed_at,updated_at)
+                     VALUES(?1,1,?2,1,'owner','provider',1,1,1,1,NULL,NULL,?3,?4,'sealed',?5,?5,?5)",
+                    params![
+                        scope.scope_id.to_text(),
+                        format!("quarantine-crash-{index}"),
+                        hex::encode([0x93; 32]),
+                        leaf,
+                        now_ts(),
+                    ],
+                )
+                .unwrap();
+            let segment_directory = db
+                .db_dir
+                .join("observer-segments")
+                .join(scope.scope_id.to_text());
+            std::fs::create_dir_all(&segment_directory).unwrap();
+            std::fs::write(segment_directory.join(&leaf), b"segment\n").unwrap();
+            let workdir = std::path::PathBuf::from(spawned.workdir.unwrap());
+            drop(db);
+
+            let ready = root.path().join(format!("{phase}.ready"));
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "db::change_ledger::recovery::harness::deletion_subprocess_crash_helper",
+                    "--nocapture",
+                ])
+                .env("RUST_TEST_THREADS", "1")
+                .env("TRAIL_TEST_CRASH_AT", phase)
+                .env("TRAIL_TEST_CRASH_READY", &ready)
+                .env("TRAIL_TEST_DELETION_CRASH_WORKSPACE", root.path())
+                .env("TRAIL_TEST_DELETION_CRASH_LANE", &lane)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            wait_for_crash_handshake(&mut child, &ready, phase);
+            child.kill().unwrap();
+            let _ = child.wait().unwrap();
+
+            let mut reopened = Trail::open(root.path()).unwrap();
+            reopened.remove_lane(&lane, true).unwrap();
+            let retired: bool = reopened
+                .conn
+                .query_row(
+                    "SELECT retired_at IS NOT NULL FROM changed_path_scopes WHERE scope_id=?1",
+                    [scope.scope_id.to_text()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let remaining_segments = std::fs::read_dir(&segment_directory)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    name == std::ffi::OsStr::new(&leaf)
+                        || name.to_string_lossy().starts_with(".trail-delete-")
+                })
+                .count();
+            assert!(retired, "scope did not remain retired after {phase}");
+            assert_eq!(remaining_segments, 0, "segment remained after {phase}");
+            assert!(!workdir.exists(), "workdir remained after {phase}");
+        }
+    }
+
+    #[test]
     fn subprocess_kill_and_reopen_covers_intent_durability_boundaries() {
         for (index, (phase, tamper)) in [
             ("changed_path_after_object_graph", None),
@@ -2194,7 +2712,7 @@ mod harness {
             }
 
             let reopened = Trail::open(&fixture.db.workspace_root).unwrap();
-            let ledger = ChangedPathLedger::new(&reopened.conn);
+            let ledger = reopened.changed_path_ledger();
             let _ = recover_scope(&ledger, &fixture.expected);
             let fsck = reopened.fsck().unwrap();
             assert!(
@@ -2525,7 +3043,7 @@ mod harness {
             root_id: target_ref.root_id.clone(),
             operation_id: Some(target_ref.operation_id.clone()),
         };
-        let ledger = ChangedPathLedger::new(&db.conn);
+        let ledger = db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &expected,
@@ -2727,7 +3245,7 @@ mod harness {
     pub(super) fn rejects_unqualified_or_stale_filesystem_proof() -> Result<()> {
         let fixture = Fixture::new(0x68)?;
         let target = fixture.target("stale-proof", fixture.expected.baseline_root.clone());
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -2772,7 +3290,7 @@ mod harness {
     pub(super) fn rejects_metadata_only_proof_without_sidecar() -> Result<()> {
         let fixture = Fixture::new(0x80)?;
         let target = fixture.target("missing-sidecar", fixture.expected.baseline_root.clone());
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let intent = prepare_intent(
             &ledger,
             &fixture.expected,
@@ -2801,7 +3319,7 @@ mod harness {
         let fixture = Fixture::new(0x69)?;
         let first_target =
             fixture.target("ambiguous-first", fixture.expected.baseline_root.clone());
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         prepare_intent(
             &ledger,
             &fixture.expected,
@@ -2941,6 +3459,24 @@ pub(crate) fn run_ambiguous_recovery_gate() -> std::result::Result<(), String> {
 #[cfg(debug_assertions)]
 pub(crate) fn run_backup_overwrite_rollback() -> std::result::Result<(), String> {
     harness::backup_overwrite_failure_preserves_previous().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_post_verification_substitution_rejection(
+) -> std::result::Result<(), String> {
+    harness::deletion_name_substitution_after_verification_fails_closed()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_restored_nullable_provider_lane_deletion() -> std::result::Result<(), String> {
+    harness::restored_nullable_provider_lane_deletion().map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, unix))]
+pub(crate) fn run_non_utf_database_path_mark_recover_and_retire() -> std::result::Result<(), String>
+{
+    harness::non_utf_database_path_mark_recover_and_retire().map_err(|error| error.to_string())
 }
 
 #[cfg(debug_assertions)]

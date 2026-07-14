@@ -90,3 +90,19 @@ fn retired_segment_deletion_keeps_retained_parent_authority() {
 fn retired_segment_deletion_rejects_leaf_substitution() {
     trail::test_support::changed_path_deletion_leaf_substitution_rejection().unwrap();
 }
+
+#[test]
+fn retired_segment_deletion_rejects_name_substitution_after_verification() {
+    trail::test_support::changed_path_deletion_post_verification_substitution_rejection().unwrap();
+}
+
+#[test]
+fn restored_nullable_provider_lane_and_view_scopes_can_be_deleted() {
+    trail::test_support::changed_path_restored_nullable_provider_lane_deletion().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn lossless_database_path_supports_mark_recovery_and_retirement() {
+    trail::test_support::changed_path_non_utf_database_path_mark_recover_and_retire().unwrap();
+}

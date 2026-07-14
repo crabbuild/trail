@@ -56,7 +56,13 @@ impl Trail {
             owners.push(view.view_id.as_str());
         }
         let roots = branch.workdir.as_deref().into_iter().collect::<Vec<_>>();
-        let retired_segments = retire_deletion_scopes(&self.conn, &owners, &roots)?;
+        let retired_segments = retire_deletion_scopes(
+            &self.conn,
+            &self.sqlite_path,
+            &owners,
+            &roots,
+            &[branch.ref_name.as_str()],
+        )?;
         remove_retired_segments(&retired_segments)?;
         remove_ref_file(&self.db_dir, &branch.ref_name)?;
         self.conn

@@ -107,6 +107,22 @@ pub mod test_support {
         crate::db::run_deletion_parent_substitution_rejection()
     }
 
+    pub fn changed_path_deletion_post_verification_substitution_rejection(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_deletion_post_verification_substitution_rejection()
+    }
+
+    pub fn changed_path_restored_nullable_provider_lane_deletion() -> std::result::Result<(), String>
+    {
+        crate::db::run_restored_nullable_provider_lane_deletion()
+    }
+
+    #[cfg(unix)]
+    pub fn changed_path_non_utf_database_path_mark_recover_and_retire(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_non_utf_database_path_mark_recover_and_retire()
+    }
+
     #[cfg(unix)]
     pub fn changed_path_deletion_leaf_substitution_rejection() -> std::result::Result<(), String> {
         crate::db::run_deletion_leaf_substitution_rejection()

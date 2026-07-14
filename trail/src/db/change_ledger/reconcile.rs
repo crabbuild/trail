@@ -2303,7 +2303,7 @@ mod compiled_harness {
                     power_loss_durability: false,
                 },
             };
-            ChangedPathLedger::new(&db.conn).begin_scope(
+            db.changed_path_ledger().begin_scope(
                 &scope,
                 &baseline,
                 &PolicyIdentity {
@@ -2348,7 +2348,7 @@ mod compiled_harness {
             &self,
             observer: &dyn QualifiedObserver,
         ) -> Result<ReconciliationAttempt> {
-            let ledger = ChangedPathLedger::new(&self.db.conn);
+            let ledger = self.db.changed_path_ledger();
             let mut attempt = begin_reconciliation(
                 &self.db,
                 &ledger,
@@ -2413,7 +2413,7 @@ mod compiled_harness {
         fs::remove_file(fixture.db.workspace_root.join("delete.txt"))?;
         fs::write(fixture.db.workspace_root.join("add.txt"), b"added\n")?;
         let observer = HarnessObserver { end_sequence: 10 };
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         let report = reconcile_full(
             &fixture.db,
             &ledger,
@@ -2449,7 +2449,7 @@ mod compiled_harness {
         fs::write(fixture.db.workspace_root.join("add.txt"), b"added\n")?;
         let observer = HarnessObserver { end_sequence: 10 };
         let attempt = fixture.begin_observed(&observer)?;
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         ledger.mark_untrusted(
             &fixture.expected,
             TrustState::StaleBaseline,
@@ -2469,7 +2469,7 @@ mod compiled_harness {
              WHERE scope_id=?1",
             [fixture.expected.scope_id.to_text()],
         )?;
-        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let ledger = fixture.db.changed_path_ledger();
         require(
             attempt
                 .publish(&fixture.db, &ledger, &fixture.policy)
@@ -2898,7 +2898,7 @@ mod tests {
                     power_loss_durability: false,
                 },
             };
-            ChangedPathLedger::new(&db.conn)
+            db.changed_path_ledger()
                 .begin_scope(&scope, &baseline, &policy_identity, &filesystem, &provider)
                 .unwrap();
             let expected = ExpectedScope {
@@ -4576,7 +4576,7 @@ mod tests {
                 power_loss_durability: false,
             },
         };
-        ChangedPathLedger::new(&db.conn)
+        db.changed_path_ledger()
             .begin_scope(
                 &scope,
                 &BaselineIdentity {
@@ -4645,7 +4645,7 @@ mod tests {
         db.conn
             .execute("DELETE FROM worktree_file_index", [])
             .unwrap();
-        let ledger = ChangedPathLedger::new(&db.conn);
+        let ledger = db.changed_path_ledger();
         let observer = FakeQualifiedObserver::new();
 
         let report = reconcile_full(

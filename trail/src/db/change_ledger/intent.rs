@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use getrandom::getrandom;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -250,7 +250,7 @@ pub(crate) fn mark_filesystem_applied(
             intent_id.0
         )));
     }
-    validate_qualified_filesystem_proof(&tx, expected, &intent, proof)?;
+    validate_qualified_filesystem_proof(&tx, ledger.database_path()?, expected, &intent, proof)?;
     let changed = tx.execute(
         "UPDATE changed_path_intents SET lifecycle_state='filesystem_applied',verified_cut=?1,
              updated_at=?2
@@ -411,6 +411,7 @@ pub(super) fn stage_intent_evidence(tx: &Transaction<'_>, intent: &PersistedInte
 
 pub(super) fn validate_qualified_filesystem_proof(
     conn: &rusqlite::Connection,
+    database_path: &Path,
     expected: &ExpectedScope,
     intent: &PersistedIntent,
     proof: &QualifiedFilesystemProof,
@@ -556,10 +557,6 @@ pub(super) fn validate_qualified_filesystem_proof(
         ));
     }
 
-    let database_path = conn
-        .path()
-        .map(PathBuf::from)
-        .ok_or_else(|| invalid("filesystem proof database path is unavailable"))?;
     let expected_directory = format!("observer-segments/{}", expected.scope_id.to_text());
     if proof.segment_directory != expected_directory {
         return Err(invalid(
@@ -603,7 +600,7 @@ pub(super) fn validate_qualified_filesystem_proof(
         .map_err(|_| Error::Corrupt("unfolded observer record limit exceeds usize".into()))?,
     };
     let recovered = super::recover_segments_from_directory(
-        &database_path,
+        database_path,
         &segment_directory,
         &super::RecoveryScope {
             scope_id: expected.scope_id,

@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 
 pub(crate) struct ChangedPathLedger<'a> {
     pub(super) conn: &'a Connection,
+    database_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -19,8 +20,25 @@ struct ScopeRow {
 }
 
 impl<'a> ChangedPathLedger<'a> {
+    #[cfg(test)]
     pub(crate) fn new(conn: &'a Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            database_path: None,
+        }
+    }
+
+    pub(crate) fn new_at(conn: &'a Connection, database_path: &std::path::Path) -> Self {
+        Self {
+            conn,
+            database_path: Some(database_path.to_path_buf()),
+        }
+    }
+
+    pub(crate) fn database_path(&self) -> Result<&std::path::Path> {
+        self.database_path.as_deref().ok_or_else(|| {
+            Error::InvalidInput("changed-path database path authority is unavailable".into())
+        })
     }
 
     pub(crate) fn begin_scope(
@@ -809,6 +827,22 @@ mod tests {
     use crate::db::{InitImportMode, Trail};
     use crate::error::Error;
     use crate::{ChangeId, ObjectId};
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_retains_lossless_non_utf8_database_path_authority() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let conn = Connection::open_in_memory().unwrap();
+        let path = std::path::Path::new(OsStr::from_bytes(b"/tmp/trail-\xff/index/trail.sqlite"));
+        let ledger = ChangedPathLedger::new_at(&conn, path);
+
+        assert_eq!(
+            ledger.database_path().unwrap().as_os_str().as_bytes(),
+            path.as_os_str().as_bytes()
+        );
+    }
 
     const FIXTURE_SCHEMA: &str = "
         PRAGMA foreign_keys = ON;

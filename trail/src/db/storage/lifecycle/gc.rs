@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::change_ledger::{ledger_gc_roots, ChangedPathLedger, IntentGcRoot};
+use crate::db::change_ledger::{ledger_gc_roots, IntentGcRoot};
 
 impl Trail {
     pub fn gc(&mut self, dry_run: bool) -> Result<GcReport> {
@@ -9,7 +9,7 @@ impl Trail {
         // may collect a target that recovery proved terminal.
         let intent_roots = ledger_gc_roots(&self.conn)?;
         if !dry_run {
-            ChangedPathLedger::new(&self.conn).recover()?;
+            self.changed_path_ledger().recover()?;
         }
         let reachable = self.reachable_object_ids_with_intent_roots(&intent_roots)?;
         let known_kinds = known_gc_object_kinds();
