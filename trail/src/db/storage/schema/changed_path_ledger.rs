@@ -279,6 +279,50 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
          );
          CREATE INDEX changed_path_observer_segments_state_idx
              ON changed_path_observer_segments(scope_id, epoch, state, last_sequence);
+         CREATE TABLE changed_path_segment_quarantine_allocations (
+             attempt_nonce TEXT PRIMARY KEY CHECK (length(attempt_nonce) = 64),
+             scope_id TEXT NOT NULL,
+             epoch INTEGER NOT NULL CHECK (epoch >= 1),
+             segment_id TEXT NOT NULL CHECK (length(segment_id) > 0),
+             quarantine_directory_leaf TEXT NOT NULL UNIQUE
+                 CHECK (length(quarantine_directory_leaf) > 0),
+             scope_directory_device TEXT NOT NULL CHECK (length(scope_directory_device) > 0),
+             scope_directory_inode TEXT NOT NULL CHECK (length(scope_directory_inode) > 0),
+             identity_policy TEXT NOT NULL
+                 CHECK (identity_policy = 'fresh_private_0700_same_euid'),
+             quarantine_directory_device TEXT,
+             quarantine_directory_inode TEXT,
+             observed_conflict_device TEXT,
+             observed_conflict_inode TEXT,
+             retained_reason TEXT,
+             state TEXT NOT NULL DEFAULT 'allocating'
+                 CHECK (state IN ('allocating', 'allocated', 'bound', 'abandoned')),
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             allocated_at INTEGER,
+             bound_at INTEGER,
+             abandoned_at INTEGER,
+             FOREIGN KEY (scope_id, epoch, segment_id)
+                 REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
+                 ON UPDATE CASCADE ON DELETE CASCADE,
+             CHECK ((quarantine_directory_device IS NULL) =
+                    (quarantine_directory_inode IS NULL)),
+             CHECK ((observed_conflict_device IS NULL) =
+                    (observed_conflict_inode IS NULL)),
+             CHECK (state NOT IN ('allocated', 'bound') OR
+                    (quarantine_directory_device IS NOT NULL AND allocated_at IS NOT NULL)),
+             CHECK ((state = 'bound' AND bound_at IS NOT NULL) OR
+                    (state <> 'bound' AND bound_at IS NULL)),
+             CHECK ((state = 'abandoned' AND retained_reason IS NOT NULL
+                      AND abandoned_at IS NOT NULL) OR
+                    (state <> 'abandoned' AND retained_reason IS NULL
+                      AND abandoned_at IS NULL))
+         );
+         CREATE INDEX changed_path_segment_quarantine_allocations_state_idx
+             ON changed_path_segment_quarantine_allocations(scope_id, epoch, segment_id, state);
+         CREATE UNIQUE INDEX changed_path_segment_quarantine_allocations_active_idx
+             ON changed_path_segment_quarantine_allocations(scope_id, epoch, segment_id)
+             WHERE state IN ('allocating', 'allocated', 'bound');
          CREATE TABLE changed_path_segment_deletions (
              scope_id TEXT NOT NULL,
              epoch INTEGER NOT NULL CHECK (epoch >= 1),
@@ -287,6 +331,7 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              quarantine_directory_leaf TEXT NOT NULL
                  CHECK (length(quarantine_directory_leaf) > 0),
              quarantine_leaf TEXT NOT NULL CHECK (length(quarantine_leaf) > 0),
+             allocation_nonce TEXT NOT NULL UNIQUE CHECK (length(allocation_nonce) = 64),
              scope_directory_device TEXT NOT NULL CHECK (length(scope_directory_device) > 0),
              scope_directory_inode TEXT NOT NULL CHECK (length(scope_directory_inode) > 0),
              quarantine_directory_device TEXT NOT NULL
@@ -318,6 +363,9 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              UNIQUE (scope_id, epoch, quarantine_directory_leaf),
              FOREIGN KEY (scope_id, epoch, segment_id)
                  REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
+                 ON UPDATE CASCADE ON DELETE CASCADE,
+             FOREIGN KEY (allocation_nonce)
+                 REFERENCES changed_path_segment_quarantine_allocations(attempt_nonce)
                  ON UPDATE CASCADE ON DELETE CASCADE,
              CHECK ((state = 'quiesced' AND completed_at IS NOT NULL)
                     OR (state <> 'quiesced' AND completed_at IS NULL))

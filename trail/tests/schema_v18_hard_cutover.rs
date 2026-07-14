@@ -299,6 +299,8 @@ fn fresh_init_creates_the_exact_v18_ledger_shape() {
         "changed_path_reconciliations",
         "changed_path_observer_segments",
         "changed_path_observer_owners",
+        "changed_path_segment_quarantine_allocations",
+        "changed_path_segment_deletions",
     ] {
         let sql: String = conn
             .query_row(
@@ -465,6 +467,54 @@ fn fresh_init_creates_the_exact_v18_ledger_shape() {
         )
         .unwrap();
     assert_eq!(delete_action, "SET NULL");
+
+    let allocation_columns = conn
+        .prepare(
+            "SELECT name FROM pragma_table_info('changed_path_segment_quarantine_allocations')
+             ORDER BY cid",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        allocation_columns,
+        vec![
+            "attempt_nonce",
+            "scope_id",
+            "epoch",
+            "segment_id",
+            "quarantine_directory_leaf",
+            "scope_directory_device",
+            "scope_directory_inode",
+            "identity_policy",
+            "quarantine_directory_device",
+            "quarantine_directory_inode",
+            "observed_conflict_device",
+            "observed_conflict_inode",
+            "retained_reason",
+            "state",
+            "created_at",
+            "updated_at",
+            "allocated_at",
+            "bound_at",
+            "abandoned_at",
+        ]
+    );
+    let deletion_allocation_column: (String, String, i64) = conn
+        .query_row(
+            "SELECT name,type,[notnull]
+             FROM pragma_table_info('changed_path_segment_deletions')
+             WHERE name='allocation_nonce'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        deletion_allocation_column,
+        ("allocation_nonce".into(), "TEXT".into(), 1)
+    );
 
     let index_columns = conn
         .prepare(
