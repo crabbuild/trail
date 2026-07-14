@@ -296,6 +296,7 @@ mod tests {
                 initialized: true,
                 baseline_root_id,
                 generation: 1,
+                policy_invalidation_index: None,
             })),
             persist: None,
             watcher: None,

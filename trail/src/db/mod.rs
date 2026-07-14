@@ -965,6 +965,7 @@ pub(crate) struct DaemonWorktreeCacheState {
     initialized: bool,
     baseline_root_id: Option<ObjectId>,
     generation: u64,
+    policy_invalidation_index: Option<change_ledger::PolicyInvalidationIndex>,
 }
 
 #[derive(Debug)]

@@ -410,6 +410,10 @@ fn fresh_init_creates_the_exact_v18_ledger_shape() {
     assert!(policy_sql.contains("WITHOUT ROWID"));
     assert!(policy_sql.contains("content_identity BLOB NOT NULL"));
     assert!(policy_sql.contains("metadata_identity BLOB NOT NULL"));
+    assert!(
+        policy_sql.contains("'ignore'"),
+        "the walker-native .ignore source requires a distinct durable dependency role"
+    );
 
     let policy_index_columns = conn
         .prepare(

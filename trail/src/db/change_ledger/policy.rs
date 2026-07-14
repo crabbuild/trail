@@ -90,6 +90,7 @@ mod tests {
                 recording: &self.db.config.recording,
                 case_sensitive: true,
                 git_environment: &self.git_env,
+                observer_cut: None,
             }
         }
 
@@ -114,6 +115,18 @@ mod tests {
         assert!(raw_path_may_invalidate_policy(Path::new(
             ".trail/config.toml"
         )));
+        let nested_rules = policy
+            .snapshot
+            .rule_sources
+            .iter()
+            .find(|source| source.path == fixture.root().join("src/.gitignore"))
+            .expect("compiled snapshot pins semantic rule bytes");
+        assert_eq!(nested_rules.bytes, b"generated\n");
+        assert!(policy
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency_is_file(dependency))
+            .all(|dependency| !dependency.observable && dependency.last_source_sequence == 0));
     }
 
     #[test]
@@ -127,6 +140,8 @@ mod tests {
         assert_eq!(first.fingerprint, second.fingerprint);
         assert_eq!(metrics.policy_dependency_full_discovery, 1);
         assert!(second.reused_manifest);
+        assert!(second.stale_baseline);
+        assert_eq!(second.adapter_equivalence, AdapterEquivalence::Conservative);
         let persisted: i64 = fixture
             .db
             .conn
@@ -137,6 +152,196 @@ mod tests {
             )
             .unwrap();
         assert_eq!(persisted as usize, second.dependencies.len());
+    }
+
+    #[test]
+    fn no_observer_proof_never_returns_equivalent_even_when_direct_checks_reuse_manifest() {
+        let fixture = Fixture::new();
+        let mut metrics = PolicyDependencyMetrics::default();
+        let _first = fixture.compile(&mut metrics);
+        fs::create_dir_all(fixture.root().join("new/nested")).unwrap();
+        fs::write(fixture.root().join("new/nested/.gitignore"), "late\n").unwrap();
+
+        let reused = fixture.compile(&mut metrics);
+
+        assert!(
+            reused.reused_manifest,
+            "bounded direct reuse remains permitted"
+        );
+        assert!(reused.stale_baseline);
+        assert_eq!(reused.adapter_equivalence, AdapterEquivalence::Conservative);
+        assert_eq!(metrics.policy_dependency_full_discovery, 1);
+    }
+
+    #[test]
+    fn exact_invalidation_index_matches_arbitrary_dependency_with_case_policy() {
+        let fixture = Fixture::new();
+        let mut policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+        let arbitrary = fixture.root().join("config/Arbitrary.Rules");
+        fs::create_dir_all(arbitrary.parent().unwrap()).unwrap();
+        fs::write(&arbitrary, "*.generated\n").unwrap();
+        policy.dependencies.push(
+            file_dependency(
+                &arbitrary,
+                PolicyDependencyKind::GitExcludesFile,
+                policy.manifest().generation,
+                &fixture.context(),
+            )
+            .unwrap(),
+        );
+        policy.invalidation_index =
+            PolicyInvalidationIndex::from_dependencies(fixture.root(), false, &policy.dependencies)
+                .unwrap();
+
+        assert!(raw_event_invalidates_policy(
+            &policy,
+            Path::new("CONFIG/arbitrary.rules")
+        ));
+        assert!(!raw_event_invalidates_policy(
+            &policy,
+            Path::new("config/unrelated.rules")
+        ));
+    }
+
+    #[test]
+    fn default_missing_git_candidates_and_missing_include_target_are_authoritative() {
+        let mut fixture = Fixture::new();
+        let home = fixture.root().parent().unwrap().join("home");
+        let xdg = fixture.root().parent().unwrap().join("xdg");
+        fs::create_dir_all(home.join(".config/git")).unwrap();
+        fs::create_dir_all(xdg.join("git")).unwrap();
+        let global = home.join(".gitconfig");
+        let missing_include = home.join("not-created-yet.gitconfig");
+        fs::write(
+            &global,
+            format!("[include]\n\tpath = {}\n", missing_include.display()),
+        )
+        .unwrap();
+        fixture.git_env = vec![
+            ("HOME".into(), home.as_os_str().to_owned()),
+            ("XDG_CONFIG_HOME".into(), xdg.as_os_str().to_owned()),
+            ("GIT_CONFIG_NOSYSTEM".into(), "0".into()),
+            (
+                "GIT_CONFIG_SYSTEM".into(),
+                fixture
+                    .root()
+                    .parent()
+                    .unwrap()
+                    .join("system.gitconfig")
+                    .into_os_string(),
+            ),
+        ];
+
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+        for candidate in [
+            home.join(".gitconfig"),
+            xdg.join("git/config"),
+            fixture.root().parent().unwrap().join("system.gitconfig"),
+            xdg.join("git/ignore"),
+            missing_include.clone(),
+        ] {
+            assert!(
+                policy
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.identity
+                        == dependency_path_identity_with_case(&candidate, true)),
+                "missing candidate {}",
+                candidate.display()
+            );
+        }
+        fs::write(&missing_include, "[core]\n\texcludesFile = ignored\n").unwrap();
+        assert_eq!(
+            validate_policy_manifest(&fixture.context(), &policy.manifest()).unwrap(),
+            PolicyManifestValidation::Changed
+        );
+    }
+
+    #[test]
+    fn config_selector_environment_change_invalidates_direct_reuse() {
+        let mut fixture = Fixture::new();
+        let first = fixture.compile(&mut PolicyDependencyMetrics::default());
+        fixture.git_env.push((
+            "XDG_CONFIG_HOME".into(),
+            fixture.root().join("different-xdg").into_os_string(),
+        ));
+
+        assert_eq!(
+            validate_policy_manifest(&fixture.context(), &first.manifest()).unwrap(),
+            PolicyManifestValidation::Changed
+        );
+    }
+
+    #[test]
+    fn canonical_fingerprint_is_framed_and_rejects_duplicate_identities() {
+        let fixture = Fixture::new();
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+        let mut duplicate = policy.manifest();
+        duplicate
+            .dependencies
+            .push(duplicate.dependencies[0].clone());
+        assert!(validate_policy_manifest(&fixture.context(), &duplicate).is_err());
+
+        let mut left = policy.dependencies[0].clone();
+        let mut right = policy.dependencies[0].clone();
+        left.identity = "ab".into();
+        right.identity = "a".into();
+        let left_fingerprint = policy_fingerprint(&[left.clone(), {
+            let mut x = right.clone();
+            x.identity = "c".into();
+            x
+        }])
+        .unwrap();
+        let right_fingerprint = policy_fingerprint(&[
+            {
+                left.identity = "a".into();
+                left
+            },
+            {
+                right.identity = "bc".into();
+                right
+            },
+        ])
+        .unwrap();
+        assert_ne!(left_fingerprint, right_fingerprint);
+    }
+
+    #[test]
+    fn stale_expected_scope_cannot_delete_concurrent_manifest_replacement() {
+        let fixture = Fixture::new();
+        let first = fixture.compile(&mut PolicyDependencyMetrics::default());
+        fixture
+            .db
+            .conn
+            .execute(
+                "UPDATE changed_path_scopes SET epoch=epoch+1 WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+            )
+            .unwrap();
+        let mut replacement_expected = fixture.expected.clone();
+        replacement_expected.epoch += 1;
+        let replacement =
+            discover_policy_manifest(replacement_expected.policy_generation, &fixture.context())
+                .unwrap();
+        persist_policy_manifest_and_stale(&fixture.db.conn, &replacement_expected, &replacement)
+            .unwrap();
+
+        let stale_result = persist_policy_manifest_and_stale(
+            &fixture.db.conn,
+            &fixture.expected,
+            &first.manifest(),
+        );
+        assert!(stale_result.is_err());
+        let count: i64 = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM changed_path_policy_dependencies WHERE scope_id=?1",
+                [replacement_expected.scope_id.to_text()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count as usize, replacement.dependencies.len());
     }
 
     #[test]
@@ -269,6 +474,7 @@ mod tests {
         for kind in [
             PolicyDependencyKind::Builtin,
             PolicyDependencyKind::TrailConfig,
+            PolicyDependencyKind::Ignore,
             PolicyDependencyKind::Normalization,
             PolicyDependencyKind::Mode,
             PolicyDependencyKind::CasePolicy,
@@ -311,13 +517,15 @@ mod tests {
 use super::ExpectedScope;
 use crate::error::{Error, Result};
 use crate::model::RecordingConfig;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 const BUILTIN_POLICY_VERSION: &[u8] = b"trail-recording-policy-v1";
@@ -328,6 +536,7 @@ const MODE_POLICY: &[u8] = b"regular-files-only-no-follow-executable-bit-v1";
 pub(crate) enum PolicyDependencyKind {
     Builtin,
     TrailConfig,
+    Ignore,
     Trailignore,
     Gitignore,
     GitInfoExclude,
@@ -343,6 +552,7 @@ impl PolicyDependencyKind {
         match self {
             Self::Builtin => "builtin",
             Self::TrailConfig => "trail_config",
+            Self::Ignore => "ignore",
             Self::Trailignore => "trailignore",
             Self::Gitignore => "gitignore",
             Self::GitInfoExclude => "git_info_exclude",
@@ -358,6 +568,7 @@ impl PolicyDependencyKind {
         match value {
             "builtin" => Ok(Self::Builtin),
             "trail_config" => Ok(Self::TrailConfig),
+            "ignore" => Ok(Self::Ignore),
             "trailignore" => Ok(Self::Trailignore),
             "gitignore" => Ok(Self::Gitignore),
             "git_info_exclude" => Ok(Self::GitInfoExclude),
@@ -388,6 +599,14 @@ pub(crate) struct PolicyDependency {
 pub(crate) struct PolicyManifest {
     pub(crate) dependencies: Vec<PolicyDependency>,
     pub(crate) generation: u64,
+    rule_sources: Vec<PolicyRuleSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PolicyRuleSource {
+    pub(crate) kind: PolicyDependencyKind,
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,6 +615,110 @@ pub(crate) struct RecordingPolicySnapshot {
     pub(crate) ignore_gitignored: bool,
     pub(crate) dependency_files: Vec<PathBuf>,
     pub(crate) case_sensitive: bool,
+    pub(crate) rule_sources: Vec<PolicyRuleSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QualifiedPolicyObserverCut {
+    pub(crate) scope_id: super::ScopeId,
+    pub(crate) provider_identity: Vec<u8>,
+    pub(crate) discovery_started_sequence: u64,
+    pub(crate) through_sequence: u64,
+    pub(crate) covered_roots: Vec<PathBuf>,
+    pub(crate) case_sensitive: bool,
+}
+
+impl QualifiedPolicyObserverCut {
+    pub(crate) fn validate_for(
+        &self,
+        expected: &ExpectedScope,
+        workspace_root: &Path,
+        case_sensitive: bool,
+    ) -> bool {
+        self.scope_id == expected.scope_id
+            && self.provider_identity == expected.provider_identity
+            && self.discovery_started_sequence > 0
+            && self.through_sequence >= self.discovery_started_sequence
+            && self.case_sensitive == case_sensitive
+            && self.covered_roots.iter().any(|root| {
+                normalized_path_key(root, case_sensitive)
+                    == normalized_path_key(workspace_root, case_sensitive)
+            })
+    }
+
+    fn covers(&self, path: &Path) -> bool {
+        let path = normalized_path_key(path, self.case_sensitive);
+        self.covered_roots.iter().any(|root| {
+            let root = normalized_path_key(root, self.case_sensitive);
+            path == root || path.strip_prefix(&format!("{root}/")).is_some()
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PolicyInvalidationIndex {
+    case_sensitive: bool,
+    exact_paths: BTreeSet<String>,
+}
+
+impl PolicyInvalidationIndex {
+    pub(crate) fn from_paths<'a>(
+        workspace_root: &Path,
+        case_sensitive: bool,
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> Self {
+        let exact_paths = paths
+            .into_iter()
+            .map(|path| {
+                let path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    workspace_root.join(path)
+                };
+                normalized_path_key(&path, case_sensitive)
+            })
+            .collect();
+        Self {
+            case_sensitive,
+            exact_paths,
+        }
+    }
+
+    pub(crate) fn from_dependencies(
+        workspace_root: &Path,
+        case_sensitive: bool,
+        dependencies: &[PolicyDependency],
+    ) -> Result<Self> {
+        let root = lexical_normalize(workspace_root);
+        let mut exact_paths = BTreeSet::new();
+        for dependency in dependencies
+            .iter()
+            .filter(|dependency| dependency_is_file(dependency))
+        {
+            let path = dependency_identity_path(&dependency.identity)
+                .ok_or_else(|| Error::Corrupt("non-canonical policy path identity".into()))?;
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            exact_paths.insert(normalized_path_key(&path, case_sensitive));
+        }
+        Ok(Self {
+            case_sensitive,
+            exact_paths,
+        })
+    }
+
+    pub(crate) fn matches(&self, workspace_root: &Path, path: &Path) -> bool {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_root.join(path)
+        };
+        self.exact_paths
+            .contains(&normalized_path_key(&path, self.case_sensitive))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -412,6 +735,7 @@ pub(crate) struct CompiledPolicy {
     pub(crate) adapter_equivalence: AdapterEquivalence,
     pub(crate) stale_baseline: bool,
     pub(crate) reused_manifest: bool,
+    pub(crate) invalidation_index: PolicyInvalidationIndex,
 }
 
 impl CompiledPolicy {
@@ -423,6 +747,7 @@ impl CompiledPolicy {
                 .map(|dependency| dependency.generation)
                 .unwrap_or(0),
             dependencies: self.dependencies.clone(),
+            rule_sources: self.snapshot.rule_sources.clone(),
         }
     }
 }
@@ -446,6 +771,7 @@ pub(crate) struct PolicyCompileContext<'a> {
     pub(crate) recording: &'a RecordingConfig,
     pub(crate) case_sensitive: bool,
     pub(crate) git_environment: &'a [(OsString, OsString)],
+    pub(crate) observer_cut: Option<&'a QualifiedPolicyObserverCut>,
 }
 
 pub(crate) fn compile_policy(
@@ -454,18 +780,47 @@ pub(crate) fn compile_policy(
     context: &PolicyCompileContext<'_>,
     metrics: &mut PolicyDependencyMetrics,
 ) -> Result<CompiledPolicy> {
+    conn.execute_batch("SAVEPOINT changed_path_policy_compile;")?;
+    let result = compile_policy_guarded(conn, expected, context, metrics);
+    match result {
+        Ok(policy) => {
+            conn.execute_batch("RELEASE changed_path_policy_compile;")?;
+            Ok(policy)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO changed_path_policy_compile; RELEASE changed_path_policy_compile;",
+            );
+            Err(err)
+        }
+    }
+}
+
+fn compile_policy_guarded(
+    conn: &Connection,
+    expected: &ExpectedScope,
+    context: &PolicyCompileContext<'_>,
+    metrics: &mut PolicyDependencyMetrics,
+) -> Result<CompiledPolicy> {
+    policy_scope_cas_guard(conn, expected)?;
     let stored = load_policy_manifest(conn, expected)?;
     let had_stored_manifest = stored.is_some();
-    if let Some(manifest) = stored {
+    if let Some(mut manifest) = stored {
         metrics.policy_dependency_direct_checks = metrics
             .policy_dependency_direct_checks
             .saturating_add(manifest.dependencies.len() as u64);
-        match validate_policy_manifest(context, &manifest)? {
+        let (validation, rule_sources) = validate_policy_manifest_and_pin(context, &manifest)?;
+        manifest.rule_sources = rule_sources;
+        match validation {
             PolicyManifestValidation::Current => {
-                return finish_compiled_policy(conn, expected, context, manifest, true, false)
+                let policy = finish_compiled_policy(expected, context, manifest, true, false)?;
+                mark_policy_stale_guarded(conn, expected, "policy_observer_cut_unavailable")?;
+                return Ok(policy);
             }
             PolicyManifestValidation::Unobservable => {
-                return finish_compiled_policy(conn, expected, context, manifest, true, true)
+                let policy = finish_compiled_policy(expected, context, manifest, true, true)?;
+                mark_policy_stale_guarded(conn, expected, "policy_observer_cut_unavailable")?;
+                return Ok(policy);
             }
             PolicyManifestValidation::Changed => {}
         }
@@ -473,48 +828,62 @@ pub(crate) fn compile_policy(
 
     metrics.policy_dependency_full_discovery =
         metrics.policy_dependency_full_discovery.saturating_add(1);
-    let manifest = discover_policy_manifest(expected.policy_generation, context)?;
-    persist_policy_manifest(conn, expected, &manifest)?;
-    finish_compiled_policy(
-        conn,
-        expected,
-        context,
-        manifest,
-        false,
-        had_stored_manifest,
-    )
+    let mut manifest = discover_policy_manifest(expected.policy_generation, context)?;
+    let (validation, rule_sources) = validate_policy_manifest_and_pin(context, &manifest)?;
+    if validation == PolicyManifestValidation::Changed {
+        return Err(Error::InvalidInput(
+            "policy dependency changed during discovery; retry reconciliation".into(),
+        ));
+    }
+    manifest.rule_sources = rule_sources;
+    persist_policy_manifest_rows(conn, expected, &manifest)?;
+    let policy = finish_compiled_policy(expected, context, manifest, false, had_stored_manifest)?;
+    mark_policy_stale_guarded(conn, expected, "policy_observer_cut_unavailable")?;
+    Ok(policy)
 }
 
 fn finish_compiled_policy(
-    conn: &Connection,
     expected: &ExpectedScope,
     context: &PolicyCompileContext<'_>,
     manifest: PolicyManifest,
     reused_manifest: bool,
     dependency_stale: bool,
 ) -> Result<CompiledPolicy> {
-    let fingerprint = policy_fingerprint(&manifest.dependencies);
+    let fingerprint = policy_fingerprint(&manifest.dependencies)?;
     let has_unobservable = manifest
         .dependencies
         .iter()
         .any(|dependency| !dependency.observable);
-    let stale_baseline =
-        dependency_stale || has_unobservable || fingerprint != expected.policy_fingerprint;
-    if stale_baseline {
-        mark_policy_stale(conn, expected)?;
-    }
+    let has_complete_observer_cut = context.observer_cut.is_some_and(|cut| {
+        cut.validate_for(expected, context.workspace_root, context.case_sensitive)
+            && manifest
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency_is_file(dependency))
+                .all(|dependency| dependency.observable && dependency.last_source_sequence > 0)
+    });
+    let stale_baseline = dependency_stale
+        || has_unobservable
+        || !has_complete_observer_cut
+        || fingerprint != expected.policy_fingerprint;
     let dependency_files = manifest
         .dependencies
         .iter()
         .filter(|dependency| dependency_is_file(dependency))
         .filter_map(|dependency| dependency_identity_path(&dependency.identity))
         .collect();
+    let invalidation_index = PolicyInvalidationIndex::from_dependencies(
+        context.workspace_root,
+        context.case_sensitive,
+        &manifest.dependencies,
+    )?;
     Ok(CompiledPolicy {
         snapshot: RecordingPolicySnapshot {
             workspace_root: context.workspace_root.to_path_buf(),
             ignore_gitignored: context.recording.ignore_gitignored,
             dependency_files,
             case_sensitive: context.case_sensitive,
+            rule_sources: manifest.rule_sources.clone(),
         },
         fingerprint,
         dependencies: manifest.dependencies,
@@ -525,6 +894,7 @@ fn finish_compiled_policy(
         },
         stale_baseline,
         reused_manifest,
+        invalidation_index,
     })
 }
 
@@ -532,35 +902,48 @@ pub(crate) fn validate_policy_manifest(
     context: &PolicyCompileContext<'_>,
     manifest: &PolicyManifest,
 ) -> Result<PolicyManifestValidation> {
+    validate_policy_manifest_and_pin(context, manifest).map(|(validation, _)| validation)
+}
+
+fn validate_policy_manifest_and_pin(
+    context: &PolicyCompileContext<'_>,
+    manifest: &PolicyManifest,
+) -> Result<(PolicyManifestValidation, Vec<PolicyRuleSource>)> {
+    validate_manifest_canonical(manifest)?;
     let synthetic = synthetic_dependencies(manifest.generation, context)?
         .into_iter()
         .map(|dependency| ((dependency.kind, dependency.identity.clone()), dependency))
         .collect::<BTreeMap<_, _>>();
     let mut unobservable = false;
+    let mut rule_sources = Vec::new();
     for dependency in &manifest.dependencies {
-        let current = if dependency_is_file(dependency) {
+        let (current, bytes) = if dependency_is_file(dependency) {
             let Some(path) = dependency_identity_path(&dependency.identity) else {
-                return Ok(PolicyManifestValidation::Changed);
+                return Ok((PolicyManifestValidation::Changed, Vec::new()));
             };
-            file_dependency(
-                &path,
-                dependency.kind,
-                dependency.generation,
-                context.workspace_root,
-            )?
+            read_file_dependency(&path, dependency.kind, dependency.generation, context)?
         } else {
             let Some(current) = synthetic.get(&(dependency.kind, dependency.identity.clone()))
             else {
-                return Ok(PolicyManifestValidation::Changed);
+                return Ok((PolicyManifestValidation::Changed, Vec::new()));
             };
-            current.clone()
+            (current.clone(), Vec::new())
         };
         if dependency.content_identity != current.content_identity
             || dependency.metadata_identity != current.metadata_identity
             || dependency.observable != current.observable
             || dependency.generation != current.generation
         {
-            return Ok(PolicyManifestValidation::Changed);
+            return Ok((PolicyManifestValidation::Changed, Vec::new()));
+        }
+        if dependency_is_rule_file(dependency.kind) {
+            let path = dependency_identity_path(&dependency.identity)
+                .ok_or_else(|| Error::Corrupt("invalid policy rule identity".into()))?;
+            rule_sources.push(PolicyRuleSource {
+                kind: dependency.kind,
+                path,
+                bytes,
+            });
         }
         unobservable |= !dependency.observable;
     }
@@ -571,36 +954,51 @@ pub(crate) fn validate_policy_manifest(
         .count()
         != synthetic.len()
     {
-        return Ok(PolicyManifestValidation::Changed);
+        return Ok((PolicyManifestValidation::Changed, Vec::new()));
     }
-    Ok(if unobservable {
-        PolicyManifestValidation::Unobservable
-    } else {
-        PolicyManifestValidation::Current
-    })
+    Ok((
+        if unobservable {
+            PolicyManifestValidation::Unobservable
+        } else {
+            PolicyManifestValidation::Current
+        },
+        rule_sources,
+    ))
 }
 
 fn dependency_is_file(dependency: &PolicyDependency) -> bool {
     dependency.identity.starts_with("path:")
 }
 
+fn dependency_is_rule_file(kind: PolicyDependencyKind) -> bool {
+    matches!(
+        kind,
+        PolicyDependencyKind::Ignore
+            | PolicyDependencyKind::Trailignore
+            | PolicyDependencyKind::Gitignore
+            | PolicyDependencyKind::GitInfoExclude
+            | PolicyDependencyKind::GitExcludesFile
+    )
+}
+
 pub(crate) fn raw_event_invalidates_policy(policy: &CompiledPolicy, path: &Path) -> bool {
-    let absolute = if path.is_absolute() {
-        lexical_normalize(path)
-    } else {
-        lexical_normalize(&policy.snapshot.workspace_root.join(path))
-    };
-    raw_path_may_invalidate_policy(path)
+    raw_path_may_invalidate_policy_with_case(path, policy.snapshot.case_sensitive)
         || policy
-            .dependencies
-            .iter()
-            .any(|dependency| dependency.identity == dependency_path_identity(&absolute))
+            .invalidation_index
+            .matches(&policy.snapshot.workspace_root, path)
 }
 
 pub(crate) fn raw_path_may_invalidate_policy(path: &Path) -> bool {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let file_name = path.file_name().and_then(OsStr::to_str);
-    matches!(file_name, Some(".trailignore" | ".gitignore"))
+    raw_path_may_invalidate_policy_with_case(path, platform_default_case_sensitive())
+}
+
+fn raw_path_may_invalidate_policy_with_case(path: &Path, case_sensitive: bool) -> bool {
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if !case_sensitive {
+        normalized = normalized.to_lowercase();
+    }
+    let file_name = normalized.rsplit('/').next();
+    matches!(file_name, Some(".ignore" | ".trailignore" | ".gitignore"))
         || normalized.ends_with("/.trail/config.toml")
         || normalized == ".trail/config.toml"
         || normalized.ends_with("/.git/info/exclude")
@@ -621,15 +1019,21 @@ fn discover_policy_manifest(
         &trail_config,
         PolicyDependencyKind::TrailConfig,
         generation,
-        context.workspace_root,
+        context,
     )?);
 
     let root = lexical_normalize(context.workspace_root);
     for (name, kind) in [
+        (".ignore", PolicyDependencyKind::Ignore),
         (".trailignore", PolicyDependencyKind::Trailignore),
         (".gitignore", PolicyDependencyKind::Gitignore),
     ] {
-        dependencies.push(file_dependency(&root.join(name), kind, generation, &root)?);
+        dependencies.push(file_dependency(
+            &root.join(name),
+            kind,
+            generation,
+            context,
+        )?);
     }
     let walker = WalkDir::new(&root)
         .follow_links(false)
@@ -649,26 +1053,32 @@ fn discover_policy_manifest(
         });
     for entry in walker {
         let entry = entry.map_err(|err| Error::InvalidInput(err.to_string()))?;
+        if entry.depth() == 1 {
+            continue;
+        }
         if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
             continue;
         }
         let kind = match entry.file_name().to_str() {
+            Some(".ignore") => PolicyDependencyKind::Ignore,
             Some(".trailignore") => PolicyDependencyKind::Trailignore,
             Some(".gitignore") => PolicyDependencyKind::Gitignore,
             _ => continue,
         };
-        dependencies.push(file_dependency(entry.path(), kind, generation, &root)?);
+        dependencies.push(file_dependency(entry.path(), kind, generation, context)?);
     }
 
     dependencies.extend(discover_git_dependencies(generation, context)?);
     dependencies.sort_by(|left, right| {
         (left.kind, left.identity.as_str()).cmp(&(right.kind, right.identity.as_str()))
     });
-    dependencies.dedup_by(|left, right| left.kind == right.kind && left.identity == right.identity);
-    Ok(PolicyManifest {
+    let manifest = PolicyManifest {
         dependencies,
         generation,
-    })
+        rule_sources: Vec::new(),
+    };
+    validate_manifest_canonical(&manifest)?;
+    Ok(manifest)
 }
 
 fn synthetic_dependencies(
@@ -677,7 +1087,7 @@ fn synthetic_dependencies(
 ) -> Result<Vec<PolicyDependency>> {
     let recording = serde_json::to_vec(context.recording)
         .map_err(|err| Error::InvalidInput(err.to_string()))?;
-    Ok(vec![
+    let mut dependencies = vec![
         synthetic_dependency(
             "builtin:recording-policy",
             PolicyDependencyKind::Builtin,
@@ -712,7 +1122,34 @@ fn synthetic_dependencies(
             },
             generation,
         ),
-    ])
+    ];
+    let mut selector_keys = [
+        OsString::from("HOME"),
+        OsString::from("XDG_CONFIG_HOME"),
+        OsString::from("GIT_CONFIG_GLOBAL"),
+        OsString::from("GIT_CONFIG_SYSTEM"),
+        OsString::from("GIT_CONFIG_NOSYSTEM"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    selector_keys.extend(
+        std::env::vars_os()
+            .chain(context.git_environment.iter().cloned())
+            .map(|(key, _)| key)
+            .filter(|key| key.to_string_lossy().starts_with("GIT_CONFIG_")),
+    );
+    for key in selector_keys {
+        let value = git_environment_value_os(context, &key)
+            .map(|value| os_str_bytes(&value).to_vec())
+            .unwrap_or_else(|| b"<unset>".to_vec());
+        dependencies.push(synthetic_dependency(
+            &format!("git-env:{}", hex::encode(os_str_bytes(&key))),
+            PolicyDependencyKind::GitConfig,
+            &value,
+            generation,
+        ));
+    }
+    Ok(dependencies)
 }
 
 fn synthetic_dependency(
@@ -739,17 +1176,40 @@ fn discover_git_dependencies(
     if !context.recording.ignore_gitignored {
         return Ok(Vec::new());
     }
-    let mut paths = BTreeMap::<PathBuf, PolicyDependencyKind>::new();
-    if let Some(global) = git_environment_value(context, "GIT_CONFIG_GLOBAL") {
+    let mut paths = BTreeMap::<(PolicyDependencyKind, String), PathBuf>::new();
+    let mut insert = |path: PathBuf, kind: PolicyDependencyKind| {
+        let path = lexical_normalize(&path);
         paths.insert(
-            lexical_normalize(&PathBuf::from(global)),
+            (kind, normalized_path_key(&path, context.case_sensitive)),
+            path,
+        );
+    };
+    let home = git_environment_value(context, "HOME").map(PathBuf::from);
+    let xdg = git_environment_value(context, "XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    if let Some(global) = git_environment_value(context, "GIT_CONFIG_GLOBAL") {
+        insert(PathBuf::from(global), PolicyDependencyKind::GitConfig);
+    } else {
+        if let Some(home) = &home {
+            insert(home.join(".gitconfig"), PolicyDependencyKind::GitConfig);
+        }
+        if let Some(xdg) = &xdg {
+            insert(xdg.join("git/config"), PolicyDependencyKind::GitConfig);
+        }
+    }
+    if !git_environment_value(context, "GIT_CONFIG_NOSYSTEM").is_some_and(|v| git_truthy(&v)) {
+        insert(
+            git_environment_value(context, "GIT_CONFIG_SYSTEM")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/etc/gitconfig")),
             PolicyDependencyKind::GitConfig,
         );
     }
-    if let Some(system) = git_environment_value(context, "GIT_CONFIG_SYSTEM") {
-        paths.insert(
-            lexical_normalize(&PathBuf::from(system)),
-            PolicyDependencyKind::GitConfig,
+    if let Some(xdg) = &xdg {
+        insert(
+            xdg.join("git/ignore"),
+            PolicyDependencyKind::GitExcludesFile,
         );
     }
     let origins = run_git(
@@ -777,7 +1237,7 @@ fn discover_git_dependencies(
             } else {
                 lexical_normalize(&context.workspace_root.join(path))
             };
-            paths.insert(path, PolicyDependencyKind::GitConfig);
+            insert(path, PolicyDependencyKind::GitConfig);
         }
     }
 
@@ -792,10 +1252,20 @@ fn discover_git_dependencies(
         true,
     )?;
     let mut lines = git_dirs.split(|byte| *byte == b'\n');
-    let _git_dir = lines.next();
+    let git_dir = lines
+        .next()
+        .filter(|line| !line.is_empty())
+        .map(|line| PathBuf::from(os_string_from_bytes(line)));
+    if let Some(git_dir) = &git_dir {
+        insert(git_dir.join("config"), PolicyDependencyKind::GitConfig);
+        insert(
+            git_dir.join("config.worktree"),
+            PolicyDependencyKind::GitConfig,
+        );
+    }
     if let Some(common) = lines.next().filter(|line| !line.is_empty()) {
-        paths.insert(
-            lexical_normalize(&PathBuf::from(os_string_from_bytes(common)).join("info/exclude")),
+        insert(
+            PathBuf::from(os_string_from_bytes(common)).join("info/exclude"),
             PolicyDependencyKind::GitInfoExclude,
         );
     }
@@ -814,7 +1284,7 @@ fn discover_git_dependencies(
     let excludes = trim_ascii_line_end(&excludes);
     if !excludes.is_empty() {
         let path = PathBuf::from(os_string_from_bytes(excludes));
-        paths.insert(
+        insert(
             if path.is_absolute() {
                 lexical_normalize(&path)
             } else {
@@ -824,18 +1294,95 @@ fn discover_git_dependencies(
         );
     }
 
+    // Git's origin output omits missing include targets. Parse every known
+    // config recursively so creation of an include/includeIf target changes
+    // the manifest even when the target did not exist at discovery time.
+    let mut pending = paths
+        .iter()
+        .filter(|((kind, _), _)| *kind == PolicyDependencyKind::GitConfig)
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let mut parsed = BTreeSet::new();
+    while let Some(config) = pending.pop() {
+        let key = normalized_path_key(&config, context.case_sensitive);
+        if !parsed.insert(key) {
+            continue;
+        }
+        let bytes = read_path_bytes_no_follow(&config)?.unwrap_or_default();
+        for included in parse_git_include_paths(&bytes, &config, home.as_deref()) {
+            let included_key = (
+                PolicyDependencyKind::GitConfig,
+                normalized_path_key(&included, context.case_sensitive),
+            );
+            if !paths.contains_key(&included_key) {
+                paths.insert(included_key, included.clone());
+                pending.push(included);
+            }
+        }
+    }
+
     paths
         .into_iter()
-        .map(|(path, kind)| file_dependency(&path, kind, generation, context.workspace_root))
+        .map(|((kind, _), path)| file_dependency(&path, kind, generation, context))
         .collect()
 }
 
+fn git_truthy(value: &OsStr) -> bool {
+    !matches!(
+        value.to_string_lossy().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+fn parse_git_include_paths(bytes: &[u8], source: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut include_section = false;
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            include_section = section == "include" || section.starts_with("includeif ");
+            continue;
+        }
+        if !include_section || line.starts_with(['#', ';']) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("path") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        let path = if value == "~" {
+            home.map(Path::to_path_buf)
+        } else if let Some(suffix) = value.strip_prefix("~/") {
+            home.map(|home| home.join(suffix))
+        } else {
+            let path = PathBuf::from(value);
+            Some(if path.is_absolute() {
+                path
+            } else {
+                source.parent().unwrap_or(Path::new(".")).join(path)
+            })
+        };
+        if let Some(path) = path {
+            paths.push(lexical_normalize(&path));
+        }
+    }
+    paths
+}
+
 fn git_environment_value(context: &PolicyCompileContext<'_>, key: &str) -> Option<OsString> {
+    git_environment_value_os(context, OsStr::new(key))
+}
+
+fn git_environment_value_os(context: &PolicyCompileContext<'_>, key: &OsStr) -> Option<OsString> {
     context
         .git_environment
         .iter()
         .rev()
-        .find(|(candidate, _)| candidate == OsStr::new(key))
+        .find(|(candidate, _)| candidate == key)
         .map(|(_, value)| value.clone())
         .or_else(|| std::env::var_os(key))
 }
@@ -864,30 +1411,26 @@ fn file_dependency(
     path: &Path,
     kind: PolicyDependencyKind,
     generation: u64,
-    workspace_root: &Path,
+    context: &PolicyCompileContext<'_>,
 ) -> Result<PolicyDependency> {
+    read_file_dependency(path, kind, generation, context).map(|(dependency, _)| dependency)
+}
+
+fn read_file_dependency(
+    path: &Path,
+    kind: PolicyDependencyKind,
+    generation: u64,
+    context: &PolicyCompileContext<'_>,
+) -> Result<(PolicyDependency, Vec<u8>)> {
     let path = lexical_normalize(path);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => Some(metadata),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(Error::Io(err)),
-    };
-    let bytes = match &metadata {
-        Some(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-            match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(err) => return Err(Error::Io(err)),
-            }
-        }
-        _ => Vec::new(),
-    };
-    let observable = path.starts_with(lexical_normalize(workspace_root))
-        && metadata
-            .as_ref()
-            .map_or(true, |metadata| !metadata.file_type().is_symlink())
-        && !has_symlink_ancestor(workspace_root, &path)?;
-    Ok(PolicyDependency {
+    let (metadata, bytes) = read_file_state_no_follow(&path)?;
+    // Task 4 has no native-observer handoff yet. Direct filesystem checks can
+    // validate reuse, but they cannot establish observer continuity, so file
+    // dependencies remain explicitly uncovered until a later task wires a
+    // qualified discovery cut into this compiler.
+    let observable = false;
+    let _has_symlink_ancestor = has_symlink_ancestor(context.workspace_root, &path)?;
+    let dependency = PolicyDependency {
         identity: dependency_path_identity(&path),
         kind,
         content_identity: digest(&bytes),
@@ -895,7 +1438,67 @@ fn file_dependency(
         observable,
         generation,
         last_source_sequence: 0,
-    })
+    };
+    Ok((dependency, bytes))
+}
+
+fn read_path_bytes_no_follow(path: &Path) -> Result<Option<Vec<u8>>> {
+    let (metadata, bytes) = read_file_state_no_follow(path)?;
+    Ok(metadata
+        .filter(|metadata| metadata.is_file())
+        .map(|_| bytes))
+}
+
+fn read_file_state_no_follow(path: &Path) -> Result<(Option<fs::Metadata>, Vec<u8>)> {
+    for _ in 0..2 {
+        let before = match fs::symlink_metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let Some(before_metadata) = before else {
+            if matches!(fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok((None, Vec::new()));
+            }
+            continue;
+        };
+        if before_metadata.file_type().is_symlink() || !before_metadata.is_file() {
+            let after = fs::symlink_metadata(path).map_err(Error::Io)?;
+            if metadata_identity(Some(&before_metadata), path)?
+                == metadata_identity(Some(&after), path)?
+            {
+                return Ok((Some(before_metadata), Vec::new()));
+            }
+            continue;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => continue,
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let opened = file.metadata().map_err(Error::Io)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(Error::Io)?;
+        let after = fs::symlink_metadata(path).map_err(Error::Io)?;
+        let opened_identity = metadata_identity(Some(&opened), path)?;
+        if opened_identity == metadata_identity(Some(&before_metadata), path)?
+            && opened_identity == metadata_identity(Some(&after), path)?
+        {
+            return Ok((Some(opened), bytes));
+        }
+    }
+    Err(Error::InvalidInput(format!(
+        "policy dependency `{}` changed while it was read",
+        path.display()
+    )))
 }
 
 fn has_symlink_ancestor(workspace_root: &Path, path: &Path) -> Result<bool> {
@@ -966,20 +1569,51 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn policy_fingerprint(dependencies: &[PolicyDependency]) -> [u8; 32] {
+fn validate_manifest_canonical(manifest: &PolicyManifest) -> Result<()> {
+    let mut identities = BTreeSet::new();
+    for dependency in &manifest.dependencies {
+        if dependency.identity.is_empty()
+            || dependency.generation != manifest.generation
+            || !identities.insert((dependency.kind, dependency.identity.clone()))
+        {
+            return Err(Error::Corrupt(
+                "duplicate or non-canonical policy dependency identity".into(),
+            ));
+        }
+        if dependency_is_file(dependency) {
+            let path = dependency_identity_path(&dependency.identity)
+                .ok_or_else(|| Error::Corrupt("invalid policy path identity".into()))?;
+            if !path.is_absolute()
+                || lexical_normalize(&path) != path
+                || dependency_path_identity(&path) != dependency.identity
+            {
+                return Err(Error::Corrupt("non-canonical policy path identity".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn policy_fingerprint(dependencies: &[PolicyDependency]) -> Result<[u8; 32]> {
     let mut ordered = dependencies.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|dependency| (dependency.kind, dependency.identity.as_str()));
     let mut hash = Sha256::new();
-    hash.update(b"trail-policy-fingerprint-v1\0");
+    hash.update(b"trail-policy-fingerprint-v2");
+    hash.update((ordered.len() as u64).to_be_bytes());
     for dependency in ordered {
-        hash.update(dependency.kind.as_str().as_bytes());
-        hash.update([0]);
-        hash.update(dependency.identity.as_bytes());
-        hash.update([0]);
-        hash.update(dependency.content_identity);
-        hash.update([u8::from(dependency.observable)]);
+        for field in [
+            dependency.kind.as_str().as_bytes(),
+            dependency.identity.as_bytes(),
+            dependency.content_identity.as_slice(),
+            dependency.metadata_identity.as_slice(),
+        ] {
+            let len = u64::try_from(field.len())
+                .map_err(|_| Error::InvalidInput("policy fingerprint field too large".into()))?;
+            hash.update(len.to_be_bytes());
+            hash.update(field);
+        }
     }
-    hash.finalize().into()
+    Ok(hash.finalize().into())
 }
 
 fn load_policy_manifest(
@@ -1024,71 +1658,21 @@ fn load_policy_manifest(
         Ok(Some(PolicyManifest {
             dependencies,
             generation: expected.policy_generation,
+            rule_sources: Vec::new(),
         }))
     }
 }
 
-fn persist_policy_manifest(
+fn persist_policy_manifest_and_stale(
     conn: &Connection,
     expected: &ExpectedScope,
     manifest: &PolicyManifest,
 ) -> Result<()> {
     conn.execute_batch("SAVEPOINT changed_path_policy_manifest;")?;
     let result = (|| -> Result<()> {
-        let scope_exists = conn
-            .query_row(
-                "SELECT 1 FROM changed_path_scopes
-                 WHERE scope_id=?1 AND epoch=?2 AND ref_name=?3 AND ref_generation=?4
-                   AND baseline_root_id=?5 AND policy_fingerprint=?6
-                   AND policy_dependency_generation=?7
-                   AND filesystem_identity=?8 AND provider_identity=?9",
-                params![
-                    expected.scope_id.to_text(),
-                    expected.epoch as i64,
-                    expected.ref_name,
-                    expected.ref_generation as i64,
-                    expected.baseline_root.0,
-                    hex::encode(expected.policy_fingerprint),
-                    expected.policy_generation as i64,
-                    hex::encode(&expected.filesystem_identity),
-                    hex::encode(&expected.provider_identity),
-                ],
-                |_| Ok(()),
-            )
-            .optional()?;
-        if scope_exists.is_none() {
-            return Err(Error::ChangeLedgerReconcileRequired {
-                scope: expected.scope_id.to_text(),
-                state: "stale_baseline".to_string(),
-                reason: "policy_manifest_scope_cas_mismatch".to_string(),
-                command: "trail index reconcile".to_string(),
-            });
-        }
-        conn.execute(
-            "DELETE FROM changed_path_policy_dependencies WHERE scope_id=?1",
-            [expected.scope_id.to_text()],
-        )?;
-        let now = crate::db::util::now_ts();
-        let mut insert = conn.prepare(
-            "INSERT INTO changed_path_policy_dependencies(
-                 scope_id, dependency_identity, dependency_kind, content_identity,
-                 metadata_identity, observable, generation, last_source_sequence,
-                 created_at, updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-        )?;
-        for dependency in &manifest.dependencies {
-            insert.execute(params![
-                expected.scope_id.to_text(),
-                dependency.identity,
-                dependency.kind.as_str(),
-                dependency.content_identity.as_slice(),
-                dependency.metadata_identity,
-                i64::from(dependency.observable),
-                dependency.generation as i64,
-                dependency.last_source_sequence as i64,
-                now,
-            ])?;
-        }
+        policy_scope_cas_guard(conn, expected)?;
+        persist_policy_manifest_rows(conn, expected, manifest)?;
+        mark_policy_stale_guarded(conn, expected, "policy_observer_cut_unavailable")?;
         Ok(())
     })();
     match result {
@@ -1105,15 +1689,80 @@ fn persist_policy_manifest(
     }
 }
 
-fn mark_policy_stale(conn: &Connection, expected: &ExpectedScope) -> Result<()> {
+fn policy_scope_cas_guard(conn: &Connection, expected: &ExpectedScope) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE changed_path_scopes SET updated_at=updated_at
+         WHERE scope_id=?1 AND epoch=?2 AND ref_name=?3 AND ref_generation=?4
+           AND baseline_root_id=?5 AND policy_fingerprint=?6
+           AND policy_dependency_generation=?7
+           AND filesystem_identity=?8 AND provider_identity=?9",
+        params![
+            expected.scope_id.to_text(),
+            expected.epoch as i64,
+            expected.ref_name,
+            expected.ref_generation as i64,
+            expected.baseline_root.0,
+            hex::encode(expected.policy_fingerprint),
+            expected.policy_generation as i64,
+            hex::encode(&expected.filesystem_identity),
+            hex::encode(&expected.provider_identity),
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(policy_stale_cas_error(expected))
+    }
+}
+
+fn persist_policy_manifest_rows(
+    conn: &Connection,
+    expected: &ExpectedScope,
+    manifest: &PolicyManifest,
+) -> Result<()> {
+    validate_manifest_canonical(manifest)?;
+    conn.execute(
+        "DELETE FROM changed_path_policy_dependencies WHERE scope_id=?1",
+        [expected.scope_id.to_text()],
+    )?;
+    let now = crate::db::util::now_ts();
+    let mut insert = conn.prepare(
+        "INSERT INTO changed_path_policy_dependencies(
+             scope_id, dependency_identity, dependency_kind, content_identity,
+             metadata_identity, observable, generation, last_source_sequence,
+             created_at, updated_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+    )?;
+    for dependency in &manifest.dependencies {
+        insert.execute(params![
+            expected.scope_id.to_text(),
+            dependency.identity,
+            dependency.kind.as_str(),
+            dependency.content_identity.as_slice(),
+            dependency.metadata_identity,
+            i64::from(dependency.observable),
+            dependency.generation as i64,
+            dependency.last_source_sequence as i64,
+            now,
+        ])?;
+    }
+    Ok(())
+}
+
+fn mark_policy_stale_guarded(
+    conn: &Connection,
+    expected: &ExpectedScope,
+    reason: &str,
+) -> Result<()> {
     let changed = conn.execute(
         "UPDATE changed_path_scopes
-         SET trust_state='stale_baseline', trust_reason='policy_dependency_changed', updated_at=?1
-         WHERE scope_id=?2 AND epoch=?3 AND ref_name=?4 AND ref_generation=?5
-           AND baseline_root_id=?6 AND policy_fingerprint=?7
-           AND policy_dependency_generation=?8
-           AND filesystem_identity=?9 AND provider_identity=?10",
+         SET trust_state='stale_baseline', trust_reason=?1, updated_at=?2
+         WHERE scope_id=?3 AND epoch=?4 AND ref_name=?5 AND ref_generation=?6
+           AND baseline_root_id=?7 AND policy_fingerprint=?8
+           AND policy_dependency_generation=?9
+           AND filesystem_identity=?10 AND provider_identity=?11",
         params![
+            reason,
             crate::db::util::now_ts(),
             expected.scope_id.to_text(),
             expected.epoch as i64,
@@ -1129,17 +1778,25 @@ fn mark_policy_stale(conn: &Connection, expected: &ExpectedScope) -> Result<()> 
     if changed == 1 {
         Ok(())
     } else {
-        Err(Error::ChangeLedgerReconcileRequired {
-            scope: expected.scope_id.to_text(),
-            state: "stale_baseline".to_string(),
-            reason: "policy_stale_scope_cas_mismatch".to_string(),
-            command: "trail index reconcile".to_string(),
-        })
+        Err(policy_stale_cas_error(expected))
+    }
+}
+
+fn policy_stale_cas_error(expected: &ExpectedScope) -> Error {
+    Error::ChangeLedgerReconcileRequired {
+        scope: expected.scope_id.to_text(),
+        state: "stale_baseline".to_string(),
+        reason: "policy_full_expected_scope_cas_mismatch".to_string(),
+        command: "trail index reconcile".to_string(),
     }
 }
 
 pub(crate) fn dependency_path_identity(path: &Path) -> String {
     format!("path:{}", hex::encode(os_str_bytes(path.as_os_str())))
+}
+
+fn dependency_path_identity_with_case(path: &Path, _case_sensitive: bool) -> String {
+    dependency_path_identity(&lexical_normalize(path))
 }
 
 fn dependency_identity_path(identity: &str) -> Option<PathBuf> {
@@ -1193,4 +1850,20 @@ fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn normalized_path_key(path: &Path, case_sensitive: bool) -> String {
+    let mut key = lexical_normalize(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .nfc()
+        .collect::<String>();
+    if !case_sensitive {
+        key = key.to_lowercase();
+    }
+    key
+}
+
+const fn platform_default_case_sensitive() -> bool {
+    !cfg!(any(target_os = "windows", target_os = "macos"))
 }

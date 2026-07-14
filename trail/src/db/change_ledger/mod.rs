@@ -16,8 +16,8 @@ pub(crate) use log::{
 pub(crate) use policy::{
     compile_policy, raw_event_invalidates_policy, raw_path_may_invalidate_policy,
     validate_policy_manifest, AdapterEquivalence, CompiledPolicy, PolicyCompileContext,
-    PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics, PolicyManifest,
-    PolicyManifestValidation, RecordingPolicySnapshot,
+    PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics, PolicyInvalidationIndex,
+    PolicyManifest, PolicyManifestValidation, QualifiedPolicyObserverCut, RecordingPolicySnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;

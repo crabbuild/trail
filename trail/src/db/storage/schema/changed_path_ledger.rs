@@ -130,7 +130,7 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
                  REFERENCES changed_path_scopes(scope_id) ON UPDATE CASCADE ON DELETE CASCADE,
              dependency_identity TEXT COLLATE BINARY NOT NULL CHECK(length(dependency_identity)>0),
              dependency_kind TEXT NOT NULL
-                 CHECK(dependency_kind IN ('builtin','trail_config','trailignore','gitignore','git_info_exclude','git_excludes_file','git_config','normalization','mode','case_policy')),
+                 CHECK(dependency_kind IN ('builtin','trail_config','ignore','trailignore','gitignore','git_info_exclude','git_excludes_file','git_config','normalization','mode','case_policy')),
              content_identity BLOB NOT NULL,
              metadata_identity BLOB NOT NULL,
              observable INTEGER NOT NULL CHECK(observable IN (0,1)),
