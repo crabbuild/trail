@@ -2717,6 +2717,13 @@ pub(crate) use change_ledger::{
     run_qualified_proof_revalidation, run_races, run_restored_nullable_provider_lane_deletion,
     run_retained_writer_quiescence, run_retirement_barrier, run_valid_prefix_interval_recovery,
 };
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) use change_ledger::{
+    run_content_mode_create_delete, run_delayed_backlog, run_fault_revocation_matrix,
+    run_fence_ordering, run_owner_death_and_root_replacement, run_process_owner_child,
+    run_reconciliation_interval_qualification, run_recursive_coverage, run_rename_matrix,
+    run_rename_storm_and_cookie_expiry,
+};
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::{
     run_deletion_leaf_substitution_rejection, run_mark_ancestor_substitution_rejection,

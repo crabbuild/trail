@@ -57,6 +57,7 @@ zip.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.15.1", default-features = false }
+inotify.workspace = true
 landlock.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -23,6 +23,58 @@ pub use model::*;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub mod test_support {
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_recursive_coverage() -> std::result::Result<(), String> {
+        crate::db::run_recursive_coverage()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_reconciliation_interval_qualification(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_reconciliation_interval_qualification()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_content_mode_create_delete() -> std::result::Result<(), String> {
+        crate::db::run_content_mode_create_delete()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_rename_matrix() -> std::result::Result<(), String> {
+        crate::db::run_rename_matrix()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_rename_storm_and_cookie_expiry() -> std::result::Result<(), String> {
+        crate::db::run_rename_storm_and_cookie_expiry()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_delayed_backlog() -> std::result::Result<(), String> {
+        crate::db::run_delayed_backlog()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_fence_ordering() -> std::result::Result<(), String> {
+        crate::db::run_fence_ordering()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_fault_revocation_matrix() -> std::result::Result<(), String> {
+        crate::db::run_fault_revocation_matrix()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_owner_death_and_root_replacement() -> std::result::Result<(), String>
+    {
+        crate::db::run_owner_death_and_root_replacement()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_process_owner_child(root: &str) -> std::result::Result<(), String> {
+        crate::db::run_process_owner_child(root)
+    }
+
     pub fn changed_path_reconciliation_oracle() -> std::result::Result<(), String> {
         crate::db::run_oracle()
     }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     raw_event_invalidates_policy, ChangedPathLedger, CompiledPolicy, EvidenceFlags, ExpectedScope,
-    LedgerPath, ScopeId, TrustState,
+    LedgerPath, ObserverFence, QualifiedObserver, ScopeId, TrustState,
 };
 use crate::db::storage::{
     PinnedWorktreeRoot, ReconciliationDirectory, ReconciliationFile, ReconciliationScanEntry,
@@ -26,13 +26,6 @@ const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
 // final CAS and SQLite commit.
 const MIN_PUBLICATION_LEASE_HORIZON_SECS: i64 = 5;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ObserverFence {
-    pub(crate) sequence: u64,
-    pub(crate) durable_offset: u64,
-    pub(crate) nonce: Vec<u8>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObserverEvent {
@@ -143,6 +136,37 @@ pub(crate) struct ObserverQualification {
 }
 
 impl ObserverQualification {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn native(
+        expected: &ExpectedScope,
+        root_handle_identity: Vec<u8>,
+        start_fence: ObserverFence,
+        end_fence: ObserverFence,
+        observer_owner_token: String,
+        owner_fence_nonce: Vec<u8>,
+        durable_segment_id: String,
+        segment_durable_offset: u64,
+    ) -> Self {
+        Self {
+            scope_id: expected.scope_id,
+            provider_identity: expected.provider_identity.clone(),
+            filesystem_identity: expected.filesystem_identity.clone(),
+            root_handle_identity,
+            policy_fingerprint: expected.policy_fingerprint,
+            policy_generation: expected.policy_generation,
+            start_fence,
+            end_fence,
+            observer_owner_token,
+            owner_fence_nonce: Some(owner_fence_nonce),
+            durable_segment_id,
+            segment_durable_offset,
+            segment_folded_offset: segment_durable_offset,
+            complete_root_interval: true,
+            complete_policy_interval: true,
+            persisted_evidence_through_end: true,
+        }
+    }
+
     #[cfg(any(test, debug_assertions))]
     fn seal_for_test(
         expected: &ExpectedScope,
@@ -194,21 +218,6 @@ impl ObserverQualification {
             && self.complete_policy_interval
             && self.persisted_evidence_through_end
     }
-}
-
-pub(crate) trait QualifiedObserver {
-    fn begin_observation(&self, expected: &ExpectedScope) -> Result<ObserverFence>;
-
-    fn end_fence(&self, expected: &ExpectedScope, start: &ObserverFence) -> Result<ObserverFence>;
-
-    fn drain_through(
-        &self,
-        expected: &ExpectedScope,
-        root_handle_identity: &[u8],
-        start: &ObserverFence,
-        end: &ObserverFence,
-        sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
-    ) -> Result<ObserverQualification>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

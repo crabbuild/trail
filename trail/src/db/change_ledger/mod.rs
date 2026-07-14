@@ -4,6 +4,7 @@
 
 mod intent;
 mod log;
+mod observer;
 mod policy;
 mod reconcile;
 mod recovery;
@@ -22,6 +23,15 @@ pub(crate) use log::{
     recover_segments_from_directory, AuthenticatedSegment, DurableCut, ObserverRecord,
     PersistedLogLimits, RecoveredTail, RecoveryError, RecoveryScope, SegmentWriter,
 };
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) use observer::linux::{
+    run_content_mode_create_delete, run_delayed_backlog, run_fault_revocation_matrix,
+    run_fence_ordering, run_owner_death_and_root_replacement, run_process_owner_child,
+    run_reconciliation_interval_qualification, run_recursive_coverage, run_rename_matrix,
+    run_rename_storm_and_cookie_expiry,
+};
+#[allow(unused_imports)]
+pub(crate) use observer::{select_observer, ObserverFence, ObserverLease, QualifiedObserver};
 #[allow(unused_imports)]
 pub(crate) use policy::{
     compile_policy, raw_event_invalidates_policy, raw_path_may_invalidate_policy,
@@ -31,8 +41,8 @@ pub(crate) use policy::{
 };
 #[allow(unused_imports)]
 pub(crate) use reconcile::{
-    begin_reconciliation, persisted_proven_prefixes, reconcile_full, ObserverEvent, ObserverFence,
-    ProvenPrefixSet, QualifiedObserver, ReconcileMode, ReconciliationAttempt,
+    begin_reconciliation, persisted_proven_prefixes, reconcile_full, ObserverEvent,
+    ProvenPrefixSet, ReconcileMode, ReconciliationAttempt,
 };
 #[cfg(debug_assertions)]
 pub(crate) use reconcile::{run_callback_spool, run_oracle, run_races};
