@@ -74,6 +74,11 @@ impl Trail {
             ));
             let verify_open = (|| -> Result<Trail> {
                 fs::create_dir_all(verify_dir.join("index"))?;
+                fs::write(verify_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+                fs::write(
+                    verify_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE),
+                    [],
+                )?;
                 fs::copy(path.join(CONFIG_FILE), verify_dir.join(CONFIG_FILE))?;
                 fs::copy(path.join(HEAD_FILE), verify_dir.join(HEAD_FILE))?;
                 fs::copy(&sqlite_path, verify_dir.join(DB_RELATIVE_PATH))?;

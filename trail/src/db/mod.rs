@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,8 @@ use crate::model::*;
 const CONFIG_FILE: &str = "config.toml";
 const HEAD_FILE: &str = "HEAD";
 const DB_RELATIVE_PATH: &str = "index/trail.sqlite";
+const SCHEMA_EXCLUSION_FILE: &str = "schema-exclusion.lock";
+const SCHEMA_VALIDATION_LEADER_FILE: &str = "schema-validation.lock";
 const TRAIL_SCHEMA_VERSION: i64 = 18;
 const SCHEMA_META_VERSION_KEY: &str = "schema.version";
 const SCHEMA_META_APP_VERSION_KEY: &str = "app.version";
@@ -49,13 +51,284 @@ pub(crate) enum SchemaOpenMode {
     Existing,
 }
 
-pub(crate) fn preflight_existing_schema(db_path: &Path, prolly_backend: &str) -> Result<()> {
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | rusqlite::OpenFlags::SQLITE_OPEN_URI;
-    let uri = immutable_sqlite_uri(db_path);
-    let conn =
-        rusqlite::Connection::open_with_flags(uri, flags).map_err(schema_reinitialize_error)?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SchemaFileGeneration {
+    suffix: &'static str,
+    present: bool,
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SchemaGeneration(Vec<SchemaFileGeneration>);
+
+#[derive(Default)]
+struct SchemaValidationState {
+    validating: bool,
+    active_handoffs: u64,
+    round: u64,
+    validated: Option<(SchemaGeneration, String)>,
+    failed: Option<(u64, String)>,
+    validation_count: u64,
+}
+
+#[derive(Default)]
+struct SchemaValidationEntry {
+    state: Mutex<SchemaValidationState>,
+    changed: Condvar,
+}
+
+static SCHEMA_VALIDATIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<SchemaValidationEntry>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static SCHEMA_VALIDATION_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+fn fail_next_schema_validation(db_path: &Path) {
+    SCHEMA_VALIDATION_FAILURES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(db_path.to_path_buf());
+}
+
+#[cfg(test)]
+fn schema_validation_count(db_path: &Path) -> u64 {
+    SCHEMA_VALIDATIONS
+        .get()
+        .and_then(|entries| {
+            entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(db_path)
+                .cloned()
+        })
+        .map(|entry| {
+            entry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .validation_count
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) struct ValidatedSchemaGeneration {
+    db_path: PathBuf,
+    generation: SchemaGeneration,
+    entry: Arc<SchemaValidationEntry>,
+    _shared_exclusion: SchemaSharedExclusion,
+    _leader_exclusion: Option<File>,
+}
+
+impl ValidatedSchemaGeneration {
+    pub(crate) fn verify_unchanged(&self) -> Result<()> {
+        let current = schema_generation(&self.db_path).map_err(schema_reinitialize_error)?;
+        if current != self.generation {
+            return Err(schema_reinitialize_error(
+                "schema main/WAL/SHM generation changed during mutable handoff",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ValidatedSchemaGeneration {
+    fn drop(&mut self) {
+        let mut state = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_handoffs = state.active_handoffs.saturating_sub(1);
+        self.entry.changed.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct SchemaSharedExclusion {
+    _database: File,
+}
+
+pub(crate) fn preflight_existing_schema(
+    db_path: &Path,
+    prolly_backend: &str,
+) -> Result<ValidatedSchemaGeneration> {
+    let shared_exclusion = acquire_schema_shared_exclusion(db_path)?;
+    let mut generation = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+    let key = db_path.to_path_buf();
+    let entry = {
+        let entries = SCHEMA_VALIDATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut entries = entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .entry(key)
+            .or_insert_with(|| Arc::new(SchemaValidationEntry::default()))
+            .clone()
+    };
+    let backend = prolly_backend.to_owned();
+
+    loop {
+        let mut state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .validated
+            .as_ref()
+            .is_some_and(|(validated, validated_backend)| {
+                validated == &generation && validated_backend == &backend
+            })
+        {
+            state.active_handoffs = state.active_handoffs.saturating_add(1);
+            drop(state);
+            return Ok(ValidatedSchemaGeneration {
+                db_path: db_path.to_path_buf(),
+                generation,
+                entry,
+                _shared_exclusion: shared_exclusion,
+                _leader_exclusion: None,
+            });
+        }
+        if state.validating {
+            let waited_round = state.round;
+            while state.validating && state.round == waited_round {
+                state = entry
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if state
+                .failed
+                .as_ref()
+                .is_some_and(|(round, _)| *round == waited_round)
+            {
+                let message = state.failed.as_ref().unwrap().1.clone();
+                return Err(schema_reinitialize_error(message));
+            }
+            continue;
+        }
+        if state.active_handoffs != 0 {
+            while state.active_handoffs != 0 {
+                state = entry
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            drop(state);
+            generation = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+            continue;
+        }
+        state.validating = true;
+        state.round = state.round.saturating_add(1);
+        state.validation_count = state.validation_count.saturating_add(1);
+        let round = state.round;
+        drop(state);
+
+        let leader_exclusion = acquire_schema_validation_leader(db_path);
+        let validation = match &leader_exclusion {
+            Ok(_) => schema_generation(db_path)
+                .map_err(schema_reinitialize_error)
+                .and_then(|current| {
+                    // Another process can complete its validated mutable handoff while this
+                    // process waits for the cross-process leader lock. Start this validation
+                    // round from the generation protected by the leader lock, not the stale
+                    // generation observed before waiting.
+                    generation = current;
+                    validate_schema_snapshot(db_path, prolly_backend)
+                })
+                .and_then(|()| {
+                    let after = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+                    if after != generation {
+                        return Err(schema_reinitialize_error(
+                            "schema main/WAL/SHM generation changed during snapshot validation",
+                        ));
+                    }
+                    Ok(())
+                }),
+            Err(error) => Err(schema_reinitialize_error(schema_failure_message(error))),
+        };
+
+        let mut state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.validating = false;
+        match validation {
+            Ok(()) => {
+                state.validated = Some((generation.clone(), backend.clone()));
+                state.failed = None;
+            }
+            Err(error) => {
+                state.validated = None;
+                state.failed = Some((round, schema_failure_message(&error)));
+            }
+        }
+        entry.changed.notify_all();
+        if let Some((failed_round, message)) = &state.failed {
+            if *failed_round == round {
+                return Err(schema_reinitialize_error(message.clone()));
+            }
+        }
+        state.active_handoffs = state.active_handoffs.saturating_add(1);
+        drop(state);
+        return Ok(ValidatedSchemaGeneration {
+            db_path: db_path.to_path_buf(),
+            generation,
+            entry,
+            _shared_exclusion: shared_exclusion,
+            _leader_exclusion: leader_exclusion.ok(),
+        });
+    }
+}
+
+fn schema_failure_message(error: &Error) -> String {
+    match error {
+        Error::SchemaReinitializeRequired { found, .. } => found.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn validate_schema_snapshot(db_path: &Path, prolly_backend: &str) -> Result<()> {
+    #[cfg(test)]
+    if SCHEMA_VALIDATION_FAILURES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(db_path)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+        return Err(schema_reinitialize_error(
+            "injected schema validation leader failure",
+        ));
+    }
+    let snapshot = tempfile::Builder::new()
+        .prefix("trail-schema-preflight-")
+        .tempdir()
+        .map_err(schema_reinitialize_error)?;
+    let snapshot_db = snapshot.path().join("trail.sqlite");
+    // The WAL is part of the durable database image. The SHM file is only a
+    // rebuildable shared-memory index and copying it can transplant stale reader
+    // marks into the private snapshot.
+    for suffix in ["", "-wal", "-journal"] {
+        let mut source = db_path.as_os_str().to_os_string();
+        source.push(suffix);
+        let source = PathBuf::from(source);
+        if source.exists() {
+            let mut destination = snapshot_db.as_os_str().to_os_string();
+            destination.push(suffix);
+            let destination = PathBuf::from(destination);
+            fs::copy(&source, &destination).map_err(schema_reinitialize_error)?;
+        }
+    }
+    let conn = rusqlite::Connection::open(&snapshot_db).map_err(schema_reinitialize_error)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(schema_reinitialize_error)?;
     Trail::validate_schema_v18(&conn).map_err(schema_reinitialize_error)?;
@@ -73,30 +346,179 @@ pub(crate) fn preflight_existing_schema(db_path: &Path, prolly_backend: &str) ->
 }
 
 #[cfg(unix)]
-fn immutable_sqlite_uri(db_path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut uri = String::from("file:");
-    for byte in db_path.as_os_str().as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                uri.push(char::from(*byte));
+fn schema_generation(db_path: &Path) -> std::io::Result<SchemaGeneration> {
+    let mut files = Vec::with_capacity(4);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        match fs::metadata(&path) {
+            Ok(metadata) => files.push(SchemaFileGeneration {
+                suffix,
+                present: true,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                modified_seconds: (suffix != "-shm").then_some(metadata.mtime()).unwrap_or(0),
+                modified_nanoseconds: (suffix != "-shm")
+                    .then_some(metadata.mtime_nsec())
+                    .unwrap_or(0),
+                changed_seconds: (suffix != "-shm").then_some(metadata.ctime()).unwrap_or(0),
+                changed_nanoseconds: (suffix != "-shm")
+                    .then_some(metadata.ctime_nsec())
+                    .unwrap_or(0),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                files.push(SchemaFileGeneration {
+                    suffix,
+                    present: false,
+                    device: 0,
+                    inode: 0,
+                    length: 0,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
+                    changed_seconds: 0,
+                    changed_nanoseconds: 0,
+                });
             }
-            _ => uri.push_str(&format!("%{byte:02x}")),
+            Err(error) => return Err(error),
         }
     }
-    uri.push_str("?immutable=1");
-    uri
+    Ok(SchemaGeneration(files))
+}
+
+fn schema_lock_waiting_is_enabled() -> bool {
+    WRITE_LOCK_WAIT_DEADLINE
+        .with(|deadline| deadline.get())
+        .is_some_and(|deadline| Instant::now() < deadline)
+}
+
+fn schema_exclusion_path(_db_dir: &Path, db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(SCHEMA_EXCLUSION_FILE)
+}
+
+fn schema_validation_leader_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(SCHEMA_VALIDATION_LEADER_FILE)
+}
+
+fn acquire_schema_validation_leader(db_path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(schema_validation_leader_path(db_path))
+        .map_err(schema_reinitialize_error)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|error| Error::Io(error.into()))?;
+    Ok(file)
+}
+
+fn schema_db_dir(db_path: &Path) -> Result<&Path> {
+    let parent = db_path.parent().ok_or_else(|| {
+        Error::InvalidInput("schema database path has no workspace directory".into())
+    })?;
+    if parent.file_name().is_some_and(|name| name == "index") {
+        return parent.parent().ok_or_else(|| {
+            Error::InvalidInput("schema database index has no workspace directory".into())
+        });
+    }
+    Ok(parent)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn acquire_schema_shared_exclusion(db_path: &Path) -> Result<SchemaSharedExclusion> {
+    let lock_path = schema_exclusion_path(schema_db_dir(db_path)?, db_path);
+    let database = File::open(lock_path).map_err(schema_reinitialize_error)?;
+    let mut delay = Duration::from_millis(2);
+    loop {
+        match rustix::fs::flock(&database, rustix::fs::FlockOperation::NonBlockingLockShared) {
+            Ok(()) => {
+                return Ok(SchemaSharedExclusion {
+                    _database: database,
+                })
+            }
+            Err(error) if error == rustix::io::Errno::AGAIN => {
+                if !schema_lock_waiting_is_enabled() {
+                    return Err(Error::WorkspaceLocked(
+                        "workspace schema writer is active".into(),
+                    ));
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(50));
+            }
+            Err(error) => return Err(Error::Io(error.into())),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn acquire_schema_shared_exclusion(db_path: &Path) -> Result<SchemaSharedExclusion> {
+    let lock_path = schema_exclusion_path(schema_db_dir(db_path)?, db_path);
+    let database = File::open(lock_path).map_err(schema_reinitialize_error)?;
+    Ok(SchemaSharedExclusion {
+        _database: database,
+    })
 }
 
 #[cfg(not(unix))]
-fn immutable_sqlite_uri(db_path: &Path) -> String {
-    let encoded_path = db_path
-        .to_string_lossy()
-        .replace('%', "%25")
-        .replace('?', "%3f")
-        .replace('#', "%23");
-    format!("file:{encoded_path}?immutable=1")
+fn schema_generation(db_path: &Path) -> std::io::Result<SchemaGeneration> {
+    let mut files = Vec::with_capacity(4);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        match fs::metadata(&path) {
+            Ok(metadata) => files.push(SchemaFileGeneration {
+                suffix,
+                present: true,
+                device: 0,
+                inode: 0,
+                length: metadata.len(),
+                modified_seconds: if suffix == "-shm" {
+                    0
+                } else {
+                    metadata
+                        .modified()?
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .min(i64::MAX as u64) as i64
+                },
+                modified_nanoseconds: if suffix == "-shm" {
+                    0
+                } else {
+                    metadata
+                        .modified()?
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos() as i64
+                },
+                changed_seconds: 0,
+                changed_nanoseconds: 0,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                files.push(SchemaFileGeneration {
+                    suffix,
+                    present: false,
+                    device: 0,
+                    inode: 0,
+                    length: 0,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
+                    changed_seconds: 0,
+                    changed_nanoseconds: 0,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(SchemaGeneration(files))
 }
 
 fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
@@ -104,23 +526,6 @@ fn schema_reinitialize_error(err: impl std::fmt::Display) -> Error {
         found: err.to_string(),
         guidance: "back up this workspace, then run `trail init --force` to create schema v18"
             .into(),
-    }
-}
-
-#[cfg(all(test, unix))]
-mod immutable_uri_tests {
-    use super::*;
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-
-    #[test]
-    fn immutable_uri_percent_encodes_non_utf8_path_bytes_losslessly() {
-        let path = Path::new(OsStr::from_bytes(b"/tmp/trail-\xff/%?#.sqlite"));
-
-        assert_eq!(
-            immutable_sqlite_uri(path),
-            "file:/tmp/trail-%ff/%25%3f%23.sqlite?immutable=1"
-        );
     }
 }
 
@@ -166,10 +571,12 @@ pub struct Trail {
     workspace_root: PathBuf,
     db_dir: PathBuf,
     sqlite_path: PathBuf,
-    conn: Connection,
     store: TrailProllyStore,
     prolly: Prolly<TrailProllyStore>,
     root_prolly: Prolly<TrailProllyStore>,
+    // Keep the connection configured with NO_CKPT_ON_CLOSE after every cloned
+    // SQLite Prolly store handle so it is the last SQLite connection dropped.
+    conn: Connection,
     config: TrailConfig,
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
@@ -1140,6 +1547,105 @@ pub(crate) enum ConflictResolution {
 #[derive(Debug)]
 pub(crate) struct WorkspaceLock {
     path: PathBuf,
+    _schema_exclusion: File,
+}
+
+pub(crate) fn acquire_workspace_lock(db_dir: &Path) -> Result<WorkspaceLock> {
+    acquire_workspace_lock_for_database(db_dir, &db_dir.join(DB_RELATIVE_PATH))
+}
+
+pub(crate) fn acquire_workspace_lock_for_database(
+    db_dir: &Path,
+    schema_path: &Path,
+) -> Result<WorkspaceLock> {
+    let path = db_dir.join("lock");
+    let mut delay = Duration::from_millis(2);
+    let mut file = loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => break file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder =
+                    fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
+                let holder_pid = holder.split_whitespace().find_map(|part| {
+                    part.strip_prefix("pid=")
+                        .and_then(|value| value.parse::<u32>().ok())
+                });
+                if holder_pid.is_some_and(|pid| !self::util::process_is_alive(pid))
+                    && fs::read_to_string(&path).unwrap_or_default() == holder
+                {
+                    match fs::remove_file(&path) {
+                        Ok(()) => continue,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(Error::Io(err)),
+                    }
+                }
+                let should_wait = WRITE_LOCK_WAIT_DEADLINE
+                    .with(|deadline| deadline.get())
+                    .is_some_and(|deadline| Instant::now() < deadline);
+                if should_wait {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                    continue;
+                }
+                return Err(Error::WorkspaceLocked(holder.trim().to_string()));
+            }
+            Err(err) => return Err(Error::Io(err)),
+        }
+    };
+    writeln!(
+        file,
+        "pid={} created_at={}",
+        std::process::id(),
+        self::util::now_ts()
+    )?;
+    let exclusion_path = schema_exclusion_path(db_dir, schema_path);
+    let schema_exclusion = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(exclusion_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return Err(Error::Io(error));
+        }
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut delay = Duration::from_millis(2);
+        let reader_drain_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match rustix::fs::flock(
+                &schema_exclusion,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => break,
+                Err(error)
+                    if error == rustix::io::Errno::AGAIN
+                        && (schema_lock_waiting_is_enabled()
+                            || Instant::now() < reader_drain_deadline) =>
+                {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                }
+                Err(error) if error == rustix::io::Errno::AGAIN => {
+                    let _ = fs::remove_file(&path);
+                    return Err(Error::WorkspaceLocked(
+                        "workspace schema reader is active".into(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&path);
+                    return Err(Error::Io(error.into()));
+                }
+            }
+        }
+    }
+    Ok(WorkspaceLock {
+        path,
+        _schema_exclusion: schema_exclusion,
+    })
 }
 
 impl Drop for WorkspaceLock {
@@ -1176,7 +1682,7 @@ pub(crate) use change_ledger::{
     run_exact_interval_bridge_rejection, run_gc_root_lifecycle, run_lane_deletion_retirement,
     run_missing_sidecar_rejection, run_oracle, run_prefix_interval_bridge_rejection,
     run_qualified_proof_revalidation, run_races, run_restored_nullable_provider_lane_deletion,
-    run_retirement_barrier, run_valid_prefix_interval_recovery,
+    run_retained_writer_quiescence, run_retirement_barrier, run_valid_prefix_interval_recovery,
 };
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::{

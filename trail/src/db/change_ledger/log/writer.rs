@@ -85,6 +85,8 @@ impl FaultScript {
 
 pub(crate) struct SegmentWriter {
     control: Connection,
+    workspace_db_dir: PathBuf,
+    database_path: PathBuf,
     segment_directory: PathBuf,
     file: File,
     pub(super) path: PathBuf,
@@ -170,6 +172,9 @@ impl SegmentWriter {
                 "observer lease requires positive epoch/duration and provider id".into(),
             ));
         }
+        let workspace_db_dir = workspace_db_dir_for_database(database_path)?;
+        let _workspace_lock =
+            crate::db::acquire_workspace_lock_for_database(&workspace_db_dir, database_path)?;
         let mut control = Connection::open(database_path)?;
         apply_sqlite_pragmas(&control)?;
         control.busy_timeout(Duration::from_secs(5))?;
@@ -268,6 +273,7 @@ impl SegmentWriter {
             .read(true)
             .write(true)
             .open(&path)?;
+        super::super::secure_fs::lock_observer_writer(&file)?;
         file.write_all(&header)?;
         file.sync_all()?;
         sync_directory(segment_directory)?;
@@ -331,6 +337,8 @@ impl SegmentWriter {
         let current_offset = header_len;
         Ok(Self {
             control,
+            workspace_db_dir,
+            database_path: database_path.to_path_buf(),
             segment_directory: segment_directory.to_path_buf(),
             file,
             path,
@@ -350,7 +358,13 @@ impl SegmentWriter {
     }
 
     pub(crate) fn append(&mut self, records: &[ObserverRecord]) -> Result<()> {
-        let result = self.append_inner(records);
+        let result = match crate::db::acquire_workspace_lock_for_database(
+            &self.workspace_db_dir,
+            &self.database_path,
+        ) {
+            Ok(_workspace_lock) => self.append_inner(records),
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.retire("append_failed");
         }
@@ -459,7 +473,13 @@ impl SegmentWriter {
     }
 
     pub(crate) fn flush_durable(&mut self) -> Result<DurableCut> {
-        let result = self.flush_inner();
+        let result = match crate::db::acquire_workspace_lock_for_database(
+            &self.workspace_db_dir,
+            &self.database_path,
+        ) {
+            Ok(_workspace_lock) => self.flush_inner(),
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.retire("flush_failed");
         }
@@ -520,7 +540,13 @@ impl SegmentWriter {
     }
 
     pub(crate) fn heartbeat(&mut self) -> Result<()> {
-        let result = self.heartbeat_inner();
+        let result = match crate::db::acquire_workspace_lock_for_database(
+            &self.workspace_db_dir,
+            &self.database_path,
+        ) {
+            Ok(_workspace_lock) => self.heartbeat_inner(),
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.retire("heartbeat_failed");
         }
@@ -554,7 +580,13 @@ impl SegmentWriter {
     }
 
     pub(crate) fn rotate(&mut self) -> Result<()> {
-        let result = self.rotate_inner();
+        let result = match crate::db::acquire_workspace_lock_for_database(
+            &self.workspace_db_dir,
+            &self.database_path,
+        ) {
+            Ok(_workspace_lock) => self.rotate_inner(),
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.retire("rotation_failed");
         }
@@ -630,6 +662,7 @@ impl SegmentWriter {
             .read(true)
             .write(true)
             .open(&next_path)?;
+        super::super::secure_fs::lock_observer_writer(&next_file)?;
         self.faults.check(FaultPoint::NextHeaderWrite)?;
         next_file.write_all(&header)?;
         self.faults.check(FaultPoint::NextHeaderSync)?;
@@ -730,13 +763,18 @@ impl SegmentWriter {
     fn retire(&mut self, reason: &str) {
         if self.authorized {
             self.authorized = false;
-            revoke_owner(
-                &self.control,
-                &self.identity.scope_id.to_text(),
-                self.identity.epoch,
-                &hex::encode(self.identity.owner_token),
-                reason,
-            );
+            if let Ok(_workspace_lock) = crate::db::acquire_workspace_lock_for_database(
+                &self.workspace_db_dir,
+                &self.database_path,
+            ) {
+                revoke_owner(
+                    &self.control,
+                    &self.identity.scope_id.to_text(),
+                    self.identity.epoch,
+                    &hex::encode(self.identity.owner_token),
+                    reason,
+                );
+            }
         }
     }
 
@@ -762,6 +800,18 @@ impl SegmentWriter {
                 .unwrap(),
         )
     }
+}
+
+fn workspace_db_dir_for_database(database_path: &Path) -> Result<PathBuf> {
+    let parent = database_path.parent().ok_or_else(|| {
+        Error::InvalidInput("observer database path has no workspace directory".into())
+    })?;
+    if parent.file_name().is_some_and(|name| name == "index") {
+        return parent.parent().map(Path::to_path_buf).ok_or_else(|| {
+            Error::InvalidInput("observer database index has no workspace directory".into())
+        });
+    }
+    Ok(parent.to_path_buf())
 }
 
 fn validate_lease_on(connection: &Connection, identity: &SegmentIdentity) -> Result<()> {

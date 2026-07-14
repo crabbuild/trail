@@ -364,9 +364,16 @@ fn retire_scope_identity(
     database_path: &std::path::Path,
     expected: &RetirementIdentity,
 ) -> Result<Vec<SegmentDeletionToken>> {
-    if expected.retired_at.is_none() {
-        ensure_segment_quarantine_allocations(conn, database_path, expected)?;
-    }
+    let retiring = if expected.retired_at.is_none() {
+        begin_scope_retirement(conn, expected)?
+    } else {
+        expected.clone()
+    };
+    let quiesced_rows = if retiring.retired_at.is_none() {
+        ensure_segment_quarantine_allocations(conn, database_path, &retiring)?
+    } else {
+        Vec::new()
+    };
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let now = now_ts();
     let current_matches: bool = tx.query_row(
@@ -377,104 +384,92 @@ fn retire_scope_identity(
            AND filesystem_identity=?12 AND continuity_generation=?13
            AND provider_identity IS ?14 AND retired_at IS ?15)",
         params![
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?,
-            expected.scope_kind,
-            expected.owner_id,
-            expected.scope_root,
-            expected.ref_name,
-            sql_u64(expected.ref_generation, "ref generation")?,
-            expected.change_id,
-            expected.baseline_root_id.0,
-            expected.policy_fingerprint,
-            sql_u64(expected.policy_generation, "policy generation")?,
-            expected.filesystem_identity,
-            sql_u64(expected.continuity_generation, "continuity generation")?,
-            expected.provider_identity,
-            expected.retired_at,
+            retiring.scope_id.to_text(),
+            sql_u64(retiring.epoch, "scope epoch")?,
+            retiring.scope_kind,
+            retiring.owner_id,
+            retiring.scope_root,
+            retiring.ref_name,
+            sql_u64(retiring.ref_generation, "ref generation")?,
+            retiring.change_id,
+            retiring.baseline_root_id.0,
+            retiring.policy_fingerprint,
+            sql_u64(retiring.policy_generation, "policy generation")?,
+            retiring.filesystem_identity,
+            sql_u64(retiring.continuity_generation, "continuity generation")?,
+            retiring.provider_identity,
+            retiring.retired_at,
         ],
         |row| row.get(0),
     )?;
     if !current_matches {
         return Err(Error::ChangeLedgerReconcileRequired {
-            scope: expected.scope_id.to_text(),
+            scope: retiring.scope_id.to_text(),
             state: "untrusted_gap".into(),
             reason: "scope retirement exact row changed".into(),
             command: "trail status".into(),
         });
     };
-    if expected.retired_at.is_none() {
+    if retiring.retired_at.is_none() {
         prepare_segment_deletion_transactions(
             &tx,
             database_path,
-            expected.scope_id,
-            expected.epoch,
+            retiring.scope_id,
+            retiring.epoch,
+            &quiesced_rows,
         )?;
     } else {
-        validate_segment_deletion_transaction_coverage(&tx, expected.scope_id, expected.epoch)?;
+        validate_segment_deletion_transaction_coverage(&tx, retiring.scope_id, retiring.epoch)?;
     }
-    if expected.retired_at.is_some() {
+    if retiring.retired_at.is_some() {
         tx.commit()?;
         durable_intent_barrier(conn)?;
         return load_segment_deletion_tokens(
             conn,
             database_path,
-            expected.scope_id,
-            expected.epoch,
+            retiring.scope_id,
+            retiring.epoch,
         );
     }
-    let revoked = tx.execute(
-        "UPDATE changed_path_observer_owners SET lease_state='revoked',updated_at=?1
-         WHERE scope_id=?2 AND epoch=?3 AND lease_state='active'",
-        params![
-            now,
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?
-        ],
-    )?;
-    let post_revocation_continuity = expected
-        .continuity_generation
-        .checked_add(u64::from(revoked != 0))
-        .ok_or_else(|| Error::Corrupt("retirement continuity generation overflow".into()))?;
     let changed = tx.execute(
         "UPDATE changed_path_scopes SET retired_at=?1,trust_state='untrusted_gap',
-             trust_reason='scope_retired',continuity_generation=continuity_generation+?5,
+             trust_reason='scope_retired',
              observer_owner_token=NULL,observer_heartbeat_at=NULL,updated_at=?1
          WHERE scope_id=?2 AND epoch=?3 AND continuity_generation=?4
-           AND provider_identity IS ?6 AND retired_at IS NULL",
+           AND provider_identity IS ?5 AND retired_at IS NULL
+           AND trust_state='untrusted_gap' AND trust_reason='scope_retiring'",
         params![
             now,
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?,
-            sql_u64(post_revocation_continuity, "continuity generation")?,
-            i64::from(revoked == 0),
-            expected.provider_identity,
+            retiring.scope_id.to_text(),
+            sql_u64(retiring.epoch, "scope epoch")?,
+            sql_u64(retiring.continuity_generation, "continuity generation")?,
+            retiring.provider_identity,
         ],
     )?;
     if changed != 1 {
         let observed: (i64, i64, Option<String>, Option<i64>) = tx.query_row(
             "SELECT epoch,continuity_generation,provider_identity,retired_at
              FROM changed_path_scopes WHERE scope_id=?1",
-            [expected.scope_id.to_text()],
+            [retiring.scope_id.to_text()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         return Err(Error::ChangeLedgerReconcileRequired {
-            scope: expected.scope_id.to_text(),
+            scope: retiring.scope_id.to_text(),
             state: "untrusted_gap".into(),
             reason: format!(
                 "scope retirement update CAS failed: expected epoch={} continuity={} provider={:?}; observed={observed:?}",
-                expected.epoch, expected.continuity_generation, expected.provider_identity
+                retiring.epoch, retiring.continuity_generation, retiring.provider_identity
             ),
             command: "trail status".into(),
         });
     }
     tx.execute(
         "UPDATE changed_path_observer_segments SET state='retired',updated_at=?1
-         WHERE scope_id=?2 AND epoch=?3",
+         WHERE scope_id=?2 AND epoch=?3 AND state='retiring'",
         params![
             now,
-            expected.scope_id.to_text(),
-            sql_u64(expected.epoch, "scope epoch")?
+            retiring.scope_id.to_text(),
+            sql_u64(retiring.epoch, "scope epoch")?
         ],
     )?;
     crate::db::util::test_crash_point("changed_path_deletion_before_retirement_commit");
@@ -482,7 +477,111 @@ fn retire_scope_identity(
     crate::db::util::test_crash_point("changed_path_deletion_after_retirement_commit");
     durable_intent_barrier(conn)?;
     crate::db::util::test_crash_point("changed_path_deletion_after_retirement_wal_barrier");
-    load_segment_deletion_tokens(conn, database_path, expected.scope_id, expected.epoch)
+    load_segment_deletion_tokens(conn, database_path, retiring.scope_id, retiring.epoch)
+}
+
+fn begin_scope_retirement(
+    conn: &Connection,
+    expected: &RetirementIdentity,
+) -> Result<RetirementIdentity> {
+    let trust_reason: String = conn.query_row(
+        "SELECT trust_reason FROM changed_path_scopes WHERE scope_id=?1",
+        [expected.scope_id.to_text()],
+        |row| row.get(0),
+    )?;
+    if trust_reason == "scope_retiring" {
+        return load_retirement_identity(conn, &expected.scope_id.to_text())?
+            .ok_or_else(|| Error::Corrupt("retiring scope disappeared".into()));
+    }
+    let (_, rows) = load_retired_segment_rows(conn, expected.scope_id, expected.epoch)?;
+    if rows
+        .iter()
+        .any(|row| !matches!(row.state.as_str(), "open" | "sealed"))
+    {
+        return Err(Error::Corrupt(
+            "scope retirement started from an invalid observer segment state".into(),
+        ));
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let now = now_ts();
+    let current_matches: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM changed_path_scopes
+         WHERE scope_id=?1 AND epoch=?2 AND continuity_generation=?3
+           AND provider_identity IS ?4 AND retired_at IS NULL)",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?,
+            sql_u64(expected.continuity_generation, "continuity generation")?,
+            expected.provider_identity,
+        ],
+        |row| row.get(0),
+    )?;
+    if !current_matches {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "scope changed before retirement revocation fence".into(),
+            command: "trail status".into(),
+        });
+    }
+    let mut fence_nonce = [0_u8; 32];
+    getrandom::getrandom(&mut fence_nonce).map_err(|error| {
+        Error::InvalidInput(format!("retirement fence nonce generation failed: {error}"))
+    })?;
+    let revoked = tx.execute(
+        "UPDATE changed_path_observer_owners
+         SET lease_state='revoked',fence_nonce=?1,updated_at=?2
+         WHERE scope_id=?3 AND epoch=?4 AND lease_state='active'",
+        params![
+            fence_nonce,
+            now,
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?,
+        ],
+    )?;
+    let post_trigger_continuity = expected
+        .continuity_generation
+        .checked_add(u64::from(revoked != 0))
+        .ok_or_else(|| Error::Corrupt("retirement continuity generation overflow".into()))?;
+    let changed = tx.execute(
+        "UPDATE changed_path_scopes
+         SET trust_state='untrusted_gap',trust_reason='scope_retiring',
+             continuity_generation=continuity_generation+?1,
+             observer_owner_token=NULL,observer_heartbeat_at=NULL,updated_at=?2
+         WHERE scope_id=?3 AND epoch=?4 AND continuity_generation=?5
+           AND provider_identity IS ?6 AND retired_at IS NULL",
+        params![
+            i64::from(revoked == 0),
+            now,
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?,
+            sql_u64(post_trigger_continuity, "continuity generation")?,
+            expected.provider_identity,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::ChangeLedgerReconcileRequired {
+            scope: expected.scope_id.to_text(),
+            state: "untrusted_gap".into(),
+            reason: "scope retirement revocation fence CAS failed".into(),
+            command: "trail status".into(),
+        });
+    }
+    tx.execute(
+        "UPDATE changed_path_observer_segments
+         SET retirement_source_state=state,state='retiring',updated_at=?1
+         WHERE scope_id=?2 AND epoch=?3 AND state IN ('open','sealed')",
+        params![
+            now,
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch, "scope epoch")?,
+        ],
+    )?;
+    tx.commit()?;
+    durable_intent_barrier(conn)?;
+    crate::db::util::test_crash_point("changed_path_deletion_after_retirement_fence_barrier");
+    load_retirement_identity(conn, &expected.scope_id.to_text())?
+        .ok_or_else(|| Error::Corrupt("retiring scope disappeared after fence".into()))
 }
 
 fn load_retirement_identity(
@@ -621,16 +720,24 @@ fn validate_retired_segment_paths(paths: &[String]) -> Result<()> {
 #[derive(Debug)]
 struct RetiredSegmentRow {
     segment_id: String,
+    log_format_version: u64,
     owner_token: [u8; 32],
+    provider_id: String,
     first_sequence: u64,
     last_sequence: Option<u64>,
     durable_end_offset: u64,
+    folded_end_offset: u64,
     previous_segment_id: Option<String>,
     previous_segment_hash: [u8; 32],
     stored_segment_hash: Option<[u8; 32]>,
     segment_path: String,
     state: String,
+    source_state: String,
+    file_length: Option<u64>,
+    file_hash: Option<[u8; 32]>,
+    durable_hash: Option<[u8; 32]>,
     source_identity: Option<(u64, u64)>,
+    quiescence_file: Option<std::fs::File>,
 }
 
 #[derive(Clone, Debug)]
@@ -804,7 +911,10 @@ fn load_retired_segment_rows(
     let rows = conn
         .prepare(
             "SELECT segment_id,owner_token,first_sequence,last_sequence,durable_end_offset,
-                    previous_segment_id,previous_segment_hash,segment_hash,segment_path,state
+                    previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
+                    COALESCE(retirement_source_state,state),log_format_version,provider_id,
+                    folded_end_offset,retirement_file_length,retirement_file_hash,
+                    retirement_durable_hash,retirement_source_device,retirement_source_inode
              FROM changed_path_observer_segments
              WHERE scope_id=?1 AND epoch=?2 ORDER BY first_sequence,segment_id",
         )?
@@ -822,6 +932,15 @@ fn load_retired_segment_rows(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             },
         )?
@@ -830,13 +949,16 @@ fn load_retired_segment_rows(
         .map(|row| {
             Ok(RetiredSegmentRow {
                 segment_id: row.0,
+                log_format_version: db_u64(row.11, "retired segment log format")?,
                 owner_token: decode_hex_32(&row.1, "retired segment owner token")?,
+                provider_id: row.12,
                 first_sequence: db_u64(row.2, "retired segment first sequence")?,
                 last_sequence: row
                     .3
                     .map(|value| db_u64(value, "retired segment last sequence"))
                     .transpose()?,
                 durable_end_offset: db_u64(row.4, "retired segment durable offset")?,
+                folded_end_offset: db_u64(row.13, "retired segment folded offset")?,
                 previous_segment_id: row.5,
                 previous_segment_hash: row
                     .6
@@ -851,7 +973,33 @@ fn load_retired_segment_rows(
                     .transpose()?,
                 segment_path: row.8,
                 state: row.9,
-                source_identity: None,
+                source_state: row.10,
+                file_length: row
+                    .14
+                    .map(|value| db_u64(value, "retirement file length"))
+                    .transpose()?,
+                file_hash: row
+                    .15
+                    .as_deref()
+                    .map(|value| decode_hex_32(value, "retirement file hash"))
+                    .transpose()?,
+                durable_hash: row
+                    .16
+                    .as_deref()
+                    .map(|value| decode_hex_32(value, "retirement durable hash"))
+                    .transpose()?,
+                source_identity: row
+                    .17
+                    .as_deref()
+                    .zip(row.18.as_deref())
+                    .map(|(device, inode)| {
+                        Ok::<_, Error>((
+                            decode_fs_identity_part(device, "retirement source device")?,
+                            decode_fs_identity_part(inode, "retirement source inode")?,
+                        ))
+                    })
+                    .transpose()?,
+                quiescence_file: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -923,6 +1071,16 @@ fn inspect_segments_before_allocation(
             Err(error) => return Err(error),
         };
         let source_identity = super::secure_fs::file_identity(&file)?;
+        match super::secure_fs::try_lock_observer_quiescence(&file) {
+            Ok(()) => {}
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(Error::WorkspaceLocked(format!(
+                    "observer segment writer has not acknowledged close: {}",
+                    row.segment_id
+                )));
+            }
+            Err(error) => return Err(error),
+        }
         let authenticated = super::log::authenticate_segment_for_deletion(
             &file,
             &super::log::DeletionSegmentExpectation {
@@ -935,15 +1093,36 @@ fn inspect_segments_before_allocation(
                 durable_end_offset: row.durable_end_offset,
                 previous_segment_hash: row.previous_segment_hash,
                 stored_segment_hash: row.stored_segment_hash,
-                state: row.state.clone(),
+                state: row.source_state.clone(),
                 limits,
             },
         )
         .map_err(|error| Error::Corrupt(error.to_string()))?;
+        if row
+            .file_length
+            .is_some_and(|value| value != authenticated.file_length)
+            || row
+                .file_hash
+                .is_some_and(|value| value != authenticated.file_hash)
+            || row
+                .durable_hash
+                .is_some_and(|value| value != authenticated.durable_hash)
+            || row
+                .source_identity
+                .is_some_and(|value| value != source_identity)
+        {
+            return Err(Error::Corrupt(
+                "persisted retirement source metadata changed before allocation".into(),
+            ));
+        }
+        row.file_length = Some(authenticated.file_length);
+        row.file_hash = Some(authenticated.file_hash);
+        row.durable_hash = Some(authenticated.durable_hash);
         row.source_identity = Some(source_identity);
+        row.quiescence_file = Some(file);
         expected_previous_segment_id = Some(row.segment_id.clone());
         expected_previous_segment_hash = authenticated.durable_hash;
-        saw_open_segment = row.state == "open";
+        saw_open_segment = row.source_state == "open";
         expected_first_sequence = row
             .last_sequence
             .unwrap_or(row.first_sequence.saturating_sub(1))
@@ -972,6 +1151,57 @@ fn journal_missing_quarantine_allocations(
         });
     }
     for row in rows {
+        let source_identity = row.source_identity.ok_or_else(|| {
+            Error::Corrupt("retirement source identity was not authenticated".into())
+        })?;
+        let file_length = row
+            .file_length
+            .ok_or_else(|| Error::Corrupt("retirement file length was not authenticated".into()))?;
+        let file_hash = row
+            .file_hash
+            .ok_or_else(|| Error::Corrupt("retirement file hash was not authenticated".into()))?;
+        let durable_hash = row.durable_hash.ok_or_else(|| {
+            Error::Corrupt("retirement durable hash was not authenticated".into())
+        })?;
+        let source_published = tx.execute(
+            "UPDATE changed_path_observer_segments
+             SET retirement_file_length=?1,retirement_file_hash=?2,
+                 retirement_durable_hash=?3,retirement_source_device=?4,
+                 retirement_source_inode=?5,updated_at=?6
+             WHERE scope_id=?7 AND epoch=?8 AND segment_id=?9 AND state='retiring'
+               AND owner_token=?10 AND provider_id=?11 AND log_format_version=?12
+               AND first_sequence=?13 AND last_sequence IS ?14
+               AND durable_end_offset=?15 AND folded_end_offset=?16
+               AND segment_path=?17 AND retirement_source_state=?18",
+            params![
+                sql_u64(file_length, "retirement file length")?,
+                hex::encode(file_hash),
+                hex::encode(durable_hash),
+                encode_fs_identity_part(source_identity.0),
+                encode_fs_identity_part(source_identity.1),
+                now_ts(),
+                expected.scope_id.to_text(),
+                sql_u64(expected.epoch, "scope epoch")?,
+                row.segment_id,
+                hex::encode(row.owner_token),
+                row.provider_id,
+                sql_u64(row.log_format_version, "segment log format")?,
+                sql_u64(row.first_sequence, "segment first sequence")?,
+                row.last_sequence
+                    .map(|value| sql_u64(value, "segment last sequence"))
+                    .transpose()?,
+                sql_u64(row.durable_end_offset, "segment durable offset")?,
+                sql_u64(row.folded_end_offset, "segment folded offset")?,
+                row.segment_path,
+                row.source_state,
+            ],
+        )?;
+        if source_published != 1 {
+            return Err(Error::Conflict(format!(
+                "retirement source metadata changed before publication: {}",
+                row.segment_id
+            )));
+        }
         let active: i64 = tx.query_row(
             "SELECT COUNT(*) FROM changed_path_segment_quarantine_allocations
              WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3
@@ -990,9 +1220,7 @@ fn journal_missing_quarantine_allocations(
                 expected.epoch,
                 &row.segment_id,
                 scope_directory_identity,
-                row.source_identity.ok_or_else(|| {
-                    Error::Corrupt("retirement source identity was not authenticated".into())
-                })?,
+                source_identity,
             )?,
             1 => {}
             count => {
@@ -1111,7 +1339,7 @@ fn authenticate_direct_quarantine(
             durable_end_offset: row.durable_end_offset,
             previous_segment_hash: row.previous_segment_hash,
             stored_segment_hash: row.stored_segment_hash,
-            state: row.state.clone(),
+            state: row.source_state.clone(),
             limits,
         },
     )
@@ -1123,11 +1351,11 @@ fn ensure_segment_quarantine_allocations(
     conn: &Connection,
     database_path: &std::path::Path,
     expected: &RetirementIdentity,
-) -> Result<()> {
+) -> Result<Vec<RetiredSegmentRow>> {
     let (scope_directory_identity, rows) =
         inspect_segments_before_allocation(conn, database_path, expected.scope_id, expected.epoch)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(rows);
     }
     journal_missing_quarantine_allocations(conn, expected, scope_directory_identity, &rows)?;
     let directory = super::secure_fs::SecureDirectory::open_absolute(
@@ -1280,7 +1508,7 @@ fn ensure_segment_quarantine_allocations(
         }
     }
     crate::db::util::test_crash_point("changed_path_deletion_after_allocation_setup");
-    Ok(())
+    Ok(rows)
 }
 
 fn prepare_segment_deletion_transactions(
@@ -1288,8 +1516,14 @@ fn prepare_segment_deletion_transactions(
     database_path: &std::path::Path,
     scope_id: super::ScopeId,
     epoch: u64,
+    rows: &[RetiredSegmentRow],
 ) -> Result<()> {
-    let (limits, rows) = load_retired_segment_rows(tx, scope_id, epoch)?;
+    let (limits, persisted_rows) = load_retired_segment_rows(tx, scope_id, epoch)?;
+    if persisted_rows.len() != rows.len() {
+        return Err(Error::Corrupt(
+            "retirement segment set changed after writer quiescence".into(),
+        ));
+    }
     if rows.is_empty() {
         return Ok(());
     }
@@ -1302,6 +1536,22 @@ fn prepare_segment_deletion_transactions(
         .join(scope_id.to_text());
     let directory = super::secure_fs::SecureDirectory::open_absolute(&directory_path)?;
     let scope_directory_identity = directory.identity()?;
+    let (retirement_generation, retirement_owner_token, retirement_fence): (i64, String, Vec<u8>) =
+        tx.query_row(
+            "SELECT scope.continuity_generation,owner.owner_token,owner.fence_nonce
+         FROM changed_path_scopes scope
+         JOIN changed_path_observer_owners owner ON owner.scope_id=scope.scope_id
+         WHERE scope.scope_id=?1 AND scope.epoch=?2
+           AND scope.trust_state='untrusted_gap' AND scope.trust_reason='scope_retiring'
+           AND owner.epoch=scope.epoch AND owner.lease_state='revoked'",
+            params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if retirement_fence.len() != 32 {
+        return Err(Error::Corrupt(
+            "retirement owner fence nonce is not exact".into(),
+        ));
+    }
     let mut expected_previous_segment_id: Option<String> = None;
     let mut expected_previous_segment_hash = [0; 32];
     let mut expected_first_sequence = 1_u64;
@@ -1334,6 +1584,11 @@ fn prepare_segment_deletion_transactions(
             )));
         }
         let allocation = load_active_quarantine_allocation(tx, scope_id, epoch, &row.segment_id)?;
+        if hex::encode(row.owner_token) != retirement_owner_token {
+            return Err(Error::Corrupt(
+                "retirement segment owner does not match revoked fence owner".into(),
+            ));
+        }
         if allocation.state != "allocated" {
             return Err(Error::Corrupt(format!(
                 "segment quarantine allocation is not ready for binding: {} state={}",
@@ -1371,14 +1626,14 @@ fn prepare_segment_deletion_transactions(
                 durable_end_offset: row.durable_end_offset,
                 previous_segment_hash: row.previous_segment_hash,
                 stored_segment_hash: row.stored_segment_hash,
-                state: row.state.clone(),
+                state: row.source_state.clone(),
                 limits,
             },
         )
         .map_err(|error| Error::Corrupt(error.to_string()))?;
         expected_previous_segment_id = Some(row.segment_id.clone());
         expected_previous_segment_hash = authenticated.durable_hash;
-        saw_open_segment = row.state == "open";
+        saw_open_segment = row.source_state == "open";
         expected_first_sequence = row
             .last_sequence
             .unwrap_or(row.first_sequence.saturating_sub(1))
@@ -1388,6 +1643,8 @@ fn prepare_segment_deletion_transactions(
         tx.execute(
             "INSERT INTO changed_path_segment_deletions(
                  scope_id,epoch,segment_id,original_leaf,quarantine_leaf,allocation_nonce,
+                 log_format_version,provider_id,folded_end_offset,
+                 retirement_continuity_generation,retirement_fence_nonce,
                  scope_directory_device,scope_directory_inode,quarantine_device,quarantine_inode,
                  segment_device,segment_inode,file_length,file_hash,durable_end_offset,
                  durable_hash,max_observer_log_bytes,max_segment_bytes,
@@ -1395,7 +1652,8 @@ fn prepare_segment_deletion_transactions(
                  previous_segment_id,previous_segment_hash,source_state,state,
                  created_at,updated_at,completed_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
-                    ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,'quiesced',?26,?26,?26)",
+                    ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
+                    ?28,?29,?30,'quiesced',?31,?31,?31)",
             params![
                 scope_id.to_text(),
                 sql_u64(epoch, "scope epoch")?,
@@ -1403,6 +1661,11 @@ fn prepare_segment_deletion_transactions(
                 row.segment_path,
                 allocation.quarantine_leaf,
                 allocation.attempt_nonce,
+                sql_u64(row.log_format_version, "segment log format")?,
+                row.provider_id,
+                sql_u64(row.folded_end_offset, "segment folded offset")?,
+                retirement_generation,
+                retirement_fence,
                 encode_fs_identity_part(scope_directory_identity.0),
                 encode_fs_identity_part(scope_directory_identity.1),
                 encode_fs_identity_part(quarantine_identity.0),
@@ -1428,7 +1691,7 @@ fn prepare_segment_deletion_transactions(
                     .transpose()?,
                 row.previous_segment_id,
                 hex::encode(row.previous_segment_hash),
-                row.state,
+                row.source_state,
                 now,
             ],
         )?;
@@ -1470,8 +1733,16 @@ fn validate_segment_deletion_transaction_coverage(
              (SELECT COUNT(*) FROM changed_path_segment_deletions deletion
               LEFT JOIN changed_path_segment_quarantine_allocations allocation
                 ON allocation.attempt_nonce=deletion.allocation_nonce
+              LEFT JOIN changed_path_observer_segments segment
+                ON segment.scope_id=deletion.scope_id AND segment.epoch=deletion.epoch
+               AND segment.segment_id=deletion.segment_id
+              LEFT JOIN changed_path_scopes scope ON scope.scope_id=deletion.scope_id
+              LEFT JOIN changed_path_observer_owners owner ON owner.scope_id=deletion.scope_id
               WHERE deletion.scope_id=?1 AND deletion.epoch=?2
                 AND (allocation.attempt_nonce IS NULL OR allocation.state<>'bound'
+                     OR segment.segment_id IS NULL OR segment.state<>'retired'
+                     OR scope.retired_at IS NULL OR scope.trust_reason<>'scope_retired'
+                     OR owner.owner_token IS NULL OR owner.lease_state<>'revoked'
                      OR allocation.scope_id<>deletion.scope_id
                      OR allocation.epoch<>deletion.epoch
                      OR allocation.segment_id<>deletion.segment_id
@@ -1483,7 +1754,30 @@ fn validate_segment_deletion_transaction_coverage(
                      OR allocation.source_segment_device<>deletion.segment_device
                      OR allocation.source_segment_inode<>deletion.segment_inode
                      OR allocation.quarantine_device<>deletion.quarantine_device
-                     OR allocation.quarantine_inode<>deletion.quarantine_inode))",
+                     OR allocation.quarantine_inode<>deletion.quarantine_inode
+                     OR deletion.original_leaf<>segment.segment_path
+                     OR deletion.log_format_version<>segment.log_format_version
+                     OR deletion.provider_id<>segment.provider_id
+                     OR deletion.provider_id<>owner.provider_id
+                     OR deletion.provider_id IS NOT scope.provider_id
+                     OR deletion.owner_token<>segment.owner_token
+                     OR deletion.owner_token<>owner.owner_token
+                     OR deletion.first_sequence<>segment.first_sequence
+                     OR deletion.last_sequence IS NOT segment.last_sequence
+                     OR deletion.durable_end_offset<>segment.durable_end_offset
+                     OR deletion.folded_end_offset<>segment.folded_end_offset
+                     OR deletion.previous_segment_id IS NOT segment.previous_segment_id
+                     OR deletion.previous_segment_hash<>
+                        COALESCE(segment.previous_segment_hash,
+                          '0000000000000000000000000000000000000000000000000000000000000000')
+                     OR deletion.source_state<>segment.retirement_source_state
+                     OR deletion.file_length<>segment.retirement_file_length
+                     OR deletion.file_hash<>segment.retirement_file_hash
+                     OR deletion.durable_hash<>segment.retirement_durable_hash
+                     OR deletion.segment_device<>segment.retirement_source_device
+                     OR deletion.segment_inode<>segment.retirement_source_inode
+                     OR deletion.retirement_continuity_generation<>scope.continuity_generation
+                     OR deletion.retirement_fence_nonce<>owner.fence_nonce))",
             params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
@@ -3161,21 +3455,23 @@ mod harness {
     fn direct_target_collision_is_retained(tag: u8) -> Result<()> {
         let fixture = Fixture::new(tag)?;
         create_real_retirement_segment(&fixture, tag)?;
+        let retirement =
+            load_retirement_identity(&fixture.db.conn, &fixture.expected.scope_id.to_text())?
+                .ok_or_else(|| Error::Corrupt("missing collision retirement identity".into()))?;
+        let retirement = begin_scope_retirement(&fixture.db.conn, &retirement)?;
         let (scope_identity, rows) = inspect_segments_before_allocation(
             &fixture.db.conn,
             &fixture.db.sqlite_path,
             fixture.expected.scope_id,
             fixture.expected.epoch,
         )?;
-        let retirement =
-            load_retirement_identity(&fixture.db.conn, &fixture.expected.scope_id.to_text())?
-                .ok_or_else(|| Error::Corrupt("missing collision retirement identity".into()))?;
         journal_missing_quarantine_allocations(
             &fixture.db.conn,
             &retirement,
             scope_identity,
             &rows,
         )?;
+        drop(rows);
         let quarantine_leaf: String = fixture.db.conn.query_row(
             "SELECT quarantine_leaf FROM changed_path_segment_quarantine_allocations
              WHERE scope_id=?1 AND state='allocating'",
@@ -3258,6 +3554,17 @@ mod harness {
     }
 
     fn create_real_segment(db: &Trail, scope_id: ScopeId, epoch: u64, tag: u8) -> Result<String> {
+        let (leaf, writer) = create_retained_real_segment(db, scope_id, epoch, tag)?;
+        drop(writer);
+        Ok(leaf)
+    }
+
+    fn create_retained_real_segment(
+        db: &Trail,
+        scope_id: ScopeId,
+        epoch: u64,
+        tag: u8,
+    ) -> Result<(String, super::super::SegmentWriter)> {
         let directory = db.db_dir.join("observer-segments").join(scope_id.to_text());
         let provider_id: String = db.conn.query_row(
             "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
@@ -3280,8 +3587,66 @@ mod harness {
             params![scope_id.to_text(), sql_u64(epoch, "scope epoch")?],
             |row| row.get(0),
         )?;
+        Ok((leaf, writer))
+    }
+
+    pub(super) fn retirement_requires_retained_writer_quiescence() -> Result<()> {
+        let fixture = Fixture::new(0xa1)?;
+        let (leaf, mut writer) = create_retained_real_segment(
+            &fixture.db,
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+            0xa1,
+        )?;
+        let original = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text())
+            .join(&leaf);
+        if retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected).is_ok() {
+            return Err(Error::Corrupt(
+                "retirement moved a segment while its writer FD remained retained".into(),
+            ));
+        }
+        if !original.exists() {
+            return Err(Error::Corrupt(
+                "retirement moved the segment before writer close acknowledgement".into(),
+            ));
+        }
+        let quiesced: i64 = fixture.db.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_segment_deletions WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        if quiesced != 0 {
+            return Err(Error::Corrupt(
+                "retirement published quiesced deletion before writer close acknowledgement".into(),
+            ));
+        }
+        let before_append = std::fs::metadata(&original)?.len();
+        let late_record = super::super::ObserverRecord {
+            sequence: 1,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse("late-after-retirement-fence.txt")?,
+            flags: EvidenceFlags::CONTENT,
+            provider_cursor: b"late-after-retirement-fence".to_vec(),
+        };
+        if writer.append(&[late_record]).is_ok()
+            || std::fs::metadata(&original)?.len() != before_append
+        {
+            return Err(Error::Corrupt(
+                "revoked retained writer appended after the retirement fence".into(),
+            ));
+        }
         drop(writer);
-        Ok(leaf)
+        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        if retry.len() != 1 || original.exists() {
+            return Err(Error::Corrupt(
+                "retirement did not converge after the retained writer closed".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn deletion_parent_substitution_uses_retained_authority() -> Result<()> {
@@ -3988,6 +4353,7 @@ mod harness {
     #[test]
     fn subprocess_kill_and_retry_covers_quarantine_deletion_boundaries() {
         for (index, phase) in [
+            "changed_path_deletion_after_retirement_fence_barrier",
             "changed_path_deletion_after_allocation_journal_barrier",
             "changed_path_deletion_after_direct_quarantine_rename",
             "changed_path_deletion_after_direct_quarantine_verify",
@@ -5087,6 +5453,11 @@ pub(crate) fn run_deletion_retry_hostile_quarantine_replacement_rejection(
 #[cfg(debug_assertions)]
 pub(crate) fn run_deletion_normal_retry_idempotence() -> std::result::Result<(), String> {
     harness::deletion_normal_retry_is_durably_idempotent().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_retained_writer_quiescence() -> std::result::Result<(), String> {
+    harness::retirement_requires_retained_writer_quiescence().map_err(|error| error.to_string())
 }
 
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]

@@ -126,6 +126,10 @@ pub mod test_support {
         crate::db::run_deletion_normal_retry_idempotence()
     }
 
+    pub fn changed_path_retained_writer_quiescence() -> std::result::Result<(), String> {
+        crate::db::run_retained_writer_quiescence()
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn changed_path_orphan_quarantine_substitution_rejection() -> std::result::Result<(), String>
     {

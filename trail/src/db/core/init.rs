@@ -4,6 +4,26 @@ const AUTO_MINIMAL_FILES_THRESHOLD: usize = 10_000;
 const AUTO_MINIMAL_BYTES_THRESHOLD: u64 = 128 * 1024 * 1024;
 const DETAILED_INIT_CHANGES_FILE_THRESHOLD: usize = 10_000;
 
+#[cfg(test)]
+thread_local! {
+    static SCHEMA_HANDOFF_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_schema_handoff_hook(hook: impl FnOnce(&Path) + 'static) {
+    SCHEMA_HANDOFF_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_schema_handoff_hook(db_dir: &Path) {
+    SCHEMA_HANDOFF_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(db_dir);
+        }
+    });
+}
+
 impl Trail {
     pub fn init(
         workspace_root: impl AsRef<Path>,
@@ -61,6 +81,8 @@ impl Trail {
         }
 
         fs::create_dir_all(db_dir.join("index"))?;
+        fs::write(db_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+        fs::write(db_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE), [])?;
         fs::create_dir_all(db_dir.join("refs/branches"))?;
         fs::create_dir_all(db_dir.join("refs/lanes"))?;
         fs::create_dir_all(db_dir.join("worktrees"))?;
@@ -254,7 +276,8 @@ impl Trail {
         config: TrailConfig,
         schema_mode: SchemaOpenMode,
     ) -> Result<Self> {
-        let db = Self::open_at_without_recovery(workspace_root, db_dir, config, schema_mode)?;
+        let db =
+            Self::open_at_without_recovery(workspace_root, db_dir, config, schema_mode, false)?;
         db.recover_after_open()?;
         Ok(db)
     }
@@ -269,7 +292,34 @@ impl Trail {
             return Err(Error::WorkspaceNotFound(db_dir));
         }
         let config = read_config(&db_dir)?;
-        Self::open_at_without_recovery(workspace_root, db_dir, config, SchemaOpenMode::Existing)
+        Self::open_at_without_recovery(
+            workspace_root,
+            db_dir,
+            config,
+            SchemaOpenMode::Existing,
+            false,
+        )
+    }
+
+    pub(crate) fn open_without_recovering_derived_paths_under_write_lock(
+        workspace_root: impl AsRef<Path>,
+        db_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        let db_dir = canonicalize_lossless(db_dir.as_ref())?;
+        if !db_dir.is_dir() {
+            return Err(Error::WorkspaceNotFound(db_dir));
+        }
+        let config = read_config(&db_dir)?;
+        // The caller owns the workspace write lock and already holds a Trail handle whose
+        // mutable handoff completed schema validation under that same exclusion.
+        Self::open_at_without_recovery(
+            workspace_root,
+            db_dir,
+            config,
+            SchemaOpenMode::Existing,
+            true,
+        )
     }
 
     fn open_at_without_recovery(
@@ -277,24 +327,42 @@ impl Trail {
         db_dir: PathBuf,
         config: TrailConfig,
         schema_mode: SchemaOpenMode,
+        writer_exclusion_held: bool,
     ) -> Result<Self> {
         let sqlite_path = db_dir.join(DB_RELATIVE_PATH);
-        match schema_mode {
-            SchemaOpenMode::FreshCreate => fs::create_dir_all(db_dir.join("index"))?,
+        let validated_schema = match schema_mode {
+            SchemaOpenMode::FreshCreate => None,
+            SchemaOpenMode::Existing if writer_exclusion_held => None,
             SchemaOpenMode::Existing => {
-                preflight_existing_schema(&sqlite_path, &config.storage.prolly_backend)?
+                Some(Self::with_write_lock_wait(Duration::from_secs(10), || {
+                    preflight_existing_schema(&sqlite_path, &config.storage.prolly_backend)
+                })?)
             }
+        };
+        if schema_mode == SchemaOpenMode::FreshCreate {
+            fs::create_dir_all(db_dir.join("index"))?;
+        }
+        #[cfg(test)]
+        if schema_mode == SchemaOpenMode::Existing && !writer_exclusion_held {
+            run_schema_handoff_hook(&db_dir);
+        }
+        if let Some(validated) = &validated_schema {
+            validated.verify_unchanged()?;
         }
         register_sqlite_vec_extension()?;
         let operation_metrics =
             operation_metrics_are_enabled().then(|| Arc::new(OperationMetricsState::default()));
+        let conn = Connection::open(&sqlite_path)?;
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
         let store = open_prolly_store(
             &config,
             &sqlite_path,
             operation_metrics.clone(),
             schema_mode,
         )?;
-        let conn = Connection::open(&sqlite_path)?;
         apply_sqlite_pragmas(&conn)?;
         let prolly = Prolly::new(store.clone(), prolly_config());
         let root_prolly = Prolly::new(store.clone(), root_map_prolly_config());
@@ -320,11 +388,34 @@ impl Trail {
     }
 
     pub(crate) fn recover_after_open(&self) -> Result<()> {
-        if self.has_pending_path_index_derived_repairs()? {
+        let lock_path = self.db_dir.join("lock");
+        if lock_path.exists()
+            && fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|holder| {
+                    holder.split_whitespace().find_map(|part| {
+                        part.strip_prefix("pid=")
+                            .and_then(|value| value.parse::<u32>().ok())
+                    })
+                })
+                .is_none()
+        {
+            // Legacy or manually managed writer locks have always allowed a read-only open.
+            // Defer recovery until a later open after that writer releases its lock.
+            return Ok(());
+        }
+        match Self::with_write_lock_wait(Duration::from_secs(30), || {
             let _lock = self.acquire_write_lock()?;
-            if self.has_pending_path_index_derived_repairs()? {
-                self.drain_pending_path_index_derived_repairs()?;
-            }
+            self.recover_after_open_under_write_lock()
+        }) {
+            Err(Error::WorkspaceLocked(_)) => Ok(()),
+            result => result,
+        }
+    }
+
+    fn recover_after_open_under_write_lock(&self) -> Result<()> {
+        if self.has_pending_path_index_derived_repairs()? {
+            self.drain_pending_path_index_derived_repairs()?;
         }
         self.recover_materialization_stages()?;
         self.recover_workspace_views()?;
@@ -406,38 +497,7 @@ impl Trail {
     }
 
     pub(crate) fn acquire_write_lock(&self) -> Result<WorkspaceLock> {
-        let path = self.db_dir.join("lock");
-        let mut delay = Duration::from_millis(2);
-        let mut file = loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => break file,
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder =
-                        fs::read_to_string(&path).unwrap_or_else(|_| "unknown writer".to_string());
-                    if is_stale_lock_holder(&holder)
-                        && fs::read_to_string(&path).unwrap_or_default() == holder
-                    {
-                        match fs::remove_file(&path) {
-                            Ok(()) => continue,
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(err) => return Err(Error::Io(err)),
-                        }
-                    }
-                    let should_wait = WRITE_LOCK_WAIT_DEADLINE
-                        .with(|deadline| deadline.get())
-                        .is_some_and(|deadline| Instant::now() < deadline);
-                    if should_wait {
-                        std::thread::sleep(delay);
-                        delay = (delay * 2).min(Duration::from_millis(50));
-                        continue;
-                    }
-                    return Err(Error::WorkspaceLocked(holder.trim().to_string()));
-                }
-                Err(err) => return Err(Error::Io(err)),
-            }
-        };
-        writeln!(file, "pid={} created_at={}", std::process::id(), now_ts())?;
-        Ok(WorkspaceLock { path })
+        acquire_workspace_lock(&self.db_dir)
     }
 }
 
@@ -498,16 +558,139 @@ fn worktree_path_scan_is_large(scan: &WorktreePathScan) -> bool {
         || scan.total_bytes > AUTO_MINIMAL_BYTES_THRESHOLD
 }
 
-fn is_stale_lock_holder(holder: &str) -> bool {
-    let Some(pid) = lock_holder_pid(holder) else {
-        return false;
+#[cfg(test)]
+mod schema_handoff_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
     };
-    !process_is_alive(pid)
-}
 
-fn lock_holder_pid(holder: &str) -> Option<u32> {
-    holder.split_whitespace().find_map(|part| {
-        part.strip_prefix("pid=")
-            .and_then(|value| value.parse::<u32>().ok())
-    })
+    #[test]
+    fn schema_snapshot_exclusion_is_retained_through_mutable_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_in_hook = observed.clone();
+        install_schema_handoff_hook(move |db_dir| {
+            assert!(matches!(
+                acquire_workspace_lock(db_dir),
+                Err(Error::WorkspaceLocked(_))
+            ));
+            observed_in_hook.store(true, Ordering::SeqCst);
+        });
+        let reopened = Trail::open(root.path()).unwrap();
+        drop(reopened);
+        assert!(observed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn one_hundred_ordinary_opens_share_one_unchanged_generation_validation() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='singleflight' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(100));
+        let started = Instant::now();
+        let handles = (0..100)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Trail::open(root).map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(schema_validation_count(&db_path), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "100 shared schema opens exceeded the five second budget"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn generation_replacement_or_sidecar_change_invalidates_mutable_handoff() {
+        for changed_suffix in ["", "-wal", "-shm"] {
+            let root = tempfile::tempdir().unwrap();
+            Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+            let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+            let writer = Connection::open(&db_path).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE schema_meta SET value='toctou' WHERE key='app.version'",
+                    [],
+                )
+                .unwrap();
+            let mut changed_path = db_path.as_os_str().to_os_string();
+            changed_path.push(changed_suffix);
+            let changed_path = PathBuf::from(changed_path);
+            assert!(changed_path.exists(), "missing sidecar {changed_suffix}");
+            install_schema_handoff_hook(move |_| {
+                if changed_suffix.is_empty() {
+                    let replacement = changed_path.with_extension("replacement");
+                    fs::copy(&changed_path, &replacement).unwrap();
+                    fs::rename(replacement, &changed_path).unwrap();
+                } else {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&changed_path)
+                        .unwrap()
+                        .write_all(b"generation-change")
+                        .unwrap();
+                }
+            });
+            assert!(matches!(
+                Trail::open(root.path()),
+                Err(Error::SchemaReinitializeRequired { .. })
+            ));
+            drop(writer);
+        }
+    }
+
+    #[test]
+    fn schema_validation_leader_failure_propagates_and_next_open_retries() {
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        fail_next_schema_validation(&db_path);
+        let barrier = Arc::new(Barrier::new(16));
+        let handles = (0..16)
+            .map(|_| {
+                let root = root.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Trail::open(root)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert!(matches!(
+                handle.join().unwrap(),
+                Err(Error::SchemaReinitializeRequired { .. })
+            ));
+        }
+        Trail::open(root.path()).unwrap();
+        assert_eq!(schema_validation_count(&db_path), 2);
+    }
 }

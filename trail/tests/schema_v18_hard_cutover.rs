@@ -12,6 +12,7 @@ use trail::{InitImportMode, Trail};
 
 struct SchemaFixture {
     temp: tempfile::TempDir,
+    wal_writer: Option<Connection>,
 }
 
 impl SchemaFixture {
@@ -46,6 +47,24 @@ impl SchemaFixture {
         fixture
     }
 
+    fn with_persistent_wal(mutator: impl FnOnce(&Connection)) -> Self {
+        let mut fixture = Self::fresh_v18();
+        let conn = Connection::open(fixture.sqlite_path()).unwrap();
+        assert_eq!(
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .to_ascii_lowercase(),
+            "wal"
+        );
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        mutator(&conn);
+        assert!(fixture.sqlite_path().with_extension("sqlite-wal").exists());
+        fixture.wal_writer = Some(conn);
+        fixture
+    }
+
     fn mutated_master_sql(object: &str, from: &str, to: &str) -> Self {
         Self::with_sql(|conn| {
             conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
@@ -68,7 +87,10 @@ impl SchemaFixture {
     fn fresh_v18() -> Self {
         let temp = tempfile::tempdir().unwrap();
         Trail::init(temp.path(), "main", InitImportMode::Empty, false).unwrap();
-        Self { temp }
+        Self {
+            temp,
+            wal_writer: None,
+        }
     }
 
     fn root(&self) -> &Path {
@@ -148,26 +170,55 @@ fn assert_tree_unchanged(fixture: &SchemaFixture, before: &BTreeMap<PathBuf, Vec
     assert!(changes.is_empty(), "workspace bytes changed: {changes:?}");
 }
 
+fn assert_persistent_wal_rejected_byte_invariantly(fixture: &SchemaFixture) {
+    let before = fixture.snapshot_tree_bytes();
+    assert!(
+        before.keys().any(|path| path.ends_with("trail.sqlite-wal")),
+        "fixture did not retain a WAL generation"
+    );
+    let err = open_error(fixture.root());
+    assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+    assert_tree_unchanged(fixture, &before);
+}
+
 fn insert_malformed_retirement_graph(conn: &Connection, kind: &str) {
     conn.execute_batch(
         "INSERT INTO changed_path_scopes(
              scope_id,scope_kind,owner_id,scope_root,scope_root_identity,
              filesystem_identity,filesystem_kind,case_sensitive,ref_name,ref_generation,
              change_id,baseline_root_id,policy_fingerprint,policy_dependency_generation,
+             provider_id,provider_identity,
              trust_state,trust_reason,retired_at,created_at,updated_at)
          VALUES('scope-a','workspace','owner-a','','root-id','fs-id','native',1,
                 'refs/heads/main',1,'change-a','root-a','policy-a',1,
+                'provider','',
                 'untrusted_gap','scope_retired',1,1,1);
+         INSERT INTO changed_path_observer_owners(
+             scope_id,epoch,owner_token,provider_id,provider_identity,lease_state,
+             fence_nonce,acquired_at,heartbeat_at,expires_at,updated_at)
+         VALUES('scope-a',1,
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'provider','','revoked',
+                X'0000000000000000000000000000000000000000000000000000000000000000',
+                1,1,1,1);
          INSERT INTO changed_path_observer_segments(
              scope_id,epoch,segment_id,owner_token,provider_id,first_sequence,
-             durable_end_offset,folded_end_offset,segment_path,state,created_at,updated_at)
+             durable_end_offset,folded_end_offset,segment_path,state,retirement_source_state,
+             retirement_file_length,retirement_file_hash,retirement_durable_hash,
+             retirement_source_device,retirement_source_inode,created_at,updated_at)
          VALUES
              ('scope-a',1,'segment-a',
               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-              'provider',1,0,0,'segment-a.cpl','retired',1,1),
+              'provider',1,0,0,'segment-a.cpl','retired','open',0,
+              '0000000000000000000000000000000000000000000000000000000000000000',
+              '0000000000000000000000000000000000000000000000000000000000000000',
+              '7','8',1,1),
              ('scope-a',1,'segment-b',
               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-              'provider',2,0,0,'segment-b.cpl','retired',1,1);",
+              'provider',2,0,0,'segment-b.cpl','retired','open',0,
+              '0000000000000000000000000000000000000000000000000000000000000000',
+              '0000000000000000000000000000000000000000000000000000000000000000',
+              '9','10',1,1);",
     )
     .unwrap();
     let allocation_state = if kind == "state_invalid" {
@@ -215,13 +266,17 @@ fn insert_malformed_retirement_graph(conn: &Connection, kind: &str) {
         conn.execute_batch(&format!(
             "INSERT INTO changed_path_segment_deletions(
                  scope_id,epoch,segment_id,original_leaf,quarantine_leaf,allocation_nonce,
+                 log_format_version,provider_id,folded_end_offset,
+                 retirement_continuity_generation,retirement_fence_nonce,
                  scope_directory_device,scope_directory_inode,quarantine_device,quarantine_inode,
                  segment_device,segment_inode,file_length,file_hash,durable_end_offset,
                  durable_hash,max_observer_log_bytes,max_segment_bytes,max_unfolded_tail_records,
                  owner_token,first_sequence,last_sequence,previous_segment_id,
                  previous_segment_hash,source_state,state,created_at,updated_at,completed_at)
              VALUES('scope-a',1,'segment-a','segment-a.cpl','.trail-delete-a.cplq',
-                    '{allocation_nonce}','1','2','7','8','7','8',0,
+                    '{allocation_nonce}',1,'provider',0,1,
+                    X'0000000000000000000000000000000000000000000000000000000000000000',
+                    '1','2','7','8','7','8',0,
                     '0000000000000000000000000000000000000000000000000000000000000000',0,
                     '0000000000000000000000000000000000000000000000000000000000000000',
                     1024,512,16,
@@ -687,4 +742,134 @@ fn malformed_retirement_graph_is_rejected_read_only() {
         assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED", "kind={kind}");
         assert_tree_unchanged(&fixture, &before);
     }
+}
+
+#[test]
+fn malformed_scope_segment_allocation_deletion_graph_is_rejected_read_only() {
+    let fixtures = [
+        SchemaFixture::with_sql(|conn| {
+            insert_malformed_retirement_graph(conn, "orphan");
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_malformed_retirement_graph(conn, "state_invalid");
+            conn.execute_batch(
+                "UPDATE changed_path_scopes
+                 SET retired_at=NULL,trust_reason='active_scope'
+                 WHERE scope_id='scope-a';
+                 UPDATE changed_path_observer_segments
+                 SET state='open' WHERE scope_id='scope-a';",
+            )
+            .unwrap();
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_malformed_retirement_graph(conn, "valid");
+            conn.execute(
+                "DELETE FROM changed_path_observer_segments
+                 WHERE scope_id='scope-a' AND segment_id='segment-b'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE changed_path_segment_deletions
+                 SET original_leaf='different.cpl' WHERE scope_id='scope-a'",
+                [],
+            )
+            .unwrap();
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_malformed_retirement_graph(conn, "valid");
+            conn.execute(
+                "DELETE FROM changed_path_observer_segments
+                 WHERE scope_id='scope-a' AND segment_id='segment-b'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE changed_path_segment_deletions
+                 SET owner_token='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+                 WHERE scope_id='scope-a'",
+                [],
+            )
+            .unwrap();
+        }),
+        SchemaFixture::with_sql(|conn| {
+            insert_malformed_retirement_graph(conn, "cross_wired");
+        }),
+    ];
+    for fixture in fixtures {
+        let before = fixture.snapshot_tree_bytes();
+        let err = open_error(fixture.root());
+        assert_eq!(err.code(), "SCHEMA_REINITIALIZE_REQUIRED");
+        assert_tree_unchanged(&fixture, &before);
+    }
+}
+
+#[test]
+fn persistent_wal_malformed_retirement_graph_is_rejected_byte_invariantly() {
+    let fixture = SchemaFixture::with_persistent_wal(|conn| {
+        insert_malformed_retirement_graph(conn, "state_invalid");
+    });
+    assert_persistent_wal_rejected_byte_invariantly(&fixture);
+}
+
+#[test]
+fn persistent_wal_schema_fk_and_partial_generations_are_rejected_byte_invariantly() {
+    let malformed_schema = SchemaFixture::with_persistent_wal(|conn| {
+        conn.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+        conn.execute(
+            "UPDATE sqlite_master SET sql=replace(sql,'CHECK (state = ''quiesced'')',
+                    'CHECK (state IN (''quiesced'',''deleted''))')
+             WHERE name='changed_path_segment_deletions'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA writable_schema=OFF;").unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        conn.pragma_update(None, "schema_version", version + 1)
+            .unwrap();
+    });
+    assert_persistent_wal_rejected_byte_invariantly(&malformed_schema);
+
+    let orphan_policy = SchemaFixture::with_persistent_wal(|conn| {
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO changed_path_policy_dependencies(
+                 scope_id,dependency_identity,dependency_kind,content_identity,
+                 metadata_identity,observable,generation,last_source_sequence,created_at,updated_at)
+             VALUES('missing-scope','dependency','builtin',X'01',X'02',1,1,0,1,1)",
+            [],
+        )
+        .unwrap();
+    });
+    assert_persistent_wal_rejected_byte_invariantly(&orphan_policy);
+
+    let partial = SchemaFixture::with_persistent_wal(|conn| {
+        conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE changed_path_policy_dependencies;")
+            .unwrap();
+    });
+    assert_persistent_wal_rejected_byte_invariantly(&partial);
+}
+
+#[test]
+fn valid_persistent_wal_generation_survives_snapshot_preflight_and_mutable_handoff() {
+    let fixture = SchemaFixture::with_persistent_wal(|conn| {
+        conn.execute(
+            "UPDATE schema_meta SET value='wal-visible' WHERE key='app.version'",
+            [],
+        )
+        .unwrap();
+    });
+    let opened = Trail::open(fixture.root()).unwrap();
+    drop(opened);
+    let conn = Connection::open(fixture.sqlite_path()).unwrap();
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key='app.version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, "wal-visible");
 }

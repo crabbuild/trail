@@ -49,6 +49,8 @@ impl Trail {
 
     pub(crate) fn create_backup_inner(&self, output: &Path) -> Result<BackupCreateReport> {
         fs::create_dir_all(output.join("index"))?;
+        fs::write(output.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+        fs::write(output.join("index").join(SCHEMA_VALIDATION_LEADER_FILE), [])?;
         fs::create_dir_all(output.join("refs/branches"))?;
         fs::create_dir_all(output.join("refs/lanes"))?;
 

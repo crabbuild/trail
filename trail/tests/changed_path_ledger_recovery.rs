@@ -114,6 +114,11 @@ fn retired_segment_deletion_normal_retry_is_durably_idempotent() {
     trail::test_support::changed_path_deletion_normal_retry_idempotence().unwrap();
 }
 
+#[test]
+fn retirement_waits_for_retained_segment_writer_close_acknowledgement() {
+    trail::test_support::changed_path_retained_writer_quiescence().unwrap();
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn orphan_quarantine_substitution_after_verification_is_rejected() {

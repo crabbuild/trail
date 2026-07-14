@@ -44,6 +44,11 @@ impl Trail {
 
         let restore_result = (|| -> Result<(u64, crate::model::FsckReport)> {
             fs::create_dir_all(temp_dir.join("index"))?;
+            fs::write(temp_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
+            fs::write(
+                temp_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE),
+                [],
+            )?;
             fs::create_dir_all(temp_dir.join("refs/branches"))?;
             fs::create_dir_all(temp_dir.join("refs/lanes"))?;
             fs::copy(backup_path.join(CONFIG_FILE), temp_dir.join(CONFIG_FILE))?;

@@ -1727,13 +1727,18 @@ mod path_index_rebuild_tests {
     }
 
     #[test]
-    fn open_with_empty_pending_queue_does_not_contend_with_writer_lock() {
+    fn schema_preflight_waits_for_writer_exclusion_even_with_empty_pending_queue() {
         let workspace = tempfile::tempdir().unwrap();
         Trail::init(workspace.path(), "main", InitImportMode::Empty, false).unwrap();
         let db = Trail::open(workspace.path()).unwrap();
-        let _lock = db.acquire_write_lock().unwrap();
+        let lock = db.acquire_write_lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(lock);
+        });
 
         Trail::open(workspace.path()).unwrap();
+        releaser.join().unwrap();
     }
 
     #[test]

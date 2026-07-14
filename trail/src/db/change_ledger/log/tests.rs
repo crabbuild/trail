@@ -169,6 +169,38 @@ impl Fixture {
     }
 }
 
+#[test]
+fn observer_writer_acquisition_obeys_workspace_exclusion_without_mutation() {
+    let fixture = Fixture::new();
+    let workspace_db_dir = fixture.database.parent().unwrap();
+    let _workspace_lock =
+        crate::db::acquire_workspace_lock_for_database(workspace_db_dir, &fixture.database)
+            .unwrap();
+
+    assert!(matches!(
+        fixture.acquire_epoch(3, [0x19; 32]),
+        Err(crate::Error::WorkspaceLocked(_))
+    ));
+
+    let connection = Connection::open(&fixture.database).unwrap();
+    let owner_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM changed_path_observer_owners",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let segment_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM changed_path_observer_segments",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((owner_count, segment_count), (0, 0));
+    assert!(!fixture.segments.exists());
+}
+
 fn database_snapshot(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
     let connection = Connection::open(&fixture.database).unwrap();
     let mut owners = connection

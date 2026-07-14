@@ -1547,7 +1547,10 @@ impl Trail {
         let mut core = ViewCore::new_lazy(
             // The outer environment mutation owns the workspace writer lock
             // and its Trail handle already completed open-time recovery.
-            Trail::open_without_recovering_derived_paths(self.workspace_root(), self.db_dir())?,
+            Trail::open_without_recovering_derived_paths_under_write_lock(
+                self.workspace_root(),
+                self.db_dir(),
+            )?,
             PathBuf::from(&view.source_upper),
             view.base_root.clone(),
         )?;
@@ -2110,7 +2113,10 @@ impl Trail {
             let mut core = ViewCore::new_lazy(
                 // The outer layer mutation owns the workspace writer lock and
                 // its Trail handle already completed open-time recovery.
-                Trail::open_without_recovering_derived_paths(self.workspace_root(), self.db_dir())?,
+                Trail::open_without_recovering_derived_paths_under_write_lock(
+                    self.workspace_root(),
+                    self.db_dir(),
+                )?,
                 PathBuf::from(&view.source_upper),
                 view.base_root.clone(),
             )?;

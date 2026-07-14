@@ -269,13 +269,26 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              segment_hash TEXT,
              segment_path TEXT NOT NULL,
              state TEXT NOT NULL DEFAULT 'open'
-                 CHECK (state IN ('open', 'sealed', 'retired', 'corrupt')),
+                 CHECK (state IN ('open', 'sealed', 'retiring', 'retired', 'corrupt')),
+             retirement_source_state TEXT
+                 CHECK (retirement_source_state IS NULL OR
+                        retirement_source_state IN ('open','sealed')),
+             retirement_file_length INTEGER CHECK (retirement_file_length IS NULL OR retirement_file_length>=0),
+             retirement_file_hash TEXT CHECK (retirement_file_hash IS NULL OR length(retirement_file_hash)=64),
+             retirement_durable_hash TEXT CHECK (retirement_durable_hash IS NULL OR length(retirement_durable_hash)=64),
+             retirement_source_device TEXT,
+             retirement_source_inode TEXT,
              created_at INTEGER NOT NULL,
              sealed_at INTEGER,
              updated_at INTEGER NOT NULL,
              PRIMARY KEY (scope_id, epoch, segment_id),
              UNIQUE (scope_id, epoch, first_sequence),
-             CHECK (folded_end_offset <= durable_end_offset)
+             CHECK (folded_end_offset <= durable_end_offset),
+             CHECK ((retirement_source_device IS NULL)=(retirement_source_inode IS NULL)),
+             CHECK (state<>'retired' OR
+                    (retirement_source_state IS NOT NULL AND retirement_file_length IS NOT NULL
+                     AND retirement_file_hash IS NOT NULL AND retirement_durable_hash IS NOT NULL
+                     AND retirement_source_device IS NOT NULL))
          );
          CREATE INDEX changed_path_observer_segments_state_idx
              ON changed_path_observer_segments(scope_id, epoch, state, last_sequence);
@@ -330,6 +343,11 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              original_leaf TEXT NOT NULL CHECK (length(original_leaf) > 0),
              quarantine_leaf TEXT NOT NULL CHECK (length(quarantine_leaf) > 0),
              allocation_nonce TEXT NOT NULL UNIQUE CHECK (length(allocation_nonce) = 64),
+             log_format_version INTEGER NOT NULL CHECK (log_format_version=1),
+             provider_id TEXT NOT NULL CHECK (length(provider_id)>0),
+             folded_end_offset INTEGER NOT NULL CHECK (folded_end_offset>=0),
+             retirement_continuity_generation INTEGER NOT NULL CHECK (retirement_continuity_generation>=1),
+             retirement_fence_nonce BLOB NOT NULL CHECK (length(retirement_fence_nonce)=32),
              scope_directory_device TEXT NOT NULL CHECK (length(scope_directory_device) > 0),
              scope_directory_inode TEXT NOT NULL CHECK (length(scope_directory_inode) > 0),
              quarantine_device TEXT NOT NULL CHECK (length(quarantine_device) > 0),
@@ -435,7 +453,7 @@ fn ledger_schema_objects(conn: &Connection) -> Result<Vec<(String, String, Strin
 
 fn schema_structure_complete(conn: &Connection) -> Result<bool> {
     type Column = (&'static str, &'static str, bool, Option<&'static str>, i64);
-    let tables: [(&str, &[Column]); 13] = [
+    let tables: [(&str, &[Column]); 14] = [
         (
             "changed_path_scopes",
             &[
@@ -526,6 +544,21 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 ("provider_id", "TEXT", false, None, 0),
                 ("provider_sequence", "INTEGER", false, None, 0),
                 ("intent_id", "TEXT", false, None, 0),
+                ("created_at", "INTEGER", true, None, 0),
+                ("updated_at", "INTEGER", true, None, 0),
+            ],
+        ),
+        (
+            "changed_path_policy_dependencies",
+            &[
+                ("scope_id", "TEXT", true, None, 1),
+                ("dependency_identity", "TEXT", true, None, 2),
+                ("dependency_kind", "TEXT", true, None, 3),
+                ("content_identity", "BLOB", true, None, 0),
+                ("metadata_identity", "BLOB", true, None, 0),
+                ("observable", "INTEGER", true, None, 0),
+                ("generation", "INTEGER", true, None, 0),
+                ("last_source_sequence", "INTEGER", true, Some("0"), 0),
                 ("created_at", "INTEGER", true, None, 0),
                 ("updated_at", "INTEGER", true, None, 0),
             ],
@@ -640,6 +673,12 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 ("segment_hash", "TEXT", false, None, 0),
                 ("segment_path", "TEXT", true, None, 0),
                 ("state", "TEXT", true, Some("'open'"), 0),
+                ("retirement_source_state", "TEXT", false, None, 0),
+                ("retirement_file_length", "INTEGER", false, None, 0),
+                ("retirement_file_hash", "TEXT", false, None, 0),
+                ("retirement_durable_hash", "TEXT", false, None, 0),
+                ("retirement_source_device", "TEXT", false, None, 0),
+                ("retirement_source_inode", "TEXT", false, None, 0),
                 ("created_at", "INTEGER", true, None, 0),
                 ("sealed_at", "INTEGER", false, None, 0),
                 ("updated_at", "INTEGER", true, None, 0),
@@ -698,6 +737,11 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 ("original_leaf", "TEXT", true, None, 0),
                 ("quarantine_leaf", "TEXT", true, None, 0),
                 ("allocation_nonce", "TEXT", true, None, 0),
+                ("log_format_version", "INTEGER", true, None, 0),
+                ("provider_id", "TEXT", true, None, 0),
+                ("folded_end_offset", "INTEGER", true, None, 0),
+                ("retirement_continuity_generation", "INTEGER", true, None, 0),
+                ("retirement_fence_nonce", "BLOB", true, None, 0),
                 ("scope_directory_device", "TEXT", true, None, 0),
                 ("scope_directory_inode", "TEXT", true, None, 0),
                 ("quarantine_device", "TEXT", true, None, 0),
@@ -730,7 +774,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let table_fragments: [(&str, &[&str]); 13] = [
+    let table_fragments: [(&str, &[&str]); 14] = [
         (
             "changed_path_scopes",
             &[
@@ -783,6 +827,16 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CHECK (first_sequence >= 0)",
                 "CHECK (provider_sequence IS NULL OR provider_sequence >= 0)",
                 "CHECK (last_sequence >= first_sequence)",
+            ],
+        ),
+        (
+            "changed_path_policy_dependencies",
+            &[
+                "dependency_identity TEXT COLLATE BINARY NOT NULL",
+                "CHECK(dependency_kind IN ('builtin','trail_config','ignore','trailignore','gitignore','git_info_exclude','git_excludes_file','git_config','normalization','mode','case_policy'))",
+                "CHECK(observable IN (0,1))",
+                "PRIMARY KEY(scope_id,dependency_identity,dependency_kind)",
+                "WITHOUT ROWID",
             ],
         ),
         (
@@ -850,9 +904,10 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                 "CHECK (last_sequence IS NULL OR last_sequence >= first_sequence)",
                 "CHECK (durable_end_offset >= 0)",
                 "CHECK (folded_end_offset >= 0)",
-                "CHECK (state IN ('open', 'sealed', 'retired', 'corrupt'))",
+                "CHECK (state IN ('open', 'sealed', 'retiring', 'retired', 'corrupt'))",
                 "UNIQUE (scope_id, epoch, first_sequence)",
                 "CHECK (folded_end_offset <= durable_end_offset)",
+                "CHECK ((retirement_source_device IS NULL)=(retirement_source_inode IS NULL))",
             ],
         ),
         (
@@ -880,6 +935,10 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             &[
                 "CHECK (epoch >= 1)",
                 "CHECK (length(allocation_nonce) = 64)",
+                "CHECK (log_format_version=1)",
+                "CHECK (folded_end_offset>=0)",
+                "CHECK (retirement_continuity_generation>=1)",
+                "CHECK (length(retirement_fence_nonce)=32)",
                 "CHECK (state = 'quiesced')",
                 "UNIQUE (scope_id, epoch, original_leaf)",
                 "UNIQUE (scope_id, epoch, quarantine_leaf)",
@@ -892,10 +951,14 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let primary_keys: [(&str, &[&str]); 13] = [
+    let primary_keys: [(&str, &[&str]); 14] = [
         ("changed_path_scopes", &["scope_id"]),
         ("changed_path_entries", &["scope_id", "normalized_path"]),
         ("changed_path_prefixes", &["scope_id", "normalized_prefix"]),
+        (
+            "changed_path_policy_dependencies",
+            &["scope_id", "dependency_identity", "dependency_kind"],
+        ),
         ("changed_path_intents", &["intent_id"]),
         (
             "changed_path_intent_paths",
@@ -980,7 +1043,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         }
     }
 
-    let named_indexes: [(&str, &str, &[&str]); 14] = [
+    let named_indexes: [(&str, &str, &[&str]); 15] = [
         (
             "changed_path_intents",
             "changed_path_intents_scope_state_idx",
@@ -1020,6 +1083,11 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
             "changed_path_prefixes",
             "changed_path_prefixes_intent_idx",
             &["intent_id"],
+        ),
+        (
+            "changed_path_policy_dependencies",
+            "changed_path_policy_dependencies_generation_idx",
+            &["scope_id", "generation", "last_source_sequence"],
         ),
         (
             "changed_path_reconciliations",
@@ -1066,7 +1134,7 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
         return Ok(false);
     }
 
-    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 13] = [
+    let expected_foreign_keys: [(&str, &[(&str, &str, &str, &str, &str)]); 14] = [
         ("changed_path_scopes", &[]),
         (
             "changed_path_entries",
@@ -1105,6 +1173,16 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
                     "SET NULL",
                 ),
             ],
+        ),
+        (
+            "changed_path_policy_dependencies",
+            &[(
+                "scope_id",
+                "changed_path_scopes",
+                "scope_id",
+                "CASCADE",
+                "CASCADE",
+            )],
         ),
         (
             "changed_path_intents",
@@ -1291,6 +1369,116 @@ fn schema_structure_complete(conn: &Connection) -> Result<bool> {
              FROM changed_path_segment_quarantine_allocations
              WHERE state IN ('allocating','allocated','bound')
              GROUP BY scope_id,epoch,segment_id HAVING COUNT(*)<>1
+             UNION ALL
+             SELECT scope.scope_id
+             FROM changed_path_scopes scope
+             WHERE scope.retired_at IS NULL
+               AND scope.trust_reason<>'scope_retiring'
+               AND (EXISTS(
+                       SELECT 1 FROM changed_path_segment_quarantine_allocations allocation
+                       WHERE allocation.scope_id=scope.scope_id)
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_segment_deletions deletion
+                       WHERE deletion.scope_id=scope.scope_id)
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_observer_segments segment
+                       WHERE segment.scope_id=scope.scope_id
+                         AND segment.state IN ('retiring','retired')))
+             UNION ALL
+             SELECT scope.scope_id
+             FROM changed_path_scopes scope
+             WHERE scope.retired_at IS NOT NULL
+               AND (scope.trust_state<>'untrusted_gap' OR scope.trust_reason<>'scope_retired'
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_observer_segments segment
+                       WHERE segment.scope_id=scope.scope_id
+                         AND (segment.epoch<>scope.epoch OR segment.state<>'retired'))
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_observer_segments segment
+                       WHERE segment.scope_id=scope.scope_id
+                         AND ((SELECT COUNT(*)
+                               FROM changed_path_segment_quarantine_allocations allocation
+                               WHERE allocation.scope_id=segment.scope_id
+                                 AND allocation.epoch=segment.epoch
+                                 AND allocation.segment_id=segment.segment_id
+                                 AND allocation.state='bound')<>1
+                              OR (SELECT COUNT(*)
+                                  FROM changed_path_segment_deletions deletion
+                                  WHERE deletion.scope_id=segment.scope_id
+                                    AND deletion.epoch=segment.epoch
+                                    AND deletion.segment_id=segment.segment_id)<>1))
+                    OR (EXISTS(SELECT 1 FROM changed_path_observer_segments segment
+                               WHERE segment.scope_id=scope.scope_id)
+                        AND NOT EXISTS(SELECT 1 FROM changed_path_observer_owners owner
+                                       WHERE owner.scope_id=scope.scope_id
+                                         AND owner.epoch=scope.epoch
+                                         AND owner.lease_state='revoked'
+                                         AND length(owner.fence_nonce)=32)))
+             UNION ALL
+             SELECT scope.scope_id
+             FROM changed_path_scopes scope
+             WHERE scope.retired_at IS NULL AND scope.trust_reason='scope_retiring'
+               AND (scope.trust_state<>'untrusted_gap'
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_observer_segments segment
+                       WHERE segment.scope_id=scope.scope_id
+                         AND (segment.epoch<>scope.epoch OR segment.state<>'retiring'
+                              OR segment.retirement_source_state IS NULL))
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_observer_owners owner
+                       WHERE owner.scope_id=scope.scope_id
+                         AND (owner.epoch<>scope.epoch OR owner.lease_state<>'revoked'
+                              OR length(owner.fence_nonce)<>32))
+                    OR (EXISTS(SELECT 1 FROM changed_path_observer_segments segment
+                               WHERE segment.scope_id=scope.scope_id)
+                        AND NOT EXISTS(SELECT 1 FROM changed_path_observer_owners owner
+                                       WHERE owner.scope_id=scope.scope_id
+                                         AND owner.epoch=scope.epoch
+                                         AND owner.lease_state='revoked'
+                                         AND length(owner.fence_nonce)=32))
+                    OR EXISTS(
+                       SELECT 1 FROM changed_path_segment_deletions deletion
+                       WHERE deletion.scope_id=scope.scope_id))
+             UNION ALL
+             SELECT deletion.segment_id
+             FROM changed_path_segment_deletions deletion
+             JOIN changed_path_observer_segments segment
+               ON segment.scope_id=deletion.scope_id AND segment.epoch=deletion.epoch
+              AND segment.segment_id=deletion.segment_id
+             JOIN changed_path_segment_quarantine_allocations allocation
+               ON allocation.attempt_nonce=deletion.allocation_nonce
+             JOIN changed_path_scopes scope ON scope.scope_id=segment.scope_id
+             JOIN changed_path_observer_owners owner ON owner.scope_id=segment.scope_id
+             WHERE scope.retired_at IS NULL OR scope.trust_reason<>'scope_retired'
+                OR segment.state<>'retired' OR allocation.state<>'bound'
+                OR owner.epoch<>segment.epoch OR owner.lease_state<>'revoked'
+                OR deletion.retirement_continuity_generation<>scope.continuity_generation
+                OR deletion.retirement_fence_nonce<>owner.fence_nonce
+                OR deletion.original_leaf<>segment.segment_path
+                OR deletion.log_format_version<>segment.log_format_version
+                OR deletion.owner_token<>segment.owner_token
+                OR deletion.owner_token<>owner.owner_token
+                OR deletion.provider_id<>segment.provider_id
+                OR deletion.provider_id<>owner.provider_id
+                OR deletion.provider_id IS NOT scope.provider_id
+                OR deletion.first_sequence<>segment.first_sequence
+                OR deletion.last_sequence IS NOT segment.last_sequence
+                OR deletion.durable_end_offset<>segment.durable_end_offset
+                OR deletion.folded_end_offset<>segment.folded_end_offset
+                OR deletion.previous_segment_id IS NOT segment.previous_segment_id
+                OR deletion.previous_segment_hash<>
+                   COALESCE(segment.previous_segment_hash,
+                     '0000000000000000000000000000000000000000000000000000000000000000')
+                OR (segment.segment_hash IS NOT NULL
+                    AND deletion.file_hash<>segment.segment_hash)
+                OR deletion.source_state<>segment.retirement_source_state
+                OR deletion.file_length<>segment.retirement_file_length
+                OR deletion.file_hash<>segment.retirement_file_hash
+                OR deletion.durable_hash<>segment.retirement_durable_hash
+                OR deletion.segment_device<>segment.retirement_source_device
+                OR deletion.segment_inode<>segment.retirement_source_inode
+                OR allocation.source_segment_device<>segment.retirement_source_device
+                OR allocation.source_segment_inode<>segment.retirement_source_inode
          ) SELECT EXISTS(SELECT 1 FROM invalid)",
         [],
         |row| row.get(0),

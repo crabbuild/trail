@@ -407,6 +407,34 @@ pub(crate) fn file_identity(file: &File) -> Result<(u64, u64)> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn lock_observer_writer(file: &File) -> Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|error| Error::Io(error.into()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn lock_observer_writer(file: &File) -> Result<()> {
+    let _ = file;
+    Err(Error::InvalidInput(
+        "observer writer descriptor locking is unsupported".into(),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn try_lock_observer_quiescence(file: &File) -> Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|error| Error::Io(error.into()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn try_lock_observer_quiescence(file: &File) -> Result<()> {
+    let _ = file;
+    Err(Error::InvalidInput(
+        "observer quiescence descriptor locking is unsupported".into(),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn descriptor_identity(file: &File) -> Result<(u64, u64)> {
     let metadata = rustix::fs::fstat(file).map_err(|error| Error::Io(error.into()))?;
     descriptor_identity_from_stat(metadata)

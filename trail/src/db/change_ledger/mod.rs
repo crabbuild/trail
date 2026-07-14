@@ -57,7 +57,7 @@ pub(crate) use recovery::{
     run_exact_interval_bridge_rejection, run_gc_root_lifecycle, run_lane_deletion_retirement,
     run_missing_sidecar_rejection, run_prefix_interval_bridge_rejection,
     run_qualified_proof_revalidation, run_restored_nullable_provider_lane_deletion,
-    run_retirement_barrier, run_valid_prefix_interval_recovery,
+    run_retained_writer_quiescence, run_retirement_barrier, run_valid_prefix_interval_recovery,
 };
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use recovery::{
