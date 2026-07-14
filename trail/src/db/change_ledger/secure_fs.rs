@@ -3,6 +3,28 @@ use std::path::{Component, Path};
 
 use crate::error::{Error, Result};
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static VERIFIED_UNLINK_INNER_WINDOW_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn install_verified_unlink_inner_window_hook(hook: impl FnOnce() + 'static) {
+    VERIFIED_UNLINK_INNER_WINDOW_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn run_verified_unlink_inner_window_hook() {
+    VERIFIED_UNLINK_INNER_WINDOW_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 #[derive(Debug)]
 pub(crate) struct SecureDirectory {
     file: File,
@@ -315,18 +337,6 @@ impl SecureDirectory {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn unlink_leaf(&self, name: &str) -> Result<bool> {
-        use rustix::fs::{unlinkat, AtFlags};
-
-        validate_leaf(name)?;
-        match unlinkat(&self.file, Path::new(name), AtFlags::empty()) {
-            Ok(()) => Ok(true),
-            Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
-            Err(error) => Err(Error::Io(error.into())),
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn remove_empty_dir(&self, name: &str) -> Result<bool> {
         use rustix::fs::{unlinkat, AtFlags};
 
@@ -346,25 +356,12 @@ impl SecureDirectory {
         ))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn unlink_verified_regular(&self, name: &str, opened: &File) -> Result<bool> {
         self.verify_opened_regular(name, opened)?;
-        self.unlink_leaf(name)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn unlink_verified_regular(&self, name: &str, opened: &File) -> Result<bool> {
-        let _ = (self, name, opened);
+        run_verified_unlink_inner_window_hook();
         Err(Error::InvalidInput(
-            "secure descriptor-relative verified unlink is unsupported".into(),
-        ))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn unlink_leaf(&self, name: &str) -> Result<bool> {
-        let _ = (self, name);
-        Err(Error::InvalidInput(
-            "secure descriptor-relative unlink is unsupported".into(),
+            "verified pathname unlink has no inode-bound POSIX authority".into(),
         ))
     }
 
@@ -462,4 +459,41 @@ fn verify_entry_identity(parent: &File, name: &str, opened: &File, directory: bo
         )));
     }
     Ok(())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use super::{install_verified_unlink_inner_window_hook, SecureDirectory};
+
+    #[test]
+    fn verified_unlink_never_deletes_an_inner_window_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let original = root_path.join("segment.cplq");
+        let retained = root_path.join("authorized.retained.cplq");
+        std::fs::write(&original, b"authenticated original\n").unwrap();
+        let directory = SecureDirectory::open_absolute(&root_path).unwrap();
+        let opened = directory.open_regular("segment.cplq").unwrap();
+        let hook_original = original.clone();
+        let hook_retained = retained.clone();
+        install_verified_unlink_inner_window_hook(move || {
+            std::fs::rename(&hook_original, &hook_retained).unwrap();
+            std::fs::write(&hook_original, b"hostile replacement\n").unwrap();
+        });
+
+        let result = directory.unlink_verified_regular("segment.cplq", &opened);
+
+        assert!(
+            retained.exists(),
+            "the authenticated inode was not retained"
+        );
+        assert!(
+            original.exists(),
+            "pathname unlink deleted the inner-window replacement"
+        );
+        assert!(
+            result.is_err(),
+            "verified pathname unlink must fail closed when no inode-bound primitive exists"
+        );
+    }
 }

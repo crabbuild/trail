@@ -126,6 +126,16 @@ pub mod test_support {
         crate::db::run_deletion_normal_retry_idempotence()
     }
 
+    pub fn changed_path_deletion_quiesced_missing_quarantine_rejection(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_deletion_quiesced_missing_quarantine_rejection()
+    }
+
+    pub fn changed_path_deletion_quiesced_reappeared_original_rejection(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_deletion_quiesced_reappeared_original_rejection()
+    }
+
     pub fn changed_path_restored_nullable_provider_lane_deletion() -> std::result::Result<(), String>
     {
         crate::db::run_restored_nullable_provider_lane_deletion()

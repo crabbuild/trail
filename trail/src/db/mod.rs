@@ -1170,6 +1170,8 @@ pub(crate) use change_ledger::{
     run_deletion_parent_substitution_rejection,
     run_deletion_post_quarantine_verification_substitution_rejection,
     run_deletion_post_verification_substitution_rejection,
+    run_deletion_quiesced_missing_quarantine_rejection,
+    run_deletion_quiesced_reappeared_original_rejection,
     run_deletion_retry_hostile_quarantine_replacement_rejection,
     run_exact_interval_bridge_rejection, run_gc_root_lifecycle, run_lane_deletion_retirement,
     run_missing_sidecar_rejection, run_oracle, run_prefix_interval_bridge_rejection,

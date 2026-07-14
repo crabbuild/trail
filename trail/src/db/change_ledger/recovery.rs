@@ -955,12 +955,18 @@ pub(crate) fn remove_retired_segments(
         let original = open_optional_regular(&token.directory, &current.original_leaf)?;
         let quarantined =
             open_optional_regular(&token.quarantine_directory, &current.quarantine_leaf)?;
-        if current.state == "complete" {
-            if original.is_some() || quarantined.is_some() {
+        if current.state == "quiesced" {
+            if original.is_some() || quarantined.is_none() {
                 return Err(Error::InvalidInput(
-                    "completed segment deletion has a reappeared filesystem name".into(),
+                    "quiesced segment retirement has missing or reappeared filesystem evidence"
+                        .into(),
                 ));
             }
+            authenticate_persisted_deletion_file(
+                token,
+                &current,
+                quarantined.as_ref().expect("checked quarantine presence"),
+            )?;
             continue;
         }
         let quarantined = match (original, quarantined) {
@@ -1005,15 +1011,6 @@ pub(crate) fn remove_retired_segments(
                 }
                 quarantined
             }
-            (None, None)
-                if matches!(
-                    current.state.as_str(),
-                    "prepared" | "quarantined" | "unlinked"
-                ) =>
-            {
-                finish_absent_segment_deletion(conn, token)?;
-                continue;
-            }
             _ => {
                 return Err(Error::InvalidInput(format!(
                     "segment deletion filesystem state does not match persisted state `{}`",
@@ -1025,23 +1022,19 @@ pub(crate) fn remove_retired_segments(
         crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_verify");
         #[cfg(debug_assertions)]
         run_deletion_substitution_hook(DeletionSubstitutionPoint::AfterQuarantineVerify);
-        if !token
+        let terminal_quarantine = token
             .quarantine_directory
-            .unlink_verified_regular(&current.quarantine_leaf, &quarantined)?
-        {
-            return Err(Error::Corrupt(
-                "authenticated quarantine entry disappeared before unlink".into(),
-            ));
-        }
-        crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_unlink");
-        update_segment_deletion_state(
-            conn,
-            token,
-            &["prepared", "quarantined"],
-            "unlinked",
-            false,
-        )?;
-        finish_absent_segment_deletion(conn, token)?;
+            .open_regular(&current.quarantine_leaf)?;
+        token
+            .quarantine_directory
+            .verify_same_opened_regular(&quarantined, &terminal_quarantine)?;
+        authenticate_persisted_deletion_file(token, &current, &terminal_quarantine)?;
+        terminal_quarantine.sync_all()?;
+        token.quarantine_directory.sync()?;
+        token.directory.sync()?;
+        crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_fsync");
+        update_segment_deletion_state(conn, token, &["prepared", "quarantined"], "quiesced", true)?;
+        crate::db::util::test_crash_point("changed_path_deletion_after_quiesced_state");
     }
     Ok(())
 }
@@ -1271,7 +1264,7 @@ fn update_segment_deletion_state(
         load_one_persisted_segment_deletion(&tx, token.scope_id, token.epoch, &token.segment_id)?;
     validate_deletion_token_identity(token, &persisted)?;
     let current = persisted.state;
-    if current == state || (completed && current == "complete") {
+    if current == state || (completed && current == "quiesced") {
         tx.commit()?;
         durable_intent_barrier(conn)?;
         return Ok(());
@@ -1303,19 +1296,6 @@ fn update_segment_deletion_state(
     }
     tx.commit()?;
     durable_intent_barrier(conn)
-}
-
-fn finish_absent_segment_deletion(conn: &Connection, token: &SegmentDeletionToken) -> Result<()> {
-    token.quarantine_directory.sync()?;
-    token.directory.sync()?;
-    crate::db::util::test_crash_point("changed_path_deletion_after_quarantine_fsync");
-    update_segment_deletion_state(
-        conn,
-        token,
-        &["prepared", "quarantined", "unlinked"],
-        "complete",
-        true,
-    )
 }
 
 fn encode_fs_identity_part(value: u64) -> String {
@@ -2832,24 +2812,92 @@ mod harness {
     }
 
     pub(super) fn deletion_normal_retry_is_durably_idempotent() -> Result<()> {
-        let (fixture, tokens, _directory, _segment_leaf) = retired_segment_fixture(0x8e)?;
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8e)?;
+        let original = directory.join(&segment_leaf);
+        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
+        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
+        let expected_bytes = std::fs::read(&original)?;
+        let expected_identity = tokens[0].identity.segment_identity;
         remove_retired_segments(&fixture.db.conn, &tokens)?;
+        if original.exists() || !quarantine.exists() {
+            return Err(Error::Corrupt(
+                "normal retirement did not retain exactly one quarantined segment".into(),
+            ));
+        }
+        let retained = std::fs::File::open(&quarantine)?;
+        if super::super::secure_fs::file_identity(&retained)? != expected_identity
+            || std::fs::read(&quarantine)? != expected_bytes
+        {
+            return Err(Error::Corrupt(
+                "quiesced retirement did not retain the authenticated segment".into(),
+            ));
+        }
         let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
         remove_retired_segments(&fixture.db.conn, &retry)?;
         remove_retired_segments(&fixture.db.conn, &retry)?;
-        let completed: i64 = fixture.db.conn.query_row(
+        let reopened = Connection::open(&fixture.db.sqlite_path)?;
+        let reopened_retry = retire_scope(&reopened, &fixture.db.sqlite_path, &fixture.expected)?;
+        remove_retired_segments(&reopened, &reopened_retry)?;
+        let quiesced: i64 = reopened.query_row(
             "SELECT COUNT(*) FROM changed_path_segment_deletions
-             WHERE scope_id=?1 AND epoch=?2 AND state='complete'",
+             WHERE scope_id=?1 AND epoch=?2 AND state='quiesced' AND completed_at IS NOT NULL",
             params![
                 fixture.expected.scope_id.to_text(),
                 sql_u64(fixture.expected.epoch, "scope epoch")?
             ],
             |row| row.get(0),
         )?;
-        if completed != 1 {
+        if quiesced != 1 || !quarantine.exists() || original.exists() {
             return Err(Error::Corrupt(format!(
-                "normal deletion retry did not retain one durable completion row: {completed}"
+                "normal deletion retry did not retain one durable quiesced row and segment: rows={quiesced} quarantine={} original={}",
+                quarantine.exists(),
+                original.exists()
             )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn deletion_quiesced_retry_rejects_missing_quarantine() -> Result<()> {
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x8f)?;
+        let original = directory.join(segment_leaf);
+        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
+        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
+        let retained = quarantine_directory.join("missing-quarantine-retained.cpl");
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
+        std::fs::rename(&quarantine, &retained)?;
+
+        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        if remove_retired_segments(&fixture.db.conn, &retry).is_ok() {
+            return Err(Error::Corrupt(
+                "quiesced retirement retry accepted a missing quarantine entry".into(),
+            ));
+        }
+        if !retained.exists() || quarantine.exists() || original.exists() {
+            return Err(Error::Corrupt(
+                "missing-quarantine retry mutated retained filesystem evidence".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn deletion_quiesced_retry_rejects_reappeared_original() -> Result<()> {
+        let (fixture, tokens, directory, segment_leaf) = retired_segment_fixture(0x94)?;
+        let original = directory.join(segment_leaf);
+        let quarantine_directory = directory.join(&tokens[0].identity.quarantine_directory_leaf);
+        let quarantine = quarantine_directory.join(&tokens[0].identity.quarantine_leaf);
+        remove_retired_segments(&fixture.db.conn, &tokens)?;
+        std::fs::write(&original, b"reappeared original-name replacement\n")?;
+
+        let retry = retire_scope(&fixture.db.conn, &fixture.db.sqlite_path, &fixture.expected)?;
+        if remove_retired_segments(&fixture.db.conn, &retry).is_ok() {
+            return Err(Error::Corrupt(
+                "quiesced retirement retry accepted a reappeared original name".into(),
+            ));
+        }
+        if !original.exists() || !quarantine.exists() {
+            return Err(Error::Corrupt(
+                "reappeared-original retry removed filesystem evidence".into(),
+            ));
         }
         Ok(())
     }
@@ -3206,10 +3254,10 @@ mod harness {
     #[test]
     fn subprocess_kill_and_retry_covers_quarantine_deletion_boundaries() {
         for (index, phase) in [
-            "changed_path_deletion_after_quarantine_unlink",
             "changed_path_deletion_after_quarantine_move",
             "changed_path_deletion_after_quarantine_verify",
             "changed_path_deletion_after_quarantine_fsync",
+            "changed_path_deletion_after_quiesced_state",
         ]
         .into_iter()
         .enumerate()
@@ -3296,6 +3344,7 @@ mod harness {
                 )
                 .unwrap();
             drop(writer);
+            let expected_segment_bytes = std::fs::read(segment_directory.join(&leaf)).unwrap();
             let workdir = std::path::PathBuf::from(spawned.workdir.unwrap());
             drop(db);
 
@@ -3319,35 +3368,6 @@ mod harness {
             child.kill().unwrap();
             let _ = child.wait().unwrap();
 
-            if phase == "changed_path_deletion_after_quarantine_unlink" {
-                let retry_ready = root.path().join("retry-after-unlink-fsync.ready");
-                let mut retry_child = Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "db::change_ledger::recovery::harness::deletion_subprocess_crash_helper",
-                        "--nocapture",
-                    ])
-                    .env("RUST_TEST_THREADS", "1")
-                    .env(
-                        "TRAIL_TEST_CRASH_AT",
-                        "changed_path_deletion_after_quarantine_fsync",
-                    )
-                    .env("TRAIL_TEST_CRASH_READY", &retry_ready)
-                    .env("TRAIL_TEST_DELETION_CRASH_WORKSPACE", root.path())
-                    .env("TRAIL_TEST_DELETION_CRASH_LANE", &lane)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .unwrap();
-                wait_for_crash_handshake(
-                    &mut retry_child,
-                    &retry_ready,
-                    "retry-after-unlink-directory-fsync",
-                );
-                retry_child.kill().unwrap();
-                let _ = retry_child.wait().unwrap();
-            }
-
             let mut reopened = Trail::open(root.path()).unwrap();
             reopened.remove_lane(&lane, true).unwrap();
             let retired: bool = reopened
@@ -3358,31 +3378,45 @@ mod harness {
                     |row| row.get(0),
                 )
                 .unwrap();
-            let remaining_segments = usize::from(segment_directory.join(&leaf).exists())
-                + std::fs::read_dir(&segment_directory)
-                    .unwrap()
-                    .filter_map(std::result::Result::ok)
-                    .filter(|entry| {
-                        let name = entry.file_name();
-                        name.to_string_lossy().starts_with(".trail-delete-")
-                            && entry.path().join("segment.cplq").exists()
-                    })
-                    .count();
+            let retained_quarantines = std::fs::read_dir(&segment_directory)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    name.to_string_lossy().starts_with(".trail-delete-")
+                        && entry.path().join("segment.cplq").exists()
+                })
+                .map(|entry| entry.path().join("segment.cplq"))
+                .collect::<Vec<_>>();
             assert!(retired, "scope did not remain retired after {phase}");
-            assert_eq!(remaining_segments, 0, "segment remained after {phase}");
+            assert!(
+                !segment_directory.join(&leaf).exists(),
+                "original segment name remained after {phase}"
+            );
+            assert_eq!(
+                retained_quarantines.len(),
+                1,
+                "exactly one quarantined segment was not retained after {phase}"
+            );
+            assert_eq!(
+                std::fs::read(&retained_quarantines[0]).unwrap(),
+                expected_segment_bytes,
+                "retained quarantine bytes changed after {phase}"
+            );
             assert!(!workdir.exists(), "workdir remained after {phase}");
-            let completed: i64 = reopened
+            let quiesced: i64 = reopened
                 .conn
                 .query_row(
                     "SELECT COUNT(*) FROM changed_path_segment_deletions
-                     WHERE scope_id=?1 AND epoch=1 AND state='complete'",
+                     WHERE scope_id=?1 AND epoch=1 AND state='quiesced'
+                       AND completed_at IS NOT NULL",
                     [scope.scope_id.to_text()],
                     |row| row.get(0),
                 )
                 .unwrap();
             assert_eq!(
-                completed, 1,
-                "deletion was not durably complete after {phase}"
+                quiesced, 1,
+                "retirement was not durably quiesced after {phase}"
             );
         }
     }
@@ -4248,6 +4282,19 @@ pub(crate) fn run_deletion_retry_hostile_quarantine_replacement_rejection(
 #[cfg(debug_assertions)]
 pub(crate) fn run_deletion_normal_retry_idempotence() -> std::result::Result<(), String> {
     harness::deletion_normal_retry_is_durably_idempotent().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_quiesced_missing_quarantine_rejection() -> std::result::Result<(), String>
+{
+    harness::deletion_quiesced_retry_rejects_missing_quarantine().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_quiesced_reappeared_original_rejection(
+) -> std::result::Result<(), String> {
+    harness::deletion_quiesced_retry_rejects_reappeared_original()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(debug_assertions)]

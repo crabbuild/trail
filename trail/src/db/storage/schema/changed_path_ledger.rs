@@ -309,7 +309,7 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              previous_segment_hash TEXT NOT NULL CHECK (length(previous_segment_hash) = 64),
              source_state TEXT NOT NULL CHECK (source_state IN ('open', 'sealed')),
              state TEXT NOT NULL DEFAULT 'prepared'
-                 CHECK (state IN ('prepared', 'quarantined', 'unlinked', 'complete')),
+                 CHECK (state IN ('prepared', 'quarantined', 'quiesced')),
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              completed_at INTEGER,
@@ -319,8 +319,8 @@ pub(super) const CHANGED_PATH_LEDGER_SCHEMA_V18: &str =
              FOREIGN KEY (scope_id, epoch, segment_id)
                  REFERENCES changed_path_observer_segments(scope_id, epoch, segment_id)
                  ON UPDATE CASCADE ON DELETE CASCADE,
-             CHECK ((state = 'complete' AND completed_at IS NOT NULL)
-                    OR (state <> 'complete' AND completed_at IS NULL))
+             CHECK ((state = 'quiesced' AND completed_at IS NOT NULL)
+                    OR (state <> 'quiesced' AND completed_at IS NULL))
          );
          CREATE INDEX changed_path_segment_deletions_state_idx
              ON changed_path_segment_deletions(scope_id, epoch, state);";

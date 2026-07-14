@@ -115,6 +115,16 @@ fn retired_segment_deletion_normal_retry_is_durably_idempotent() {
 }
 
 #[test]
+fn retired_segment_deletion_quiesced_retry_rejects_missing_quarantine() {
+    trail::test_support::changed_path_deletion_quiesced_missing_quarantine_rejection().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_quiesced_retry_rejects_reappeared_original() {
+    trail::test_support::changed_path_deletion_quiesced_reappeared_original_rejection().unwrap();
+}
+
+#[test]
 fn restored_nullable_provider_lane_and_view_scopes_can_be_deleted() {
     trail::test_support::changed_path_restored_nullable_provider_lane_deletion().unwrap();
 }
