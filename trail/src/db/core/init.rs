@@ -778,6 +778,8 @@ mod schema_handoff_tests {
                 _leader_exclusion: leader_exclusion,
                 _socket_cleanup: socket_cleanup,
                 _announcement_cleanup: announcement_cleanup,
+                _failure_cache_cleanup: None,
+                panic_on_serve: false,
             },
             socket_path,
             lock_path,
@@ -1309,6 +1311,7 @@ mod schema_handoff_tests {
             canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
         fail_next_schema_validation(&db_path);
         let barrier = Arc::new(Barrier::new(16));
+        let started = Instant::now();
         let handles = (0..16)
             .map(|_| {
                 let root = root.path().to_path_buf();
@@ -1325,8 +1328,57 @@ mod schema_handoff_tests {
                 Err(Error::SchemaReinitializeRequired { .. })
             ));
         }
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "invalid-schema peers paid the detached IPC fanout lifetime: {:?}",
+            started.elapsed()
+        );
         Trail::open(root.path()).unwrap();
         assert_eq!(schema_validation_count(&db_path), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn completed_schema_servers_naturally_leave_a_bounded_registry() {
+        let roots = (0..24)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
+        let keys = roots
+            .iter()
+            .map(|root| root.path().join("workspace.sqlite"))
+            .collect::<Vec<_>>();
+        let resources = roots
+            .iter()
+            .zip(&keys)
+            .map(|(root, key)| {
+                let (server, socket, lock, _, _) = test_schema_validation_server(root.path());
+                start_schema_validation_server(key, server);
+                (socket, root.path().join("schema-validation.announce"), lock)
+            })
+            .collect::<Vec<_>>();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let registered = SCHEMA_VALIDATION_SERVERS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if keys.iter().all(|key| !registered.contains_key(key)) {
+                break;
+            }
+            drop(registered);
+            assert!(
+                Instant::now() < deadline,
+                "completed detached servers remained registered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        for (socket, announcement, lock) in resources {
+            assert!(!socket.exists());
+            assert!(!announcement.exists());
+            assert_schema_leader_lock_available_to_child(&lock);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1373,10 +1425,24 @@ mod schema_handoff_tests {
     #[test]
     fn schema_validation_server_panic_releases_ipc_and_leader_lock() {
         let root = tempfile::tempdir().unwrap();
-        let (server, socket_path, lock_path, _, _) = test_schema_validation_server(root.path());
+        let (mut server, socket_path, lock_path, _, _) = test_schema_validation_server(root.path());
+        server.panic_on_serve = true;
+        let key = root.path().join("workspace.sqlite");
 
-        let server = std::thread::spawn(move || server.panic_for_test());
-        assert!(server.join().is_err());
+        start_schema_validation_server(&key, server);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while SCHEMA_VALIDATION_SERVERS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "panicked detached server remained registered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!socket_path.exists());
         assert!(!root.path().join("schema-validation.announce").exists());
         assert_schema_leader_lock_available_to_child(&lock_path);
