@@ -221,6 +221,16 @@ mod tests {
     }
 
     #[test]
+    fn production_compiled_policy_cannot_authorize_reconciliation() {
+        let fixture = Fixture::new();
+        let policy = fixture.compile(&mut PolicyDependencyMetrics::default());
+
+        assert!(!policy.authorizes_reconciliation(&fixture.expected));
+        assert_eq!(policy.adapter_equivalence, AdapterEquivalence::Conservative);
+        assert!(policy.stale_baseline);
+    }
+
+    #[test]
     fn exact_invalidation_index_matches_arbitrary_dependency_with_case_policy() {
         let fixture = Fixture::new();
         let mut policy = fixture.compile(&mut PolicyDependencyMetrics::default());
@@ -1254,6 +1264,7 @@ pub(crate) struct RecordingPolicySnapshot {
     pub(crate) rule_sources: Vec<PolicyRuleSource>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QualifiedPolicyObserverCut {
     pub(crate) scope_id: super::ScopeId,
@@ -1264,6 +1275,7 @@ pub(crate) struct QualifiedPolicyObserverCut {
     pub(crate) case_sensitive: bool,
 }
 
+#[cfg(test)]
 impl QualifiedPolicyObserverCut {
     pub(crate) fn validate_for(
         &self,
@@ -1370,13 +1382,19 @@ pub(crate) enum AdapterEquivalence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompiledPolicy {
-    pub(crate) snapshot: RecordingPolicySnapshot,
-    pub(crate) fingerprint: [u8; 32],
-    pub(crate) dependencies: Vec<PolicyDependency>,
-    pub(crate) adapter_equivalence: AdapterEquivalence,
-    pub(crate) stale_baseline: bool,
-    pub(crate) reused_manifest: bool,
-    pub(crate) invalidation_index: PolicyInvalidationIndex,
+    snapshot: RecordingPolicySnapshot,
+    fingerprint: [u8; 32],
+    dependencies: Vec<PolicyDependency>,
+    adapter_equivalence: AdapterEquivalence,
+    stale_baseline: bool,
+    reused_manifest: bool,
+    invalidation_index: PolicyInvalidationIndex,
+    reconciliation_authorization: Option<PolicyReconciliationAuthorization>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyReconciliationAuthorization {
+    expected: ExpectedScope,
 }
 
 impl CompiledPolicy {
@@ -1390,6 +1408,71 @@ impl CompiledPolicy {
             dependencies: self.dependencies.clone(),
             rule_sources: self.snapshot.rule_sources.clone(),
         }
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.snapshot.workspace_root
+    }
+
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+
+    pub(crate) fn authorizes_reconciliation(&self, expected: &ExpectedScope) -> bool {
+        self.adapter_equivalence == AdapterEquivalence::Equivalent
+            && !self.stale_baseline
+            && self
+                .reconciliation_authorization
+                .as_ref()
+                .is_some_and(|authorization| authorization.expected == *expected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authorize_reconciliation_for_test(&mut self, expected: &ExpectedScope) {
+        self.adapter_equivalence = AdapterEquivalence::Equivalent;
+        self.stale_baseline = false;
+        self.reconciliation_authorization = Some(PolicyReconciliationAuthorization {
+            expected: expected.clone(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ignore_gitignored_for_test(&mut self, ignore_gitignored: bool) {
+        self.snapshot.ignore_gitignored = ignore_gitignored;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_gitignore_rule_for_test(&mut self, path: PathBuf, bytes: Vec<u8>) {
+        self.snapshot.rule_sources = vec![PolicyRuleSource {
+            kind: PolicyDependencyKind::Gitignore,
+            path,
+            bytes,
+        }];
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_reconciliation_test(
+        snapshot: RecordingPolicySnapshot,
+        fingerprint: [u8; 32],
+        expected: &ExpectedScope,
+    ) -> Self {
+        let invalidation_index = PolicyInvalidationIndex::from_paths(
+            &snapshot.workspace_root,
+            snapshot.case_sensitive,
+            std::iter::empty(),
+        );
+        let mut policy = Self {
+            snapshot,
+            fingerprint,
+            dependencies: Vec::new(),
+            adapter_equivalence: AdapterEquivalence::Conservative,
+            stale_baseline: true,
+            reused_manifest: false,
+            invalidation_index,
+            reconciliation_authorization: None,
+        };
+        policy.authorize_reconciliation_for_test(expected);
+        policy
     }
 }
 
@@ -1515,6 +1598,7 @@ fn finish_compiled_policy(
         stale_baseline: true,
         reused_manifest,
         invalidation_index,
+        reconciliation_authorization: None,
     })
 }
 

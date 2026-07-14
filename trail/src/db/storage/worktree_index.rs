@@ -1,9 +1,7 @@
 use super::*;
 #[cfg(test)]
 use crate::db::change_ledger::PolicyInvalidationIndex;
-use crate::db::change_ledger::{
-    raw_path_may_invalidate_policy, CompiledPolicy, PolicyDependencyKind,
-};
+use crate::db::change_ledger::{raw_path_may_invalidate_policy, CompiledPolicy};
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -49,6 +47,18 @@ pub(crate) struct ReconciliationFile {
     pub(crate) peak_buffer_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReconciliationDirectory {
+    pub(crate) path: String,
+    pub(crate) identity: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationScanEntry {
+    Directory(ReconciliationDirectory),
+    File(ReconciliationFile),
+}
+
 #[derive(Debug)]
 struct WorktreeIndexReadCandidate {
     path: String,
@@ -87,7 +97,7 @@ impl Trail {
         &self,
         policy: &CompiledPolicy,
     ) -> Result<PinnedWorktreeRoot> {
-        if policy.snapshot.workspace_root != self.workspace_root {
+        if policy.workspace_root() != self.workspace_root {
             return Err(Error::InvalidInput(
                 "compiled recording policy belongs to a different workspace root".into(),
             ));
@@ -114,14 +124,13 @@ impl Trail {
     pub(crate) fn visit_pinned_worktree_files<F>(
         &self,
         root: &PinnedWorktreeRoot,
-        policy: &CompiledPolicy,
+        _policy: &CompiledPolicy,
         prefixes: &[String],
         mut visitor: F,
     ) -> Result<()>
     where
-        F: FnMut(ReconciliationFile) -> Result<()>,
+        F: FnMut(ReconciliationScanEntry) -> Result<()>,
     {
-        let matcher = pinned_policy_matcher(policy)?;
         let mut walker = WalkDir::new(&root.path).follow_links(false).into_iter();
         while let Some(item) = walker.next() {
             let entry = item.map_err(|err| Error::InvalidInput(err.to_string()))?;
@@ -138,11 +147,22 @@ impl Trail {
             let relative = normalize_relative_path(relative)?;
             let is_dir = entry.file_type().is_dir();
             if !path_intersects_reconcile_scope(&relative, is_dir, prefixes)
-                || reconcile_path_ignored(&matcher, &relative, is_dir)
+                || reconcile_path_ignored(&relative)
             {
                 if is_dir {
                     walker.skip_current_dir();
                 }
+                continue;
+            }
+            if is_dir {
+                let directory =
+                    read_reconciliation_directory_no_follow(&root.descriptor, &relative)?
+                        .ok_or_else(|| {
+                            Error::InvalidInput(format!(
+                                "directory identity changed during reconciliation: `{relative}`"
+                            ))
+                        })?;
+                visitor(ReconciliationScanEntry::Directory(directory))?;
                 continue;
             }
             if !entry.file_type().is_file() {
@@ -151,21 +171,32 @@ impl Trail {
             if let Some(file) =
                 read_reconciliation_file_no_follow(&root.descriptor, &relative, &self.config.text)?
             {
-                visitor(file)?;
+                visitor(ReconciliationScanEntry::File(file))?;
             }
         }
         Ok(())
     }
 
+    pub(crate) fn verify_pinned_worktree_directory(
+        &self,
+        root: &PinnedWorktreeRoot,
+        path: &str,
+        expected_identity: &[u8],
+    ) -> Result<bool> {
+        Ok(
+            read_reconciliation_directory_no_follow(&root.descriptor, path)?
+                .is_some_and(|directory| directory.identity == expected_identity),
+        )
+    }
+
     pub(crate) fn read_pinned_worktree_path(
         &self,
         root: &PinnedWorktreeRoot,
-        policy: &CompiledPolicy,
+        _policy: &CompiledPolicy,
         path: &str,
     ) -> Result<Option<ReconciliationFile>> {
         let path = normalize_relative_path(path)?;
-        let matcher = pinned_policy_matcher(policy)?;
-        if reconcile_path_ignored(&matcher, &path, false) {
+        if reconcile_path_ignored(&path) {
             return Ok(None);
         }
         read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text)
@@ -1108,45 +1139,12 @@ impl Trail {
     }
 }
 
-fn pinned_policy_matcher(policy: &CompiledPolicy) -> Result<ignore::gitignore::Gitignore> {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(&policy.snapshot.workspace_root);
-    for source in &policy.snapshot.rule_sources {
-        if !matches!(
-            source.kind,
-            PolicyDependencyKind::Ignore
-                | PolicyDependencyKind::Trailignore
-                | PolicyDependencyKind::Gitignore
-                | PolicyDependencyKind::GitInfoExclude
-                | PolicyDependencyKind::GitExcludesFile
-        ) {
-            continue;
-        }
-        let rules = std::str::from_utf8(&source.bytes).map_err(|_| {
-            Error::InvalidInput(format!(
-                "recording policy rule source `{}` is not UTF-8",
-                source.path.display()
-            ))
-        })?;
-        for line in rules.lines() {
-            builder
-                .add_line(Some(source.path.clone()), line)
-                .map_err(|err| Error::InvalidInput(err.to_string()))?;
-        }
-    }
-    builder
-        .build()
-        .map_err(|err| Error::InvalidInput(err.to_string()))
-}
-
-fn reconcile_path_ignored(
-    matcher: &ignore::gitignore::Gitignore,
-    relative: &str,
-    is_dir: bool,
-) -> bool {
+fn reconcile_path_ignored(relative: &str) -> bool {
+    // Task 4's flattened matcher cannot prove exact nested ignore semantics.
+    // Reconciliation therefore over-enumerates and excludes only Trail's
+    // hardcoded internal/default-denied paths. Git-ignored files may be false
+    // positive candidates, but no visible regular file can be omitted.
     is_default_ignored(relative)
-        || matcher
-            .matched_path_or_any_parents(path_from_rel(relative), is_dir)
-            .is_ignore()
 }
 
 fn path_intersects_reconcile_scope(relative: &str, is_dir: bool, prefixes: &[String]) -> bool {
@@ -1219,6 +1217,53 @@ fn root_descriptor_identity(file: &fs::File) -> Result<Vec<u8>> {
         stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid
     )
     .into_bytes())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_reconciliation_directory_no_follow(
+    root: &fs::File,
+    relative: &str,
+) -> Result<Option<ReconciliationDirectory>> {
+    use rustix::fs::{fstat, openat, Mode, OFlags};
+
+    let path = path_from_rel(relative);
+    let mut descriptor = root.try_clone().map_err(Error::Io)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(Error::InvalidInput(format!(
+                "reconciliation directory `{relative}` is not normalized"
+            )));
+        };
+        descriptor = match openat(
+            &descriptor,
+            Path::new(name),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fs::File::from(fd),
+            Err(err) if err == rustix::io::Errno::NOENT => return Ok(None),
+            Err(err) => return Err(Error::Io(err.into())),
+        };
+    }
+    let stat = fstat(&descriptor).map_err(|err| Error::Io(err.into()))?;
+    Ok(Some(ReconciliationDirectory {
+        path: relative.to_string(),
+        identity: format!(
+            "directory-v1:dev={};ino={};mode={};ctime={};ctime_nsec={}",
+            stat.st_dev, stat.st_ino, stat.st_mode, stat.st_ctime, stat.st_ctime_nsec
+        )
+        .into_bytes(),
+    }))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_reconciliation_directory_no_follow(
+    _root: &fs::File,
+    relative: &str,
+) -> Result<Option<ReconciliationDirectory>> {
+    Err(Error::InvalidInput(format!(
+        "qualified reconciliation of directory `{relative}` is unsupported on this platform"
+    )))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

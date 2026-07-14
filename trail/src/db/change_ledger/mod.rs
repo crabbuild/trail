@@ -18,13 +18,12 @@ pub(crate) use policy::{
     compile_policy, raw_event_invalidates_policy, raw_path_may_invalidate_policy,
     validate_policy_manifest, AdapterEquivalence, CompiledPolicy, PolicyCompileContext,
     PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics, PolicyInvalidationIndex,
-    PolicyManifest, PolicyManifestValidation, QualifiedPolicyObserverCut, RecordingPolicySnapshot,
+    PolicyManifest, PolicyManifestValidation, RecordingPolicySnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use reconcile::{
     begin_reconciliation, persisted_proven_prefixes, reconcile_full, ObserverEvent, ObserverFence,
-    ObserverQualification, ProvenPrefixSet, QualifiedObserver, ReconcileMode,
-    ReconciliationAttempt,
+    ProvenPrefixSet, QualifiedObserver, ReconcileMode, ReconciliationAttempt,
 };
 #[allow(unused_imports)]
 pub(crate) use store::ChangedPathLedger;

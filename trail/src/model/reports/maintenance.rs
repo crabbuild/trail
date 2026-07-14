@@ -78,6 +78,7 @@ pub(crate) struct ChangeLedgerReconcileReport {
     pub(crate) end_sequence: u64,
     pub(crate) start_durable_offset: u64,
     pub(crate) end_durable_offset: u64,
+    pub(crate) refreshed: bool,
     pub(crate) published: bool,
     pub(crate) trust_state: String,
     pub(crate) retries: u64,

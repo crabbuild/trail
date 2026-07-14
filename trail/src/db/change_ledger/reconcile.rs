@@ -7,13 +7,16 @@ use super::{
     raw_event_invalidates_policy, ChangedPathLedger, CompiledPolicy, EvidenceFlags, ExpectedScope,
     LedgerPath, ScopeId, TrustState,
 };
-use crate::db::storage::{PinnedWorktreeRoot, ReconciliationFile};
+use crate::db::storage::{
+    PinnedWorktreeRoot, ReconciliationDirectory, ReconciliationFile, ReconciliationScanEntry,
+};
 use crate::db::util::now_ts;
 use crate::error::{Error, Result};
 use crate::model::{ChangeLedgerReconcileReport, FileEntry, FileKind};
 use crate::Trail;
 
 const STAGING_BATCH_ROWS: usize = 256;
+const MAX_IDENTITY_RACE_RETRIES: u64 = 2;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,9 +49,8 @@ pub(crate) struct ObserverQualification {
 }
 
 impl ObserverQualification {
-    // This is deliberately not public outside the changed-ledger module. Task
-    // 5 has no production native provider capable of minting this proof.
-    pub(super) fn seal_for_provider(
+    #[cfg(test)]
+    fn seal_for_test(
         expected: &ExpectedScope,
         root_handle_identity: Vec<u8>,
         start_fence: ObserverFence,
@@ -110,6 +112,28 @@ pub(crate) trait QualifiedObserver {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProvenPrefixSet {
     prefixes: Vec<LedgerPath>,
+    epoch: u64,
+    owner_token: String,
+    owner_fence_nonce: Option<Vec<u8>>,
+    provider_id: String,
+    provider_identity: String,
+    provider_cursor: Option<Vec<u8>>,
+    provider_fence: Option<Vec<u8>>,
+    durable_offset: u64,
+    folded_offset: u64,
+    rows: Vec<ProvenPrefixRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProvenPrefixRow {
+    prefix: LedgerPath,
+    event_flags: i64,
+    source_mask: i64,
+    first_sequence: u64,
+    last_sequence: u64,
+    provider_sequence: u64,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,9 +169,26 @@ impl ReconcileMode {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct StoredStartFence {
-    fence: ObserverFence,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredAttemptIdentity {
+    scope_id: String,
+    scope_root: String,
+    scope_root_identity: String,
+    case_sensitive: bool,
+    epoch: u64,
+    ref_name: String,
+    ref_generation: u64,
+    change_id: String,
+    baseline_root_id: String,
+    policy_fingerprint: String,
+    policy_generation: u64,
+    filesystem_identity: String,
+    provider_id: Option<String>,
+    provider_identity: Option<String>,
+    observer_owner_token: Option<String>,
+    initial_durable_offset: u64,
+    initial_folded_offset: u64,
+    start_fence: ObserverFence,
     root_handle_identity: Vec<u8>,
 }
 
@@ -159,6 +200,8 @@ pub(crate) struct ReconciliationAttempt {
     start_fence: ObserverFence,
     end_fence: Option<ObserverFence>,
     qualification: Option<ObserverQualification>,
+    stored_identity: StoredAttemptIdentity,
+    encoded_identity: Vec<u8>,
     root: PinnedWorktreeRoot,
     report: ChangeLedgerReconcileReport,
 }
@@ -175,10 +218,41 @@ pub(crate) fn persisted_proven_prefixes(
     }
     exact_scope_guard(ledger.conn, expected)?;
     let scope_id = expected.scope_id.to_text();
-    let (state, reason, provider_id): (String, String, String) = ledger.conn.query_row(
-        "SELECT trust_state, trust_reason, provider_id FROM changed_path_scopes WHERE scope_id=?1",
+    let (
+        state,
+        reason,
+        provider_id,
+        provider_identity,
+        provider_cursor,
+        provider_fence,
+        durable_offset,
+        folded_offset,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+    ) = ledger.conn.query_row(
+        "SELECT trust_state,trust_reason,provider_id,provider_identity,
+                provider_cursor,provider_fence,durable_offset,folded_offset
+         FROM changed_path_scopes WHERE scope_id=?1",
         [&scope_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
     )?;
     if !matches!(state.as_str(), "trusted" | "reconciling") {
         return Err(reconcile_required(
@@ -187,57 +261,109 @@ pub(crate) fn persisted_proven_prefixes(
             &format!("full reconciliation required: {reason}"),
         ));
     }
-    let owner_is_live = ledger.conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM changed_path_observer_owners
-             WHERE scope_id=?1 AND epoch=?2 AND provider_id=?3
-               AND provider_identity=?4 AND lease_state='active' AND expires_at>=?5
-         )",
-        params![
-            scope_id,
-            sql_u64(expected.epoch)?,
-            provider_id,
-            hex::encode(&expected.provider_identity),
-            now_ts(),
-        ],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !owner_is_live {
+    if provider_identity != hex::encode(&expected.provider_identity) {
+        return Err(reconcile_required(
+            expected,
+            &state,
+            "provider identity changed; full reconciliation required",
+        ));
+    }
+    let owner = ledger
+        .conn
+        .query_row(
+            "SELECT owner_token,fence_nonce FROM changed_path_observer_owners
+         WHERE scope_id=?1 AND epoch=?2 AND provider_id=?3
+           AND provider_identity=?4 AND lease_state='active' AND expires_at>=?5",
+            params![
+                scope_id,
+                sql_u64(expected.epoch)?,
+                provider_id,
+                provider_identity,
+                now_ts(),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )
+        .optional()?;
+    let Some((owner_token, owner_fence_nonce)) = owner else {
         return Err(reconcile_required(
             expected,
             &state,
             "qualified provider owner is unavailable; full reconciliation required",
         ));
-    }
+    };
     let mut prefixes = requested.to_vec();
     prefixes.sort();
     prefixes.dedup();
+    let mut proof_rows = Vec::with_capacity(prefixes.len());
     for prefix in &prefixes {
-        let qualified = ledger.conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM changed_path_prefixes
-                 WHERE scope_id=?1 AND normalized_prefix=?2 COLLATE BINARY
-                   AND completeness_reason='provider_complete'
-                   AND source_mask=?3 AND provider_id=?4
-                   AND provider_sequence IS NOT NULL
-             )",
-            params![
-                scope_id,
-                prefix.as_str(),
-                super::EvidenceSource::Observer.mask(),
-                provider_id,
-            ],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !qualified {
+        let row = ledger
+            .conn
+            .query_row(
+                "SELECT event_flags,source_mask,first_sequence,last_sequence,
+                    provider_sequence,created_at,updated_at
+             FROM changed_path_prefixes
+             WHERE scope_id=?1 AND normalized_prefix=?2 COLLATE BINARY
+               AND completeness_reason='provider_complete'
+               AND source_mask=?3 AND provider_id=?4
+               AND provider_sequence IS NOT NULL AND intent_id IS NULL",
+                params![
+                    scope_id,
+                    prefix.as_str(),
+                    super::EvidenceSource::Observer.mask(),
+                    provider_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((event_flags, source_mask, first, last, sequence, created_at, updated_at)) = row
+        else {
             return Err(reconcile_required(
                 expected,
                 &state,
                 "prefix was not persisted by the qualified provider",
             ));
-        }
+        };
+        proof_rows.push(ProvenPrefixRow {
+            prefix: prefix.clone(),
+            event_flags,
+            source_mask,
+            first_sequence: db_u64(first)?,
+            last_sequence: db_u64(last)?,
+            provider_sequence: db_u64(sequence)?,
+            created_at,
+            updated_at,
+        });
     }
-    Ok(ProvenPrefixSet { prefixes })
+    let durable_offset = db_u64(durable_offset)?;
+    let folded_offset = db_u64(folded_offset)?;
+    if folded_offset > durable_offset {
+        return Err(Error::Corrupt(
+            "prefix proof folded cut exceeds durable cut".into(),
+        ));
+    }
+    Ok(ProvenPrefixSet {
+        prefixes,
+        epoch: expected.epoch,
+        owner_token,
+        owner_fence_nonce,
+        provider_id,
+        provider_identity,
+        provider_cursor,
+        provider_fence,
+        durable_offset,
+        folded_offset,
+        rows: proof_rows,
+    })
 }
 
 pub(crate) fn begin_reconciliation(
@@ -249,15 +375,18 @@ pub(crate) fn begin_reconciliation(
     mode: ReconcileMode,
     reason: &str,
 ) -> Result<ReconciliationAttempt> {
+    if !policy.authorizes_reconciliation(expected) {
+        return Err(reconcile_required(
+            expected,
+            TrustState::StaleBaseline.as_str(),
+            "compiled recording policy has no authenticated reconciliation authorization",
+        ));
+    }
     // The observation cut is deliberately acquired before the root is opened
     // and before any enumeration can begin.
     let start_fence = observer.begin_observation(expected)?;
     let root = trail.open_pinned_worktree_root(policy)?;
     let root_handle_identity = trail.pinned_worktree_root_identity(&root);
-    let stored_start = serde_json::to_vec(&StoredStartFence {
-        fence: start_fence.clone(),
-        root_handle_identity,
-    })?;
     let attempt_id = format!(
         "reconcile-{}-{}",
         now_ts(),
@@ -266,12 +395,10 @@ pub(crate) fn begin_reconciliation(
     let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
     exact_scope_guard(&tx, expected)?;
     validate_mode_start(&tx, expected, &mode)?;
-    let scope_id = expected.scope_id.to_text();
-    let (change_id, provider_id): (String, String) = tx.query_row(
-        "SELECT change_id, provider_id FROM changed_path_scopes WHERE scope_id=?1",
-        [&scope_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let stored_identity =
+        capture_attempt_identity(&tx, expected, start_fence.clone(), root_handle_identity)?;
+    let encoded_identity = serde_json::to_vec(&stored_identity)?;
+    let scope_id = stored_identity.scope_id.clone();
     tx.execute(
         "UPDATE changed_path_reconciliations
          SET state='abandoned', updated_at=?1
@@ -295,15 +422,15 @@ pub(crate) fn begin_reconciliation(
             sql_u64(expected.epoch)?,
             expected.ref_name,
             sql_u64(expected.ref_generation)?,
-            change_id,
-            expected.baseline_root.0,
-            hex::encode(&expected.filesystem_identity),
-            hex::encode(expected.policy_fingerprint),
-            sql_u64(expected.policy_generation)?,
-            provider_id,
-            hex::encode(&expected.provider_identity),
+            stored_identity.change_id,
+            stored_identity.baseline_root_id,
+            stored_identity.filesystem_identity,
+            stored_identity.policy_fingerprint,
+            sql_u64(stored_identity.policy_generation)?,
+            stored_identity.provider_id,
+            stored_identity.provider_identity,
             start_cursor.as_slice(),
-            stored_start,
+            encoded_identity,
             mode.label(),
             reason,
             mode.completeness(),
@@ -323,6 +450,8 @@ pub(crate) fn begin_reconciliation(
         start_fence: start_fence.clone(),
         end_fence: None,
         qualification: None,
+        stored_identity,
+        encoded_identity,
         root,
         report: ChangeLedgerReconcileReport {
             mode: mode.label().to_string(),
@@ -343,21 +472,68 @@ pub(crate) fn reconcile_full(
     policy: &CompiledPolicy,
     reason: &str,
 ) -> Result<ChangeLedgerReconcileReport> {
-    let mut attempt = begin_reconciliation(
-        trail,
-        ledger,
-        observer,
-        expected,
-        policy,
-        ReconcileMode::Full,
-        reason,
-    )?;
-    attempt.observe(trail, ledger, observer, policy)?;
-    attempt.publish(trail, ledger, policy)
+    let mut retries = 0;
+    loop {
+        let mut attempt = begin_reconciliation(
+            trail,
+            ledger,
+            observer,
+            expected,
+            policy,
+            ReconcileMode::Full,
+            reason,
+        )?;
+        if let Err(error) = attempt.observe(trail, ledger, observer, policy) {
+            if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_identity_race(&error) {
+                retries += 1;
+                continue;
+            }
+            return Err(error);
+        }
+        match attempt.publish(trail, ledger, policy) {
+            Ok(mut report) => {
+                report.retries = retries;
+                return Ok(report);
+            }
+            Err(error)
+                if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_identity_race(&error) =>
+            {
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_retryable_identity_race(error: &Error) -> bool {
+    let message = match error {
+        Error::InvalidInput(message) => message.as_str(),
+        Error::ChangeLedgerReconcileRequired { reason, .. } => reason.as_str(),
+        _ => return false,
+    };
+    message.contains("identity race")
+        || message.contains("changed while it was read")
+        || message.contains("workspace root identity changed")
+        || message.contains("directory identity changed")
 }
 
 impl ReconciliationAttempt {
     pub(crate) fn observe(
+        &mut self,
+        trail: &Trail,
+        ledger: &ChangedPathLedger<'_>,
+        observer: &dyn QualifiedObserver,
+        policy: &CompiledPolicy,
+    ) -> Result<()> {
+        let result = self.observe_inner(trail, ledger, observer, policy);
+        if let Err(error) = result {
+            mark_attempt_failed(ledger.conn, &self.attempt_id, &error.to_string())?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn observe_inner(
         &mut self,
         trail: &Trail,
         ledger: &ChangedPathLedger<'_>,
@@ -371,10 +547,14 @@ impl ReconciliationAttempt {
         }
         let prefixes = self.mode.prefixes();
         let mut writer = StagingWriter::new(ledger.conn, &self.attempt_id);
-        trail.visit_pinned_worktree_files(&self.root, policy, &prefixes, |file| {
-            writer.stage_filesystem(file)
+        trail.visit_pinned_worktree_files(&self.root, policy, &prefixes, |entry| match entry {
+            ReconciliationScanEntry::Directory(directory) => {
+                writer.stage_directory_guard(directory)
+            }
+            ReconciliationScanEntry::File(file) => writer.stage_filesystem(file),
         })?;
         writer.flush()?;
+        self.validate_directory_guards(trail, ledger)?;
         trail.visit_root_file_entries(
             &self.expected.baseline_root,
             &prefixes,
@@ -423,7 +603,8 @@ impl ReconciliationAttempt {
         }
         writer.flush()?;
         let candidate_rows = ledger.conn.query_row(
-            "SELECT COUNT(*) FROM changed_path_reconciliation_rows WHERE attempt_id=?1",
+            "SELECT COUNT(*) FROM changed_path_reconciliation_rows
+             WHERE attempt_id=?1 AND before_identity LIKE 'flags:%'",
             [&self.attempt_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -453,6 +634,33 @@ impl ReconciliationAttempt {
         Ok(())
     }
 
+    fn validate_directory_guards(
+        &self,
+        trail: &Trail,
+        ledger: &ChangedPathLedger<'_>,
+    ) -> Result<()> {
+        let mut statement = ledger.conn.prepare(
+            "SELECT content_hash,after_identity
+             FROM changed_path_reconciliation_rows
+             WHERE attempt_id=?1 AND before_identity='directory_guard'
+             ORDER BY normalized_path COLLATE BINARY",
+        )?;
+        let mut rows = statement.query([&self.attempt_id])?;
+        while let Some(row) = rows.next()? {
+            let path = row.get::<_, String>(0)?;
+            let identity = row
+                .get::<_, Option<String>>(1)?
+                .and_then(|value| hex::decode(value).ok())
+                .ok_or_else(|| Error::Corrupt("invalid staged directory guard".into()))?;
+            if !trail.verify_pinned_worktree_directory(&self.root, &path, &identity)? {
+                return Err(Error::InvalidInput(format!(
+                    "directory identity changed during reconciliation: `{path}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn publish(
         mut self,
         trail: &Trail,
@@ -471,7 +679,9 @@ impl ReconciliationAttempt {
                 "qualified observer proof is unavailable",
             ));
         };
-        if policy.fingerprint != self.expected.policy_fingerprint {
+        if policy.fingerprint() != self.expected.policy_fingerprint
+            || !policy.authorizes_reconciliation(&self.expected)
+        {
             return self.fail_report(
                 ledger,
                 "compiled recording policy fingerprint changed before publication",
@@ -483,25 +693,38 @@ impl ReconciliationAttempt {
         }
 
         if matches!(self.mode, ReconcileMode::ProvenPrefixes(_)) {
-            // A complete prefix proof can refresh staged evidence, but it is
-            // not a proof that all other paths are clean and never promotes
-            // global scope trust.
-            self.report.published = false;
-            self.report.trust_state = current_trust_state(ledger.conn, &self.expected)?;
-            return Ok(self.report);
+            return self.publish_prefix(ledger, trail, &root_identity, &end);
         }
 
         let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
-        if exact_scope_guard(&tx, &self.expected).is_err() {
+        let (current_durable, current_folded) =
+            match validate_stored_scope(&tx, &self.expected, &self.stored_identity) {
+                Ok(cuts) => cuts,
+                Err(_) => {
+                    return self.fail_publication_transaction(
+                        tx,
+                        "scope changed during reconciliation publication",
+                    )
+                }
+            };
+        if current_durable < self.stored_identity.initial_durable_offset
+            || current_folded < self.stored_identity.initial_folded_offset
+        {
             return self.fail_publication_transaction(
                 tx,
-                "scope changed during reconciliation publication",
+                "scope evidence cuts regressed during reconciliation publication",
             );
         }
         if !matches!(trail.verify_pinned_worktree_root(&self.root), Ok(true)) {
             return self.fail_publication_transaction(
                 tx,
                 "workspace root identity changed before publication",
+            );
+        }
+        if self.validate_directory_guards(trail, ledger).is_err() {
+            return self.fail_publication_transaction(
+                tx,
+                "directory identity changed before reconciliation publication",
             );
         }
         if validate_ready_attempt(&tx, &self, &root_identity).is_err() {
@@ -515,6 +738,7 @@ impl ReconciliationAttempt {
             );
         }
         let scope_id = self.expected.scope_id.to_text();
+        tx.execute_batch("SAVEPOINT changed_path_reconciliation_candidates;")?;
         tx.execute(
             "DELETE FROM changed_path_entries
              WHERE scope_id=?1 AND (
@@ -567,26 +791,45 @@ impl ReconciliationAttempt {
                 self.attempt_id,
             ],
         )?;
+        if candidate_cap_exceeded(&tx, &scope_id)? {
+            return self.fail_candidate_cap_transaction(tx);
+        }
+        tx.execute_batch("RELEASE changed_path_reconciliation_candidates;")?;
+        let merged_durable = current_durable.max(end.durable_offset);
+        let merged_folded = current_folded.max(end.durable_offset);
+        debug_assert!(merged_folded <= merged_durable);
         let changed = tx.execute(
             "UPDATE changed_path_scopes
              SET trust_state='trusted', trust_reason='reconciliation_published',
-                 durable_offset=?1, folded_offset=?1, updated_at=?2
-             WHERE scope_id=?3 AND epoch=?4 AND ref_name=?5 AND ref_generation=?6
-               AND baseline_root_id=?7 AND policy_fingerprint=?8
-               AND policy_dependency_generation=?9 AND filesystem_identity=?10
-               AND provider_identity=?11",
+                 durable_offset=?1, folded_offset=?2, updated_at=?3
+             WHERE scope_id=?4 AND scope_root=?5 AND scope_root_identity=?6
+               AND case_sensitive=?7 AND epoch=?8 AND ref_name=?9
+               AND ref_generation=?10 AND change_id=?11 AND baseline_root_id=?12
+               AND policy_fingerprint=?13 AND policy_dependency_generation=?14
+               AND filesystem_identity=?15 AND provider_id IS ?16
+               AND provider_identity IS ?17 AND observer_owner_token IS ?18
+               AND durable_offset=?19 AND folded_offset=?20",
             params![
-                sql_u64(end.durable_offset)?,
+                sql_u64(merged_durable)?,
+                sql_u64(merged_folded)?,
                 now,
-                scope_id,
-                sql_u64(self.expected.epoch)?,
-                self.expected.ref_name,
-                sql_u64(self.expected.ref_generation)?,
-                self.expected.baseline_root.0,
-                hex::encode(self.expected.policy_fingerprint),
-                sql_u64(self.expected.policy_generation)?,
-                hex::encode(&self.expected.filesystem_identity),
-                hex::encode(&self.expected.provider_identity),
+                self.stored_identity.scope_id,
+                self.stored_identity.scope_root,
+                self.stored_identity.scope_root_identity,
+                self.stored_identity.case_sensitive,
+                sql_u64(self.stored_identity.epoch)?,
+                self.stored_identity.ref_name,
+                sql_u64(self.stored_identity.ref_generation)?,
+                self.stored_identity.change_id,
+                self.stored_identity.baseline_root_id,
+                self.stored_identity.policy_fingerprint,
+                sql_u64(self.stored_identity.policy_generation)?,
+                self.stored_identity.filesystem_identity,
+                self.stored_identity.provider_id,
+                self.stored_identity.provider_identity,
+                self.stored_identity.observer_owner_token,
+                sql_u64(current_durable)?,
+                sql_u64(current_folded)?,
             ],
         )?;
         if changed != 1 {
@@ -600,6 +843,7 @@ impl ReconciliationAttempt {
         )?;
         tx.commit()?;
         self.report.published = true;
+        self.report.refreshed = true;
         self.report.trust_state = TrustState::Trusted.as_str().to_string();
         let candidate_rows = ledger.conn.query_row(
             "SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1",
@@ -608,6 +852,197 @@ impl ReconciliationAttempt {
         )?;
         self.report.candidate_rows = db_u64(candidate_rows)?;
         Ok(self.report)
+    }
+
+    fn publish_prefix(
+        mut self,
+        ledger: &ChangedPathLedger<'_>,
+        trail: &Trail,
+        root_identity: &[u8],
+        end: &ObserverFence,
+    ) -> Result<ChangeLedgerReconcileReport> {
+        let ReconcileMode::ProvenPrefixes(proof) = self.mode.clone() else {
+            unreachable!("prefix publication requires a prefix proof");
+        };
+        let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
+        if validate_stored_scope(&tx, &self.expected, &self.stored_identity).is_err() {
+            return self.fail_publication_transaction(
+                tx,
+                "scope changed during prefix reconciliation publication",
+            );
+        }
+        if validate_prefix_proof(&tx, &self.expected, &proof).is_err() {
+            return self.fail_publication_transaction(
+                tx,
+                "provider owner, cut, or persisted prefix changed before publication",
+            );
+        }
+        if !matches!(trail.verify_pinned_worktree_root(&self.root), Ok(true)) {
+            return self.fail_publication_transaction(
+                tx,
+                "workspace root identity changed before prefix publication",
+            );
+        }
+        if self.validate_directory_guards(trail, ledger).is_err() {
+            return self.fail_publication_transaction(
+                tx,
+                "directory identity changed before prefix publication",
+            );
+        }
+        if validate_ready_attempt(&tx, &self, root_identity).is_err() {
+            return self.fail_publication_transaction(tx, "prefix reconciliation attempt changed");
+        }
+
+        let scope_id = self.stored_identity.scope_id.clone();
+        tx.execute_batch("SAVEPOINT changed_path_reconciliation_candidates;")?;
+        for proof_row in &proof.rows {
+            let prefix = &proof_row.prefix;
+            let lower = format!("{}/", prefix.as_str());
+            let upper = format!("{}0", prefix.as_str());
+            tx.execute(
+                "DELETE FROM changed_path_entries
+                 WHERE scope_id=?1
+                   AND (normalized_path=?2 COLLATE BINARY OR
+                        (normalized_path>=?3 COLLATE BINARY AND normalized_path<?4 COLLATE BINARY))
+                   AND (source_mask=?5 OR
+                        (source_mask=?6 AND provider_id=?7
+                         AND provider_sequence IS NOT NULL AND provider_sequence<=?8))",
+                params![
+                    scope_id,
+                    prefix.as_str(),
+                    lower,
+                    upper,
+                    super::EvidenceSource::Reconciliation.mask(),
+                    super::EvidenceSource::Observer.mask(),
+                    proof.provider_id,
+                    sql_u64(proof_row.provider_sequence)?,
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM changed_path_prefixes
+                 WHERE scope_id=?1
+                   AND (normalized_prefix=?2 COLLATE BINARY OR
+                        (normalized_prefix>=?3 COLLATE BINARY AND normalized_prefix<?4 COLLATE BINARY))
+                   AND (source_mask=?5 OR
+                        (source_mask=?6 AND provider_id=?7
+                         AND provider_sequence IS NOT NULL AND provider_sequence<=?8))",
+                params![
+                    scope_id,
+                    prefix.as_str(),
+                    lower,
+                    upper,
+                    super::EvidenceSource::Reconciliation.mask(),
+                    super::EvidenceSource::Observer.mask(),
+                    proof.provider_id,
+                    sql_u64(proof_row.provider_sequence)?,
+                ],
+            )?;
+        }
+        let now = now_ts();
+        for row in &proof.rows {
+            tx.execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,
+                     source_mask,first_sequence,last_sequence,provider_id,
+                     provider_sequence,intent_id,created_at,updated_at
+                 ) VALUES(?1,?2,'provider_complete',?3,?4,?5,?6,?7,?8,NULL,?9,?10)",
+                params![
+                    scope_id,
+                    row.prefix.as_str(),
+                    row.event_flags,
+                    row.source_mask,
+                    sql_u64(row.first_sequence)?,
+                    sql_u64(row.last_sequence)?,
+                    proof.provider_id,
+                    sql_u64(row.provider_sequence)?,
+                    row.created_at,
+                    row.updated_at,
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO changed_path_entries(
+                 scope_id, normalized_path, event_flags, source_mask,
+                 first_sequence, last_sequence, provider_id, provider_sequence,
+                 intent_id, created_at, updated_at
+             )
+             SELECT ?1, normalized_path,
+                    CAST(substr(before_identity, 7) AS INTEGER), ?2,
+                    ?3, ?3, 'reconciliation', NULL, NULL, ?4, ?4
+             FROM changed_path_reconciliation_rows
+             WHERE attempt_id=?5 AND before_identity LIKE 'flags:%'
+             ON CONFLICT(scope_id, normalized_path) DO UPDATE SET
+                 event_flags=(changed_path_entries.event_flags | excluded.event_flags),
+                 source_mask=(changed_path_entries.source_mask | excluded.source_mask),
+                 first_sequence=MIN(changed_path_entries.first_sequence, excluded.first_sequence),
+                 last_sequence=MAX(changed_path_entries.last_sequence, excluded.last_sequence),
+                 updated_at=excluded.updated_at",
+            params![
+                scope_id,
+                super::EvidenceSource::Reconciliation.mask(),
+                sql_u64(end.sequence)?,
+                now,
+                self.attempt_id,
+            ],
+        )?;
+        if candidate_cap_exceeded(&tx, &scope_id)? {
+            return self.fail_candidate_cap_transaction(tx);
+        }
+        tx.execute_batch("RELEASE changed_path_reconciliation_candidates;")?;
+        let terminalized = tx.execute(
+            "UPDATE changed_path_reconciliations SET state='published', updated_at=?1
+             WHERE attempt_id=?2 AND state='ready'",
+            params![now, self.attempt_id],
+        )?;
+        if terminalized != 1 {
+            return self
+                .fail_publication_transaction(tx, "prefix reconciliation attempt was replaced");
+        }
+        let trust_state: String = tx.query_row(
+            "SELECT trust_state FROM changed_path_scopes WHERE scope_id=?1",
+            [&scope_id],
+            |row| row.get(0),
+        )?;
+        let candidate_rows = tx.query_row(
+            "SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1",
+            [&scope_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        tx.commit()?;
+        self.report.refreshed = true;
+        self.report.published = false;
+        self.report.trust_state = trust_state;
+        self.report.candidate_rows = db_u64(candidate_rows)?;
+        Ok(self.report)
+    }
+
+    fn fail_candidate_cap_transaction(
+        &self,
+        tx: Transaction<'_>,
+    ) -> Result<ChangeLedgerReconcileReport> {
+        tx.execute_batch(
+            "ROLLBACK TO changed_path_reconciliation_candidates;
+             RELEASE changed_path_reconciliation_candidates;",
+        )?;
+        let reason = "reconciliation candidate row cap exceeded";
+        tx.execute(
+            "UPDATE changed_path_scopes
+             SET trust_state='overflow',trust_reason=?1,updated_at=?2
+             WHERE scope_id=?3",
+            params![reason, now_ts(), self.stored_identity.scope_id],
+        )?;
+        tx.execute(
+            "UPDATE changed_path_reconciliations
+             SET state='failed',reason=?1,updated_at=?2
+             WHERE attempt_id=?3 AND state!='published'",
+            params![reason, now_ts(), self.attempt_id],
+        )?;
+        tx.commit()?;
+        Err(reconcile_required(
+            &self.expected,
+            TrustState::Overflow.as_str(),
+            reason,
+        ))
     }
 
     fn fail<T>(&self, ledger: &ChangedPathLedger<'_>, reason: &str) -> Result<T> {
@@ -690,6 +1125,23 @@ impl<'a> StagingWriter<'a> {
         self.hashed_bytes = self.hashed_bytes.saturating_add(file.size_bytes);
         self.peak_buffer_bytes = self.peak_buffer_bytes.max(file.peak_buffer_bytes);
         self.push(file_row(file, EvidenceFlags::CREATE, None))
+    }
+
+    fn stage_directory_guard(&mut self, directory: ReconciliationDirectory) -> Result<()> {
+        self.push(StagedRow {
+            path: format!(
+                "#directory-guard/{}",
+                hex::encode(directory.path.as_bytes())
+            ),
+            row_kind: "entry",
+            file_kind: Some("DirectoryGuard".into()),
+            content_hash: Some(directory.path),
+            executable: None,
+            size_bytes: None,
+            flags: EvidenceFlags::default(),
+            identity: Some(directory.identity),
+            source_sequence: None,
+        })
     }
 
     fn compare_baseline(&mut self, path: String, baseline: FileEntry) -> Result<()> {
@@ -857,7 +1309,11 @@ impl<'a> StagingWriter<'a> {
                     row.content_hash,
                     row.executable.map(i64::from),
                     row.size_bytes.map(sql_u64).transpose()?,
-                    format!("flags:{}", row.flags.0),
+                    if row.file_kind.as_deref() == Some("DirectoryGuard") {
+                        "directory_guard".to_string()
+                    } else {
+                        format!("flags:{}", row.flags.0)
+                    },
                     row.identity.map(hex::encode),
                     row.source_sequence.map(sql_u64).transpose()?,
                     now_ts(),
@@ -907,6 +1363,86 @@ fn validate_mode_start(
                 "empty provider prefix proof is not authoritative".into(),
             ));
         }
+        validate_prefix_proof(tx, expected, proof)?;
+    }
+    Ok(())
+}
+
+fn validate_prefix_proof(
+    conn: &rusqlite::Connection,
+    expected: &ExpectedScope,
+    proof: &ProvenPrefixSet,
+) -> Result<()> {
+    let scope_id = expected.scope_id.to_text();
+    let scope_matches = conn.query_row(
+        "SELECT COUNT(*) FROM changed_path_scopes
+         WHERE scope_id=?1 AND epoch=?2 AND provider_id=?3
+           AND provider_identity=?4 AND provider_cursor IS ?5
+           AND provider_fence IS ?6 AND durable_offset=?7 AND folded_offset=?8",
+        params![
+            scope_id,
+            sql_u64(proof.epoch)?,
+            proof.provider_id,
+            proof.provider_identity,
+            proof.provider_cursor,
+            proof.provider_fence,
+            sql_u64(proof.durable_offset)?,
+            sql_u64(proof.folded_offset)?,
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    let owner_matches = conn.query_row(
+        "SELECT COUNT(*) FROM changed_path_observer_owners
+         WHERE scope_id=?1 AND epoch=?2 AND owner_token=?3
+           AND provider_id=?4 AND provider_identity=?5
+           AND fence_nonce IS ?6 AND lease_state='active' AND expires_at>=?7",
+        params![
+            scope_id,
+            sql_u64(proof.epoch)?,
+            proof.owner_token,
+            proof.provider_id,
+            proof.provider_identity,
+            proof.owner_fence_nonce,
+            now_ts(),
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    if !scope_matches || !owner_matches {
+        return Err(reconcile_required(
+            expected,
+            TrustState::Reconciling.as_str(),
+            "provider owner or exact cut changed; full reconciliation required",
+        ));
+    }
+    for row in &proof.rows {
+        let matched = conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_prefixes
+             WHERE scope_id=?1 AND normalized_prefix=?2 COLLATE BINARY
+               AND completeness_reason='provider_complete' AND event_flags=?3
+               AND source_mask=?4 AND first_sequence=?5 AND last_sequence=?6
+               AND provider_id=?7 AND provider_sequence=?8 AND intent_id IS NULL
+               AND created_at=?9 AND updated_at=?10",
+            params![
+                scope_id,
+                row.prefix.as_str(),
+                row.event_flags,
+                row.source_mask,
+                sql_u64(row.first_sequence)?,
+                sql_u64(row.last_sequence)?,
+                proof.provider_id,
+                sql_u64(row.provider_sequence)?,
+                row.created_at,
+                row.updated_at,
+            ],
+            |query| query.get::<_, i64>(0),
+        )?;
+        if matched != 1 {
+            return Err(reconcile_required(
+                expected,
+                TrustState::Reconciling.as_str(),
+                "persisted provider-complete prefix changed; full reconciliation required",
+            ));
+        }
     }
     Ok(())
 }
@@ -934,29 +1470,37 @@ fn validate_ready_attempt(
     attempt: &ReconciliationAttempt,
     root_identity: &[u8],
 ) -> Result<()> {
-    let stored_start = serde_json::to_vec(&StoredStartFence {
-        fence: attempt.start_fence.clone(),
-        root_handle_identity: root_identity.to_vec(),
-    })?;
+    if attempt.stored_identity.root_handle_identity != root_identity
+        || serde_json::to_vec(&attempt.stored_identity)? != attempt.encoded_identity
+    {
+        return Err(reconcile_required(
+            &attempt.expected,
+            TrustState::Reconciling.as_str(),
+            "reconciliation attempt's pinned identity changed",
+        ));
+    }
     let matched = tx.query_row(
         "SELECT COUNT(*) FROM changed_path_reconciliations
          WHERE attempt_id=?1 AND scope_id=?2 AND expected_scope_epoch=?3
            AND expected_ref_name=?4 AND expected_ref_generation=?5
-           AND expected_root_id=?6 AND filesystem_identity=?7
-           AND policy_fingerprint=?8 AND policy_dependency_generation=?9
-           AND provider_identity=?10 AND start_fence=?11 AND state='ready'",
+           AND expected_change_id=?6 AND expected_root_id=?7
+           AND filesystem_identity=?8 AND policy_fingerprint=?9
+           AND policy_dependency_generation=?10 AND provider_id IS ?11
+           AND provider_identity IS ?12 AND start_fence=?13 AND state='ready'",
         params![
             attempt.attempt_id,
-            attempt.expected.scope_id.to_text(),
-            sql_u64(attempt.expected.epoch)?,
-            attempt.expected.ref_name,
-            sql_u64(attempt.expected.ref_generation)?,
-            attempt.expected.baseline_root.0,
-            hex::encode(&attempt.expected.filesystem_identity),
-            hex::encode(attempt.expected.policy_fingerprint),
-            sql_u64(attempt.expected.policy_generation)?,
-            hex::encode(&attempt.expected.provider_identity),
-            stored_start,
+            attempt.stored_identity.scope_id,
+            sql_u64(attempt.stored_identity.epoch)?,
+            attempt.stored_identity.ref_name,
+            sql_u64(attempt.stored_identity.ref_generation)?,
+            attempt.stored_identity.change_id,
+            attempt.stored_identity.baseline_root_id,
+            attempt.stored_identity.filesystem_identity,
+            attempt.stored_identity.policy_fingerprint,
+            sql_u64(attempt.stored_identity.policy_generation)?,
+            attempt.stored_identity.provider_id,
+            attempt.stored_identity.provider_identity,
+            attempt.encoded_identity,
         ],
         |row| row.get::<_, i64>(0),
     )?;
@@ -968,6 +1512,159 @@ fn validate_ready_attempt(
         ));
     }
     Ok(())
+}
+
+fn capture_attempt_identity(
+    conn: &rusqlite::Connection,
+    expected: &ExpectedScope,
+    start_fence: ObserverFence,
+    root_handle_identity: Vec<u8>,
+) -> Result<StoredAttemptIdentity> {
+    let identity = conn.query_row(
+        "SELECT scope_id,scope_root,scope_root_identity,case_sensitive,epoch,
+                ref_name,ref_generation,change_id,baseline_root_id,
+                policy_fingerprint,policy_dependency_generation,
+                filesystem_identity,provider_id,provider_identity,
+                observer_owner_token,durable_offset,folded_offset
+         FROM changed_path_scopes WHERE scope_id=?1",
+        [expected.scope_id.to_text()],
+        |row| {
+            let epoch = row.get::<_, i64>(4)?;
+            let ref_generation = row.get::<_, i64>(6)?;
+            let policy_generation = row.get::<_, i64>(10)?;
+            let durable_offset = row.get::<_, i64>(15)?;
+            let folded_offset = row.get::<_, i64>(16)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                epoch,
+                row.get::<_, String>(5)?,
+                ref_generation,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                policy_generation,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                durable_offset,
+                folded_offset,
+            ))
+        },
+    )?;
+    let (
+        scope_id,
+        scope_root,
+        scope_root_identity,
+        case_sensitive,
+        epoch,
+        ref_name,
+        ref_generation,
+        change_id,
+        baseline_root_id,
+        policy_fingerprint,
+        policy_generation,
+        filesystem_identity,
+        provider_id,
+        provider_identity,
+        observer_owner_token,
+        durable_offset,
+        folded_offset,
+    ) = identity;
+    let identity = StoredAttemptIdentity {
+        scope_id,
+        scope_root,
+        scope_root_identity,
+        case_sensitive,
+        epoch: db_u64(epoch)?,
+        ref_name,
+        ref_generation: db_u64(ref_generation)?,
+        change_id,
+        baseline_root_id,
+        policy_fingerprint,
+        policy_generation: db_u64(policy_generation)?,
+        filesystem_identity,
+        provider_id,
+        provider_identity,
+        observer_owner_token,
+        initial_durable_offset: db_u64(durable_offset)?,
+        initial_folded_offset: db_u64(folded_offset)?,
+        start_fence,
+        root_handle_identity,
+    };
+    if identity.initial_folded_offset > identity.initial_durable_offset
+        || identity.scope_id != expected.scope_id.to_text()
+        || identity.epoch != expected.epoch
+        || identity.ref_name != expected.ref_name
+        || identity.ref_generation != expected.ref_generation
+        || identity.baseline_root_id != expected.baseline_root.0
+        || identity.policy_fingerprint != hex::encode(expected.policy_fingerprint)
+        || identity.policy_generation != expected.policy_generation
+        || identity.filesystem_identity != hex::encode(&expected.filesystem_identity)
+        || identity.provider_identity.as_deref()
+            != Some(hex::encode(&expected.provider_identity).as_str())
+    {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "full scope identity or initial cuts changed before reconciliation began",
+        ));
+    }
+    Ok(identity)
+}
+
+fn validate_stored_scope(
+    conn: &rusqlite::Connection,
+    expected: &ExpectedScope,
+    identity: &StoredAttemptIdentity,
+) -> Result<(u64, u64)> {
+    let cuts = conn
+        .query_row(
+            "SELECT durable_offset,folded_offset FROM changed_path_scopes
+             WHERE scope_id=?1 AND scope_root=?2 AND scope_root_identity=?3
+               AND case_sensitive=?4 AND epoch=?5 AND ref_name=?6
+               AND ref_generation=?7 AND change_id=?8 AND baseline_root_id=?9
+               AND policy_fingerprint=?10 AND policy_dependency_generation=?11
+               AND filesystem_identity=?12 AND provider_id IS ?13
+               AND provider_identity IS ?14 AND observer_owner_token IS ?15",
+            params![
+                identity.scope_id,
+                identity.scope_root,
+                identity.scope_root_identity,
+                identity.case_sensitive,
+                sql_u64(identity.epoch)?,
+                identity.ref_name,
+                sql_u64(identity.ref_generation)?,
+                identity.change_id,
+                identity.baseline_root_id,
+                identity.policy_fingerprint,
+                sql_u64(identity.policy_generation)?,
+                identity.filesystem_identity,
+                identity.provider_id,
+                identity.provider_identity,
+                identity.observer_owner_token,
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((durable, folded)) = cuts else {
+        return Err(reconcile_required(
+            expected,
+            TrustState::Reconciling.as_str(),
+            "stored reconciliation scope identity changed",
+        ));
+    };
+    let durable = db_u64(durable)?;
+    let folded = db_u64(folded)?;
+    if folded > durable {
+        return Err(Error::Corrupt(
+            "changed-path scope folded cut exceeds durable cut".into(),
+        ));
+    }
+    Ok((durable, folded))
 }
 
 fn exact_scope_guard(conn: &rusqlite::Connection, expected: &ExpectedScope) -> Result<()> {
@@ -1057,6 +1754,17 @@ fn mark_attempt_failed(conn: &rusqlite::Connection, attempt_id: &str, reason: &s
     Ok(())
 }
 
+fn candidate_cap_exceeded(conn: &rusqlite::Connection, scope_id: &str) -> Result<bool> {
+    let (count, cap): (i64, i64) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1),
+                max_candidate_rows
+         FROM changed_path_scopes WHERE scope_id=?1",
+        [scope_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(db_u64(count)? > db_u64(cap)?)
+}
+
 fn reconcile_required(expected: &ExpectedScope, state: &str, reason: &str) -> Error {
     Error::ChangeLedgerReconcileRequired {
         scope: expected.scope_id.to_text(),
@@ -1091,9 +1799,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use crate::db::change_ledger::{
-        AdapterEquivalence, BaselineIdentity, FilesystemIdentity, PolicyIdentity,
-        PolicyInvalidationIndex, ProviderCapabilities, ProviderIdentity, RecordingPolicySnapshot,
-        ScopeIdentity, ScopeKind,
+        BaselineIdentity, FilesystemIdentity, PolicyIdentity, ProviderCapabilities,
+        ProviderIdentity, RecordingPolicySnapshot, ScopeIdentity, ScopeKind,
     };
     use crate::{InitImportMode, ObjectId};
 
@@ -1106,6 +1813,117 @@ mod tests {
     struct EventDuringFenceObserver {
         event: ObserverEvent,
         mutation: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ObserverFailurePoint {
+        EndFence,
+        Drain,
+        Callback,
+    }
+
+    struct FailingObserver {
+        point: ObserverFailurePoint,
+        callback_path: Option<LedgerPath>,
+    }
+
+    impl QualifiedObserver for FailingObserver {
+        fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
+            Ok(ObserverFence {
+                sequence: 10,
+                durable_offset: 0,
+                nonce: b"failure-start".to_vec(),
+            })
+        }
+
+        fn end_fence(
+            &self,
+            _expected: &ExpectedScope,
+            _start: &ObserverFence,
+        ) -> Result<ObserverFence> {
+            if matches!(self.point, ObserverFailurePoint::EndFence) {
+                return Err(Error::InvalidInput("injected end fence failure".into()));
+            }
+            Ok(ObserverFence {
+                sequence: 11,
+                durable_offset: 0,
+                nonce: b"failure-end".to_vec(),
+            })
+        }
+
+        fn drain_through(
+            &self,
+            expected: &ExpectedScope,
+            root_handle_identity: &[u8],
+            start: &ObserverFence,
+            end: &ObserverFence,
+            sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+        ) -> Result<ObserverQualification> {
+            if matches!(self.point, ObserverFailurePoint::Drain) {
+                return Err(Error::InvalidInput("injected drain failure".into()));
+            }
+            if matches!(self.point, ObserverFailurePoint::Callback) {
+                sink(ObserverEvent {
+                    path: self.callback_path.clone().unwrap(),
+                    flags: EvidenceFlags::CONTENT,
+                    sequence: 11,
+                })?;
+            }
+            Ok(ObserverQualification::seal_for_test(
+                expected,
+                root_handle_identity.to_vec(),
+                start.clone(),
+                end.clone(),
+            ))
+        }
+    }
+
+    struct RetryOnceObserver {
+        attempts: Cell<u64>,
+    }
+
+    impl QualifiedObserver for RetryOnceObserver {
+        fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
+            self.attempts.set(self.attempts.get() + 1);
+            Ok(ObserverFence {
+                sequence: 10,
+                durable_offset: 0,
+                nonce: format!("retry-start-{}", self.attempts.get()).into_bytes(),
+            })
+        }
+
+        fn end_fence(
+            &self,
+            _expected: &ExpectedScope,
+            _start: &ObserverFence,
+        ) -> Result<ObserverFence> {
+            if self.attempts.get() == 1 {
+                return Err(Error::InvalidInput(
+                    "workspace root identity race; retry reconciliation".into(),
+                ));
+            }
+            Ok(ObserverFence {
+                sequence: 10,
+                durable_offset: 0,
+                nonce: b"retry-end".to_vec(),
+            })
+        }
+
+        fn drain_through(
+            &self,
+            expected: &ExpectedScope,
+            root_handle_identity: &[u8],
+            start: &ObserverFence,
+            end: &ObserverFence,
+            _sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+        ) -> Result<ObserverQualification> {
+            Ok(ObserverQualification::seal_for_test(
+                expected,
+                root_handle_identity.to_vec(),
+                start.clone(),
+                end.clone(),
+            ))
+        }
     }
 
     impl QualifiedObserver for EventDuringFenceObserver {
@@ -1141,7 +1959,7 @@ mod tests {
             sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
         ) -> Result<ObserverQualification> {
             sink(self.event.clone())?;
-            Ok(ObserverQualification::seal_for_provider(
+            Ok(ObserverQualification::seal_for_test(
                 expected,
                 root_handle_identity.to_vec(),
                 start.clone(),
@@ -1199,7 +2017,7 @@ mod tests {
             end: &ObserverFence,
             _sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
         ) -> Result<ObserverQualification> {
-            let mut qualification = ObserverQualification::seal_for_provider(
+            let mut qualification = ObserverQualification::seal_for_test(
                 expected,
                 root_handle_identity.to_vec(),
                 start.clone(),
@@ -1275,8 +2093,8 @@ mod tests {
                 provider_identity: provider.identity,
             };
             let policy_root = db.workspace_root.clone();
-            let policy = CompiledPolicy {
-                snapshot: RecordingPolicySnapshot {
+            let policy = CompiledPolicy::for_reconciliation_test(
+                RecordingPolicySnapshot {
                     workspace_root: policy_root.clone(),
                     ignore_gitignored: true,
                     dependency_files: Vec::new(),
@@ -1284,16 +2102,8 @@ mod tests {
                     rule_sources: Vec::new(),
                 },
                 fingerprint,
-                dependencies: Vec::new(),
-                adapter_equivalence: AdapterEquivalence::Conservative,
-                stale_baseline: true,
-                reused_manifest: false,
-                invalidation_index: PolicyInvalidationIndex::from_paths(
-                    &policy_root,
-                    true,
-                    std::iter::empty(),
-                ),
-            };
+                &expected,
+            );
             Self {
                 _temp: temp,
                 db,
@@ -1304,6 +2114,36 @@ mod tests {
 
         fn root(&self) -> &std::path::Path {
             &self.db.workspace_root
+        }
+
+        fn observed_paths(&self) -> Vec<String> {
+            let observer = FakeQualifiedObserver::new();
+            let ledger = ChangedPathLedger::new(&self.db.conn);
+            let mut attempt = begin_reconciliation(
+                &self.db,
+                &ledger,
+                &observer,
+                &self.expected,
+                &self.policy,
+                ReconcileMode::Full,
+                "scan_paths",
+            )
+            .unwrap();
+            attempt
+                .observe(&self.db, &ledger, &observer, &self.policy)
+                .unwrap();
+            self.db
+                .conn
+                .prepare(
+                    "SELECT normalized_path FROM changed_path_reconciliation_rows
+                     WHERE attempt_id=?1 AND before_identity LIKE 'flags:%'
+                     ORDER BY normalized_path COLLATE BINARY",
+                )
+                .unwrap()
+                .query_map([attempt.attempt_id], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
         }
 
         fn ledger_rows(&self) -> Vec<(String, i64)> {
@@ -1319,6 +2159,18 @@ mod tests {
                 })
                 .unwrap()
                 .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        fn latest_attempt_state(&self) -> String {
+            self.db
+                .conn
+                .query_row(
+                    "SELECT state FROM changed_path_reconciliations
+                     ORDER BY created_at DESC, attempt_id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap()
         }
 
@@ -1453,6 +2305,44 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_does_not_flatten_nested_gitignore_authority() {
+        let mut fixture = Fixture::new();
+        fs::create_dir_all(fixture.root().join("src/generated")).unwrap();
+        fs::create_dir_all(fixture.root().join("other/generated")).unwrap();
+        fs::write(fixture.root().join("src/.gitignore"), "generated\n").unwrap();
+        fs::write(fixture.root().join("src/generated/ignored.txt"), b"src\n").unwrap();
+        fs::write(
+            fixture.root().join("other/generated/must-scan.txt"),
+            b"other\n",
+        )
+        .unwrap();
+        let rule_path = fixture.root().join("src/.gitignore");
+        fixture
+            .policy
+            .set_gitignore_rule_for_test(rule_path, b"generated\n".to_vec());
+
+        let paths = fixture.observed_paths();
+
+        assert!(paths
+            .iter()
+            .any(|path| path == "other/generated/must-scan.txt"));
+        assert!(paths.iter().any(|path| path == "src/generated/ignored.txt"));
+    }
+
+    #[test]
+    fn reconciliation_scans_gitignored_files_when_recording_keeps_them() {
+        let mut fixture = Fixture::new();
+        fixture.policy.set_ignore_gitignored_for_test(false);
+        fs::write(fixture.root().join(".gitignore"), "kept.txt\n").unwrap();
+        fs::write(fixture.root().join("kept.txt"), b"kept\n").unwrap();
+
+        assert!(fixture
+            .observed_paths()
+            .iter()
+            .any(|path| path == "kept.txt"));
+    }
+
+    #[test]
     fn stale_scope_cas_fails_attempt_without_replacing_candidates() {
         for column in [
             "ref_generation",
@@ -1496,6 +2386,123 @@ mod tests {
     }
 
     #[test]
+    fn full_scope_identity_changes_fail_the_ready_attempt() {
+        for (column, replacement) in [
+            ("change_id", "replacement-change"),
+            ("provider_id", "replacement-provider"),
+            ("scope_root", "/replacement/root"),
+            ("scope_root_identity", "replacement-root-identity"),
+            ("case_sensitive", "0"),
+        ] {
+            let fixture = Fixture::new();
+            fs::write(fixture.root().join("add.txt"), b"added\n").unwrap();
+            let attempt = fixture.begin_observed();
+            fixture
+                .db
+                .conn
+                .execute(
+                    &format!("UPDATE changed_path_scopes SET {column}=?1 WHERE scope_id=?2"),
+                    params![replacement, fixture.expected.scope_id.to_text()],
+                )
+                .unwrap();
+
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            assert!(
+                attempt
+                    .publish(&fixture.db, &ledger, &fixture.policy)
+                    .is_err(),
+                "column {column}"
+            );
+            let state: String = fixture
+                .db
+                .conn
+                .query_row(
+                    "SELECT state FROM changed_path_reconciliations ORDER BY created_at DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "failed", "column {column}");
+        }
+    }
+
+    #[test]
+    fn publication_never_regresses_later_durable_or_folded_cuts() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root().join("add.txt"), b"added\n").unwrap();
+        let attempt = fixture.begin_observed();
+        fixture
+            .db
+            .conn
+            .execute(
+                "UPDATE changed_path_scopes SET durable_offset=50, folded_offset=40
+                 WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+            )
+            .unwrap();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+
+        attempt
+            .publish(&fixture.db, &ledger, &fixture.policy)
+            .unwrap();
+
+        let cuts: (i64, i64) = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT durable_offset,folded_offset FROM changed_path_scopes WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cuts, (50, 40));
+    }
+
+    #[test]
+    fn publication_candidate_cap_accepts_boundary_and_rolls_back_overflow() {
+        for (cap, succeeds) in [(2_i64, true), (1_i64, false)] {
+            let fixture = Fixture::new();
+            fs::write(fixture.root().join("cap-one.txt"), b"one\n").unwrap();
+            fs::write(fixture.root().join("cap-two.txt"), b"two\n").unwrap();
+            fixture
+                .db
+                .conn
+                .execute(
+                    "UPDATE changed_path_scopes SET max_candidate_rows=?1 WHERE scope_id=?2",
+                    params![cap, fixture.expected.scope_id.to_text()],
+                )
+                .unwrap();
+            let attempt = fixture.begin_observed();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+
+            let result = attempt.publish(&fixture.db, &ledger, &fixture.policy);
+            let (trust, attempt_state, candidates): (String, String, i64) = fixture
+                .db
+                .conn
+                .query_row(
+                    "SELECT s.trust_state,r.state,
+                            (SELECT COUNT(*) FROM changed_path_entries e WHERE e.scope_id=s.scope_id)
+                     FROM changed_path_scopes s JOIN changed_path_reconciliations r
+                       ON r.scope_id=s.scope_id ORDER BY r.created_at DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            if succeeds {
+                assert!(result.is_ok());
+                assert_eq!(trust, "trusted");
+                assert_eq!(attempt_state, "published");
+                assert_eq!(candidates, 2);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(trust, "overflow");
+                assert_eq!(attempt_state, "failed");
+                assert_eq!(candidates, 0);
+            }
+        }
+    }
+
+    #[test]
     fn workspace_root_replacement_cannot_publish_trust() {
         let fixture = Fixture::new();
         fs::write(fixture.root().join("add.txt"), b"added\n").unwrap();
@@ -1521,6 +2528,47 @@ mod tests {
             )
             .unwrap();
         assert_ne!(trust, "trusted");
+    }
+
+    #[test]
+    fn nested_directory_replacement_forces_a_fresh_scan_before_publication() {
+        let fixture = Fixture::new();
+        let directory = fixture.root().join("nested");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("original.txt"), b"original\n").unwrap();
+        let displaced = fixture.root().join("nested-displaced");
+        let mutation_directory = directory.clone();
+        let mutation_displaced = displaced.clone();
+        let observer = EventDuringFenceObserver {
+            event: ObserverEvent {
+                path: LedgerPath::parse("nested/replacement.txt").unwrap(),
+                flags: EvidenceFlags::CREATE,
+                sequence: 31,
+            },
+            mutation: RefCell::new(Some(Box::new(move || {
+                fs::rename(&mutation_directory, &mutation_displaced).unwrap();
+                fs::create_dir(&mutation_directory).unwrap();
+                fs::write(mutation_directory.join("replacement.txt"), b"replacement\n").unwrap();
+            }))),
+        };
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let result = reconcile_full(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            "directory_replacement",
+        );
+        fs::remove_dir_all(&directory).unwrap();
+        fs::rename(&displaced, &directory).unwrap();
+
+        let report = result.unwrap();
+        assert_eq!(report.retries, 1);
+        assert!(report.published);
+        let rows = fixture.ledger_rows();
+        assert!(rows.contains(&("nested/replacement.txt".into(), EvidenceFlags::CREATE.0)));
+        assert!(!rows.iter().any(|(path, _)| path == "nested/original.txt"));
     }
 
     #[test]
@@ -1695,7 +2743,232 @@ mod tests {
             .unwrap();
 
         assert!(!report.published);
+        assert!(report.refreshed);
         assert_eq!(report.trust_state, "reconciling");
+        assert_eq!(fixture.latest_attempt_state(), "published");
+    }
+
+    #[test]
+    fn proven_prefix_proof_is_bound_to_exact_owner_and_provider_cut() {
+        for mutation in [
+            "UPDATE changed_path_observer_owners SET owner_token='replacement-owner'",
+            "UPDATE changed_path_prefixes SET provider_sequence=provider_sequence+1",
+            "UPDATE changed_path_scopes SET durable_offset=1, folded_offset=1",
+        ] {
+            let fixture = Fixture::new();
+            fixture.persist_live_provider_prefix("src");
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            let proof = persisted_proven_prefixes(
+                &ledger,
+                &fixture.expected,
+                &[LedgerPath::parse("src").unwrap()],
+            )
+            .unwrap();
+            fixture.db.conn.execute(mutation, []).unwrap();
+            let observer = FakeQualifiedObserver::new();
+
+            assert!(begin_reconciliation(
+                &fixture.db,
+                &ledger,
+                &observer,
+                &fixture.expected,
+                &fixture.policy,
+                ReconcileMode::ProvenPrefixes(proof),
+                "stale_prefix_proof",
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn proven_prefix_publish_replaces_only_covered_owned_rows() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.root().join("src")).unwrap();
+        fs::write(fixture.root().join("src/current.txt"), b"current\n").unwrap();
+        fixture.persist_live_provider_prefix("src");
+        let scope = fixture.expected.scope_id.to_text();
+        let provider = hex::encode(&fixture.expected.provider_identity);
+        for (path, source_mask, provider_id, provider_sequence) in [
+            (
+                "src/stale-reconcile.txt",
+                super::super::EvidenceSource::Reconciliation.mask(),
+                None,
+                None,
+            ),
+            (
+                "src/stale-provider.txt",
+                super::super::EvidenceSource::Observer.mask(),
+                Some(provider.as_str()),
+                Some(2_i64),
+            ),
+            (
+                "src/later-provider.txt",
+                super::super::EvidenceSource::Observer.mask(),
+                Some(provider.as_str()),
+                Some(99_i64),
+            ),
+            (
+                "src/intent.txt",
+                super::super::EvidenceSource::Intent.mask(),
+                None,
+                None,
+            ),
+            (
+                "outside.txt",
+                super::super::EvidenceSource::Reconciliation.mask(),
+                None,
+                None,
+            ),
+        ] {
+            fixture
+                .db
+                .conn
+                .execute(
+                    "INSERT INTO changed_path_entries(
+                         scope_id,normalized_path,event_flags,source_mask,
+                         first_sequence,last_sequence,provider_id,provider_sequence,
+                         created_at,updated_at
+                     ) VALUES(?1,?2,?3,?4,1,1,?5,?6,?7,?7)",
+                    params![
+                        scope,
+                        path,
+                        EvidenceFlags::CONTENT.0,
+                        source_mask,
+                        provider_id,
+                        provider_sequence,
+                        now_ts(),
+                    ],
+                )
+                .unwrap();
+        }
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let proof = persisted_proven_prefixes(
+            &ledger,
+            &fixture.expected,
+            &[LedgerPath::parse("src").unwrap()],
+        )
+        .unwrap();
+        let observer = FakeQualifiedObserver::new();
+        let mut attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::ProvenPrefixes(proof),
+            "prefix_replace",
+        )
+        .unwrap();
+        attempt
+            .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+            .unwrap();
+
+        let report = attempt
+            .publish(&fixture.db, &ledger, &fixture.policy)
+            .unwrap();
+        let paths = fixture
+            .db
+            .conn
+            .prepare(
+                "SELECT normalized_path FROM changed_path_entries WHERE scope_id=?1
+                 ORDER BY normalized_path COLLATE BINARY",
+            )
+            .unwrap()
+            .query_map([scope], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(report.refreshed);
+        assert!(!report.published);
+        assert!(paths.contains(&"src/current.txt".to_string()));
+        assert!(!paths.contains(&"src/stale-reconcile.txt".to_string()));
+        assert!(!paths.contains(&"src/stale-provider.txt".to_string()));
+        assert!(paths.contains(&"src/later-provider.txt".to_string()));
+        assert!(paths.contains(&"src/intent.txt".to_string()));
+        assert!(paths.contains(&"outside.txt".to_string()));
+    }
+
+    #[test]
+    fn each_proven_prefix_uses_its_own_provider_sequence_cut() {
+        let fixture = Fixture::new();
+        fixture.persist_live_provider_prefix("a");
+        let scope = fixture.expected.scope_id.to_text();
+        let provider = hex::encode(&fixture.expected.provider_identity);
+        fixture
+            .db
+            .conn
+            .execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,
+                     source_mask,first_sequence,last_sequence,provider_id,
+                     provider_sequence,created_at,updated_at
+                 ) VALUES(?1,'b','provider_complete',0,?2,1,8,?3,8,?4,?4)",
+                params![
+                    scope,
+                    super::super::EvidenceSource::Observer.mask(),
+                    provider,
+                    now_ts(),
+                ],
+            )
+            .unwrap();
+        fixture
+            .db
+            .conn
+            .execute(
+                "INSERT INTO changed_path_entries(
+                     scope_id,normalized_path,event_flags,source_mask,
+                     first_sequence,last_sequence,provider_id,provider_sequence,
+                     created_at,updated_at
+                 ) VALUES(?1,'a/later.txt',?2,?3,5,5,?4,5,?5,?5)",
+                params![
+                    scope,
+                    EvidenceFlags::CONTENT.0,
+                    super::super::EvidenceSource::Observer.mask(),
+                    provider,
+                    now_ts(),
+                ],
+            )
+            .unwrap();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let proof = persisted_proven_prefixes(
+            &ledger,
+            &fixture.expected,
+            &[
+                LedgerPath::parse("a").unwrap(),
+                LedgerPath::parse("b").unwrap(),
+            ],
+        )
+        .unwrap();
+        let observer = FakeQualifiedObserver::new();
+        let mut attempt = begin_reconciliation(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            ReconcileMode::ProvenPrefixes(proof),
+            "per_prefix_cut",
+        )
+        .unwrap();
+        attempt
+            .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+            .unwrap();
+        attempt
+            .publish(&fixture.db, &ledger, &fixture.policy)
+            .unwrap();
+
+        let preserved: bool = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM changed_path_entries
+                 WHERE scope_id=?1 AND normalized_path='a/later.txt')",
+                [scope],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(preserved);
     }
 
     #[test]
@@ -1791,6 +3064,151 @@ mod tests {
     }
 
     #[test]
+    fn scan_end_fence_drain_callback_and_flush_errors_terminalize_attempts() {
+        for point in [ObserverFailurePoint::EndFence, ObserverFailurePoint::Drain] {
+            let fixture = Fixture::new();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            let observer = FailingObserver {
+                point,
+                callback_path: None,
+            };
+            let mut attempt = begin_reconciliation(
+                &fixture.db,
+                &ledger,
+                &observer,
+                &fixture.expected,
+                &fixture.policy,
+                ReconcileMode::Full,
+                "terminal_failure",
+            )
+            .unwrap();
+            assert!(attempt
+                .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+                .is_err());
+            assert_eq!(fixture.latest_attempt_state(), "failed");
+        }
+
+        #[cfg(unix)]
+        {
+            let fixture = Fixture::new();
+            let blocked = fixture.root().join("blocked-directory");
+            fs::create_dir(&blocked).unwrap();
+            fs::write(blocked.join("file.txt"), b"blocked\n").unwrap();
+            let mut blocked_permissions = fs::metadata(&blocked).unwrap().permissions();
+            blocked_permissions.set_mode(0o000);
+            fs::set_permissions(&blocked, blocked_permissions).unwrap();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            let observer = FakeQualifiedObserver::new();
+            let mut attempt = begin_reconciliation(
+                &fixture.db,
+                &ledger,
+                &observer,
+                &fixture.expected,
+                &fixture.policy,
+                ReconcileMode::Full,
+                "scan_failure",
+            )
+            .unwrap();
+            let result = attempt.observe(&fixture.db, &ledger, &observer, &fixture.policy);
+            let mut restore_permissions = fs::metadata(&blocked).unwrap().permissions();
+            restore_permissions.set_mode(0o700);
+            fs::set_permissions(&blocked, restore_permissions).unwrap();
+            assert!(result.is_err());
+            assert_eq!(fixture.latest_attempt_state(), "failed");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let fixture = Fixture::new();
+            let external = tempfile::tempdir().unwrap();
+            fs::write(external.path().join("file.txt"), b"external\n").unwrap();
+            symlink(external.path(), fixture.root().join("linked")).unwrap();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            let observer = FailingObserver {
+                point: ObserverFailurePoint::Callback,
+                callback_path: Some(LedgerPath::parse("linked/file.txt").unwrap()),
+            };
+            let mut attempt = begin_reconciliation(
+                &fixture.db,
+                &ledger,
+                &observer,
+                &fixture.expected,
+                &fixture.policy,
+                ReconcileMode::Full,
+                "callback_failure",
+            )
+            .unwrap();
+            assert!(attempt
+                .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+                .is_err());
+            assert_eq!(fixture.latest_attempt_state(), "failed");
+        }
+
+        {
+            let fixture = Fixture::new();
+            fs::write(fixture.root().join("flush.txt"), b"flush\n").unwrap();
+            fixture
+                .db
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_reconciliation_flush
+                     BEFORE INSERT ON changed_path_reconciliation_rows
+                     BEGIN SELECT RAISE(ABORT, 'injected flush failure'); END;",
+                )
+                .unwrap();
+            let ledger = ChangedPathLedger::new(&fixture.db.conn);
+            let observer = FakeQualifiedObserver::new();
+            let mut attempt = begin_reconciliation(
+                &fixture.db,
+                &ledger,
+                &observer,
+                &fixture.expected,
+                &fixture.policy,
+                ReconcileMode::Full,
+                "flush_failure",
+            )
+            .unwrap();
+            assert!(attempt
+                .observe(&fixture.db, &ledger, &observer, &fixture.policy)
+                .is_err());
+            assert_eq!(fixture.latest_attempt_state(), "failed");
+        }
+    }
+
+    #[test]
+    fn retryable_identity_race_restarts_and_reports_actual_retry() {
+        let fixture = Fixture::new();
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let observer = RetryOnceObserver {
+            attempts: Cell::new(0),
+        };
+
+        let report = reconcile_full(
+            &fixture.db,
+            &ledger,
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            "retry_once",
+        )
+        .unwrap();
+
+        assert_eq!(observer.attempts.get(), 2);
+        assert_eq!(report.retries, 1);
+        let failed: i64 = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM changed_path_reconciliations WHERE state='failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed, 1);
+    }
+
+    #[test]
     fn hundred_thousand_staged_rows_keep_batch_memory_bounded() {
         let fixture = Fixture::new();
         let observer = FakeQualifiedObserver::new();
@@ -1835,5 +3253,129 @@ mod tests {
         assert_eq!(count, 100_000);
         assert_eq!(writer.peak_batch_rows, STAGING_BATCH_ROWS as u64);
         assert!(writer.pending.capacity() <= STAGING_BATCH_ROWS);
+    }
+
+    #[test]
+    fn realistic_filesystem_hash_and_baseline_gate_ignores_worktree_index_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        for directory in 0..32_u64 {
+            let path = temp.path().join(format!("tree/{directory:02}"));
+            fs::create_dir_all(&path).unwrap();
+            for file in 0..16_u64 {
+                fs::write(
+                    path.join(format!("{file:02}.txt")),
+                    format!("baseline-{directory}-{file}\n"),
+                )
+                .unwrap();
+            }
+        }
+        Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+        let db = Trail::open(temp.path()).unwrap();
+        let branch = db.current_branch().unwrap();
+        let head = db.resolve_branch_ref(&branch).unwrap();
+        let scope = ScopeIdentity {
+            scope_id: ScopeId([81; 32]),
+            kind: ScopeKind::Workspace,
+            owner_id: "realistic-reconcile".into(),
+        };
+        let fingerprint = [82; 32];
+        let provider = ProviderIdentity {
+            identity: vec![83],
+            capabilities: ProviderCapabilities {
+                durable_cursor: true,
+                linearizable_fence: true,
+                rename_pairing: true,
+                overflow_scope: true,
+                filesystem_supported: true,
+                clean_proof_allowed: true,
+                power_loss_durability: false,
+            },
+        };
+        ChangedPathLedger::new(&db.conn)
+            .begin_scope(
+                &scope,
+                &BaselineIdentity {
+                    ref_name: head.name.clone(),
+                    ref_generation: u64::try_from(head.generation).unwrap(),
+                    change_id: head.change_id,
+                    root_id: head.root_id.clone(),
+                },
+                &PolicyIdentity {
+                    fingerprint,
+                    generation: 1,
+                },
+                &FilesystemIdentity(vec![84]),
+                &provider,
+            )
+            .unwrap();
+        let expected = ExpectedScope {
+            scope_id: scope.scope_id,
+            epoch: 1,
+            ref_name: head.name,
+            ref_generation: u64::try_from(head.generation).unwrap(),
+            baseline_root: head.root_id,
+            policy_fingerprint: fingerprint,
+            policy_generation: 1,
+            filesystem_identity: vec![84],
+            provider_identity: provider.identity,
+        };
+        let policy = CompiledPolicy::for_reconciliation_test(
+            RecordingPolicySnapshot {
+                workspace_root: db.workspace_root.clone(),
+                ignore_gitignored: true,
+                dependency_files: Vec::new(),
+                case_sensitive: true,
+                rule_sources: Vec::new(),
+            },
+            fingerprint,
+            &expected,
+        );
+        for index in 0..128_u64 {
+            let directory = index / 16;
+            let file = index % 16;
+            fs::write(
+                temp.path()
+                    .join(format!("tree/{directory:02}/{file:02}.txt")),
+                format!("modified-{index}\n"),
+            )
+            .unwrap();
+        }
+        for index in 128..256_u64 {
+            let directory = index / 16;
+            let file = index % 16;
+            fs::remove_file(
+                temp.path()
+                    .join(format!("tree/{directory:02}/{file:02}.txt")),
+            )
+            .unwrap();
+        }
+        for index in 0..128_u64 {
+            fs::write(
+                temp.path().join(format!("tree/new-{index:03}.txt")),
+                format!("new-{index}\n"),
+            )
+            .unwrap();
+        }
+        db.conn
+            .execute("DELETE FROM worktree_file_index", [])
+            .unwrap();
+        let ledger = ChangedPathLedger::new(&db.conn);
+        let observer = FakeQualifiedObserver::new();
+
+        let report = reconcile_full(
+            &db,
+            &ledger,
+            &observer,
+            &expected,
+            &policy,
+            "realistic_gate",
+        )
+        .unwrap();
+
+        assert_eq!(report.observed_files, 512);
+        assert_eq!(report.observed_candidates, 384);
+        assert!(report.hashed_bytes > 0);
+        assert!(report.peak_batch_rows <= STAGING_BATCH_ROWS as u64);
+        assert!(report.peak_buffer_bytes <= 2 * 64 * 1024 + 6);
     }
 }
