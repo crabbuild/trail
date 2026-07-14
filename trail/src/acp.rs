@@ -793,6 +793,7 @@ struct PendingPermission {
 
 struct CaptureCoordinator {
     options: AcpRelayOptions,
+    db_pool: Arc<Mutex<Vec<Trail>>>,
     pending_initialize: HashSet<String>,
     pending_sessions: HashMap<String, PendingSession>,
     pending_prompts: HashMap<String, PendingPrompt>,
@@ -803,12 +804,44 @@ struct CaptureCoordinator {
     upstream_command_json: Option<String>,
 }
 
+struct PooledTrail {
+    db: Option<Trail>,
+    pool: Arc<Mutex<Vec<Trail>>>,
+}
+
+impl std::ops::Deref for PooledTrail {
+    type Target = Trail;
+
+    fn deref(&self) -> &Self::Target {
+        self.db.as_ref().expect("pooled Trail handle is present")
+    }
+}
+
+impl std::ops::DerefMut for PooledTrail {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.db.as_mut().expect("pooled Trail handle is present")
+    }
+}
+
+impl Drop for PooledTrail {
+    fn drop(&mut self) {
+        if let Some(db) = self.db.take() {
+            self.pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(db);
+        }
+    }
+}
+
 impl CaptureCoordinator {
     fn new(options: AcpRelayOptions) -> Result<Self> {
         let upstream_command_json =
             serde_json::to_string(&redact_command(&options.upstream_command)).ok();
+        let db = Trail::open_with_db_dir(&options.workspace_root, &options.db_dir)?;
         Ok(Self {
             options,
+            db_pool: Arc::new(Mutex::new(vec![db])),
             pending_initialize: HashSet::new(),
             pending_sessions: HashMap::new(),
             pending_prompts: HashMap::new(),
@@ -1869,8 +1902,25 @@ impl CaptureCoordinator {
         )
     }
 
-    fn open_db(&self) -> Result<Trail> {
-        Trail::open_with_db_dir(&self.options.workspace_root, &self.options.db_dir)
+    fn open_db(&self) -> Result<PooledTrail> {
+        if let Some(db) = self
+            .db_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+        {
+            return Ok(PooledTrail {
+                db: Some(db),
+                pool: self.db_pool.clone(),
+            });
+        }
+        Ok(PooledTrail {
+            db: Some(Trail::open_with_db_dir(
+                &self.options.workspace_root,
+                &self.options.db_dir,
+            )?),
+            pool: self.db_pool.clone(),
+        })
     }
 
     fn upstream_command_hash(&self) -> Option<String> {

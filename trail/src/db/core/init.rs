@@ -665,6 +665,8 @@ mod schema_handoff_tests {
 
     const CROSS_PROCESS_TEST: &str =
         "db::core::init::schema_handoff_tests::cross_process_schema_validation_fanout";
+    const SCHEMA_LEADER_LOCK_PROBE_TEST: &str =
+        "db::core::init::schema_handoff_tests::schema_leader_lock_probe";
 
     fn wait_for_path(path: &Path, deadline: Duration) {
         let started = Instant::now();
@@ -737,6 +739,63 @@ mod schema_handoff_tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_schema_validation_server(
+        root: &Path,
+    ) -> (SchemaValidationServer, PathBuf, PathBuf, String, String) {
+        use std::os::unix::net::UnixListener;
+
+        let lock_path = root.join("schema-validation.lock");
+        let leader_exclusion = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::fcntl_lock(
+            &leader_exclusion,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .unwrap();
+        let socket_path = root.join("schema-validation.socket");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let socket_cleanup = SchemaValidationRuntimeEntry::capture(&socket_path).unwrap();
+        let announcement_path = root.join("schema-validation.announce");
+        fs::write(&announcement_path, b"test announcement").unwrap();
+        let announcement_cleanup =
+            SchemaValidationRuntimeEntry::capture(&announcement_path).unwrap();
+        let nonce = "a".repeat(64);
+        let generation = "b".repeat(64);
+        (
+            SchemaValidationServer {
+                listener,
+                nonce: nonce.clone(),
+                generation: generation.clone(),
+                backend: "sqlite".to_owned(),
+                outcome: CrossProcessSchemaValidationOutcome::Success,
+                _leader_exclusion: leader_exclusion,
+                _socket_cleanup: socket_cleanup,
+                _announcement_cleanup: announcement_cleanup,
+            },
+            socket_path,
+            lock_path,
+            nonce,
+            generation,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_schema_leader_lock_available_to_child(lock_path: &Path) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", SCHEMA_LEADER_LOCK_PROBE_TEST, "--nocapture"])
+            .env("TRAIL_TEST_SCHEMA_LEADER_LOCK_PROBE", lock_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "schema leader lock remained held");
+    }
+
     fn run_schema_child() -> bool {
         let Ok(mode) = std::env::var("TRAIL_TEST_SCHEMA_CHILD") else {
             return false;
@@ -767,6 +826,21 @@ mod schema_handoff_tests {
             other => panic!("unknown schema child mode {other}"),
         };
         true
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_leader_lock_probe() {
+        let Some(lock_path) = std::env::var_os("TRAIL_TEST_SCHEMA_LEADER_LOCK_PROBE") else {
+            return;
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1257,26 +1331,54 @@ mod schema_handoff_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn uncontended_schema_validation_does_not_wait_for_an_ipc_audience() {
-        use std::os::unix::net::UnixListener;
-
+    fn schema_validation_server_returns_immediately_and_serves_a_late_follower() {
         let root = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(root.path().join("schema.sock")).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let (server, socket_path, lock_path, nonce, generation) =
+            test_schema_validation_server(root.path());
 
         let started = Instant::now();
-        serve_schema_validation_result(
-            &listener,
-            &"a".repeat(64),
-            &"b".repeat(64),
-            "sqlite",
-            &CrossProcessSchemaValidationOutcome::Success,
-        );
-
+        let shutdown = Arc::new(SchemaValidationServerShutdown::default());
+        let server = spawn_schema_validation_server(server, shutdown.clone()).unwrap();
         assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "uncontended IPC service waited for a nonexistent audience: {:?}",
+            started.elapsed() < Duration::from_millis(5),
+            "starting the background IPC server delayed mutable handoff: {:?}",
             started.elapsed()
         );
+
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            request_schema_validation_result(
+                &socket_path,
+                &nonce,
+                &generation,
+                "sqlite",
+                std::process::id(),
+            ),
+            Some(CrossProcessSchemaValidationOutcome::Success)
+        ));
+        let stopped = Instant::now();
+        shutdown.stop();
+        server.join().unwrap();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(50),
+            "schema server shutdown did not wake immediately: {:?}",
+            stopped.elapsed()
+        );
+        assert!(!socket_path.exists());
+        assert!(!root.path().join("schema-validation.announce").exists());
+        assert_schema_leader_lock_available_to_child(&lock_path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn schema_validation_server_panic_releases_ipc_and_leader_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, socket_path, lock_path, _, _) = test_schema_validation_server(root.path());
+
+        let server = std::thread::spawn(move || server.panic_for_test());
+        assert!(server.join().is_err());
+        assert!(!socket_path.exists());
+        assert!(!root.path().join("schema-validation.announce").exists());
+        assert_schema_leader_lock_available_to_child(&lock_path);
     }
 }
