@@ -52,3 +52,41 @@ fn metadata_only_intent_proof_without_a_real_sidecar_is_rejected() {
 fn authenticated_intent_cut_remains_a_prefix_after_later_observer_advance() {
     trail::test_support::changed_path_advanced_prefix_recovery().unwrap();
 }
+
+#[test]
+fn pre_and_post_events_cannot_bridge_an_empty_exact_path_interval() {
+    trail::test_support::changed_path_exact_interval_bridge_rejection().unwrap();
+}
+
+#[test]
+fn pre_and_post_events_cannot_bridge_an_empty_complete_prefix_interval() {
+    trail::test_support::changed_path_prefix_interval_bridge_rejection().unwrap();
+}
+
+#[test]
+fn authenticated_complete_prefix_interval_preserves_later_suffix() {
+    trail::test_support::changed_path_valid_prefix_interval_recovery().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_directory_substitution_is_rejected_at_marking() {
+    trail::test_support::changed_path_mark_ancestor_substitution_rejection().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ancestor_directory_substitution_is_rejected_at_recovery() {
+    trail::test_support::changed_path_recovery_ancestor_substitution_rejection().unwrap();
+}
+
+#[test]
+fn retired_segment_deletion_keeps_retained_parent_authority() {
+    trail::test_support::changed_path_deletion_parent_substitution_rejection().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn retired_segment_deletion_rejects_leaf_substitution() {
+    trail::test_support::changed_path_deletion_leaf_substitution_rejection().unwrap();
+}

@@ -355,9 +355,26 @@ pub(super) fn header_end(bytes: &[u8]) -> std::result::Result<usize, RecoveryErr
     decode_header(bytes).map(|(_, end)| end)
 }
 
+#[cfg(test)]
 pub(crate) fn recover_segments(
     database_path: &Path,
     segment_directory: &Path,
+    expected: &RecoveryScope,
+    limits: PersistedLogLimits,
+) -> std::result::Result<RecoveredTail, RecoveryError> {
+    let canonical_directory = segment_directory.canonicalize().map_err(|error| {
+        RecoveryError::new(format!("canonicalize observer test directory: {error}"))
+    })?;
+    let segment_directory = super::super::secure_fs::SecureDirectory::open_absolute(
+        &canonical_directory,
+    )
+    .map_err(|error| RecoveryError::new(format!("open observer directory securely: {error}")))?;
+    recover_segments_from_directory(database_path, &segment_directory, expected, limits)
+}
+
+pub(crate) fn recover_segments_from_directory(
+    database_path: &Path,
+    segment_directory: &super::super::secure_fs::SecureDirectory,
     expected: &RecoveryScope,
     limits: PersistedLogLimits,
 ) -> std::result::Result<RecoveredTail, RecoveryError> {
@@ -492,8 +509,11 @@ pub(crate) fn recover_segments(
                 "open observer segment appears before the recovered tail",
             ));
         }
-        let path = segment_directory.join(&expected_filename);
-        let file = open_segment_no_follow(&path)?;
+        let file = segment_directory
+            .open_regular(&expected_filename)
+            .map_err(|error| {
+                RecoveryError::new(format!("open observer segment securely: {error}"))
+            })?;
         let metadata = file.metadata().map_err(|error| {
             RecoveryError::new(format!("read observer segment metadata: {error}"))
         })?;
@@ -626,30 +646,27 @@ pub(crate) fn recover_segments(
         ));
     }
 
-    if segment_directory.exists() {
-        for entry in fs::read_dir(segment_directory).map_err(|error| {
-            RecoveryError::new(format!("list observer segment directory: {error}"))
-        })? {
-            let entry = entry
-                .map_err(|error| RecoveryError::new(format!("list observer segment: {error}")))?;
-            let filename = entry.file_name();
-            let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "cpl") {
-                let published = filename.to_str().is_some_and(|filename| {
-                    filename.len() <= MAX_SEGMENT_FILENAME_BYTES
-                        && is_strictly_published_filename(
-                            &connection,
-                            &expected.scope_id,
-                            filename,
-                            &path,
-                        )
-                        .unwrap_or(false)
-                });
-                if published {
-                    continue;
-                }
-                requires_reconciliation = true;
+    for filename in segment_directory.entry_names().map_err(|error| {
+        RecoveryError::new(format!("list observer segment directory securely: {error}"))
+    })? {
+        if Path::new(&filename)
+            .extension()
+            .is_some_and(|extension| extension == "cpl")
+        {
+            let published = filename.to_str().is_some_and(|filename| {
+                filename.len() <= MAX_SEGMENT_FILENAME_BYTES
+                    && is_strictly_published_filename(
+                        &connection,
+                        &expected.scope_id,
+                        filename,
+                        segment_directory,
+                    )
+                    .unwrap_or(false)
+            });
+            if published {
+                continue;
             }
+            requires_reconciliation = true;
         }
     }
     let recovered = RecoveredTail {
@@ -743,7 +760,7 @@ fn is_strictly_published_filename(
     connection: &Connection,
     scope_id: &ScopeId,
     filename: &str,
-    path: &Path,
+    directory: &super::super::secure_fs::SecureDirectory,
 ) -> std::result::Result<bool, RecoveryError> {
     let mut statement = connection
         .prepare(
@@ -800,7 +817,8 @@ fn is_strictly_published_filename(
             && segment_path == derived_filename
             && filename == derived_filename
             && published_header_matches(
-                path,
+                directory,
+                filename,
                 &RecoveryScope {
                     scope_id: *scope_id,
                     epoch,
@@ -815,11 +833,14 @@ fn is_strictly_published_filename(
 }
 
 fn published_header_matches(
-    path: &Path,
+    directory: &super::super::secure_fs::SecureDirectory,
+    filename: &str,
     expected: &RecoveryScope,
 ) -> std::result::Result<bool, RecoveryError> {
     const PREFIX_BYTES: usize = 8 + 2 + 4;
-    let mut file = open_segment_no_follow(path)?;
+    let mut file = directory.open_regular(filename).map_err(|error| {
+        RecoveryError::new(format!("open published segment header securely: {error}"))
+    })?;
     let mut prefix = [0_u8; PREFIX_BYTES];
     file.read_exact(&mut prefix)
         .map_err(|error| RecoveryError::new(format!("read published segment header: {error}")))?;

@@ -78,6 +78,39 @@ pub mod test_support {
     pub fn changed_path_advanced_prefix_recovery() -> std::result::Result<(), String> {
         crate::db::run_advanced_prefix_recovery()
     }
+
+    pub fn changed_path_exact_interval_bridge_rejection() -> std::result::Result<(), String> {
+        crate::db::run_exact_interval_bridge_rejection()
+    }
+
+    pub fn changed_path_prefix_interval_bridge_rejection() -> std::result::Result<(), String> {
+        crate::db::run_prefix_interval_bridge_rejection()
+    }
+
+    pub fn changed_path_valid_prefix_interval_recovery() -> std::result::Result<(), String> {
+        crate::db::run_valid_prefix_interval_recovery()
+    }
+
+    #[cfg(unix)]
+    pub fn changed_path_mark_ancestor_substitution_rejection() -> std::result::Result<(), String> {
+        crate::db::run_mark_ancestor_substitution_rejection()
+    }
+
+    #[cfg(unix)]
+    pub fn changed_path_recovery_ancestor_substitution_rejection() -> std::result::Result<(), String>
+    {
+        crate::db::run_recovery_ancestor_substitution_rejection()
+    }
+
+    pub fn changed_path_deletion_parent_substitution_rejection() -> std::result::Result<(), String>
+    {
+        crate::db::run_deletion_parent_substitution_rejection()
+    }
+
+    #[cfg(unix)]
+    pub fn changed_path_deletion_leaf_substitution_rejection() -> std::result::Result<(), String> {
+        crate::db::run_deletion_leaf_substitution_rejection()
+    }
 }
 
 /// Re-export the prolly crate as a Trail module namespace.

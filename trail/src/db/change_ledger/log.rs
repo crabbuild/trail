@@ -6,7 +6,9 @@ use crate::error::{Error, Result};
 mod codec;
 mod writer;
 
+#[cfg(test)]
 pub(crate) use codec::recover_segments;
+pub(crate) use codec::recover_segments_from_directory;
 pub(crate) use writer::SegmentWriter;
 
 #[cfg(all(test, target_os = "linux"))]

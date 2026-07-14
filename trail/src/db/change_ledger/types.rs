@@ -205,6 +205,7 @@ impl EvidenceFlags {
     pub(crate) const DELETE: Self = Self(1 << 3);
     pub(crate) const RENAME_FROM: Self = Self(1 << 4);
     pub(crate) const RENAME_TO: Self = Self(1 << 5);
+    pub(crate) const PROVIDER_COMPLETE_PREFIX: Self = Self(1 << 6);
 
     #[cfg(test)]
     pub(crate) const fn from_index(index: u8) -> Self {

@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use getrandom::getrandom;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -11,6 +10,28 @@ use crate::db::util::now_ts;
 use crate::error::{Error, Result};
 use crate::model::{OPERATION_KIND, WORKTREE_ROOT_KIND};
 use crate::{ChangeId, ObjectId};
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SIDECAR_ANCESTOR_SUBSTITUTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn install_sidecar_ancestor_substitution_hook(hook: impl FnOnce() + 'static) {
+    SIDECAR_ANCESTOR_SUBSTITUTION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(debug_assertions)]
+fn run_sidecar_ancestor_substitution_hook() {
+    SIDECAR_ANCESTOR_SUBSTITUTION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct IntentId(pub(crate) String);
@@ -549,22 +570,16 @@ pub(super) fn validate_qualified_filesystem_proof(
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| invalid("filesystem proof database has no Trail root"))?;
-    let mut segment_directory = database_root.to_path_buf();
-    for component in Path::new(&proof.segment_directory).components() {
-        let Component::Normal(component) = component else {
-            return Err(invalid(
-                "filesystem proof segment directory escapes Trail root",
-            ));
-        };
-        segment_directory.push(component);
-        let metadata = fs::symlink_metadata(&segment_directory)
-            .map_err(|_| invalid("filesystem proof segment directory is missing"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(invalid(
-                "filesystem proof segment directory is not a real directory",
-            ));
-        }
-    }
+    let trail_directory = super::secure_fs::SecureDirectory::open_absolute(database_root)
+        .map_err(|error| invalid(&format!("open Trail root securely: {error}")))?;
+    let observer_directory = trail_directory
+        .open_dir("observer-segments")
+        .map_err(|error| invalid(&format!("open observer root securely: {error}")))?;
+    #[cfg(debug_assertions)]
+    run_sidecar_ancestor_substitution_hook();
+    let segment_directory = observer_directory
+        .open_dir(&expected.scope_id.to_text())
+        .map_err(|error| invalid(&format!("open observer scope securely: {error}")))?;
     let owner_token: [u8; 32] = hex::decode(&proof.observer_owner_token)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -587,7 +602,7 @@ pub(super) fn validate_qualified_filesystem_proof(
         )?)
         .map_err(|_| Error::Corrupt("unfolded observer record limit exceeds usize".into()))?,
     };
-    let recovered = super::recover_segments(
+    let recovered = super::recover_segments_from_directory(
         &database_path,
         &segment_directory,
         &super::RecoveryScope {
@@ -630,52 +645,60 @@ pub(super) fn validate_qualified_filesystem_proof(
         ));
     }
 
-    let path_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM changed_path_intent_paths WHERE intent_id=?1",
-        [&intent.id.0],
-        |row| row.get(0),
-    )?;
-    let missing_paths: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM changed_path_intent_paths p WHERE p.intent_id=?1
-         AND NOT EXISTS(SELECT 1 FROM changed_path_entries e
-             WHERE e.scope_id=?2 AND e.normalized_path=p.normalized_path COLLATE BINARY
-               AND (e.source_mask & 1) != 0 AND (e.event_flags & p.event_flags)=p.event_flags
-               AND e.first_sequence<=?4 AND e.provider_sequence>=?3)",
-        params![
-            intent.id.0,
-            intent.scope_id,
-            sql_u64(proof.start_sequence, "proof start sequence")?,
-            sql_u64(proof.end_cut.sequence, "proof end sequence")?,
-        ],
-        |row| row.get(0),
-    )?;
-    let prefix_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM changed_path_intent_prefixes WHERE intent_id=?1",
-        [&intent.id.0],
-        |row| row.get(0),
-    )?;
-    let missing_prefixes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM changed_path_intent_prefixes p WHERE p.intent_id=?1
-         AND NOT EXISTS(SELECT 1 FROM changed_path_prefixes e
-             WHERE e.scope_id=?2 AND e.normalized_prefix=p.normalized_prefix COLLATE BINARY
-               AND e.completeness_reason='provider_complete' AND (e.source_mask & 1) != 0
-               AND (e.event_flags & p.event_flags)=p.event_flags
-               AND e.first_sequence<=?4 AND e.provider_sequence>=?3)",
-        params![
-            intent.id.0,
-            intent.scope_id,
-            sql_u64(proof.start_sequence, "proof start sequence")?,
-            sql_u64(proof.end_cut.sequence, "proof end sequence")?,
-        ],
-        |row| row.get(0),
-    )?;
-    if missing_paths != 0
-        || missing_prefixes != 0
-        || db_u64(path_count, "intent path count")? != proof.verified_paths
-        || db_u64(prefix_count, "intent prefix count")? != proof.verified_prefixes
+    let intent_paths = conn
+        .prepare(
+            "SELECT normalized_path,event_flags FROM changed_path_intent_paths
+             WHERE intent_id=?1 ORDER BY normalized_path COLLATE BINARY",
+        )?
+        .query_map([&intent.id.0], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let intent_prefixes = conn
+        .prepare(
+            "SELECT normalized_prefix,completeness_reason,event_flags
+             FROM changed_path_intent_prefixes
+             WHERE intent_id=?1 ORDER BY normalized_prefix COLLATE BINARY",
+        )?
+        .query_map([&intent.id.0], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut exact_flags = std::collections::BTreeMap::<&str, i64>::new();
+    let mut prefix_flags = std::collections::BTreeMap::<&str, i64>::new();
+    for record in recovered.records.iter().filter(|record| {
+        record.source == super::EvidenceSource::Observer
+            && record.sequence >= proof.start_sequence
+            && record.sequence <= proof.end_cut.sequence
+    }) {
+        let flags = record.flags.0 & !super::EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0;
+        *exact_flags.entry(record.path.as_str()).or_default() |= flags;
+        if record.flags.0 & super::EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0 != 0 {
+            *prefix_flags.entry(record.path.as_str()).or_default() |= flags;
+        }
+    }
+    let paths_covered = intent_paths.iter().all(|(path, required)| {
+        exact_flags
+            .get(path.as_str())
+            .is_some_and(|observed| observed & required == *required)
+    });
+    let prefixes_covered = intent_prefixes.iter().all(|(prefix, reason, required)| {
+        reason == "provider_complete"
+            && prefix_flags
+                .get(prefix.as_str())
+                .is_some_and(|observed| observed & required == *required)
+    });
+    if !paths_covered
+        || !prefixes_covered
+        || u64::try_from(intent_paths.len()).ok() != Some(proof.verified_paths)
+        || u64::try_from(intent_prefixes.len()).ok() != Some(proof.verified_prefixes)
     {
         return Err(invalid(
-            "filesystem proof does not cover all persisted intent evidence",
+            "filesystem proof interval does not contain all authenticated intent evidence",
         ));
     }
     Ok(())

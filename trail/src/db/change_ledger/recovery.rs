@@ -212,12 +212,63 @@ pub(crate) fn rotate_restored_scopes(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct SegmentDeletionToken {
-    pub(crate) scope_id: super::ScopeId,
-    pub(crate) epoch: u64,
-    pub(crate) directory: std::path::PathBuf,
-    pub(crate) leaf: String,
+    scope_id: super::ScopeId,
+    epoch: u64,
+    directory: Option<std::sync::Arc<super::secure_fs::SecureDirectory>>,
+    leaf: String,
+}
+
+impl std::fmt::Debug for SegmentDeletionToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentDeletionToken")
+            .field("scope_id", &self.scope_id.to_text())
+            .field("epoch", &self.epoch)
+            .field("directory_retained", &self.directory.is_some())
+            .field("leaf", &self.leaf)
+            .finish()
+    }
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeletionSubstitutionPoint {
+    Parent,
+    Leaf,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static DELETION_SUBSTITUTION_HOOK: std::cell::RefCell<
+        Option<(DeletionSubstitutionPoint, Box<dyn FnOnce()>)>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn install_deletion_substitution_hook(
+    point: DeletionSubstitutionPoint,
+    hook: impl FnOnce() + 'static,
+) {
+    DELETION_SUBSTITUTION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some((point, Box::new(hook)));
+    });
+}
+
+#[cfg(debug_assertions)]
+fn run_deletion_substitution_hook(point: DeletionSubstitutionPoint) {
+    DELETION_SUBSTITUTION_HOOK.with(|slot| {
+        let should_run = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(installed, _)| *installed == point);
+        if should_run {
+            if let Some((_, hook)) = slot.borrow_mut().take() {
+                hook();
+            }
+        }
+    });
 }
 
 pub(crate) fn retire_scope(
@@ -433,6 +484,11 @@ fn segment_deletion_tokens(
     let directory = trail_root
         .join("observer-segments")
         .join(expected.scope_id.to_text());
+    let directory = match super::secure_fs::SecureDirectory::open_absolute(&directory) {
+        Ok(directory) => Some(std::sync::Arc::new(directory)),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     Ok(leaves
         .iter()
         .map(|leaf| SegmentDeletionToken {
@@ -445,59 +501,24 @@ fn segment_deletion_tokens(
 }
 
 pub(crate) fn remove_retired_segments(tokens: &[SegmentDeletionToken]) -> Result<()> {
-    let mut synced = std::collections::BTreeSet::new();
     for token in tokens {
         validate_retired_segment_paths(std::slice::from_ref(&token.leaf))?;
-        let metadata = match std::fs::symlink_metadata(&token.directory) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+        let Some(directory) = &token.directory else {
+            continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Error::Corrupt(format!(
-                "retired segment directory is not a real directory for scope {} epoch {}",
-                token.scope_id.to_text(),
-                token.epoch
-            )));
+        #[cfg(debug_assertions)]
+        run_deletion_substitution_hook(DeletionSubstitutionPoint::Parent);
+        let opened = match directory.open_regular(&token.leaf) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        #[cfg(debug_assertions)]
+        run_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf);
+        directory.verify_opened_regular(&token.leaf, &opened)?;
+        if directory.unlink_leaf(&token.leaf)? {
+            directory.sync()?;
         }
-        let path = token.directory.join(&token.leaf);
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                std::fs::remove_file(&path)?;
-                synced.insert(token.directory.clone());
-            }
-            Ok(_) => {
-                return Err(Error::Corrupt(format!(
-                    "retired segment token does not name a regular file: {}",
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    for directory in synced {
-        sync_retired_segment_directory(&directory)?;
-    }
-    Ok(())
-}
-
-fn sync_retired_segment_directory(path: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)?
-            .sync_all()?;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(0x0200_0000)
-            .open(path)?
-            .sync_all()?;
     }
     Ok(())
 }
@@ -686,11 +707,12 @@ mod harness {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::db::change_ledger::intent::install_sidecar_ancestor_substitution_hook;
     use crate::db::change_ledger::{
-        mark_filesystem_applied, prepare_intent, publish_intent, BaselineIdentity, EvidenceCut,
-        EvidenceFlags, EvidenceSource, FilesystemIdentity, IntentEvidence, IntentProducer,
-        IntentTarget, LedgerPath, PolicyIdentity, ProviderCapabilities, ProviderIdentity,
-        QualifiedFilesystemProof, ScopeId, ScopeIdentity, ScopeKind,
+        mark_filesystem_applied, prepare_intent, publish_intent, BaselineIdentity, DirtyPrefix,
+        DurableCut, EvidenceCut, EvidenceFlags, EvidenceSource, FilesystemIdentity, IntentEvidence,
+        IntentProducer, IntentTarget, LedgerPath, PolicyIdentity, ProviderCapabilities,
+        ProviderIdentity, QualifiedFilesystemProof, ScopeId, ScopeIdentity, ScopeKind,
     };
     use crate::db::{InitImportMode, Trail};
     use crate::model::{Actor, FileContentRef};
@@ -948,6 +970,100 @@ mod harness {
             )?;
             Ok(())
         }
+
+        fn insert_observer_prefix(&self, path: &str, sequence: u64) -> Result<()> {
+            self.db.conn.execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,source_mask,
+                     first_sequence,last_sequence,provider_id,provider_sequence,intent_id,
+                     created_at,updated_at)
+                 VALUES(?1,?2,'provider_complete',?3,1,?4,?4,'observer',?4,NULL,?5,?5)
+                 ON CONFLICT(scope_id,normalized_prefix) DO UPDATE SET
+                    event_flags=changed_path_prefixes.event_flags|excluded.event_flags,
+                    source_mask=changed_path_prefixes.source_mask|excluded.source_mask,
+                    first_sequence=MIN(changed_path_prefixes.first_sequence,excluded.first_sequence),
+                    last_sequence=MAX(changed_path_prefixes.last_sequence,excluded.last_sequence),
+                    provider_sequence=MAX(changed_path_prefixes.provider_sequence,excluded.provider_sequence),
+                    updated_at=excluded.updated_at",
+                params![
+                    self.expected.scope_id.to_text(),
+                    path,
+                    EvidenceFlags::CONTENT.0,
+                    sql_u64(sequence, "observer prefix sequence")?,
+                    now_ts()
+                ],
+            )?;
+            Ok(())
+        }
+
+        fn proof_for_durable_segment(
+            &self,
+            durable: &DurableCut,
+            start_cursor: Vec<u8>,
+            start_sequence: u64,
+            verified_paths: u64,
+            verified_prefixes: u64,
+        ) -> Result<QualifiedFilesystemProof> {
+            let provider_id: String = self.db.conn.query_row(
+                "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
+                [self.expected.scope_id.to_text()],
+                |row| row.get(0),
+            )?;
+            let segment = self.db.conn.query_row(
+                "SELECT segment_hash,segment_path,durable_end_offset,folded_end_offset
+                 FROM changed_path_observer_segments
+                 WHERE scope_id=?1 AND segment_id=?2 AND state='sealed'",
+                params![self.expected.scope_id.to_text(), durable.segment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            let segment_hash = hex::decode(segment.0)
+                .map_err(|error| Error::Corrupt(error.to_string()))?
+                .try_into()
+                .map_err(|_| Error::Corrupt("invalid fixture segment hash".into()))?;
+            Ok(QualifiedFilesystemProof {
+                scope_id: self.expected.scope_id,
+                epoch: self.expected.epoch,
+                expected_root_id: self.expected.baseline_root.clone(),
+                scope_root_identity: self.expected.filesystem_identity.clone(),
+                filesystem_identity: self.expected.filesystem_identity.clone(),
+                provider_id,
+                provider_identity: self.expected.provider_identity.clone(),
+                observer_owner_token: hex::encode(
+                    [self.expected.scope_id.0[0].wrapping_add(0x31); 32],
+                ),
+                owner_fence_nonce: Some(b"qualified-fence".to_vec()),
+                durable_segment_id: durable.segment_id.clone(),
+                durable_segment_hash: segment_hash,
+                segment_directory: format!(
+                    "observer-segments/{}",
+                    self.expected.scope_id.to_text()
+                ),
+                segment_path: segment.1,
+                start_cursor: Some(start_cursor),
+                end_cursor: durable.provider_cursor.clone(),
+                start_sequence,
+                end_cut: EvidenceCut {
+                    source: EvidenceSource::Observer,
+                    sequence: durable.last_sequence,
+                    durable_offset: durable.durable_end_offset,
+                    folded_offset: durable.durable_end_offset,
+                },
+                segment_durable_offset: db_u64(segment.2, "fixture segment durable")?,
+                segment_folded_offset: db_u64(segment.3, "fixture segment folded")?,
+                verified_paths,
+                verified_prefixes,
+                complete_root_interval: true,
+                complete_policy_interval: true,
+                persisted_evidence_through_end: true,
+            })
+        }
     }
 
     pub(super) fn acknowledgement_race() -> Result<()> {
@@ -1055,6 +1171,377 @@ mod harness {
             return Err(Error::Corrupt(
                 "later observer evidence was cleared with the intent prefix".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn aggregate_bridge_without_interval_evidence_is_rejected(prefix: bool) -> Result<()> {
+        let fixture = Fixture::new(if prefix { 0x83 } else { 0x82 })?;
+        let bridge_path = if prefix {
+            "bridged-prefix"
+        } else {
+            "bridged-path.rs"
+        };
+        let target = fixture.target("aggregate-bridge", fixture.expected.baseline_root.clone());
+        let owner_token = [fixture.expected.scope_id.0[0].wrapping_add(0x31); 32];
+        let provider_id: String = fixture.db.conn.query_row(
+            "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        let segment_directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        let mut writer = super::super::SegmentWriter::acquire(
+            &fixture.db.db_dir.join(crate::db::DB_RELATIVE_PATH),
+            &segment_directory,
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+            owner_token,
+            &provider_id,
+            b"cursor-1".to_vec(),
+            Duration::from_secs(600),
+        )?;
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 1,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse(bridge_path)?,
+            flags: EvidenceFlags::CONTENT,
+            provider_cursor: b"cursor-2".to_vec(),
+        }])?;
+        let before = writer.flush_durable()?;
+        writer.rotate()?;
+        if prefix {
+            fixture.insert_observer_prefix(bridge_path, 1)?;
+        } else {
+            fixture.insert_observer_event(bridge_path, 1)?;
+        }
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1 AND segment_id=?2",
+            params![fixture.expected.scope_id.to_text(), before.segment_id],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                before.provider_cursor,
+                sql_u64(before.durable_end_offset, "pre-intent durable offset")?,
+                fixture.expected.scope_id.to_text()
+            ],
+        )?;
+
+        let evidence = if prefix {
+            IntentEvidence {
+                exact_paths: Vec::new(),
+                complete_prefixes: vec![DirtyPrefix {
+                    path: LedgerPath::parse(bridge_path)?,
+                    complete: true,
+                    reason: "provider_complete".into(),
+                    first_sequence: 2,
+                    last_sequence: 2,
+                }],
+            }
+        } else {
+            Fixture::evidence(bridge_path)
+        };
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &evidence,
+        )?;
+
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 2,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse("unrelated-during-intent.rs")?,
+            flags: EvidenceFlags::CONTENT,
+            provider_cursor: b"cursor-3".to_vec(),
+        }])?;
+        let proof_cut = writer.flush_durable()?;
+        writer.rotate()?;
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 3,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse(bridge_path)?,
+            flags: EvidenceFlags::CONTENT,
+            provider_cursor: b"cursor-4".to_vec(),
+        }])?;
+        let after = writer.flush_durable()?;
+        writer.rotate()?;
+        drop(writer);
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+        )?;
+        if prefix {
+            fixture.insert_observer_prefix(bridge_path, 3)?;
+        } else {
+            fixture.insert_observer_event(bridge_path, 3)?;
+        }
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_owners
+             SET provider_identity=?1,fence_nonce=?2 WHERE scope_id=?3",
+            params![
+                hex::encode(&fixture.expected.provider_identity),
+                b"qualified-fence".as_slice(),
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                after.provider_cursor,
+                sql_u64(
+                    after.durable_end_offset.max(proof_cut.durable_end_offset),
+                    "post-intent durable offset"
+                )?,
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        let proof = fixture.proof_for_durable_segment(
+            &proof_cut,
+            b"cursor-2".to_vec(),
+            2,
+            u64::from(!prefix),
+            u64::from(prefix),
+        )?;
+
+        if mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof).is_ok() {
+            return Err(Error::Corrupt(format!(
+                "{} SQL aggregate bridged an authenticated interval with no matching record",
+                if prefix { "prefix" } else { "exact-path" }
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn exact_path_aggregate_bridge_is_rejected() -> Result<()> {
+        aggregate_bridge_without_interval_evidence_is_rejected(false)
+    }
+
+    pub(super) fn prefix_aggregate_bridge_is_rejected() -> Result<()> {
+        aggregate_bridge_without_interval_evidence_is_rejected(true)
+    }
+
+    pub(super) fn authenticated_prefix_interval_preserves_later_suffix() -> Result<()> {
+        let fixture = Fixture::new(0x84)?;
+        let prefix = "authenticated-prefix";
+        let target = fixture.target("prefix-interval", fixture.expected.baseline_root.clone());
+        let evidence = IntentEvidence {
+            exact_paths: Vec::new(),
+            complete_prefixes: vec![DirtyPrefix {
+                path: LedgerPath::parse(prefix)?,
+                complete: true,
+                reason: "provider_complete".into(),
+                first_sequence: 1,
+                last_sequence: 1,
+            }],
+        };
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &evidence,
+        )?;
+        let owner_token = [fixture.expected.scope_id.0[0].wrapping_add(0x31); 32];
+        let provider_id: String = fixture.db.conn.query_row(
+            "SELECT provider_id FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        let mut writer = super::super::SegmentWriter::acquire(
+            &fixture.db.db_dir.join(crate::db::DB_RELATIVE_PATH),
+            &fixture
+                .db
+                .db_dir
+                .join("observer-segments")
+                .join(fixture.expected.scope_id.to_text()),
+            fixture.expected.scope_id,
+            fixture.expected.epoch,
+            owner_token,
+            &provider_id,
+            b"cursor-1".to_vec(),
+            Duration::from_secs(600),
+        )?;
+        let complete_flags =
+            EvidenceFlags(EvidenceFlags::CONTENT.0 | EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0);
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 1,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse(prefix)?,
+            flags: complete_flags,
+            provider_cursor: b"cursor-2".to_vec(),
+        }])?;
+        let proof_cut = writer.flush_durable()?;
+        writer.rotate()?;
+        fixture.insert_observer_prefix(prefix, 1)?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1 AND segment_id=?2",
+            params![fixture.expected.scope_id.to_text(), proof_cut.segment_id],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_owners
+             SET provider_identity=?1,fence_nonce=?2 WHERE scope_id=?3",
+            params![
+                hex::encode(&fixture.expected.provider_identity),
+                b"qualified-fence".as_slice(),
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                proof_cut.provider_cursor,
+                sql_u64(proof_cut.durable_end_offset, "prefix proof durable offset")?,
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        let proof = fixture.proof_for_durable_segment(&proof_cut, b"cursor-1".to_vec(), 1, 0, 1)?;
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+
+        writer.append(&[super::super::ObserverRecord {
+            sequence: 2,
+            source: EvidenceSource::Observer,
+            path: LedgerPath::parse(prefix)?,
+            flags: complete_flags,
+            provider_cursor: b"cursor-3".to_vec(),
+        }])?;
+        let suffix = writer.flush_durable()?;
+        writer.rotate()?;
+        drop(writer);
+        fixture.insert_observer_prefix(prefix, 2)?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_observer_segments SET folded_end_offset=durable_end_offset
+             WHERE scope_id=?1 AND segment_id=?2",
+            params![fixture.expected.scope_id.to_text(), suffix.segment_id],
+        )?;
+        fixture.db.conn.execute(
+            "UPDATE changed_path_scopes SET provider_cursor=?1,durable_offset=?2,folded_offset=?2
+             WHERE scope_id=?3",
+            params![
+                suffix.provider_cursor,
+                sql_u64(
+                    suffix.durable_end_offset.max(proof_cut.durable_end_offset),
+                    "prefix suffix durable offset"
+                )?,
+                fixture.expected.scope_id.to_text(),
+            ],
+        )?;
+        fixture.advance_ref_to(&target)?;
+        publish_intent(&ledger, &fixture.expected, &intent)?;
+        let decisions = recover_scope(&ledger, &fixture.expected)?;
+        if decisions != vec![(intent, RecoveryDecision::FinishPublication)] {
+            return Err(Error::Corrupt(format!(
+                "valid authenticated prefix interval did not publish: {decisions:?}"
+            )));
+        }
+        let retained: (i64, i64, Option<String>) = fixture.db.conn.query_row(
+            "SELECT source_mask,provider_sequence,intent_id FROM changed_path_prefixes
+             WHERE scope_id=?1 AND normalized_prefix=?2",
+            params![fixture.expected.scope_id.to_text(), prefix],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if retained != (EvidenceSource::Observer.mask(), 2, None) {
+            return Err(Error::Corrupt(format!(
+                "later authenticated prefix suffix was not retained: {retained:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn install_scope_directory_symlink_substitution(fixture: &Fixture) {
+        use std::os::unix::fs::symlink;
+
+        let scope_directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        let retained_directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(format!("{}.retained", fixture.expected.scope_id.to_text()));
+        install_sidecar_ancestor_substitution_hook(move || {
+            std::fs::rename(&scope_directory, &retained_directory).unwrap();
+            symlink(&retained_directory, &scope_directory).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    pub(super) fn ancestor_substitution_at_mark_is_rejected() -> Result<()> {
+        let fixture = Fixture::new(0x85)?;
+        let target = fixture.target(
+            "mark-directory-swap",
+            fixture.expected.baseline_root.clone(),
+        );
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("mark-directory-swap.rs"),
+        )?;
+        let proof = fixture.qualified_proof(1, "mark-directory-swap.rs")?;
+        install_scope_directory_symlink_substitution(&fixture);
+
+        if mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof).is_ok() {
+            return Err(Error::Corrupt(
+                "ancestor directory substitution authorized filesystem-applied marking".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn ancestor_substitution_at_recovery_is_rejected() -> Result<()> {
+        let fixture = Fixture::new(0x86)?;
+        let target = fixture.target(
+            "recovery-directory-swap",
+            fixture.expected.baseline_root.clone(),
+        );
+        let ledger = ChangedPathLedger::new(&fixture.db.conn);
+        let intent = prepare_intent(
+            &ledger,
+            &fixture.expected,
+            IntentProducer::Checkout,
+            &target,
+            &Fixture::evidence("recovery-directory-swap.rs"),
+        )?;
+        let proof = fixture.qualified_proof(1, "recovery-directory-swap.rs")?;
+        mark_filesystem_applied(&ledger, &fixture.expected, &intent, &proof)?;
+        fixture.advance_ref_to(&target)?;
+        install_scope_directory_symlink_substitution(&fixture);
+
+        let decisions = recover_scope(&ledger, &fixture.expected)?;
+        if decisions == vec![(intent, RecoveryDecision::FinishPublication)] {
+            return Err(Error::Corrupt(
+                "ancestor directory substitution authorized publication recovery".into(),
+            ));
+        }
+        let trust: String = fixture.db.conn.query_row(
+            "SELECT trust_state FROM changed_path_scopes WHERE scope_id=?1",
+            [fixture.expected.scope_id.to_text()],
+            |row| row.get(0),
+        )?;
+        if trust != "untrusted_gap" {
+            return Err(Error::Corrupt(format!(
+                "ancestor substitution did not fail closed: {trust}"
+            )));
         }
         Ok(())
     }
@@ -1352,6 +1839,95 @@ mod harness {
         Ok(())
     }
 
+    fn retired_segment_fixture(
+        tag: u8,
+        leaf: &str,
+    ) -> Result<(Fixture, Vec<SegmentDeletionToken>, std::path::PathBuf)> {
+        let fixture = Fixture::new(tag)?;
+        fixture.db.conn.execute(
+            "INSERT INTO changed_path_observer_segments(
+                 scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
+                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
+                 previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
+                 created_at,sealed_at,updated_at)
+             VALUES(?1,1,'deletion-substitution',1,'owner','provider',1,1,1,1,
+                    NULL,NULL,?2,?3,'sealed',?4,?4,?4)",
+            params![
+                fixture.expected.scope_id.to_text(),
+                hex::encode([7_u8; 32]),
+                leaf,
+                now_ts()
+            ],
+        )?;
+        let directory = fixture
+            .db
+            .db_dir
+            .join("observer-segments")
+            .join(fixture.expected.scope_id.to_text());
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join(leaf), b"retired authority\n")?;
+        let tokens = retire_scope(&fixture.db.conn, &fixture.expected)?;
+        Ok((fixture, tokens, directory))
+    }
+
+    pub(super) fn deletion_parent_substitution_uses_retained_authority() -> Result<()> {
+        let (_fixture, tokens, directory) =
+            retired_segment_fixture(0x87, "parent-substitution.cpl")?;
+        let retained = directory.with_extension("retained-directory");
+        let replacement_file = directory.join("parent-substitution.cpl");
+        let original_file = retained.join("parent-substitution.cpl");
+        let hook_directory = directory.clone();
+        let hook_retained = retained.clone();
+        install_deletion_substitution_hook(DeletionSubstitutionPoint::Parent, move || {
+            std::fs::rename(&hook_directory, &hook_retained).unwrap();
+            std::fs::create_dir(&hook_directory).unwrap();
+            std::fs::write(
+                hook_directory.join("parent-substitution.cpl"),
+                b"replacement must survive\n",
+            )
+            .unwrap();
+        });
+
+        remove_retired_segments(&tokens)?;
+        remove_retired_segments(&tokens)?;
+        if original_file.exists() || !replacement_file.exists() {
+            return Err(Error::Corrupt(
+                "retired deletion followed a substituted parent directory".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn deletion_leaf_substitution_fails_closed() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (fixture, tokens, directory) = retired_segment_fixture(0x88, "leaf-substitution.cpl")?;
+        let leaf = directory.join("leaf-substitution.cpl");
+        let retained_leaf = directory.join("leaf-substitution.retained.cpl");
+        let outside = fixture._root.path().join("outside-segment.cpl");
+        std::fs::write(&outside, b"outside must survive\n")?;
+        let hook_leaf = leaf.clone();
+        let hook_retained = retained_leaf.clone();
+        let hook_outside = outside.clone();
+        install_deletion_substitution_hook(DeletionSubstitutionPoint::Leaf, move || {
+            std::fs::rename(&hook_leaf, &hook_retained).unwrap();
+            symlink(&hook_outside, &hook_leaf).unwrap();
+        });
+
+        if remove_retired_segments(&tokens).is_ok() {
+            return Err(Error::Corrupt(
+                "retired deletion accepted a substituted leaf".into(),
+            ));
+        }
+        if !outside.exists() || !retained_leaf.exists() {
+            return Err(Error::Corrupt(
+                "retired deletion escaped its descriptor-relative leaf".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn lane_deletion_retires_scope_first() -> Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("lane.txt"), b"lane\n")?;
@@ -1360,6 +1936,13 @@ mod harness {
         let spawned = db.spawn_lane("retire-first", Some("main"), true, None, None)?;
         let branch = db.lane_branch("retire-first")?;
         let head = db.get_ref(&branch.ref_name)?;
+        let view = db.create_workspace_view(
+            &branch.lane_id,
+            &head.change_id,
+            &head.root_id,
+            "fuse-cow",
+            &root.path().join("retire-first-view"),
+        )?;
         let scope = ScopeIdentity {
             scope_id: ScopeId([0x6d; 32]),
             kind: ScopeKind::MaterializedLane,
@@ -1396,6 +1979,18 @@ mod harness {
             &filesystem,
             &provider,
         )?;
+        let view_scope = ScopeIdentity {
+            scope_id: ScopeId([0x6e; 32]),
+            kind: ScopeKind::WorkspaceView,
+            owner_id: view.view_id.clone(),
+        };
+        ChangedPathLedger::new(&db.conn).begin_scope(
+            &view_scope,
+            &baseline,
+            &policy,
+            &filesystem,
+            &provider,
+        )?;
         db.conn.execute(
             "UPDATE changed_path_scopes SET scope_root=?1 WHERE scope_id=?2",
             params![spawned.workdir, scope.scope_id.to_text()],
@@ -1409,6 +2004,20 @@ mod harness {
              VALUES(?1,1,'lane-segment',1,'owner','provider',1,1,1,1,NULL,NULL,?2,
                     '../escape.cpl','sealed',?3,?3,?3)",
             params![scope.scope_id.to_text(), hex::encode([3_u8; 32]), now_ts()],
+        )?;
+        db.conn.execute(
+            "INSERT INTO changed_path_observer_segments(
+                 scope_id,epoch,segment_id,log_format_version,owner_token,provider_id,
+                 first_sequence,last_sequence,durable_end_offset,folded_end_offset,
+                 previous_segment_id,previous_segment_hash,segment_hash,segment_path,state,
+                 created_at,sealed_at,updated_at)
+             VALUES(?1,1,'view-segment',1,'owner','provider',1,1,1,1,NULL,NULL,?2,
+                    'view-segment.cpl','sealed',?3,?3,?3)",
+            params![
+                view_scope.scope_id.to_text(),
+                hex::encode([4_u8; 32]),
+                now_ts()
+            ],
         )?;
         if db.remove_lane("retire-first", true).is_ok() {
             return Err(Error::Corrupt(
@@ -1441,6 +2050,17 @@ mod harness {
             .read(true)
             .open(&segment_file)?
             .sync_all()?;
+        let view_segment_directory = db
+            .db_dir
+            .join("observer-segments")
+            .join(view_scope.scope_id.to_text());
+        std::fs::create_dir_all(&view_segment_directory)?;
+        let view_segment_file = view_segment_directory.join("view-segment.cpl");
+        std::fs::write(&view_segment_file, b"retired view segment\n")?;
+        OpenOptions::new()
+            .read(true)
+            .open(&view_segment_file)?
+            .sync_all()?;
         let reader = Connection::open(db.db_dir.join(crate::db::DB_RELATIVE_PATH))?;
         reader.execute_batch("BEGIN DEFERRED")?;
         let _: i64 = reader.query_row("SELECT COUNT(*) FROM changed_path_scopes", [], |row| {
@@ -1463,14 +2083,15 @@ mod harness {
         }
         reader.execute_batch("COMMIT")?;
         db.remove_lane("retire-first", true)?;
-        let retired: bool = db.conn.query_row(
-            "SELECT retired_at IS NOT NULL FROM changed_path_scopes WHERE scope_id=?1",
-            [scope.scope_id.to_text()],
+        let retired: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM changed_path_scopes
+             WHERE scope_id IN (?1,?2) AND retired_at IS NOT NULL",
+            params![scope.scope_id.to_text(), view_scope.scope_id.to_text()],
             |row| row.get(0),
         )?;
-        if !retired || workdir.exists() || segment_file.exists() {
+        if retired != 2 || workdir.exists() || segment_file.exists() || view_segment_file.exists() {
             return Err(Error::Corrupt(
-                "lane scope/segment was not retired before workdir deletion".into(),
+                "lane/view scopes or segments were not retired before workdir deletion".into(),
             ));
         }
         Ok(())
@@ -1685,7 +2306,13 @@ mod harness {
             "restore_after_staged_checkpoint",
             "restore_after_staged_sync",
             "backup_restore_after_staging_sync",
+            "restore_after_policy_staging",
+            "restore_after_policy_exchange_before_marker",
+            "restore_after_policy_publication",
             "backup_restore_after_atomic_exchange",
+            "restore_after_trail_publication",
+            "restore_during_rollback",
+            "restore_during_finalization",
             "restore_before_retained_cleanup",
             "restore_after_retained_cleanup",
         ] {
@@ -1694,6 +2321,11 @@ mod harness {
                 .db
                 .spawn_lane("restore-crash-lane", Some("main"), true, None, None)
                 .unwrap();
+            std::fs::write(
+                fixture.db.workspace_root.join(".trailignore"),
+                b"new-policy-generation\n",
+            )
+            .unwrap();
             fixture.db.create_backup(&fixture.backup, false).unwrap();
             let destination = fixture._root.path().join(format!("restore-{phase}"));
             std::fs::write(destination.join("live.txt"), b"old live workspace\n").unwrap_or_else(
@@ -1704,6 +2336,7 @@ mod harness {
             );
             Trail::init(&destination, "main", InitImportMode::WorkingTree, false).unwrap();
             std::fs::write(destination.join(".trail/live-marker"), b"old\n").unwrap();
+            std::fs::write(destination.join(".trailignore"), b"old-policy-generation\n").unwrap();
             run_backup_restore_child(
                 "restore",
                 phase,
@@ -1718,6 +2351,16 @@ mod harness {
             assert!(
                 old_is_intact || new_is_intact,
                 "neither old nor restored tree survived {phase}"
+            );
+            let policy = std::fs::read(destination.join(".trailignore")).unwrap();
+            assert_eq!(
+                policy,
+                if old_is_intact {
+                    b"old-policy-generation\n".as_slice()
+                } else {
+                    b"new-policy-generation\n".as_slice()
+                },
+                "restore exposed a mixed DB/policy generation after {phase}"
             );
             if !old_is_intact {
                 let restored = Trail::open(&destination).unwrap();
@@ -1792,7 +2435,8 @@ mod harness {
         backup: &std::path::Path,
         ready: &std::path::Path,
     ) {
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "db::change_ledger::recovery::harness::backup_restore_subprocess_crash_helper",
@@ -1805,9 +2449,11 @@ mod harness {
             .env("TRAIL_TEST_BACKUP_RESTORE_WORKSPACE", workspace)
             .env("TRAIL_TEST_BACKUP_RESTORE_BACKUP", backup)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        if phase == "restore_during_rollback" {
+            command.env("TRAIL_TEST_RESTORE_FORCE_ROLLBACK", "1");
+        }
+        let mut child = command.spawn().unwrap();
         wait_for_crash_handshake(&mut child, ready, phase);
         child.kill().unwrap();
         let _ = child.wait().unwrap();
@@ -2316,4 +2962,41 @@ pub(crate) fn run_missing_sidecar_rejection() -> std::result::Result<(), String>
 pub(crate) fn run_advanced_prefix_recovery() -> std::result::Result<(), String> {
     harness::authenticated_prefix_survives_later_observer_advance()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_exact_interval_bridge_rejection() -> std::result::Result<(), String> {
+    harness::exact_path_aggregate_bridge_is_rejected().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_prefix_interval_bridge_rejection() -> std::result::Result<(), String> {
+    harness::prefix_aggregate_bridge_is_rejected().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_valid_prefix_interval_recovery() -> std::result::Result<(), String> {
+    harness::authenticated_prefix_interval_preserves_later_suffix()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, unix))]
+pub(crate) fn run_mark_ancestor_substitution_rejection() -> std::result::Result<(), String> {
+    harness::ancestor_substitution_at_mark_is_rejected().map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, unix))]
+pub(crate) fn run_recovery_ancestor_substitution_rejection() -> std::result::Result<(), String> {
+    harness::ancestor_substitution_at_recovery_is_rejected().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_deletion_parent_substitution_rejection() -> std::result::Result<(), String> {
+    harness::deletion_parent_substitution_uses_retained_authority()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(all(debug_assertions, unix))]
+pub(crate) fn run_deletion_leaf_substitution_rejection() -> std::result::Result<(), String> {
+    harness::deletion_leaf_substitution_fails_closed().map_err(|error| error.to_string())
 }

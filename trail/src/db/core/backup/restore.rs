@@ -1,8 +1,8 @@
 use super::*;
 use crate::db::change_ledger::rotate_restored_scopes;
-use crate::db::core::backup::publication::{
-    publish_staged_tree, remove_any, remove_retained_tree, rollback_published_tree, sibling_stage,
-    sync_directory_strict, sync_tree_bottom_up,
+use crate::db::core::backup::publication::{remove_any, sibling_stage, sync_tree_bottom_up};
+use crate::db::core::backup::restore_transaction::{
+    recover_restore_publication, RestorePublication,
 };
 
 impl Trail {
@@ -13,6 +13,7 @@ impl Trail {
     ) -> Result<BackupRestoreReport> {
         fs::create_dir_all(workspace_root.as_ref())?;
         let workspace_root = canonicalize_lossless(workspace_root.as_ref())?;
+        recover_restore_publication(&workspace_root)?;
         let backup_path = absolute_path(backup_path.as_ref())?;
         let verification = Self::verify_backup(&backup_path)?;
         if !verification.valid {
@@ -103,65 +104,28 @@ impl Trail {
                 return Err(err);
             }
         };
-        let retained = match publish_staged_tree(&temp_dir, &db_dir) {
-            Ok(retained) => retained,
-            Err(error) => {
-                let _ = remove_any(&temp_dir);
-                return Err(error);
-            }
-        };
-        let post_publish = (|| -> Result<BackupRestoreReport> {
-            let backup_trailignore = backup_path.join(".trailignore");
-            let workspace_trailignore = workspace_root.join(".trailignore");
-            let restored_trailignore =
-                if backup_trailignore.is_file() && (force || !workspace_trailignore.exists()) {
-                    fs::copy(&backup_trailignore, &workspace_trailignore)?;
-                    OpenOptions::new()
-                        .read(true)
-                        .open(&workspace_trailignore)?
-                        .sync_all()?;
-                    true
-                } else {
-                    if !workspace_trailignore.exists() {
-                        write_default_trailignore(&workspace_root)?;
-                        OpenOptions::new()
-                            .read(true)
-                            .open(&workspace_trailignore)?
-                            .sync_all()?;
-                    }
-                    false
-                };
-            sync_directory_strict(&workspace_root)?;
-
-            Ok(BackupRestoreReport {
-                workspace: workspace_root.to_string_lossy().to_string(),
-                db_dir: db_dir.to_string_lossy().to_string(),
-                backup_path: backup_path.to_string_lossy().to_string(),
-                workspace_id: manifest.workspace_id.clone(),
-                branch: manifest.branch.clone(),
-                replaced_existing,
-                restored_trailignore,
-                rewritten_workdirs,
-                checked_refs: fsck.checked_refs,
-                checked_roots: fsck.checked_roots,
-                checked_texts: fsck.checked_texts,
-            })
-        })();
-        match post_publish {
-            Ok(report) => {
-                let parent = db_dir
-                    .parent()
-                    .ok_or_else(|| Error::InvalidInput("restore target has no parent".into()))?;
-                test_crash_point("restore_before_retained_cleanup");
-                remove_retained_tree(retained, parent)?;
-                test_crash_point("restore_after_retained_cleanup");
-                Ok(report)
-            }
-            Err(error) => {
-                rollback_published_tree(&db_dir, retained)?;
-                Err(error)
-            }
-        }
+        let (publication, restored_trailignore) =
+            match RestorePublication::prepare(&workspace_root, &temp_dir, &backup_path, force) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = remove_any(&temp_dir);
+                    return Err(error);
+                }
+            };
+        publication.publish()?;
+        Ok(BackupRestoreReport {
+            workspace: workspace_root.to_string_lossy().to_string(),
+            db_dir: db_dir.to_string_lossy().to_string(),
+            backup_path: backup_path.to_string_lossy().to_string(),
+            workspace_id: manifest.workspace_id,
+            branch: manifest.branch,
+            replaced_existing,
+            restored_trailignore,
+            rewritten_workdirs,
+            checked_refs: fsck.checked_refs,
+            checked_roots: fsck.checked_roots,
+            checked_texts: fsck.checked_texts,
+        })
     }
 }
 

@@ -106,28 +106,6 @@ pub(super) fn remove_retained_tree(path: Option<PathBuf>, parent: &Path) -> Resu
     Ok(())
 }
 
-pub(super) fn rollback_published_tree(target: &Path, retained: Option<PathBuf>) -> Result<()> {
-    let Some(retained) = retained else {
-        remove_any(target)?;
-        if let Some(parent) = target.parent() {
-            sync_directory_strict(parent)?;
-        }
-        return Ok(());
-    };
-    let parent = target
-        .parent()
-        .ok_or_else(|| Error::InvalidInput("publication target has no parent".into()))?;
-    if atomic_exchange(&retained, target)? {
-        sync_directory_strict(parent)?;
-        remove_any(&retained)?;
-        sync_directory_strict(parent)?;
-        return Ok(());
-    }
-    Err(Error::Conflict(
-        "atomic rollback exchange is unsupported; both trees were retained".into(),
-    ))
-}
-
 pub(super) fn remove_any(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -165,7 +143,7 @@ pub(super) fn sync_directory_strict(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
+pub(super) fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -188,7 +166,7 @@ fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
+pub(super) fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -220,6 +198,6 @@ fn atomic_exchange(left: &Path, right: &Path) -> Result<bool> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn atomic_exchange(_left: &Path, _right: &Path) -> Result<bool> {
+pub(super) fn atomic_exchange(_left: &Path, _right: &Path) -> Result<bool> {
     Ok(false)
 }
