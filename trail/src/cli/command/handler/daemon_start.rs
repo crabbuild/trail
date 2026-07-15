@@ -1,14 +1,15 @@
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use getrandom::getrandom;
-use rustix::fs::{flock, FlockOperation};
+use rustix::fs::{flock, renameat_with, FlockOperation, RenameFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use trail::{Error, Result, Trail};
@@ -21,6 +22,7 @@ const ENDPOINT_FILE: &str = "daemon.json";
 const TOKEN_FILE: &str = "daemon.token";
 const LOCK_FILE: &str = "daemon.lock";
 const STARTING_FILE: &str = "daemon.starting.json";
+const SOCKET_FILE: &str = "changed-path.sock";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct WorkspaceDaemonEndpoint {
@@ -226,8 +228,9 @@ fn classify_endpoint(
             "workspace daemon token publication does not match the endpoint".into(),
         ));
     }
-    verify_secure_socket_identity(
-        &endpoint.socket_path,
+    verify_secure_socket_leaf_identity(
+        &authority.trail_directory,
+        SOCKET_FILE,
         endpoint.socket_device,
         endpoint.socket_inode,
     )?;
@@ -312,6 +315,15 @@ fn spawn_workspace_daemon(
     }
     let token_read_fd = token_pipe[0];
     let token_write_fd = token_pipe[1];
+    if let Err(error) = seal_daemon_exec_descriptors() {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            libc::close(token_read_fd);
+            libc::close(token_write_fd);
+        }
+        return Err(error);
+    }
     let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFD) };
     let token_read_flags = unsafe { libc::fcntl(token_read_fd, libc::F_GETFD) };
     let token_write_flags = unsafe { libc::fcntl(token_write_fd, libc::F_GETFD) };
@@ -437,6 +449,87 @@ fn spawn_workspace_daemon(
     }
 }
 
+fn seal_daemon_exec_descriptors() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let closed = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3_u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if closed == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            return Err(Error::Io(error));
+        }
+        return mark_open_descriptors_cloexec("/proc/self/fd");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        mark_open_descriptors_cloexec("/dev/fd")
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let limit = unsafe { libc::getdtablesize() };
+        if limit < 0 {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        for fd in 3..limit {
+            mark_descriptor_cloexec_if_open(fd)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mark_open_descriptors_cloexec(directory: &str) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<RawFd>().ok())
+        else {
+            continue;
+        };
+        mark_descriptor_cloexec_if_open(fd)?;
+    }
+    Ok(())
+}
+
+fn mark_descriptor_cloexec_if_open(fd: RawFd) -> Result<()> {
+    if fd < 3 {
+        return Ok(());
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EBADF) {
+            return Ok(());
+        }
+        return Err(Error::Io(error));
+    }
+    if flags & libc::FD_CLOEXEC == 0
+        && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(Error::Io(error));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn is_auto_workspace_daemon() -> bool {
     std::env::var_os("TRAIL_WORKSPACE_DAEMON").is_some()
 }
@@ -463,24 +556,49 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         .map_err(|_| Error::InvalidInput("workspace daemon readiness fd is invalid".into()))?;
     std::env::remove_var("TRAIL_WORKSPACE_DAEMON_READY_FD");
 
-    let socket_path = db.db_dir().join("changed-path.sock");
+    let socket_path = db.db_dir().join(SOCKET_FILE);
     authority.verify_trail_identity(db.db_dir())?;
-    if fs::symlink_metadata(&socket_path).is_ok() {
-        return Err(Error::DaemonUnavailable(
-            "workspace daemon socket pathname is already occupied".into(),
-        ));
-    }
-    let socket = std::os::unix::net::UnixListener::bind(&socket_path)?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-    verify_secure_socket(&socket_path)?;
-    let socket_metadata = fs::symlink_metadata(&socket_path)?;
-    authority.verify_trail_identity(db.db_dir())?;
+    // Keep the private bind leaf shorter than the stable leaf so workspaces
+    // whose final socket fits SUN_LEN do not fail only during publication.
+    let socket_tmp_leaf = format!(".s{}", random_hex(6)?);
+    let socket_tmp_path = db.db_dir().join(&socket_tmp_leaf);
+    let socket = std::os::unix::net::UnixListener::bind(&socket_tmp_path)?;
+    let socket_identity =
+        verify_socket_leaf_owner(&authority.trail_directory, &socket_tmp_leaf, None)?;
     let mut unpublished_socket = BoundSocketGuard {
-        path: socket_path.clone(),
-        device: socket_metadata.dev(),
-        inode: socket_metadata.ino(),
+        authority: authority.try_clone()?,
+        leaf: socket_tmp_leaf.clone(),
+        device: socket_identity.0,
+        inode: socket_identity.1,
         armed: true,
     };
+    fs::set_permissions(&socket_tmp_path, fs::Permissions::from_mode(0o600))?;
+    verify_secure_socket_leaf_identity(
+        &authority.trail_directory,
+        &socket_tmp_leaf,
+        socket_identity.0,
+        socket_identity.1,
+    )?;
+    authority.verify_trail_identity(db.db_dir())?;
+    renameat_noreplace(&authority.trail_directory, &socket_tmp_leaf, SOCKET_FILE).map_err(
+        |error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::DaemonUnavailable(
+                    "workspace daemon socket pathname is already occupied".into(),
+                )
+            } else {
+                Error::Io(error)
+            }
+        },
+    )?;
+    unpublished_socket.leaf = SOCKET_FILE.to_string();
+    authority.trail_directory.sync_all()?;
+    let socket_metadata = verify_secure_socket_leaf_identity(
+        &authority.trail_directory,
+        SOCKET_FILE,
+        socket_identity.0,
+        socket_identity.1,
+    )?;
     let starting = WorkspaceDaemonStarting {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
@@ -491,8 +609,8 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         workspace_identity: workspace_identity(&workspace)?,
         owner_nonce: owner_nonce.clone(),
         socket_path: socket_path.clone(),
-        socket_device: socket_metadata.dev(),
-        socket_inode: socket_metadata.ino(),
+        socket_device: socket_metadata.0,
+        socket_inode: socket_metadata.1,
     };
     publish_owner_file(
         &authority,
@@ -533,8 +651,8 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         owner_nonce,
         auth_token: token.clone(),
         socket_path: socket_path.clone(),
-        socket_device: socket_metadata.dev(),
-        socket_inode: socket_metadata.ino(),
+        socket_device: socket_metadata.0,
+        socket_inode: socket_metadata.1,
         url: format!("unix://{}", socket_path.display()),
         observer_ready: true,
         recovery_complete: true,
@@ -571,7 +689,6 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     unlink_authority_file(&authority, STARTING_FILE)?;
     let mut publication = PublicationGuard {
         authority: authority.try_clone()?,
-        socket_path,
         socket_device: endpoint.socket_device,
         socket_inode: endpoint.socket_inode,
         endpoint: endpoint.clone(),
@@ -600,7 +717,6 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
 
 struct PublicationGuard {
     authority: SecureAuthority,
-    socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,
     endpoint: WorkspaceDaemonEndpoint,
@@ -608,7 +724,8 @@ struct PublicationGuard {
 }
 
 struct BoundSocketGuard {
-    path: PathBuf,
+    authority: SecureAuthority,
+    leaf: String,
     device: u64,
     inode: u64,
     armed: bool,
@@ -616,9 +733,15 @@ struct BoundSocketGuard {
 
 impl Drop for BoundSocketGuard {
     fn drop(&mut self) {
-        if self.armed && verify_secure_socket_identity(&self.path, self.device, self.inode).is_ok()
-        {
-            let _ = fs::remove_file(&self.path);
+        if self.armed {
+            let _ = remove_socket_leaf_if_identity(
+                &self.authority,
+                &self.leaf,
+                self.device,
+                self.inode,
+                true,
+                false,
+            );
         }
     }
 }
@@ -633,16 +756,19 @@ impl Drop for PublicationGuard {
             .flatten()
             .as_ref()
             == Some(&self.endpoint)
-            && verify_secure_socket_identity(
-                &self.socket_path,
+            && remove_socket_leaf_if_identity(
+                &self.authority,
+                SOCKET_FILE,
                 self.socket_device,
                 self.socket_inode,
+                true,
+                false,
             )
             .is_ok()
         {
             let _ = unlink_authority_file(&self.authority, ENDPOINT_FILE);
             let _ = unlink_authority_file(&self.authority, TOKEN_FILE);
-            let _ = fs::remove_file(&self.socket_path);
+            let _ = self.authority.directory.sync_all();
         }
     }
 }
@@ -924,18 +1050,14 @@ fn recover_stale_starting_publication(
             }
         }
     }
-    match fs::symlink_metadata(&starting.socket_path) {
-        Ok(_) => {
-            verify_secure_socket_identity(
-                &starting.socket_path,
-                starting.socket_device,
-                starting.socket_inode,
-            )?;
-            fs::remove_file(&starting.socket_path)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(Error::Io(error)),
-    }
+    remove_socket_leaf_if_identity(
+        authority,
+        SOCKET_FILE,
+        starting.socket_device,
+        starting.socket_inode,
+        true,
+        false,
+    )?;
     unlink_authority_file(authority, STARTING_FILE)?;
     authority.directory.sync_all()?;
     Ok(true)
@@ -974,41 +1096,59 @@ fn verify_owner_file(file: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_secure_socket(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+fn socket_leaf_stat(parent: &File, leaf: &str) -> std::io::Result<libc::stat> {
+    let leaf = CString::new(leaf).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid socket leaf")
+    })?;
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            leaf.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn verify_socket_leaf_owner(
+    parent: &File,
+    leaf: &str,
+    required_mode: Option<u32>,
+) -> Result<(u64, u64)> {
+    let metadata = socket_leaf_stat(parent, leaf).map_err(|error| {
         Error::DaemonUnavailable(format!(
-            "could not inspect workspace daemon socket {}: {error}",
-            path.display()
+            "could not inspect workspace daemon socket leaf {leaf}: {error}"
         ))
     })?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o777 != 0o600
+    if u32::from(metadata.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFSOCK)
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || required_mode.is_some_and(|mode| u32::from(metadata.st_mode) & 0o777 != mode)
     {
         return Err(Error::DaemonUnavailable(
             "workspace daemon socket has unsafe type, owner, or mode".into(),
         ));
     }
-    Ok(())
+    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
 }
 
-fn verify_secure_socket_identity(
-    path: &Path,
+fn verify_secure_socket_leaf_identity(
+    parent: &File,
+    leaf: &str,
     expected_device: u64,
     expected_inode: u64,
-) -> Result<()> {
-    verify_secure_socket(path)?;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        Error::DaemonUnavailable(format!(
-            "workspace daemon socket disappeared during identity verification: {error}"
-        ))
-    })?;
-    if metadata.dev() != expected_device || metadata.ino() != expected_inode {
+) -> Result<(u64, u64)> {
+    let identity = verify_socket_leaf_owner(parent, leaf, Some(0o600))?;
+    if identity != (expected_device, expected_inode) {
         return Err(Error::DaemonUnavailable(
             "workspace daemon socket identity changed; refusing pathname authority".into(),
         ));
     }
-    Ok(())
+    Ok(identity)
 }
 
 fn publish_owner_file(authority: &SecureAuthority, name: &str, bytes: &[u8]) -> Result<()> {
@@ -1030,21 +1170,99 @@ fn remove_stale_publication(
     authority: &SecureAuthority,
     endpoint: &WorkspaceDaemonEndpoint,
 ) -> Result<()> {
-    match fs::symlink_metadata(&endpoint.socket_path) {
-        Ok(_) => verify_secure_socket_identity(
-            &endpoint.socket_path,
-            endpoint.socket_device,
-            endpoint.socket_inode,
-        )?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(Error::Io(error)),
-    }
+    remove_socket_leaf_if_identity(
+        authority,
+        SOCKET_FILE,
+        endpoint.socket_device,
+        endpoint.socket_inode,
+        true,
+        true,
+    )?;
     for name in [ENDPOINT_FILE, TOKEN_FILE] {
         unlink_authority_file(authority, name)?;
     }
-    remove_if_exists(&endpoint.socket_path)?;
     authority.directory.sync_all()?;
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn test_socket_unlink_boundary() -> Result<()> {
+    let Some(barrier) = std::env::var_os("TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_UNLINK_BARRIER")
+    else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(barrier);
+    fs::write(barrier.join("verified"), b"ready")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("continue").exists() {
+        if Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "socket unlink test barrier timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+fn remove_socket_leaf_if_identity(
+    authority: &SecureAuthority,
+    leaf: &str,
+    expected_device: u64,
+    expected_inode: u64,
+    missing_ok: bool,
+    run_test_boundary: bool,
+) -> Result<()> {
+    match socket_leaf_stat(&authority.trail_directory, leaf) {
+        Ok(_) => {
+            verify_secure_socket_leaf_identity(
+                &authority.trail_directory,
+                leaf,
+                expected_device,
+                expected_inode,
+            )?;
+        }
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    }
+
+    #[cfg(debug_assertions)]
+    if run_test_boundary {
+        test_socket_unlink_boundary()?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = run_test_boundary;
+
+    let quarantine = format!(".{leaf}.{}.removing", random_hex(12)?);
+    match renameat_noreplace(&authority.trail_directory, leaf, &quarantine) {
+        Ok(()) => {}
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    }
+    authority.trail_directory.sync_all()?;
+
+    let captured = verify_socket_leaf_owner(&authority.trail_directory, &quarantine, Some(0o600));
+    if captured.as_ref().ok() != Some(&(expected_device, expected_inode)) {
+        let restore = renameat_noreplace(&authority.trail_directory, &quarantine, leaf);
+        let _ = authority.trail_directory.sync_all();
+        return match restore {
+            Ok(()) => Err(Error::DaemonUnavailable(
+                "workspace daemon socket identity changed before removal; restored substituted socket and refused cleanup"
+                    .into(),
+            )),
+            Err(error) => Err(Error::DaemonUnavailable(format!(
+                "workspace daemon socket identity changed before removal and could not be restored without replacing another leaf: {error}"
+            ))),
+        };
+    }
+
+    unlinkat_leaf(&authority.trail_directory, &quarantine)?;
+    authority.trail_directory.sync_all()?;
+    Ok(())
+}
+
+fn renameat_noreplace(parent: &File, old: &str, new: &str) -> std::io::Result<()> {
+    renameat_with(parent, old, parent, new, RenameFlags::NOREPLACE).map_err(Into::into)
 }
 
 fn renameat_leaf(parent: &File, old: &str, new: &str) -> Result<()> {
@@ -1067,9 +1285,13 @@ fn renameat_leaf(parent: &File, old: &str, new: &str) -> Result<()> {
 }
 
 fn unlink_authority_file(authority: &SecureAuthority, name: &str) -> Result<()> {
+    unlinkat_leaf(&authority.directory, name)
+}
+
+fn unlinkat_leaf(parent: &File, name: &str) -> Result<()> {
     let name =
         CString::new(name).map_err(|_| Error::InvalidInput("invalid authority leaf".into()))?;
-    if unsafe { libc::unlinkat(authority.directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0 {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
@@ -1077,14 +1299,6 @@ fn unlink_authority_file(authority: &SecureAuthority, name: &str) -> Result<()> 
         Ok(())
     } else {
         Err(Error::Io(error))
-    }
-}
-
-fn remove_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::Io(error)),
     }
 }
 

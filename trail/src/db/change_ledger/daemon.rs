@@ -122,9 +122,9 @@ impl WorkspaceDaemonRuntime {
                 (1, None)
             }
             Some(stored) => {
-                if stored.filesystem_identity != filesystem_identity
-                    || stored.provider_identity != provider_identity
-                {
+                let identity_changed = stored.filesystem_identity != filesystem_identity
+                    || stored.provider_identity != provider_identity;
+                if identity_changed && !replace_verified_stale_owner {
                     return Err(Error::ChangeLedgerReconcileRequired {
                         scope: scope_id.to_text(),
                         state: "stale_baseline".into(),
@@ -148,7 +148,9 @@ impl WorkspaceDaemonRuntime {
                     filesystem_identity: stored.filesystem_identity.clone(),
                     provider_identity: stored.provider_identity.clone(),
                 };
-                ledger.recover_scope(&old_expected)?;
+                if !identity_changed {
+                    ledger.recover_scope(&old_expected)?;
+                }
                 if !replace_verified_stale_owner {
                     return Err(Error::DaemonUnavailable(
                         "persisted workspace daemon owner exists without verified stale process identity"
@@ -171,12 +173,19 @@ impl WorkspaceDaemonRuntime {
                     "UPDATE changed_path_scopes
                      SET epoch=?1,
                          ref_name=?2, ref_generation=?3, change_id=?4, baseline_root_id=?5,
-                         trust_state='untrusted_gap', trust_reason='daemon_owner_restarted',
+                         scope_root_identity=?6, filesystem_identity=?6,
+                         provider_id=?7, provider_identity=?7,
+                         durable_cursor=?8, linearizable_fence=?9, rename_pairing=?10,
+                         overflow_scope=?11, filesystem_supported=?12,
+                         clean_proof_allowed=?13, power_loss_durability=?14,
+                         trust_state='untrusted_gap', trust_reason=?15,
                          observer_owner_token=NULL, provider_cursor=NULL, provider_fence=NULL,
+                         observer_heartbeat_at=NULL,
                          durable_offset=0, folded_offset=0,
                          continuity_generation=continuity_generation+1,
                          updated_at=strftime('%s','now')
-                     WHERE scope_id=?6 AND epoch=?7",
+                     WHERE scope_id=?16 AND epoch=?17
+                       AND filesystem_identity=?18 AND provider_identity=?19",
                     params![
                         i64::try_from(next)
                             .map_err(|_| Error::InvalidInput("epoch overflow".into()))?,
@@ -185,9 +194,53 @@ impl WorkspaceDaemonRuntime {
                             .map_err(|_| Error::InvalidInput("ref generation overflow".into()))?,
                         &baseline.change_id.0,
                         &baseline.root_id.0,
+                        hex::encode(&filesystem_identity),
+                        hex::encode(&provider_identity),
+                        if capabilities.durable_cursor {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if capabilities.linearizable_fence {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if capabilities.rename_pairing {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if capabilities.overflow_scope {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if capabilities.filesystem_supported {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if capabilities.clean_proof_allowed {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if capabilities.power_loss_durability {
+                            1_i64
+                        } else {
+                            0_i64
+                        },
+                        if identity_changed {
+                            "daemon_identity_transition"
+                        } else {
+                            "daemon_owner_restarted"
+                        },
                         scope_id.to_text(),
                         i64::try_from(old_epoch)
                             .map_err(|_| Error::InvalidInput("epoch overflow".into()))?,
+                        hex::encode(&stored.filesystem_identity),
+                        hex::encode(&stored.provider_identity),
                     ],
                 )?;
                 if changed != 1 {
@@ -201,7 +254,7 @@ impl WorkspaceDaemonRuntime {
                 tx.commit()?;
                 (
                     next,
-                    if baseline_changed {
+                    if baseline_changed || identity_changed {
                         None
                     } else {
                         stored.provider_cursor

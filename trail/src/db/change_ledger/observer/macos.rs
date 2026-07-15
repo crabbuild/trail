@@ -1637,6 +1637,7 @@ fn build_coverage_plan(
     for dependency in dependencies {
         let dependency = normalize_absolute_dependency(requested_root, dependency)?;
         if let Ok(relative) = dependency.strip_prefix(requested_root) {
+            validate_policy_dependency_leaf(&dependency)?;
             policy_watches.push(PolicyWatch {
                 observed_path: lexical_normalize_path(&root.join(relative)),
                 dependency,
@@ -1650,6 +1651,7 @@ fn build_coverage_plan(
                 .or_insert(alias);
         }
         if observed_dependency.starts_with(root) {
+            validate_policy_dependency_leaf(&observed_dependency)?;
             policy_watches.push(PolicyWatch {
                 observed_path: observed_dependency,
                 dependency,
@@ -1664,6 +1666,7 @@ fn build_coverage_plan(
                 observed_dependency.display()
             )));
         }
+        validate_policy_dependency_leaf(&observed_dependency)?;
         let relative = observed_dependency
             .strip_prefix(&named_root)
             .map_err(|_| reconcile_error("fsevents_policy_dependency_coverage_mapping_failure"))?;
@@ -1753,6 +1756,44 @@ fn exact_system_alias_binding(
         alias_identity,
         target_identity: root_identity(&target)?,
     })
+}
+
+fn validate_policy_dependency_leaf(dependency: &Path) -> Result<()> {
+    let named = match std::fs::symlink_metadata(dependency) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(reconcile_error(
+                "fsevents_policy_dependency_leaf_is_symlink_or_unsafe",
+            ));
+        }
+    };
+    if named.file_type().is_symlink() || !named.is_file() {
+        return Err(reconcile_error(
+            "fsevents_policy_dependency_leaf_is_symlink_or_unsafe",
+        ));
+    }
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dependency)
+        .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
+    let descriptor = opened
+        .metadata()
+        .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
+    let renamed = std::fs::symlink_metadata(dependency)
+        .map_err(|_| reconcile_error("fsevents_policy_dependency_leaf_is_symlink_or_unsafe"))?;
+    if !descriptor.is_file()
+        || renamed.file_type().is_symlink()
+        || !renamed.is_file()
+        || descriptor.dev() != renamed.dev()
+        || descriptor.ino() != renamed.ino()
+    {
+        return Err(reconcile_error(
+            "fsevents_policy_dependency_leaf_is_symlink_or_unsafe",
+        ));
+    }
+    Ok(())
 }
 
 fn nearest_existing_parent(dependency: &Path) -> Result<(PathBuf, PathBuf, File)> {
@@ -3086,6 +3127,59 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
             return Err(Error::Corrupt(
                 "symlinked policy parent did not fail closed explicitly".into(),
             ));
+        }
+
+        let in_root_symlink_target = external_root.path().join("actual-in-root.gitconfig");
+        let in_root_symlink_dependency = external_root.path().join("linked-in-root.gitconfig");
+        std::fs::write(&in_root_symlink_target, b"[core]\n")?;
+        symlink(&in_root_symlink_target, &in_root_symlink_dependency)?;
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let in_root_error = MacOsFseventsObserver::start(
+            external_root.path(),
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&in_root_symlink_dependency),
+        )
+        .err();
+
+        let external_leaf_home = tempfile::tempdir()?;
+        let external_symlink_target = external_leaf_home.path().join("actual-global.gitconfig");
+        let external_symlink_dependency = external_leaf_home.path().join("linked-global.gitconfig");
+        std::fs::write(&external_symlink_target, b"[core]\n")?;
+        symlink(&external_symlink_target, &external_symlink_dependency)?;
+        let external_error = if std::fs::metadata(external_leaf_home.path())?.dev()
+            == std::fs::metadata(external_root.path())?.dev()
+        {
+            let provider = b"macos-fsevents-file-events-v1".to_vec();
+            let (durability, _) = memory_durability(provider, Duration::ZERO);
+            MacOsFseventsObserver::start(
+                external_root.path(),
+                Box::new(durability),
+                None,
+                std::slice::from_ref(&external_symlink_dependency),
+            )
+            .err()
+        } else {
+            None
+        };
+        for (kind, error) in [
+            ("in-root", in_root_error),
+            ("same-device external", external_error),
+        ] {
+            let error = error.ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "{kind} symlink policy dependency leaf was accepted"
+                ))
+            })?;
+            if !error
+                .to_string()
+                .contains("fsevents_policy_dependency_leaf_is_symlink_or_unsafe")
+            {
+                return Err(Error::Corrupt(format!(
+                    "{kind} symlink policy dependency leaf did not fail closed explicitly"
+                )));
+            }
         }
 
         let lease_root = tempfile::tempdir()?;

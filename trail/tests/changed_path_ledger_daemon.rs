@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -267,6 +268,58 @@ fn concurrent_first_status_calls_converge_on_one_ready_owner() {
 }
 
 #[test]
+fn auto_started_daemon_does_not_retain_unrelated_inherited_file_descriptors() {
+    let fixture = Fixture::new();
+    let mut pipe = [0_i32; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let read = unsafe { File::from_raw_fd(pipe[0]) };
+    let write = unsafe { File::from_raw_fd(pipe[1]) };
+    let read_flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFD) };
+    let write_flags = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFD) };
+    assert!(read_flags >= 0 && write_flags >= 0);
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                read.as_raw_fd(),
+                libc::F_SETFD,
+                read_flags | libc::FD_CLOEXEC,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                write.as_raw_fd(),
+                libc::F_SETFD,
+                write_flags & !libc::FD_CLOEXEC,
+            )
+        },
+        0
+    );
+
+    let status = fixture.status();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    drop(write);
+
+    let mut poll_fd = libc::pollfd {
+        fd: read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let polled = unsafe { libc::poll(&mut poll_fd, 1, 1_000) };
+    assert_eq!(
+        polled, 1,
+        "daemon retained an unrelated inherited pipe writer"
+    );
+    assert_ne!(poll_fd.revents & libc::POLLHUP, 0);
+}
+
+#[test]
 fn first_diff_and_record_share_the_automatically_started_workspace_daemon() {
     let fixture = Fixture::new();
     let diff = fixture.run(&["diff", "--dirty", "--name-only"]);
@@ -488,6 +541,76 @@ fn stale_cleanup_refuses_to_unlink_a_substituted_same_user_socket() {
 }
 
 #[test]
+fn stale_cleanup_does_not_unlink_socket_substituted_after_identity_verification() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    assert!(
+        first.socket_path.exists(),
+        "killed daemon removed the stale socket before cleanup could verify it"
+    );
+
+    let barrier = fixture.root().join("socket-unlink-race");
+    fs::create_dir(&barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_UNLINK_BARRIER",
+            &barrier,
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !barrier.join("verified").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "stale cleanup exited before the verified socket boundary: status={status}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "stale cleanup did not reach the verified socket boundary before timeout\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    fs::remove_file(&first.socket_path).unwrap();
+    let unrelated = UnixListener::bind(&first.socket_path).unwrap();
+    fs::set_permissions(&first.socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let substituted_inode = fs::symlink_metadata(&first.socket_path).unwrap().ino();
+    fs::write(barrier.join("continue"), b"go").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+    assert_eq!(
+        fs::symlink_metadata(&first.socket_path).unwrap().ino(),
+        substituted_inode,
+        "stale cleanup unlinked the socket substituted after verification"
+    );
+    drop(unrelated);
+}
+
+#[test]
 fn crash_after_persisting_ledger_owner_is_automatically_recovered() {
     let fixture = Fixture::new();
     let crashed =
@@ -626,4 +749,106 @@ fn real_git_external_global_config_is_observed_and_live_creation_recovers() {
     };
     assert_ne!(second.owner_nonce, first.owner_nonce);
     unsafe { libc::kill(second.pid as i32, libc::SIGTERM) };
+}
+
+#[test]
+fn verified_stale_persisted_identity_drift_rotates_epoch_and_reconciles() {
+    for column in ["filesystem_identity", "provider_identity"] {
+        let fixture = Fixture::new();
+        assert!(fixture.status().status.success());
+        let first = fixture.endpoint();
+        kill_and_wait(first.pid);
+
+        let conn =
+            rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+        let original_authority: (String, String, String, String, [i64; 7]) = conn
+            .query_row(
+                "SELECT filesystem_identity,scope_root_identity,
+                        provider_identity,provider_id,
+                        durable_cursor,linearizable_fence,rename_pairing,
+                        overflow_scope,filesystem_supported,clean_proof_allowed,
+                        power_loss_durability
+                 FROM changed_path_scopes LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        [
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                        ],
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(original_authority.0, original_authority.1);
+        assert_eq!(original_authority.2, original_authority.3);
+        conn.execute(&format!("UPDATE changed_path_scopes SET {column}='00'"), [])
+            .unwrap();
+        drop(conn);
+
+        let recovered = fixture.status();
+        assert!(
+            recovered.status.success(),
+            "{column} drift did not automatically recover: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        let second = fixture.endpoint();
+        assert!(second.epoch > first.epoch, "{column} drift kept old epoch");
+        assert_ne!(second.owner_nonce, first.owner_nonce);
+
+        let conn =
+            rusqlite::Connection::open(fixture.root().join(".trail/index/trail.sqlite")).unwrap();
+        let (stored_epoch, trust_state, recovered_authority): (
+            i64,
+            String,
+            (String, String, String, String, [i64; 7]),
+        ) = conn
+            .query_row(
+                "SELECT epoch,trust_state,
+                        filesystem_identity,scope_root_identity,
+                        provider_identity,provider_id,
+                        durable_cursor,linearizable_fence,rename_pairing,
+                        overflow_scope,filesystem_supported,clean_proof_allowed,
+                        power_loss_durability
+                 FROM changed_path_scopes LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        (
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            [
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                                row.get(9)?,
+                                row.get(10)?,
+                                row.get(11)?,
+                                row.get(12)?,
+                            ],
+                        ),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(u64::try_from(stored_epoch).unwrap(), second.epoch);
+        assert_eq!(trust_state, "trusted");
+        assert_eq!(recovered_authority, original_authority);
+        assert_eq!(recovered_authority.0, recovered_authority.1);
+        assert_eq!(recovered_authority.2, recovered_authority.3);
+        kill_and_wait(second.pid);
+    }
 }
