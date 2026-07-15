@@ -105,6 +105,76 @@ pub(crate) struct SegmentWriter {
 }
 
 impl SegmentWriter {
+    pub(crate) fn bind_native_observer(
+        &mut self,
+        provider_identity: Vec<u8>,
+        fence_nonce: Vec<u8>,
+    ) -> Result<super::ObserverWriterBinding> {
+        if provider_identity.is_empty() || fence_nonce.len() < 16 {
+            return Err(Error::InvalidInput(
+                "native observer binding requires provider identity and an unguessable fence nonce"
+                    .into(),
+            ));
+        }
+        if self.provider_id != hex::encode(&provider_identity) {
+            return Err(Error::InvalidInput(
+                "native observer provider identity does not match the acquired writer".into(),
+            ));
+        }
+        let _workspace_lock = crate::db::acquire_workspace_lock_for_database(
+            &self.workspace_db_dir,
+            &self.database_path,
+        )?;
+        self.ensure_authorized()?;
+        let transaction = self
+            .control
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_lease_on(&transaction, &self.identity)?;
+        let owner_token = hex::encode(self.identity.owner_token);
+        let provider_identity_text = hex::encode(&provider_identity);
+        let owner_changed = transaction.execute(
+            "UPDATE changed_path_observer_owners
+             SET provider_identity=?1,fence_nonce=?2,updated_at=?3
+             WHERE scope_id=?4 AND epoch=?5 AND owner_token=?6
+               AND provider_id=?7 AND lease_state='active' AND expires_at>?3",
+            params![
+                provider_identity_text,
+                fence_nonce,
+                now_ts(),
+                self.identity.scope_id.to_text(),
+                sql_i64(self.identity.epoch, "observer epoch")?,
+                owner_token,
+                self.provider_id,
+            ],
+        )?;
+        let scope_changed = transaction.execute(
+            "UPDATE changed_path_scopes
+             SET observer_owner_token=?1,updated_at=?2
+             WHERE scope_id=?3 AND epoch=?4 AND provider_id=?5
+               AND provider_identity=?6",
+            params![
+                owner_token,
+                now_ts(),
+                self.identity.scope_id.to_text(),
+                sql_i64(self.identity.epoch, "observer epoch")?,
+                self.provider_id,
+                provider_identity_text,
+            ],
+        )?;
+        if owner_changed != 1 || scope_changed != 1 {
+            return Err(Error::WorkspaceLocked(
+                "native observer binding lost its exact writer lease".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(super::ObserverWriterBinding {
+            owner_token,
+            provider_id: self.provider_id.clone(),
+            provider_identity,
+            fence_nonce,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire(
         database_path: &Path,

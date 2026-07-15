@@ -2719,10 +2719,12 @@ pub(crate) use change_ledger::{
 };
 #[cfg(all(debug_assertions, target_os = "linux"))]
 pub(crate) use change_ledger::{
+    run_authenticated_fence_rejections, run_complete_prefix_publication_races,
     run_content_mode_create_delete, run_delayed_backlog, run_fault_revocation_matrix,
     run_fence_ordering, run_owner_death_and_root_replacement, run_process_owner_child,
-    run_reconciliation_interval_qualification, run_recursive_coverage, run_rename_matrix,
-    run_rename_storm_and_cookie_expiry,
+    run_raw_decoder_faults, run_reconciliation_interval_qualification, run_recursive_coverage,
+    run_rename_matrix, run_rename_storm_and_cookie_expiry,
+    run_segment_writer_reconcile_publication,
 };
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::{

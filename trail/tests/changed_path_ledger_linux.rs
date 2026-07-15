@@ -52,3 +52,23 @@ fn linux_observer_process_owner_child() {
     };
     trail::test_support::changed_path_linux_process_owner_child(&root).unwrap();
 }
+
+#[test]
+fn complete_prefix_races_publish_every_descendant_without_false_clean() {
+    trail::test_support::changed_path_linux_complete_prefix_publication_races().unwrap();
+}
+
+#[test]
+fn issued_fences_reject_forgery_cross_scope_replay_and_owner_replacement() {
+    trail::test_support::changed_path_linux_authenticated_fence_rejections().unwrap();
+}
+
+#[test]
+fn native_segment_writer_reconcile_full_publishes_real_sqlite_state() {
+    trail::test_support::changed_path_linux_segment_writer_reconcile_publication().unwrap();
+}
+
+#[test]
+fn raw_overflow_and_unknown_watch_events_use_the_decoder_fail_closed_path() {
+    trail::test_support::changed_path_linux_raw_decoder_faults().unwrap();
+}

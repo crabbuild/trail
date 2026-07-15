@@ -75,6 +75,28 @@ pub mod test_support {
         crate::db::run_process_owner_child(root)
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_complete_prefix_publication_races() -> std::result::Result<(), String>
+    {
+        crate::db::run_complete_prefix_publication_races()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_authenticated_fence_rejections() -> std::result::Result<(), String> {
+        crate::db::run_authenticated_fence_rejections()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_segment_writer_reconcile_publication(
+    ) -> std::result::Result<(), String> {
+        crate::db::run_segment_writer_reconcile_publication()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_raw_decoder_faults() -> std::result::Result<(), String> {
+        crate::db::run_raw_decoder_faults()
+    }
+
     pub fn changed_path_reconciliation_oracle() -> std::result::Result<(), String> {
         crate::db::run_oracle()
     }

@@ -1,5 +1,9 @@
+#[cfg(all(debug_assertions, target_os = "linux"))]
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(debug_assertions, target_os = "linux"))]
+use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,35 @@ const OBSERVER_SPOOL_HEADER_BYTES: usize = 4 + 8 + 8;
 // final CAS and SQLite commit.
 const MIN_PUBLICATION_LEASE_HORIZON_SECS: i64 = 5;
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(all(debug_assertions, target_os = "linux"))]
+type InitialScanHook = Box<dyn FnOnce() -> Result<()> + Send>;
+#[cfg(all(debug_assertions, target_os = "linux"))]
+static INITIAL_SCAN_HOOKS: OnceLock<Mutex<HashMap<ScopeId, InitialScanHook>>> = OnceLock::new();
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn install_initial_scan_hook<F>(scope_id: ScopeId, hook: F)
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    INITIAL_SCAN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(scope_id, Box::new(hook));
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn run_initial_scan_hook(scope_id: ScopeId) -> Result<()> {
+    let hook = INITIAL_SCAN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&scope_id);
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObserverEvent {
@@ -129,7 +162,8 @@ pub(crate) struct ObserverQualification {
     owner_fence_nonce: Option<Vec<u8>>,
     durable_segment_id: String,
     segment_durable_offset: u64,
-    segment_folded_offset: u64,
+    segment_consumed_offset: u64,
+    segment_initial_folded_offset: u64,
     complete_root_interval: bool,
     complete_policy_interval: bool,
     persisted_evidence_through_end: bool,
@@ -146,6 +180,7 @@ impl ObserverQualification {
         owner_fence_nonce: Vec<u8>,
         durable_segment_id: String,
         segment_durable_offset: u64,
+        segment_consumed_offset: u64,
     ) -> Self {
         Self {
             scope_id: expected.scope_id,
@@ -160,7 +195,8 @@ impl ObserverQualification {
             owner_fence_nonce: Some(owner_fence_nonce),
             durable_segment_id,
             segment_durable_offset,
-            segment_folded_offset: segment_durable_offset,
+            segment_consumed_offset,
+            segment_initial_folded_offset: 0,
             complete_root_interval: true,
             complete_policy_interval: true,
             persisted_evidence_through_end: true,
@@ -187,7 +223,8 @@ impl ObserverQualification {
             owner_fence_nonce: Some(b"full-test-fence".to_vec()),
             durable_segment_id: "full-test-segment".into(),
             segment_durable_offset: 100,
-            segment_folded_offset: 100,
+            segment_consumed_offset: 100,
+            segment_initial_folded_offset: 100,
             complete_root_interval: true,
             complete_policy_interval: true,
             persisted_evidence_through_end: true,
@@ -211,7 +248,8 @@ impl ObserverQualification {
             && self.end_fence == *end
             && !self.observer_owner_token.is_empty()
             && !self.durable_segment_id.is_empty()
-            && self.segment_folded_offset <= self.segment_durable_offset
+            && self.segment_initial_folded_offset <= self.segment_consumed_offset
+            && self.segment_consumed_offset <= self.segment_durable_offset
             && end.sequence >= start.sequence
             && end.durable_offset >= start.durable_offset
             && self.complete_root_interval
@@ -695,6 +733,8 @@ impl ReconciliationAttempt {
         })?;
         writer.flush()?;
         self.validate_directory_guards(trail, ledger)?;
+        #[cfg(all(debug_assertions, target_os = "linux"))]
+        run_initial_scan_hook(self.expected.scope_id)?;
         trail.visit_root_file_entries(
             &self.expected.baseline_root,
             &prefixes,
@@ -713,7 +753,7 @@ impl ReconciliationAttempt {
         }
         let root_identity = trail.pinned_worktree_root_identity(&self.root);
         let mut spool = ObserverEventSpool::new()?;
-        let qualification = observer.drain_through(
+        let mut qualification = observer.drain_through(
             &self.expected,
             &root_identity,
             &self.start_fence,
@@ -727,6 +767,8 @@ impl ReconciliationAttempt {
                 spool.push(event)
             },
         )?;
+        qualification.segment_initial_folded_offset =
+            qualification_segment_folded_offset(ledger.conn, &self.expected, &qualification)?;
         spool.finish()?;
         while let Some(event) = spool.next()? {
             if raw_event_invalidates_policy(policy, std::path::Path::new(event.path.as_str())) {
@@ -735,11 +777,50 @@ impl ReconciliationAttempt {
                     "recording policy changed during reconciliation interval",
                 );
             }
-            let current =
-                trail.read_pinned_worktree_path(&self.root, policy, event.path.as_str())?;
-            let baseline =
-                trail.root_file_entry(&self.expected.baseline_root, event.path.as_str())?;
-            writer.stage_observer_result(event, current, baseline)?;
+            if event.flags.0 & EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0 != 0 {
+                writer.flush()?;
+                writer.clear_prefix(event.path.as_str())?;
+                if !trail.verify_pinned_worktree_root(&self.root)? {
+                    return self.fail(
+                        ledger,
+                        "workspace root identity changed during prefix replay",
+                    );
+                }
+                let prefix = vec![event.path.as_str().to_string()];
+                trail.visit_pinned_worktree_files(
+                    &self.root,
+                    policy,
+                    &prefix,
+                    |entry| match entry {
+                        ReconciliationScanEntry::Directory(directory) => {
+                            writer.stage_directory_guard(directory)
+                        }
+                        ReconciliationScanEntry::File(file) => {
+                            writer.stage_prefix_filesystem(file, event.sequence)
+                        }
+                    },
+                )?;
+                writer.flush()?;
+                trail.visit_root_file_entries(
+                    &self.expected.baseline_root,
+                    &prefix,
+                    |path, baseline| writer.compare_baseline(path, baseline),
+                )?;
+                writer.flush()?;
+                self.validate_directory_guards(trail, ledger)?;
+                if !trail.verify_pinned_worktree_root(&self.root)? {
+                    return self.fail(
+                        ledger,
+                        "workspace root identity changed after prefix replay",
+                    );
+                }
+            } else {
+                let current =
+                    trail.read_pinned_worktree_path(&self.root, policy, event.path.as_str())?;
+                let baseline =
+                    trail.root_file_entry(&self.expected.baseline_root, event.path.as_str())?;
+                writer.stage_observer_result(event, current, baseline)?;
+            }
         }
         writer.flush()?;
         let candidate_rows = ledger.conn.query_row(
@@ -891,6 +972,12 @@ impl ReconciliationAttempt {
         }
         let scope_id = self.expected.scope_id.to_text();
         tx.execute_batch("SAVEPOINT changed_path_reconciliation_candidates;")?;
+        if persist_consumed_observer_fold(&tx, &self.expected, &qualification, &end).is_err() {
+            return self.fail_observer_continuity_candidate_transaction(
+                tx,
+                "observer consumed cut could not be atomically folded",
+            );
+        }
         tx.execute(
             "DELETE FROM changed_path_entries
              WHERE scope_id=?1 AND (
@@ -1084,6 +1171,12 @@ impl ReconciliationAttempt {
 
         let scope_id = self.stored_identity.scope_id.clone();
         tx.execute_batch("SAVEPOINT changed_path_reconciliation_candidates;")?;
+        if persist_consumed_observer_fold(&tx, &self.expected, &qualification, end).is_err() {
+            return self.fail_observer_continuity_candidate_transaction(
+                tx,
+                "observer consumed prefix cut could not be atomically folded",
+            );
+        }
         for proof_row in &proof.rows {
             let prefix = &proof_row.prefix;
             let lower = format!("{}/", prefix.as_str());
@@ -1392,6 +1485,42 @@ impl<'a> StagingWriter<'a> {
         self.hashed_bytes = self.hashed_bytes.saturating_add(file.size_bytes);
         self.peak_buffer_bytes = self.peak_buffer_bytes.max(file.peak_buffer_bytes);
         self.push(file_row(file, EvidenceFlags::CREATE, None))
+    }
+
+    fn stage_prefix_filesystem(&mut self, file: ReconciliationFile, sequence: u64) -> Result<()> {
+        self.observed_files = self.observed_files.saturating_add(1);
+        self.hashed_bytes = self.hashed_bytes.saturating_add(file.size_bytes);
+        self.peak_buffer_bytes = self.peak_buffer_bytes.max(file.peak_buffer_bytes);
+        self.push(file_row(
+            file,
+            EvidenceFlags::CREATE | EvidenceFlags::PROVIDER_COMPLETE_PREFIX,
+            Some(sequence),
+        ))
+    }
+
+    fn clear_prefix(&mut self, prefix: &str) -> Result<()> {
+        self.flush()?;
+        let prefix_len = i64::try_from(prefix.len())
+            .map_err(|_| Error::InvalidInput("observer prefix length exceeds range".into()))?;
+        self.conn.execute(
+            "DELETE FROM changed_path_reconciliation_rows
+             WHERE attempt_id=?1 AND (
+                 normalized_path=?2 COLLATE BINARY OR
+                 (substr(normalized_path,1,?3)=?2 COLLATE BINARY
+                  AND substr(normalized_path,?3+1,1)='/')
+             )",
+            params![self.attempt_id, prefix, prefix_len],
+        )?;
+        self.conn.execute(
+            "DELETE FROM changed_path_reconciliation_guards
+             WHERE attempt_id=?1 AND (
+                 CAST(relative_path AS TEXT)=?2 COLLATE BINARY OR
+                 (substr(CAST(relative_path AS TEXT),1,?3)=?2 COLLATE BINARY
+                  AND substr(CAST(relative_path AS TEXT),?3+1,1)='/')
+             )",
+            params![self.attempt_id, prefix, prefix_len],
+        )?;
+        Ok(())
     }
 
     fn stage_directory_guard(&mut self, directory: ReconciliationDirectory) -> Result<()> {
@@ -1756,6 +1885,77 @@ fn validate_observer_continuity(
     )
 }
 
+fn persist_consumed_observer_fold(
+    tx: &Transaction<'_>,
+    expected: &ExpectedScope,
+    qualification: &ObserverQualification,
+    end: &ObserverFence,
+) -> Result<()> {
+    if qualification.segment_consumed_offset != end.durable_offset {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "observer consumed cut does not equal the authenticated end fence",
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE changed_path_observer_segments
+         SET folded_end_offset=?1,updated_at=?2
+         WHERE scope_id=?3 AND epoch=?4 AND segment_id=?5
+           AND owner_token=?6 AND state IN ('open','sealed')
+           AND durable_end_offset>=?1 AND last_sequence>=?7
+           AND folded_end_offset>=?8 AND folded_end_offset<=?1",
+        params![
+            sql_u64(qualification.segment_consumed_offset)?,
+            now_ts(),
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch)?,
+            qualification.durable_segment_id,
+            qualification.observer_owner_token,
+            sql_u64(end.sequence)?,
+            sql_u64(qualification.segment_initial_folded_offset)?,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "observer consumed cut did not match the durable owner segment",
+        ));
+    }
+    Ok(())
+}
+
+fn qualification_segment_folded_offset(
+    conn: &rusqlite::Connection,
+    expected: &ExpectedScope,
+    qualification: &ObserverQualification,
+) -> Result<u64> {
+    let folded = conn
+        .query_row(
+            "SELECT folded_end_offset FROM changed_path_observer_segments
+             WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3 AND owner_token=?4
+               AND provider_id=?5 AND state IN ('open','sealed')",
+            params![
+                expected.scope_id.to_text(),
+                sql_u64(expected.epoch)?,
+                qualification.durable_segment_id,
+                qualification.observer_owner_token,
+                hex::encode(&expected.provider_identity),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            reconcile_required(
+                expected,
+                TrustState::UntrustedGap.as_str(),
+                "observer durable segment was unavailable after drain",
+            )
+        })?;
+    db_u64(folded)
+}
+
 fn validate_observer_continuity_at(
     tx: &Transaction<'_>,
     expected: &ExpectedScope,
@@ -1793,8 +1993,7 @@ fn validate_observer_continuity_at(
          WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3
            AND owner_token=?4 AND provider_id IS ?5
            AND state IN ('open','sealed') AND last_sequence IS NOT NULL
-           AND last_sequence>=?6 AND durable_end_offset>=?7
-           AND folded_end_offset>=?8",
+           AND last_sequence>=?6 AND durable_end_offset>=?7",
         params![
             identity.scope_id,
             sql_u64(identity.epoch)?,
@@ -1803,7 +2002,6 @@ fn validate_observer_continuity_at(
             identity.provider_id,
             sql_u64(end.sequence)?,
             sql_u64(qualification.segment_durable_offset)?,
-            sql_u64(qualification.segment_folded_offset)?,
         ],
         |row| row.get::<_, i64>(0),
     )? == 1;
@@ -2181,7 +2379,7 @@ mod compiled_harness {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: 10,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"compiled-harness-start".to_vec(),
             })
         }
@@ -2193,7 +2391,7 @@ mod compiled_harness {
         ) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: self.end_sequence,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"compiled-harness-end".to_vec(),
             })
         }
@@ -2220,11 +2418,17 @@ mod compiled_harness {
         path: std::path::PathBuf,
     }
 
+    // The compiled harness invokes this observer synchronously on its creating
+    // thread; the unsafe marker only lets it satisfy the production daemon
+    // contract without pretending rusqlite itself is thread-safe.
+    unsafe impl Send for CallbackObserver<'_> {}
+    unsafe impl Sync for CallbackObserver<'_> {}
+
     impl QualifiedObserver for CallbackObserver<'_> {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: 10,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"compiled-callback-start".to_vec(),
             })
         }
@@ -2236,7 +2440,7 @@ mod compiled_harness {
         ) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: 266,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"compiled-callback-end".to_vec(),
             })
         }
@@ -2377,7 +2581,8 @@ mod compiled_harness {
         let provider_id = hex::encode(&expected.provider_identity);
         let now = now_ts();
         conn.execute(
-            "UPDATE changed_path_scopes SET observer_owner_token='full-test-owner'
+            "UPDATE changed_path_scopes
+             SET observer_owner_token='full-test-owner',durable_offset=100,folded_offset=100
              WHERE scope_id=?1",
             [&scope_id],
         )?;
@@ -2526,10 +2731,11 @@ pub(crate) use compiled_harness::{run_callback_spool, run_oracle, run_races};
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::cell::{Cell, RefCell};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     use crate::db::change_ledger::{
         BaselineIdentity, FilesystemIdentity, PolicyIdentity, ProviderCapabilities,
@@ -2538,15 +2744,15 @@ mod tests {
     use crate::{InitImportMode, ObjectId};
 
     struct FakeQualifiedObserver {
-        began: Cell<bool>,
-        drains: Cell<u64>,
-        sequence: Cell<u64>,
+        began: AtomicBool,
+        drains: AtomicU64,
+        sequence: AtomicU64,
         corrupt_proof: bool,
     }
 
     struct EventDuringFenceObserver {
         event: ObserverEvent,
-        mutation: RefCell<Option<Box<dyn FnOnce()>>>,
+        mutation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     #[derive(Clone, Copy)]
@@ -2565,7 +2771,7 @@ mod tests {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: 10,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"failure-start".to_vec(),
             })
         }
@@ -2580,7 +2786,7 @@ mod tests {
             }
             Ok(ObserverFence {
                 sequence: 11,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"failure-end".to_vec(),
             })
         }
@@ -2613,7 +2819,7 @@ mod tests {
     }
 
     struct RetryOnceObserver {
-        attempts: Cell<u64>,
+        attempts: AtomicU64,
     }
 
     struct PrimaryTransactionObserver<'a> {
@@ -2621,11 +2827,17 @@ mod tests {
         path: std::path::PathBuf,
     }
 
+    // This test double is only invoked synchronously by reconciliation. It
+    // deliberately holds the primary connection to prove callbacks merely
+    // spool while that connection has an open transaction.
+    unsafe impl Send for PrimaryTransactionObserver<'_> {}
+    unsafe impl Sync for PrimaryTransactionObserver<'_> {}
+
     impl QualifiedObserver for PrimaryTransactionObserver<'_> {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: 10,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"spool-start".to_vec(),
             })
         }
@@ -2637,7 +2849,7 @@ mod tests {
         ) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: 266,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"spool-end".to_vec(),
             })
         }
@@ -2672,11 +2884,11 @@ mod tests {
 
     impl QualifiedObserver for RetryOnceObserver {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
-            self.attempts.set(self.attempts.get() + 1);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(ObserverFence {
                 sequence: 10,
-                durable_offset: 0,
-                nonce: format!("retry-start-{}", self.attempts.get()).into_bytes(),
+                durable_offset: 100,
+                nonce: format!("retry-start-{attempt}").into_bytes(),
             })
         }
 
@@ -2685,14 +2897,14 @@ mod tests {
             _expected: &ExpectedScope,
             _start: &ObserverFence,
         ) -> Result<ObserverFence> {
-            if self.attempts.get() == 1 {
+            if self.attempts.load(Ordering::SeqCst) == 1 {
                 return Err(Error::InvalidInput(
                     "workspace root identity race; retry reconciliation".into(),
                 ));
             }
             Ok(ObserverFence {
                 sequence: 10,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"retry-end".to_vec(),
             })
         }
@@ -2718,7 +2930,7 @@ mod tests {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
             Ok(ObserverFence {
                 sequence: self.event.sequence - 1,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"event-start".to_vec(),
             })
         }
@@ -2728,12 +2940,17 @@ mod tests {
             _expected: &ExpectedScope,
             _start: &ObserverFence,
         ) -> Result<ObserverFence> {
-            if let Some(mutation) = self.mutation.borrow_mut().take() {
+            if let Some(mutation) = self
+                .mutation
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
                 mutation();
             }
             Ok(ObserverFence {
                 sequence: self.event.sequence,
-                durable_offset: 0,
+                durable_offset: 100,
                 nonce: b"event-end".to_vec(),
             })
         }
@@ -2759,18 +2976,18 @@ mod tests {
     impl FakeQualifiedObserver {
         fn new() -> Self {
             Self {
-                began: Cell::new(false),
-                drains: Cell::new(0),
-                sequence: Cell::new(10),
+                began: AtomicBool::new(false),
+                drains: AtomicU64::new(0),
+                sequence: AtomicU64::new(10),
                 corrupt_proof: false,
             }
         }
 
         fn with_corrupt_proof() -> Self {
             Self {
-                began: Cell::new(false),
-                drains: Cell::new(0),
-                sequence: Cell::new(10),
+                began: AtomicBool::new(false),
+                drains: AtomicU64::new(0),
+                sequence: AtomicU64::new(10),
                 corrupt_proof: true,
             }
         }
@@ -2778,10 +2995,10 @@ mod tests {
 
     impl QualifiedObserver for FakeQualifiedObserver {
         fn begin_observation(&self, _expected: &ExpectedScope) -> Result<ObserverFence> {
-            assert!(!self.began.replace(true));
+            assert!(!self.began.swap(true, Ordering::SeqCst));
             Ok(ObserverFence {
-                sequence: self.sequence.get(),
-                durable_offset: 0,
+                sequence: self.sequence.load(Ordering::SeqCst),
+                durable_offset: 100,
                 nonce: b"start".to_vec(),
             })
         }
@@ -2791,10 +3008,10 @@ mod tests {
             _expected: &ExpectedScope,
             _start: &ObserverFence,
         ) -> Result<ObserverFence> {
-            assert!(self.began.get());
+            assert!(self.began.load(Ordering::SeqCst));
             Ok(ObserverFence {
-                sequence: self.sequence.get(),
-                durable_offset: 0,
+                sequence: self.sequence.load(Ordering::SeqCst),
+                durable_offset: 100,
                 nonce: b"end".to_vec(),
             })
         }
@@ -2807,7 +3024,7 @@ mod tests {
             end: &ObserverFence,
             _sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
         ) -> Result<ObserverQualification> {
-            self.drains.set(self.drains.get().saturating_add(1));
+            self.drains.fetch_add(1, Ordering::SeqCst);
             let mut qualification = ObserverQualification::seal_for_test(
                 expected,
                 root_handle_identity.to_vec(),
@@ -2833,7 +3050,8 @@ mod tests {
         let provider_id = hex::encode(&expected.provider_identity);
         let now = now_ts();
         conn.execute(
-            "UPDATE changed_path_scopes SET observer_owner_token='full-test-owner'
+            "UPDATE changed_path_scopes
+             SET observer_owner_token='full-test-owner',durable_offset=100,folded_offset=100
              WHERE scope_id=?1",
             [&scope_id],
         )
@@ -3128,7 +3346,7 @@ mod tests {
         assert!(report.published);
         assert_eq!(report.trust_state, "trusted");
         assert!(report.peak_batch_rows <= STAGING_BATCH_ROWS as u64);
-        assert_eq!(observer.began.get(), true);
+        assert!(observer.began.load(Ordering::SeqCst));
         assert_eq!(
             fixture.expected.baseline_root,
             ObjectId(fixture.expected.baseline_root.0.clone())
@@ -3513,7 +3731,7 @@ mod tests {
             .db
             .conn
             .execute(
-                "UPDATE changed_path_scopes SET durable_offset=50, folded_offset=40
+                "UPDATE changed_path_scopes SET durable_offset=150, folded_offset=140
                  WHERE scope_id=?1",
                 [fixture.expected.scope_id.to_text()],
             )
@@ -3533,7 +3751,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(cuts, (50, 40));
+        assert_eq!(cuts, (150, 140));
     }
 
     #[test]
@@ -3623,7 +3841,7 @@ mod tests {
                 flags: EvidenceFlags::CREATE,
                 sequence: 31,
             },
-            mutation: RefCell::new(Some(Box::new(move || {
+            mutation: Mutex::new(Some(Box::new(move || {
                 fs::rename(&mutation_directory, &mutation_displaced).unwrap();
                 fs::create_dir(&mutation_directory).unwrap();
                 fs::write(mutation_directory.join("replacement.txt"), b"replacement\n").unwrap();
@@ -3659,7 +3877,7 @@ mod tests {
                 flags: EvidenceFlags::CONTENT,
                 sequence: 31,
             },
-            mutation: RefCell::new(Some(Box::new(move || {
+            mutation: Mutex::new(Some(Box::new(move || {
                 fs::write(path, b"changed during end fence\n").unwrap();
             }))),
         };
@@ -4428,7 +4646,7 @@ mod tests {
         let fixture = Fixture::new();
         let ledger = ChangedPathLedger::new(&fixture.db.conn);
         let observer = RetryOnceObserver {
-            attempts: Cell::new(0),
+            attempts: AtomicU64::new(0),
         };
 
         let report = reconcile_full(
@@ -4441,7 +4659,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(observer.attempts.get(), 2);
+        assert_eq!(observer.attempts.load(Ordering::SeqCst), 2);
         assert_eq!(report.retries, 1);
         let failed: i64 = fixture
             .db
@@ -4539,7 +4757,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(observer.drains.get(), 1);
+        assert_eq!(observer.drains.load(Ordering::SeqCst), 1);
         assert_eq!(report.observed_files, 100_004);
         assert_eq!(report.observed_candidates, 100_000);
         assert_eq!(report.candidate_rows, 100_000);

@@ -50,6 +50,14 @@ pub(crate) struct DurableCut {
     pub(crate) provider_cursor: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObserverWriterBinding {
+    pub(crate) owner_token: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_identity: Vec<u8>,
+    pub(crate) fence_nonce: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PersistedLogLimits {
     pub(crate) max_log_bytes: u64,

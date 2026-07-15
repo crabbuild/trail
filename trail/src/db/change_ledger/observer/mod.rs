@@ -46,7 +46,7 @@ impl AdvisoryObserver {
     }
 }
 
-pub(crate) trait QualifiedObserver {
+pub(crate) trait QualifiedObserver: Send + Sync {
     fn begin_observation(&self, expected: &ExpectedScope) -> Result<ObserverFence>;
 
     fn end_fence(&self, expected: &ExpectedScope, start: &ObserverFence) -> Result<ObserverFence>;
