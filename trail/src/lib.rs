@@ -23,6 +23,26 @@ pub use model::*;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub mod test_support {
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_real_apfs_file_events() -> std::result::Result<(), String> {
+        crate::db::run_macos_real_apfs_file_events()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_gap_flag_matrix() -> std::result::Result<(), String> {
+        crate::db::run_macos_gap_flag_matrix()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_continuity_fault_matrix() -> std::result::Result<(), String> {
+        crate::db::run_macos_continuity_fault_matrix()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_fence_ordering() -> std::result::Result<(), String> {
+        crate::db::run_macos_fence_ordering()
+    }
+
     #[cfg(target_os = "linux")]
     pub fn changed_path_linux_recursive_coverage() -> std::result::Result<(), String> {
         crate::db::run_recursive_coverage()

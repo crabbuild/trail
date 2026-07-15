@@ -3107,6 +3107,11 @@ pub(crate) use change_ledger::{
     run_empty_orphan_quarantine_rejection, run_no_orphan_quarantine_allocation,
     run_orphan_quarantine_substitution_rejection,
 };
+#[cfg(all(debug_assertions, target_os = "macos"))]
+pub(crate) use change_ledger::{
+    run_macos_continuity_fault_matrix, run_macos_fence_ordering, run_macos_gap_flag_matrix,
+    run_macos_real_apfs_file_events,
+};
 mod core;
 mod lane;
 mod merge;

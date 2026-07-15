@@ -88,6 +88,7 @@ libc = "0.2"
 landlock = "0.4.5"
 notify = "6.1"
 inotify = { version = "0.9.6", default-features = false }
+fsevent-sys = "4.1.0"
 getrandom = "0.2"
 similar = "2.6"
 tempfile = "3.10"

@@ -33,6 +33,13 @@ pub(crate) use observer::linux::{
     run_recursive_coverage, run_rename_matrix, run_rename_storm_and_cookie_expiry,
     run_segment_writer_reconcile_publication,
 };
+#[cfg(all(debug_assertions, target_os = "macos"))]
+pub(crate) use observer::macos::{
+    run_continuity_fault_matrix as run_macos_continuity_fault_matrix,
+    run_fence_ordering as run_macos_fence_ordering,
+    run_gap_flag_matrix as run_macos_gap_flag_matrix,
+    run_real_apfs_file_events as run_macos_real_apfs_file_events,
+};
 #[allow(unused_imports)]
 pub(crate) use observer::{select_observer, ObserverFence, ObserverLease, QualifiedObserver};
 #[allow(unused_imports)]

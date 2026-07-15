@@ -12,6 +12,8 @@ use crate::error::Result;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ObserverFence {
@@ -64,6 +66,8 @@ pub(crate) trait QualifiedObserver: Send + Sync {
 pub(crate) enum SelectedObserver {
     #[cfg(target_os = "linux")]
     Linux,
+    #[cfg(target_os = "macos")]
+    MacOs,
     Advisory,
 }
 
@@ -75,6 +79,11 @@ pub(crate) fn select_observer() -> SelectedObserver {
         SelectedObserver::Linux
     }
     #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        SelectedObserver::MacOs
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         SelectedObserver::Advisory
     }
