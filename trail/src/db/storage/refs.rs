@@ -47,8 +47,18 @@ impl Trail {
         root_id: &ObjectId,
         operation_id: &ObjectId,
     ) -> Result<()> {
+        self.advance_ref_cas_in_transaction(expected, change_id, root_id, operation_id)?;
+        self.repair_ref_mirror(expected, change_id, root_id, operation_id)
+    }
+
+    pub(crate) fn advance_ref_cas_in_transaction(
+        &self,
+        expected: &RefRecord,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
         let generation = expected.generation + 1;
-        let now = now_ts();
         let updated = self.conn.execute(
             "UPDATE refs SET change_id = ?1, root_id = ?2, operation_id = ?3, generation = ?4, updated_at = ?5 \
              WHERE name = ?6 AND generation = ?7 AND change_id = ?8",
@@ -57,7 +67,7 @@ impl Trail {
                 root_id.0,
                 operation_id.0,
                 generation,
-                now,
+                now_ts(),
                 expected.name.clone(),
                 expected.generation,
                 expected.change_id.0.clone()
@@ -66,6 +76,17 @@ impl Trail {
         if updated != 1 {
             return Err(Error::StaleBranch(expected.name.clone()));
         }
+        Ok(())
+    }
+
+    pub(crate) fn repair_ref_mirror(
+        &self,
+        expected: &RefRecord,
+        change_id: &ChangeId,
+        root_id: &ObjectId,
+        operation_id: &ObjectId,
+    ) -> Result<()> {
+        let generation = expected.generation + 1;
         write_ref_file(
             &self.db_dir,
             &expected.name,

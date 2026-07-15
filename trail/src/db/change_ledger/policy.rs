@@ -1163,6 +1163,7 @@ mod tests {
     }
 }
 use super::ExpectedScope;
+use crate::db::util::{is_default_ignored, normalize_relative_path, path_from_rel};
 use crate::error::{Error, Result};
 use crate::model::RecordingConfig;
 use rusqlite::{params, Connection};
@@ -1394,6 +1395,11 @@ pub(crate) struct CompiledPolicy {
     reconciliation_authorization: Option<PolicyReconciliationAuthorization>,
 }
 
+pub(crate) struct CompiledRecordingMatcher {
+    workspace_root: PathBuf,
+    matcher: ::ignore::gitignore::Gitignore,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PolicyReconciliationAuthorization {
     expected: ExpectedScope,
@@ -1422,6 +1428,40 @@ impl CompiledPolicy {
 
     pub(crate) fn dependency_files(&self) -> &[PathBuf] {
         &self.snapshot.dependency_files
+    }
+
+    pub(crate) fn recording_matcher(&self) -> Result<CompiledRecordingMatcher> {
+        let mut builder = ::ignore::gitignore::GitignoreBuilder::new(&self.snapshot.workspace_root);
+        for source in &self.snapshot.rule_sources {
+            let applies = matches!(source.kind, PolicyDependencyKind::Trailignore)
+                || (self.snapshot.ignore_gitignored
+                    && matches!(
+                        source.kind,
+                        PolicyDependencyKind::Gitignore
+                            | PolicyDependencyKind::GitInfoExclude
+                            | PolicyDependencyKind::GitExcludesFile
+                    ));
+            if !applies {
+                continue;
+            }
+            let text = std::str::from_utf8(&source.bytes).map_err(|_| {
+                Error::InvalidInput(format!(
+                    "compiled recording rule `{}` is not UTF-8",
+                    source.path.display()
+                ))
+            })?;
+            for line in text.lines() {
+                builder
+                    .add_line(Some(source.path.clone()), line)
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            }
+        }
+        Ok(CompiledRecordingMatcher {
+            workspace_root: self.snapshot.workspace_root.clone(),
+            matcher: builder
+                .build()
+                .map_err(|error| Error::InvalidInput(error.to_string()))?,
+        })
     }
 
     pub(crate) fn authorizes_reconciliation(&self, expected: &ExpectedScope) -> bool {
@@ -1461,6 +1501,38 @@ impl CompiledPolicy {
         self.stale_baseline = false;
         self.reconciliation_authorization = Some(PolicyReconciliationAuthorization {
             expected: expected.clone(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn rebind_observed_baseline(
+        &mut self,
+        previous: &ExpectedScope,
+        next: &ExpectedScope,
+    ) -> Result<()> {
+        if previous.scope_id != next.scope_id
+            || previous.epoch != next.epoch
+            || previous.policy_fingerprint != next.policy_fingerprint
+            || previous.policy_generation != next.policy_generation
+            || previous.filesystem_identity != next.filesystem_identity
+            || previous.provider_identity != next.provider_identity
+            || self.fingerprint != next.policy_fingerprint
+            || self
+                .reconciliation_authorization
+                .as_ref()
+                .is_none_or(|authorization| authorization.expected != *previous)
+        {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: previous.scope_id.to_text(),
+                state: super::TrustState::StaleBaseline.as_str().into(),
+                reason:
+                    "compiled recording policy could not rebind the committed observed baseline"
+                        .into(),
+                command: "trail status".into(),
+            });
+        }
+        self.reconciliation_authorization = Some(PolicyReconciliationAuthorization {
+            expected: next.clone(),
         });
         Ok(())
     }
@@ -1511,6 +1583,20 @@ impl CompiledPolicy {
         };
         policy.authorize_reconciliation_for_test(expected);
         policy
+    }
+}
+
+impl CompiledRecordingMatcher {
+    pub(crate) fn is_ignored(&self, path: &str, is_dir: bool) -> Result<bool> {
+        let normalized = normalize_relative_path(path)?;
+        if is_default_ignored(&normalized) {
+            return Ok(true);
+        }
+        let absolute = self.workspace_root.join(path_from_rel(&normalized));
+        Ok(self
+            .matcher
+            .matched_path_or_any_parents(absolute, is_dir)
+            .is_ignore())
     }
 }
 

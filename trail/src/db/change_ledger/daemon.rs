@@ -9,9 +9,11 @@ use getrandom::getrandom;
 use rusqlite::{named_params, params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use super::FencedCandidateSnapshot;
 use super::{
-    compile_policy, reconcile_full, BaselineIdentity, CompiledPolicy, EvidenceCut, EvidenceSource,
-    ExpectedScope, FilesystemIdentity, ObserverFence, ObserverLease, PolicyCompileContext,
+    compile_policy, fold_observer_interval, raw_event_invalidates_policy, reconcile_full_with_tail,
+    BaselineIdentity, CompiledPolicy, EvidenceCut, EvidenceSource, ExpectedScope,
+    FilesystemIdentity, ObserverEvent, ObserverFence, ObserverLease, PolicyCompileContext,
     PolicyDependencyMetrics, PolicyIdentity, ProviderCapabilities, ProviderIdentity,
     QualifiedObserver, ScopeId, ScopeIdentity, ScopeKind, SegmentWriter,
 };
@@ -78,6 +80,7 @@ pub(crate) struct WorkspaceDaemonRuntime {
     expected: ExpectedScope,
     policy: CompiledPolicy,
     observer: PlatformObserver,
+    tail_anchor: Option<ObserverFence>,
     last_cut: Option<EvidenceCut>,
 }
 
@@ -549,6 +552,7 @@ impl WorkspaceDaemonRuntime {
             expected,
             policy,
             observer,
+            tail_anchor: None,
             last_cut: None,
         })
     }
@@ -565,8 +569,12 @@ impl WorkspaceDaemonRuntime {
     }
 
     fn reconcile(&mut self, db: &Trail, reason: &str) -> Result<WorkspaceDaemonProof> {
+        db.note_operation_metrics(crate::db::OperationMetricsDelta {
+            reconciliation_run_count: 1,
+            ..crate::db::OperationMetricsDelta::default()
+        });
         db.changed_path_ledger().recover_scope(&self.expected)?;
-        reconcile_full(
+        let (_report, tail_anchor) = reconcile_full_with_tail(
             db,
             &db.changed_path_ledger(),
             &self.observer,
@@ -574,39 +582,69 @@ impl WorkspaceDaemonRuntime {
             &self.policy,
             reason,
         )?;
-        self.fence(db)
+        let cut = EvidenceCut {
+            source: EvidenceSource::Observer,
+            sequence: tail_anchor.sequence,
+            durable_offset: tail_anchor.durable_offset,
+            folded_offset: tail_anchor.durable_offset,
+        };
+        self.tail_anchor = Some(tail_anchor);
+        self.last_cut = Some(cut.clone());
+        Ok(WorkspaceDaemonProof {
+            scope_id: self.expected.scope_id.to_text(),
+            epoch: self.expected.epoch,
+            cut,
+        })
     }
 
     fn fence(&mut self, db: &Trail) -> Result<WorkspaceDaemonProof> {
-        let start = self.observer.begin_observation(&self.expected)?;
+        let start = self.tail_anchor.clone().ok_or_else(|| {
+            Error::DaemonUnavailable("workspace daemon has no continuous observer anchor".into())
+        })?;
         let fence = self.observer.end_fence(&self.expected, &start)?;
         let lease = self.observer.lease().map_err(|error| {
             Error::DaemonUnavailable(format!(
                 "changed-path observer health no longer authorizes the ready proof: {error}"
             ))
         })?;
-        self.observer.drain_through(
+        let mut events = Vec::<ObserverEvent>::new();
+        let mut qualification = self.observer.drain_through_retaining_end(
             &self.expected,
             &lease.root_identity,
             &start,
             &fence,
-            &mut |_event| Ok(()),
+            &mut |event| {
+                if raw_event_invalidates_policy(
+                    &self.policy,
+                    std::path::Path::new(event.path.as_str()),
+                ) {
+                    return Err(Error::ChangeLedgerReconcileRequired {
+                        scope: self.expected.scope_id.to_text(),
+                        state: "stale_baseline".into(),
+                        reason: "recording policy changed during continuous observer interval"
+                            .into(),
+                        command: "trail status".into(),
+                    });
+                }
+                events.push(event);
+                Ok(())
+            },
         )?;
-        let folded = db.conn.query_row(
-            "SELECT folded_offset FROM changed_path_scopes WHERE scope_id=?1 AND epoch=?2",
-            params![
-                self.expected.scope_id.to_text(),
-                i64::try_from(self.expected.epoch).unwrap_or(i64::MAX)
-            ],
-            |row| row.get::<_, i64>(0),
+        let cut = fold_observer_interval(
+            &db.changed_path_ledger(),
+            &self.expected,
+            &lease.root_identity,
+            &start,
+            &fence,
+            &mut qualification,
+            &events,
         )?;
-        let cut = EvidenceCut {
-            source: EvidenceSource::Observer,
-            sequence: fence.sequence,
-            durable_offset: fence.durable_offset,
-            folded_offset: u64::try_from(folded)
-                .map_err(|_| Error::Corrupt("negative daemon folded offset".into()))?,
-        };
+        db.note_operation_metrics(crate::db::OperationMetricsDelta {
+            observer_tail_record_fold_count: events.len().try_into().unwrap_or(u64::MAX),
+            ledger_row_touch_count: events.len().try_into().unwrap_or(u64::MAX),
+            ..crate::db::OperationMetricsDelta::default()
+        });
+        self.tail_anchor = Some(fence);
         self.last_cut = Some(cut.clone());
         Ok(WorkspaceDaemonProof {
             scope_id: self.expected.scope_id.to_text(),
@@ -638,6 +676,98 @@ impl WorkspaceDaemonRuntime {
             })?,
         })
     }
+
+    pub(crate) fn with_authoritative_snapshot<T, F>(
+        &mut self,
+        db: &Trail,
+        mut consume: F,
+    ) -> Result<(T, FencedCandidateSnapshot)>
+    where
+        F: FnMut(&Trail, &CompiledPolicy, &super::CandidateSnapshot) -> Result<T>,
+    {
+        let mut retried = false;
+        loop {
+            let c1 = match self.fence(db) {
+                Ok(proof) => proof.cut,
+                Err(error) if !retried && requires_reconciliation(&error) => {
+                    self.reconcile(db, "authoritative_snapshot_retry")?;
+                    retried = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut candidates = match db.changed_path_ledger().snapshot_candidates(&self.expected)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) if !retried && requires_reconciliation(&error) => {
+                    self.reconcile(db, "authoritative_snapshot_retry")?;
+                    retried = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            candidates.cut = c1;
+            let consumed = consume(db, &self.policy, &candidates);
+            // c2 is mandatory even when comparison/build fails, so no command
+            // can strand an unconsumed interval behind c1.
+            let c2 = self.fence(db);
+            match (consumed, c2) {
+                (Ok(value), Ok(c2)) => {
+                    return Ok((
+                        value,
+                        FencedCandidateSnapshot {
+                            candidates,
+                            c2: c2.cut,
+                        },
+                    ));
+                }
+                (Err(error), _) => return Err(error),
+                (_, Err(error)) if !retried && requires_reconciliation(&error) => {
+                    self.reconcile(db, "authoritative_snapshot_retry")?;
+                    retried = true;
+                }
+                (_, Err(error)) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn accept_observed_baseline(
+        &mut self,
+        expected: &ExpectedScope,
+        target: &BaselineIdentity,
+    ) -> Result<()> {
+        if self.expected != *expected
+            || self
+                .last_cut
+                .as_ref()
+                .is_none_or(|cut| cut.durable_offset != cut.folded_offset)
+        {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: expected.scope_id.to_text(),
+                state: "stale_baseline".into(),
+                reason: "daemon baseline transition did not match the committed observed scope"
+                    .into(),
+                command: "trail status".into(),
+            });
+        }
+        let mut next = self.expected.clone();
+        next.ref_name = target.ref_name.clone();
+        next.ref_generation = target.ref_generation;
+        next.baseline_root = target.root_id.clone();
+        let anchor = self.tail_anchor.as_ref().ok_or_else(|| {
+            Error::DaemonUnavailable("daemon has no retained tail to rebind".into())
+        })?;
+        self.observer
+            .rebind_retained_tail(&self.expected, &next, anchor)?;
+        self.policy
+            .rebind_observed_baseline(&self.expected, &next)?;
+        self.expected = next;
+        Ok(())
+    }
+}
+
+fn requires_reconciliation(error: &Error) -> bool {
+    matches!(error, Error::ChangeLedgerReconcileRequired { .. })
 }
 
 #[cfg(debug_assertions)]
@@ -773,6 +903,48 @@ impl QualifiedObserver for PlatformObserver {
             Self::MacOs(observer) => {
                 observer.drain_through(expected, root_handle_identity, start, end, sink)
             }
+        }
+    }
+
+    fn drain_through_retaining_end(
+        &self,
+        expected: &ExpectedScope,
+        root_handle_identity: &[u8],
+        start: &ObserverFence,
+        end: &ObserverFence,
+        sink: &mut dyn FnMut(super::ObserverEvent) -> Result<()>,
+    ) -> Result<super::reconcile::ObserverQualification> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(observer) => observer.drain_through_retaining_end(
+                expected,
+                root_handle_identity,
+                start,
+                end,
+                sink,
+            ),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(observer) => observer.drain_through_retaining_end(
+                expected,
+                root_handle_identity,
+                start,
+                end,
+                sink,
+            ),
+        }
+    }
+
+    fn rebind_retained_tail(
+        &self,
+        previous: &ExpectedScope,
+        next: &ExpectedScope,
+        anchor: &ObserverFence,
+    ) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(observer) => observer.rebind_retained_tail(previous, next, anchor),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(observer) => observer.rebind_retained_tail(previous, next, anchor),
         }
     }
 }

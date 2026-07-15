@@ -10,8 +10,17 @@ mod policy;
 mod reconcile;
 mod recovery;
 mod secure_fs;
+mod snapshot;
 mod store;
 mod types;
+
+#[allow(unused_imports)]
+pub(crate) use snapshot::{
+    command_authority_enabled, CandidateComparison, FencedCandidateSnapshot, ObservedRecordCut,
+};
+#[cfg(debug_assertions)]
+#[allow(unused_imports)]
+pub(crate) use snapshot::{run_command_flow, set_command_authority_override};
 
 pub(crate) use daemon::{
     prepare_workspace_daemon, workspace_daemon_fence, workspace_daemon_ready_proof,
@@ -57,16 +66,16 @@ pub(crate) use observer::{select_observer, ObserverFence, ObserverLease, Qualifi
 #[allow(unused_imports)]
 pub(crate) use policy::{
     compile_policy, raw_event_invalidates_policy, raw_path_may_invalidate_policy,
-    validate_policy_manifest, AdapterEquivalence, CompiledPolicy, PolicyCompileContext,
-    PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics, PolicyInvalidationIndex,
-    PolicyManifest, PolicyManifestValidation, RecordingPolicySnapshot,
+    validate_policy_manifest, AdapterEquivalence, CompiledPolicy, CompiledRecordingMatcher,
+    PolicyCompileContext, PolicyDependency, PolicyDependencyKind, PolicyDependencyMetrics,
+    PolicyInvalidationIndex, PolicyManifest, PolicyManifestValidation, RecordingPolicySnapshot,
 };
 #[cfg(all(debug_assertions, target_os = "linux"))]
 pub(crate) use reconcile::install_initial_scan_hook;
 #[allow(unused_imports)]
 pub(crate) use reconcile::{
-    begin_reconciliation, persisted_proven_prefixes, reconcile_full, ObserverEvent,
-    ProvenPrefixSet, ReconcileMode, ReconciliationAttempt,
+    begin_reconciliation, fold_observer_interval, persisted_proven_prefixes, reconcile_full,
+    reconcile_full_with_tail, ObserverEvent, ProvenPrefixSet, ReconcileMode, ReconciliationAttempt,
 };
 #[cfg(debug_assertions)]
 pub(crate) use reconcile::{run_callback_spool, run_oracle, run_races};
@@ -107,7 +116,8 @@ pub(crate) use recovery::{
 pub(crate) use store::ChangedPathLedger;
 #[allow(unused_imports)]
 pub(crate) use types::{
-    BaselineIdentity, CandidateSnapshot, DirtyPrefix, EvidenceCut, EvidenceFlags, EvidenceSource,
-    ExpectedScope, FilesystemIdentity, LedgerPath, OwnedEvidence, PolicyIdentity,
-    ProviderCapabilities, ProviderIdentity, ScopeId, ScopeIdentity, ScopeKind, TrustState,
+    BaselineIdentity, CandidateSnapshot, DirtyPrefix, EvidenceAcknowledgementToken, EvidenceCut,
+    EvidenceFlags, EvidenceRowKind, EvidenceSource, ExpectedScope, FilesystemIdentity, LedgerPath,
+    OwnedEvidence, PolicyIdentity, ProviderCapabilities, ProviderIdentity, ScopeId, ScopeIdentity,
+    ScopeKind, TrustState,
 };

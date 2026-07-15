@@ -64,6 +64,32 @@ pub(crate) trait QualifiedObserver: Send + Sync {
         end: &ObserverFence,
         sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
     ) -> Result<ObserverQualification>;
+
+    /// Consume `(start, end]` while retaining `end` as the authenticated
+    /// anchor for the next rotation.  Native adapters override this method;
+    /// the default preserves compatibility for reconciliation-only test
+    /// observers which do not provide continuous command authority.
+    fn drain_through_retaining_end(
+        &self,
+        expected: &ExpectedScope,
+        root_handle_identity: &[u8],
+        start: &ObserverFence,
+        end: &ObserverFence,
+        sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+    ) -> Result<ObserverQualification> {
+        self.drain_through(expected, root_handle_identity, start, end, sink)
+    }
+
+    fn rebind_retained_tail(
+        &self,
+        _previous: &ExpectedScope,
+        _next: &ExpectedScope,
+        _anchor: &ObserverFence,
+    ) -> Result<()> {
+        Err(crate::Error::DaemonUnavailable(
+            "observer does not support retained-tail baseline rebinding".into(),
+        ))
+    }
 }
 
 pub(crate) enum SelectedObserver {

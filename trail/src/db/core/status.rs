@@ -1,6 +1,25 @@
 use super::*;
 
 impl Trail {
+    pub(crate) fn status_from_changed_path_ledger(&mut self) -> Result<StatusReport> {
+        let branch = self.current_branch()?;
+        let head = self.resolve_branch_ref(&branch)?;
+        let (comparison, _fenced) =
+            self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
+                db.compare_authoritative_candidates(policy, candidates, &head.root_id)
+            })?;
+        let changed_paths = comparison.summaries;
+        let worktree_state = worktree_state_from_changes(&changed_paths);
+        let suggestions = self.status_suggestions(&branch, &worktree_state, &changed_paths);
+        Ok(StatusReport {
+            branch,
+            head,
+            worktree_state,
+            changed_paths,
+            suggestions,
+        })
+    }
+
     pub fn status(&self, branch: Option<&str>) -> Result<StatusReport> {
         let metrics = self.operation_metrics.clone();
         let result_metrics = metrics.clone();

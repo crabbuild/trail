@@ -35,8 +35,15 @@ impl Trail {
     ) -> Result<RecordReport> {
         let metrics = self.operation_metrics.clone();
         profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Record, || {
-            let _lock = self.acquire_write_lock()?;
-            self.record_with_options_unlocked(branch, message, actor, options)
+            if crate::db::change_ledger::command_authority_enabled() {
+                // Native fence durability uses the same workspace writer
+                // exclusion.  The observed path obtains c1/c2 first, then
+                // takes the lock for its single CAS transaction below.
+                self.record_with_options_unlocked(branch, message, actor, options)
+            } else {
+                let _lock = self.acquire_write_lock()?;
+                self.record_with_options_unlocked(branch, message, actor, options)
+            }
         })
     }
 
@@ -89,12 +96,21 @@ impl Trail {
         });
         let session_id = options
             .session_id
+            .clone()
             .map(|session_id| {
                 validate_session_id(&session_id)?;
                 self.lane_session(&session_id)?;
                 Ok::<String, Error>(session_id)
             })
             .transpose()?;
+        if crate::db::change_ledger::command_authority_enabled()
+            && selected_paths.is_empty()
+            && branch == self.current_branch()?
+        {
+            return self.record_from_changed_path_ledger(
+                branch, head, message, actor, options, session_id,
+            );
+        }
         let daemon_snapshot = if selected_paths.is_empty() {
             self.daemon_worktree_snapshot()
         } else {
@@ -305,6 +321,95 @@ impl Trail {
             operation: Some(change_id),
             root_id: built.root_id,
             changed_paths: diff.summaries,
+        })
+    }
+
+    fn record_from_changed_path_ledger(
+        &mut self,
+        branch: String,
+        head: RefRecord,
+        message: Option<String>,
+        actor: Actor,
+        options: RecordOptions,
+        session_id: Option<String>,
+    ) -> Result<RecordReport> {
+        let branch_for_build = branch.clone();
+        let actor_for_build = actor.clone();
+        let message_for_build = message.clone();
+        let session_for_build = session_id.clone();
+        let kind = options.kind.unwrap_or(OperationKind::ManualRecord);
+        let (built_record, fenced) =
+            self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
+                let comparison =
+                    db.compare_authoritative_candidates(policy, candidates, &head.root_id)?;
+                if comparison.summaries.is_empty() {
+                    return Ok(None);
+                }
+                let paths = comparison
+                    .summaries
+                    .iter()
+                    .map(|summary| summary.path.clone())
+                    .collect::<Vec<_>>();
+                // Candidate selection and trust are pinned to the daemon's
+                // compiled policy above.  c2 retains any filesystem race that
+                // occurs while bytes are materialized here.
+                let disk_files = db.scan_visible_files_for_paths(&paths)?;
+                let change_id = db.allocate_change_id(&actor_for_build.id, "record")?;
+                let built = db.build_root_for_selected_record_incremental(
+                    &head.root_id,
+                    &comparison.baseline_files,
+                    &disk_files,
+                    &paths,
+                    false,
+                    &change_id,
+                )?;
+                let diff = db.diff_file_maps(&comparison.baseline_files, &built.files)?;
+                if diff.changes.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    Operation {
+                        version: OP_OBJECT_VERSION,
+                        change_id: change_id.clone(),
+                        kind: kind.clone(),
+                        parents: vec![head.change_id.clone()],
+                        before_root: Some(head.root_id.clone()),
+                        after_root: built.root_id.clone(),
+                        branch: branch_for_build.clone(),
+                        actor: actor_for_build.clone(),
+                        session_id: session_for_build.clone(),
+                        message: message_for_build
+                            .clone()
+                            .map(|message| redact_sensitive_text(&message)),
+                        changes: diff.changes,
+                        created_at: now_ts(),
+                    },
+                    built.root_id,
+                    diff.summaries,
+                )))
+            })?;
+        let Some((operation, root_id, changed_paths)) = built_record else {
+            return Ok(RecordReport {
+                branch,
+                operation: None,
+                root_id: head.root_id,
+                changed_paths: Vec::new(),
+            });
+        };
+        let observed = crate::db::change_ledger::ObservedRecordCut {
+            expected: fenced.candidates.expected.clone(),
+            c1: fenced.candidates.cut.clone(),
+            c2: fenced.c2,
+            acknowledgement_tokens: fenced.candidates.acknowledgement_tokens,
+        };
+        let _lock = self.acquire_write_lock()?;
+        self.commit_observed_record(&operation, &head, &observed, true, None)?;
+        self.set_worktree_index_baseline(&root_id)?;
+        Ok(RecordReport {
+            branch,
+            operation: Some(operation.change_id),
+            root_id,
+            changed_paths,
         })
     }
 }

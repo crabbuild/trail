@@ -3718,7 +3718,21 @@ mod tests {
             mapping.mapping_id
         );
 
+        crate::db::prepare_workspace_daemon(&mut db, false).unwrap();
         std::fs::write(temp.path().join("README.md"), "after\n").unwrap();
+        crate::db::workspace_daemon_fence(&mut db, None, None).unwrap();
+        let workspace_scope_before_lane: (String, i64, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT baseline_root_id,ref_generation,ref_name,
+                        (SELECT COUNT(*) FROM changed_path_entries e
+                         WHERE e.scope_id=s.scope_id)
+                 FROM changed_path_scopes s WHERE scope_kind='workspace'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(workspace_scope_before_lane.3 > 0);
         let stop = persist(
             &mut db,
             "Stop",
@@ -3747,6 +3761,18 @@ mod tests {
         );
         assert_eq!(view.task.latest_checkpoint, Some(branch.head_change));
         assert_eq!(view.transcript.unwrap().turns.len(), 1);
+        let workspace_scope_after_lane: (String, i64, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT baseline_root_id,ref_generation,ref_name,
+                        (SELECT COUNT(*) FROM changed_path_entries e
+                         WHERE e.scope_id=s.scope_id)
+                 FROM changed_path_scopes s WHERE scope_kind='workspace'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(workspace_scope_after_lane, workspace_scope_before_lane);
     }
 
     #[test]

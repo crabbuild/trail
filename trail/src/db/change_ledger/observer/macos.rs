@@ -234,6 +234,7 @@ struct DurableEvent {
 #[derive(Clone)]
 enum IssuedFenceKind {
     Start,
+    TailAnchor,
     End { start_nonce: Vec<u8> },
 }
 
@@ -384,6 +385,28 @@ pub(crate) struct MacOsFseventsObserver {
 }
 
 impl MacOsFseventsObserver {
+    fn rebind_tail_anchor(
+        &self,
+        previous: &ExpectedScope,
+        next: &ExpectedScope,
+        anchor: &ObserverFence,
+    ) -> Result<()> {
+        let mut state = self.shared.lock();
+        let retained = state
+            .issued_fences
+            .get_mut(&anchor.nonce)
+            .ok_or_else(|| reconcile_error("fsevents_retained_tail_rebind_missing"))?;
+        if retained.public != *anchor
+            || retained.expected != *previous
+            || !matches!(retained.kind, IssuedFenceKind::TailAnchor)
+            || !stable_observer_binding(previous, next)
+        {
+            return Err(reconcile_error("fsevents_retained_tail_rebind_mismatch"));
+        }
+        retained.expected = next.clone();
+        Ok(())
+    }
+
     pub(crate) fn start(
         root_path: &Path,
         durability: Box<dyn MacObserverDurability>,
@@ -1198,7 +1221,10 @@ impl QualifiedObserver for MacOsFseventsObserver {
 
     fn end_fence(&self, expected: &ExpectedScope, start: &ObserverFence) -> Result<ObserverFence> {
         let issued = self.issued_fence(expected, start)?;
-        if !matches!(issued.kind, IssuedFenceKind::Start) {
+        if !matches!(
+            issued.kind,
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor
+        ) {
             self.shared.revoke("fsevents_start_fence_kind_mismatch");
             return Err(reconcile_error("fsevents_start_fence_kind_mismatch"));
         }
@@ -1223,6 +1249,49 @@ impl QualifiedObserver for MacOsFseventsObserver {
         end: &ObserverFence,
         sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
     ) -> Result<ObserverQualification> {
+        self.drain_interval(expected, root_handle_identity, start, end, sink, false)
+    }
+
+    fn drain_through_retaining_end(
+        &self,
+        expected: &ExpectedScope,
+        root_handle_identity: &[u8],
+        start: &ObserverFence,
+        end: &ObserverFence,
+        sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+    ) -> Result<ObserverQualification> {
+        self.drain_interval(expected, root_handle_identity, start, end, sink, true)
+    }
+
+    fn rebind_retained_tail(
+        &self,
+        previous: &ExpectedScope,
+        next: &ExpectedScope,
+        anchor: &ObserverFence,
+    ) -> Result<()> {
+        self.rebind_tail_anchor(previous, next, anchor)
+    }
+}
+
+fn stable_observer_binding(previous: &ExpectedScope, next: &ExpectedScope) -> bool {
+    previous.scope_id == next.scope_id
+        && previous.epoch == next.epoch
+        && previous.policy_fingerprint == next.policy_fingerprint
+        && previous.policy_generation == next.policy_generation
+        && previous.filesystem_identity == next.filesystem_identity
+        && previous.provider_identity == next.provider_identity
+}
+
+impl MacOsFseventsObserver {
+    fn drain_interval(
+        &self,
+        expected: &ExpectedScope,
+        root_handle_identity: &[u8],
+        start: &ObserverFence,
+        end: &ObserverFence,
+        sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
+        retain_end: bool,
+    ) -> Result<ObserverQualification> {
         self.ensure_history_authority()?;
         if self.root_identity()? != root_handle_identity {
             self.shared.revoke("fsevents_root_identity_mismatch");
@@ -1230,12 +1299,13 @@ impl QualifiedObserver for MacOsFseventsObserver {
         }
         let issued_start = self.issued_fence(expected, start)?;
         let issued_end = self.issued_fence(expected, end)?;
-        if !matches!(issued_start.kind, IssuedFenceKind::Start)
-            || !matches!(
-                &issued_end.kind,
-                IssuedFenceKind::End { start_nonce } if *start_nonce == start.nonce
-            )
-            || issued_end.provider_event_id < issued_start.provider_event_id
+        if !matches!(
+            issued_start.kind,
+            IssuedFenceKind::Start | IssuedFenceKind::TailAnchor
+        ) || !matches!(
+            &issued_end.kind,
+            IssuedFenceKind::End { start_nonce } if *start_nonce == start.nonce
+        ) || issued_end.provider_event_id < issued_start.provider_event_id
         {
             self.shared.revoke("fsevents_fence_interval_mismatch");
             return Err(reconcile_error("fsevents_fence_interval_mismatch"));
@@ -1274,7 +1344,15 @@ impl QualifiedObserver for MacOsFseventsObserver {
             .events
             .retain(|item| item.event.sequence > end.sequence);
         state.issued_fences.remove(&start.nonce);
-        state.issued_fences.remove(&end.nonce);
+        if retain_end {
+            let retained = state
+                .issued_fences
+                .get_mut(&end.nonce)
+                .ok_or_else(|| reconcile_error("fsevents_end_fence_not_retained_for_rotation"))?;
+            retained.kind = IssuedFenceKind::TailAnchor;
+        } else {
+            state.issued_fences.remove(&end.nonce);
+        }
         Ok(qualification)
     }
 }

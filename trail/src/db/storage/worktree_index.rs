@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::change_ledger::CompiledRecordingMatcher;
 #[cfg(test)]
 use crate::db::change_ledger::PolicyInvalidationIndex;
 use crate::db::change_ledger::{raw_path_may_invalidate_policy, CompiledPolicy};
@@ -185,6 +186,118 @@ impl Trail {
             return Ok(None);
         }
         read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text)
+    }
+
+    /// Walk only the selected complete prefixes from descriptor-relative,
+    /// no-follow handles.  Unlike `visit_pinned_worktree_files`, this never
+    /// starts a `WalkDir` at the workspace root and is therefore O(k+affected
+    /// subtree), not O(N), on the authoritative command path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn visit_pinned_worktree_prefix_files<F>(
+        &self,
+        root: &PinnedWorktreeRoot,
+        matcher: &CompiledRecordingMatcher,
+        prefixes: &[String],
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ReconciliationFile) -> Result<()>,
+    {
+        use rustix::fs::{openat, statat, AtFlags, Dir, FileType, Mode, OFlags};
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let prefixes = minimal_component_selections(prefixes);
+        for prefix in prefixes {
+            if matcher.is_ignored(&prefix, false)? {
+                continue;
+            }
+            if let Some(file) =
+                read_reconciliation_file_no_follow(&root.descriptor, &prefix, &self.config.text)?
+            {
+                visitor(file)?;
+                continue;
+            }
+            let Some(prefix_dir) = open_relative_directory_no_follow(&root.descriptor, &prefix)?
+            else {
+                continue;
+            };
+            let mut pending = vec![(prefix_dir, prefix.clone())];
+            while let Some((directory, relative_dir)) = pending.pop() {
+                let mut entries =
+                    Dir::read_from(&directory).map_err(|error| Error::Io(error.into()))?;
+                while let Some(entry) = entries.next() {
+                    let entry = entry.map_err(|error| Error::Io(error.into()))?;
+                    let name_bytes = entry.file_name().to_bytes();
+                    if matches!(name_bytes, b"." | b"..") {
+                        continue;
+                    }
+                    let name = std::str::from_utf8(name_bytes).map_err(|_| {
+                        Error::InvalidInput(
+                            "authoritative candidate walk does not support non-UTF-8 paths".into(),
+                        )
+                    })?;
+                    let relative = format!("{relative_dir}/{name}");
+                    let stat = match statat(
+                        &directory,
+                        OsStr::from_bytes(name_bytes),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(stat) => stat,
+                        Err(error) if error == rustix::io::Errno::NOENT => continue,
+                        Err(error) => return Err(Error::Io(error.into())),
+                    };
+                    match FileType::from_raw_mode(stat.st_mode) {
+                        FileType::Directory => {
+                            if matcher.is_ignored(&relative, true)? {
+                                continue;
+                            }
+                            let child = openat(
+                                &directory,
+                                OsStr::from_bytes(name_bytes),
+                                OFlags::RDONLY
+                                    | OFlags::DIRECTORY
+                                    | OFlags::NOFOLLOW
+                                    | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            )
+                            .map_err(|error| Error::Io(error.into()))?;
+                            pending.push((fs::File::from(child), relative));
+                        }
+                        FileType::RegularFile => {
+                            if matcher.is_ignored(&relative, false)? {
+                                continue;
+                            }
+                            if let Some(file) = read_reconciliation_file_no_follow(
+                                &root.descriptor,
+                                &relative,
+                                &self.config.text,
+                            )? {
+                                visitor(file)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn visit_pinned_worktree_prefix_files<F>(
+        &self,
+        _root: &PinnedWorktreeRoot,
+        _matcher: &CompiledRecordingMatcher,
+        _prefixes: &[String],
+        _visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ReconciliationFile) -> Result<()>,
+    {
+        Err(Error::InvalidInput(
+            "authoritative changed-path candidates require Linux or macOS".into(),
+        ))
     }
 
     /// Returns true only when a clean baseline identifies the same immutable
@@ -1078,6 +1191,35 @@ impl Trail {
         )?;
         Ok(())
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_relative_directory_no_follow(root: &fs::File, relative: &str) -> Result<Option<fs::File>> {
+    use rustix::fs::{openat, Mode, OFlags};
+    let path = path_from_rel(relative);
+    let mut directory = root.try_clone().map_err(Error::Io)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(Error::InvalidInput(format!(
+                "candidate prefix `{relative}` is not normalized"
+            )));
+        };
+        directory = match openat(
+            &directory,
+            Path::new(name),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fs::File::from(fd),
+            Err(error)
+                if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NOTDIR =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(Error::Io(error.into())),
+        };
+    }
+    Ok(Some(directory))
 }
 
 fn reconcile_path_ignored(relative: &str) -> bool {

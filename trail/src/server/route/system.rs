@@ -36,7 +36,11 @@ pub(super) fn handle_system_route(
     }
 
     if request.method == "GET" && path == "/v1/status" {
-        let report = match db.status(None) {
+        let report = match if crate::db::command_authority_enabled() {
+            db.status_from_changed_path_ledger()
+        } else {
+            db.status(None)
+        } {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 db.status(None)?
             }
@@ -148,7 +152,11 @@ pub(super) fn handle_system_route(
                     "diff accepts only one of `range`, `root`, or `dirty`".to_string(),
                 ));
             }
-            db.diff_dirty(patch, line_ids)?
+            if crate::db::command_authority_enabled() {
+                db.diff_dirty_from_changed_path_ledger(patch, line_ids)?
+            } else {
+                db.diff_dirty(patch, line_ids)?
+            }
         } else if let Some(root) = utils::query_value(query, "root") {
             if utils::query_value(query, "range").is_some() {
                 return Err(Error::InvalidInput(

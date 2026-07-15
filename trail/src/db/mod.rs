@@ -3065,11 +3065,16 @@ impl Drop for WriteLockWaitGuard {
 
 mod agent;
 mod change_ledger;
+#[cfg(debug_assertions)]
+pub(crate) use change_ledger::run_command_flow;
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::run_non_utf_database_path_mark_recover_and_retire;
+#[cfg(debug_assertions)]
+#[allow(unused_imports)]
+pub(crate) use change_ledger::set_command_authority_override;
 pub(crate) use change_ledger::{
-    prepare_workspace_daemon, workspace_daemon_fence, workspace_daemon_ready_proof,
-    workspace_daemon_reconcile, WorkspaceDaemonProof,
+    command_authority_enabled, prepare_workspace_daemon, workspace_daemon_fence,
+    workspace_daemon_ready_proof, workspace_daemon_reconcile, WorkspaceDaemonProof,
 };
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::{

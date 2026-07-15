@@ -310,22 +310,35 @@ impl<'a> ChangedPathLedger<'a> {
             ));
         }
 
-        let exact_path_values = tx
+        let exact_values = tx
             .prepare(
-                "SELECT normalized_path FROM changed_path_entries
+                "SELECT normalized_path,event_flags,source_mask,first_sequence,last_sequence,
+                        provider_id,provider_sequence,intent_id
+                 FROM changed_path_entries
                  WHERE scope_id = ?1 ORDER BY normalized_path COLLATE BINARY",
             )?
-            .query_map([&scope_id], |row| row.get::<_, String>(0))?
+            .query_map([&scope_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let exact_paths = exact_path_values
+        let exact_paths = exact_values
             .iter()
-            .map(|path| LedgerPath::parse(path))
+            .map(|row| LedgerPath::parse(&row.0))
             .collect::<Result<Vec<_>>>()?;
 
         let prefix_values = tx
             .prepare(
-                "SELECT normalized_prefix, completeness_reason,
-                        first_sequence, last_sequence
+                "SELECT normalized_prefix,completeness_reason,event_flags,source_mask,
+                        first_sequence,last_sequence,provider_id,provider_sequence,intent_id
                  FROM changed_path_prefixes
                  WHERE scope_id = ?1 ORDER BY normalized_prefix COLLATE BINARY",
             )?
@@ -335,21 +348,89 @@ impl<'a> ChangedPathLedger<'a> {
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let prefixes = prefix_values
-            .into_iter()
-            .map(|(path, reason, first, last)| {
-                Ok(DirtyPrefix {
-                    path: LedgerPath::parse(&path)?,
-                    complete: true,
-                    reason,
-                    first_sequence: db_u64(first, "prefix first sequence")?,
-                    last_sequence: db_u64(last, "prefix last sequence")?,
-                })
-            })
+            .iter()
+            .map(
+                |(path, reason, _flags, _source, first, last, _provider, _sequence, _intent)| {
+                    Ok(DirtyPrefix {
+                        path: LedgerPath::parse(path)?,
+                        complete: true,
+                        reason: reason.clone(),
+                        first_sequence: db_u64(*first, "prefix first sequence")?,
+                        last_sequence: db_u64(*last, "prefix last sequence")?,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
+        let mut acknowledgement_tokens = exact_values
+            .into_iter()
+            .map(
+                |(
+                    path,
+                    flags,
+                    source_mask,
+                    first,
+                    last,
+                    provider_id,
+                    provider_sequence,
+                    intent_id,
+                )| {
+                    Ok(EvidenceAcknowledgementToken {
+                        kind: EvidenceRowKind::Exact,
+                        path: LedgerPath::parse(&path)?,
+                        flags: EvidenceFlags(flags),
+                        source_mask,
+                        first_sequence: db_u64(first, "entry first sequence")?,
+                        last_sequence: db_u64(last, "entry last sequence")?,
+                        provider_id,
+                        provider_sequence: provider_sequence
+                            .map(|value| db_u64(value, "entry provider sequence"))
+                            .transpose()?,
+                        intent_id,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        acknowledgement_tokens.extend(
+            prefix_values
+                .into_iter()
+                .map(
+                    |(
+                        path,
+                        _reason,
+                        flags,
+                        source_mask,
+                        first,
+                        last,
+                        provider_id,
+                        provider_sequence,
+                        intent_id,
+                    )| {
+                        Ok(EvidenceAcknowledgementToken {
+                            kind: EvidenceRowKind::CompletePrefix,
+                            path: LedgerPath::parse(&path)?,
+                            flags: EvidenceFlags(flags),
+                            source_mask,
+                            first_sequence: db_u64(first, "prefix first sequence")?,
+                            last_sequence: db_u64(last, "prefix last sequence")?,
+                            provider_id,
+                            provider_sequence: provider_sequence
+                                .map(|value| db_u64(value, "prefix provider sequence"))
+                                .transpose()?,
+                            intent_id,
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?,
+        );
         let sequence = tx.query_row(
             "SELECT COALESCE(MAX(provider_sequence), 0)
              FROM (
@@ -374,6 +455,7 @@ impl<'a> ChangedPathLedger<'a> {
             },
             exact_paths,
             prefixes,
+            acknowledgement_tokens,
             trust: TrustState::Trusted,
         };
         tx.commit()?;
@@ -443,6 +525,64 @@ impl<'a> ChangedPathLedger<'a> {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn acknowledge_immutable_tokens_in_transaction(
+        conn: &Connection,
+        expected: &ExpectedScope,
+        latest_cut: &EvidenceCut,
+        through_sequence: u64,
+        tokens: &[EvidenceAcknowledgementToken],
+        acknowledge_complete_prefixes: bool,
+    ) -> Result<u64> {
+        cas_guard(conn, expected, true)?;
+        let scope = load_scope(conn, expected)?;
+        validate_cut_boundaries(expected, &scope, latest_cut)?;
+        let mut deleted = 0u64;
+        for token in tokens {
+            // A mixed-source row or a row advanced beyond c1 cannot be proved
+            // fully represented by the observed record.
+            if token.source_mask != EvidenceSource::Observer.mask()
+                || token
+                    .provider_sequence
+                    .is_none_or(|sequence| sequence > through_sequence)
+                || (token.kind == EvidenceRowKind::CompletePrefix && !acknowledge_complete_prefixes)
+            {
+                continue;
+            }
+            let table = match token.kind {
+                EvidenceRowKind::Exact => "changed_path_entries",
+                EvidenceRowKind::CompletePrefix => "changed_path_prefixes",
+            };
+            let path_column = match token.kind {
+                EvidenceRowKind::Exact => "normalized_path",
+                EvidenceRowKind::CompletePrefix => "normalized_prefix",
+            };
+            let sql = format!(
+                "DELETE FROM {table} WHERE scope_id=?1 AND {path_column}=?2 COLLATE BINARY
+                   AND event_flags=?3 AND source_mask=?4 AND first_sequence=?5
+                   AND last_sequence=?6 AND provider_id IS ?7
+                   AND provider_sequence IS ?8 AND intent_id IS ?9"
+            );
+            deleted = deleted.saturating_add(conn.execute(
+                &sql,
+                params![
+                    expected.scope_id.to_text(),
+                    token.path.as_str(),
+                    token.flags.0,
+                    token.source_mask,
+                    sql_u64(token.first_sequence, "acknowledgement first sequence")?,
+                    sql_u64(token.last_sequence, "acknowledgement last sequence")?,
+                    token.provider_id,
+                    token
+                        .provider_sequence
+                        .map(|value| sql_u64(value, "acknowledgement provider sequence"))
+                        .transpose()?,
+                    token.intent_id,
+                ],
+            )? as u64);
+        }
+        Ok(deleted)
     }
 
     pub(crate) fn advance_baseline(
@@ -1170,6 +1310,112 @@ mod tests {
             ChangedPathLedger::new(&conn).snapshot_candidates(&expected()),
             Err(Error::ChangeLedgerReconcileRequired { .. })
         ));
+    }
+
+    #[test]
+    fn immutable_ack_token_retains_same_path_evidence_arriving_after_c1() {
+        let conn = fixture(10, 10);
+        set_trust(&conn, TrustState::Trusted);
+        let ledger = ChangedPathLedger::new(&conn);
+        let path = LedgerPath::parse("same.txt").unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &path,
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                1,
+            )
+            .unwrap();
+        let c1 = ledger.snapshot_candidates(&expected()).unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &path,
+                EvidenceFlags::MODE,
+                EvidenceSource::Observer,
+                2,
+            )
+            .unwrap();
+
+        ChangedPathLedger::acknowledge_immutable_tokens_in_transaction(
+            &conn,
+            &expected(),
+            &c1.cut,
+            c1.cut.sequence,
+            &c1.acknowledgement_tokens,
+            true,
+        )
+        .unwrap();
+
+        let retained = ledger.all_exact(&expected()).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].last_sequence, 2);
+        assert_eq!(
+            retained[0].flags.0,
+            (EvidenceFlags::CONTENT | EvidenceFlags::MODE).0
+        );
+    }
+
+    #[test]
+    fn partial_observed_record_retains_complete_prefix_and_mixed_source_rows() {
+        let conn = fixture(10, 10);
+        set_trust(&conn, TrustState::Trusted);
+        let scope = expected().scope_id.to_text();
+        conn.execute(
+            "INSERT INTO changed_path_prefixes(
+                 scope_id,normalized_prefix,completeness_reason,event_flags,source_mask,
+                 first_sequence,last_sequence,provider_id,provider_sequence,intent_id,
+                 created_at,updated_at
+             ) VALUES(?1,'src','provider_complete',?2,?3,1,1,'observer',1,NULL,1,1)",
+            params![
+                scope,
+                EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0,
+                EvidenceSource::Observer.mask()
+            ],
+        )
+        .unwrap();
+        let ledger = ChangedPathLedger::new(&conn);
+        ledger
+            .upsert_exact(
+                &expected(),
+                &LedgerPath::parse("mixed.txt").unwrap(),
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Observer,
+                1,
+            )
+            .unwrap();
+        let snapshot = ledger.snapshot_candidates(&expected()).unwrap();
+        ledger
+            .upsert_exact(
+                &expected(),
+                &LedgerPath::parse("mixed.txt").unwrap(),
+                EvidenceFlags::CONTENT,
+                EvidenceSource::Intent,
+                1,
+            )
+            .unwrap();
+
+        ChangedPathLedger::acknowledge_immutable_tokens_in_transaction(
+            &conn,
+            &expected(),
+            &snapshot.cut,
+            snapshot.cut.sequence,
+            &snapshot.acknowledgement_tokens,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM changed_path_prefixes WHERE scope_id=?1",
+                [expected().scope_id.to_text()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(ledger.all_exact(&expected()).unwrap()[0].source_mask, 3);
     }
 
     #[test]

@@ -265,7 +265,31 @@ pub(crate) struct CandidateSnapshot {
     pub(crate) cut: EvidenceCut,
     pub(crate) exact_paths: Vec<LedgerPath>,
     pub(crate) prefixes: Vec<DirtyPrefix>,
+    /// Immutable row identities captured in the same read transaction as the
+    /// candidate set.  A checkpoint may acknowledge a row only when every
+    /// field still matches this token; merging newer or differently-owned
+    /// evidence therefore always leaves the row pending.
+    pub(crate) acknowledgement_tokens: Vec<EvidenceAcknowledgementToken>,
     pub(crate) trust: TrustState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EvidenceAcknowledgementToken {
+    pub(crate) kind: EvidenceRowKind,
+    pub(crate) path: LedgerPath,
+    pub(crate) flags: EvidenceFlags,
+    pub(crate) source_mask: i64,
+    pub(crate) first_sequence: u64,
+    pub(crate) last_sequence: u64,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) provider_sequence: Option<u64>,
+    pub(crate) intent_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EvidenceRowKind {
+    Exact,
+    CompletePrefix,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,6 +1,30 @@
 use super::*;
 
 impl Trail {
+    pub(crate) fn diff_dirty_from_changed_path_ledger(
+        &mut self,
+        patches: bool,
+        line_changes: bool,
+    ) -> Result<DiffSummary> {
+        if patches || line_changes {
+            return Err(Error::InvalidInput(
+                "authoritative dirty patch materialization is not enabled before ledger activation"
+                    .into(),
+            ));
+        }
+        let branch = self.current_branch()?;
+        let head = self.resolve_branch_ref(&branch)?;
+        let (comparison, _fenced) =
+            self.with_workspace_authoritative_snapshot(|db, policy, candidates| {
+                db.compare_authoritative_candidates(policy, candidates, &head.root_id)
+            })?;
+        Ok(DiffSummary {
+            from: branch,
+            to: "dirty".into(),
+            files: comparison.summaries,
+        })
+    }
+
     pub fn diff_range(&self, spec: &str, patches: bool) -> Result<DiffSummary> {
         let metrics = self.operation_metrics.clone();
         profile_operation_metrics(metrics.as_ref(), OperationMetricsKind::Diff, || {

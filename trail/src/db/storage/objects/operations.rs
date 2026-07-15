@@ -2,10 +2,18 @@ use super::*;
 
 impl Trail {
     pub(crate) fn store_operation(&self, operation: &Operation) -> Result<ObjectId> {
-        let operation = redact_operation_for_storage(operation);
-        let operation_id = self.put_object(OPERATION_KIND, OP_OBJECT_VERSION, &operation)?;
+        let (operation, operation_id) = self.store_operation_object_unindexed(operation)?;
         self.index_operation(&operation, &operation_id)?;
         Ok(operation_id)
+    }
+
+    pub(crate) fn store_operation_object_unindexed(
+        &self,
+        operation: &Operation,
+    ) -> Result<(Operation, ObjectId)> {
+        let operation = redact_operation_for_storage(operation);
+        let operation_id = self.put_object(OPERATION_KIND, OP_OBJECT_VERSION, &operation)?;
+        Ok((operation, operation_id))
     }
 
     pub(crate) fn index_operation(

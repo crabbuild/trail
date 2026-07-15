@@ -9,8 +9,8 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    raw_event_invalidates_policy, ChangedPathLedger, CompiledPolicy, EvidenceFlags, ExpectedScope,
-    LedgerPath, ObserverFence, QualifiedObserver, ScopeId, TrustState,
+    raw_event_invalidates_policy, ChangedPathLedger, CompiledPolicy, EvidenceCut, EvidenceFlags,
+    ExpectedScope, LedgerPath, ObserverFence, QualifiedObserver, ScopeId, TrustState,
 };
 use crate::db::storage::{
     PinnedWorktreeRoot, ReconciliationDirectory, ReconciliationFile, ReconciliationScanEntry,
@@ -635,6 +635,20 @@ pub(crate) fn reconcile_full(
     policy: &CompiledPolicy,
     reason: &str,
 ) -> Result<ChangeLedgerReconcileReport> {
+    reconcile_full_with_tail(trail, ledger, observer, expected, policy, reason)
+        .map(|(report, _tail)| report)
+}
+
+/// Full reconciliation plus the authenticated end fence retained by native
+/// observers as the start of continuous post-reconciliation coverage.
+pub(crate) fn reconcile_full_with_tail(
+    trail: &Trail,
+    ledger: &ChangedPathLedger<'_>,
+    observer: &dyn QualifiedObserver,
+    expected: &ExpectedScope,
+    policy: &CompiledPolicy,
+    reason: &str,
+) -> Result<(ChangeLedgerReconcileReport, ObserverFence)> {
     let mut retries = 0;
     loop {
         let mut attempt = begin_reconciliation(
@@ -653,10 +667,13 @@ pub(crate) fn reconcile_full(
             }
             return Err(error);
         }
+        let retained_tail = attempt.end_fence.clone().ok_or_else(|| {
+            Error::InvalidInput("reconciliation produced no retained observer tail".into())
+        })?;
         match attempt.publish(trail, ledger, policy) {
             Ok(mut report) => {
                 report.retries = retries;
-                return Ok(report);
+                return Ok((report, retained_tail));
             }
             Err(error)
                 if retries < MAX_IDENTITY_RACE_RETRIES && is_retryable_identity_race(&error) =>
@@ -666,6 +683,226 @@ pub(crate) fn reconcile_full(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Atomically folds one authenticated continuous observer interval.  The
+/// caller must have drained the interval with `drain_through_retaining_end`;
+/// no evidence row becomes visible unless the exact owner, segment, scope and
+/// cut transition all commit together.
+pub(crate) fn fold_observer_interval(
+    ledger: &ChangedPathLedger<'_>,
+    expected: &ExpectedScope,
+    root_identity: &[u8],
+    start: &ObserverFence,
+    end: &ObserverFence,
+    qualification: &mut ObserverQualification,
+    events: &[ObserverEvent],
+) -> Result<EvidenceCut> {
+    if end.sequence <= start.sequence || end.durable_offset < start.durable_offset {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "continuous observer tail regressed",
+        ));
+    }
+    if !qualification.validates(expected, root_identity, start, end)
+        || events
+            .iter()
+            .any(|event| event.sequence <= start.sequence || event.sequence > end.sequence)
+    {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "continuous observer interval did not authenticate the exact scope and cut",
+        ));
+    }
+
+    let tx = Transaction::new_unchecked(ledger.conn, TransactionBehavior::Immediate)?;
+    exact_scope_guard(&tx, expected)?;
+    let (trust_state, durable, folded, owner): (String, i64, i64, Option<String>) = tx.query_row(
+        "SELECT trust_state,durable_offset,folded_offset,observer_owner_token
+         FROM changed_path_scopes WHERE scope_id=?1",
+        [expected.scope_id.to_text()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if trust_state != TrustState::Trusted.as_str()
+        || db_u64(durable)? != start.durable_offset
+        || db_u64(folded)? != start.durable_offset
+        || owner.as_deref() != Some(qualification.observer_owner_token.as_str())
+    {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "continuous observer anchor does not match the persisted trusted cut",
+        ));
+    }
+    qualification.segment_initial_folded_offset =
+        qualification_segment_folded_offset(&tx, expected, qualification)?;
+    if qualification.segment_initial_folded_offset != start.durable_offset {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "continuous observer segment was not folded through the previous anchor",
+        ));
+    }
+    validate_observer_owner_and_segment(&tx, expected, qualification, end)?;
+
+    let scope_id = expected.scope_id.to_text();
+    let now = now_ts();
+    tx.execute_batch("SAVEPOINT changed_path_continuous_fold_rows;")?;
+    for event in events {
+        let sequence = sql_u64(event.sequence)?;
+        if event.flags.0 & EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0 != 0 {
+            tx.execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,source_mask,
+                     first_sequence,last_sequence,provider_id,provider_sequence,intent_id,
+                     created_at,updated_at
+                 ) VALUES(?1,?2,'provider_complete',?3,?4,?5,?5,?6,?5,NULL,?7,?7)
+                 ON CONFLICT(scope_id,normalized_prefix) DO UPDATE SET
+                     event_flags=(changed_path_prefixes.event_flags | excluded.event_flags),
+                     source_mask=(changed_path_prefixes.source_mask | excluded.source_mask),
+                     first_sequence=MIN(changed_path_prefixes.first_sequence,excluded.first_sequence),
+                     last_sequence=MAX(changed_path_prefixes.last_sequence,excluded.last_sequence),
+                     provider_id=CASE WHEN changed_path_prefixes.source_mask=excluded.source_mask
+                                      THEN excluded.provider_id ELSE NULL END,
+                     provider_sequence=MAX(COALESCE(changed_path_prefixes.provider_sequence,0),excluded.provider_sequence),
+                     updated_at=excluded.updated_at",
+                params![
+                    scope_id,
+                    event.path.as_str(),
+                    event.flags.0,
+                    super::EvidenceSource::Observer.mask(),
+                    sequence,
+                    hex::encode(&expected.provider_identity),
+                    now,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO changed_path_entries(
+                     scope_id,normalized_path,event_flags,source_mask,first_sequence,last_sequence,
+                     provider_id,provider_sequence,intent_id,created_at,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?5,?6,?5,NULL,?7,?7)
+                 ON CONFLICT(scope_id,normalized_path) DO UPDATE SET
+                     event_flags=(changed_path_entries.event_flags | excluded.event_flags),
+                     source_mask=(changed_path_entries.source_mask | excluded.source_mask),
+                     first_sequence=MIN(changed_path_entries.first_sequence,excluded.first_sequence),
+                     last_sequence=MAX(changed_path_entries.last_sequence,excluded.last_sequence),
+                     provider_id=CASE WHEN changed_path_entries.source_mask=excluded.source_mask
+                                      THEN excluded.provider_id ELSE NULL END,
+                     provider_sequence=MAX(COALESCE(changed_path_entries.provider_sequence,0),excluded.provider_sequence),
+                     updated_at=excluded.updated_at",
+                params![
+                    scope_id,
+                    event.path.as_str(),
+                    event.flags.0,
+                    super::EvidenceSource::Observer.mask(),
+                    sequence,
+                    hex::encode(&expected.provider_identity),
+                    now,
+                ],
+            )?;
+        }
+    }
+    if candidate_cap_exceeded(&tx, &scope_id)? {
+        tx.execute_batch(
+            "ROLLBACK TO changed_path_continuous_fold_rows;
+             RELEASE changed_path_continuous_fold_rows;",
+        )?;
+        tx.execute(
+            "UPDATE changed_path_scopes SET trust_state='overflow',
+                 trust_reason='persisted evidence cap exceeded',
+                 continuity_generation=continuity_generation+1,updated_at=?1
+             WHERE scope_id=?2",
+            params![now, scope_id],
+        )?;
+        tx.commit()?;
+        return Err(reconcile_required(
+            expected,
+            TrustState::Overflow.as_str(),
+            "persisted evidence cap exceeded",
+        ));
+    }
+    tx.execute_batch("RELEASE changed_path_continuous_fold_rows;")?;
+    persist_consumed_observer_fold(&tx, expected, qualification, end)?;
+    let changed = tx.execute(
+        "UPDATE changed_path_scopes SET durable_offset=?1,folded_offset=?1,
+             trust_reason='continuous_tail_folded',updated_at=?2
+         WHERE scope_id=?3 AND epoch=?4 AND durable_offset=?5 AND folded_offset=?5
+           AND trust_state='trusted' AND observer_owner_token=?6",
+        params![
+            sql_u64(end.durable_offset)?,
+            now,
+            scope_id,
+            sql_u64(expected.epoch)?,
+            sql_u64(start.durable_offset)?,
+            qualification.observer_owner_token,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "continuous observer fold lost its exact cut CAS",
+        ));
+    }
+    tx.commit()?;
+    Ok(EvidenceCut {
+        source: super::EvidenceSource::Observer,
+        sequence: end.sequence,
+        durable_offset: end.durable_offset,
+        folded_offset: end.durable_offset,
+    })
+}
+
+fn validate_observer_owner_and_segment(
+    conn: &rusqlite::Connection,
+    expected: &ExpectedScope,
+    qualification: &ObserverQualification,
+    end: &ObserverFence,
+) -> Result<()> {
+    let owner_ok = conn.query_row(
+        "SELECT COUNT(*) FROM changed_path_observer_owners
+         WHERE scope_id=?1 AND epoch=?2 AND owner_token=?3
+           AND provider_id=?4 AND provider_identity=?4
+           AND fence_nonce=?5 AND lease_state='active' AND expires_at>=?6",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch)?,
+            qualification.observer_owner_token,
+            hex::encode(&expected.provider_identity),
+            qualification.owner_fence_nonce,
+            publication_lease_deadline()?,
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    let segment_ok = conn.query_row(
+        "SELECT COUNT(*) FROM changed_path_observer_segments
+         WHERE scope_id=?1 AND epoch=?2 AND segment_id=?3 AND owner_token=?4
+           AND provider_id=?5 AND state IN ('open','sealed')
+           AND last_sequence>=?6 AND durable_end_offset>=?7
+           AND folded_end_offset=?8",
+        params![
+            expected.scope_id.to_text(),
+            sql_u64(expected.epoch)?,
+            qualification.durable_segment_id,
+            qualification.observer_owner_token,
+            hex::encode(&expected.provider_identity),
+            sql_u64(end.sequence)?,
+            sql_u64(end.durable_offset)?,
+            sql_u64(qualification.segment_initial_folded_offset)?,
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    if !owner_ok || !segment_ok {
+        return Err(reconcile_required(
+            expected,
+            TrustState::UntrustedGap.as_str(),
+            "continuous observer owner or segment authority changed",
+        ));
+    }
+    Ok(())
 }
 
 fn is_retryable_identity_race(error: &Error) -> bool {
@@ -753,7 +990,7 @@ impl ReconciliationAttempt {
         }
         let root_identity = trail.pinned_worktree_root_identity(&self.root);
         let mut spool = ObserverEventSpool::new()?;
-        let mut qualification = observer.drain_through(
+        let mut qualification = observer.drain_through_retaining_end(
             &self.expected,
             &root_identity,
             &self.start_fence,
