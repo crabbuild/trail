@@ -175,6 +175,7 @@ where
     O: FrameObserver,
 {
     let mut pending = Vec::new();
+    let mut scan_from = 0;
     let mut chunk = [0_u8; 8192];
     loop {
         if stop.load(Ordering::Acquire) {
@@ -217,10 +218,12 @@ where
             return writer.flush();
         }
         pending.extend_from_slice(&chunk[..usize::try_from(read).unwrap_or(0)]);
-        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+        while let Some(relative_end) = pending[scan_from..].iter().position(|byte| *byte == b'\n') {
+            let end = scan_from + relative_end;
             let remainder = pending.split_off(end + 1);
             let raw = std::mem::replace(&mut pending, remainder);
             forward_raw_frame(raw, Direction::ClientToAgent, &observer, &mut writer)?;
+            scan_from = 0;
         }
         if pending.len() > ACP_MAX_FRAME_BYTES {
             return Err(io::Error::new(
@@ -228,6 +231,7 @@ where
                 format!("ACP frame exceeds the {ACP_MAX_FRAME_BYTES}-byte transport limit"),
             ));
         }
+        scan_from = pending.len();
     }
 }
 
