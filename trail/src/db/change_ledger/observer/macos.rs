@@ -56,7 +56,7 @@ const GAP_FLAGS: u32 = fs_events::kFSEventStreamEventFlagMustScanSubDirs
     | fs_events::kFSEventStreamEventFlagRootChanged
     | fs_events::kFSEventStreamEventFlagUnmount;
 
-static NULL_CONTEXT_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static NULL_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[link(name = "CoreServices", kind = "framework")]
 extern "C" {
@@ -261,6 +261,7 @@ enum StartupDecision {
 struct StartOptions {
     timeout: Duration,
     authority_override: Option<HistoryAuthority>,
+    post_start_database_uuid_override: Option<[u8; 16]>,
     delay_after_native_start: Duration,
     cleanup_observed: Option<Arc<AtomicBool>>,
 }
@@ -270,6 +271,7 @@ impl StartOptions {
         Self {
             timeout: FENCE_TIMEOUT,
             authority_override: None,
+            post_start_database_uuid_override: None,
             delay_after_native_start: Duration::ZERO,
             cleanup_observed: None,
         }
@@ -287,6 +289,8 @@ pub(crate) struct MacOsFseventsObserver {
     owner_token: String,
     owner_fence_nonce: Vec<u8>,
     lineage_identity: Vec<u8>,
+    history_authority: HistoryAuthority,
+    null_context_generation: u64,
     shared: Arc<Shared>,
     commands: SyncSender<DurabilityCommand>,
     stream: StreamHandle,
@@ -297,6 +301,8 @@ pub(crate) struct MacOsFseventsObserver {
     fail_next_fence_sync: Mutex<bool>,
     #[cfg(debug_assertions)]
     fail_next_root_descriptor: Mutex<bool>,
+    #[cfg(debug_assertions)]
+    next_history_authority_override: Mutex<Option<HistoryAuthority>>,
 }
 
 impl MacOsFseventsObserver {
@@ -345,6 +351,7 @@ impl MacOsFseventsObserver {
         if authority.device != device {
             return Err(reconcile_error("fsevents_actual_history_device_mismatch"));
         }
+        let null_context_generation = NULL_CONTEXT_GENERATION.load(Ordering::Acquire);
         let binding = durability.binding();
         if binding.owner_token.is_empty()
             || binding.provider_id != hex::encode(&binding.provider_identity)
@@ -420,6 +427,7 @@ impl MacOsFseventsObserver {
         let stream_authority = authority.clone();
         let stream_cancelled = Arc::clone(&startup_cancelled);
         let delay_after_native_start = options.delay_after_native_start;
+        let post_start_database_uuid_override = options.post_start_database_uuid_override;
         let cleanup_observed = options.cleanup_observed.clone();
         let stream_worker = match thread::Builder::new()
             .name("trail-macos-fsevents".into())
@@ -431,6 +439,7 @@ impl MacOsFseventsObserver {
                     ready_tx,
                     decision_rx,
                     stream_cancelled,
+                    post_start_database_uuid_override,
                     delay_after_native_start,
                     cleanup_observed,
                     stream_shared,
@@ -488,6 +497,8 @@ impl MacOsFseventsObserver {
             owner_token: binding.owner_token,
             owner_fence_nonce: binding.fence_nonce,
             lineage_identity,
+            history_authority: authority,
+            null_context_generation,
             shared,
             commands,
             stream,
@@ -498,7 +509,10 @@ impl MacOsFseventsObserver {
             fail_next_fence_sync: Mutex::new(false),
             #[cfg(debug_assertions)]
             fail_next_root_descriptor: Mutex::new(false),
+            #[cfg(debug_assertions)]
+            next_history_authority_override: Mutex::new(None),
         };
+        observer.ensure_null_context_generation()?;
         observer.wait_for_history()?;
         observer.root_identity()?;
         Ok(observer)
@@ -522,6 +536,7 @@ impl MacOsFseventsObserver {
     }
 
     fn ensure_available(&self) -> Result<()> {
+        self.ensure_null_context_generation()?;
         let state = self.shared.lock();
         if let Some(reason) = &state.revoked {
             return Err(reconcile_error(reason));
@@ -535,10 +550,63 @@ impl MacOsFseventsObserver {
         Ok(())
     }
 
+    fn ensure_null_context_generation(&self) -> Result<()> {
+        if NULL_CONTEXT_GENERATION.load(Ordering::Acquire) != self.null_context_generation {
+            self.shared
+                .revoke("fsevents_null_callback_context_generation_changed");
+            return Err(reconcile_error(
+                "fsevents_null_callback_context_generation_changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_history_authority(&self) -> Result<()> {
+        self.ensure_available()?;
+        #[cfg(debug_assertions)]
+        let injected = self
+            .next_history_authority_override
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        #[cfg(not(debug_assertions))]
+        let injected: Option<HistoryAuthority> = None;
+        let observed = match injected {
+            Some(authority) => authority,
+            None => match actual_history_authority(&self.root_path, self.device) {
+                Ok(authority) => authority,
+                Err(_) => {
+                    self.shared
+                        .revoke("fsevents_history_authority_revalidation_failure");
+                    return Err(reconcile_error(
+                        "fsevents_history_authority_revalidation_failure",
+                    ));
+                }
+            },
+        };
+        self.ensure_available()?;
+        if observed != self.history_authority {
+            self.shared
+                .revoke("fsevents_history_authority_revalidation_mismatch");
+            return Err(reconcile_error(
+                "fsevents_history_authority_revalidation_mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     fn wait_for_history(&self) -> Result<()> {
         let deadline = Instant::now() + FENCE_TIMEOUT;
         let mut state = self.shared.lock();
         while state.history_required && !state.history_done && state.revoked.is_none() {
+            if NULL_CONTEXT_GENERATION.load(Ordering::Acquire) != self.null_context_generation {
+                drop(state);
+                self.shared
+                    .revoke("fsevents_null_callback_context_generation_changed");
+                return Err(reconcile_error(
+                    "fsevents_null_callback_context_generation_changed",
+                ));
+            }
             let now = Instant::now();
             if now >= deadline {
                 drop(state);
@@ -548,14 +616,20 @@ impl MacOsFseventsObserver {
             let waited = self
                 .shared
                 .changed
-                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .wait_timeout(
+                    state,
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(25)),
+                )
                 .unwrap_or_else(|poison| poison.into_inner());
             state = waited.0;
         }
         if let Some(reason) = &state.revoked {
             return Err(reconcile_error(reason));
         }
-        Ok(())
+        drop(state);
+        self.ensure_null_context_generation()
     }
 
     pub(crate) fn root_identity(&self) -> Result<Vec<u8>> {
@@ -607,7 +681,7 @@ impl MacOsFseventsObserver {
         expected: &ExpectedScope,
         kind: IssuedFenceKind,
     ) -> Result<ObserverFence> {
-        self.ensure_available()?;
+        self.ensure_history_authority()?;
         self.root_identity()?;
         if expected.provider_identity != self.provider_identity
             || expected.filesystem_identity != self.root_identity
@@ -740,6 +814,7 @@ impl MacOsFseventsObserver {
                 return Err(reconcile_error("fsevents_durable_fence_timeout"));
             }
         };
+        self.ensure_history_authority()?;
         self.root_identity()?;
         let issued = IssuedFence {
             public: public.clone(),
@@ -798,6 +873,7 @@ impl MacOsFseventsObserver {
     }
 
     fn issued_fence(&self, expected: &ExpectedScope, fence: &ObserverFence) -> Result<IssuedFence> {
+        self.ensure_history_authority()?;
         let state = self.shared.lock();
         let Some(issued) = state.issued_fences.get(&fence.nonce) else {
             drop(state);
@@ -883,6 +959,14 @@ impl MacOsFseventsObserver {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = true;
     }
+
+    #[cfg(debug_assertions)]
+    fn set_next_history_authority_for_test(&self, authority: HistoryAuthority) {
+        *self
+            .next_history_authority_override
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(authority);
+    }
 }
 
 impl QualifiedObserver for MacOsFseventsObserver {
@@ -917,7 +1001,7 @@ impl QualifiedObserver for MacOsFseventsObserver {
         end: &ObserverFence,
         sink: &mut dyn FnMut(ObserverEvent) -> Result<()>,
     ) -> Result<ObserverQualification> {
-        self.ensure_available()?;
+        self.ensure_history_authority()?;
         if self.root_identity()? != root_handle_identity {
             self.shared.revoke("fsevents_root_identity_mismatch");
             return Err(reconcile_error("fsevents_root_identity_mismatch"));
@@ -951,6 +1035,7 @@ impl QualifiedObserver for MacOsFseventsObserver {
         for event in events {
             sink(event)?;
         }
+        self.ensure_history_authority()?;
         let qualification = ObserverQualification::native(
             expected,
             root_handle_identity.to_vec(),
@@ -995,7 +1080,9 @@ extern "C" fn callback(
     event_ids: *const u64,
 ) {
     if info.is_null() {
-        NULL_CONTEXT_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+        if count != 0 {
+            NULL_CONTEXT_GENERATION.fetch_add(1, Ordering::Release);
+        }
         return;
     }
     let context = unsafe { &*(info as *const CallbackContext) };
@@ -1221,6 +1308,7 @@ fn run_stream(
     ready: SyncSender<Result<StreamHandle>>,
     decision: Receiver<StartupDecision>,
     cancelled: Arc<AtomicBool>,
+    post_start_database_uuid_override: Option<[u8; 16]>,
     delay_after_native_start: Duration,
     cleanup_observed: Option<Arc<AtomicBool>>,
     shared: Arc<Shared>,
@@ -1318,6 +1406,27 @@ fn run_stream(
             fs_events::FSEventStreamRelease(stream);
             let _ = ready.send(Err(reconcile_error("fsevents_stream_start_failure")));
             return;
+        }
+        let post_start_database_uuid = match post_start_database_uuid_override {
+            Some(uuid) => Ok(uuid),
+            None => copy_history_database_uuid(authority.device),
+        };
+        match post_start_database_uuid {
+            Ok(uuid) if uuid == authority.database_uuid => {}
+            Ok(_) => {
+                cleanup_stream(stream, cleanup_observed.as_ref());
+                let _ = ready.send(Err(reconcile_error(
+                    "fsevents_post_start_history_database_uuid_mismatch",
+                )));
+                return;
+            }
+            Err(_) => {
+                cleanup_stream(stream, cleanup_observed.as_ref());
+                let _ = ready.send(Err(reconcile_error(
+                    "fsevents_post_start_history_database_uuid_unavailable",
+                )));
+                return;
+            }
         }
         if !delay_after_native_start.is_zero() {
             thread::sleep(delay_after_native_start);
@@ -1561,6 +1670,12 @@ fn open_root_no_follow(path: &Path) -> Result<File> {
 }
 
 fn actual_history_authority(root: &Path, device: u64) -> Result<HistoryAuthority> {
+    let observed_device = open_root_no_follow(root)?.metadata()?.dev();
+    if observed_device != device {
+        return Err(reconcile_error(
+            "fsevents_history_authority_device_mismatch",
+        ));
+    }
     let database_uuid = copy_history_database_uuid(device)?;
     let root_text = root
         .to_str()
@@ -2701,6 +2816,7 @@ pub(crate) fn run_startup_cancellation() -> std::result::Result<(), String> {
         let options = StartOptions {
             timeout: Duration::from_millis(20),
             authority_override: None,
+            post_start_database_uuid_override: None,
             delay_after_native_start: Duration::from_millis(200),
             cleanup_observed: Some(Arc::clone(&cleanup)),
         };
@@ -2798,7 +2914,7 @@ pub(crate) fn run_malformed_callbacks() -> std::result::Result<(), String> {
                 )));
             }
         }
-        let before = NULL_CONTEXT_CALLBACKS.load(Ordering::Relaxed);
+        let before = NULL_CONTEXT_GENERATION.load(Ordering::Acquire);
         callback(
             ptr::null_mut(),
             ptr::null_mut(),
@@ -2807,7 +2923,7 @@ pub(crate) fn run_malformed_callbacks() -> std::result::Result<(), String> {
             ptr::null(),
             ptr::null(),
         );
-        if NULL_CONTEXT_CALLBACKS.load(Ordering::Relaxed) != before.saturating_add(1) {
+        if NULL_CONTEXT_GENERATION.load(Ordering::Acquire) != before.saturating_add(1) {
             return Err(Error::Corrupt(
                 "structurally impossible null callback context was not observable".into(),
             ));
@@ -2862,6 +2978,171 @@ pub(crate) fn run_root_revalidation_failures() -> std::result::Result<(), String
         globally_revoked(&fixture.observer)?;
         std::fs::remove_file(&root)?;
         std::fs::rename(&displaced, &root)?;
+        Ok(())
+    }
+    run().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_null_context_generation() -> std::result::Result<(), String> {
+    fn run() -> Result<()> {
+        let ensure_fixture = TestFixture::new()?;
+        let begin_fixture = TestFixture::new()?;
+        let end_fixture = TestFixture::new()?;
+        let end_start = end_fixture
+            .observer
+            .begin_observation(&end_fixture.expected)?;
+        let drain_fixture = TestFixture::new()?;
+        let drain_start = drain_fixture
+            .observer
+            .begin_observation(&drain_fixture.expected)?;
+        let drain_end = drain_fixture
+            .observer
+            .end_fence(&drain_fixture.expected, &drain_start)?;
+        let baseline = NULL_CONTEXT_GENERATION.load(Ordering::Acquire);
+        callback(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+        );
+        if NULL_CONTEXT_GENERATION.load(Ordering::Acquire) != baseline
+            || ensure_fixture.observer.ensure_available().is_err()
+            || begin_fixture.observer.ensure_available().is_err()
+            || end_fixture.observer.ensure_available().is_err()
+            || drain_fixture.observer.ensure_available().is_err()
+        {
+            return Err(Error::Corrupt(
+                "zero-count null-context callback changed live authority".into(),
+            ));
+        }
+        callback(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+        );
+        let unavailable = ensure_fixture.observer.ensure_available().unwrap_err();
+        if unavailable.code() != "CHANGE_LEDGER_RECONCILE_REQUIRED"
+            || !unavailable
+                .to_string()
+                .contains("fsevents_null_callback_context_generation_changed")
+        {
+            return Err(Error::Corrupt(
+                "nonempty null-context callback did not revoke the live observer".into(),
+            ));
+        }
+        if begin_fixture
+            .observer
+            .begin_observation(&begin_fixture.expected)
+            .is_ok()
+            || end_fixture
+                .observer
+                .end_fence(&end_fixture.expected, &end_start)
+                .is_ok()
+        {
+            return Err(Error::Corrupt(
+                "observer issued or authenticated a fence after null-context generation changed"
+                    .into(),
+            ));
+        }
+        let mut sink = |_event: ObserverEvent| Ok(());
+        let drain_root_identity = drain_fixture.observer.root_identity.clone();
+        if drain_fixture
+            .observer
+            .drain_through(
+                &drain_fixture.expected,
+                &drain_root_identity,
+                &drain_start,
+                &drain_end,
+                &mut sink,
+            )
+            .is_ok()
+        {
+            return Err(Error::Corrupt(
+                "observer qualified a drain after null-context generation changed".into(),
+            ));
+        }
+        Ok(())
+    }
+    run().map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_uuid_revalidation() -> std::result::Result<(), String> {
+    fn run() -> Result<()> {
+        let resume_fixture = TestFixture::new()?;
+        resume_fixture.interval(|root| {
+            std::fs::write(root.join("post-start-uuid-resume"), b"history")?;
+            Ok(())
+        })?;
+        let cursor = resume_fixture
+            .observer
+            .resume_cursor()?
+            .ok_or_else(|| Error::Corrupt("post-start UUID test cursor was absent".into()))?;
+        let canonical_root = resume_fixture.temp.path().canonicalize()?;
+        let expected_authority = actual_history_authority(&canonical_root, cursor.device)?;
+        let mut replacement_uuid = expected_authority.database_uuid;
+        replacement_uuid[0] ^= 0xff;
+        let TestFixture { temp, observer, .. } = resume_fixture;
+        drop(observer);
+        let cleanup = Arc::new(AtomicBool::new(false));
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let options = StartOptions {
+            timeout: FENCE_TIMEOUT,
+            authority_override: None,
+            post_start_database_uuid_override: Some(replacement_uuid),
+            delay_after_native_start: Duration::ZERO,
+            cleanup_observed: Some(Arc::clone(&cleanup)),
+        };
+        let error = match MacOsFseventsObserver::start_inner(
+            temp.path(),
+            Box::new(durability),
+            Some(cursor),
+            &[temp.path().join(".trail/config.toml")],
+            options,
+        ) {
+            Ok(_) => {
+                return Err(Error::Corrupt(
+                    "post-start UUID replacement was accepted".into(),
+                ))
+            }
+            Err(error) => error,
+        };
+        if !error
+            .to_string()
+            .contains("fsevents_post_start_history_database_uuid_mismatch")
+            || !cleanup.load(Ordering::Acquire)
+        {
+            return Err(Error::Corrupt(
+                "post-start UUID replacement did not reject and clean the native stream".into(),
+            ));
+        }
+
+        let fixture = TestFixture::new()?;
+        let mut replacement = fixture.observer.history_authority.clone();
+        replacement.database_uuid[0] ^= 0xff;
+        fixture
+            .observer
+            .set_next_history_authority_for_test(replacement);
+        let error = fixture
+            .observer
+            .begin_observation(&fixture.expected)
+            .unwrap_err();
+        if !error
+            .to_string()
+            .contains("fsevents_history_authority_revalidation_mismatch")
+            || fixture.observer.ensure_available().is_ok()
+        {
+            return Err(Error::Corrupt(
+                "proof-boundary UUID replacement did not revoke clean authority".into(),
+            ));
+        }
         Ok(())
     }
     run().map_err(|error| error.to_string())

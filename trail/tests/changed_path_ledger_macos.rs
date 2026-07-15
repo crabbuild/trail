@@ -44,3 +44,13 @@ fn malformed_callback_arrays_revoke_but_zero_count_is_safe() {
 fn every_root_revalidation_failure_revokes_globally() {
     trail::test_support::changed_path_macos_root_revalidation_failures().unwrap();
 }
+
+#[test]
+fn null_context_generation_revokes_every_live_proof_path() {
+    trail::test_support::changed_path_macos_null_context_generation().unwrap();
+}
+
+#[test]
+fn database_uuid_is_revalidated_after_start_and_before_proof() {
+    trail::test_support::changed_path_macos_uuid_revalidation().unwrap();
+}

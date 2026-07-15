@@ -3110,9 +3110,10 @@ pub(crate) use change_ledger::{
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub(crate) use change_ledger::{
     run_macos_continuity_fault_matrix, run_macos_fence_ordering, run_macos_gap_flag_matrix,
-    run_macos_history_authority, run_macos_malformed_callbacks, run_macos_paused_callback_fence,
-    run_macos_real_apfs_file_events, run_macos_root_revalidation_failures,
-    run_macos_startup_cancellation,
+    run_macos_history_authority, run_macos_malformed_callbacks, run_macos_null_context_generation,
+    run_macos_paused_callback_fence, run_macos_real_apfs_file_events,
+    run_macos_root_revalidation_failures, run_macos_startup_cancellation,
+    run_macos_uuid_revalidation,
 };
 mod core;
 mod lane;

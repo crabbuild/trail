@@ -40,10 +40,12 @@ pub(crate) use observer::macos::{
     run_gap_flag_matrix as run_macos_gap_flag_matrix,
     run_history_authority as run_macos_history_authority,
     run_malformed_callbacks as run_macos_malformed_callbacks,
+    run_null_context_generation as run_macos_null_context_generation,
     run_paused_callback_fence as run_macos_paused_callback_fence,
     run_real_apfs_file_events as run_macos_real_apfs_file_events,
     run_root_revalidation_failures as run_macos_root_revalidation_failures,
     run_startup_cancellation as run_macos_startup_cancellation,
+    run_uuid_revalidation as run_macos_uuid_revalidation,
 };
 #[allow(unused_imports)]
 pub(crate) use observer::{select_observer, ObserverFence, ObserverLease, QualifiedObserver};

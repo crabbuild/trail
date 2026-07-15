@@ -68,6 +68,16 @@ pub mod test_support {
         crate::db::run_macos_root_revalidation_failures()
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_null_context_generation() -> std::result::Result<(), String> {
+        crate::db::run_macos_null_context_generation()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_uuid_revalidation() -> std::result::Result<(), String> {
+        crate::db::run_macos_uuid_revalidation()
+    }
+
     #[cfg(target_os = "linux")]
     pub fn changed_path_linux_recursive_coverage() -> std::result::Result<(), String> {
         crate::db::run_recursive_coverage()
