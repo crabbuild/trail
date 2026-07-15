@@ -28,9 +28,9 @@ pub(crate) use log::{
 pub(crate) use observer::linux::{
     run_authenticated_fence_rejections, run_complete_prefix_publication_races,
     run_content_mode_create_delete, run_delayed_backlog, run_fault_revocation_matrix,
-    run_fence_ordering, run_owner_death_and_root_replacement, run_process_owner_child,
-    run_raw_decoder_faults, run_reconciliation_interval_qualification, run_recursive_coverage,
-    run_rename_matrix, run_rename_storm_and_cookie_expiry,
+    run_fence_ordering, run_owner_death_and_root_replacement, run_policy_dependency_observation,
+    run_process_owner_child, run_raw_decoder_faults, run_reconciliation_interval_qualification,
+    run_recursive_coverage, run_rename_matrix, run_rename_storm_and_cookie_expiry,
     run_segment_writer_reconcile_publication,
 };
 #[allow(unused_imports)]

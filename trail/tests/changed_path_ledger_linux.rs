@@ -72,3 +72,8 @@ fn native_segment_writer_reconcile_full_publishes_real_sqlite_state() {
 fn raw_overflow_and_unknown_watch_events_use_the_decoder_fail_closed_path() {
     trail::test_support::changed_path_linux_raw_decoder_faults().unwrap();
 }
+
+#[test]
+fn declared_internal_policy_dependencies_invalidate_without_storage_self_feedback() {
+    trail::test_support::changed_path_linux_policy_dependency_observation().unwrap();
+}

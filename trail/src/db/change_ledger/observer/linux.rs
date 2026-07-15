@@ -1,6 +1,6 @@
 //! Qualified Linux inotify observer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -176,9 +176,14 @@ enum DurabilityCommand {
 }
 
 impl LinuxInotifyObserver {
-    pub(crate) fn start(root_path: &Path, durability: Box<dyn ObserverDurability>) -> Result<Self> {
+    pub(crate) fn start(
+        root_path: &Path,
+        durability: Box<dyn ObserverDurability>,
+        policy_dependencies: &[PathBuf],
+    ) -> Result<Self> {
         let root = open_root_no_follow(root_path)?;
         let root_identity = root_identity(&root)?;
+        let policy_dependencies = policy_watch_paths(root_path, policy_dependencies)?;
         let binding = durability.binding();
         if binding.owner_token.is_empty()
             || binding.provider_id.is_empty()
@@ -193,6 +198,8 @@ impl LinuxInotifyObserver {
         let mut inotify = Inotify::init()?;
         let mut watches = HashMap::new();
         add_tree(&mut inotify, root_path, Path::new(""), &mut watches, false)?;
+        let policy_parents = policy_parent_paths(&policy_dependencies);
+        add_policy_parent_watches(&mut inotify, root_path, &policy_parents, &mut watches)?;
 
         let owner_token = binding.owner_token.clone();
         let provider_id = binding.provider_id.clone();
@@ -229,6 +236,8 @@ impl LinuxInotifyObserver {
                     worker_root_path,
                     worker_root,
                     expected_identity,
+                    policy_dependencies,
+                    policy_parents,
                     records_tx,
                     worker_shared,
                 )
@@ -554,6 +563,8 @@ fn run_worker(
     root_path: PathBuf,
     root: File,
     root_identity_expected: Vec<u8>,
+    policy_dependencies: HashSet<PathBuf>,
+    policy_parents: HashSet<PathBuf>,
     records: SyncSender<DurabilityCommand>,
     shared: Arc<Shared>,
 ) {
@@ -590,6 +601,12 @@ fn run_worker(
             let Some(parent) = watches.get(&wd).cloned() else {
                 break;
             };
+            if policy_parents.contains(&parent)
+                && mask.intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF)
+            {
+                shared.revoke("inotify_policy_parent_replaced");
+                break;
+            }
             if parent.as_os_str().is_empty()
                 && (mask.contains(EventMask::DELETE_SELF) || mask.contains(EventMask::MOVE_SELF))
             {
@@ -608,6 +625,24 @@ fn run_worker(
                 break;
             }
             let relative = parent.join(name);
+            let is_dir = mask.contains(EventMask::ISDIR);
+            if is_dir
+                && mask.intersects(
+                    EventMask::CREATE
+                        | EventMask::DELETE
+                        | EventMask::MOVED_FROM
+                        | EventMask::MOVED_TO,
+                )
+                && policy_parents.iter().any(|policy_parent| {
+                    policy_parent == &relative || policy_parent.starts_with(&relative)
+                })
+            {
+                shared.revoke("inotify_policy_parent_replaced");
+                break;
+            }
+            if observer_internal_path(&relative) && !policy_dependencies.contains(&relative) {
+                continue;
+            }
             let Some(relative_text) = relative.to_str() else {
                 shared.revoke("inotify_path_decode_ambiguity");
                 break;
@@ -619,7 +654,6 @@ fn run_worker(
                     break;
                 }
             };
-            let is_dir = mask.contains(EventMask::ISDIR);
             if is_dir && (mask.contains(EventMask::CREATE) || mask.contains(EventMask::MOVED_TO)) {
                 let fail = {
                     let mut state = shared.lock();
@@ -877,6 +911,76 @@ fn add_tree(
     Ok(())
 }
 
+fn policy_watch_paths(root: &Path, dependencies: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+    let root = root.canonicalize()?;
+    dependencies
+        .iter()
+        .map(|dependency| {
+            let absolute = if dependency.is_absolute() {
+                dependency.clone()
+            } else {
+                root.join(dependency)
+            };
+            let relative = absolute.strip_prefix(&root).map_err(|_| {
+                Error::InvalidInput(format!(
+                    "native observer cannot qualify external policy dependency `{}`",
+                    dependency.display()
+                ))
+            })?;
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "native observer policy dependency is not an exact in-root file `{}`",
+                    dependency.display()
+                )));
+            }
+            Ok(relative.to_path_buf())
+        })
+        .collect()
+}
+
+fn add_policy_parent_watches(
+    inotify: &mut Inotify,
+    root: &Path,
+    parents: &HashSet<PathBuf>,
+    watches: &mut HashMap<WatchDescriptor, PathBuf>,
+) -> Result<()> {
+    let mut parents = parents.iter().cloned().collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+    for parent in parents {
+        let absolute = root.join(&parent);
+        let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+            Error::InvalidInput(format!(
+                "native observer policy parent `{}` is unavailable: {error}",
+                absolute.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "native observer policy parent is not a no-follow directory `{}`",
+                absolute.display()
+            )));
+        }
+        #[allow(deprecated)]
+        let wd = inotify.add_watch(&absolute, WATCH_MASK)?;
+        watches.insert(wd, parent);
+    }
+    Ok(())
+}
+
+fn policy_parent_paths(dependencies: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+    dependencies
+        .iter()
+        .filter_map(|dependency| dependency.parent())
+        .filter(|parent| observer_internal_path(parent))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
 fn observer_internal_path(relative: &Path) -> bool {
     relative.components().next().is_some_and(|component| {
         component.as_os_str() == ".trail" || component.as_os_str() == ".git"
@@ -1019,6 +1123,17 @@ impl NativeFixture {
         setup(temp.path())?;
         Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false)?;
         let db = Trail::open(temp.path())?;
+        fs::create_dir_all(db.workspace_root.join(".git/info"))?;
+        for path in [
+            db.workspace_root.join(".git/config"),
+            db.workspace_root.join(".git/config.worktree"),
+            db.workspace_root.join(".git/info/exclude"),
+            db.workspace_root.join(".trailignore"),
+        ] {
+            if !path.exists() {
+                fs::write(path, b"# native observer policy fixture\n")?;
+            }
+        }
         let branch = db.current_branch()?;
         let head = db.resolve_branch_ref(&branch)?;
         let scope = ScopeIdentity {
@@ -1068,11 +1183,18 @@ impl NativeFixture {
             filesystem_identity,
             provider_identity,
         };
+        let dependency_files = vec![
+            db.db_dir.join("config.toml"),
+            db.workspace_root.join(".git/info/exclude"),
+            db.workspace_root.join(".git/config"),
+            db.workspace_root.join(".git/config.worktree"),
+            db.workspace_root.join(".trailignore"),
+        ];
         let policy = CompiledPolicy::for_reconciliation_test(
             RecordingPolicySnapshot {
                 workspace_root: db.workspace_root.clone(),
                 ignore_gitignored: true,
-                dependency_files: Vec::new(),
+                dependency_files,
                 case_sensitive: true,
                 rule_sources: Vec::new(),
             },
@@ -1109,7 +1231,11 @@ impl NativeFixture {
             self.expected.provider_identity.clone(),
             fence.to_vec(),
         )?;
-        LinuxInotifyObserver::start(&self.db.workspace_root, Box::new(durability))
+        LinuxInotifyObserver::start(
+            &self.db.workspace_root,
+            Box::new(durability),
+            self.policy.dependency_files(),
+        )
     }
 
     fn published_paths(&self) -> Result<Vec<String>> {
@@ -1144,7 +1270,7 @@ impl ObserverDurability for SlowDurability {
 #[cfg(debug_assertions)]
 fn fixture() -> std::result::Result<(tempfile::TempDir, LinuxInotifyObserver), String> {
     let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let observer = LinuxInotifyObserver::start(temp.path(), Box::new(memory_durability(None)))
+    let observer = LinuxInotifyObserver::start(temp.path(), Box::new(memory_durability(None)), &[])
         .map_err(|error| error.to_string())?;
     Ok((temp, observer))
 }
@@ -1416,6 +1542,7 @@ pub(crate) fn run_fault_revocation_matrix() -> std::result::Result<(), String> {
         Box::new(SlowDurability {
             inner: memory_durability(None),
         }),
+        &[],
     )
     .map_err(|error| error.to_string())?;
     for index in 0..6_000 {
@@ -1450,8 +1577,9 @@ pub(crate) fn run_fault_revocation_matrix() -> std::result::Result<(), String> {
     expect_revoked(&observer, "inotify_path_decode_ambiguity")?;
 
     let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let observer = LinuxInotifyObserver::start(temp.path(), Box::new(memory_durability(Some(0))))
-        .map_err(|error| error.to_string())?;
+    let observer =
+        LinuxInotifyObserver::start(temp.path(), Box::new(memory_durability(Some(0))), &[])
+            .map_err(|error| error.to_string())?;
     fs::write(temp.path().join("durability-fails"), b"fail").map_err(|error| error.to_string())?;
     expect_revoked(&observer, "inotify_durability_failure")?;
     Ok(())
@@ -1551,8 +1679,12 @@ pub(crate) fn run_owner_death_and_root_replacement() -> std::result::Result<(), 
         vec![0x5a; 24],
     )
     .map_err(|error| error.to_string())?;
-    let replacement = LinuxInotifyObserver::start(&native.db.workspace_root, Box::new(durability))
-        .map_err(|error| error.to_string())?;
+    let replacement = LinuxInotifyObserver::start(
+        &native.db.workspace_root,
+        Box::new(durability),
+        native.policy.dependency_files(),
+    )
+    .map_err(|error| error.to_string())?;
     let mut advanced = native.expected.clone();
     advanced.epoch = 2;
     replacement
@@ -1898,6 +2030,132 @@ pub(crate) fn run_raw_decoder_faults() -> std::result::Result<(), String> {
 }
 
 #[cfg(debug_assertions)]
+pub(crate) fn run_policy_dependency_observation() -> std::result::Result<(), String> {
+    let dependency_paths = [
+        ".trail/config.toml",
+        ".git/info/exclude",
+        ".git/config",
+        ".git/config.worktree",
+        ".trailignore",
+    ];
+    for relative in dependency_paths {
+        let fixture = NativeFixture::new(|_| Ok(())).map_err(|error| error.to_string())?;
+        let observer = fixture.observer().map_err(|error| error.to_string())?;
+        let changed = fixture.db.workspace_root.join(relative);
+        install_initial_scan_hook(fixture.expected.scope_id, move || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&changed)?;
+            writeln!(file, "# changed after native observation began")?;
+            file.sync_all()?;
+            Ok(())
+        });
+        let result = reconcile_full(
+            &fixture.db,
+            &fixture.db.changed_path_ledger(),
+            &observer,
+            &fixture.expected,
+            &fixture.policy,
+            "native_policy_dependency_change",
+        );
+        let error = result
+            .err()
+            .ok_or_else(|| format!("policy dependency `{relative}` published false clean"))?;
+        if !error.to_string().contains("recording policy changed") {
+            return Err(format!(
+                "policy dependency `{relative}` failed for the wrong reason: {error}"
+            ));
+        }
+    }
+
+    let fixture = NativeFixture::new(|_| Ok(())).map_err(|error| error.to_string())?;
+    let observer = fixture.observer().map_err(|error| error.to_string())?;
+    let start = observer
+        .begin_observation(&fixture.expected)
+        .map_err(|error| error.to_string())?;
+    let internal_noise = fixture.db.db_dir.join("observer-internal-noise");
+    for index in 0_u64..2_000 {
+        fs::write(&internal_noise, index.to_be_bytes()).map_err(|error| error.to_string())?;
+    }
+    fs::remove_file(&internal_noise).map_err(|error| error.to_string())?;
+    fixture
+        .db
+        .conn
+        .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+        .map_err(|error| error.to_string())?;
+    let end = observer
+        .end_fence(&fixture.expected, &start)
+        .map_err(|error| error.to_string())?;
+    let mut observed = Vec::new();
+    observer
+        .drain_through(
+            &fixture.expected,
+            &observer
+                .root_identity()
+                .map_err(|error| error.to_string())?,
+            &start,
+            &end,
+            &mut |event| {
+                observed.push(event.path.as_str().to_string());
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if observed
+        .iter()
+        .any(|path| path.starts_with(".trail/") || path.starts_with(".git/"))
+    {
+        return Err(format!(
+            "internal storage activity self-fed the durable observer: {observed:?}"
+        ));
+    }
+
+    for parent in [".trail", ".git", ".git/info"] {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        fs::create_dir_all(root.path().join(".trail")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(root.path().join(".git/info")).map_err(|error| error.to_string())?;
+        let dependencies = [
+            root.path().join(".trail/config.toml"),
+            root.path().join(".git/config"),
+            root.path().join(".git/config.worktree"),
+            root.path().join(".git/info/exclude"),
+        ];
+        let observer = LinuxInotifyObserver::start(
+            root.path(),
+            Box::new(memory_durability(None)),
+            &dependencies,
+        )
+        .map_err(|error| error.to_string())?;
+        let watched_parent = root.path().join(parent);
+        let moved_parent = root
+            .path()
+            .join(format!("{}.replaced", parent.replace('/', "-")));
+        fs::rename(&watched_parent, &moved_parent).map_err(|error| error.to_string())?;
+        fs::create_dir_all(&watched_parent).map_err(|error| error.to_string())?;
+        expect_revoked(&observer, "inotify_policy_parent_replaced")?;
+    }
+
+    let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let external = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let result = LinuxInotifyObserver::start(
+        root.path(),
+        Box::new(memory_durability(None)),
+        &[external.path().join("policy")],
+    );
+    let error = match result {
+        Ok(_) => return Err("external policy dependency silently qualified".into()),
+        Err(error) => error,
+    };
+    if !error.to_string().contains("external policy dependency") {
+        return Err(format!(
+            "external policy dependency failed for the wrong reason: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn run_process_owner_child(root: &str) -> std::result::Result<(), String> {
     let _database;
     let _observer = if std::env::var_os("TRAIL_LINUX_OBSERVER_CHILD_SQLITE").is_some() {
@@ -1920,13 +2178,13 @@ pub(crate) fn run_process_owner_child(root: &str) -> std::result::Result<(), Str
         .map_err(|error| error.to_string())?;
         let durability = SegmentWriterDurability::new(writer, provider_identity, fence.to_vec())
             .map_err(|error| error.to_string())?;
-        let observer = LinuxInotifyObserver::start(Path::new(root), Box::new(durability))
+        let observer = LinuxInotifyObserver::start(Path::new(root), Box::new(durability), &[])
             .map_err(|error| error.to_string())?;
         _database = Some(database);
         observer
     } else {
         _database = None;
-        LinuxInotifyObserver::start(Path::new(root), Box::new(memory_durability(None)))
+        LinuxInotifyObserver::start(Path::new(root), Box::new(memory_durability(None)), &[])
             .map_err(|error| error.to_string())?
     };
     println!("TRAIL_LINUX_OBSERVER_OWNER_READY");

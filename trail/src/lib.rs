@@ -97,6 +97,11 @@ pub mod test_support {
         crate::db::run_raw_decoder_faults()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn changed_path_linux_policy_dependency_observation() -> std::result::Result<(), String> {
+        crate::db::run_policy_dependency_observation()
+    }
+
     pub fn changed_path_reconciliation_oracle() -> std::result::Result<(), String> {
         crate::db::run_oracle()
     }

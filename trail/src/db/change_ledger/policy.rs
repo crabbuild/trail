@@ -1420,6 +1420,10 @@ impl CompiledPolicy {
         self.fingerprint
     }
 
+    pub(crate) fn dependency_files(&self) -> &[PathBuf] {
+        &self.snapshot.dependency_files
+    }
+
     pub(crate) fn authorizes_reconciliation(&self, expected: &ExpectedScope) -> bool {
         self.adapter_equivalence == AdapterEquivalence::Equivalent
             && !self.stale_baseline
@@ -1461,7 +1465,7 @@ impl CompiledPolicy {
         let invalidation_index = PolicyInvalidationIndex::from_paths(
             &snapshot.workspace_root,
             snapshot.case_sensitive,
-            std::iter::empty(),
+            snapshot.dependency_files.iter(),
         );
         let mut policy = Self {
             snapshot,
