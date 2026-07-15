@@ -186,6 +186,11 @@ impl CaptureIngress {
     }
 
     pub(crate) fn finish(&self, reason: RelayFinishReason) {
+        if let Err(error) = self.spill.persist_finish(&reason)
+            && self.health.record_error(&error)
+        {
+            eprintln!("trail acp capture warning: durable finish journal failed: {error}");
+        }
         if let Some(tx) = &self.tx {
             if let Err(error) = tx.try_send(CaptureCommand::Finish(reason)) {
                 let reason = match error {
@@ -274,6 +279,8 @@ struct SpillStore {
 #[derive(Default)]
 struct SpillState {
     claimed_paths: Vec<PathBuf>,
+    claimed_finish_paths: Vec<PathBuf>,
+    recovered_finishes: VecDeque<RelayFinishReason>,
     claimed_owners: Vec<(PathBuf, File)>,
 }
 
@@ -332,23 +339,51 @@ impl SpillStore {
         Ok(())
     }
 
+    fn persist_finish(&self, reason: &RelayFinishReason) -> Result<()> {
+        let _guard = self
+            .state
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        let counter = SPILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.dir.join(format!(
+            "{}.finish.{}.{}.tmp",
+            self.connection_id,
+            std::process::id(),
+            counter
+        ));
+        let final_path = self.finish_path_for(&self.connection_id);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, reason)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &final_path)?;
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+
     fn take_all(&self) -> Result<Vec<CapturedFrame>> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
-        if !state.claimed_paths.is_empty() {
+        if !state.claimed_paths.is_empty() || !state.claimed_finish_paths.is_empty() {
             return Ok(Vec::new());
         }
         let mut paths = fs::read_dir(&self.dir)?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "jsonl" || extension == "processing")
+                spill_connection_id(path).is_some()
+                    && path.extension().is_some_and(|extension| {
+                        extension == "jsonl" || extension == "json" || extension == "processing"
+                    })
             })
             .collect::<Vec<_>>();
         paths.sort();
         let mut claimed = Vec::new();
+        let mut claimed_finishes = Vec::new();
         let mut recoverable_connections = HashSet::new();
         recoverable_connections.insert(self.connection_id.clone());
         let mut active_connections = HashSet::new();
@@ -377,18 +412,28 @@ impl SpillStore {
             if active_connections.contains(&connection_id) {
                 continue;
             }
-            if path
+            let finish = spill_finish_path(&path);
+            if !path
                 .extension()
-                .is_some_and(|extension| extension == "jsonl")
+                .is_some_and(|extension| extension == "processing")
             {
                 let counter = SPILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let claimed_path = path.with_extension(format!(
-                    "jsonl.{}.{}.processing",
+                    "{}.{}.{}.processing",
+                    path.extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("spill"),
                     std::process::id(),
                     counter
                 ));
                 fs::rename(&path, &claimed_path)?;
-                claimed.push(claimed_path);
+                if finish {
+                    claimed_finishes.push(claimed_path);
+                } else {
+                    claimed.push(claimed_path);
+                }
+            } else if finish {
+                claimed_finishes.push(path);
             } else {
                 claimed.push(path);
             }
@@ -403,12 +448,26 @@ impl SpillStore {
                 }
             }
         }
+        let mut finishes = VecDeque::new();
+        for path in &claimed_finishes {
+            let file = OpenOptions::new().read(true).open(path)?;
+            finishes.push_back(serde_json::from_reader(file)?);
+        }
         state.claimed_paths = claimed;
+        state.claimed_finish_paths = claimed_finishes;
+        state.recovered_finishes = finishes;
         state.claimed_owners = claimed_owners;
         Ok(frames)
     }
 
-    fn complete_claimed(&self) -> Result<()> {
+    fn take_recovered_finishes(&self) -> Vec<RelayFinishReason> {
+        self.state
+            .lock()
+            .map(|mut state| state.recovered_finishes.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn complete_claimed_frames(&self) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -420,19 +479,44 @@ impl SpillStore {
                 Err(error) => return Err(Error::Io(error)),
             }
         }
-        for (owner_path, _owner) in state.claimed_owners.drain(..) {
-            match fs::remove_file(owner_path) {
+        if state.claimed_finish_paths.is_empty() {
+            remove_claimed_owners(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn complete_finish(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InvalidInput("ACP spill lock poisoned".to_string()))?;
+        for path in state.claimed_finish_paths.drain(..) {
+            match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Error::Io(error)),
             }
         }
+        match fs::remove_file(self.finish_path_for(&self.connection_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+        state.recovered_finishes.clear();
+        remove_claimed_owners(&mut state)?;
+        File::open(&self.dir)?.sync_all()?;
         Ok(())
+    }
+
+    fn finish_path_for(&self, connection_id: &str) -> PathBuf {
+        self.dir.join(format!("{connection_id}.finish.json"))
     }
 
     fn release_claimed(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.claimed_paths.clear();
+            state.claimed_finish_paths.clear();
+            state.recovered_finishes.clear();
             state.claimed_owners.clear();
         }
     }
@@ -440,6 +524,17 @@ impl SpillStore {
     fn path_for(&self, connection_id: &str) -> PathBuf {
         self.dir.join(format!("{connection_id}.jsonl"))
     }
+}
+
+fn remove_claimed_owners(state: &mut SpillState) -> Result<()> {
+    for (owner_path, _owner) in state.claimed_owners.drain(..) {
+        match fs::remove_file(owner_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Ok(())
 }
 
 impl Drop for SpillStore {
@@ -450,14 +545,28 @@ impl Drop for SpillStore {
 
 fn spill_connection_id(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    let (connection_id, _) = name.split_once(".jsonl")?;
+    let connection_id = name
+        .split_once(".jsonl")
+        .or_else(|| name.split_once(".finish.json"))?
+        .0;
     (!connection_id.is_empty()).then(|| connection_id.to_string())
+}
+
+fn spill_finish_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".finish.json"))
 }
 
 #[cfg(unix)]
 fn lock_spill_owner(file: &File) -> Result<()> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|error| Error::Io(error.into()))
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Err(Error::InvalidInput(
+            "ACP capture connection identity is already active".to_string(),
+        )),
+        Err(error) => Err(Error::Io(error.into())),
+    }
 }
 
 #[cfg(not(unix))]
@@ -498,13 +607,17 @@ fn capture_worker(
             VecDeque::new()
         }
     };
+    load_recovered_finish(&spill, &pending_finish);
     let mut deferred_barriers = Vec::new();
 
     loop {
         if stopping.load(Ordering::Acquire) {
             let mut recovered_spill = true;
             match spill.take_all() {
-                Ok(frames) => pending.extend(frames.into_iter().map(|frame| (frame, false))),
+                Ok(frames) => {
+                    pending.extend(frames.into_iter().map(|frame| (frame, false)));
+                    load_recovered_finish(&spill, &pending_finish);
+                }
                 Err(error) => {
                     recovered_spill = false;
                     if health.record_error(&error) {
@@ -571,13 +684,13 @@ fn capture_worker(
                     }
                     _ => {
                         if frames.is_empty() {
-                            let _ = spill.complete_claimed();
+                            let _ = spill.complete_claimed_frames();
                         }
                         frames.is_empty()
                     }
                 };
             if preserved_every_frame
-                && settle_pending_finish(&coordinator, &health, &pending_finish)
+                && settle_pending_finish(&coordinator, &health, &spill, &pending_finish)
             {
                 acknowledge_barriers(&mut deferred_barriers);
             }
@@ -604,6 +717,7 @@ fn capture_worker(
                 Ok(frames) => {
                     merged_frames |= !frames.is_empty();
                     pending.extend(frames.into_iter().map(|frame| (frame, false)));
+                    load_recovered_finish(&spill, &pending_finish);
                 }
                 Err(error) => {
                     if health.record_error(&error) {
@@ -627,7 +741,7 @@ fn capture_worker(
                         .last_projected_sequence
                         .store(frame.sequence, Ordering::Release);
                     if pending.is_empty() {
-                        match spill.complete_claimed() {
+                        match spill.complete_claimed_frames() {
                             Err(error) => {
                                 if health.record_error(&error) {
                                     eprintln!(
@@ -671,7 +785,7 @@ fn capture_worker(
         }
 
         if !spill_mode.load(Ordering::Acquire)
-            && settle_pending_finish(&coordinator, &health, &pending_finish)
+            && settle_pending_finish(&coordinator, &health, &spill, &pending_finish)
         {
             acknowledge_barriers(&mut deferred_barriers);
         }
@@ -713,18 +827,25 @@ fn sort_pending_frames(pending: &mut VecDeque<(CapturedFrame, bool)>) {
 fn settle_pending_finish(
     coordinator: &Arc<Mutex<CaptureCoordinator>>,
     health: &CaptureHealth,
+    spill: &SpillStore,
     pending_finish: &Mutex<Option<RelayFinishReason>>,
 ) -> bool {
     let Some(reason) = take_finish(pending_finish) else {
         return true;
     };
-    match process_finish(coordinator, reason.clone()) {
+    match process_finish(coordinator, reason.clone()).and_then(|()| spill.complete_finish()) {
         Ok(()) => true,
         Err(error) => {
             store_finish(pending_finish, reason);
             health.record_error(&error);
             false
         }
+    }
+}
+
+fn load_recovered_finish(spill: &SpillStore, pending_finish: &Mutex<Option<RelayFinishReason>>) {
+    for reason in spill.take_recovered_finishes() {
+        store_finish(pending_finish, reason);
     }
 }
 
@@ -1201,10 +1322,18 @@ mod tests {
             !ingress.flush(Duration::from_millis(100)),
             "barrier acknowledged before the earlier spill and finish were projected"
         );
+        assert!(
+            ingress.spill.finish_path_for("barrier-order").is_file(),
+            "timed-out finalization lost its durable finish marker"
+        );
         drop(writer_lock);
         assert!(
             ingress.flush(Duration::from_secs(2)),
             "barrier did not acknowledge after spill replay and finish projection"
+        );
+        assert!(
+            !ingress.spill.finish_path_for("barrier-order").exists(),
+            "finish marker remained after terminal projection was acknowledged"
         );
     }
 
@@ -1233,6 +1362,42 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].connection_id, "live-connection");
         assert_eq!(recovered[0].sequence, 7);
-        recovery.complete_claimed().unwrap();
+        recovery.complete_claimed_frames().unwrap();
+    }
+
+    #[test]
+    fn spill_recovery_preserves_the_terminal_reason_until_acknowledged() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("acp-ingress");
+        let live = SpillStore::new(dir.clone(), "finished-connection".to_string()).unwrap();
+        live.persist_finish(&RelayFinishReason::AgentError(
+            "upstream terminated".to_string(),
+        ))
+        .unwrap();
+        drop(live);
+
+        let recovery = SpillStore::new(dir.clone(), "recovery-connection".to_string()).unwrap();
+        assert!(recovery.take_all().unwrap().is_empty());
+        assert_eq!(
+            recovery.take_recovered_finishes(),
+            vec![RelayFinishReason::AgentError(
+                "upstream terminated".to_string()
+            )]
+        );
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| spill_finish_path(&entry.path())),
+            "finish marker disappeared before terminal projection committed"
+        );
+        recovery.complete_finish().unwrap();
+        assert!(
+            !fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| spill_finish_path(&entry.path())),
+            "acknowledged finish marker remained in the journal"
+        );
     }
 }

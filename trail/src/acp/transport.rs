@@ -5,6 +5,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use super::protocol::{Direction, Frame};
 use super::AcpRelayOptions;
 use crate::{Error, Result};
@@ -14,7 +16,7 @@ pub(crate) const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_PUMP_DRAIN_TIMEOUT: Duration = ACP_SHUTDOWN_TIMEOUT;
 const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum RelayFinishReason {
     EditorEof,
     EditorError(String),
@@ -127,7 +129,11 @@ impl<O: FrameObserver> StdioRelay<O> {
 
         let (editor_result, agent_result) = pump_results(first, second)?;
         self.observer.finish(reason);
-        self.observer.flush(ACP_CAPTURE_FLUSH_TIMEOUT);
+        if !self.observer.flush(ACP_CAPTURE_FLUSH_TIMEOUT) {
+            return Err(Error::InvalidInput(
+                "ACP capture did not settle before the finalization deadline".to_string(),
+            ));
+        }
         editor_result.map_err(Error::Io)?;
         agent_result.map_err(Error::Io)?;
         if exit.timed_out {
