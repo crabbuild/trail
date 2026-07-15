@@ -721,6 +721,10 @@ impl WorkspaceDaemonRuntime {
                         },
                     ));
                 }
+                (Err(error), _) if !retried && requires_reconciliation(&error) => {
+                    self.reconcile(db, "authoritative_snapshot_retry")?;
+                    retried = true;
+                }
                 (Err(error), _) => return Err(error),
                 (_, Err(error)) if !retried && requires_reconciliation(&error) => {
                     self.reconcile(db, "authoritative_snapshot_retry")?;

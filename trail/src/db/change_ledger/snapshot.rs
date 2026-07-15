@@ -8,7 +8,7 @@ use super::{
     BaselineIdentity, CandidateSnapshot, EvidenceAcknowledgementToken, EvidenceCut, ExpectedScope,
 };
 use crate::db::storage::file_kind_from_index;
-use crate::db::{DiskManifest, OperationMetricsDelta};
+use crate::db::{DiskFile, DiskManifest, OperationMetricsDelta};
 use crate::model::{FileDiffSummary, FileEntry};
 use crate::model::{Operation, RefRecord};
 use crate::{ObjectId, Result};
@@ -49,6 +49,7 @@ pub(crate) struct CandidateComparison {
     pub(crate) selections: Vec<String>,
     pub(crate) baseline_files: BTreeMap<String, FileEntry>,
     pub(crate) disk_manifest: BTreeMap<String, DiskManifest>,
+    pub(crate) disk_files: Vec<DiskFile>,
     pub(crate) summaries: Vec<FileDiffSummary>,
 }
 
@@ -102,6 +103,7 @@ impl crate::Trail {
                 selections,
                 baseline_files,
                 disk_manifest: BTreeMap::new(),
+                disk_files: Vec::new(),
                 summaries: Vec::new(),
             });
         }
@@ -116,30 +118,49 @@ impl crate::Trail {
             });
         }
         let mut disk_manifest = BTreeMap::new();
+        let mut disk_files = Vec::new();
         for path in exact {
             if matcher.is_ignored(&path, false)? {
                 continue;
             }
-            if let Some(file) = self.read_pinned_worktree_path(&pinned, policy, &path)? {
+            if let Some(file) = self.read_pinned_candidate_path(&pinned, policy, &path)? {
+                let bytes = file.bytes.ok_or_else(|| {
+                    crate::Error::Corrupt(
+                        "authoritative candidate read omitted captured contents".into(),
+                    )
+                })?;
                 disk_manifest.insert(
-                    path,
+                    path.clone(),
                     DiskManifest {
                         kind: file_kind_from_index(&file.file_kind)?,
                         executable: file.executable,
                         content_hash: file.content_hash,
                     },
                 );
+                disk_files.push(DiskFile {
+                    path,
+                    bytes,
+                    executable: file.executable,
+                });
             }
         }
         self.visit_pinned_worktree_prefix_files(&pinned, &matcher, &prefixes, |file| {
+            let bytes = file.bytes.ok_or_else(|| {
+                crate::Error::Corrupt("authoritative prefix read omitted captured contents".into())
+            })?;
             disk_manifest.insert(
-                file.path,
+                file.path.clone(),
                 DiskManifest {
                     kind: file_kind_from_index(&file.file_kind)?,
                     executable: file.executable,
                     content_hash: file.content_hash,
                 },
             );
+            disk_files.push(DiskFile {
+                path: file.path,
+                bytes,
+                executable: file.executable,
+            });
             Ok(())
         })?;
         if !self.verify_pinned_worktree_root(&pinned)? {
@@ -159,6 +180,7 @@ impl crate::Trail {
             selections,
             baseline_files,
             disk_manifest,
+            disk_files,
             summaries,
         })
     }
@@ -168,6 +190,7 @@ impl crate::Trail {
 pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
     use crate::model::Actor;
     use crate::{InitImportMode, Trail};
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
 
@@ -193,6 +216,25 @@ pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
     super::prepare_workspace_daemon(&mut db, false).map_err(|error| error.to_string())?;
     set_command_authority_override(true);
     let _reset = OverrideReset;
+
+    let consume_attempts = std::cell::Cell::new(0_u8);
+    db.with_workspace_authoritative_snapshot(|_, _, candidates| {
+        let attempt = consume_attempts.get().saturating_add(1);
+        consume_attempts.set(attempt);
+        if attempt == 1 {
+            return Err(crate::Error::ChangeLedgerReconcileRequired {
+                scope: candidates.expected.scope_id.to_text(),
+                state: "untrusted_gap".into(),
+                reason: "command_test_consumer_retry".into(),
+                command: "trail status".into(),
+            });
+        }
+        Ok(())
+    })
+    .map_err(|error| format!("consumer reconciliation retry: {error}"))?;
+    if consume_attempts.get() != 2 {
+        return Err("consumer reconciliation did not retry the entire fenced flow once".into());
+    }
 
     let clean = db
         .status_from_changed_path_ledger()
@@ -228,17 +270,49 @@ pub(crate) fn run_command_flow() -> std::result::Result<(), String> {
                 .collect::<Vec<_>>()
         ));
     }
+    let changed_after_comparison = temp.path().join("tracked.txt");
+    crate::db::install_observed_record_after_compare_hook(move || {
+        fs::write(changed_after_comparison, b"changed-after-comparison\n")?;
+        Ok(())
+    });
     let recorded = db
         .record(None, Some("observed".into()), Actor::human(), false)
         .map_err(|error| format!("observed record: {error}"))?;
     if recorded.operation.is_none() || recorded.changed_paths.len() != 1 {
         return Err("observed record did not publish the candidate change".into());
     }
-    let after = db
+    let recorded_files = db
+        .load_root_files_for_paths(&recorded.root_id, &["tracked.txt".to_string()])
+        .map_err(|error| format!("load observed record root: {error}"))?;
+    let recorded_hash = recorded_files
+        .get("tracked.txt")
+        .map(|entry| entry.content_hash.as_str());
+    let compared_hash = hex::encode(Sha256::digest(b"changed\n"));
+    if recorded_hash != Some(compared_hash.as_str()) {
+        return Err("observed record did not use the authorized pinned candidate bytes".into());
+    }
+    let after_race = db
         .status_from_changed_path_ledger()
         .map_err(|error| format!("post-record authoritative status: {error}"))?;
+    if after_race.changed_paths.len() != 1 || after_race.changed_paths[0].path != "tracked.txt" {
+        return Err("post-comparison mutation was not retained as c2 evidence".into());
+    }
+    let recorded_after_race = db
+        .record(
+            None,
+            Some("observed-after-race".into()),
+            Actor::human(),
+            false,
+        )
+        .map_err(|error| format!("observed record after comparison race: {error}"))?;
+    if recorded_after_race.operation.is_none() || recorded_after_race.changed_paths.len() != 1 {
+        return Err("second observed record did not publish retained c2 evidence".into());
+    }
+    let after = db
+        .status_from_changed_path_ledger()
+        .map_err(|error| format!("final post-record authoritative status: {error}"))?;
     if !after.changed_paths.is_empty() {
-        return Err("atomic observed record did not acknowledge its unchanged c1 evidence".into());
+        return Err("atomic observed record did not acknowledge unchanged evidence".into());
     }
     Ok(())
 }

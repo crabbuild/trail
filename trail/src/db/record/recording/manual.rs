@@ -1,5 +1,36 @@
 use super::*;
 
+#[cfg(debug_assertions)]
+type ObservedRecordAfterCompareHook = Box<dyn FnOnce() -> Result<()> + Send>;
+
+#[cfg(debug_assertions)]
+static OBSERVED_RECORD_AFTER_COMPARE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedRecordAfterCompareHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(debug_assertions)]
+pub(crate) fn install_observed_record_after_compare_hook(
+    hook: impl FnOnce() -> Result<()> + Send + 'static,
+) {
+    *OBSERVED_RECORD_AFTER_COMPARE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(Box::new(hook));
+}
+
+#[cfg(debug_assertions)]
+fn run_observed_record_after_compare_hook() -> Result<()> {
+    let hook = OBSERVED_RECORD_AFTER_COMPARE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
 impl Trail {
     pub fn record(
         &mut self,
@@ -345,24 +376,39 @@ impl Trail {
                 if comparison.summaries.is_empty() {
                     return Ok(None);
                 }
-                let paths = comparison
-                    .summaries
-                    .iter()
-                    .map(|summary| summary.path.clone())
-                    .collect::<Vec<_>>();
-                // Candidate selection and trust are pinned to the daemon's
-                // compiled policy above.  c2 retains any filesystem race that
-                // occurs while bytes are materialized here.
-                let disk_files = db.scan_visible_files_for_paths(&paths)?;
+                #[cfg(debug_assertions)]
+                run_observed_record_after_compare_hook()?;
                 let change_id = db.allocate_change_id(&actor_for_build.id, "record")?;
-                let built = db.build_root_for_selected_record_incremental(
+                let built = db.build_root_for_selected_disk_files_incremental(
                     &head.root_id,
                     &comparison.baseline_files,
-                    &disk_files,
-                    &paths,
-                    false,
+                    &comparison.disk_files,
+                    &comparison.selections,
                     &change_id,
                 )?;
+                let built_manifest = built
+                    .files
+                    .iter()
+                    .map(|(path, entry)| {
+                        (
+                            path.clone(),
+                            DiskManifest {
+                                kind: entry.kind.clone(),
+                                executable: entry.executable,
+                                content_hash: entry.content_hash.clone(),
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                if built_manifest != comparison.disk_manifest {
+                    return Err(crate::Error::ChangeLedgerReconcileRequired {
+                        scope: candidates.expected.scope_id.to_text(),
+                        state: "untrusted_gap".into(),
+                        reason: "authorized candidate contents changed during root construction"
+                            .into(),
+                        command: "trail record".into(),
+                    });
+                }
                 let diff = db.diff_file_maps(&comparison.baseline_files, &built.files)?;
                 if diff.changes.is_empty() {
                     return Ok(None);
@@ -402,7 +448,9 @@ impl Trail {
             c2: fenced.c2,
             acknowledgement_tokens: fenced.candidates.acknowledgement_tokens,
         };
-        let _lock = self.acquire_write_lock()?;
+        let _lock = Self::with_write_lock_wait(std::time::Duration::from_secs(5), || {
+            self.acquire_write_lock()
+        })?;
         self.commit_observed_record(&operation, &head, &observed, true, None)?;
         self.set_worktree_index_baseline(&root_id)?;
         Ok(RecordReport {

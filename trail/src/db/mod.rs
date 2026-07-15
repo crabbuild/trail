@@ -2602,7 +2602,7 @@ pub(crate) struct OperationObject {
     operation: Operation,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiskManifest {
     kind: FileKind,
     executable: bool,
@@ -3124,6 +3124,8 @@ mod lane;
 mod merge;
 mod performance;
 mod record;
+#[cfg(debug_assertions)]
+pub(crate) use record::install_observed_record_after_compare_hook;
 mod storage;
 use self::performance::*;
 pub(crate) use storage::{observed_exact_paths_for_candidates, ObservedPathKind};

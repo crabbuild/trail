@@ -44,6 +44,9 @@ pub(crate) struct ReconciliationFile {
     pub(crate) size_bytes: u64,
     pub(crate) identity: Vec<u8>,
     pub(crate) peak_buffer_bytes: u64,
+    /// Present only for command candidate materialization. Full reconciliation
+    /// remains streaming and never retains complete file contents.
+    pub(crate) bytes: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,9 +157,12 @@ impl Trail {
             if !entry.file_type().is_file() {
                 continue;
             }
-            if let Some(file) =
-                read_reconciliation_file_no_follow(&root.descriptor, &relative, &self.config.text)?
-            {
+            if let Some(file) = read_reconciliation_file_no_follow(
+                &root.descriptor,
+                &relative,
+                &self.config.text,
+                false,
+            )? {
                 visitor(ReconciliationScanEntry::File(file))?;
             }
         }
@@ -185,7 +191,20 @@ impl Trail {
         if reconcile_path_ignored(&path) {
             return Ok(None);
         }
-        read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text)
+        read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text, false)
+    }
+
+    pub(crate) fn read_pinned_candidate_path(
+        &self,
+        root: &PinnedWorktreeRoot,
+        _policy: &CompiledPolicy,
+        path: &str,
+    ) -> Result<Option<ReconciliationFile>> {
+        let path = normalize_relative_path(path)?;
+        if reconcile_path_ignored(&path) {
+            return Ok(None);
+        }
+        read_reconciliation_file_no_follow(&root.descriptor, &path, &self.config.text, true)
     }
 
     /// Walk only the selected complete prefixes from descriptor-relative,
@@ -212,9 +231,12 @@ impl Trail {
             if matcher.is_ignored(&prefix, false)? {
                 continue;
             }
-            if let Some(file) =
-                read_reconciliation_file_no_follow(&root.descriptor, &prefix, &self.config.text)?
-            {
+            if let Some(file) = read_reconciliation_file_no_follow(
+                &root.descriptor,
+                &prefix,
+                &self.config.text,
+                true,
+            )? {
                 visitor(file)?;
                 continue;
             }
@@ -272,6 +294,7 @@ impl Trail {
                                 &root.descriptor,
                                 &relative,
                                 &self.config.text,
+                                true,
                             )? {
                                 visitor(file)?;
                             }
@@ -1361,6 +1384,7 @@ fn read_reconciliation_file_no_follow(
     root: &fs::File,
     relative: &str,
     text: &TextConfig,
+    retain_bytes: bool,
 ) -> Result<Option<ReconciliationFile>> {
     use rustix::fs::{fstat, openat, statat, AtFlags, FileType, Mode, OFlags};
 
@@ -1430,12 +1454,16 @@ fn read_reconciliation_file_no_follow(
         let mut current_line_bytes = 0u64;
         let mut max_line_bytes = 0u64;
         let mut size = 0u64;
+        let mut retained = retain_bytes.then(Vec::new);
         loop {
             let read = file.read(&mut buffer).map_err(Error::Io)?;
             if read == 0 {
                 break;
             }
             hasher.update(&buffer[..read]);
+            if let Some(retained) = retained.as_mut() {
+                retained.extend_from_slice(&buffer[..read]);
+            }
             size = size.saturating_add(read as u64);
             if binary_bytes_seen < 8192 {
                 let inspected = read.min(8192 - binary_bytes_seen);
@@ -1495,7 +1523,9 @@ fn read_reconciliation_file_no_follow(
             size_bytes: size,
             identity: stat_identity(&after_open),
             peak_buffer_bytes: (buffer.len() + utf8_validation.capacity() + utf8_tail.capacity())
+                .saturating_add(retained.as_ref().map_or(0, Vec::capacity))
                 as u64,
+            bytes: retained,
         }));
     }
     Err(Error::InvalidInput(format!(
@@ -1508,6 +1538,7 @@ fn read_reconciliation_file_no_follow(
     _root: &fs::File,
     relative: &str,
     _text: &TextConfig,
+    _retain_bytes: bool,
 ) -> Result<Option<ReconciliationFile>> {
     Err(Error::InvalidInput(format!(
         "qualified reconciliation of `{relative}` is unsupported on this platform"

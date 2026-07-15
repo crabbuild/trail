@@ -91,16 +91,18 @@ impl ObserverDurability for SegmentWriterDurability {
     }
 
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut> {
-        self.writer.append(&[record])?;
-        self.writer.flush_durable()
+        crate::Trail::with_write_lock_wait(Duration::from_secs(5), || {
+            self.writer.append(&[record])?;
+            self.writer.flush_durable()
+        })
     }
 
     fn heartbeat(&mut self) -> Result<()> {
-        self.writer.heartbeat()
+        crate::Trail::with_write_lock_wait(Duration::from_secs(5), || self.writer.heartbeat())
     }
 
     fn revoke_owner(&mut self, reason: &str) -> Result<()> {
-        self.writer.revoke(reason)
+        crate::Trail::with_write_lock_wait(Duration::from_secs(5), || self.writer.revoke(reason))
     }
 }
 

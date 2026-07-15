@@ -805,7 +805,7 @@ pub(crate) fn fold_observer_interval(
             )?;
         }
     }
-    if candidate_cap_exceeded(&tx, &scope_id)? {
+    if evidence_cap_exceeded(&tx, &scope_id)? {
         tx.execute_batch(
             "ROLLBACK TO changed_path_continuous_fold_rows;
              RELEASE changed_path_continuous_fold_rows;",
@@ -1267,7 +1267,7 @@ impl ReconciliationAttempt {
                 self.attempt_id,
             ],
         )?;
-        if candidate_cap_exceeded(&tx, &scope_id)? {
+        if evidence_cap_exceeded(&tx, &scope_id)? {
             return self.fail_candidate_cap_transaction(tx);
         }
         #[cfg(test)]
@@ -1504,7 +1504,7 @@ impl ReconciliationAttempt {
                 self.attempt_id,
             ],
         )?;
-        if candidate_cap_exceeded(&tx, &scope_id)? {
+        if evidence_cap_exceeded(&tx, &scope_id)? {
             return self.fail_candidate_cap_transaction(tx);
         }
         #[cfg(test)]
@@ -2561,15 +2561,19 @@ fn mark_attempt_failed(conn: &rusqlite::Connection, attempt_id: &str, reason: &s
     Ok(())
 }
 
-fn candidate_cap_exceeded(conn: &rusqlite::Connection, scope_id: &str) -> Result<bool> {
-    let (count, cap): (i64, i64) = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1),
-                max_candidate_rows
+fn evidence_cap_exceeded(conn: &rusqlite::Connection, scope_id: &str) -> Result<bool> {
+    let (candidate_count, candidate_cap, prefix_count, prefix_cap): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM changed_path_entries WHERE scope_id=?1),
+                max_candidate_rows,
+                (SELECT COUNT(*) FROM changed_path_prefixes WHERE scope_id=?1),
+                max_prefix_rows
          FROM changed_path_scopes WHERE scope_id=?1",
-        [scope_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    Ok(db_u64(count)? > db_u64(cap)?)
+            [scope_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    Ok(db_u64(candidate_count)? > db_u64(candidate_cap)?
+        || db_u64(prefix_count)? > db_u64(prefix_cap)?)
 }
 
 fn reconcile_required(expected: &ExpectedScope, state: &str, reason: &str) -> Error {
@@ -3989,6 +3993,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cuts, (150, 140));
+    }
+
+    #[test]
+    fn continuous_fold_prefix_cap_rolls_back_rows_and_marks_overflow_atomically() {
+        let fixture = Fixture::new();
+        let scope_id = fixture.expected.scope_id.to_text();
+        let now = now_ts();
+        fixture
+            .db
+            .conn
+            .execute(
+                "UPDATE changed_path_scopes
+                 SET max_prefix_rows=1,trust_state='trusted',trust_reason='test_ready'
+                 WHERE scope_id=?1",
+                [&scope_id],
+            )
+            .unwrap();
+        fixture
+            .db
+            .conn
+            .execute(
+                "INSERT INTO changed_path_prefixes(
+                     scope_id,normalized_prefix,completeness_reason,event_flags,source_mask,
+                     first_sequence,last_sequence,provider_id,provider_sequence,
+                     created_at,updated_at
+                 ) VALUES(?1,'existing','provider_complete',?2,?3,99,99,?4,99,?5,?5)",
+                params![
+                    scope_id,
+                    EvidenceFlags::PROVIDER_COMPLETE_PREFIX.0,
+                    super::super::EvidenceSource::Observer.mask(),
+                    hex::encode(&fixture.expected.provider_identity),
+                    now,
+                ],
+            )
+            .unwrap();
+        let start = ObserverFence {
+            sequence: 100,
+            durable_offset: 100,
+            nonce: b"continuous-prefix-cap-start".to_vec(),
+        };
+        let end = ObserverFence {
+            sequence: 101,
+            durable_offset: 100,
+            nonce: b"continuous-prefix-cap-end".to_vec(),
+        };
+        let root_identity = b"continuous-prefix-cap-root".to_vec();
+        let mut qualification = ObserverQualification::seal_for_test(
+            &fixture.expected,
+            root_identity.clone(),
+            start.clone(),
+            end.clone(),
+        );
+        let ledger = fixture.db.changed_path_ledger();
+
+        let error = fold_observer_interval(
+            &ledger,
+            &fixture.expected,
+            &root_identity,
+            &start,
+            &end,
+            &mut qualification,
+            &[ObserverEvent {
+                path: LedgerPath::parse("new-prefix").unwrap(),
+                flags: EvidenceFlags::PROVIDER_COMPLETE_PREFIX,
+                sequence: 101,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::ChangeLedgerReconcileRequired { .. }));
+        assert_eq!(fixture.ledger_prefixes(), vec!["existing".to_string()]);
+        let scope: (String, i64, i64) = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT trust_state,durable_offset,folded_offset
+                 FROM changed_path_scopes WHERE scope_id=?1",
+                [scope_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(scope, ("overflow".into(), 100, 100));
+        let segment_folded: i64 = fixture
+            .db
+            .conn
+            .query_row(
+                "SELECT folded_end_offset FROM changed_path_observer_segments
+                 WHERE scope_id=?1",
+                [fixture.expected.scope_id.to_text()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(segment_folded, 100);
     }
 
     #[test]
