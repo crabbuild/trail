@@ -23,6 +23,9 @@ const TOKEN_FILE: &str = "daemon.token";
 const LOCK_FILE: &str = "daemon.lock";
 const STARTING_FILE: &str = "daemon.starting.json";
 const SOCKET_FILE: &str = "changed-path.sock";
+const SOCKET_TOMBSTONE_PREFIX: &str = ".changed-path-socket-tombstone.";
+const SOCKET_TOMBSTONE_SUFFIX: &str = ".removing";
+const SOCKET_TOMBSTONE_CAP: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct WorkspaceDaemonEndpoint {
@@ -560,9 +563,18 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
     authority.verify_trail_identity(db.db_dir())?;
     // Keep the private bind leaf shorter than the stable leaf so workspaces
     // whose final socket fits SUN_LEN do not fail only during publication.
+    ensure_socket_tombstone_capacity(&authority.trail_directory)?;
     let socket_tmp_leaf = format!(".s{}", random_hex(6)?);
     let socket_tmp_path = db.db_dir().join(&socket_tmp_leaf);
-    let socket = std::os::unix::net::UnixListener::bind(&socket_tmp_path)?;
+    // This process was exec'd solely as the workspace daemon, and this bind
+    // precedes observer/server worker startup, so the process-global umask
+    // window cannot affect concurrent Trail-created files.
+    let socket = {
+        let _umask = ScopedUmask::owner_only();
+        std::os::unix::net::UnixListener::bind(&socket_tmp_path)
+    }?;
+    #[cfg(debug_assertions)]
+    test_socket_bound_boundary(&socket_tmp_leaf)?;
     let socket_identity =
         verify_socket_leaf_owner(&authority.trail_directory, &socket_tmp_leaf, None)?;
     let mut unpublished_socket = BoundSocketGuard {
@@ -572,7 +584,6 @@ pub(super) fn run_auto_workspace_daemon(mut db: Trail) -> Result<()> {
         inode: socket_identity.1,
         armed: true,
     };
-    fs::set_permissions(&socket_tmp_path, fs::Permissions::from_mode(0o600))?;
     verify_secure_socket_leaf_identity(
         &authority.trail_directory,
         &socket_tmp_leaf,
@@ -729,6 +740,22 @@ struct BoundSocketGuard {
     device: u64,
     inode: u64,
     armed: bool,
+}
+
+struct ScopedUmask(libc::mode_t);
+
+impl ScopedUmask {
+    fn owner_only() -> Self {
+        Self(unsafe { libc::umask(0o177) })
+    }
+}
+
+impl Drop for ScopedUmask {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
 }
 
 impl Drop for BoundSocketGuard {
@@ -1205,6 +1232,66 @@ fn test_socket_unlink_boundary() -> Result<()> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+fn test_socket_quarantine_verified_boundary(quarantine: &str) -> Result<()> {
+    let Some(barrier) = std::env::var_os("TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_QUARANTINE_BARRIER")
+    else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(barrier);
+    fs::write(barrier.join("verified"), quarantine.as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("continue").exists() {
+        if Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "socket quarantine test barrier timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn test_socket_quarantine_pre_rename_boundary(quarantine: &str) -> Result<()> {
+    let Some(barrier) =
+        std::env::var_os("TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_QUARANTINE_PRE_RENAME_BARRIER")
+    else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(barrier);
+    fs::write(barrier.join("prepared"), quarantine.as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("continue").exists() {
+        if Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "socket quarantine pre-rename test barrier timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn test_socket_bound_boundary(leaf: &str) -> Result<()> {
+    let Some(barrier) = std::env::var_os("TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_BOUND_BARRIER") else {
+        return Ok(());
+    };
+    let barrier = PathBuf::from(barrier);
+    fs::write(barrier.join("bound"), leaf.as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.join("continue").exists() {
+        if Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "socket bind test barrier timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 fn remove_socket_leaf_if_identity(
     authority: &SecureAuthority,
     leaf: &str,
@@ -1233,7 +1320,13 @@ fn remove_socket_leaf_if_identity(
     #[cfg(not(debug_assertions))]
     let _ = run_test_boundary;
 
-    let quarantine = format!(".{leaf}.{}.removing", random_hex(12)?);
+    ensure_socket_tombstone_capacity(&authority.trail_directory)?;
+    let quarantine = format!(
+        "{SOCKET_TOMBSTONE_PREFIX}{}{SOCKET_TOMBSTONE_SUFFIX}",
+        random_hex(12)?
+    );
+    #[cfg(debug_assertions)]
+    test_socket_quarantine_pre_rename_boundary(&quarantine)?;
     match renameat_noreplace(&authority.trail_directory, leaf, &quarantine) {
         Ok(()) => {}
         Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1256,9 +1349,53 @@ fn remove_socket_leaf_if_identity(
         };
     }
 
-    unlinkat_leaf(&authority.trail_directory, &quarantine)?;
+    #[cfg(debug_assertions)]
+    test_socket_quarantine_verified_boundary(&quarantine)?;
+
+    // The quarantine name is the last pathname boundary we can verify
+    // portably. Unlinking it after verification would reopen a same-user
+    // substitution window, so retain the detached socket inode as an inert
+    // tombstone. The 96-bit random suffix bounds collisions without requiring
+    // an unsafe pathname cleanup pass over previously verified tombstones.
     authority.trail_directory.sync_all()?;
     Ok(())
+}
+
+fn ensure_socket_tombstone_capacity(parent: &File) -> Result<()> {
+    // Foreground stale cleanup holds daemon.lock. A spawned child completes
+    // its unpublished guard while that caller still owns the lock, and a
+    // published child remains live until its publication guard runs at exit,
+    // so ordinary Trail lifecycle cleanup cannot independently overrun this
+    // count. Same-UID namespace races remain fail-closed at NOREPLACE.
+    let mut directory = rustix::fs::Dir::read_from(parent)
+        .map_err(|error| Error::Io(std::io::Error::from(error)))?;
+    let mut count = 0_usize;
+    while let Some(entry) = directory.read() {
+        let entry = entry.map_err(|error| Error::Io(std::io::Error::from(error)))?;
+        if is_socket_tombstone_name(entry.file_name().to_bytes()) {
+            count += 1;
+            if count >= SOCKET_TOMBSTONE_CAP {
+                return Err(Error::DaemonUnavailable(format!(
+                    "workspace daemon retained socket tombstone limit ({SOCKET_TOMBSTONE_CAP}) reached; reinitialize this workspace"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_socket_tombstone_name(name: &[u8]) -> bool {
+    let prefix = SOCKET_TOMBSTONE_PREFIX.as_bytes();
+    let suffix = SOCKET_TOMBSTONE_SUFFIX.as_bytes();
+    if name.len() != prefix.len() + 24 + suffix.len()
+        || !name.starts_with(prefix)
+        || !name.ends_with(suffix)
+    {
+        return false;
+    }
+    name[prefix.len()..prefix.len() + 24]
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn renameat_noreplace(parent: &File, old: &str, new: &str) -> std::io::Result<()> {

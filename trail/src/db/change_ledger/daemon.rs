@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use getrandom::getrandom;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -100,6 +100,10 @@ impl WorkspaceDaemonRuntime {
         };
         let ledger = db.changed_path_ledger();
         let existing = load_existing_scope(db, scope_id)?;
+        #[cfg(debug_assertions)]
+        if existing.is_some() {
+            test_daemon_transition_after_load_boundary()?;
+        }
         let (epoch, mut resume_cursor) = match existing {
             None => {
                 ledger.begin_scope(
@@ -122,8 +126,13 @@ impl WorkspaceDaemonRuntime {
                 (1, None)
             }
             Some(stored) => {
+                let current_filesystem_identity = hex::encode(&filesystem_identity);
+                let current_provider_identity = hex::encode(&provider_identity);
                 let identity_changed = stored.filesystem_identity != filesystem_identity
-                    || stored.provider_identity != provider_identity;
+                    || stored.scope_root_identity != current_filesystem_identity
+                    || stored.provider_identity != provider_identity
+                    || stored.provider_id_text.as_deref()
+                        != Some(current_provider_identity.as_str());
                 if identity_changed && !replace_verified_stale_owner {
                     return Err(Error::ChangeLedgerReconcileRequired {
                         scope: scope_id.to_text(),
@@ -161,95 +170,214 @@ impl WorkspaceDaemonRuntime {
                 let next = old_epoch.checked_add(1).ok_or_else(|| {
                     Error::InvalidInput("changed-path daemon scope epoch overflow".into())
                 })?;
+                let owner_authority_consistent = match stored.observer_owner.as_ref() {
+                    Some(owner) => {
+                        let provider_binding_matches_loaded_scope =
+                            stored.provider_id_text.as_deref() == Some(owner.provider_id.as_str())
+                                && stored.provider_identity_text.as_deref()
+                                    == Some(owner.provider_identity.as_str());
+                        let provider_binding_is_verified_drift_target = identity_changed
+                            && owner.provider_id == current_provider_identity
+                            && owner.provider_identity == current_provider_identity;
+                        owner.epoch == stored.epoch
+                            && stored.observer_owner_token.as_deref()
+                                == Some(owner.owner_token.as_str())
+                            && (provider_binding_matches_loaded_scope
+                                || provider_binding_is_verified_drift_target)
+                    }
+                    None => stored.observer_owner_token.is_none(),
+                };
+                if !owner_authority_consistent {
+                    return Err(daemon_owner_authority_inconsistent(scope_id));
+                }
                 let tx = db.conn.unchecked_transaction()?;
-                tx.execute(
-                    "UPDATE changed_path_observer_owners
-                     SET lease_state='revoked', error_state='daemon_owner_replaced',
-                         error_at=strftime('%s','now'), updated_at=strftime('%s','now')
-                     WHERE scope_id=?1",
-                    [scope_id.to_text()],
-                )?;
+                let owner_changed = match stored.observer_owner.as_ref() {
+                    Some(owner) => tx.execute(
+                        "UPDATE changed_path_observer_owners
+                         SET lease_state='revoked', error_state='daemon_owner_replaced',
+                             error_at=strftime('%s','now'), updated_at=strftime('%s','now')
+                         WHERE scope_id=:scope_id AND epoch=:epoch
+                           AND owner_token=:owner_token AND provider_id=:provider_id
+                           AND provider_identity=:provider_identity
+                           AND lease_state=:lease_state AND fence_nonce IS :fence_nonce
+                           AND acquired_at=:acquired_at AND heartbeat_at=:heartbeat_at
+                           AND expires_at=:expires_at AND error_state IS :error_state
+                           AND error_at IS :error_at",
+                        named_params! {
+                            ":scope_id": scope_id.to_text(),
+                            ":epoch": i64::try_from(owner.epoch).map_err(|_| Error::InvalidInput("observer epoch overflow".into()))?,
+                            ":owner_token": &owner.owner_token,
+                            ":provider_id": &owner.provider_id,
+                            ":provider_identity": &owner.provider_identity,
+                            ":lease_state": &owner.lease_state,
+                            ":fence_nonce": &owner.fence_nonce,
+                            ":acquired_at": owner.acquired_at,
+                            ":heartbeat_at": owner.heartbeat_at,
+                            ":expires_at": owner.expires_at,
+                            ":error_state": &owner.error_state,
+                            ":error_at": owner.error_at,
+                        },
+                    )?,
+                    None => {
+                        let count = tx.query_row(
+                            "SELECT COUNT(*) FROM changed_path_observer_owners WHERE scope_id=?1",
+                            [scope_id.to_text()],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        usize::from(count == 0)
+                    }
+                };
+                if owner_changed != 1 {
+                    tx.rollback()?;
+                    return Err(daemon_authority_transition_lost(scope_id));
+                }
+                let owner_revocation_triggered = stored
+                    .observer_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.lease_state == "active");
+                let old_trust_state_after_revocation = if owner_revocation_triggered
+                    && matches!(stored.trust_state.as_str(), "trusted" | "reconciling")
+                {
+                    "untrusted_gap"
+                } else {
+                    stored.trust_state.as_str()
+                };
+                let old_trust_reason_after_revocation = if owner_revocation_triggered
+                    && matches!(stored.trust_state.as_str(), "trusted" | "reconciling")
+                {
+                    "observer_owner_revoked"
+                } else {
+                    stored.trust_reason.as_str()
+                };
+                let old_continuity_after_revocation = stored
+                    .continuity_generation
+                    .checked_add(u64::from(owner_revocation_triggered))
+                    .ok_or_else(|| Error::InvalidInput("continuity generation overflow".into()))?;
                 let changed = tx.execute(
                     "UPDATE changed_path_scopes
-                     SET epoch=?1,
-                         ref_name=?2, ref_generation=?3, change_id=?4, baseline_root_id=?5,
-                         scope_root_identity=?6, filesystem_identity=?6,
-                         provider_id=?7, provider_identity=?7,
-                         durable_cursor=?8, linearizable_fence=?9, rename_pairing=?10,
-                         overflow_scope=?11, filesystem_supported=?12,
-                         clean_proof_allowed=?13, power_loss_durability=?14,
-                         trust_state='untrusted_gap', trust_reason=?15,
+                     SET epoch=:next_epoch,
+                         ref_name=:next_ref_name, ref_generation=:next_ref_generation,
+                         change_id=:next_change_id, baseline_root_id=:next_baseline_root,
+                         scope_root_identity=:next_filesystem_identity,
+                         filesystem_identity=:next_filesystem_identity,
+                         provider_id=:next_provider_identity,
+                         provider_identity=:next_provider_identity,
+                         durable_cursor=:next_durable_cursor,
+                         linearizable_fence=:next_linearizable_fence,
+                         rename_pairing=:next_rename_pairing,
+                         overflow_scope=:next_overflow_scope,
+                         filesystem_supported=:next_filesystem_supported,
+                         clean_proof_allowed=:next_clean_proof_allowed,
+                         power_loss_durability=:next_power_loss_durability,
+                         trust_state='untrusted_gap', trust_reason=:next_trust_reason,
                          observer_owner_token=NULL, provider_cursor=NULL, provider_fence=NULL,
-                         observer_heartbeat_at=NULL,
+                         observer_heartbeat_at=NULL, observer_error_state=NULL,
+                         observer_error_at=NULL,
                          durable_offset=0, folded_offset=0,
                          continuity_generation=continuity_generation+1,
                          updated_at=strftime('%s','now')
-                     WHERE scope_id=?16 AND epoch=?17
-                       AND filesystem_identity=?18 AND provider_identity=?19",
-                    params![
-                        i64::try_from(next)
-                            .map_err(|_| Error::InvalidInput("epoch overflow".into()))?,
-                        &baseline.ref_name,
-                        i64::try_from(baseline.ref_generation)
-                            .map_err(|_| Error::InvalidInput("ref generation overflow".into()))?,
-                        &baseline.change_id.0,
-                        &baseline.root_id.0,
-                        hex::encode(&filesystem_identity),
-                        hex::encode(&provider_identity),
-                        if capabilities.durable_cursor {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if capabilities.linearizable_fence {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if capabilities.rename_pairing {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if capabilities.overflow_scope {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if capabilities.filesystem_supported {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if capabilities.clean_proof_allowed {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if capabilities.power_loss_durability {
-                            1_i64
-                        } else {
-                            0_i64
-                        },
-                        if identity_changed {
-                            "daemon_identity_transition"
-                        } else {
-                            "daemon_owner_restarted"
-                        },
-                        scope_id.to_text(),
-                        i64::try_from(old_epoch)
-                            .map_err(|_| Error::InvalidInput("epoch overflow".into()))?,
-                        hex::encode(&stored.filesystem_identity),
-                        hex::encode(&stored.provider_identity),
-                    ],
+                     WHERE scope_id=:scope_id AND scope_kind=:old_scope_kind
+                       AND schema_version=:old_schema_version
+                       AND owner_id=:old_owner_id AND scope_root=:old_scope_root
+                       AND scope_root_identity=:old_scope_root_identity
+                       AND filesystem_identity=:old_filesystem_identity
+                       AND filesystem_kind=:old_filesystem_kind
+                       AND case_sensitive=:old_case_sensitive
+                       AND epoch=:old_epoch AND ref_name=:old_ref_name
+                       AND ref_generation=:old_ref_generation
+                       AND change_id=:old_change_id
+                       AND baseline_root_id=:old_baseline_root
+                       AND policy_fingerprint=:old_policy_fingerprint
+                       AND policy_dependency_generation=:old_policy_generation
+                       AND trust_state=:old_trust_state
+                       AND trust_reason=:old_trust_reason
+                       AND continuity_generation=:old_continuity_generation
+                       AND provider_id IS :old_provider_id
+                       AND provider_identity IS :old_provider_identity
+                       AND durable_cursor=:old_durable_cursor
+                       AND linearizable_fence=:old_linearizable_fence
+                       AND rename_pairing=:old_rename_pairing
+                       AND overflow_scope=:old_overflow_scope
+                       AND filesystem_supported=:old_filesystem_supported
+                       AND clean_proof_allowed=:old_clean_proof_allowed
+                       AND power_loss_durability=:old_power_loss_durability
+                       AND provider_cursor IS :old_provider_cursor
+                       AND provider_fence IS :old_provider_fence
+                       AND durable_offset=:old_durable_offset
+                       AND folded_offset=:old_folded_offset
+                       AND observer_owner_token IS :old_observer_owner_token
+                       AND observer_heartbeat_at IS :old_observer_heartbeat_at
+                       AND observer_error_state IS :old_observer_error_state
+                       AND observer_error_at IS :old_observer_error_at
+                       AND max_candidate_rows=:old_max_candidate_rows
+                       AND max_prefix_rows=:old_max_prefix_rows
+                       AND max_observer_log_bytes=:old_max_observer_log_bytes
+                       AND max_segment_bytes=:old_max_segment_bytes
+                       AND max_unfolded_tail_records=:old_max_unfolded_tail_records
+                       AND retired_at IS :old_retired_at",
+                    named_params! {
+                        ":next_epoch": i64::try_from(next).map_err(|_| Error::InvalidInput("epoch overflow".into()))?,
+                        ":next_ref_name": &baseline.ref_name,
+                        ":next_ref_generation": i64::try_from(baseline.ref_generation).map_err(|_| Error::InvalidInput("ref generation overflow".into()))?,
+                        ":next_change_id": &baseline.change_id.0,
+                        ":next_baseline_root": &baseline.root_id.0,
+                        ":next_filesystem_identity": hex::encode(&filesystem_identity),
+                        ":next_provider_identity": hex::encode(&provider_identity),
+                        ":next_durable_cursor": i64::from(capabilities.durable_cursor),
+                        ":next_linearizable_fence": i64::from(capabilities.linearizable_fence),
+                        ":next_rename_pairing": i64::from(capabilities.rename_pairing),
+                        ":next_overflow_scope": i64::from(capabilities.overflow_scope),
+                        ":next_filesystem_supported": i64::from(capabilities.filesystem_supported),
+                        ":next_clean_proof_allowed": i64::from(capabilities.clean_proof_allowed),
+                        ":next_power_loss_durability": i64::from(capabilities.power_loss_durability),
+                        ":next_trust_reason": if identity_changed { "daemon_identity_transition" } else { "daemon_owner_restarted" },
+                        ":scope_id": scope_id.to_text(),
+                        ":old_scope_kind": &stored.scope_kind,
+                        ":old_schema_version": stored.schema_version,
+                        ":old_owner_id": &stored.owner_id,
+                        ":old_scope_root": &stored.scope_root,
+                        ":old_scope_root_identity": &stored.scope_root_identity,
+                        ":old_filesystem_identity": hex::encode(&stored.filesystem_identity),
+                        ":old_filesystem_kind": &stored.filesystem_kind,
+                        ":old_case_sensitive": stored.case_sensitive,
+                        ":old_epoch": i64::try_from(old_epoch).map_err(|_| Error::InvalidInput("epoch overflow".into()))?,
+                        ":old_ref_name": &stored.ref_name,
+                        ":old_ref_generation": i64::try_from(stored.ref_generation).map_err(|_| Error::InvalidInput("ref generation overflow".into()))?,
+                        ":old_change_id": &stored.change_id,
+                        ":old_baseline_root": &stored.baseline_root,
+                        ":old_policy_fingerprint": hex::encode(stored.policy_fingerprint),
+                        ":old_policy_generation": i64::try_from(stored.policy_generation).map_err(|_| Error::InvalidInput("policy generation overflow".into()))?,
+                        ":old_trust_state": old_trust_state_after_revocation,
+                        ":old_trust_reason": old_trust_reason_after_revocation,
+                        ":old_continuity_generation": i64::try_from(old_continuity_after_revocation).map_err(|_| Error::InvalidInput("continuity generation overflow".into()))?,
+                        ":old_provider_id": &stored.provider_id_text,
+                        ":old_provider_identity": &stored.provider_identity_text,
+                        ":old_durable_cursor": stored.capabilities[0],
+                        ":old_linearizable_fence": stored.capabilities[1],
+                        ":old_rename_pairing": stored.capabilities[2],
+                        ":old_overflow_scope": stored.capabilities[3],
+                        ":old_filesystem_supported": stored.capabilities[4],
+                        ":old_clean_proof_allowed": stored.capabilities[5],
+                        ":old_power_loss_durability": stored.capabilities[6],
+                        ":old_provider_cursor": &stored.provider_cursor,
+                        ":old_provider_fence": &stored.provider_fence,
+                        ":old_durable_offset": i64::try_from(stored.durable_offset).map_err(|_| Error::InvalidInput("durable offset overflow".into()))?,
+                        ":old_folded_offset": i64::try_from(stored.folded_offset).map_err(|_| Error::InvalidInput("folded offset overflow".into()))?,
+                        ":old_observer_owner_token": &stored.observer_owner_token,
+                        ":old_observer_heartbeat_at": stored.observer_heartbeat_at,
+                        ":old_observer_error_state": &stored.observer_error_state,
+                        ":old_observer_error_at": stored.observer_error_at,
+                        ":old_retired_at": stored.retired_at,
+                        ":old_max_candidate_rows": stored.limits[0],
+                        ":old_max_prefix_rows": stored.limits[1],
+                        ":old_max_observer_log_bytes": stored.limits[2],
+                        ":old_max_segment_bytes": stored.limits[3],
+                        ":old_max_unfolded_tail_records": stored.limits[4],
+                    },
                 )?;
                 if changed != 1 {
-                    return Err(Error::ChangeLedgerReconcileRequired {
-                        scope: scope_id.to_text(),
-                        state: "stale_baseline".into(),
-                        reason: "daemon baseline transition lost exact scope authority".into(),
-                        command: "trail status".into(),
-                    });
+                    tx.rollback()?;
+                    return Err(daemon_authority_transition_lost(scope_id));
                 }
                 tx.commit()?;
                 (
@@ -512,6 +640,25 @@ impl WorkspaceDaemonRuntime {
     }
 }
 
+#[cfg(debug_assertions)]
+fn test_daemon_transition_after_load_boundary() -> Result<()> {
+    let Some(barrier) = std::env::var_os("TRAIL_TEST_DAEMON_TRANSITION_AFTER_LOAD_BARRIER") else {
+        return Ok(());
+    };
+    let barrier = std::path::PathBuf::from(barrier);
+    fs::write(barrier.join("loaded"), b"ready")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !barrier.join("continue").exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::DaemonUnavailable(
+                "daemon transition after-load test barrier timed out".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
 enum PlatformObserver {
     #[cfg(target_os = "linux")]
     Linux(super::observer::linux::LinuxInotifyObserver),
@@ -637,6 +784,24 @@ fn workspace_scope_id(db: &Trail) -> ScopeId {
     ScopeId(digest.finalize().into())
 }
 
+fn daemon_authority_transition_lost(scope_id: ScopeId) -> Error {
+    Error::ChangeLedgerReconcileRequired {
+        scope: scope_id.to_text(),
+        state: "stale_baseline".into(),
+        reason: "daemon authority transition lost exact loaded authority".into(),
+        command: "trail status".into(),
+    }
+}
+
+fn daemon_owner_authority_inconsistent(scope_id: ScopeId) -> Error {
+    Error::ChangeLedgerReconcileRequired {
+        scope: scope_id.to_text(),
+        state: "corrupt".into(),
+        reason: "persisted daemon scope and observer owner authority are inconsistent".into(),
+        command: "trail status".into(),
+    }
+}
+
 fn platform_provider_identity() -> Vec<u8> {
     #[cfg(target_os = "linux")]
     return b"linux-inotify-native-v1".to_vec();
@@ -685,6 +850,14 @@ fn decode_fingerprint(value: &str) -> Result<[u8; 32]> {
 }
 
 struct ExistingScope {
+    scope_kind: String,
+    owner_id: String,
+    scope_root: String,
+    scope_root_identity: String,
+    filesystem_kind: String,
+    case_sensitive: i64,
+    schema_version: i64,
+    limits: [i64; 5],
     epoch: u64,
     ref_name: String,
     ref_generation: u64,
@@ -694,36 +867,136 @@ struct ExistingScope {
     policy_generation: u64,
     filesystem_identity: Vec<u8>,
     provider_identity: Vec<u8>,
+    provider_id_text: Option<String>,
+    provider_identity_text: Option<String>,
     provider_cursor: Option<Vec<u8>>,
+    provider_fence: Option<Vec<u8>>,
+    capabilities: [i64; 7],
+    trust_state: String,
+    trust_reason: String,
+    continuity_generation: u64,
+    durable_offset: u64,
+    folded_offset: u64,
+    observer_owner_token: Option<String>,
+    observer_heartbeat_at: Option<i64>,
+    observer_error_state: Option<String>,
+    observer_error_at: Option<i64>,
+    retired_at: Option<i64>,
+    observer_owner: Option<ExistingObserverOwner>,
+}
+
+struct ExistingObserverOwner {
+    epoch: u64,
+    owner_token: String,
+    provider_id: String,
+    provider_identity: String,
+    lease_state: String,
+    fence_nonce: Option<Vec<u8>>,
+    acquired_at: i64,
+    heartbeat_at: i64,
+    expires_at: i64,
+    error_state: Option<String>,
+    error_at: Option<i64>,
 }
 
 fn load_existing_scope(db: &Trail, scope_id: ScopeId) -> Result<Option<ExistingScope>> {
     let row = db
         .conn
         .query_row(
-            "SELECT epoch,ref_name,ref_generation,change_id,baseline_root_id,
-                    policy_fingerprint,policy_dependency_generation,
-                    filesystem_identity,provider_identity,provider_cursor
-             FROM changed_path_scopes WHERE scope_id=?1",
+            "SELECT scope.scope_kind,scope.owner_id,scope.scope_root,
+                    scope.scope_root_identity,scope.filesystem_kind,scope.case_sensitive,
+                    scope.epoch,scope.ref_name,scope.ref_generation,scope.change_id,
+                    scope.baseline_root_id,scope.policy_fingerprint,
+                    scope.policy_dependency_generation,scope.filesystem_identity,
+                    scope.provider_id,scope.provider_identity,scope.provider_cursor,
+                    scope.provider_fence,scope.durable_cursor,scope.linearizable_fence,
+                    scope.rename_pairing,scope.overflow_scope,scope.filesystem_supported,
+                    scope.clean_proof_allowed,scope.power_loss_durability,
+                    scope.trust_state,scope.trust_reason,scope.continuity_generation,
+                    scope.durable_offset,scope.folded_offset,scope.observer_owner_token,
+                    scope.observer_heartbeat_at,scope.observer_error_state,
+                    scope.observer_error_at,scope.retired_at,scope.schema_version,
+                    scope.max_candidate_rows,scope.max_prefix_rows,
+                    scope.max_observer_log_bytes,scope.max_segment_bytes,
+                    scope.max_unfolded_tail_records,
+                    owner.epoch,owner.owner_token,owner.provider_id,
+                    owner.provider_identity,owner.lease_state,owner.fence_nonce,
+                    owner.acquired_at,owner.heartbeat_at,owner.expires_at,
+                    owner.error_state,owner.error_at
+             FROM changed_path_scopes scope
+             LEFT JOIN changed_path_observer_owners owner ON owner.scope_id=scope.scope_id
+             WHERE scope.scope_id=?1",
             [scope_id.to_text()],
             |row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<Vec<u8>>>(16)?,
+                    row.get::<_, Option<Vec<u8>>>(17)?,
+                    [
+                        row.get::<_, i64>(18)?,
+                        row.get::<_, i64>(19)?,
+                        row.get::<_, i64>(20)?,
+                        row.get::<_, i64>(21)?,
+                        row.get::<_, i64>(22)?,
+                        row.get::<_, i64>(23)?,
+                        row.get::<_, i64>(24)?,
+                    ],
+                    row.get::<_, String>(25)?,
+                    row.get::<_, String>(26)?,
+                    row.get::<_, i64>(27)?,
+                    row.get::<_, i64>(28)?,
+                    row.get::<_, i64>(29)?,
+                    row.get::<_, Option<String>>(30)?,
+                    row.get::<_, Option<i64>>(31)?,
+                    row.get::<_, Option<String>>(32)?,
+                    row.get::<_, Option<i64>>(33)?,
+                    row.get::<_, Option<i64>>(34)?,
+                    row.get::<_, i64>(35)?,
+                    [
+                        row.get::<_, i64>(36)?,
+                        row.get::<_, i64>(37)?,
+                        row.get::<_, i64>(38)?,
+                        row.get::<_, i64>(39)?,
+                        row.get::<_, i64>(40)?,
+                    ],
+                    row.get::<_, Option<i64>>(41)?,
+                    row.get::<_, Option<String>>(42)?,
+                    row.get::<_, Option<String>>(43)?,
+                    row.get::<_, Option<String>>(44)?,
+                    row.get::<_, Option<String>>(45)?,
+                    row.get::<_, Option<Vec<u8>>>(46)?,
+                    row.get::<_, Option<i64>>(47)?,
+                    row.get::<_, Option<i64>>(48)?,
+                    row.get::<_, Option<i64>>(49)?,
+                    row.get::<_, Option<String>>(50)?,
+                    row.get::<_, Option<i64>>(51)?,
                 ))
             },
         )
         .optional()?;
     row.map(
         |(
+            scope_kind,
+            owner_id,
+            scope_root,
+            scope_root_identity,
+            filesystem_kind,
+            case_sensitive,
             epoch,
             ref_name,
             ref_generation,
@@ -732,10 +1005,87 @@ fn load_existing_scope(db: &Trail, scope_id: ScopeId) -> Result<Option<ExistingS
             policy_fingerprint,
             policy_generation,
             filesystem_identity,
-            provider_identity,
+            provider_id_text,
+            provider_identity_text,
             provider_cursor,
+            provider_fence,
+            capabilities,
+            trust_state,
+            trust_reason,
+            continuity_generation,
+            durable_offset,
+            folded_offset,
+            observer_owner_token,
+            observer_heartbeat_at,
+            observer_error_state,
+            observer_error_at,
+            retired_at,
+            schema_version,
+            limits,
+            owner_epoch,
+            owner_token,
+            owner_provider_id,
+            owner_provider_identity,
+            owner_lease_state,
+            owner_fence_nonce,
+            owner_acquired_at,
+            owner_heartbeat_at,
+            owner_expires_at,
+            owner_error_state,
+            owner_error_at,
         )| {
+            let provider_identity_text = provider_identity_text.ok_or_else(|| {
+                Error::Corrupt("daemon scope is missing provider identity".into())
+            })?;
+            let observer_owner = match (
+                owner_epoch,
+                owner_token,
+                owner_provider_id,
+                owner_provider_identity,
+                owner_lease_state,
+                owner_acquired_at,
+                owner_heartbeat_at,
+                owner_expires_at,
+            ) {
+                (
+                    Some(epoch),
+                    Some(token),
+                    Some(provider_id),
+                    Some(provider_identity),
+                    Some(lease_state),
+                    Some(acquired_at),
+                    Some(heartbeat_at),
+                    Some(expires_at),
+                ) => Some(ExistingObserverOwner {
+                    epoch: u64::try_from(epoch)
+                        .map_err(|_| Error::Corrupt("negative observer owner epoch".into()))?,
+                    owner_token: token,
+                    provider_id,
+                    provider_identity,
+                    lease_state,
+                    fence_nonce: owner_fence_nonce,
+                    acquired_at,
+                    heartbeat_at,
+                    expires_at,
+                    error_state: owner_error_state,
+                    error_at: owner_error_at,
+                }),
+                (None, None, None, None, None, None, None, None) => None,
+                _ => {
+                    return Err(Error::Corrupt(
+                        "partial daemon observer owner authority".into(),
+                    ))
+                }
+            };
             Ok(ExistingScope {
+                scope_kind,
+                owner_id,
+                scope_root,
+                scope_root_identity,
+                filesystem_kind,
+                case_sensitive,
+                schema_version,
+                limits,
                 epoch: u64::try_from(epoch)
                     .map_err(|_| Error::Corrupt("negative changed-path scope epoch".into()))?,
                 ref_name,
@@ -750,9 +1100,27 @@ fn load_existing_scope(db: &Trail, scope_id: ScopeId) -> Result<Option<ExistingS
                 filesystem_identity: hex::decode(filesystem_identity).map_err(|_| {
                     Error::Corrupt("invalid changed-path filesystem identity".into())
                 })?,
-                provider_identity: hex::decode(provider_identity)
+                provider_identity: hex::decode(&provider_identity_text)
                     .map_err(|_| Error::Corrupt("invalid changed-path provider identity".into()))?,
+                provider_id_text,
+                provider_identity_text: Some(provider_identity_text),
                 provider_cursor,
+                provider_fence,
+                capabilities,
+                trust_state,
+                trust_reason,
+                continuity_generation: u64::try_from(continuity_generation)
+                    .map_err(|_| Error::Corrupt("negative continuity generation".into()))?,
+                durable_offset: u64::try_from(durable_offset)
+                    .map_err(|_| Error::Corrupt("negative durable offset".into()))?,
+                folded_offset: u64::try_from(folded_offset)
+                    .map_err(|_| Error::Corrupt("negative folded offset".into()))?,
+                observer_owner_token,
+                observer_heartbeat_at,
+                observer_error_state,
+                observer_error_at,
+                retired_at,
+                observer_owner,
             })
         },
     )

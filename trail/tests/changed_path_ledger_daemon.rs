@@ -148,6 +148,157 @@ fn write_owner_file(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+fn spawn_status_waiting_after_daemon_authority_load(
+    fixture: &Fixture,
+    barrier: &Path,
+) -> std::process::Child {
+    fs::create_dir(barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("TRAIL_TEST_DAEMON_TRANSITION_AFTER_LOAD_BARRIER", barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !barrier.join("loaded").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon transition exited before authority load barrier: status={status}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon transition did not reach authority load barrier\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+#[derive(Debug, PartialEq)]
+struct TransitionAuthoritySnapshot {
+    scope: (
+        i64,
+        i64,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    ),
+    owner: (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<i64>,
+    ),
+    limits: (i64, i64, i64, i64, i64, i64, i64),
+}
+
+fn transition_authority_snapshot(database: &Path) -> TransitionAuthoritySnapshot {
+    let conn = rusqlite::Connection::open(database).unwrap();
+    let scope = conn
+        .query_row(
+            "SELECT epoch,ref_generation,baseline_root_id,policy_fingerprint,
+                    policy_dependency_generation,filesystem_identity,provider_id,
+                    provider_identity,observer_owner_token,trust_state,continuity_generation
+             FROM changed_path_scopes",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    let owner = conn
+        .query_row(
+            "SELECT epoch,owner_token,provider_id,provider_identity,lease_state,
+                    fence_nonce,acquired_at,heartbeat_at,expires_at,error_state,error_at
+             FROM changed_path_observer_owners",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    let limits = conn
+        .query_row(
+            "SELECT schema_version,max_candidate_rows,max_prefix_rows,
+                    max_observer_log_bytes,max_segment_bytes,max_unfolded_tail_records,
+                    case_sensitive
+             FROM changed_path_scopes",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    TransitionAuthoritySnapshot {
+        scope,
+        owner,
+        limits,
+    }
+}
+
 fn kill_and_wait(pid: u32) {
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -611,6 +762,312 @@ fn stale_cleanup_does_not_unlink_socket_substituted_after_identity_verification(
 }
 
 #[test]
+fn stale_cleanup_never_unlinks_socket_substituted_after_quarantine_verification() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    assert!(first.socket_path.exists());
+
+    let barrier = fixture.root().join("socket-quarantine-race");
+    fs::create_dir(&barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_QUARANTINE_BARRIER",
+            &barrier,
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let verified = barrier.join("verified");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !verified.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "stale cleanup exited before quarantine verification: status={status}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "stale cleanup did not reach quarantine verification\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let quarantine_leaf = fs::read_to_string(&verified).unwrap();
+    assert!(
+        quarantine_leaf.starts_with(".changed-path-socket-tombstone."),
+        "unexpected tombstone namespace: {quarantine_leaf}"
+    );
+    let quarantine_path = fixture.root().join(".trail").join(&quarantine_leaf);
+    assert!(quarantine_path.exists());
+    assert!(!first.socket_path.exists());
+    let unrelated = UnixListener::bind(&first.socket_path).unwrap();
+    fs::set_permissions(&first.socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&quarantine_path).unwrap();
+    fs::rename(&first.socket_path, &quarantine_path).unwrap();
+    let substituted_inode = fs::symlink_metadata(&quarantine_path).unwrap().ino();
+    fs::write(barrier.join("continue"), b"go").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        quarantine_path.exists(),
+        "cleanup pathname-unlinked a socket substituted after quarantine verification; status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(&quarantine_path).unwrap().ino(),
+        substituted_inode
+    );
+    drop(unrelated);
+}
+
+fn populate_socket_tombstones(fixture: &Fixture, count: usize) {
+    for index in 0..count {
+        fs::write(
+            fixture.root().join(".trail").join(format!(
+                ".changed-path-socket-tombstone.{index:024x}.removing"
+            )),
+            b"retained",
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn socket_tombstone_cap_minus_one_permits_exactly_the_final_slot() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    populate_socket_tombstones(&fixture, 1023);
+    fs::write(
+        fixture
+            .root()
+            .join(".trail/.changed-path-socket-tombstone.not-hex.removing"),
+        b"near-match",
+    )
+    .unwrap();
+
+    let output = fixture.status();
+    assert_status_failed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reinitialize this workspace"),
+        "missing reinitialize guidance after consuming final slot: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exact = fs::read_dir(fixture.root().join(".trail"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(hex) = name
+                .strip_prefix(".changed-path-socket-tombstone.")
+                .and_then(|name| name.strip_suffix(".removing"))
+            else {
+                return false;
+            };
+            hex.len() == 24
+                && hex
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .count();
+    assert_eq!(exact, 1024);
+    assert!(
+        !first.socket_path.exists(),
+        "cap-minus-one did not move the verified stale socket into the final tombstone slot"
+    );
+    let private_bind_leaves = fs::read_dir(fixture.root().join(".trail"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 14
+                && name.starts_with(".s")
+                && name[2..]
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .count();
+    assert_eq!(private_bind_leaves, 0);
+}
+
+#[test]
+fn socket_tombstone_cap_refuses_before_rename_with_reinitialize_guidance() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    let original_inode = fs::symlink_metadata(&first.socket_path).unwrap().ino();
+    populate_socket_tombstones(&fixture, 1024);
+
+    let output = fixture.status();
+    assert_status_failed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reinitialize this workspace"),
+        "missing reinitialize guidance: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(&first.socket_path).unwrap().ino(),
+        original_inode,
+        "cap refusal moved the original socket"
+    );
+}
+
+#[test]
+fn socket_tombstone_cap_refuses_before_creating_private_bind_leaf() {
+    let fixture = Fixture::new();
+    populate_socket_tombstones(&fixture, 1024);
+    let output = fixture.status();
+    assert_status_failed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reinitialize this workspace"),
+        "missing reinitialize guidance: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let private_bind_leaves = fs::read_dir(fixture.root().join(".trail"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 14
+                && name.starts_with(".s")
+                && name[2..]
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .count();
+    assert_eq!(private_bind_leaves, 0);
+}
+
+#[test]
+fn private_bind_socket_is_created_with_owner_only_mode_atomically() {
+    let fixture = Fixture::new();
+    let barrier = fixture.root().join("socket-bound-mode");
+    fs::create_dir(&barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_BOUND_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let bound = barrier.join("bound");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !bound.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon exited before socket bind boundary: status={status} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(Instant::now() < deadline, "socket bind barrier timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let leaf = fs::read_to_string(&bound).unwrap();
+    let socket = fixture.root().join(".trail").join(leaf);
+    let initial_mode = fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o777;
+    fs::write(barrier.join("continue"), b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "daemon startup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(initial_mode, 0o600);
+}
+
+#[test]
+fn socket_tombstone_noreplace_collision_retains_original_socket() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    let original_inode = fs::symlink_metadata(&first.socket_path).unwrap().ino();
+    let barrier = fixture.root().join("socket-quarantine-prerename-race");
+    fs::create_dir(&barrier).unwrap();
+    let canonical_root = fixture.root().canonicalize().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trail"))
+        .arg("--workspace")
+        .arg(fixture.root())
+        .arg("--json")
+        .arg("status")
+        .env("HOME", &canonical_root)
+        .env("XDG_CONFIG_HOME", canonical_root.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "TRAIL_TEST_WORKSPACE_DAEMON_SOCKET_QUARANTINE_PRE_RENAME_BARRIER",
+            &barrier,
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let prepared = barrier.join("prepared");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !prepared.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "cleanup exited before pre-rename boundary: status={status} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(Instant::now() < deadline, "pre-rename barrier timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let tombstone_leaf = fs::read_to_string(&prepared).unwrap();
+    let collision = fixture.root().join(".trail").join(tombstone_leaf);
+    fs::write(&collision, b"collision").unwrap();
+    fs::write(barrier.join("continue"), b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+    assert_eq!(fs::read(&collision).unwrap(), b"collision");
+    assert_eq!(
+        fs::symlink_metadata(&first.socket_path).unwrap().ino(),
+        original_inode
+    );
+}
+
+#[test]
 fn crash_after_persisting_ledger_owner_is_automatically_recovered() {
     let fixture = Fixture::new();
     let crashed =
@@ -851,4 +1308,205 @@ fn verified_stale_persisted_identity_drift_rotates_epoch_and_reconciles() {
         assert_eq!(recovered_authority.2, recovered_authority.3);
         kill_and_wait(second.pid);
     }
+}
+
+fn assert_loaded_scope_authority_race_is_rejected(
+    name: &str,
+    mutation: &str,
+    retained_column: &str,
+    expected_value: &str,
+) {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute(
+        "UPDATE changed_path_scopes SET filesystem_identity='00'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let barrier = fixture.root().join(format!("{name}-authority-race"));
+    let child = spawn_status_waiting_after_daemon_authority_load(&fixture, &barrier);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(conn.execute(mutation, []).unwrap(), 1);
+    drop(conn);
+    let concurrent_authority = transition_authority_snapshot(&database);
+    fs::write(barrier.join("continue"), b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("daemon authority transition lost exact loaded authority"),
+        "{name} race did not fail at the full authority CAS boundary: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        transition_authority_snapshot(&database),
+        concurrent_authority,
+        "{name} race partially transitioned authority before failing closed"
+    );
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let retained: String = conn
+        .query_row(
+            &format!("SELECT {retained_column} FROM changed_path_scopes"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, expected_value, "{name} authority was overwritten");
+}
+
+#[test]
+fn verified_stale_transition_rejects_baseline_change_after_authority_load() {
+    assert_loaded_scope_authority_race_is_rejected(
+        "baseline",
+        "UPDATE changed_path_scopes SET ref_generation=ref_generation+1, baseline_root_id='concurrent-baseline-root'",
+        "baseline_root_id",
+        "concurrent-baseline-root",
+    );
+}
+
+#[test]
+fn verified_stale_transition_rejects_policy_change_after_authority_load() {
+    assert_loaded_scope_authority_race_is_rejected(
+        "policy",
+        "UPDATE changed_path_scopes SET policy_fingerprint='1111111111111111111111111111111111111111111111111111111111111111', policy_dependency_generation=policy_dependency_generation+1",
+        "policy_fingerprint",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    );
+}
+
+#[test]
+fn verified_stale_transition_rejects_limit_change_after_authority_load() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute(
+        "UPDATE changed_path_scopes SET filesystem_identity='00'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let barrier = fixture.root().join("limit-authority-race");
+    let child = spawn_status_waiting_after_daemon_authority_load(&fixture, &barrier);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_scopes SET max_candidate_rows=max_candidate_rows+1",
+            [],
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+    let concurrent_authority = transition_authority_snapshot(&database);
+    let concurrent_max_candidate_rows = concurrent_authority.limits.1;
+    fs::write(barrier.join("continue"), b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("daemon authority transition lost exact loaded authority"),
+        "limit race did not fail at the full authority CAS boundary: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        transition_authority_snapshot(&database),
+        concurrent_authority,
+        "limit race partially transitioned authority before failing closed"
+    );
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let retained_limit: i64 = conn
+        .query_row(
+            "SELECT max_candidate_rows FROM changed_path_scopes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained_limit, concurrent_max_candidate_rows);
+}
+
+#[test]
+fn verified_stale_transition_does_not_revoke_owner_acquired_after_authority_load() {
+    let fixture = Fixture::new();
+    assert!(fixture.status().status.success());
+    let first = fixture.endpoint();
+    kill_and_wait(first.pid);
+    let database = fixture.root().join(".trail/index/trail.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute(
+        "UPDATE changed_path_scopes SET filesystem_identity='00'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let barrier = fixture.root().join("owner-authority-race");
+    let child = spawn_status_waiting_after_daemon_authority_load(&fixture, &barrier);
+    let replacement_token = "ab".repeat(32);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_observer_owners
+             SET owner_token=?1, provider_id='concurrent-provider',
+                 provider_identity='concurrent-provider-identity', lease_state='active',
+                 fence_nonce=x'01020304050607080910111213141516',
+                 error_state=NULL,error_at=NULL,updated_at=strftime('%s','now')
+             WHERE scope_id=(SELECT scope_id FROM changed_path_scopes)",
+            [&replacement_token],
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.execute(
+            "UPDATE changed_path_scopes SET observer_owner_token=?1",
+            [&replacement_token],
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+    fs::write(barrier.join("continue"), b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_status_failed(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("daemon authority transition lost exact loaded authority"),
+        "owner race did not fail at the full authority CAS boundary: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let owner: (String, String, String) = conn
+        .query_row(
+            "SELECT owner_token,lease_state,provider_id FROM changed_path_observer_owners",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        owner,
+        (
+            replacement_token.clone(),
+            "active".into(),
+            "concurrent-provider".into()
+        )
+    );
+    let scope_owner: String = conn
+        .query_row(
+            "SELECT observer_owner_token FROM changed_path_scopes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(scope_owner, replacement_token);
 }
