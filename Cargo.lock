@@ -5544,6 +5544,7 @@ dependencies = [
  "async-trait",
  "bzip2 0.5.2",
  "clap",
+ "core-foundation-sys",
  "dokan",
  "dokan-sys",
  "ed25519-dalek",

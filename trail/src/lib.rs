@@ -43,6 +43,31 @@ pub mod test_support {
         crate::db::run_macos_fence_ordering()
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_paused_callback_fence() -> std::result::Result<(), String> {
+        crate::db::run_macos_paused_callback_fence()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_history_authority() -> std::result::Result<(), String> {
+        crate::db::run_macos_history_authority()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_startup_cancellation() -> std::result::Result<(), String> {
+        crate::db::run_macos_startup_cancellation()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_malformed_callbacks() -> std::result::Result<(), String> {
+        crate::db::run_macos_malformed_callbacks()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn changed_path_macos_root_revalidation_failures() -> std::result::Result<(), String> {
+        crate::db::run_macos_root_revalidation_failures()
+    }
+
     #[cfg(target_os = "linux")]
     pub fn changed_path_linux_recursive_coverage() -> std::result::Result<(), String> {
         crate::db::run_recursive_coverage()
