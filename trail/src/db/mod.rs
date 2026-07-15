@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{symlink as symlink_file, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink as symlink_file, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -72,7 +72,7 @@ struct SchemaGeneration(Vec<SchemaFileGeneration>);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 enum CrossProcessSchemaValidationOutcome {
-    Success,
+    Success(String),
     Failure(String),
 }
 
@@ -81,7 +81,7 @@ struct SchemaValidationState {
     validating: bool,
     active_handoffs: u64,
     round: u64,
-    validated: Option<(SchemaGeneration, String)>,
+    validated: Option<(SchemaGeneration, String, String)>,
     failed: Option<(u64, String)>,
     validation_count: u64,
 }
@@ -108,6 +108,65 @@ static SCHEMA_VALIDATION_FAILURES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock:
 #[cfg(test)]
 static NEXT_SCHEMA_VALIDATION_SERVER_DELAYS: OnceLock<Mutex<HashMap<PathBuf, (u64, u64)>>> =
     OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+type SchemaSocketAuthorityHook = Box<dyn FnOnce(&Path) + Send>;
+
+#[cfg(all(test, target_os = "linux"))]
+static NEXT_SCHEMA_SOCKET_AUTHORITY_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, SchemaSocketAuthorityHook>>,
+> = OnceLock::new();
+
+#[cfg(all(test, unix))]
+type SchemaWalDigestHook = Box<dyn FnOnce(&Path) + Send>;
+
+#[cfg(all(test, unix))]
+static NEXT_SCHEMA_WAL_DIGEST_HOOKS: OnceLock<Mutex<HashMap<PathBuf, SchemaWalDigestHook>>> =
+    OnceLock::new();
+
+#[cfg(all(test, unix))]
+type SchemaWalDigestAttemptHook = Box<dyn FnMut(&Path) + Send>;
+
+#[cfg(all(test, unix))]
+static SCHEMA_WAL_DIGEST_ATTEMPT_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, SchemaWalDigestAttemptHook>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_schema_socket_authority_hook(path: &Path, hook: SchemaSocketAuthorityHook) {
+    NEXT_SCHEMA_SOCKET_AUTHORITY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), hook);
+}
+
+#[cfg(all(test, unix))]
+fn install_schema_wal_digest_hook(path: &Path, hook: SchemaWalDigestHook) {
+    NEXT_SCHEMA_WAL_DIGEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), hook);
+}
+
+#[cfg(all(test, unix))]
+fn install_schema_wal_digest_attempt_hook(path: &Path, hook: SchemaWalDigestAttemptHook) {
+    SCHEMA_WAL_DIGEST_ATTEMPT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), hook);
+}
+
+#[cfg(all(test, unix))]
+fn clear_schema_wal_digest_attempt_hook(path: &Path) {
+    SCHEMA_WAL_DIGEST_ATTEMPT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
+}
 
 #[cfg(test)]
 fn fail_next_schema_validation(db_path: &Path) {
@@ -183,6 +242,7 @@ pub(crate) struct ValidatedSchemaGeneration {
     main_authority: File,
     _shared_exclusion: SchemaSharedExclusion,
     _leader_exclusion: Option<File>,
+    authenticated_wal_digest: String,
 }
 
 impl ValidatedSchemaGeneration {
@@ -201,6 +261,9 @@ impl ValidatedSchemaGeneration {
                 &current,
                 concurrent_handoffs,
             )
+            && !(schema_generation_is_only_wal_ctime_transition(&self.generation, &current)
+                && schema_wal_digest_allowing_wal_ctime_transition(&self.db_path, &current)
+                    .is_ok_and(|digest| digest == self.authenticated_wal_digest))
         {
             return Err(schema_reinitialize_error(
                 "schema main/WAL/SHM generation changed during mutable handoff",
@@ -255,6 +318,28 @@ impl ValidatedSchemaGeneration {
         }
         Ok(())
     }
+}
+
+fn schema_generation_is_only_wal_ctime_transition(
+    expected: &SchemaGeneration,
+    current: &SchemaGeneration,
+) -> bool {
+    expected.0.len() == current.0.len()
+        && expected.0.iter().zip(&current.0).all(|(left, right)| {
+            if left.suffix != right.suffix {
+                return false;
+            }
+            if left.suffix == "-wal" {
+                return left.present
+                    && right.present
+                    && left.device == right.device
+                    && left.inode == right.inode
+                    && left.length == right.length
+                    && left.modified_seconds == right.modified_seconds
+                    && left.modified_nanoseconds == right.modified_nanoseconds;
+            }
+            left == right
+        })
 }
 
 fn schema_generation_is_only_volatile_shm_presence_transition(
@@ -392,12 +477,13 @@ pub(crate) fn preflight_existing_schema(
         if state
             .validated
             .as_ref()
-            .is_some_and(|(validated, validated_backend)| {
+            .is_some_and(|(validated, validated_backend, _)| {
                 validated == &generation && validated_backend == &backend
             })
         {
             let (parent_authority, main_authority) =
                 open_schema_main_authority(db_path, &generation)?;
+            let authenticated_wal_digest = state.validated.as_ref().unwrap().2.clone();
             state.active_handoffs = state.active_handoffs.saturating_add(1);
             drop(state);
             return Ok(ValidatedSchemaGeneration {
@@ -408,6 +494,7 @@ pub(crate) fn preflight_existing_schema(
                 main_authority,
                 _shared_exclusion: shared_exclusion,
                 _leader_exclusion: None,
+                authenticated_wal_digest,
             });
         }
         if state.validating {
@@ -445,8 +532,19 @@ pub(crate) fn preflight_existing_schema(
         let round = state.round;
         drop(state);
 
-        let (validation, leader_exclusion) =
-            coordinate_schema_snapshot_validation(db_path, prolly_backend, &mut generation);
+        let mut authenticated_wal_digest = None;
+        let (mut validation, leader_exclusion) = coordinate_schema_snapshot_validation(
+            db_path,
+            prolly_backend,
+            &mut generation,
+            &mut authenticated_wal_digest,
+        );
+        if validation.is_ok() && authenticated_wal_digest.is_none() {
+            match schema_wal_digest(db_path, &generation) {
+                Ok(digest) => authenticated_wal_digest = Some(digest),
+                Err(error) => validation = Err(error),
+            }
+        }
 
         let mut state = entry
             .state
@@ -455,7 +553,11 @@ pub(crate) fn preflight_existing_schema(
         state.validating = false;
         match validation {
             Ok(()) => {
-                state.validated = Some((generation.clone(), backend.clone()));
+                state.validated = Some((
+                    generation.clone(),
+                    backend.clone(),
+                    authenticated_wal_digest.clone().unwrap(),
+                ));
                 state.failed = None;
             }
             Err(error) => {
@@ -480,6 +582,7 @@ pub(crate) fn preflight_existing_schema(
             main_authority,
             _shared_exclusion: shared_exclusion,
             _leader_exclusion: leader_exclusion,
+            authenticated_wal_digest: authenticated_wal_digest.unwrap(),
         });
     }
 }
@@ -536,6 +639,103 @@ struct SchemaValidationRuntimeEntry {
     path: PathBuf,
     device: u64,
     inode: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SchemaValidationSocketAuthority {
+    #[cfg(target_os = "linux")]
+    _inode: File,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn schema_validation_socket_identity_matches(
+    metadata: &fs::Metadata,
+    expected: &SchemaValidationRuntimeEntry,
+) -> bool {
+    metadata.file_type().is_socket()
+        && metadata.uid() == rustix::process::getuid().as_raw()
+        && metadata.dev() == expected.device
+        && metadata.ino() == expected.inode
+        && metadata.mode() & 0o777 == 0o600
+}
+
+#[cfg(target_os = "linux")]
+fn secure_schema_validation_socket(
+    path: &Path,
+    expected: &SchemaValidationRuntimeEntry,
+) -> std::io::Result<SchemaValidationSocketAuthority> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Linux does not implement fchmodat(AT_SYMLINK_NOFOLLOW). Pin the bound
+    // socket inode with O_PATH|O_NOFOLLOW, then chmod through that descriptor's
+    // procfs handle. The pathname can be replaced without redirecting chmod;
+    // the final lstat comparison rejects any such substitution.
+    let inode = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let before = inode.metadata()?;
+    if !before.file_type().is_socket()
+        || before.uid() != rustix::process::getuid().as_raw()
+        || before.dev() != expected.device
+        || before.ino() != expected.inode
+    {
+        return Err(std::io::Error::other(
+            "schema validation socket inode changed before permission binding",
+        ));
+    }
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", inode.as_raw_fd()));
+    fs::set_permissions(&descriptor_path, fs::Permissions::from_mode(0o600))?;
+    let pinned = inode.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !schema_validation_socket_identity_matches(&pinned, expected)
+        || !schema_validation_socket_identity_matches(&named, expected)
+    {
+        return Err(std::io::Error::other(
+            "schema validation socket inode changed during permission binding",
+        ));
+    }
+    #[cfg(test)]
+    if let Some(hook) = NEXT_SCHEMA_SOCKET_AUTHORITY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path)
+    {
+        hook(path);
+    }
+    let pinned = inode.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !schema_validation_socket_identity_matches(&pinned, expected)
+        || !schema_validation_socket_identity_matches(&named, expected)
+    {
+        return Err(std::io::Error::other(
+            "schema validation socket pathname changed after permission binding",
+        ));
+    }
+    Ok(SchemaValidationSocketAuthority { _inode: inode })
+}
+
+#[cfg(target_os = "macos")]
+fn secure_schema_validation_socket(
+    path: &Path,
+    expected: &SchemaValidationRuntimeEntry,
+) -> std::io::Result<SchemaValidationSocketAuthority> {
+    rustix::fs::chmodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(std::io::Error::from)?;
+    let named = fs::symlink_metadata(path)?;
+    if !schema_validation_socket_identity_matches(&named, expected) {
+        return Err(std::io::Error::other(
+            "schema validation socket inode changed during permission binding",
+        ));
+    }
+    Ok(SchemaValidationSocketAuthority {})
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -641,7 +841,7 @@ fn schema_validation_wire_result(
     outcome: &CrossProcessSchemaValidationOutcome,
 ) -> String {
     let (kind, payload) = match outcome {
-        CrossProcessSchemaValidationOutcome::Success => ("success", String::new()),
+        CrossProcessSchemaValidationOutcome::Success(wal_digest) => ("success", wal_digest.clone()),
         CrossProcessSchemaValidationOutcome::Failure(message) => {
             ("failure", hex::encode(message.as_bytes()))
         }
@@ -673,7 +873,9 @@ fn parse_schema_validation_wire_result(
         return None;
     }
     match kind {
-        "success" if payload.is_empty() => Some(CrossProcessSchemaValidationOutcome::Success),
+        "success" if payload.len() == 64 && hex::decode(payload).is_ok() => Some(
+            CrossProcessSchemaValidationOutcome::Success(payload.to_owned()),
+        ),
         "failure" => String::from_utf8(hex::decode(payload).ok()?)
             .ok()
             .map(CrossProcessSchemaValidationOutcome::Failure),
@@ -804,6 +1006,7 @@ struct SchemaValidationServer {
     backend: String,
     outcome: CrossProcessSchemaValidationOutcome,
     _leader_exclusion: File,
+    _socket_authority: SchemaValidationSocketAuthority,
     _socket_cleanup: SchemaValidationRuntimeEntry,
     _announcement_cleanup: SchemaValidationRuntimeEntry,
     #[cfg(test)]
@@ -1008,10 +1211,13 @@ fn coordinate_schema_snapshot_validation(
     db_path: &Path,
     backend: &str,
     generation: &mut SchemaGeneration,
+    authenticated_wal_digest: &mut Option<String>,
 ) -> (Result<()>, Option<File>) {
     use rustix::process::{Flock, FlockType, Pid};
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixListener;
+
+    *authenticated_wal_digest = None;
 
     // POSIX record locks are process-associated, so never overlap a replacement
     // FD with an existing process-local server. Revoke the old server without
@@ -1088,24 +1294,16 @@ fn coordinate_schema_snapshot_validation(
                         )
                     }
                 };
-                if rustix::fs::chmodat(
-                    rustix::fs::CWD,
-                    &socket_path,
-                    rustix::fs::Mode::from_raw_mode(0o600),
-                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .is_err()
-                    || fs::symlink_metadata(&socket_path).is_ok_and(|metadata| {
-                        metadata.dev() != socket_cleanup.device
-                            || metadata.ino() != socket_cleanup.inode
-                            || metadata.mode() & 0o077 != 0
-                    })
-                {
-                    return (
-                        validate_schema_snapshot_generation(db_path, backend, generation),
-                        Some(file),
-                    );
-                }
+                let socket_authority =
+                    match secure_schema_validation_socket(&socket_path, &socket_cleanup) {
+                        Ok(authority) => authority,
+                        Err(_) => {
+                            return (
+                                validate_schema_snapshot_generation(db_path, backend, generation),
+                                Some(file),
+                            )
+                        }
+                    };
                 let _ = listener.set_nonblocking(true);
                 let announcement = format!(
                     "trail-schema-validation-announce-v1\n{}\n{}\n{}\n{}\n",
@@ -1154,12 +1352,25 @@ fn coordinate_schema_snapshot_validation(
                     Err(error) => return (Err(error), Some(file)),
                 };
                 let generation_key = schema_generation_key(generation);
-                let validation = validate_schema_snapshot_generation(db_path, backend, generation);
-                let outcome = match &validation {
-                    Ok(()) => CrossProcessSchemaValidationOutcome::Success,
-                    Err(error) => {
-                        CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(error))
+                let mut validation =
+                    validate_schema_snapshot_generation(db_path, backend, generation);
+                let outcome = if validation.is_ok() {
+                    match schema_wal_digest(db_path, generation) {
+                        Ok(digest) => {
+                            *authenticated_wal_digest = Some(digest.clone());
+                            CrossProcessSchemaValidationOutcome::Success(digest)
+                        }
+                        Err(error) => {
+                            validation = Err(error);
+                            CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(
+                                validation.as_ref().unwrap_err(),
+                            ))
+                        }
                     }
+                } else {
+                    CrossProcessSchemaValidationOutcome::Failure(schema_failure_message(
+                        validation.as_ref().unwrap_err(),
+                    ))
                 };
                 #[cfg(test)]
                 let (start_delay, shutdown_delay) =
@@ -1171,6 +1382,7 @@ fn coordinate_schema_snapshot_validation(
                     backend: backend.to_owned(),
                     outcome,
                     _leader_exclusion: file,
+                    _socket_authority: socket_authority,
                     _socket_cleanup: socket_cleanup,
                     _announcement_cleanup: announcement_cleanup,
                     #[cfg(test)]
@@ -1225,7 +1437,10 @@ fn coordinate_schema_snapshot_validation(
                             ) {
                                 return (
                                     match outcome {
-                                        CrossProcessSchemaValidationOutcome::Success => Ok(()),
+                                        CrossProcessSchemaValidationOutcome::Success(digest) => {
+                                            *authenticated_wal_digest = Some(digest);
+                                            Ok(())
+                                        }
                                         CrossProcessSchemaValidationOutcome::Failure(message) => {
                                             Err(schema_reinitialize_error(message))
                                         }
@@ -1248,7 +1463,9 @@ fn coordinate_schema_snapshot_validation(
     db_path: &Path,
     backend: &str,
     generation: &mut SchemaGeneration,
+    authenticated_wal_digest: &mut Option<String>,
 ) -> (Result<()>, Option<File>) {
+    *authenticated_wal_digest = None;
     (
         validate_schema_snapshot_generation(db_path, backend, generation),
         None,
@@ -1373,6 +1590,160 @@ fn schema_validation_process_test_probe() -> Result<()> {
         return Err(schema_reinitialize_error(message));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn schema_wal_digest(db_path: &Path, expected: &SchemaGeneration) -> Result<String> {
+    schema_wal_digest_inner(db_path, expected, false)?.ok_or_else(|| {
+        schema_reinitialize_error("schema WAL unexpectedly lacked a stable digest snapshot")
+    })
+}
+
+#[cfg(unix)]
+fn schema_wal_digest_allowing_wal_ctime_transition(
+    db_path: &Path,
+    expected: &SchemaGeneration,
+) -> Result<String> {
+    const MAX_STABLE_SNAPSHOT_ATTEMPTS: usize = 16;
+
+    for attempt in 0..MAX_STABLE_SNAPSHOT_ATTEMPTS {
+        if let Some(digest) = schema_wal_digest_inner(db_path, expected, true)? {
+            return Ok(digest);
+        }
+        if attempt + 1 < MAX_STABLE_SNAPSHOT_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    Err(schema_reinitialize_error(
+        "schema WAL did not reach a stable descriptor snapshot for digest",
+    ))
+}
+
+#[cfg(unix)]
+fn schema_wal_digest_inner(
+    db_path: &Path,
+    expected: &SchemaGeneration,
+    allow_wal_ctime_transition: bool,
+) -> Result<Option<String>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let before = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+    if &before != expected
+        && !(allow_wal_ctime_transition
+            && schema_generation_is_only_wal_ctime_transition(expected, &before))
+    {
+        return Err(schema_reinitialize_error(
+            "schema generation changed before WAL digest",
+        ));
+    }
+    let wal = before
+        .0
+        .iter()
+        .find(|file| file.suffix == "-wal")
+        .ok_or_else(|| schema_reinitialize_error("schema generation omitted WAL authority"))?;
+    let mut digest = Sha256::new();
+    digest.update(b"trail-schema-wal-v1\0");
+    digest.update([u8::from(wal.present)]);
+    if wal.present {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push("-wal");
+        let path = PathBuf::from(path);
+        #[cfg(test)]
+        if let Some(hook) = NEXT_SCHEMA_WAL_DIGEST_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path)
+        {
+            hook(&path);
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(schema_reinitialize_error)?;
+        let opened = file.metadata().map_err(schema_reinitialize_error)?;
+        let opened = schema_wal_generation_from_metadata(&opened);
+        if !schema_wal_generation_matches_authority(&opened, wal) {
+            return Err(schema_reinitialize_error(
+                "schema WAL descriptor changed before digest",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(hook) = SCHEMA_WAL_DIGEST_ATTEMPT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&path)
+        {
+            hook(&path);
+        }
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(schema_reinitialize_error)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let hashed = file.metadata().map_err(schema_reinitialize_error)?;
+        let hashed = schema_wal_generation_from_metadata(&hashed);
+        if hashed != opened {
+            if allow_wal_ctime_transition {
+                return Ok(None);
+            }
+            return Err(schema_reinitialize_error(
+                "schema WAL descriptor changed during digest",
+            ));
+        }
+    }
+    let after = schema_generation(db_path).map_err(schema_reinitialize_error)?;
+    if after != before {
+        if allow_wal_ctime_transition
+            && schema_generation_is_only_wal_ctime_transition(&before, &after)
+        {
+            return Ok(None);
+        }
+        return Err(schema_reinitialize_error(
+            "schema generation changed during WAL digest",
+        ));
+    }
+    Ok(Some(hex::encode(digest.finalize())))
+}
+
+#[cfg(unix)]
+fn schema_wal_generation_from_metadata(metadata: &fs::Metadata) -> SchemaFileGeneration {
+    SchemaFileGeneration {
+        suffix: "-wal",
+        present: metadata.file_type().is_file(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(unix)]
+fn schema_wal_generation_matches_authority(
+    observed: &SchemaFileGeneration,
+    expected: &SchemaFileGeneration,
+) -> bool {
+    observed.present
+        && observed.device == expected.device
+        && observed.inode == expected.inode
+        && observed.length == expected.length
+        && observed.modified_seconds == expected.modified_seconds
+        && observed.modified_nanoseconds == expected.modified_nanoseconds
+}
+
+#[cfg(not(unix))]
+fn schema_wal_digest(_db_path: &Path, _expected: &SchemaGeneration) -> Result<String> {
+    Err(schema_reinitialize_error(
+        "schema WAL digest is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]

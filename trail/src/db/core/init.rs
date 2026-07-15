@@ -767,6 +767,8 @@ mod schema_handoff_tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let socket_cleanup = SchemaValidationRuntimeEntry::capture(&socket_path).unwrap();
+        let socket_authority =
+            secure_schema_validation_socket(&socket_path, &socket_cleanup).unwrap();
         let announcement_path = root.join("schema-validation.announce");
         fs::write(&announcement_path, b"test announcement").unwrap();
         let announcement_cleanup =
@@ -779,8 +781,9 @@ mod schema_handoff_tests {
                 nonce: nonce.clone(),
                 generation: generation.clone(),
                 backend: "sqlite".to_owned(),
-                outcome: CrossProcessSchemaValidationOutcome::Success,
+                outcome: CrossProcessSchemaValidationOutcome::Success("a".repeat(64)),
                 _leader_exclusion: leader_exclusion,
+                _socket_authority: socket_authority,
                 _socket_cleanup: socket_cleanup,
                 _announcement_cleanup: announcement_cleanup,
                 panic_on_serve: false,
@@ -1042,7 +1045,7 @@ mod schema_handoff_tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &original_key,
             "sqlite",
-            &CrossProcessSchemaValidationOutcome::Success,
+            &CrossProcessSchemaValidationOutcome::Success("d".repeat(64)),
         );
         for suffix in ["", "-wal", "-shm"] {
             let index = generation
@@ -1068,6 +1071,96 @@ mod schema_handoff_tests {
             "slatedb",
         )
         .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_schema_socket_is_really_published_owner_only() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path =
+            canonicalize_lossless(&root.path().join(".trail").join(DB_RELATIVE_PATH)).unwrap();
+        let mut generation = schema_generation(&db_path).unwrap();
+
+        let mut authenticated_wal_digest = None;
+        let (validation, foreground_leader) = coordinate_schema_snapshot_validation(
+            &db_path,
+            "sqlite",
+            &mut generation,
+            &mut authenticated_wal_digest,
+        );
+        validation.unwrap();
+        assert!(
+            foreground_leader.is_none(),
+            "Linux silently fell back to per-process validation instead of publishing IPC"
+        );
+        assert!(authenticated_wal_digest.is_some());
+
+        let (runtime_dir, namespace) = schema_validation_runtime_namespace(&db_path)
+            .unwrap()
+            .unwrap();
+        let prefix = format!("{}-", &namespace[..24]);
+        let announcement = fs::read_dir(&runtime_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".announce")
+            })
+            .expect("Linux schema validation announcement was not published");
+        let (_, socket_path) = read_schema_validation_announcement(
+            &announcement.path(),
+            std::process::id(),
+            &namespace,
+        )
+        .expect("published Linux announcement was not authenticated");
+        let metadata = fs::symlink_metadata(&socket_path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        assert!(stop_schema_validation_server(&db_path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_schema_socket_rejects_last_moment_path_substitution() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let socket_path = root.path().join("schema.socket");
+        let retained_path = root.path().join("retained.socket");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let expected = SchemaValidationRuntimeEntry::capture(&socket_path).unwrap();
+        let hook_retained = retained_path.clone();
+        install_schema_socket_authority_hook(
+            &socket_path,
+            Box::new(move |path| {
+                fs::rename(path, &hook_retained).unwrap();
+                let replacement = UnixListener::bind(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+                drop(replacement);
+            }),
+        );
+
+        let result = secure_schema_validation_socket(&socket_path, &expected);
+        assert!(
+            result.is_err(),
+            "descriptor-bound socket authority accepted a substituted pathname"
+        );
+        let retained = fs::symlink_metadata(&retained_path).unwrap();
+        let replacement = fs::symlink_metadata(&socket_path).unwrap();
+        assert!(retained.file_type().is_socket());
+        assert_eq!(retained.dev(), expected.device);
+        assert_eq!(retained.ino(), expected.inode);
+        assert_eq!(retained.permissions().mode() & 0o777, 0o600);
+        assert!(replacement.file_type().is_socket());
+        assert_ne!(replacement.ino(), expected.inode);
+        assert_eq!(replacement.permissions().mode() & 0o777, 0o644);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1340,6 +1433,157 @@ mod schema_handoff_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restored_mtime_wal_byte_change_invalidates_authenticated_handoff() {
+        use std::ffi::CString;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='digest-race' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let hook_wal = wal.clone();
+        install_schema_handoff_hook(move |_| {
+            let metadata = fs::metadata(&hook_wal).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&hook_wal)
+                .unwrap();
+            file.seek(SeekFrom::End(-1)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            file.seek(SeekFrom::End(-1)).unwrap();
+            file.write_all(&[byte[0] ^ 0xff]).unwrap();
+            file.sync_all().unwrap();
+            let path = CString::new(hook_wal.as_os_str().as_bytes()).unwrap();
+            let times = [
+                libc::timespec {
+                    tv_sec: metadata.atime(),
+                    tv_nsec: metadata.atime_nsec(),
+                },
+                libc::timespec {
+                    tv_sec: metadata.mtime(),
+                    tv_nsec: metadata.mtime_nsec(),
+                },
+            ];
+            assert_eq!(
+                unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+                0
+            );
+        });
+
+        assert!(matches!(
+            Trail::open(root.path()),
+            Err(Error::SchemaReinitializeRequired { .. })
+        ));
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_digest_rejects_last_component_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='digest-symlink' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+
+        let expected = schema_generation(&db_path).unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let retained = wal.with_extension("wal.digest-retained");
+        let hook_retained = retained.clone();
+        install_schema_wal_digest_hook(
+            &wal,
+            Box::new(move |path| {
+                fs::rename(path, &hook_retained).unwrap();
+                symlink(&hook_retained, path).unwrap();
+            }),
+        );
+
+        let error = schema_wal_digest(&db_path, &expected).unwrap_err();
+        assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+        assert!(wal.symlink_metadata().unwrap().file_type().is_symlink());
+
+        fs::remove_file(&wal).unwrap();
+        fs::rename(&retained, &wal).unwrap();
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_digest_continuous_churn_is_bounded_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        Trail::init(root.path(), "main", InitImportMode::Empty, false).unwrap();
+        let db_path = root.path().join(".trail").join(DB_RELATIVE_PATH);
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE schema_meta SET value='digest-churn' WHERE key='app.version'",
+                [],
+            )
+            .unwrap();
+
+        let expected = schema_generation(&db_path).unwrap();
+        let mut wal = db_path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let mut owner_only = false;
+        install_schema_wal_digest_attempt_hook(
+            &wal,
+            Box::new(move |path| {
+                owner_only = !owner_only;
+                let mode = if owner_only { 0o600 } else { 0o640 };
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }),
+        );
+
+        let started = Instant::now();
+        let error =
+            schema_wal_digest_allowing_wal_ctime_transition(&db_path, &expected).unwrap_err();
+        clear_schema_wal_digest_attempt_hook(&wal);
+        assert!(matches!(error, Error::SchemaReinitializeRequired { .. }));
+        assert!(error.to_string().contains("stable descriptor snapshot"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded WAL digest retry took {:?}",
+            started.elapsed()
+        );
+        drop(writer);
+    }
+
     #[test]
     fn schema_validation_leader_failure_propagates_and_next_open_retries() {
         let root = tempfile::tempdir().unwrap();
@@ -1503,7 +1747,8 @@ mod schema_handoff_tests {
                 "sqlite",
                 std::process::id(),
             ),
-            Some(CrossProcessSchemaValidationOutcome::Success)
+            Some(CrossProcessSchemaValidationOutcome::Success(digest))
+                if digest == "a".repeat(64)
         ));
         let stopped = Instant::now();
         shutdown.stop();
