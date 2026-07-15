@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use crate::{Error, Result};
 pub(crate) const ACP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const ACP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const ACP_PUMP_DRAIN_TIMEOUT: Duration = ACP_SHUTDOWN_TIMEOUT;
-const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_millis(750);
+const ACP_CAPTURE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RelayFinishReason {
@@ -24,7 +25,9 @@ pub(crate) enum RelayFinishReason {
 pub(crate) trait FrameObserver: Send + Sync + 'static {
     fn observe(&self, frame: &mut Frame) -> Result<()>;
     fn finish(&self, reason: RelayFinishReason);
-    fn flush(&self, _timeout: Duration) {}
+    fn flush(&self, _timeout: Duration) -> bool {
+        true
+    }
 }
 
 pub(crate) struct StdioRelay<O: FrameObserver> {
@@ -82,15 +85,12 @@ impl<O: FrameObserver> StdioRelay<O> {
         }
 
         let (done_tx, done_rx) = mpsc::channel();
+        let stop_editor = Arc::new(AtomicBool::new(false));
         let editor_observer = Arc::clone(&self.observer);
         let editor_done = done_tx.clone();
+        let editor_stop = Arc::clone(&stop_editor);
         let editor_handle = thread::spawn(move || {
-            let result = pump(
-                io::stdin().lock(),
-                child_stdin,
-                Direction::ClientToAgent,
-                editor_observer,
-            );
+            let result = pump_editor(child_stdin, editor_observer, editor_stop);
             let _ = editor_done.send(PumpDone::Editor(result));
         });
 
@@ -108,40 +108,32 @@ impl<O: FrameObserver> StdioRelay<O> {
         let first = done_rx.recv().map_err(|err| {
             Error::InvalidInput(format!("ACP relay pump failed before startup: {err}"))
         })?;
-        self.observer.finish(finish_reason(&first));
-        self.observer.flush(ACP_CAPTURE_FLUSH_TIMEOUT);
+        let reason = finish_reason(&first);
+        if matches!(first, PumpDone::Agent(_)) {
+            stop_editor.store(true, Ordering::Release);
+        }
+        let exit = wait_bounded(&mut child)?;
+        let second = done_rx.recv_timeout(ACP_PUMP_DRAIN_TIMEOUT).map_err(|_| {
+            Error::InvalidInput(
+                "ACP relay pump did not stop before the finalization boundary".to_string(),
+            )
+        })?;
+        editor_handle.join().map_err(|_| {
+            Error::InvalidInput("ACP editor pump panicked during shutdown".to_string())
+        })?;
+        agent_handle.join().map_err(|_| {
+            Error::InvalidInput("ACP agent pump panicked during shutdown".to_string())
+        })?;
 
-        match first {
-            PumpDone::Editor(editor_result) => {
-                let exit = wait_bounded(&mut child)?;
-                let agent_result =
-                    done_rx
-                        .recv_timeout(ACP_PUMP_DRAIN_TIMEOUT)
-                        .ok()
-                        .and_then(|done| match done {
-                            PumpDone::Agent(result) => Some(result),
-                            PumpDone::Editor(_) => None,
-                        });
-                let _ = editor_handle.join();
-                if agent_result.is_some() {
-                    let _ = agent_handle.join();
-                }
-                editor_result.map_err(Error::Io)?;
-                if let Some(result) = agent_result {
-                    result.map_err(Error::Io)?;
-                }
-                if exit.timed_out {
-                    Ok(())
-                } else {
-                    ensure_success(exit.status)
-                }
-            }
-            PumpDone::Agent(agent_result) => {
-                let exit = wait_bounded(&mut child)?;
-                let _ = agent_handle.join();
-                agent_result.map_err(Error::Io)?;
-                ensure_success(exit.status)
-            }
+        let (editor_result, agent_result) = pump_results(first, second)?;
+        self.observer.finish(reason);
+        self.observer.flush(ACP_CAPTURE_FLUSH_TIMEOUT);
+        editor_result.map_err(Error::Io)?;
+        agent_result.map_err(Error::Io)?;
+        if exit.timed_out {
+            Ok(())
+        } else {
+            ensure_success(exit.status)
         }
     }
 }
@@ -158,6 +150,118 @@ fn finish_reason(done: &PumpDone) -> RelayFinishReason {
         PumpDone::Agent(Ok(())) => RelayFinishReason::AgentEof,
         PumpDone::Agent(Err(err)) => RelayFinishReason::AgentError(err.to_string()),
     }
+}
+
+fn pump_results(first: PumpDone, second: PumpDone) -> Result<(io::Result<()>, io::Result<()>)> {
+    match (first, second) {
+        (PumpDone::Editor(editor), PumpDone::Agent(agent))
+        | (PumpDone::Agent(agent), PumpDone::Editor(editor)) => Ok((editor, agent)),
+        _ => Err(Error::InvalidInput(
+            "ACP relay received duplicate pump completion".to_string(),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn pump_editor<W, O>(mut writer: W, observer: Arc<O>, stop: Arc<AtomicBool>) -> io::Result<()>
+where
+    W: Write,
+    O: FrameObserver,
+{
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return writer.flush();
+        }
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 25) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 || stop.load(Ordering::Acquire) {
+            continue;
+        }
+        let read =
+            unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if read == 0 {
+            if !pending.is_empty() {
+                forward_raw_frame(
+                    std::mem::take(&mut pending),
+                    Direction::ClientToAgent,
+                    &observer,
+                    &mut writer,
+                )?;
+            }
+            return writer.flush();
+        }
+        pending.extend_from_slice(&chunk[..usize::try_from(read).unwrap_or(0)]);
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let remainder = pending.split_off(end + 1);
+            let raw = std::mem::replace(&mut pending, remainder);
+            forward_raw_frame(raw, Direction::ClientToAgent, &observer, &mut writer)?;
+        }
+        if pending.len() > ACP_MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ACP frame exceeds the {ACP_MAX_FRAME_BYTES}-byte transport limit"),
+            ));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn pump_editor<W, O>(writer: W, observer: Arc<O>, _stop: Arc<AtomicBool>) -> io::Result<()>
+where
+    W: Write,
+    O: FrameObserver,
+{
+    pump(
+        io::stdin().lock(),
+        writer,
+        Direction::ClientToAgent,
+        observer,
+    )
+}
+
+fn forward_raw_frame<W, O>(
+    raw: Vec<u8>,
+    direction: Direction,
+    observer: &Arc<O>,
+    writer: &mut W,
+) -> io::Result<()>
+where
+    W: Write,
+    O: FrameObserver,
+{
+    if raw.len() > ACP_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("ACP frame exceeds the {ACP_MAX_FRAME_BYTES}-byte transport limit"),
+        ));
+    }
+    if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(());
+    }
+    let mut frame = Frame::parse(direction, raw)?;
+    observer.observe(&mut frame).map_err(io::Error::other)?;
+    writer.write_all(frame.forward_bytes())?;
+    writer.flush()
 }
 
 fn pump<R, W, O>(

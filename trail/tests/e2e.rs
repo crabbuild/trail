@@ -6330,6 +6330,115 @@ fn acp_relay_runs_three_synchronized_relays_on_distinct_lanes() {
 
 #[cfg(unix)]
 #[test]
+fn acp_relay_drains_delayed_terminal_frames_and_spill_before_finalizing() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("README.md"), "hello\n").unwrap();
+    Trail::init(temp.path(), "main", InitImportMode::WorkingTree, false).unwrap();
+
+    let lane = "acp-finalization-order";
+    let session_id = "sess_finalization_order";
+    let lane_workdir = temp
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(format!(".trail/worktrees/{lane}"));
+    let mut options = StubAcpAgentOptions::new(session_id);
+    options.lane_workdir = Some(&lane_workdir);
+    options.sleep_before_result_ms = Some(100);
+    let stub_agent = write_stub_acp_agent(temp.path(), "finalization-order-agent.sh", options);
+
+    let mut child = Command::new(trail_bin())
+        .arg("--workspace")
+        .arg(temp.path())
+        .args([
+            "acp",
+            "relay",
+            "--lane",
+            lane,
+            "--materialize",
+            "--provider",
+            "test-stub",
+            "--",
+        ])
+        .arg(stub_agent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":1}}}}"#
+    )
+    .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":0"#));
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"{}","mcpServers":[]}}}}"#,
+        temp.path().display()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.contains(session_id));
+
+    let lock_path = temp.path().join(".trail/lock");
+    fs::write(
+        &lock_path,
+        format!("pid={} created_at=0", std::process::id()),
+    )
+    .unwrap();
+    let lock_remover = {
+        let lock_path = lock_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            match fs::remove_file(lock_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to release capture writer lock: {error}"),
+            }
+        })
+    };
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"{session_id}","prompt":[{{"type":"text","text":"finish after drain"}}]}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let mut remaining_stdout = String::new();
+    stdout.read_to_string(&mut remaining_stdout).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+    lock_remover.join().unwrap();
+    assert!(
+        status.success(),
+        "relay failed\nstdout:\n{remaining_stdout}\nstderr:\n{stderr}"
+    );
+    assert!(remaining_stdout.contains(r#""id":2"#));
+
+    let db = Trail::open(temp.path()).unwrap();
+    let mapping = db.try_lane_acp_session(session_id).unwrap().unwrap();
+    let session = db.show_lane_session(&mapping.trail_session_id).unwrap();
+    assert_eq!(session.turns.len(), 1);
+    assert_eq!(session.turns[0].status, "completed");
+    assert!(session.messages.iter().any(|message| {
+        message.role == "assistant" && message.body.contains("diagnostic complete")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
 fn acp_relay_waits_for_transient_workspace_writer_lock() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "hello\n").unwrap();
@@ -6396,7 +6505,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
         let lock_path = lock_path.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
-            fs::remove_file(lock_path).unwrap();
+            match fs::remove_file(lock_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("failed to release transient writer lock: {error}"),
+            }
         })
     };
 

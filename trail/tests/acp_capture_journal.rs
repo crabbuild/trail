@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -190,8 +190,15 @@ fn forwarding_never_waits_for_database_writer() {
     reader.join().unwrap();
     let shutdown_started = Instant::now();
     drop(stdin);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
     let status = child.wait().unwrap();
-    assert!(status.success());
+    assert!(status.success(), "relay failed\nstderr:\n{stderr}");
     assert!(
         shutdown_started.elapsed() < Duration::from_millis(2_500),
         "capture shutdown exceeded its bounded drain budget: {:?}",

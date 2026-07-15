@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -98,9 +96,9 @@ impl CaptureIngress {
         _workspace_root: PathBuf,
         db_dir: PathBuf,
         coordinator: Arc<Mutex<CaptureCoordinator>>,
-        _connection_id: String,
+        connection_id: String,
     ) -> Result<Self> {
-        let spill = Arc::new(SpillStore::new(db_dir.join("acp-ingress"))?);
+        let spill = Arc::new(SpillStore::new(db_dir.join("acp-ingress"), connection_id)?);
         let health = Arc::new(CaptureHealth::new());
         let spill_mode = Arc::new(AtomicBool::new(false));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -202,9 +200,9 @@ impl CaptureIngress {
         }
     }
 
-    pub(crate) fn flush(&self, timeout: Duration) {
+    pub(crate) fn flush(&self, timeout: Duration) -> bool {
         let Some(tx) = &self.tx else {
-            return;
+            return false;
         };
         let deadline = Instant::now() + timeout;
         let (barrier_tx, barrier_rx) = mpsc::channel();
@@ -214,14 +212,11 @@ impl CaptureIngress {
                 Err(mpsc::TrySendError::Full(_)) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(1));
                 }
-                Err(_) => return,
+                Err(_) => return false,
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let _ = barrier_rx.recv_timeout(remaining);
-        while self.spill_mode.load(Ordering::Acquire) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
+        barrier_rx.recv_timeout(remaining).is_ok()
     }
 
     #[allow(dead_code)]
@@ -270,19 +265,34 @@ impl Drop for CaptureIngress {
 
 struct SpillStore {
     dir: PathBuf,
+    connection_id: String,
+    owner_path: PathBuf,
+    _owner_lock: File,
     state: Mutex<SpillState>,
 }
 
 #[derive(Default)]
 struct SpillState {
     claimed_paths: Vec<PathBuf>,
+    claimed_owners: Vec<(PathBuf, File)>,
 }
 
 impl SpillStore {
-    fn new(dir: PathBuf) -> Result<Self> {
+    fn new(dir: PathBuf, connection_id: String) -> Result<Self> {
         fs::create_dir_all(&dir)?;
+        let owner_path = dir.join(format!("{connection_id}.owner"));
+        let owner_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&owner_path)?;
+        lock_spill_owner(&owner_lock)?;
         Ok(Self {
             dir,
+            connection_id,
+            owner_path,
+            _owner_lock: owner_lock,
             state: Mutex::new(SpillState::default()),
         })
     }
@@ -339,7 +349,34 @@ impl SpillStore {
             .collect::<Vec<_>>();
         paths.sort();
         let mut claimed = Vec::new();
+        let mut recoverable_connections = HashSet::new();
+        recoverable_connections.insert(self.connection_id.clone());
+        let mut active_connections = HashSet::new();
+        let mut claimed_owners = Vec::new();
         for path in paths {
+            let Some(connection_id) = spill_connection_id(&path) else {
+                continue;
+            };
+            if !recoverable_connections.contains(&connection_id)
+                && !active_connections.contains(&connection_id)
+            {
+                let owner_path = self.dir.join(format!("{connection_id}.owner"));
+                let owner = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&owner_path)?;
+                if try_lock_spill_owner(&owner)? {
+                    recoverable_connections.insert(connection_id.clone());
+                    claimed_owners.push((owner_path, owner));
+                } else {
+                    active_connections.insert(connection_id.clone());
+                }
+            }
+            if active_connections.contains(&connection_id) {
+                continue;
+            }
             if path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
@@ -367,6 +404,7 @@ impl SpillStore {
             }
         }
         state.claimed_paths = claimed;
+        state.claimed_owners = claimed_owners;
         Ok(frames)
     }
 
@@ -382,18 +420,63 @@ impl SpillStore {
                 Err(error) => return Err(Error::Io(error)),
             }
         }
+        for (owner_path, _owner) in state.claimed_owners.drain(..) {
+            match fs::remove_file(owner_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
         Ok(())
     }
 
     fn release_claimed(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.claimed_paths.clear();
+            state.claimed_owners.clear();
         }
     }
 
     fn path_for(&self, connection_id: &str) -> PathBuf {
         self.dir.join(format!("{connection_id}.jsonl"))
     }
+}
+
+impl Drop for SpillStore {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.owner_path);
+    }
+}
+
+fn spill_connection_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let (connection_id, _) = name.split_once(".jsonl")?;
+    (!connection_id.is_empty()).then(|| connection_id.to_string())
+}
+
+#[cfg(unix)]
+fn lock_spill_owner(file: &File) -> Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|error| Error::Io(error.into()))
+}
+
+#[cfg(not(unix))]
+fn lock_spill_owner(_file: &File) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn try_lock_spill_owner(file: &File) -> Result<bool> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
+        Err(error) => Err(Error::Io(error.into())),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_spill_owner(_file: &File) -> Result<bool> {
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -415,15 +498,28 @@ fn capture_worker(
             VecDeque::new()
         }
     };
+    let mut deferred_barriers = Vec::new();
 
     loop {
         if stopping.load(Ordering::Acquire) {
+            let mut recovered_spill = true;
+            match spill.take_all() {
+                Ok(frames) => pending.extend(frames.into_iter().map(|frame| (frame, false))),
+                Err(error) => {
+                    recovered_spill = false;
+                    if health.record_error(&error) {
+                        eprintln!(
+                            "trail acp capture warning: shutdown spill replay failed: {error}"
+                        );
+                    }
+                }
+            }
             for command in rx.try_iter() {
                 match command {
                     CaptureCommand::Frame(frame) => pending.push_back((frame, true)),
                     CaptureCommand::Finish(reason) => store_finish(&pending_finish, reason),
                     CaptureCommand::Barrier(barrier) => {
-                        let _ = barrier.send(());
+                        deferred_barriers.push(barrier);
                     }
                     #[cfg(test)]
                     CaptureCommand::SimulateWorkerPanic => {
@@ -431,6 +527,7 @@ fn capture_worker(
                     }
                 }
             }
+            sort_pending_frames(&mut pending);
             let drain_deadline = Instant::now() + CAPTURE_SHUTDOWN_DRAIN_BUDGET;
             while Instant::now() + CAPTURE_PROJECT_LOCK_WAIT < drain_deadline {
                 let Some((frame, queued)) = pending.pop_front() else {
@@ -464,22 +561,59 @@ fn capture_worker(
                     frame
                 })
                 .collect::<Vec<_>>();
-            match spill.append_many(&frames) {
-                Err(error) => {
-                    if health.record_error(&error) {
-                        eprintln!("trail acp capture warning: shutdown spill failed: {error}");
+            let preserved_every_frame = recovered_spill
+                && match spill.append_many(&frames) {
+                    Err(error) => {
+                        if health.record_error(&error) {
+                            eprintln!("trail acp capture warning: shutdown spill failed: {error}");
+                        }
+                        false
                     }
-                }
-                _ => {
-                    if frames.is_empty() {
-                        let _ = spill.complete_claimed();
+                    _ => {
+                        if frames.is_empty() {
+                            let _ = spill.complete_claimed();
+                        }
+                        frames.is_empty()
                     }
-                }
-            }
-            if let Some(reason) = take_finish(&pending_finish) {
-                let _ = process_finish(&coordinator, reason);
+                };
+            if preserved_every_frame
+                && settle_pending_finish(&coordinator, &health, &pending_finish)
+            {
+                acknowledge_barriers(&mut deferred_barriers);
             }
             break;
+        }
+
+        let mut merged_frames = false;
+        if spill_mode.load(Ordering::Acquire) {
+            for command in rx.try_iter() {
+                match command {
+                    CaptureCommand::Frame(frame) => {
+                        pending.push_back((frame, true));
+                        merged_frames = true;
+                    }
+                    CaptureCommand::Finish(reason) => store_finish(&pending_finish, reason),
+                    CaptureCommand::Barrier(barrier) => deferred_barriers.push(barrier),
+                    #[cfg(test)]
+                    CaptureCommand::SimulateWorkerPanic => {
+                        panic!("simulated ACP capture worker panic")
+                    }
+                }
+            }
+            match spill.take_all() {
+                Ok(frames) => {
+                    merged_frames |= !frames.is_empty();
+                    pending.extend(frames.into_iter().map(|frame| (frame, false)));
+                }
+                Err(error) => {
+                    if health.record_error(&error) {
+                        eprintln!("trail acp capture warning: spill replay failed: {error}");
+                    }
+                }
+            }
+        }
+        if merged_frames {
+            sort_pending_frames(&mut pending);
         }
 
         if let Some((frame, queued)) = pending.pop_front() {
@@ -537,37 +671,16 @@ fn capture_worker(
         }
 
         if !spill_mode.load(Ordering::Acquire)
-            && let Some(reason) = take_finish(&pending_finish)
+            && settle_pending_finish(&coordinator, &health, &pending_finish)
         {
-            if let Err(error) = process_finish(&coordinator, reason) {
-                health.record_error(&error);
-            }
+            acknowledge_barriers(&mut deferred_barriers);
         }
 
         match rx.recv_timeout(CAPTURE_RETRY_INTERVAL) {
-            Ok(CaptureCommand::Frame(frame)) => {
-                match spill.take_all() {
-                    Ok(frames) => {
-                        pending.extend(frames.into_iter().map(|frame| (frame, false)));
-                    }
-                    Err(error) => {
-                        if health.record_error(&error) {
-                            eprintln!("trail acp capture warning: spill replay failed: {error}");
-                        }
-                    }
-                }
-                pending.push_back((frame, true));
-            }
+            Ok(CaptureCommand::Frame(frame)) => pending.push_back((frame, true)),
             Ok(CaptureCommand::Finish(reason)) => store_finish(&pending_finish, reason),
             Ok(CaptureCommand::Barrier(barrier)) => {
-                if !spill_mode.load(Ordering::Acquire)
-                    && let Some(reason) = take_finish(&pending_finish)
-                {
-                    if let Err(error) = process_finish(&coordinator, reason) {
-                        health.record_error(&error);
-                    }
-                }
-                let _ = barrier.send(());
+                deferred_barriers.push(barrier);
             }
             #[cfg(test)]
             Ok(CaptureCommand::SimulateWorkerPanic) => {
@@ -576,21 +689,48 @@ fn capture_worker(
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 stopping.store(true, Ordering::Release);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => match spill.take_all() {
-                Ok(frames) => {
-                    if frames.is_empty() {
-                        spill_mode.store(false, Ordering::Release);
-                    } else {
-                        pending.extend(frames.into_iter().map(|frame| (frame, false)));
-                    }
-                }
-                Err(error) => {
-                    if health.record_error(&error) {
-                        eprintln!("trail acp capture warning: spill replay failed: {error}");
-                    }
-                }
-            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+fn sort_pending_frames(pending: &mut VecDeque<(CapturedFrame, bool)>) {
+    let mut ordered = pending.drain(..).collect::<Vec<_>>();
+    ordered.sort_by(|(left, _), (right, _)| {
+        if left.connection_id == right.connection_id {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| direction_name(left.direction).cmp(direction_name(right.direction)))
+        } else {
+            left.received_at
+                .cmp(&right.received_at)
+                .then_with(|| left.connection_id.cmp(&right.connection_id))
+        }
+    });
+    pending.extend(ordered);
+}
+
+fn settle_pending_finish(
+    coordinator: &Arc<Mutex<CaptureCoordinator>>,
+    health: &CaptureHealth,
+    pending_finish: &Mutex<Option<RelayFinishReason>>,
+) -> bool {
+    let Some(reason) = take_finish(pending_finish) else {
+        return true;
+    };
+    match process_finish(coordinator, reason.clone()) {
+        Ok(()) => true,
+        Err(error) => {
+            store_finish(pending_finish, reason);
+            health.record_error(&error);
+            false
+        }
+    }
+}
+
+fn acknowledge_barriers(barriers: &mut Vec<mpsc::Sender<()>>) {
+    for barrier in barriers.drain(..) {
+        let _ = barrier.send(());
     }
 }
 
@@ -1008,6 +1148,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let ingress = test_ingress(temp.path(), "spill-failure");
         let spill_dir = temp.path().join(".trail/acp-ingress");
+        fs::remove_file(&ingress.spill.owner_path).unwrap();
         fs::remove_dir(&spill_dir).unwrap();
         fs::write(&spill_dir, "not a directory").unwrap();
         ingress.spill_mode.store(true, Ordering::Release);
@@ -1025,5 +1166,73 @@ mod tests {
         assert!(!report.healthy);
         assert!(report.degraded);
         assert_eq!(report.spilled, 0);
+    }
+
+    #[test]
+    fn barrier_waits_for_spill_replay_and_finish_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let ingress = test_ingress(temp.path(), "barrier-order");
+        let writer_lock = crate::db::acquire_workspace_lock(&temp.path().join(".trail")).unwrap();
+
+        ingress
+            .append(capture_frame(
+                "barrier-order",
+                Direction::AgentToClient,
+                1,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sequence": 1}
+                }),
+                false,
+            ))
+            .unwrap();
+        let spill_deadline = Instant::now() + Duration::from_secs(1);
+        while !ingress.spill_mode.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < spill_deadline,
+                "capture worker never entered durable spill mode"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        ingress.finish(RelayFinishReason::EditorEof);
+        assert!(
+            !ingress.flush(Duration::from_millis(100)),
+            "barrier acknowledged before the earlier spill and finish were projected"
+        );
+        drop(writer_lock);
+        assert!(
+            ingress.flush(Duration::from_secs(2)),
+            "barrier did not acknowledge after spill replay and finish projection"
+        );
+    }
+
+    #[test]
+    fn spill_recovery_never_claims_another_live_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("acp-ingress");
+        let live = SpillStore::new(dir.clone(), "live-connection".to_string()).unwrap();
+        live.append(&capture_frame(
+            "live-connection",
+            Direction::AgentToClient,
+            7,
+            &serde_json::json!({"jsonrpc":"2.0","method":"ext/live"}),
+            false,
+        ))
+        .unwrap();
+
+        let recovery = SpillStore::new(dir, "recovery-connection".to_string()).unwrap();
+        assert!(
+            recovery.take_all().unwrap().is_empty(),
+            "recovery worker claimed a spill owned by a live relay"
+        );
+        drop(live);
+
+        let recovered = recovery.take_all().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].connection_id, "live-connection");
+        assert_eq!(recovered[0].sequence, 7);
+        recovery.complete_claimed().unwrap();
     }
 }

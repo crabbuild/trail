@@ -469,7 +469,11 @@ pub fn benchmark_acp_relay_frames(
         });
     }
     observer.finish(RelayFinishReason::EditorEof);
-    observer.flush(Duration::from_secs(120));
+    if !observer.flush(Duration::from_secs(120)) {
+        return Err(Error::InvalidInput(
+            "ACP benchmark capture did not settle before the finalization deadline".to_string(),
+        ));
+    }
     drop(observer);
     Ok(samples)
 }
@@ -595,7 +599,7 @@ impl FrameObserver for CaptureObserver {
         self.ingress.finish(reason);
     }
 
-    fn flush(&self, timeout: Duration) {
+    fn flush(&self, timeout: Duration) -> bool {
         let has_pending_client_callbacks = self
             .coordinator
             .lock()
@@ -606,17 +610,21 @@ impl FrameObserver for CaptureObserver {
         } else {
             timeout
         };
-        self.ingress.flush(timeout);
+        let settled = self.ingress.flush(timeout);
+        if !settled {
+            return false;
+        }
         let reason = self
             .finish_reason
             .lock()
             .ok()
             .and_then(|mut reason| reason.take());
         if let Some(reason) = reason {
-            capture_step(&self.coordinator, |capture| {
+            return capture_step(&self.coordinator, |capture| {
                 capture.capture_callback_shutdown(&reason)
             });
         }
+        true
     }
 }
 
