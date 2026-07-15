@@ -1,5 +1,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,6 +20,48 @@ pub(super) fn try_handle_auto_daemon_command(
     if !daemon_supports_command(command) {
         return Ok(false);
     }
+    if matches!(
+        command,
+        Command::Status(_) | Command::Diff(_) | Command::Record(_)
+    ) {
+        let workspace = daemon_start::workspace_from_context(ctx)?;
+        let ready =
+            daemon_start::ensure_workspace_daemon_ready(&workspace, daemon_token.as_deref())?;
+        let result = try_handle_daemon_command(
+            ctx,
+            Some(ready.url.clone()),
+            Some(ready.auth_token.clone()),
+            command,
+        );
+        match result {
+            Ok(handled) => return Ok(handled),
+            Err(error) => {
+                if daemon_command_requires_one_recovery_retry(&error) {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match daemon_start::ensure_workspace_daemon_ready(
+                            &workspace,
+                            daemon_token.as_deref(),
+                        ) {
+                            Ok(recovered) => {
+                                return try_handle_daemon_command(
+                                    ctx,
+                                    Some(recovered.url),
+                                    Some(recovered.auth_token),
+                                    command,
+                                );
+                            }
+                            Err(_) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => return Err(error),
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
     let Some(daemon_url) = discover_daemon_url(ctx)? else {
         return Ok(false);
     };
@@ -26,6 +70,13 @@ pub(super) fn try_handle_auto_daemon_command(
         Err(err) if auto_daemon_should_fallback(&err) => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+fn daemon_command_requires_one_recovery_retry(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::ChangeLedgerReconcileRequired { .. } | Error::DaemonError { exit_code: 16, .. }
+    )
 }
 
 pub(super) fn try_handle_daemon_command(
@@ -936,15 +987,15 @@ fn append_query(path: &str, params: Vec<String>) -> String {
     }
 }
 
-struct DaemonClient {
-    endpoint: DaemonEndpoint,
+pub(super) struct DaemonClient {
+    endpoint: DaemonTransport,
     token: Option<String>,
 }
 
 impl DaemonClient {
-    fn new(url: &str, token: Option<String>) -> Result<Self> {
+    pub(super) fn new(url: &str, token: Option<String>) -> Result<Self> {
         Ok(Self {
-            endpoint: DaemonEndpoint::parse(url)?,
+            endpoint: DaemonTransport::parse(url)?,
             token,
         })
     }
@@ -961,7 +1012,7 @@ impl DaemonClient {
         self.request_json("DELETE", path, None)
     }
 
-    fn request_json<T: DeserializeOwned>(
+    pub(super) fn request_json<T: DeserializeOwned>(
         &self,
         method: &str,
         path: &str,
@@ -974,7 +1025,7 @@ impl DaemonClient {
         let request_path = self.endpoint.request_path(path);
         let mut request = format!(
             "{method} {request_path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            self.endpoint.authority,
+            self.endpoint.authority(),
             body_bytes.len()
         );
         if body.is_some() {
@@ -985,30 +1036,132 @@ impl DaemonClient {
         }
         request.push_str("\r\n");
 
-        let mut stream =
-            TcpStream::connect((&*self.endpoint.host, self.endpoint.port)).map_err(|err| {
-                Error::DaemonUnavailable(format!(
-                    "could not connect to {}: {err}",
-                    self.endpoint.authority
-                ))
-            })?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(Error::from)?;
-        stream.write_all(request.as_bytes())?;
-        if !body_bytes.is_empty() {
-            stream.write_all(&body_bytes)?;
-        }
-        stream.flush()?;
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
+        let response = self.endpoint.exchange(request.as_bytes(), &body_bytes)?;
         let (status, response_body) = parse_http_response(&response)?;
         if !(200..300).contains(&status) {
             return Err(error_from_daemon_response(status, response_body));
         }
         serde_json::from_slice(response_body).map_err(Error::from)
     }
+}
+
+#[derive(Serialize)]
+struct LedgerFenceRequest<'a> {
+    protocol_version: u16,
+    owner_nonce: &'a str,
+    workspace_identity: &'a str,
+    executable_identity: &'a str,
+    scope_id: &'a str,
+    expected_epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct LedgerFenceProof {
+    pub(super) protocol_version: u16,
+    pub(super) pid: u32,
+    pub(super) process_start_identity: String,
+    pub(super) executable_identity: String,
+    pub(super) owner_nonce: String,
+    pub(super) workspace_identity: String,
+    pub(super) live_fence_sequence: u64,
+    pub(super) scope_id: String,
+    pub(super) epoch: u64,
+    pub(super) durable_offset: u64,
+    pub(super) folded_offset: u64,
+}
+
+pub(super) fn authenticated_ledger_fence(
+    endpoint: &daemon_start::WorkspaceDaemonEndpoint,
+) -> Result<LedgerFenceProof> {
+    let client = DaemonClient::new(&endpoint.url, Some(endpoint.auth_token.clone()))?;
+    let body = serde_json::to_value(LedgerFenceRequest {
+        protocol_version: endpoint.protocol_version,
+        owner_nonce: &endpoint.owner_nonce,
+        workspace_identity: &endpoint.workspace_identity,
+        executable_identity: &endpoint.executable_identity,
+        scope_id: &endpoint.scope_id,
+        expected_epoch: endpoint.epoch,
+    })?;
+    client.request_json("POST", "/v1/ledger/challenge", Some(&body))
+}
+
+enum DaemonTransport {
+    Tcp(DaemonEndpoint),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl DaemonTransport {
+    fn parse(url: &str) -> Result<Self> {
+        #[cfg(unix)]
+        if let Some(path) = url.strip_prefix("unix://") {
+            if path.is_empty() {
+                return Err(Error::InvalidInput(
+                    "daemon Unix socket path is empty".into(),
+                ));
+            }
+            return Ok(Self::Unix(PathBuf::from(path)));
+        }
+        Ok(Self::Tcp(DaemonEndpoint::parse(url)?))
+    }
+
+    fn authority(&self) -> &str {
+        match self {
+            Self::Tcp(endpoint) => &endpoint.authority,
+            #[cfg(unix)]
+            Self::Unix(_) => "localhost",
+        }
+    }
+
+    fn request_path(&self, path: &str) -> String {
+        match self {
+            Self::Tcp(endpoint) => endpoint.request_path(path),
+            #[cfg(unix)]
+            Self::Unix(_) => path.to_string(),
+        }
+    }
+
+    fn exchange(&self, request: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Self::Tcp(endpoint) => {
+                let mut stream =
+                    TcpStream::connect((&*endpoint.host, endpoint.port)).map_err(|error| {
+                        Error::DaemonUnavailable(format!(
+                            "could not connect to {}: {error}",
+                            endpoint.authority
+                        ))
+                    })?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                exchange_stream(&mut stream, request, body)
+            }
+            #[cfg(unix)]
+            Self::Unix(path) => {
+                let mut stream = UnixStream::connect(path).map_err(|error| {
+                    Error::DaemonUnavailable(format!(
+                        "could not connect to workspace daemon socket {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                exchange_stream(&mut stream, request, body)
+            }
+        }
+    }
+}
+
+fn exchange_stream<S: Read + Write>(
+    stream: &mut S,
+    request: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    stream.write_all(request)?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
 }
 
 struct DaemonEndpoint {

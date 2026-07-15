@@ -623,6 +623,42 @@ impl SegmentWriter {
         result
     }
 
+    /// Durably revokes the exact active observer owner after its terminal
+    /// invalidation marker has been flushed.
+    pub(crate) fn revoke(&mut self, reason: &str) -> Result<()> {
+        self.ensure_authorized()?;
+        let _workspace_lock = crate::db::acquire_workspace_lock_for_database(
+            &self.workspace_db_dir,
+            &self.database_path,
+        )?;
+        let transaction = self
+            .control
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_lease_on(&transaction, &self.identity)?;
+        let changed = transaction.execute(
+            "UPDATE changed_path_observer_owners
+             SET lease_state='error', error_state=?1, error_at=?2, updated_at=?2,
+                 expires_at=?2
+             WHERE scope_id=?3 AND epoch=?4 AND owner_token=?5
+               AND lease_state='active'",
+            params![
+                reason,
+                now_ts(),
+                self.identity.scope_id.to_text(),
+                sql_i64(self.identity.epoch, "observer epoch")?,
+                hex::encode(self.identity.owner_token),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(Error::WorkspaceLocked(
+                "observer owner changed before durable revocation".into(),
+            ));
+        }
+        transaction.commit()?;
+        self.authorized = false;
+        Ok(())
+    }
+
     fn heartbeat_inner(&mut self) -> Result<()> {
         self.validate_lease()?;
         self.faults.check(FaultPoint::Heartbeat)?;

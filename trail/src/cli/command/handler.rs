@@ -13,6 +13,7 @@ mod acp;
 mod agent;
 mod collaboration;
 mod daemon_rpc;
+mod daemon_start;
 mod errors;
 mod inspect;
 mod lane;

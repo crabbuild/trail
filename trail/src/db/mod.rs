@@ -1969,6 +1969,7 @@ pub struct Trail {
     config: TrailConfig,
     object_cache: Mutex<ObjectCache>,
     daemon_worktree_cache: Option<DaemonWorktreeCache>,
+    changed_path_daemon_runtime: Option<change_ledger::WorkspaceDaemonRuntime>,
     git_handoff_metrics: Cell<GitHandoffMetrics>,
     case_fold_index_metrics: Cell<CaseFoldIndexMetrics>,
     operation_metrics: Option<Arc<OperationMetricsState>>,
@@ -2753,13 +2754,7 @@ pub(crate) struct DaemonWorktreeCache {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DaemonWorktreeCachePersist {
-    path: PathBuf,
-    workspace_root: PathBuf,
-    pid: u32,
-    active: Arc<AtomicBool>,
-    metrics: Option<Arc<OperationMetricsState>>,
-}
+pub(crate) struct DaemonWorktreeCachePersist;
 
 #[derive(Debug)]
 pub struct DaemonWorktreeCacheWarmup {
@@ -3072,6 +3067,10 @@ mod agent;
 mod change_ledger;
 #[cfg(all(debug_assertions, unix))]
 pub(crate) use change_ledger::run_non_utf_database_path_mark_recover_and_retire;
+pub(crate) use change_ledger::{
+    prepare_workspace_daemon, workspace_daemon_fence, workspace_daemon_ready_proof,
+    workspace_daemon_reconcile, WorkspaceDaemonProof,
+};
 #[cfg(debug_assertions)]
 pub(crate) use change_ledger::{
     run_acknowledgement_race, run_advanced_prefix_recovery, run_ambiguous_recovery_gate,

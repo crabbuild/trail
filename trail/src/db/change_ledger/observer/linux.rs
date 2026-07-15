@@ -1,11 +1,14 @@
 //! Qualified Linux inotify observer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
+use std::os::fd::AsRawFd;
+#[cfg(debug_assertions)]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -14,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use rustix::fs::{fstat, fsync, openat, unlinkat, AtFlags, Mode, OFlags};
+use sha2::{Digest, Sha256};
 
 use super::{ObserverFence, ObserverLease, QualifiedObserver};
 use crate::db::change_ledger::reconcile::{ObserverEvent, ObserverQualification};
@@ -54,6 +58,12 @@ const WATCH_MASK: WatchMask = WatchMask::CREATE
 pub(crate) trait ObserverDurability: Send {
     fn binding(&self) -> ObserverWriterBinding;
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut>;
+    fn heartbeat(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn revoke_owner(&mut self, _reason: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Segment writes run on the observer worker, never in an inotify callback.
@@ -84,6 +94,14 @@ impl ObserverDurability for SegmentWriterDurability {
         self.writer.append(&[record])?;
         self.writer.flush_durable()
     }
+
+    fn heartbeat(&mut self) -> Result<()> {
+        self.writer.heartbeat()
+    }
+
+    fn revoke_owner(&mut self, reason: &str) -> Result<()> {
+        self.writer.revoke(reason)
+    }
 }
 
 #[derive(Clone)]
@@ -106,6 +124,7 @@ struct State {
     pending_renames: HashMap<u32, PendingRename>,
     issued_fences: HashMap<Vec<u8>, IssuedFence>,
     fail_next_watch_add: bool,
+    policy_invalidation_pending: bool,
 }
 
 #[derive(Clone)]
@@ -162,6 +181,9 @@ pub(crate) struct LinuxInotifyObserver {
     provider_id: String,
     owner_token: String,
     owner_fence_nonce: Vec<u8>,
+    policy_dependencies: Vec<PathBuf>,
+    policy_directories: Vec<PolicyDirectoryAuthority>,
+    records: SyncSender<DurabilityCommand>,
     shared: Arc<Shared>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -173,6 +195,41 @@ struct PlannedRecord {
 
 enum DurabilityCommand {
     Record(PlannedRecord),
+    PolicyInvalidation {
+        dependency: PathBuf,
+        reason: String,
+        response: SyncSender<Result<()>>,
+    },
+}
+
+struct PolicyDirectoryAuthority {
+    named_path: PathBuf,
+    canonical_path: PathBuf,
+    directory: File,
+    identity: Vec<u8>,
+}
+
+impl PolicyDirectoryAuthority {
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            named_path: self.named_path.clone(),
+            canonical_path: self.canonical_path.clone(),
+            directory: self.directory.try_clone()?,
+            identity: self.identity.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct PolicyDependencyWatch {
+    dependency: PathBuf,
+    observed_path: PathBuf,
+    directory_index: usize,
+}
+
+struct WorkerPolicyDirectory {
+    authority: PolicyDirectoryAuthority,
+    watch_descriptor: WatchDescriptor,
 }
 
 impl LinuxInotifyObserver {
@@ -183,7 +240,7 @@ impl LinuxInotifyObserver {
     ) -> Result<Self> {
         let root = open_root_no_follow(root_path)?;
         let root_identity = root_identity(&root)?;
-        let policy_dependencies = policy_watch_paths(root_path, policy_dependencies)?;
+        let lease_policy_dependencies = policy_dependencies.to_vec();
         let binding = durability.binding();
         if binding.owner_token.is_empty()
             || binding.provider_id.is_empty()
@@ -198,8 +255,17 @@ impl LinuxInotifyObserver {
         let mut inotify = Inotify::init()?;
         let mut watches = HashMap::new();
         add_tree(&mut inotify, root_path, Path::new(""), &mut watches, false)?;
-        let policy_parents = policy_parent_paths(&policy_dependencies);
-        add_policy_parent_watches(&mut inotify, root_path, &policy_parents, &mut watches)?;
+        let (policy_watches, policy_directories) = build_policy_coverage(
+            &mut inotify,
+            root_path,
+            &root,
+            policy_dependencies,
+            &mut watches,
+        )?;
+        let observer_policy_directories = policy_directories
+            .iter()
+            .map(|directory| directory.authority.try_clone())
+            .collect::<Result<Vec<_>>>()?;
 
         let owner_token = binding.owner_token.clone();
         let provider_id = binding.provider_id.clone();
@@ -214,6 +280,7 @@ impl LinuxInotifyObserver {
                 pending_renames: HashMap::new(),
                 issued_fences: HashMap::new(),
                 fail_next_watch_add: false,
+                policy_invalidation_pending: false,
             }),
             changed: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -223,6 +290,7 @@ impl LinuxInotifyObserver {
         let worker_root = root.try_clone()?;
         let expected_identity = root_identity.clone();
         let (records_tx, records_rx) = mpsc::sync_channel(MAX_PENDING_RECORDS);
+        let observer_records = records_tx.clone();
         let durability_shared = Arc::clone(&shared);
         let durability_worker = thread::Builder::new()
             .name("trail-linux-observer-durability".into())
@@ -236,8 +304,8 @@ impl LinuxInotifyObserver {
                     worker_root_path,
                     worker_root,
                     expected_identity,
-                    policy_dependencies,
-                    policy_parents,
+                    policy_watches,
+                    policy_directories,
                     records_tx,
                     worker_shared,
                 )
@@ -250,6 +318,9 @@ impl LinuxInotifyObserver {
             provider_id,
             owner_token,
             owner_fence_nonce,
+            policy_dependencies: lease_policy_dependencies,
+            policy_directories: observer_policy_directories,
+            records: observer_records,
             shared,
             workers: Mutex::new(vec![worker, durability_worker]),
         })
@@ -275,6 +346,20 @@ impl LinuxInotifyObserver {
             self.shared.revoke("inotify_root_replaced");
             return Err(reconcile_error("inotify_root_replaced"));
         }
+        if verify_policy_directories(&self.policy_directories).is_err() {
+            let dependency = self.policy_dependencies.first().cloned().ok_or_else(|| {
+                reconcile_error("inotify_policy_parent_identity_revalidation_failure")
+            })?;
+            request_policy_invalidation(
+                &self.shared,
+                &self.records,
+                dependency,
+                "inotify_policy_parent_replaced",
+            )?;
+            return Err(reconcile_error(
+                "inotify_policy_parent_identity_revalidation_failure",
+            ));
+        }
         Ok(self.root_identity.clone())
     }
 
@@ -282,6 +367,8 @@ impl LinuxInotifyObserver {
         Ok(ObserverLease {
             owner_token: self.owner_token.clone(),
             root_identity: self.root_identity()?,
+            provider_identity: self.provider_identity.clone(),
+            policy_dependencies: self.policy_dependencies.clone(),
             capabilities: self.capabilities(),
         })
     }
@@ -563,8 +650,8 @@ fn run_worker(
     root_path: PathBuf,
     root: File,
     root_identity_expected: Vec<u8>,
-    policy_dependencies: HashSet<PathBuf>,
-    policy_parents: HashSet<PathBuf>,
+    policy_watches: Vec<PolicyDependencyWatch>,
+    policy_directories: Vec<WorkerPolicyDirectory>,
     records: SyncSender<DurabilityCommand>,
     shared: Arc<Shared>,
 ) {
@@ -575,6 +662,20 @@ fn run_worker(
         }
         if verify_root(&root_path, &root, &root_identity_expected).is_err() {
             shared.revoke("inotify_root_replaced");
+            break;
+        }
+        if verify_worker_policy_directories(&policy_directories).is_err() {
+            let Some(dependency) = policy_watches.first().map(|watch| watch.dependency.clone())
+            else {
+                shared.revoke("inotify_policy_parent_identity_revalidation_failure");
+                break;
+            };
+            let _ = request_policy_invalidation(
+                &shared,
+                &records,
+                dependency,
+                "inotify_policy_parent_replaced",
+            );
             break;
         }
         let events = match inotify.read_events(&mut buffer) {
@@ -595,19 +696,35 @@ fn run_worker(
             }
         };
         for (wd, mask, cookie, name) in events {
-            if classify_raw_authority_event(&shared, mask, watches.contains_key(&wd)).is_err() {
-                break;
+            let policy_directory_index = policy_directories
+                .iter()
+                .position(|directory| directory.watch_descriptor == wd);
+            if let Some(dependency) = policy_directory_invalidation_dependency(
+                mask,
+                policy_directory_index,
+                &policy_watches,
+            ) {
+                let _ = request_policy_invalidation(
+                    &shared,
+                    &records,
+                    dependency,
+                    "inotify_policy_parent_replaced",
+                );
+                return;
             }
-            let Some(parent) = watches.get(&wd).cloned() else {
-                break;
-            };
-            if policy_parents.contains(&parent)
-                && mask.intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF)
+            if classify_raw_authority_event(
+                &shared,
+                mask,
+                watches.contains_key(&wd) || policy_directory_index.is_some(),
+            )
+            .is_err()
             {
-                shared.revoke("inotify_policy_parent_replaced");
                 break;
             }
-            if parent.as_os_str().is_empty()
+            let ledger_parent = watches.get(&wd).cloned();
+            if ledger_parent
+                .as_ref()
+                .is_some_and(|parent| parent.as_os_str().is_empty())
                 && (mask.contains(EventMask::DELETE_SELF) || mask.contains(EventMask::MOVE_SELF))
             {
                 shared.revoke("inotify_root_deleted_or_moved");
@@ -624,23 +741,46 @@ fn run_worker(
                 shared.revoke("inotify_path_decode_ambiguity");
                 break;
             }
+            let candidate = match (ledger_parent.as_ref(), policy_directory_index) {
+                (Some(parent), _) => root_path.join(parent).join(name),
+                (None, Some(index)) => policy_directories[index]
+                    .authority
+                    .canonical_path
+                    .join(name),
+                (None, None) => {
+                    shared.revoke("inotify_unknown_watch_descriptor");
+                    break;
+                }
+            };
+            if let Some(dependency) = policy_watches
+                .iter()
+                .find(|watch| policy_dependency_triggered(&candidate, &watch.observed_path, mask))
+                .map(|watch| watch.dependency.clone())
+            {
+                let _ = request_policy_invalidation(
+                    &shared,
+                    &records,
+                    dependency,
+                    "inotify_policy_dependency_invalidated",
+                );
+                return;
+            }
+            let Some(parent) = ledger_parent else {
+                // External policy coverage is classification-only. Paths that
+                // are not exact dependencies or their ancestors never become
+                // ledger candidates.
+                continue;
+            };
             let relative = parent.join(name);
             let is_dir = mask.contains(EventMask::ISDIR);
-            if is_dir
-                && mask.intersects(
-                    EventMask::CREATE
-                        | EventMask::DELETE
-                        | EventMask::MOVED_FROM
-                        | EventMask::MOVED_TO,
-                )
-                && policy_parents.iter().any(|policy_parent| {
-                    policy_parent == &relative || policy_parent.starts_with(&relative)
+            if observer_internal_path(&relative)
+                && !policy_watches.iter().any(|watch| {
+                    watch
+                        .observed_path
+                        .strip_prefix(&root_path)
+                        .is_ok_and(|dependency| dependency == relative)
                 })
             {
-                shared.revoke("inotify_policy_parent_replaced");
-                break;
-            }
-            if observer_internal_path(&relative) && !policy_dependencies.contains(&relative) {
                 continue;
             }
             let Some(relative_text) = relative.to_str() else {
@@ -776,11 +916,57 @@ fn enqueue(
     }
 }
 
+fn request_policy_invalidation(
+    shared: &Shared,
+    records: &SyncSender<DurabilityCommand>,
+    dependency: PathBuf,
+    reason: &str,
+) -> Result<()> {
+    {
+        let mut state = shared.lock();
+        if state.policy_invalidation_pending {
+            drop(state);
+            return Err(reconcile_error("inotify_policy_invalidation_pending"));
+        }
+        state.policy_invalidation_pending = true;
+    }
+    let (response, result) = mpsc::sync_channel(1);
+    match records.try_send(DurabilityCommand::PolicyInvalidation {
+        dependency,
+        reason: reason.to_string(),
+        response,
+    }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            shared.revoke("inotify_policy_invalidation_queue_overflow");
+            return Err(reconcile_error(
+                "inotify_policy_invalidation_queue_overflow",
+            ));
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            shared.revoke("inotify_policy_invalidation_worker_unavailable");
+            return Err(reconcile_error(
+                "inotify_policy_invalidation_worker_unavailable",
+            ));
+        }
+    }
+    match result.recv_timeout(FENCE_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => {
+            shared.revoke("inotify_policy_invalidation_durability_timeout");
+            Err(reconcile_error(
+                "inotify_policy_invalidation_durability_timeout",
+            ))
+        }
+    }
+}
+
 fn run_durability_worker(
     records: Receiver<DurabilityCommand>,
     mut durability: Box<dyn ObserverDurability>,
     shared: Arc<Shared>,
 ) {
+    let mut last_heartbeat = Instant::now();
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             break;
@@ -792,8 +978,46 @@ fn run_durability_worker(
                         break;
                     }
                 }
+                DurabilityCommand::PolicyInvalidation {
+                    dependency,
+                    reason,
+                    response,
+                } => {
+                    let digest = Sha256::digest(dependency.as_os_str().as_encoded_bytes());
+                    let marker = LedgerPath::parse(&format!(
+                        ".trail/policy-invalidations/{}",
+                        hex::encode(digest)
+                    ));
+                    let result = match marker {
+                        Ok(marker) => {
+                            persist(&shared, durability.as_mut(), marker, EvidenceFlags::CONTENT)
+                                .and_then(|()| {
+                                    let exact_reason = format!("{reason}:{}", dependency.display());
+                                    durability.revoke_owner(&exact_reason)?;
+                                    shared.revoke(exact_reason);
+                                    Ok(())
+                                })
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = &result {
+                        shared.revoke(format!(
+                            "inotify_policy_invalidation_durability_failure:{error}"
+                        ));
+                    }
+                    let _ = response.send(result);
+                    break;
+                }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) if !shared.shutdown.load(Ordering::Acquire) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) if !shared.shutdown.load(Ordering::Acquire) => {
+                if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                    if durability.heartbeat().is_err() {
+                        shared.revoke("inotify_observer_heartbeat_failed");
+                        break;
+                    }
+                    last_heartbeat = Instant::now();
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -911,74 +1135,237 @@ fn add_tree(
     Ok(())
 }
 
-fn policy_watch_paths(root: &Path, dependencies: &[PathBuf]) -> Result<HashSet<PathBuf>> {
-    let root = root.canonicalize()?;
-    dependencies
-        .iter()
-        .map(|dependency| {
-            let absolute = if dependency.is_absolute() {
-                dependency.clone()
-            } else {
-                root.join(dependency)
-            };
-            let relative = absolute.strip_prefix(&root).map_err(|_| {
-                Error::InvalidInput(format!(
-                    "native observer cannot qualify external policy dependency `{}`",
-                    dependency.display()
-                ))
-            })?;
-            if relative.as_os_str().is_empty()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                return Err(Error::InvalidInput(format!(
-                    "native observer policy dependency is not an exact in-root file `{}`",
-                    dependency.display()
-                )));
-            }
-            Ok(relative.to_path_buf())
-        })
-        .collect()
-}
-
-fn add_policy_parent_watches(
+fn build_policy_coverage(
     inotify: &mut Inotify,
     root: &Path,
-    parents: &HashSet<PathBuf>,
+    root_directory: &File,
+    dependencies: &[PathBuf],
     watches: &mut HashMap<WatchDescriptor, PathBuf>,
-) -> Result<()> {
-    let mut parents = parents.iter().cloned().collect::<Vec<_>>();
-    parents.sort();
-    parents.dedup();
-    for parent in parents {
-        let absolute = root.join(&parent);
-        let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
-            Error::InvalidInput(format!(
-                "native observer policy parent `{}` is unavailable: {error}",
-                absolute.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Error::InvalidInput(format!(
-                "native observer policy parent is not a no-follow directory `{}`",
-                absolute.display()
+) -> Result<(Vec<PolicyDependencyWatch>, Vec<WorkerPolicyDirectory>)> {
+    let root = root.canonicalize()?;
+    let root_device = fstat(root_directory)
+        .map_err(|error| Error::Io(error.into()))?
+        .st_dev;
+    let mut policy_watches = Vec::with_capacity(dependencies.len());
+    let mut authorities = Vec::<PolicyDirectoryAuthority>::new();
+    for dependency in dependencies {
+        let dependency = normalize_absolute_policy_dependency(&root, dependency)?;
+        let (named_parent, canonical_parent, directory) =
+            nearest_existing_policy_parent(&dependency)?;
+        let stat = fstat(&directory).map_err(|error| Error::Io(error.into()))?;
+        if stat.st_dev != root_device {
+            return Err(reconcile_error(&format!(
+                "inotify_policy_dependency_crosses_device:{}",
+                dependency.display()
             )));
         }
+        let suffix = dependency
+            .strip_prefix(&named_parent)
+            .map_err(|_| reconcile_error("inotify_policy_dependency_coverage_mapping_failure"))?;
+        let observed_path = canonical_parent.join(suffix);
+        let directory_index = match authorities
+            .iter()
+            .position(|authority| authority.canonical_path == canonical_parent)
+        {
+            Some(index) => index,
+            None => {
+                let index = authorities.len();
+                authorities.push(PolicyDirectoryAuthority {
+                    named_path: named_parent,
+                    canonical_path: canonical_parent,
+                    identity: root_identity(&directory)?,
+                    directory,
+                });
+                index
+            }
+        };
+        policy_watches.push(PolicyDependencyWatch {
+            dependency,
+            observed_path,
+            directory_index,
+        });
+    }
+
+    let mut policy_directories = Vec::with_capacity(authorities.len());
+    for authority in authorities {
+        let pinned_watch_path = PathBuf::from(format!(
+            "/proc/self/fd/{}/.",
+            authority.directory.as_raw_fd()
+        ));
         #[allow(deprecated)]
-        let wd = inotify.add_watch(&absolute, WATCH_MASK)?;
-        watches.insert(wd, parent);
+        let watch_descriptor = inotify.add_watch(&pinned_watch_path, WATCH_MASK)?;
+        if let Ok(relative) = authority.canonical_path.strip_prefix(&root) {
+            watches.insert(watch_descriptor.clone(), relative.to_path_buf());
+        }
+        policy_directories.push(WorkerPolicyDirectory {
+            authority,
+            watch_descriptor,
+        });
+    }
+    Ok((policy_watches, policy_directories))
+}
+
+fn normalize_absolute_policy_dependency(root: &Path, dependency: &Path) -> Result<PathBuf> {
+    let absolute = if dependency.is_absolute() {
+        dependency.to_path_buf()
+    } else {
+        root.join(dependency)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(reconcile_error(
+                        "inotify_policy_dependency_path_is_unsafe_or_ambiguous",
+                    ));
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+            Component::Prefix(_) => {
+                return Err(reconcile_error(
+                    "inotify_policy_dependency_path_is_unsafe_or_ambiguous",
+                ));
+            }
+        }
+    }
+    if !normalized.is_absolute() || normalized == Path::new("/") || normalized.to_str().is_none() {
+        return Err(reconcile_error(
+            "inotify_policy_dependency_path_is_unsafe_or_ambiguous",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn nearest_existing_policy_parent(dependency: &Path) -> Result<(PathBuf, PathBuf, File)> {
+    match fs::symlink_metadata(dependency) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(reconcile_error(
+                "inotify_policy_dependency_is_symlink_or_unsafe",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(reconcile_error(
+                "inotify_policy_dependency_is_symlink_or_unsafe",
+            ));
+        }
+    }
+    let mut candidate = dependency
+        .parent()
+        .ok_or_else(|| reconcile_error("inotify_policy_dependency_has_no_parent"))?;
+    loop {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(reconcile_error(
+                    "inotify_policy_dependency_parent_is_symlink_or_unsafe",
+                ));
+            }
+            Ok(_) => {
+                let directory = open_absolute_directory_no_follow(candidate).map_err(|_| {
+                    reconcile_error("inotify_policy_dependency_parent_is_symlink_or_unsafe")
+                })?;
+                let canonical = candidate.canonicalize().map_err(|_| {
+                    reconcile_error("inotify_policy_dependency_parent_identity_unavailable")
+                })?;
+                return Ok((candidate.to_path_buf(), canonical, directory));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                candidate = candidate.parent().ok_or_else(|| {
+                    reconcile_error("inotify_policy_dependency_parent_unobservable")
+                })?;
+            }
+            Err(_) => {
+                return Err(reconcile_error(
+                    "inotify_policy_dependency_parent_is_symlink_or_unsafe",
+                ));
+            }
+        }
+    }
+}
+
+fn open_absolute_directory_no_follow(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(reconcile_error(
+            "inotify_policy_dependency_parent_is_not_absolute",
+        ));
+    }
+    let mut directory = open_root_no_follow(Path::new("/"))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(component) => {
+                let child = openat(
+                    &directory,
+                    Path::new(component),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| Error::Io(error.into()))?;
+                directory = File::from(child);
+            }
+            _ => {
+                return Err(reconcile_error(
+                    "inotify_policy_dependency_parent_is_symlink_or_unsafe",
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn verify_policy_directories(directories: &[PolicyDirectoryAuthority]) -> Result<()> {
+    for authority in directories {
+        if authority.named_path.canonicalize()? != authority.canonical_path
+            || root_identity(&authority.directory)? != authority.identity
+            || root_identity(&open_absolute_directory_no_follow(&authority.named_path)?)?
+                != authority.identity
+        {
+            return Err(reconcile_error(
+                "inotify_policy_parent_identity_revalidation_failure",
+            ));
+        }
     }
     Ok(())
 }
 
-fn policy_parent_paths(dependencies: &HashSet<PathBuf>) -> HashSet<PathBuf> {
-    dependencies
+fn verify_worker_policy_directories(directories: &[WorkerPolicyDirectory]) -> Result<()> {
+    for directory in directories {
+        verify_policy_directories(std::slice::from_ref(&directory.authority))?;
+    }
+    Ok(())
+}
+
+fn policy_dependency_triggered(candidate: &Path, dependency: &Path, mask: EventMask) -> bool {
+    if candidate == dependency {
+        return true;
+    }
+    dependency.starts_with(candidate)
+        && mask.intersects(
+            EventMask::CREATE
+                | EventMask::DELETE
+                | EventMask::MOVED_FROM
+                | EventMask::MOVED_TO
+                | EventMask::ATTRIB,
+        )
+}
+
+fn policy_directory_invalidation_dependency(
+    mask: EventMask,
+    directory_index: Option<usize>,
+    watches: &[PolicyDependencyWatch],
+) -> Option<PathBuf> {
+    if !mask.intersects(EventMask::IGNORED | EventMask::DELETE_SELF | EventMask::MOVE_SELF) {
+        return None;
+    }
+    let directory_index = directory_index?;
+    watches
         .iter()
-        .filter_map(|dependency| dependency.parent())
-        .filter(|parent| observer_internal_path(parent))
-        .map(Path::to_path_buf)
-        .collect()
+        .find(|watch| watch.directory_index == directory_index)
+        .map(|watch| watch.dependency.clone())
 }
 
 fn observer_internal_path(relative: &Path) -> bool {
@@ -1063,6 +1450,7 @@ struct MemoryDurability {
     offset: u64,
     fail_after: Option<u64>,
     binding: ObserverWriterBinding,
+    trace: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 #[cfg(debug_assertions)]
@@ -1077,6 +1465,12 @@ impl ObserverDurability for MemoryDurability {
                 "injected observer durability failure".into(),
             ));
         }
+        if let Some(trace) = &self.trace {
+            trace
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(format!("append:{}", record.path.as_str()));
+        }
         self.offset = self.offset.saturating_add(1);
         Ok(DurableCut {
             segment_id: "linux-native-test".into(),
@@ -1085,6 +1479,16 @@ impl ObserverDurability for MemoryDurability {
             last_hash: [0; 32],
             provider_cursor: record.provider_cursor,
         })
+    }
+
+    fn revoke_owner(&mut self, reason: &str) -> Result<()> {
+        if let Some(trace) = &self.trace {
+            trace
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(format!("revoke:{reason}"));
+        }
+        Ok(())
     }
 }
 
@@ -1098,6 +1502,7 @@ fn memory_durability(fail_after: Option<u64>) -> MemoryDurability {
     MemoryDurability {
         offset: 0,
         fail_after,
+        trace: None,
         binding: ObserverWriterBinding {
             owner_token: hex::encode(owner),
             provider_id: hex::encode(&provider_identity),
@@ -2062,7 +2467,10 @@ pub(crate) fn run_policy_dependency_observation() -> std::result::Result<(), Str
         let error = result
             .err()
             .ok_or_else(|| format!("policy dependency `{relative}` published false clean"))?;
-        if !error.to_string().contains("recording policy changed") {
+        if !error
+            .to_string()
+            .contains("inotify_policy_dependency_invalidated")
+        {
             return Err(format!(
                 "policy dependency `{relative}` failed for the wrong reason: {error}"
             ));
@@ -2138,18 +2546,101 @@ pub(crate) fn run_policy_dependency_observation() -> std::result::Result<(), Str
 
     let root = tempfile::tempdir().map_err(|error| error.to_string())?;
     let external = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let result = LinuxInotifyObserver::start(
+    let dependency = external.path().join("policy");
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut durability = memory_durability(None);
+    durability.trace = Some(Arc::clone(&trace));
+    let observer = LinuxInotifyObserver::start(
+        root.path(),
+        Box::new(durability),
+        std::slice::from_ref(&dependency),
+    )
+    .map_err(|error| error.to_string())?;
+    let ignored_dependency = policy_directory_invalidation_dependency(
+        EventMask::IGNORED,
+        Some(0),
+        &[PolicyDependencyWatch {
+            dependency: dependency.clone(),
+            observed_path: dependency.clone(),
+            directory_index: 0,
+        }],
+    )
+    .ok_or_else(|| "policy watch IN_IGNORED was not terminal".to_string())?;
+    request_policy_invalidation(
+        &observer.shared,
+        &observer.records,
+        ignored_dependency,
+        "inotify_policy_parent_replaced",
+    )
+    .map_err(|error| error.to_string())?;
+    let trace = trace.lock().unwrap_or_else(|poison| poison.into_inner());
+    let marker = trace
+        .iter()
+        .position(|action| action.starts_with("append:.trail/policy-invalidations/"))
+        .ok_or_else(|| format!("IN_IGNORED omitted durable policy marker: {trace:?}"))?;
+    let revoke = trace
+        .iter()
+        .position(|action| action.starts_with("revoke:inotify_policy_parent_replaced"))
+        .ok_or_else(|| format!("IN_IGNORED omitted owner revocation: {trace:?}"))?;
+    if marker >= revoke {
+        return Err(format!(
+            "IN_IGNORED revoked before its durable marker: {trace:?}"
+        ));
+    }
+    drop(trace);
+    drop(observer);
+
+    let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let external = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let dependency = external.path().join("policy");
+    let observer = LinuxInotifyObserver::start(
         root.path(),
         Box::new(memory_durability(None)),
-        &[external.path().join("policy")],
-    );
-    let error = match result {
-        Ok(_) => return Err("external policy dependency silently qualified".into()),
-        Err(error) => error,
-    };
-    if !error.to_string().contains("external policy dependency") {
+        std::slice::from_ref(&dependency),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(&dependency, b"created").map_err(|error| error.to_string())?;
+    expect_revoked(&observer, "inotify_policy_dependency_invalidated")?;
+
+    let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let cross_device = PathBuf::from("/dev/trail-policy-missing");
+    if fs::metadata(root.path())
+        .map_err(|error| error.to_string())?
+        .dev()
+        != fs::metadata("/dev")
+            .map_err(|error| error.to_string())?
+            .dev()
+    {
+        let error = LinuxInotifyObserver::start(
+            root.path(),
+            Box::new(memory_durability(None)),
+            &[cross_device],
+        )
+        .err()
+        .ok_or_else(|| "cross-device policy dependency was accepted".to_string())?;
+        if !error.to_string().contains("crosses_device") {
+            return Err(format!(
+                "cross-device policy dependency failed for the wrong reason: {error}"
+            ));
+        }
+    }
+
+    let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let external = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let target = external.path().join("target");
+    fs::create_dir(&target).map_err(|error| error.to_string())?;
+    std::os::unix::fs::symlink(&target, external.path().join("alias"))
+        .map_err(|error| error.to_string())?;
+    let error = LinuxInotifyObserver::start(
+        root.path(),
+        Box::new(memory_durability(None)),
+        &[external.path().join("alias/policy")],
+    )
+    .err()
+    .ok_or_else(|| "symlinked policy parent was accepted".to_string())?;
+    if !error.to_string().contains("symlink_or_unsafe") {
         return Err(format!(
-            "external policy dependency failed for the wrong reason: {error}"
+            "symlinked policy dependency failed for the wrong reason: {error}"
         ));
     }
     Ok(())

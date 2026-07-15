@@ -70,7 +70,6 @@ impl Trail {
             "refs",
             "daemon.json",
             "daemon.token",
-            "worktree-daemon-cache.json",
         ] {
             collect_read_only_file_fingerprints(
                 &self.db_dir.join(rel),

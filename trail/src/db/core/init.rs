@@ -113,6 +113,12 @@ impl Trail {
         }
 
         fs::create_dir_all(db_dir.join("index"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&db_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(db_dir.join("index"), fs::Permissions::from_mode(0o700))?;
+        }
         fs::write(db_dir.join("index").join(SCHEMA_EXCLUSION_FILE), [])?;
         fs::write(db_dir.join("index").join(SCHEMA_VALIDATION_LEADER_FILE), [])?;
         fs::create_dir_all(db_dir.join("refs/branches"))?;
@@ -428,6 +434,7 @@ impl Trail {
             config,
             object_cache: Mutex::new(ObjectCache::default()),
             daemon_worktree_cache: None,
+            changed_path_daemon_runtime: None,
             git_handoff_metrics: Cell::new(GitHandoffMetrics::default()),
             case_fold_index_metrics: Cell::new(CaseFoldIndexMetrics::default()),
             operation_metrics,

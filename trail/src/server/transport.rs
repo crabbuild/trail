@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -167,6 +169,59 @@ pub fn serve_listener_with_auth_rate_limit_and_timeout(
         );
         handled += 1;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn serve_unix_listener_with_auth_and_timeout(
+    db: &mut Trail,
+    listener: UnixListener,
+    auth: ServerAuth,
+    connection_timeout: Duration,
+) -> Result<()> {
+    if connection_timeout.is_zero() {
+        return Err(Error::InvalidInput(
+            "connection timeout must be greater than zero".into(),
+        ));
+    }
+    loop {
+        let (mut stream, _) = listener.accept()?;
+        let _ = handle_unix_connection(db, &mut stream, &auth, connection_timeout);
+        if std::env::var_os("TRAIL_WORKSPACE_DAEMON").is_some() {
+            if super::workspace_changed_path_ready_proof(db).is_err() {
+                std::thread::sleep(Duration::from_millis(10));
+                if super::workspace_changed_path_ready_proof(db).is_err() {
+                    return Err(Error::DaemonUnavailable(
+                        "workspace daemon observer health retirement requested".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_unix_connection(
+    db: &mut Trail,
+    stream: &mut UnixStream,
+    auth: &ServerAuth,
+    connection_timeout: Duration,
+) -> Result<()> {
+    stream.set_read_timeout(Some(connection_timeout))?;
+    stream.set_write_timeout(Some(connection_timeout))?;
+    let request = match read_unix_request(stream) {
+        Ok(request) => request,
+        Err(err) => {
+            let response = request_read_error_response(&err, connection_timeout);
+            let _ = stream
+                .write_all(&response.to_http_bytes())
+                .and_then(|_| stream.flush());
+            return Ok(());
+        }
+    };
+    let response = route::route_request(db, request, auth);
+    stream.write_all(&response.to_http_bytes())?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -339,6 +394,67 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body)?;
     parse_request_parts(&first_line, headers, body)
+}
+
+#[cfg(unix)]
+fn read_unix_request(stream: &mut UnixStream) -> Result<HttpRequest> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    read_request_from(&mut reader)
+}
+
+fn read_request_from<R: std::io::BufRead>(reader: &mut R) -> Result<HttpRequest> {
+    let mut bytes_read = 0usize;
+    let first_line = read_http_line_limited(reader, &mut bytes_read)?;
+    if first_line.trim().is_empty() {
+        return Err(Error::InvalidInput("empty HTTP request".to_string()));
+    }
+    let mut content_length = 0usize;
+    let mut headers = BTreeMap::new();
+    loop {
+        let line = read_http_line_limited(reader, &mut bytes_read)?;
+        if line == "\r\n" || line == "\n" || line.is_empty() {
+            break;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| Error::InvalidInput("malformed HTTP request header".to_string()))?;
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name == "content-length" {
+            content_length = value
+                .parse::<usize>()
+                .map_err(|_| Error::InvalidInput("invalid HTTP Content-Length".to_string()))?;
+        }
+        headers.insert(name, value);
+    }
+    if bytes_read.saturating_add(content_length) > MAX_HTTP_REQUEST_BYTES {
+        return Err(Error::InvalidInput(
+            "HTTP request exceeds size limit".to_string(),
+        ));
+    }
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body)?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| Error::InvalidInput("HTTP request method is missing".to_string()))?;
+    let path = parts
+        .next()
+        .ok_or_else(|| Error::InvalidInput("HTTP request path is missing".to_string()))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| Error::InvalidInput("HTTP version is missing".to_string()))?;
+    if parts.next().is_some() || !version.starts_with("HTTP/") {
+        return Err(Error::InvalidInput(
+            "malformed HTTP request line".to_string(),
+        ));
+    }
+    Ok(HttpRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers,
+        body,
+    })
 }
 
 fn read_http_line_limited<R: Read>(reader: &mut R, bytes_read: &mut usize) -> Result<String> {

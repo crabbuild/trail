@@ -4,7 +4,7 @@
 //! path, then performs one bounded `try_send`.  Segment I/O and SQLite lease
 //! validation belong exclusively to the durability worker.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -24,6 +24,7 @@ use core_foundation_sys::uuid::{CFUUIDGetUUIDBytes, CFUUIDRef};
 use fsevent_sys as fs_events;
 use rustix::fs::{fsync, openat, unlinkat, AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ObserverFence, ObserverLease, QualifiedObserver};
 use crate::db::change_ledger::reconcile::{ObserverEvent, ObserverQualification};
@@ -45,7 +46,7 @@ const MAX_PENDING_RECORDS: usize = 8_192;
 const MAX_RETAINED_EVENTS: usize = 65_536;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const CAPABILITY_VERSION: u16 = 2;
+const CAPABILITY_VERSION: u16 = 3;
 const STREAM_FLAGS: u32 = fs_events::kFSEventStreamCreateFlagFileEvents
     | fs_events::kFSEventStreamCreateFlagNoDefer
     | fs_events::kFSEventStreamCreateFlagWatchRoot;
@@ -70,9 +71,54 @@ struct HistoryAuthority {
     device_relative_root: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CursorCoverageRoot {
+    device_relative_root: String,
+    root_identity: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SystemAliasBinding {
+    alias_path: PathBuf,
+    canonical_target: PathBuf,
+    alias_identity: Vec<u8>,
+    target_identity: Vec<u8>,
+}
+
+struct CoverageRoot {
+    absolute_root: PathBuf,
+    device_relative_root: String,
+    root_identity: Vec<u8>,
+    root: File,
+}
+
+#[derive(Clone)]
+struct CallbackCoverageRoot {
+    absolute_root: PathBuf,
+    device_relative_root: PathBuf,
+}
+
+#[derive(Clone)]
+struct PolicyWatch {
+    observed_path: PathBuf,
+    dependency: PathBuf,
+}
+
+struct CoveragePlan {
+    roots: Vec<CoverageRoot>,
+    stream_roots: Vec<String>,
+    system_aliases: Vec<SystemAliasBinding>,
+    policy_dependencies: Vec<PathBuf>,
+    policy_watches: Vec<PolicyWatch>,
+}
+
 pub(crate) trait MacObserverDurability: Send {
     fn binding(&self) -> ObserverWriterBinding;
     fn append_and_flush(&mut self, record: ObserverRecord) -> Result<DurableCut>;
+    fn heartbeat(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn revoke_owner(&mut self, reason: &str) -> Result<()>;
 }
 
 pub(crate) struct MacSegmentWriterDurability {
@@ -100,6 +146,14 @@ impl MacObserverDurability for MacSegmentWriterDurability {
         self.writer.append(&[record])?;
         self.writer.flush_durable()
     }
+
+    fn heartbeat(&mut self) -> Result<()> {
+        self.writer.heartbeat()
+    }
+
+    fn revoke_owner(&mut self, reason: &str) -> Result<()> {
+        self.writer.revoke(reason)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,6 +163,9 @@ pub(crate) struct MacOsProviderCursor {
     device: u64,
     history_database_uuid: [u8; 16],
     device_relative_root: String,
+    coverage_roots: Vec<CursorCoverageRoot>,
+    system_aliases: Vec<SystemAliasBinding>,
+    policy_dependencies: Vec<PathBuf>,
     root_identity: Vec<u8>,
     lineage_identity: Vec<u8>,
     provider_identity: Vec<u8>,
@@ -129,13 +186,18 @@ impl MacOsProviderCursor {
         &self,
         root_identity: &[u8],
         authority: &HistoryAuthority,
+        coverage: &CoveragePlan,
         provider_identity: &[u8],
     ) -> Result<()> {
+        let coverage_roots = cursor_coverage_roots(coverage);
         if self.version != CAPABILITY_VERSION
             || self.event_id == fs_events::kFSEventStreamEventIdSinceNow
             || self.device != authority.device
             || self.history_database_uuid != authority.database_uuid
             || self.device_relative_root != authority.device_relative_root
+            || self.coverage_roots != coverage_roots
+            || self.system_aliases != coverage.system_aliases
+            || self.policy_dependencies != coverage.policy_dependencies
             || self.root_identity != root_identity
             || self.lineage_identity.len() < 16
             || self.provider_identity != provider_identity
@@ -190,8 +252,7 @@ struct IssuedFence {
 struct State {
     active: bool,
     revoked: Option<String>,
-    history_required: bool,
-    history_done: bool,
+    history_pending: usize,
     events: Vec<DurableEvent>,
     next_sequence: u64,
     last_provider_event_id: u64,
@@ -222,10 +283,12 @@ impl Shared {
     }
 }
 
+#[derive(Clone)]
 struct CallbackContext {
     root_path: PathBuf,
     device_relative_root: PathBuf,
-    policy_dependencies: Vec<LedgerPath>,
+    coverage_roots: Vec<CallbackCoverageRoot>,
+    policy_watches: Vec<PolicyWatch>,
     records: SyncSender<DurabilityCommand>,
     shared: Arc<Shared>,
 }
@@ -234,6 +297,10 @@ enum DurabilityCommand {
     Record {
         path: LedgerPath,
         flags: EvidenceFlags,
+        provider_event_id: u64,
+    },
+    PolicyInvalidation {
+        dependency: PathBuf,
         provider_event_id: u64,
     },
     Fence {
@@ -246,10 +313,16 @@ enum DurabilityCommand {
     Shutdown,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StreamHandle {
-    stream: usize,
+    streams: Vec<usize>,
     run_loop: usize,
+}
+
+struct WorkerHandle {
+    name: &'static str,
+    join: JoinHandle<()>,
+    done: Receiver<()>,
 }
 
 enum StartupDecision {
@@ -288,19 +361,24 @@ pub(crate) struct MacOsFseventsObserver {
     provider_identity: Vec<u8>,
     owner_token: String,
     owner_fence_nonce: Vec<u8>,
+    policy_dependencies: Vec<PathBuf>,
     lineage_identity: Vec<u8>,
     history_authority: HistoryAuthority,
+    coverage_roots: Vec<CoverageRoot>,
+    system_aliases: Vec<SystemAliasBinding>,
     null_context_generation: u64,
     shared: Arc<Shared>,
     commands: SyncSender<DurabilityCommand>,
     stream: StreamHandle,
-    workers: Mutex<Vec<JoinHandle<()>>>,
+    workers: Mutex<Vec<WorkerHandle>>,
     #[cfg(debug_assertions)]
     next_test_fence_nonce: Mutex<Option<Vec<u8>>>,
     #[cfg(debug_assertions)]
     fail_next_fence_sync: Mutex<bool>,
     #[cfg(debug_assertions)]
     fail_next_root_descriptor: Mutex<bool>,
+    #[cfg(debug_assertions)]
+    fail_next_coverage_descriptor: Mutex<bool>,
     #[cfg(debug_assertions)]
     next_history_authority_override: Mutex<Option<HistoryAuthority>>,
 }
@@ -332,8 +410,10 @@ impl MacOsFseventsObserver {
         let root_path = root_path.canonicalize()?;
         let root = open_root_no_follow(&root_path)?;
         let root_identity = root_identity(&root)?;
-        let policy_dependencies =
-            normalize_policy_dependencies(&root_path, &requested_root, policy_dependencies)?;
+        let lease_policy_dependencies = policy_dependencies
+            .iter()
+            .map(|dependency| normalize_absolute_dependency(&requested_root, dependency))
+            .collect::<Result<Vec<_>>>()?;
         let secure_root = SecureDirectory::open_absolute(&root_path)?;
         let trail_directory = secure_root
             .open_dir(".trail")
@@ -351,6 +431,12 @@ impl MacOsFseventsObserver {
         if authority.device != device {
             return Err(reconcile_error("fsevents_actual_history_device_mismatch"));
         }
+        let coverage = build_coverage_plan(
+            &root_path,
+            &requested_root,
+            device,
+            &lease_policy_dependencies,
+        )?;
         let null_context_generation = NULL_CONTEXT_GENERATION.load(Ordering::Acquire);
         let binding = durability.binding();
         if binding.owner_token.is_empty()
@@ -363,7 +449,12 @@ impl MacOsFseventsObserver {
             ));
         }
         if let Some(cursor) = &resume {
-            cursor.validate_resume(&root_identity, &authority, &binding.provider_identity)?;
+            cursor.validate_resume(
+                &root_identity,
+                &authority,
+                &coverage,
+                &binding.provider_identity,
+            )?;
         }
         let mut lineage_identity = resume
             .as_ref()
@@ -382,8 +473,11 @@ impl MacOsFseventsObserver {
             state: Mutex::new(State {
                 active: true,
                 revoked: None,
-                history_required: resume.is_some(),
-                history_done: resume.is_none(),
+                history_pending: if resume.is_some() {
+                    coverage.stream_roots.len()
+                } else {
+                    0
+                },
                 events: Vec::new(),
                 next_sequence: 1,
                 last_provider_event_id: resume.as_ref().map_or(0, |cursor| cursor.event_id),
@@ -401,25 +495,38 @@ impl MacOsFseventsObserver {
             device,
             history_database_uuid: authority.database_uuid,
             device_relative_root: authority.device_relative_root.clone(),
+            coverage_roots: cursor_coverage_roots(&coverage),
+            system_aliases: coverage.system_aliases.clone(),
+            policy_dependencies: coverage.policy_dependencies.clone(),
             root_identity: root_identity.clone(),
             lineage_identity: lineage_identity.clone(),
             provider_identity: binding.provider_identity.clone(),
             stream_flags: STREAM_FLAGS,
             capabilities: native_capabilities(),
         };
+        let (durability_done_tx, durability_done_rx) = mpsc::sync_channel(1);
         let durability_worker = thread::Builder::new()
             .name("trail-macos-observer-durability".into())
             .spawn(move || {
-                run_durability_worker(records, durability, durability_shared, cursor_template)
+                run_durability_worker(records, durability, durability_shared, cursor_template);
+                let _ = durability_done_tx.send(());
             })?;
 
-        let callback = Box::new(CallbackContext {
+        let callback = CallbackContext {
             root_path: root_path.clone(),
             device_relative_root: PathBuf::from(&authority.device_relative_root),
-            policy_dependencies,
+            coverage_roots: coverage
+                .roots
+                .iter()
+                .map(|root| CallbackCoverageRoot {
+                    absolute_root: root.absolute_root.clone(),
+                    device_relative_root: PathBuf::from(&root.device_relative_root),
+                })
+                .collect(),
+            policy_watches: coverage.policy_watches.clone(),
             records: commands.clone(),
             shared: Arc::clone(&shared),
-        });
+        };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (decision_tx, decision_rx) = mpsc::sync_channel(1);
         let startup_cancelled = Arc::new(AtomicBool::new(false));
@@ -429,11 +536,14 @@ impl MacOsFseventsObserver {
         let delay_after_native_start = options.delay_after_native_start;
         let post_start_database_uuid_override = options.post_start_database_uuid_override;
         let cleanup_observed = options.cleanup_observed.clone();
+        let watched_roots = coverage.stream_roots.clone();
+        let (stream_done_tx, stream_done_rx) = mpsc::sync_channel(1);
         let stream_worker = match thread::Builder::new()
             .name("trail-macos-fsevents".into())
             .spawn(move || {
                 run_stream(
                     stream_authority,
+                    watched_roots,
                     since_when,
                     callback,
                     ready_tx,
@@ -443,7 +553,8 @@ impl MacOsFseventsObserver {
                     delay_after_native_start,
                     cleanup_observed,
                     stream_shared,
-                )
+                );
+                let _ = stream_done_tx.send(());
             }) {
             Ok(worker) => worker,
             Err(error) => {
@@ -496,13 +607,27 @@ impl MacOsFseventsObserver {
             provider_identity: binding.provider_identity,
             owner_token: binding.owner_token,
             owner_fence_nonce: binding.fence_nonce,
+            policy_dependencies: lease_policy_dependencies,
             lineage_identity,
             history_authority: authority,
+            coverage_roots: coverage.roots,
+            system_aliases: coverage.system_aliases,
             null_context_generation,
             shared,
             commands,
             stream,
-            workers: Mutex::new(vec![stream_worker, durability_worker]),
+            workers: Mutex::new(vec![
+                WorkerHandle {
+                    name: "FSEvents run loop",
+                    join: stream_worker,
+                    done: stream_done_rx,
+                },
+                WorkerHandle {
+                    name: "observer durability",
+                    join: durability_worker,
+                    done: durability_done_rx,
+                },
+            ]),
             #[cfg(debug_assertions)]
             next_test_fence_nonce: Mutex::new(None),
             #[cfg(debug_assertions)]
@@ -510,10 +635,13 @@ impl MacOsFseventsObserver {
             #[cfg(debug_assertions)]
             fail_next_root_descriptor: Mutex::new(false),
             #[cfg(debug_assertions)]
+            fail_next_coverage_descriptor: Mutex::new(false),
+            #[cfg(debug_assertions)]
             next_history_authority_override: Mutex::new(None),
         };
         observer.ensure_null_context_generation()?;
         observer.wait_for_history()?;
+        observer.ensure_history_authority()?;
         observer.root_identity()?;
         Ok(observer)
     }
@@ -523,9 +651,12 @@ impl MacOsFseventsObserver {
     }
 
     pub(crate) fn lease(&self) -> Result<ObserverLease> {
+        self.ensure_history_authority()?;
         Ok(ObserverLease {
             owner_token: self.owner_token.clone(),
             root_identity: self.root_identity()?,
+            provider_identity: self.provider_identity.clone(),
+            policy_dependencies: self.policy_dependencies.clone(),
             capabilities: self.capabilities(),
         })
     }
@@ -544,7 +675,7 @@ impl MacOsFseventsObserver {
         if !state.active {
             return Err(reconcile_error("fsevents_observer_unavailable"));
         }
-        if state.history_required && !state.history_done {
+        if state.history_pending != 0 {
             return Err(reconcile_error("fsevents_history_not_complete"));
         }
         Ok(())
@@ -592,13 +723,84 @@ impl MacOsFseventsObserver {
                 "fsevents_history_authority_revalidation_mismatch",
             ));
         }
+        self.ensure_coverage_roots()
+    }
+
+    fn ensure_coverage_roots(&self) -> Result<()> {
+        #[cfg(debug_assertions)]
+        {
+            let mut fail = self
+                .fail_next_coverage_descriptor
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if *fail {
+                *fail = false;
+                drop(fail);
+                self.shared
+                    .revoke("fsevents_policy_coverage_descriptor_failure");
+                return Err(reconcile_error(
+                    "fsevents_policy_coverage_descriptor_failure",
+                ));
+            }
+        }
+        for pinned in &self.system_aliases {
+            let observed = match pinned.alias_path.as_path() {
+                path if path == Path::new("/etc") => exact_system_alias_binding(
+                    path,
+                    Path::new("/private/etc"),
+                    Path::new("private/etc"),
+                ),
+                path if path == Path::new("/var") => exact_system_alias_binding(
+                    path,
+                    Path::new("/private/var"),
+                    Path::new("private/var"),
+                ),
+                path if path == Path::new("/tmp") => exact_system_alias_binding(
+                    path,
+                    Path::new("/private/tmp"),
+                    Path::new("private/tmp"),
+                ),
+                _ => Err(reconcile_error(
+                    "fsevents_system_policy_alias_is_not_allowlisted",
+                )),
+            }
+            .map_err(|_| {
+                self.shared
+                    .revoke("fsevents_system_policy_alias_revalidation_failure");
+                reconcile_error("fsevents_system_policy_alias_revalidation_failure")
+            })?;
+            if &observed != pinned {
+                self.shared
+                    .revoke("fsevents_system_policy_alias_revalidation_mismatch");
+                return Err(reconcile_error(
+                    "fsevents_system_policy_alias_revalidation_mismatch",
+                ));
+            }
+        }
+        for coverage in &self.coverage_roots {
+            let descriptor = root_identity(&coverage.root).map_err(|_| {
+                self.shared
+                    .revoke("fsevents_policy_coverage_descriptor_failure");
+                reconcile_error("fsevents_policy_coverage_descriptor_failure")
+            })?;
+            let named = open_root_no_follow(&coverage.absolute_root)
+                .and_then(|root| root_identity(&root))
+                .map_err(|_| {
+                    self.shared.revoke("fsevents_policy_coverage_named_failure");
+                    reconcile_error("fsevents_policy_coverage_named_failure")
+                })?;
+            if descriptor != coverage.root_identity || named != coverage.root_identity {
+                self.shared.revoke("fsevents_policy_coverage_replaced");
+                return Err(reconcile_error("fsevents_policy_coverage_replaced"));
+            }
+        }
         Ok(())
     }
 
     fn wait_for_history(&self) -> Result<()> {
         let deadline = Instant::now() + FENCE_TIMEOUT;
         let mut state = self.shared.lock();
-        while state.history_required && !state.history_done && state.revoked.is_none() {
+        while state.history_pending != 0 && state.revoked.is_none() {
             if NULL_CONTEXT_GENERATION.load(Ordering::Acquire) != self.null_context_generation {
                 drop(state);
                 self.shared
@@ -755,8 +957,10 @@ impl MacOsFseventsObserver {
         // FlushSync alone cannot order a write which fseventsd has not yet
         // ingested.  The private create is the first journal barrier; its
         // durable callback proves every earlier journal entry was ingested.
-        unsafe {
-            fs_events::FSEventStreamFlushSync(self.stream.stream as fs_events::FSEventStreamRef);
+        for stream in &self.stream.streams {
+            unsafe {
+                fs_events::FSEventStreamFlushSync(*stream as fs_events::FSEventStreamRef);
+            }
         }
         if let Err(error) = self.wait_for_sentinel(&sentinel_path, EvidenceFlags::CREATE) {
             let _ = unlinkat(
@@ -784,8 +988,10 @@ impl MacOsFseventsObserver {
                 "fsevents_fence_post_unlink_parent_sync_failure",
             ));
         }
-        unsafe {
-            fs_events::FSEventStreamFlushSync(self.stream.stream as fs_events::FSEventStreamRef);
+        for stream in &self.stream.streams {
+            unsafe {
+                fs_events::FSEventStreamFlushSync(*stream as fs_events::FSEventStreamRef);
+            }
         }
         let sentinel_event = self.wait_for_sentinel(&sentinel_path, EvidenceFlags::DELETE)?;
         let (response_tx, response_rx) = mpsc::sync_channel(1);
@@ -897,31 +1103,39 @@ impl MacOsFseventsObserver {
 
     fn shutdown_inner(&self) -> Result<()> {
         self.shared.shutdown.store(true, Ordering::Release);
+        let _ = self.commands.try_send(DurabilityCommand::Shutdown);
         unsafe {
             fs_events::core_foundation::CFRunLoopStop(
                 self.stream.run_loop as fs_events::core_foundation::CFRunLoopRef,
             );
         }
-        let mut workers = std::mem::take(
+        let workers = std::mem::take(
             &mut *self
                 .workers
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()),
         );
-        if !workers.is_empty() {
-            workers
-                .remove(0)
-                .join()
-                .map_err(|_| Error::InvalidInput("macOS FSEvents run loop panicked".into()))?;
-        }
-        let _ = self.commands.send(DurabilityCommand::Shutdown);
+        let deadline = Instant::now() + FENCE_TIMEOUT;
+        let mut failure = None;
         for worker in workers {
-            worker.join().map_err(|_| {
-                Error::InvalidInput("macOS observer durability worker panicked".into())
-            })?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || worker.done.recv_timeout(remaining).is_err() {
+                failure = Some(reconcile_error(&format!(
+                    "fsevents_bounded_shutdown_timeout:{}",
+                    worker.name
+                )));
+                drop(worker.join);
+                continue;
+            }
+            if worker.join.join().is_err() {
+                failure = Some(Error::InvalidInput(format!(
+                    "macOS {} worker panicked",
+                    worker.name
+                )));
+            }
         }
         self.shared.lock().active = false;
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     #[cfg(debug_assertions)]
@@ -956,6 +1170,14 @@ impl MacOsFseventsObserver {
     fn fail_next_root_descriptor_for_test(&self) {
         *self
             .fail_next_root_descriptor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = true;
+    }
+
+    #[cfg(debug_assertions)]
+    fn fail_next_coverage_descriptor_for_test(&self) {
+        *self
+            .fail_next_coverage_descriptor
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = true;
     }
@@ -1113,16 +1335,42 @@ extern "C" fn callback(
             context.shared.revoke("fsevents_path_decode_ambiguity");
             return;
         };
-        let Ok(path) = normalize_callback_path(
-            &context.root_path,
-            &context.device_relative_root,
-            Path::new(path_text),
-        ) else {
+        let disposition = classify_callback_path(context, Path::new(path_text), flags[index]);
+        let Ok(disposition) = disposition else {
             context.shared.revoke(format!(
                 "fsevents_path_escaped_or_ambiguous: callback={path_text:?} root={:?} device_relative_root={:?}",
                 context.root_path, context.device_relative_root,
             ));
             return;
+        };
+        let CallbackDisposition::Ledger(path) = disposition else {
+            match disposition {
+                CallbackDisposition::PolicyDependency(dependency) => {
+                    match context
+                        .records
+                        .try_send(DurabilityCommand::PolicyInvalidation {
+                            dependency,
+                            provider_event_id: ids[index],
+                        }) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            context
+                                .shared
+                                .revoke("fsevents_bounded_callback_queue_overflow");
+                            return;
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            context
+                                .shared
+                                .revoke("fsevents_durability_worker_disconnected");
+                            return;
+                        }
+                    }
+                }
+                CallbackDisposition::Ignore => {}
+                CallbackDisposition::Ledger(_) => unreachable!(),
+            }
+            continue;
         };
         let Some(path) = path else {
             // Directory metadata events for the watched root have no ledger
@@ -1130,10 +1378,7 @@ extern "C" fn callback(
             // authoritative WatchRoot flags.
             continue;
         };
-        if observer_internal_path(&path)
-            && !observer_fence_path(&path)
-            && !policy_dependency_event(&context.policy_dependencies, &path)
-        {
+        if observer_internal_path(&path) && !observer_fence_path(&path) {
             continue;
         }
         let evidence = evidence_flags(flags[index]);
@@ -1162,6 +1407,82 @@ extern "C" fn callback(
     }
 }
 
+enum CallbackDisposition {
+    Ledger(Option<LedgerPath>),
+    PolicyDependency(PathBuf),
+    Ignore,
+}
+
+fn classify_callback_path(
+    context: &CallbackContext,
+    event_path: &Path,
+    native_flags: u32,
+) -> Result<CallbackDisposition> {
+    let candidates = if event_path.is_absolute() {
+        vec![lexical_normalize_path(event_path)]
+    } else {
+        let mut candidates = Vec::new();
+        for coverage in &context.coverage_roots {
+            if let Ok(relative) = event_path.strip_prefix(&coverage.device_relative_root) {
+                candidates.push(lexical_normalize_path(
+                    &coverage.absolute_root.join(relative),
+                ));
+            }
+        }
+        candidates
+    };
+    if candidates.is_empty() {
+        return Err(reconcile_error(
+            "fsevents_callback_outside_exact_watch_coverage",
+        ));
+    }
+    for candidate in &candidates {
+        if let Some(dependency) = context
+            .policy_watches
+            .iter()
+            .find(|watch| dependency_triggered_by(candidate, &watch.observed_path, native_flags))
+        {
+            return Ok(CallbackDisposition::PolicyDependency(
+                dependency.dependency.clone(),
+            ));
+        }
+    }
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.starts_with(&context.root_path))
+    {
+        return normalize_callback_path(
+            &context.root_path,
+            &context.device_relative_root,
+            candidate,
+        )
+        .map(CallbackDisposition::Ledger);
+    }
+    if candidates.iter().any(|candidate| {
+        context
+            .coverage_roots
+            .iter()
+            .any(|coverage| candidate.starts_with(&coverage.absolute_root))
+    }) {
+        return Ok(CallbackDisposition::Ignore);
+    }
+    Err(reconcile_error(
+        "fsevents_callback_outside_exact_watch_coverage",
+    ))
+}
+
+fn dependency_triggered_by(event: &Path, dependency: &Path, native_flags: u32) -> bool {
+    if event == dependency {
+        return true;
+    }
+    let ancestor_identity_flags = fs_events::kFSEventStreamEventFlagItemCreated
+        | fs_events::kFSEventStreamEventFlagItemRemoved
+        | fs_events::kFSEventStreamEventFlagItemRenamed
+        | fs_events::kFSEventStreamEventFlagItemInodeMetaMod
+        | fs_events::kFSEventStreamEventFlagItemChangeOwner;
+    dependency.strip_prefix(event).is_ok() && native_flags & ancestor_identity_flags != 0
+}
+
 fn classify_authority_flags(shared: &Shared, flags: u32) -> Result<()> {
     if flags & GAP_FLAGS != 0 {
         let reason = if flags & fs_events::kFSEventStreamEventFlagMustScanSubDirs != 0 {
@@ -1182,12 +1503,12 @@ fn classify_authority_flags(shared: &Shared, flags: u32) -> Result<()> {
     }
     if flags & fs_events::kFSEventStreamEventFlagHistoryDone != 0 {
         let mut state = shared.lock();
-        if !state.history_required || state.history_done {
+        if state.history_pending == 0 {
             drop(state);
             shared.revoke("fsevents_inconsistent_history_done");
             return Err(reconcile_error("fsevents_inconsistent_history_done"));
         }
-        state.history_done = true;
+        state.history_pending -= 1;
         shared.changed.notify_all();
     }
     Ok(())
@@ -1269,42 +1590,251 @@ fn observer_fence_path(path: &LedgerPath) -> bool {
     path.as_str().starts_with(".trail/observer-fences/")
 }
 
-fn normalize_policy_dependencies(
+fn normalize_absolute_dependency(requested_root: &Path, dependency: &Path) -> Result<PathBuf> {
+    let absolute = if dependency.is_absolute() {
+        dependency.to_path_buf()
+    } else {
+        requested_root.join(dependency)
+    };
+    let normalized = lexical_normalize_path(&absolute);
+    if !normalized.is_absolute() {
+        return Err(reconcile_error(
+            "fsevents_policy_dependency_is_not_absolute",
+        ));
+    }
+    normalized
+        .to_str()
+        .ok_or_else(|| reconcile_error("fsevents_policy_dependency_path_decode_ambiguity"))?;
+    Ok(normalized)
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+    normalized
+}
+
+fn build_coverage_plan(
     root: &Path,
     requested_root: &Path,
+    device: u64,
     dependencies: &[PathBuf],
-) -> Result<Vec<LedgerPath>> {
-    dependencies
+) -> Result<CoveragePlan> {
+    let mut roots = BTreeMap::<PathBuf, CoverageRoot>::new();
+    add_coverage_root(&mut roots, root, device)?;
+    let mut system_aliases = BTreeMap::<PathBuf, SystemAliasBinding>::new();
+    let mut policy_watches = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let dependency = normalize_absolute_dependency(requested_root, dependency)?;
+        if let Ok(relative) = dependency.strip_prefix(requested_root) {
+            policy_watches.push(PolicyWatch {
+                observed_path: lexical_normalize_path(&root.join(relative)),
+                dependency,
+            });
+            continue;
+        }
+        let (observed_dependency, alias) = canonicalize_known_system_alias(&dependency)?;
+        if let Some(alias) = alias {
+            system_aliases
+                .entry(alias.alias_path.clone())
+                .or_insert(alias);
+        }
+        if observed_dependency.starts_with(root) {
+            policy_watches.push(PolicyWatch {
+                observed_path: observed_dependency,
+                dependency,
+            });
+            continue;
+        }
+        let (named_root, canonical, coverage_root) = nearest_existing_parent(&observed_dependency)?;
+        let metadata = coverage_root.metadata()?;
+        if metadata.dev() != device {
+            return Err(reconcile_error(&format!(
+                "fsevents_policy_dependency_crosses_device:{}",
+                observed_dependency.display()
+            )));
+        }
+        let relative = observed_dependency
+            .strip_prefix(&named_root)
+            .map_err(|_| reconcile_error("fsevents_policy_dependency_coverage_mapping_failure"))?;
+        policy_watches.push(PolicyWatch {
+            observed_path: lexical_normalize_path(&canonical.join(relative)),
+            dependency,
+        });
+        add_open_coverage_root(&mut roots, canonical, coverage_root, device)?;
+    }
+    let roots = roots.into_values().collect::<Vec<_>>();
+    let stream_roots = roots
         .iter()
-        .map(|dependency| {
-            let relative = dependency
-                .strip_prefix(root)
-                .or_else(|_| dependency.strip_prefix(requested_root))
-                .map_err(|_| {
-                    reconcile_error("fsevents_external_policy_dependency_is_unobservable")
+        .filter(|candidate| {
+            !roots.iter().any(|other| {
+                other.absolute_root != candidate.absolute_root
+                    && candidate.absolute_root.starts_with(&other.absolute_root)
+            })
+        })
+        .map(|root| root.device_relative_root.clone())
+        .collect();
+    Ok(CoveragePlan {
+        roots,
+        stream_roots,
+        system_aliases: system_aliases.into_values().collect(),
+        policy_dependencies: dependencies.to_vec(),
+        policy_watches,
+    })
+}
+
+fn canonicalize_known_system_alias(
+    dependency: &Path,
+) -> Result<(PathBuf, Option<SystemAliasBinding>)> {
+    for (alias, target, link_target) in [
+        ("/etc", "/private/etc", "private/etc"),
+        ("/var", "/private/var", "private/var"),
+        ("/tmp", "/private/tmp", "private/tmp"),
+    ] {
+        let alias = Path::new(alias);
+        let Ok(relative) = dependency.strip_prefix(alias) else {
+            continue;
+        };
+        let binding = exact_system_alias_binding(alias, Path::new(target), Path::new(link_target))?;
+        return Ok((
+            lexical_normalize_path(&binding.canonical_target.join(relative)),
+            Some(binding),
+        ));
+    }
+    Ok((dependency.to_path_buf(), None))
+}
+
+fn exact_system_alias_binding(
+    alias: &Path,
+    expected_target: &Path,
+    expected_link_target: &Path,
+) -> Result<SystemAliasBinding> {
+    let metadata = std::fs::symlink_metadata(alias)
+        .map_err(|_| reconcile_error("fsevents_system_policy_alias_identity_unavailable"))?;
+    let link_target = std::fs::read_link(alias)
+        .map_err(|_| reconcile_error("fsevents_system_policy_alias_identity_unavailable"))?;
+    let canonical_target = alias
+        .canonicalize()
+        .map_err(|_| reconcile_error("fsevents_system_policy_alias_target_unavailable"))?;
+    if !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || link_target != expected_link_target
+        || canonical_target != expected_target
+    {
+        return Err(reconcile_error(
+            "fsevents_system_policy_alias_identity_mismatch",
+        ));
+    }
+    let target = open_root_no_follow(&canonical_target)
+        .map_err(|_| reconcile_error("fsevents_system_policy_alias_target_unavailable"))?;
+    let alias_identity = format!(
+        "system-alias-v1:dev={};ino={};mode={};uid={};gid={};target={}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.uid(),
+        metadata.gid(),
+        link_target.display(),
+    )
+    .into_bytes();
+    Ok(SystemAliasBinding {
+        alias_path: alias.to_path_buf(),
+        canonical_target,
+        alias_identity,
+        target_identity: root_identity(&target)?,
+    })
+}
+
+fn nearest_existing_parent(dependency: &Path) -> Result<(PathBuf, PathBuf, File)> {
+    let mut candidate = dependency
+        .parent()
+        .ok_or_else(|| reconcile_error("fsevents_policy_dependency_has_no_parent"))?;
+    loop {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(reconcile_error(
+                    "fsevents_policy_dependency_parent_is_symlink_or_unsafe",
+                ));
+            }
+            Ok(_) => {
+                let root = open_root_no_follow(candidate).map_err(|_| {
+                    reconcile_error("fsevents_policy_dependency_parent_is_symlink_or_unsafe")
                 })?;
-            let text = relative.to_str().ok_or_else(|| {
-                reconcile_error("fsevents_policy_dependency_path_decode_ambiguity")
-            })?;
-            LedgerPath::parse(text)
+                let canonical = candidate.canonicalize().map_err(|_| {
+                    reconcile_error("fsevents_policy_coverage_root_identity_unavailable")
+                })?;
+                return Ok((candidate.to_path_buf(), canonical, root));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = candidate.parent().ok_or_else(|| {
+                    reconcile_error("fsevents_policy_dependency_parent_unobservable")
+                })?;
+            }
+            Err(_) => {
+                return Err(reconcile_error(
+                    "fsevents_policy_dependency_parent_is_symlink_or_unsafe",
+                ));
+            }
+        }
+    }
+}
+
+fn add_coverage_root(
+    roots: &mut BTreeMap<PathBuf, CoverageRoot>,
+    path: &Path,
+    device: u64,
+) -> Result<()> {
+    let root = open_root_no_follow(path)?;
+    add_open_coverage_root(roots, path.to_path_buf(), root, device)
+}
+
+fn add_open_coverage_root(
+    roots: &mut BTreeMap<PathBuf, CoverageRoot>,
+    absolute_root: PathBuf,
+    root: File,
+    device: u64,
+) -> Result<()> {
+    let metadata = root.metadata()?;
+    if metadata.dev() != device {
+        return Err(reconcile_error("fsevents_policy_dependency_crosses_device"));
+    }
+    let relative = device_relative_root(&absolute_root)?;
+    let identity = root_identity(&root)?;
+    roots.entry(absolute_root.clone()).or_insert(CoverageRoot {
+        absolute_root,
+        device_relative_root: relative,
+        root_identity: identity,
+        root,
+    });
+    Ok(())
+}
+
+fn cursor_coverage_roots(coverage: &CoveragePlan) -> Vec<CursorCoverageRoot> {
+    coverage
+        .roots
+        .iter()
+        .map(|root| CursorCoverageRoot {
+            device_relative_root: root.device_relative_root.clone(),
+            root_identity: root.root_identity.clone(),
         })
         .collect()
 }
 
-fn policy_dependency_event(dependencies: &[LedgerPath], path: &LedgerPath) -> bool {
-    dependencies.iter().any(|dependency| {
-        dependency == path
-            || dependency
-                .as_str()
-                .strip_prefix(path.as_str())
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    })
-}
-
 fn run_stream(
     authority: HistoryAuthority,
+    watched_roots: Vec<String>,
     since_when: u64,
-    callback_context: Box<CallbackContext>,
+    callback_context: CallbackContext,
     ready: SyncSender<Result<StreamHandle>>,
     decision: Receiver<StartupDecision>,
     cancelled: Arc<AtomicBool>,
@@ -1316,96 +1846,106 @@ fn run_stream(
     if cancelled.load(Ordering::Acquire) {
         return;
     }
-    let Ok(relative_root) = std::ffi::CString::new(authority.device_relative_root.as_bytes())
-    else {
-        let _ = ready.send(Err(reconcile_error("fsevents_relative_root_contains_nul")));
-        return;
-    };
-    let cf_path = unsafe {
-        fs_events::core_foundation::CFStringCreateWithCString(
-            fs_events::core_foundation::kCFAllocatorDefault,
-            relative_root.as_ptr(),
-            fs_events::core_foundation::kCFStringEncodingUTF8,
-        )
-    };
-    if cf_path.is_null() {
-        let _ = ready.send(Err(reconcile_error("fsevents_root_cfstring_failure")));
-        return;
-    }
-    let paths = unsafe {
-        fs_events::core_foundation::CFArrayCreateMutable(
-            fs_events::core_foundation::kCFAllocatorDefault,
-            1,
-            &fs_events::core_foundation::kCFTypeArrayCallBacks,
-        )
-    };
-    if paths.is_null() {
-        unsafe { fs_events::core_foundation::CFRelease(cf_path) };
-        let _ = ready.send(Err(reconcile_error("fsevents_paths_array_failure")));
-        return;
-    }
-    unsafe {
-        fs_events::core_foundation::CFArrayAppendValue(paths, cf_path);
-        fs_events::core_foundation::CFRelease(cf_path);
-    }
-    let raw_context = Box::into_raw(callback_context);
-    let context = fs_events::FSEventStreamContext {
-        version: 0,
-        info: raw_context.cast(),
-        retain: None,
-        release: Some(release_callback_context),
-        copy_description: None,
-    };
-    let stream = unsafe {
-        fs_events::FSEventStreamCreateRelativeToDevice(
-            fs_events::core_foundation::kCFAllocatorDefault,
-            callback,
-            &context,
-            authority.device as libc::dev_t,
-            paths,
-            since_when,
-            0.01,
-            STREAM_FLAGS,
-        )
-    };
-    unsafe { fs_events::core_foundation::CFRelease(paths) };
-    if stream.is_null() {
-        unsafe { drop(Box::from_raw(raw_context)) };
-        let _ = ready.send(Err(reconcile_error("fsevents_stream_create_failure")));
-        return;
-    }
-    let actual_device = unsafe { fs_events::FSEventStreamGetDeviceBeingWatched(stream) };
-    let watched_root = copy_watched_root(stream);
-    if actual_device as u64 != authority.device
-        || !matches!(watched_root.as_deref(), Ok(path) if path == authority.device_relative_root)
-    {
-        let reason = format!(
-            "fsevents_native_device_or_relative_root_mismatch: expected_device={} actual_device={} expected_root={:?} actual_root={:?}",
-            authority.device,
-            actual_device,
-            authority.device_relative_root,
-            watched_root.as_ref().map_err(ToString::to_string),
-        );
-        unsafe {
-            fs_events::FSEventStreamInvalidate(stream);
-            fs_events::FSEventStreamRelease(stream);
+    let mut streams = Vec::with_capacity(watched_roots.len());
+    for root in &watched_roots {
+        let paths = unsafe {
+            fs_events::core_foundation::CFArrayCreateMutable(
+                fs_events::core_foundation::kCFAllocatorDefault,
+                1,
+                &fs_events::core_foundation::kCFTypeArrayCallBacks,
+            )
+        };
+        if paths.is_null() {
+            unsafe { cleanup_streams(&streams, cleanup_observed.as_ref()) };
+            let _ = ready.send(Err(reconcile_error("fsevents_paths_array_failure")));
+            return;
         }
-        mark_cleanup(&cleanup_observed);
-        let _ = ready.send(Err(reconcile_error(&reason)));
-        return;
+        let Ok(relative_root) = std::ffi::CString::new(root.as_bytes()) else {
+            unsafe { fs_events::core_foundation::CFRelease(paths) };
+            unsafe { cleanup_streams(&streams, cleanup_observed.as_ref()) };
+            let _ = ready.send(Err(reconcile_error("fsevents_relative_root_contains_nul")));
+            return;
+        };
+        let cf_path = unsafe {
+            fs_events::core_foundation::CFStringCreateWithCString(
+                fs_events::core_foundation::kCFAllocatorDefault,
+                relative_root.as_ptr(),
+                fs_events::core_foundation::kCFStringEncodingUTF8,
+            )
+        };
+        if cf_path.is_null() {
+            unsafe { fs_events::core_foundation::CFRelease(paths) };
+            unsafe { cleanup_streams(&streams, cleanup_observed.as_ref()) };
+            let _ = ready.send(Err(reconcile_error("fsevents_root_cfstring_failure")));
+            return;
+        }
+        unsafe {
+            fs_events::core_foundation::CFArrayAppendValue(paths, cf_path);
+            fs_events::core_foundation::CFRelease(cf_path);
+        }
+        let raw_context = Box::into_raw(Box::new(callback_context.clone()));
+        let context = fs_events::FSEventStreamContext {
+            version: 0,
+            info: raw_context.cast(),
+            retain: None,
+            release: Some(release_callback_context),
+            copy_description: None,
+        };
+        let stream = unsafe {
+            fs_events::FSEventStreamCreateRelativeToDevice(
+                fs_events::core_foundation::kCFAllocatorDefault,
+                callback,
+                &context,
+                authority.device as libc::dev_t,
+                paths,
+                since_when,
+                0.01,
+                STREAM_FLAGS,
+            )
+        };
+        unsafe { fs_events::core_foundation::CFRelease(paths) };
+        if stream.is_null() {
+            unsafe {
+                drop(Box::from_raw(raw_context));
+                cleanup_streams(&streams, cleanup_observed.as_ref());
+            }
+            let _ = ready.send(Err(reconcile_error("fsevents_stream_create_failure")));
+            return;
+        }
+        let actual_device = unsafe { fs_events::FSEventStreamGetDeviceBeingWatched(stream) };
+        let actual_roots = copy_watched_roots(stream);
+        if actual_device as u64 != authority.device
+            || !matches!(actual_roots.as_ref(), Ok(paths) if paths == std::slice::from_ref(root))
+        {
+            let reason = format!(
+                "fsevents_native_device_or_relative_root_mismatch: expected_device={} actual_device={} expected_root={:?} actual_roots={:?}",
+                authority.device,
+                actual_device,
+                root,
+                actual_roots.as_ref().map_err(ToString::to_string),
+            );
+            streams.push(stream);
+            unsafe { cleanup_streams(&streams, cleanup_observed.as_ref()) };
+            let _ = ready.send(Err(reconcile_error(&reason)));
+            return;
+        }
+        streams.push(stream);
     }
     unsafe {
         let run_loop = fs_events::core_foundation::CFRunLoopGetCurrent();
-        fs_events::FSEventStreamScheduleWithRunLoop(
-            stream,
-            run_loop,
-            fs_events::core_foundation::kCFRunLoopDefaultMode,
-        );
-        if fs_events::FSEventStreamStart(stream) == 0 {
-            fs_events::FSEventStreamInvalidate(stream);
-            fs_events::FSEventStreamRelease(stream);
-            let _ = ready.send(Err(reconcile_error("fsevents_stream_start_failure")));
-            return;
+        for stream in &streams {
+            fs_events::FSEventStreamScheduleWithRunLoop(
+                *stream,
+                run_loop,
+                fs_events::core_foundation::kCFRunLoopDefaultMode,
+            );
+            if fs_events::FSEventStreamStart(*stream) == 0 {
+                cleanup_streams(&streams, cleanup_observed.as_ref());
+                let _ = ready.send(Err(reconcile_error(&format!(
+                    "fsevents_stream_start_failure:watched_roots={watched_roots:?}"
+                ))));
+                return;
+            }
         }
         let post_start_database_uuid = match post_start_database_uuid_override {
             Some(uuid) => Ok(uuid),
@@ -1414,14 +1954,14 @@ fn run_stream(
         match post_start_database_uuid {
             Ok(uuid) if uuid == authority.database_uuid => {}
             Ok(_) => {
-                cleanup_stream(stream, cleanup_observed.as_ref());
+                cleanup_streams(&streams, cleanup_observed.as_ref());
                 let _ = ready.send(Err(reconcile_error(
                     "fsevents_post_start_history_database_uuid_mismatch",
                 )));
                 return;
             }
             Err(_) => {
-                cleanup_stream(stream, cleanup_observed.as_ref());
+                cleanup_streams(&streams, cleanup_observed.as_ref());
                 let _ = ready.send(Err(reconcile_error(
                     "fsevents_post_start_history_database_uuid_unavailable",
                 )));
@@ -1432,85 +1972,88 @@ fn run_stream(
             thread::sleep(delay_after_native_start);
         }
         if cancelled.load(Ordering::Acquire) {
-            cleanup_stream(stream, cleanup_observed.as_ref());
+            cleanup_streams(&streams, cleanup_observed.as_ref());
             return;
         }
         if ready
             .send(Ok(StreamHandle {
-                stream: stream as usize,
+                streams: streams.iter().map(|stream| *stream as usize).collect(),
                 run_loop: run_loop as usize,
             }))
             .is_err()
         {
-            cleanup_stream(stream, cleanup_observed.as_ref());
+            cleanup_streams(&streams, cleanup_observed.as_ref());
             return;
         }
         match decision.recv_timeout(FENCE_TIMEOUT) {
             Ok(StartupDecision::Publish) if !cancelled.load(Ordering::Acquire) => {}
             Ok(StartupDecision::Publish | StartupDecision::Cancel)
             | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                cleanup_stream(stream, cleanup_observed.as_ref());
+                cleanup_streams(&streams, cleanup_observed.as_ref());
                 return;
             }
         }
         fs_events::core_foundation::CFRunLoopRun();
-        cleanup_stream(stream, cleanup_observed.as_ref());
+        cleanup_streams(&streams, cleanup_observed.as_ref());
     }
     if !shared.shutdown.load(Ordering::Acquire) {
         shared.revoke("fsevents_run_loop_stopped");
     }
 }
 
-fn copy_watched_root(stream: fs_events::ConstFSEventStreamRef) -> Result<String> {
+fn copy_watched_roots(stream: fs_events::ConstFSEventStreamRef) -> Result<Vec<String>> {
     let paths = unsafe { fs_events::FSEventStreamCopyPathsBeingWatched(stream) };
     if paths.is_null() {
         return Err(reconcile_error("fsevents_copy_watched_paths_failure"));
     }
     let result = (|| {
         let count = unsafe { fs_events::core_foundation::CFArrayGetCount(paths) };
-        if count != 1 {
+        if count <= 0 {
             return Err(reconcile_error("fsevents_watched_path_count_mismatch"));
         }
-        let value = unsafe { fs_events::core_foundation::CFArrayGetValueAtIndex(paths, 0) };
-        if value.is_null() {
-            return Err(reconcile_error("fsevents_watched_path_is_null"));
+        let mut result = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let value = unsafe { fs_events::core_foundation::CFArrayGetValueAtIndex(paths, index) };
+            if value.is_null() {
+                return Err(reconcile_error("fsevents_watched_path_is_null"));
+            }
+            let mut buffer = vec![0_i8; 16 * 1024];
+            let copied = unsafe {
+                fs_events::core_foundation::CFStringGetCString(
+                    value,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as i64,
+                    fs_events::core_foundation::kCFStringEncodingUTF8,
+                )
+            };
+            if !copied {
+                return Err(reconcile_error("fsevents_watched_path_decode_failure"));
+            }
+            result.push(
+                unsafe { CStr::from_ptr(buffer.as_ptr()) }
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| reconcile_error("fsevents_watched_path_not_utf8"))?,
+            );
         }
-        let mut buffer = vec![0_i8; 16 * 1024];
-        let copied = unsafe {
-            fs_events::core_foundation::CFStringGetCString(
-                value,
-                buffer.as_mut_ptr(),
-                buffer.len() as i64,
-                fs_events::core_foundation::kCFStringEncodingUTF8,
-            )
-        };
-        if !copied {
-            return Err(reconcile_error("fsevents_watched_path_decode_failure"));
-        }
-        unsafe { CStr::from_ptr(buffer.as_ptr()) }
-            .to_str()
-            .map(str::to_owned)
-            .map_err(|_| reconcile_error("fsevents_watched_path_not_utf8"))
+        result.sort();
+        Ok(result)
     })();
     unsafe { fs_events::core_foundation::CFRelease(paths) };
     result
 }
 
-unsafe fn cleanup_stream(
-    stream: fs_events::FSEventStreamRef,
+unsafe fn cleanup_streams(
+    streams: &[fs_events::FSEventStreamRef],
     cleanup_observed: Option<&Arc<AtomicBool>>,
 ) {
-    unsafe {
-        fs_events::FSEventStreamStop(stream);
-        fs_events::FSEventStreamInvalidate(stream);
-        fs_events::FSEventStreamRelease(stream);
+    for stream in streams {
+        unsafe {
+            fs_events::FSEventStreamStop(*stream);
+            fs_events::FSEventStreamInvalidate(*stream);
+            fs_events::FSEventStreamRelease(*stream);
+        }
     }
-    if let Some(observed) = cleanup_observed {
-        observed.store(true, Ordering::Release);
-    }
-}
-
-fn mark_cleanup(cleanup_observed: &Option<Arc<AtomicBool>>) {
     if let Some(observed) = cleanup_observed {
         observed.store(true, Ordering::Release);
     }
@@ -1522,13 +2065,23 @@ fn run_durability_worker(
     shared: Arc<Shared>,
     cursor_template: MacOsProviderCursor,
 ) {
+    let mut last_heartbeat = Instant::now();
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
         let command = match receiver.recv_timeout(Duration::from_millis(25)) {
             Ok(command) => command,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                    if durability.heartbeat().is_err() {
+                        shared.revoke("fsevents_observer_heartbeat_failed");
+                        return;
+                    }
+                    last_heartbeat = Instant::now();
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 if !shared.shutdown.load(Ordering::Acquire) {
                     shared.revoke("fsevents_durability_worker_disconnected");
@@ -1544,50 +2097,93 @@ fn run_durability_worker(
             shared.revoke("fsevents_durability_worker_stopped");
             return;
         }
-        let (path, flags, provider_event_id, internal, fence_nonce, response) = match command {
-            DurabilityCommand::Record {
-                path,
-                flags,
-                provider_event_id,
-            } => {
-                let internal = path.as_str().starts_with(".trail/observer-fences/");
-                (path, flags, provider_event_id, internal, Vec::new(), None)
-            }
-            DurabilityCommand::Fence {
-                minimum_provider_event_id,
-                nonce,
-                response,
-            } => {
-                let provider_event_id = shared.lock().last_provider_event_id;
-                if provider_event_id < minimum_provider_event_id {
-                    let _ = response.send(Err(reconcile_error(
-                        "fsevents_fence_precedes_authenticated_sentinel",
-                    )));
-                    shared.revoke("fsevents_fence_precedes_authenticated_sentinel");
-                    return;
-                }
-                let name = format!(".trail-fsevents-fence-{}", hex::encode(&nonce));
-                let Ok(path) = LedgerPath::parse(&name) else {
-                    let _ = response.send(Err(reconcile_error("fsevents_fence_path_failure")));
-                    shared.revoke("fsevents_fence_path_failure");
-                    return;
-                };
-                (
+        let (path, flags, provider_event_id, internal, fence_nonce, response, revocation) =
+            match command {
+                DurabilityCommand::Record {
                     path,
-                    EvidenceFlags::default(),
+                    flags,
                     provider_event_id,
-                    true,
+                } => {
+                    let internal = path.as_str().starts_with(".trail/observer-fences/");
+                    (
+                        path,
+                        flags,
+                        provider_event_id,
+                        internal,
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                }
+                DurabilityCommand::PolicyInvalidation {
+                    dependency,
+                    provider_event_id,
+                } => {
+                    let digest = Sha256::digest(dependency.as_os_str().as_bytes());
+                    let path = match LedgerPath::parse(&format!(
+                        ".trail/policy-invalidations/{}",
+                        hex::encode(digest)
+                    )) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            shared.revoke("fsevents_policy_invalidation_marker_failure");
+                            return;
+                        }
+                    };
+                    (
+                        path,
+                        EvidenceFlags::CONTENT,
+                        provider_event_id,
+                        true,
+                        Vec::new(),
+                        None,
+                        Some(format!(
+                            "fsevents_policy_dependency_invalidated:{}",
+                            dependency.display()
+                        )),
+                    )
+                }
+                DurabilityCommand::Fence {
+                    minimum_provider_event_id,
                     nonce,
-                    Some(response),
-                )
-            }
-            #[cfg(debug_assertions)]
-            DurabilityCommand::StopForTest => unreachable!(),
-            DurabilityCommand::Shutdown => unreachable!(),
-        };
+                    response,
+                } => {
+                    let provider_event_id = shared.lock().last_provider_event_id;
+                    if provider_event_id < minimum_provider_event_id {
+                        let _ = response.send(Err(reconcile_error(
+                            "fsevents_fence_precedes_authenticated_sentinel",
+                        )));
+                        shared.revoke("fsevents_fence_precedes_authenticated_sentinel");
+                        return;
+                    }
+                    let name = format!(".trail-fsevents-fence-{}", hex::encode(&nonce));
+                    let Ok(path) = LedgerPath::parse(&name) else {
+                        let _ = response.send(Err(reconcile_error("fsevents_fence_path_failure")));
+                        shared.revoke("fsevents_fence_path_failure");
+                        return;
+                    };
+                    (
+                        path,
+                        EvidenceFlags::default(),
+                        provider_event_id,
+                        true,
+                        nonce,
+                        Some(response),
+                        None,
+                    )
+                }
+                #[cfg(debug_assertions)]
+                DurabilityCommand::StopForTest => unreachable!(),
+                DurabilityCommand::Shutdown => unreachable!(),
+            };
         let sequence = shared.lock().next_sequence;
+        // Device event IDs are global, but callbacks from separate one-root
+        // streams are not promised to be delivered in global-ID order. The
+        // resume cursor is therefore the durable high-water mark, while the
+        // individual event retains its exact native ID for fence filtering.
+        let cursor_event_id = shared.lock().last_provider_event_id.max(provider_event_id);
         let mut cursor = cursor_template.clone();
-        cursor.event_id = provider_event_id;
+        cursor.event_id = cursor_event_id;
         let provider_cursor = match cursor.encode() {
             Ok(cursor) => cursor,
             Err(error) => {
@@ -1619,13 +2215,8 @@ fn run_durability_worker(
         };
         {
             let mut state = shared.lock();
-            if provider_event_id < state.last_provider_event_id {
-                drop(state);
-                shared.revoke("fsevents_non_monotonic_provider_cursor");
-                return;
-            }
             state.next_sequence = sequence.saturating_add(1);
-            state.last_provider_event_id = provider_event_id;
+            state.last_provider_event_id = state.last_provider_event_id.max(provider_event_id);
             state.last_cursor = Some(cursor);
             state.events.push(DurableEvent {
                 event: ObserverEvent {
@@ -1646,6 +2237,15 @@ fn run_durability_worker(
         }
         if let Some(response) = response {
             let _ = response.send(Ok((public, cut, provider_event_id)));
+        }
+        if let Some(reason) = revocation {
+            match durability.revoke_owner(&reason) {
+                Ok(()) => shared.revoke(reason),
+                Err(error) => {
+                    shared.revoke(format!("fsevents_policy_owner_revocation_failure:{error}"))
+                }
+            }
+            return;
         }
     }
 }
@@ -1677,6 +2277,15 @@ fn actual_history_authority(root: &Path, device: u64) -> Result<HistoryAuthority
         ));
     }
     let database_uuid = copy_history_database_uuid(device)?;
+    let device_relative_root = device_relative_root(root)?;
+    Ok(HistoryAuthority {
+        device,
+        database_uuid,
+        device_relative_root,
+    })
+}
+
+fn device_relative_root(root: &Path) -> Result<String> {
     let root_text = root
         .to_str()
         .ok_or_else(|| reconcile_error("fsevents_non_utf8_root"))?;
@@ -1708,11 +2317,7 @@ fn actual_history_authority(root: &Path, device: u64) -> Result<HistoryAuthority
             "fsevents_device_relative_root_is_not_normal",
         ));
     }
-    Ok(HistoryAuthority {
-        device,
-        database_uuid,
-        device_relative_root,
-    })
+    Ok(device_relative_root)
 }
 
 fn copy_history_database_uuid(device: u64) -> Result<[u8; 16]> {
@@ -1747,7 +2352,7 @@ fn copy_history_database_uuid(device: u64) -> Result<[u8; 16]> {
 fn root_identity(file: &File) -> Result<Vec<u8>> {
     let metadata = file.metadata()?;
     Ok(format!(
-        "mac-root-v1:dev={};ino={};mode={};uid={};gid={}",
+        "root-v1:dev={};ino={};mode={};uid={};gid={}",
         metadata.dev(),
         metadata.ino(),
         metadata.mode(),
@@ -1821,6 +2426,10 @@ impl MacObserverDurability for MemoryDurability {
             last_hash: [0; 32],
             provider_cursor,
         })
+    }
+
+    fn revoke_owner(&mut self, _reason: &str) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -2084,20 +2693,15 @@ pub(crate) fn run_real_apfs_file_events() -> std::result::Result<(), String> {
             ));
         }
         let events = fixture.interval(|root| {
-            std::fs::write(
-                root.join(".trail/config.toml"),
-                b"ignore_gitignored = true\n",
-            )?;
             std::fs::write(root.join(".trail/internal-noise"), b"noise")?;
             Ok(())
         })?;
-        if !has_event(&events, ".trail/config.toml", EvidenceFlags::CREATE)
-            || events
-                .iter()
-                .any(|event| event.path.as_str() == ".trail/internal-noise")
+        if events
+            .iter()
+            .any(|event| event.path.as_str() == ".trail/internal-noise")
         {
             return Err(Error::Corrupt(
-                "internal policy dependency was lost or storage noise leaked".into(),
+                "internal storage noise leaked into the ledger".into(),
             ));
         }
         if fixture.records.lock().unwrap().is_empty() {
@@ -2175,8 +2779,7 @@ fn callback_overflow_or_disconnect(disconnect: bool) -> Result<()> {
         state: Mutex::new(State {
             active: true,
             revoked: None,
-            history_required: false,
-            history_done: true,
+            history_pending: 0,
             events: Vec::new(),
             next_sequence: 1,
             last_provider_event_id: 0,
@@ -2196,7 +2799,11 @@ fn callback_overflow_or_disconnect(disconnect: bool) -> Result<()> {
     let context = CallbackContext {
         root_path: temp.path().to_path_buf(),
         device_relative_root: PathBuf::new(),
-        policy_dependencies: Vec::new(),
+        coverage_roots: vec![CallbackCoverageRoot {
+            absolute_root: temp.path().to_path_buf(),
+            device_relative_root: PathBuf::new(),
+        }],
+        policy_watches: Vec::new(),
         records: tx,
         shared: Arc::clone(&shared),
     };
@@ -2238,35 +2845,287 @@ pub(crate) fn run_continuity_fault_matrix() -> std::result::Result<(), String> {
         return run_owner_process_child(Path::new(&root)).map_err(|error| error.to_string());
     }
     fn run() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         callback_overflow_or_disconnect(false)?;
         callback_overflow_or_disconnect(true)?;
 
         let external_root = tempfile::tempdir()?;
         std::fs::create_dir(external_root.path().join(".trail"))?;
-        let external_dependency = tempfile::NamedTempFile::new()?;
+        let external_policy_home = tempfile::tempdir()?;
+        let external_dependency = external_policy_home.path().join("missing-global.gitconfig");
         let provider = b"macos-fsevents-file-events-v1".to_vec();
-        let (durability, _) = memory_durability(provider, Duration::ZERO);
-        let error = match MacOsFseventsObserver::start(
+        let (durability, external_records) = memory_durability(provider, Duration::ZERO);
+        let external_observer = MacOsFseventsObserver::start(
             external_root.path(),
             Box::new(durability),
             None,
-            &[external_dependency.path().to_path_buf()],
-        ) {
-            Ok(_) => {
-                return Err(Error::Corrupt(
-                    "unobservable external policy dependency was accepted".into(),
-                ));
+            std::slice::from_ref(&external_dependency),
+        )?;
+        std::fs::write(external_policy_home.path().join("unrelated"), b"unrelated")?;
+        for stream in &external_observer.stream.streams {
+            unsafe {
+                fs_events::FSEventStreamFlushSync(*stream as fs_events::FSEventStreamRef);
             }
-            Err(error) => error,
-        };
-        if !error
-            .to_string()
-            .contains("fsevents_external_policy_dependency_is_unobservable")
+        }
+        if external_observer.ensure_available().is_err()
+            || !external_records
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty()
         {
             return Err(Error::Corrupt(
-                "external policy dependency did not fail closed".into(),
+                "unrelated covered sibling leaked into policy invalidation".into(),
+            ));
+        }
+        std::fs::write(&external_dependency, b"[core]\n\texcludesFile = ignored\n")?;
+        let deadline = Instant::now() + FENCE_TIMEOUT;
+        while external_observer.ensure_available().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if external_observer.ensure_available().is_ok() {
+            return Err(Error::Corrupt(
+                "same-device external policy creation did not revoke observation".into(),
+            ));
+        }
+        let records = external_records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !records.iter().any(|record| {
+            record
+                .path
+                .as_str()
+                .starts_with(".trail/policy-invalidations/")
+        }) {
+            return Err(Error::Corrupt(
+                "external policy invalidation was not durable before revocation".into(),
+            ));
+        }
+        drop(records);
+        drop(external_observer);
+
+        let durable_fixture = NativeSegmentFixture::new()?;
+        let durable_policy_home = tempfile::tempdir()?;
+        let durable_dependency = durable_policy_home.path().join("missing-global.gitconfig");
+        let writer = SegmentWriter::acquire(
+            &durable_fixture.db.sqlite_path,
+            &durable_fixture.segment_directory,
+            durable_fixture.expected.scope_id,
+            durable_fixture.expected.epoch,
+            [0xda; 32],
+            &hex::encode(&durable_fixture.expected.provider_identity),
+            Vec::new(),
+            Duration::from_secs(3_600),
+        )?;
+        let durability = MacSegmentWriterDurability::new(
+            writer,
+            durable_fixture.expected.provider_identity.clone(),
+            vec![0xdb; 24],
+        )?;
+        let durable_observer = MacOsFseventsObserver::start(
+            durable_fixture.temp.path(),
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&durable_dependency),
+        )?;
+        std::fs::write(&durable_dependency, b"[core]\n")?;
+        let deadline = Instant::now() + FENCE_TIMEOUT;
+        let persisted = loop {
+            let persisted = durable_fixture.db.conn.query_row(
+                "SELECT owner.lease_state,owner.error_state,
+                        segment.last_sequence,segment.durable_end_offset
+                 FROM changed_path_observer_owners owner
+                 JOIN changed_path_observer_segments segment
+                   ON segment.scope_id=owner.scope_id AND segment.epoch=owner.epoch
+                 WHERE owner.scope_id=?1",
+                [durable_fixture.expected.scope_id.to_text()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            if persisted.0 == "error" || Instant::now() >= deadline {
+                break persisted;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        if persisted.0 != "error"
+            || !persisted
+                .1
+                .as_deref()
+                .is_some_and(|reason| reason.contains("policy_dependency_invalidated"))
+            || persisted.2.unwrap_or(0) < 1
+            || persisted.3 <= 0
+        {
+            return Err(Error::Corrupt(format!(
+                "policy invalidation did not flush marker before durable owner revoke: {persisted:?}"
+            )));
+        }
+        drop(durable_observer);
+
+        let overlapping_home = tempfile::tempdir()?;
+        let nested_workspace = overlapping_home.path().join("workspace");
+        std::fs::create_dir_all(nested_workspace.join(".trail"))?;
+        let overlapping_dependency = overlapping_home.path().join(".gitconfig");
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider.clone(), Duration::ZERO);
+        let overlapping_observer = MacOsFseventsObserver::start(
+            &nested_workspace,
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&overlapping_dependency),
+        )?;
+        if overlapping_observer.stream.streams.len() != 1 {
+            return Err(Error::Corrupt(
+                "overlapping policy/workspace roots created duplicate native streams".into(),
+            ));
+        }
+        let overlapping_expected = ExpectedScope {
+            scope_id: ScopeId([0xd8; 32]),
+            epoch: 1,
+            ref_name: "refs/branches/main".into(),
+            ref_generation: 1,
+            baseline_root: crate::ObjectId("overlapping-root".into()),
+            policy_fingerprint: [0xd9; 32],
+            policy_generation: 1,
+            filesystem_identity: overlapping_observer.root_identity.clone(),
+            provider_identity: provider,
+        };
+        let start = overlapping_observer.begin_observation(&overlapping_expected)?;
+        std::fs::write(nested_workspace.join("one-event"), b"one")?;
+        let end = overlapping_observer.end_fence(&overlapping_expected, &start)?;
+        let mut duplicate_count = 0;
+        overlapping_observer.drain_through(
+            &overlapping_expected,
+            &overlapping_observer.root_identity,
+            &start,
+            &end,
+            &mut |event| {
+                if event.path.as_str() == "one-event" {
+                    duplicate_count += 1;
+                }
+                Ok(())
+            },
+        )?;
+        if duplicate_count != 1 {
+            return Err(Error::Corrupt(format!(
+                "overlapping policy/workspace roots produced {duplicate_count} events"
+            )));
+        }
+
+        let cross_device_dependency = PathBuf::from("/dev/null");
+        if std::fs::metadata(&cross_device_dependency)?.dev()
+            != std::fs::metadata(external_root.path())?.dev()
+        {
+            let provider = b"macos-fsevents-file-events-v1".to_vec();
+            let (durability, _) = memory_durability(provider, Duration::ZERO);
+            let error = MacOsFseventsObserver::start(
+                external_root.path(),
+                Box::new(durability),
+                None,
+                &[cross_device_dependency],
+            )
+            .err()
+            .ok_or_else(|| Error::Corrupt("cross-device policy dependency was accepted".into()))?;
+            if !error
+                .to_string()
+                .contains("fsevents_policy_dependency_crosses_device")
+            {
+                return Err(Error::Corrupt(
+                    "cross-device policy dependency did not fail closed explicitly".into(),
+                ));
+            }
+        }
+
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let system_dependency = PathBuf::from("/etc/gitconfig");
+        let system_observer = MacOsFseventsObserver::start(
+            external_root.path(),
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&system_dependency),
+        )?;
+        let system_lease = system_observer.lease()?;
+        if system_lease.policy_dependencies != [system_dependency]
+            || system_observer.system_aliases.len() != 1
+            || system_observer.system_aliases[0].alias_path != Path::new("/etc")
+            || !system_observer
+                .coverage_roots
+                .iter()
+                .any(|root| root.absolute_root == Path::new("/private/etc"))
+        {
+            return Err(Error::Corrupt(
+                "normal real-Git /etc system policy was not canonically covered".into(),
+            ));
+        }
+        drop(system_observer);
+
+        let symlink_policy_home = tempfile::tempdir()?;
+        let symlink_target = tempfile::tempdir()?;
+        let symlink_parent = symlink_policy_home.path().join("linked-config-home");
+        symlink(symlink_target.path(), &symlink_parent)?;
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let error = MacOsFseventsObserver::start(
+            external_root.path(),
+            Box::new(durability),
+            None,
+            &[symlink_parent.join("global.gitconfig")],
+        )
+        .err()
+        .ok_or_else(|| Error::Corrupt("symlinked policy parent was accepted".into()))?;
+        if !error
+            .to_string()
+            .contains("fsevents_policy_dependency_parent_is_symlink_or_unsafe")
+        {
+            return Err(Error::Corrupt(
+                "symlinked policy parent did not fail closed explicitly".into(),
+            ));
+        }
+
+        let lease_root = tempfile::tempdir()?;
+        std::fs::create_dir(lease_root.path().join(".trail"))?;
+        let lease_policy_home = tempfile::tempdir()?;
+        let lease_dependency = lease_policy_home.path().join("global.gitconfig");
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let lease_observer = MacOsFseventsObserver::start(
+            lease_root.path(),
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&lease_dependency),
+        )?;
+        lease_observer.fail_next_coverage_descriptor_for_test();
+        if lease_observer.lease().is_ok() {
+            return Err(Error::Corrupt(
+                "coverage descriptor failure remained lease-authoritative".into(),
+            ));
+        }
+        drop(lease_observer);
+
+        let provider = b"macos-fsevents-file-events-v1".to_vec();
+        let (durability, _) = memory_durability(provider, Duration::ZERO);
+        let lease_observer = MacOsFseventsObserver::start(
+            lease_root.path(),
+            Box::new(durability),
+            None,
+            std::slice::from_ref(&lease_dependency),
+        )?;
+        let policy_home = lease_policy_home.path().to_path_buf();
+        let displaced_policy_home = policy_home.with_extension("displaced-policy-home");
+        std::fs::rename(&policy_home, &displaced_policy_home)?;
+        std::fs::create_dir(&policy_home)?;
+        let lease_result = lease_observer.lease();
+        std::fs::remove_dir(&policy_home)?;
+        std::fs::rename(&displaced_policy_home, &policy_home)?;
+        if lease_result.is_ok() {
+            return Err(Error::Corrupt(
+                "replaced external coverage parent remained lease-authoritative".into(),
             ));
         }
 
@@ -2582,8 +3441,7 @@ fn test_shared(last_provider_event_id: u64) -> Arc<Shared> {
         state: Mutex::new(State {
             active: true,
             revoked: None,
-            history_required: false,
-            history_done: true,
+            history_pending: 0,
             events: Vec::new(),
             next_sequence: 1,
             last_provider_event_id,
@@ -2638,6 +3496,12 @@ pub(crate) fn run_paused_callback_fence() -> std::result::Result<(), String> {
                     device: 1,
                     history_database_uuid: [1; 16],
                     device_relative_root: "tmp/workspace".into(),
+                    coverage_roots: vec![CursorCoverageRoot {
+                        device_relative_root: "tmp/workspace".into(),
+                        root_identity: b"root".to_vec(),
+                    }],
+                    system_aliases: Vec::new(),
+                    policy_dependencies: Vec::new(),
                     root_identity: b"root".to_vec(),
                     lineage_identity: vec![2; 24],
                     provider_identity: provider,
@@ -2782,6 +3646,22 @@ pub(crate) fn run_history_authority() -> std::result::Result<(), String> {
         forged.device_relative_root.push_str("-replacement");
         reject(forged, None)?;
         let mut forged = cursor.clone();
+        forged.coverage_roots[0].root_identity.push(0xff);
+        reject(forged, None)?;
+        let mut forged = cursor.clone();
+        forged.system_aliases.push(SystemAliasBinding {
+            alias_path: PathBuf::from("/etc"),
+            canonical_target: PathBuf::from("/private/etc"),
+            alias_identity: vec![0xff],
+            target_identity: vec![0xff],
+        });
+        reject(forged, None)?;
+        let mut forged = cursor.clone();
+        forged
+            .policy_dependencies
+            .push(fixture.temp.path().join("uncovered-policy"));
+        reject(forged, None)?;
+        let mut forged = cursor.clone();
         forged.root_identity.push(0xff);
         reject(forged, None)?;
         let mut forged = cursor.clone();
@@ -2857,7 +3737,11 @@ pub(crate) fn run_malformed_callbacks() -> std::result::Result<(), String> {
             let context = CallbackContext {
                 root_path: temp.path().to_path_buf(),
                 device_relative_root: PathBuf::from("tmp/callback"),
-                policy_dependencies: Vec::new(),
+                coverage_roots: vec![CallbackCoverageRoot {
+                    absolute_root: temp.path().to_path_buf(),
+                    device_relative_root: PathBuf::from("tmp/callback"),
+                }],
+                policy_watches: Vec::new(),
                 records,
                 shared: Arc::clone(&shared),
             };

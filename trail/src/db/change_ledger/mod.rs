@@ -2,6 +2,7 @@
 // authoritative readers and native producers to it.
 #![allow(dead_code)]
 
+mod daemon;
 mod intent;
 mod log;
 mod observer;
@@ -12,6 +13,10 @@ mod secure_fs;
 mod store;
 mod types;
 
+pub(crate) use daemon::{
+    prepare_workspace_daemon, workspace_daemon_fence, workspace_daemon_ready_proof,
+    workspace_daemon_reconcile, WorkspaceDaemonProof, WorkspaceDaemonRuntime,
+};
 #[allow(unused_imports)]
 pub(crate) use intent::{
     mark_filesystem_applied, prepare_intent, publish_intent, IntentEvidence, IntentId,

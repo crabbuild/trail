@@ -288,6 +288,7 @@ impl OperationMetricsState {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn note_daemon_cumulative_rewrite(&self, bytes: usize) {
         let mut daemon = lock_unpoisoned(&self.daemon_rewrites);
         daemon.count = daemon.count.saturating_add(1);

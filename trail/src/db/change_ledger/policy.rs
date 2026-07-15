@@ -1433,6 +1433,38 @@ impl CompiledPolicy {
                 .is_some_and(|authorization| authorization.expected == *expected)
     }
 
+    pub(crate) fn authorize_native_reconciliation(
+        &mut self,
+        expected: &ExpectedScope,
+        lease: &super::ObserverLease,
+    ) -> Result<()> {
+        if self.fingerprint != expected.policy_fingerprint
+            || lease.root_identity != expected.filesystem_identity
+            || lease.provider_identity != expected.provider_identity
+            || lease.policy_dependencies != self.snapshot.dependency_files
+            || !lease.capabilities.durable_cursor
+            || !lease.capabilities.linearizable_fence
+            || !lease.capabilities.overflow_scope
+            || !lease.capabilities.filesystem_supported
+            || !lease.capabilities.clean_proof_allowed
+            || !lease.capabilities.power_loss_durability
+        {
+            return Err(Error::ChangeLedgerReconcileRequired {
+                scope: expected.scope_id.to_text(),
+                state: super::TrustState::StaleBaseline.as_str().into(),
+                reason: "native observer lease cannot authorize the compiled recording policy"
+                    .into(),
+                command: "trail status".into(),
+            });
+        }
+        self.adapter_equivalence = AdapterEquivalence::Equivalent;
+        self.stale_baseline = false;
+        self.reconciliation_authorization = Some(PolicyReconciliationAuthorization {
+            expected: expected.clone(),
+        });
+        Ok(())
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn authorize_reconciliation_for_test(&mut self, expected: &ExpectedScope) {
         self.adapter_equivalence = AdapterEquivalence::Equivalent;
@@ -1576,12 +1608,14 @@ fn finish_compiled_policy(
     reused_manifest: bool,
 ) -> Result<CompiledPolicy> {
     let fingerprint = policy_fingerprint(&manifest.dependencies)?;
-    let dependency_files = manifest
+    let mut dependency_files = manifest
         .dependencies
         .iter()
         .filter(|dependency| dependency_is_file(dependency))
         .filter_map(|dependency| dependency_identity_path(&dependency.identity))
-        .collect();
+        .collect::<Vec<_>>();
+    dependency_files.sort();
+    dependency_files.dedup();
     let invalidation_index = PolicyInvalidationIndex::from_dependencies(
         context.workspace_root,
         context.case_sensitive,
@@ -1891,6 +1925,18 @@ fn discover_git_dependencies(
     if !context.recording.ignore_gitignored {
         return Ok(Vec::new());
     }
+    let Some(git_dirs) = run_git_optional_repository(
+        context,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )?
+    else {
+        return Ok(Vec::new());
+    };
     let mut paths = BTreeMap::<(PolicyDependencyKind, String), PathBuf>::new();
     let cwd = lexical_normalize(context.workspace_root);
     let home = git_environment_value(context, "HOME").map(|value| {
@@ -1961,16 +2007,6 @@ fn discover_git_dependencies(
             PolicyDependencyKind::GitExcludesFile,
         );
     }
-    let git_dirs = run_git(
-        context,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ],
-        true,
-    )?;
     let mut lines = git_dirs.split(|byte| *byte == b'\n');
     let git_dir = lines
         .next()
@@ -2294,6 +2330,28 @@ fn run_git(context: &PolicyCompileContext<'_>, args: &[&str], required: bool) ->
         .envs(git_command_environment(context, std::env::vars_os()));
     let output = command.output().map_err(Error::Io)?;
     git_output(args, required, output)
+}
+
+fn run_git_optional_repository(
+    context: &PolicyCompileContext<'_>,
+    args: &[&str],
+) -> Result<Option<Vec<u8>>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(context.workspace_root)
+        .env_clear()
+        .envs(git_command_environment(context, std::env::vars_os()))
+        .env("LC_ALL", "C");
+    let output = command.output().map_err(Error::Io)?;
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(128) && stderr.contains("not a git repository") {
+        return Ok(None);
+    }
+    git_output(args, true, output).map(Some)
 }
 
 fn run_git_with_stdin(

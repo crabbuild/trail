@@ -5,6 +5,7 @@
 //! only prove continuity through this trait and a durable end fence.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use super::reconcile::{ObserverEvent, ObserverQualification};
 use super::{ExpectedScope, ProviderCapabilities};
@@ -26,6 +27,8 @@ pub(crate) struct ObserverFence {
 pub(crate) struct ObserverLease {
     pub(crate) owner_token: String,
     pub(crate) root_identity: Vec<u8>,
+    pub(crate) provider_identity: Vec<u8>,
+    pub(crate) policy_dependencies: Vec<PathBuf>,
     pub(crate) capabilities: ProviderCapabilities,
 }
 

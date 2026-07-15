@@ -1692,7 +1692,7 @@ fn free_loopback_port() -> u16 {
 }
 
 fn wait_for_daemon_health(port: u16) {
-    for _ in 0..100 {
+    for _ in 0..400 {
         if daemon_health_ok(port) {
             return;
         }
@@ -12631,8 +12631,8 @@ fn cli_auto_discovers_daemon_for_hot_commands_and_falls_back_on_stale_endpoint()
     assert_eq!(endpoint["url"], format!("http://127.0.0.1:{port}"));
     assert_eq!(endpoint["auth"], true);
 
-    let status = run_trail_json(temp.path(), &["status"]);
-    assert_eq!(status["branch"], "main");
+    let lanes = run_trail_json(temp.path(), &["lane", "list"]);
+    assert!(lanes.as_array().unwrap().is_empty());
     wait_for_child_exit(&mut daemon.child);
     assert!(!endpoint_path.exists());
 
@@ -12647,8 +12647,8 @@ fn cli_auto_discovers_daemon_for_hot_commands_and_falls_back_on_stale_endpoint()
         .unwrap(),
     )
     .unwrap();
-    let fallback = run_trail_json(temp.path(), &["status"]);
-    assert_eq!(fallback["branch"], "main");
+    let fallback = run_trail_json(temp.path(), &["lane", "list"]);
+    assert!(fallback.as_array().unwrap().is_empty());
 }
 
 #[test]

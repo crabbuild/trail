@@ -80,6 +80,9 @@ pub(super) fn handle_api_command(_ctx: &RuntimeContext, api: ApiCommand) -> Resu
 
 pub(super) fn handle_daemon_command(ctx: &RuntimeContext, args: DaemonArgs) -> Result<()> {
     let mut db = open_db(ctx)?;
+    if daemon_start::is_auto_workspace_daemon() {
+        return daemon_start::run_auto_workspace_daemon(db);
+    }
     let addr = daemon_listen_addr(&args)?;
     validate_daemon_listen_security(&args, addr)?;
     let rate_limit = daemon_rate_limit(&args)?;
