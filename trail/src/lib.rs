@@ -24,58 +24,72 @@ pub use model::*;
 #[doc(hidden)]
 pub mod test_support {
     #[cfg(target_os = "macos")]
+    fn run_macos_integration(
+        test: fn() -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
+        use std::sync::{Mutex, OnceLock};
+
+        static MACOS_INTEGRATION: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = MACOS_INTEGRATION
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        test()
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn changed_path_macos_real_apfs_file_events() -> std::result::Result<(), String> {
-        crate::db::run_macos_real_apfs_file_events()
+        run_macos_integration(crate::db::run_macos_real_apfs_file_events)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_gap_flag_matrix() -> std::result::Result<(), String> {
-        crate::db::run_macos_gap_flag_matrix()
+        run_macos_integration(crate::db::run_macos_gap_flag_matrix)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_continuity_fault_matrix() -> std::result::Result<(), String> {
-        crate::db::run_macos_continuity_fault_matrix()
+        run_macos_integration(crate::db::run_macos_continuity_fault_matrix)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_fence_ordering() -> std::result::Result<(), String> {
-        crate::db::run_macos_fence_ordering()
+        run_macos_integration(crate::db::run_macos_fence_ordering)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_paused_callback_fence() -> std::result::Result<(), String> {
-        crate::db::run_macos_paused_callback_fence()
+        run_macos_integration(crate::db::run_macos_paused_callback_fence)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_history_authority() -> std::result::Result<(), String> {
-        crate::db::run_macos_history_authority()
+        run_macos_integration(crate::db::run_macos_history_authority)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_startup_cancellation() -> std::result::Result<(), String> {
-        crate::db::run_macos_startup_cancellation()
+        run_macos_integration(crate::db::run_macos_startup_cancellation)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_malformed_callbacks() -> std::result::Result<(), String> {
-        crate::db::run_macos_malformed_callbacks()
+        run_macos_integration(crate::db::run_macos_malformed_callbacks)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_root_revalidation_failures() -> std::result::Result<(), String> {
-        crate::db::run_macos_root_revalidation_failures()
+        run_macos_integration(crate::db::run_macos_root_revalidation_failures)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_null_context_generation() -> std::result::Result<(), String> {
-        crate::db::run_macos_null_context_generation()
+        run_macos_integration(crate::db::run_macos_null_context_generation)
     }
 
     #[cfg(target_os = "macos")]
     pub fn changed_path_macos_uuid_revalidation() -> std::result::Result<(), String> {
-        crate::db::run_macos_uuid_revalidation()
+        run_macos_integration(crate::db::run_macos_uuid_revalidation)
     }
 
     #[cfg(target_os = "linux")]
